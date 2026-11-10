@@ -375,8 +375,9 @@ impl Residency {
         self.refill_tier();
     }
 
-    /// Keep each group's reserve of tier records ready or graced: the
-    /// victims chosen from the ranking with no lock of the steps' held
+    /// Keep each group's reserve of tier records holding no expert mapped
+    /// (`HostRecords::reserved`): the victims chosen from the ranking with
+    /// no lock of the steps' held
     /// (`Directory::refill_victims`), then, where no step begins, each
     /// unmapped, unchanged since (`Directory::refill`), graced for the
     /// steps begun; a lent record only while no prompt group holds or

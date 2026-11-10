@@ -46,6 +46,7 @@ pub(crate) fn test_accounts() -> MemoryAccounts {
 #[cfg(test)]
 pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, OpenedCuda)> {
     static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    seismic_lang::registry::test_device_reached("opens the CUDA test device");
     let exclusive = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let selected = std::env::var("SEISMIC_TEST_BACKEND").is_ok_and(|name| name == "cuda");
     match device_count() {

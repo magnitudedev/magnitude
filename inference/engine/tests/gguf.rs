@@ -320,12 +320,12 @@ fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
     assert!(!fixtures.is_empty());
     for path in fixtures {
         let name = path.display();
-        let mut bytes = Vec::new();
-        let data_offset = gguf::read_header_bytes(
-            &mut flate2::read::GzDecoder::new(std::fs::File::open(&path).unwrap()),
-            &mut bytes,
-        )
-        .unwrap();
+        let mut read = gguf::HeaderBytes::new();
+        let data_offset = read
+            .read(&mut flate2::read::GzDecoder::new(std::fs::File::open(&path).unwrap()))
+            .unwrap()
+            .data_offset;
+        let mut bytes = read.into_bytes();
         bytes.truncate(data_offset);
         let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
             panic!("{name}: a whole header");
@@ -360,7 +360,7 @@ fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
 
         let mut cuts = (0..data_offset).step_by(data_offset / 32 + 1).collect::<Vec<_>>();
         for entry in &header.entries {
-            cuts.extend([entry.head.end, (entry.head.end + entry.end) / 2]);
+            cuts.extend([entry.head().end, (entry.head().end + entry.end) / 2]);
         }
         for cut in cuts {
             let prefix = match gguf::walk(&bytes[..cut]).unwrap() {
@@ -377,7 +377,7 @@ fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
                 "{name} at {cut}: an entry in hand is left out"
             );
             if let Some(open) = prefix.open {
-                assert_eq!(open, header.entries[held].head, "{name} at {cut}");
+                assert_eq!(open, header.entries[held].head(), "{name} at {cut}");
             }
             assert_eq!(prefix.preamble.is_some(), cut >= 24, "{name} at {cut}");
             assert!(1 <= prefix.minimum && prefix.minimum <= prefix.estimate, "{name} at {cut}");

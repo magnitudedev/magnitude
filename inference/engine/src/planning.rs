@@ -7,6 +7,7 @@
 //! tensor directory (a header-only open is sufficient), the model
 //! definition, the resolved model policy and the service limits.
 
+use crate::assessment::Measurements;
 use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
@@ -14,7 +15,8 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, Placed, PlannedMethod, ResourceLimits,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits,
+    assessment::{decode_step, ExecutorCosts, Priced},
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
@@ -74,19 +76,6 @@ pub fn plan_execution<C: HeldCharge>(
     plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, selected, resident))
 }
 
-/// [`plan_execution`]'s structure, whatever room the machine has: its
-/// experts held as its largest plan holds them under the model policy's
-/// weight bound (`ExecutionPlanDraft::with_ceiling_bank`), what metadata-only
-/// assessment prepares from the structure alone.
-pub fn plan_ceiling<C: HeldCharge>(
-    manifest: &ExecutionManifest,
-    selected: &SelectedDevice,
-) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
-    plan_resident(manifest, selected)?
-        .with_ceiling_bank(&manifest.definition, manifest.model.weight_bound)
-        .map_err(ExecutionPlanningError::Plan)
-}
-
 /// [`plan_execution`]'s plan before its expert bank: every expert resident.
 pub fn plan_resident(
     manifest: &ExecutionManifest,
@@ -110,7 +99,7 @@ pub fn plan_resident(
 /// experts placed whole under the model policy's weight cap, if any, from
 /// memory alone (`ExecutionPlanDraft::placed`), reading no price and asking
 /// no measurement; else streamed through the expert bank its settle grants
-/// on the machine's prices (`assessment::plan_prices`, `Unplaced::streamed`):
+/// on the machine's prices ([`plan_prices`], `Unplaced::streamed`):
 /// the records of its kernel cache, its model store's figures.
 ///
 /// Every load, whole or streamed, is priced on its executor's costs as it
@@ -124,7 +113,6 @@ pub fn plan_banked<C: HeldCharge>(
     selected: &SelectedDevice,
     resident: ExecutionPlanDraft,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
-    use crate::assessment::Measurements;
     let measurements = match manifest.kernel_cache.as_deref() {
         None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
         Some(kernels) => crate::assessment::stored_measurements(
@@ -144,8 +132,29 @@ pub fn plan_banked<C: HeldCharge>(
         Placed::Whole(whole) => return Ok(whole),
         Placed::Short(short) => short,
     };
-    let prices = crate::assessment::plan_prices(&measurements, short.draft());
+    let prices = plan_prices(&measurements, short.draft());
     short.streamed(&manifest.definition, &prices).map_err(ExecutionPlanningError::Plan)
+}
+
+/// The prices a plan of `definition` as `plan` (its plan before any bank)
+/// settles its holdings on (`PlanPrices`): the executor's costs and the
+/// streamed figures `measurements` hold, and its decode on those costs in
+/// each form, `plan`'s and the banked plan's streamed form's
+/// (`assessment::decode_step`). Pending or unavailable as the measurements
+/// or their streamed figures are: a plan that holds a bank waits for them.
+pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
+    match measurements {
+        Measurements::Pending => Priced::Pending("the executor's costs are not measured yet".into()),
+        Measurements::Unavailable { reason } => Priced::Unavailable(reason.clone()),
+        Measurements::Measured { costs, streamed, .. } => streamed.as_ref().and_then(|figures| {
+            let (resident, steps) = (plan.clone(), ExecutorCosts::clone(costs));
+            Priced::Measured(PlanPrices::new(
+                ExecutorCosts::clone(costs),
+                *figures,
+                Box::new(move |definition, banked| decode_step(definition, &resident, banked, steps.clone())),
+            ))
+        }),
+    }
 }
 
 /// Plan the manifest's model on `backend`, which is all planning reads of a
@@ -366,3 +375,4 @@ mod tests {
         );
     }
 }
+

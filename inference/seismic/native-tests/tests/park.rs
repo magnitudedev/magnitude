@@ -133,7 +133,7 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[1, 4]).unwrap();
         graph.timeline(seismic::timeline::Publish);
-        let call = scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 1.0 };
+        let call = scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(1.0) };
         assert!(graph.enqueue(&rows, call).is_err(), "{backend:?}: a publication before any call");
 
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
@@ -143,7 +143,7 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
         let skip = graph.port(Element::i32(), &[1]).unwrap();
         let input = graph.port(Element::f32(), &[n]).unwrap();
         let scaled = graph
-            .enqueue(&rows, scale_rows::WorkflowArgs { x: published.tensor().into(), factor: 3.0 })
+            .enqueue(&rows, scale_rows::WorkflowArgs { x: published.tensor().into(), factor: seismic::Argument::from(3.0) })
             .unwrap()
             .value;
         let publication = graph.timeline(seismic::timeline::Publish);
@@ -228,7 +228,7 @@ fn a_park_pairs_with_a_call_that_parks() {
         graph.timeline(seismic::timeline::Park);
         let call = scale_rows::WorkflowArgs {
             x: input.tensor().into(),
-            factor: 1.0,
+            factor: seismic::Argument::from(1.0),
         };
         assert!(graph.enqueue(&kernel, call).is_err());
         // A park that ends the graph.
@@ -236,7 +236,7 @@ fn a_park_pairs_with_a_call_that_parks() {
         let input = graph.port(Element::f32(), &[1, 4]).unwrap();
         let call = scale_rows::WorkflowArgs {
             x: input.tensor().into(),
-            factor: 1.0,
+            factor: seismic::Argument::from(1.0),
         };
         let value = graph.enqueue(&kernel, call).unwrap().value;
         graph.export(&value).unwrap();

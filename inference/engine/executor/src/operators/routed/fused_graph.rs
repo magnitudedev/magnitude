@@ -17,11 +17,13 @@ use crate::programs::native_constants::GraphConstant;
 use super::grouped::{ExpertsPass, Grouped};
 use super::split::{BackCrossing, Crossing, PassPorts, SharedInput, Split};
 use super::streamed::{
-    BankCombineEntry, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals, StreamedLayer, WaitPorts,
+    BankCombineEntry, BankForm, BankNumbers, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals,
+    StreamedLayer, WaitPorts,
 };
 use crate::planning::RecordTensors;
+use crate::programs::graph::facts::Numbers;
 use crate::programs::native_target_graph::{
-    WeightPart, WeightPort, WeightScale, weight, weight_port,
+    PlannedWeights, WeightPart, WeightPort, WeightScale, weight, weight_port,
 };
 use magnitude_kernels::{routed_output_project, routed_output_sited, routed_route_streamed};
 use crate::{
@@ -36,7 +38,7 @@ use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
 };
-use seismic::{BackendName, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 /// How a backend runs the decode rows' expansions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +112,7 @@ impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedRoutedEntries {
     route: [(&'static str, Element); 3],
     decode: CheckedDecodeEntries,
@@ -119,6 +122,7 @@ pub(crate) struct CheckedRoutedEntries {
     combine: [(&'static str, Element); 4],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedDecodeEntries {
     Expand([(&'static str, Element); 5]),
     SharedRoute {
@@ -200,31 +204,79 @@ impl CheckedRoutedEntries {
     }
 }
 
-/// The expert dimensions the routed entries are specialized to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExpertShape {
-    pub count: u64,
-    pub selected: u64,
-    pub intermediate: u64,
-    pub shared_intermediate: u64,
-    pub normalize_selected: bool,
+/// What decides a fused routed layer's graph beside its numbers: how it
+/// reads its experts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RoutedTopology {
+    pub bank: BankForm,
+}
+
+/// The numbers the routed entries are specialized to: the residual's
+/// width, the experts, the selected experts, their features and the shared
+/// expert's, whether the route normalizes the selected weights (`1`, else
+/// `0`: `routed_route`'s `normalize`), and a streamed layer's bank's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ExpertShape<D = Dim> {
+    pub hidden: D,
+    pub count: D,
+    pub selected: D,
+    pub intermediate: D,
+    pub shared_intermediate: D,
+    pub normalize: D,
+    pub bank: Option<BankNumbers<D>>,
+}
+
+impl<D> Numbers<D> for ExpertShape<D> {
+    type Of<E> = ExpertShape<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> ExpertShape<E> {
+        ExpertShape {
+            hidden: f(self.hidden),
+            count: f(self.count),
+            selected: f(self.selected),
+            intermediate: f(self.intermediate),
+            shared_intermediate: f(self.shared_intermediate),
+            normalize: f(self.normalize),
+            bank: self.bank.map(|bank| bank.map(&mut *f)),
+        }
+    }
 }
 
 impl ExpertShape {
-    pub(crate) fn of_binding(binding: &RoutedBinding) -> Self {
-        Self {
+    /// `routed_route`'s `normalize` argument.
+    fn normalize(&self) -> Result<Argument<i32>, GraphError> {
+        crate::operators::scalar(&self.normalize, "a route's normalize code")
+    }
+}
+
+/// What a fused routed layer's numbers are read from: a program's binding,
+/// or an admitted operator over a `hidden`-wide residual (`operators::admit`
+/// guarantees its shared expert).
+pub(crate) enum RoutedSource<'r> {
+    Binding(&'r RoutedBinding),
+    Operator { routed: &'r RoutedFfn, hidden: u64 },
+}
+
+/// The topology and numbers of the fused routed layer of `scope` read from
+/// `source`, whose graph reads its experts as `bank` does.
+pub(crate) fn split<G: GraphDraft>(
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    source: RoutedSource<'_>,
+    bank: &LayerBank<'_, '_, G>,
+) -> Result<(RoutedTopology, ExpertShape<u64>), GraphError> {
+    let (bank, numbers) = super::streamed::split(load, scope, bank)?;
+    let shape = match source {
+        RoutedSource::Binding(binding) => ExpertShape {
+            hidden: binding.hidden,
             count: binding.experts,
             selected: binding.selected,
             intermediate: binding.features,
             shared_intermediate: binding.shared,
-            normalize_selected: binding.normalize_selected,
-        }
-    }
-
-    /// The shape of an admitted routed operator (`operators::admit`
-    /// guarantees its shared expert).
-    pub(crate) fn of_operator(routed: &RoutedFfn) -> Result<Self, String> {
-        Ok(Self {
+            normalize: u64::from(binding.normalize_selected),
+            bank: numbers,
+        },
+        RoutedSource::Operator { routed, hidden } => ExpertShape {
+            hidden,
             count: routed.experts,
             selected: routed.selected,
             intermediate: routed.intermediate,
@@ -233,9 +285,11 @@ impl ExpertShape {
                 .as_ref()
                 .ok_or("routed feed-forward without shared expert")?
                 .intermediate,
-            normalize_selected: routed.router.normalization == RouteNormalization::Sum,
-        })
-    }
+            normalize: u64::from(routed.router.normalization == RouteNormalization::Sum),
+            bank: numbers,
+        },
+    };
+    Ok((RoutedTopology { bank }, shape))
 }
 
 /// The largest row class the decode form serves: the K1 GEMV row bound,
@@ -243,8 +297,8 @@ impl ExpertShape {
 pub(crate) const DECODE_ROWS: u64 = magnitude_kernels::constants::DECODE_ROWS;
 
 /// Whether a `rows`-row class runs the decode form.
-pub(crate) fn decodes(rows: u64) -> bool {
-    rows <= DECODE_ROWS
+pub(crate) fn decodes(rows: impl Into<Dim>) -> bool {
+    rows.into().at_most(DECODE_ROWS)
 }
 
 /// Rows of one expert tile of the grouped form.
@@ -255,23 +309,28 @@ pub(crate) const TILE_ROWS: u64 = 32;
 /// At most `min(experts, rows * selected)` experts are chosen, so
 /// `ceil((rows * selected + min(experts, rows * selected) * (TILE_ROWS - 1))
 /// / TILE_ROWS)`.
-pub(crate) fn grouped_blocks(rows: u64, experts: u64, selected: u64) -> Result<u64, String> {
-    let choices = rows
-        .checked_mul(selected)
-        .ok_or_else(|| format!("grouped tiles of {rows} rows overflow"))?;
+pub(crate) fn grouped_blocks(
+    rows: impl Into<Dim>,
+    experts: impl Into<Dim>,
+    selected: impl Into<Dim>,
+) -> Result<Dim, String> {
+    let rows = rows.into();
+    let overflow = || format!("grouped tiles of {rows:?} rows overflow");
+    let choices = rows.checked_mul(selected.into()).ok_or_else(overflow)?;
     experts
-        .min(choices)
+        .into()
+        .min(&choices)
         .checked_mul(TILE_ROWS - 1)
         .and_then(|padding| choices.checked_add(padding))
-        .map(|slots| slots.div_ceil(TILE_ROWS))
-        .ok_or_else(|| format!("grouped tiles of {rows} rows overflow"))
+        .map(|slots| slots.ceil_div(TILE_ROWS))
+        .ok_or_else(overflow)
 }
 
 /// The first row and row count `routed_group` groups in a `rows`-row class
 /// of a graph that groups its own rows: every row, from row 0.
 pub(crate) fn class_rows<G: GraphDraft>(
     graph: &mut G,
-    rows: u64,
+    rows: &Dim,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<[WorkflowTensor; 2], GraphError> {
     let [first, count] = [GraphConstant::i32(graph, &[0])?, GraphConstant::row_count(graph, rows)?];
@@ -303,23 +362,23 @@ struct RouteWeights {
 impl RouteWeights {
     fn of<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        planned: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         input: SublayerInput<'_>,
     ) -> Result<Self, GraphError> {
         let norm = match input.form.normalized {
-            true => weight(graph, load, scope, WeightKind::InputNorm, weights)?,
+            true => weight(graph, planned, scope, WeightKind::InputNorm, weights)?,
             false => GraphConstant::absent(graph, constants)?.tensor().clone(),
         };
         Ok(Self {
             norm,
-            router: weight(graph, load, scope, WeightKind::Router, weights)?,
-            shared_router: weight(graph, load, scope, WeightKind::SharedRouter, weights)?,
+            router: weight(graph, planned, scope, WeightKind::Router, weights)?,
+            shared_router: weight(graph, planned, scope, WeightKind::SharedRouter, weights)?,
             expert_scale: WeightScale::per_expert(
                 graph,
-                load,
+                planned,
                 WeightRole { scope, kind: WeightKind::ExpertDown },
                 weights,
                 constants,
@@ -328,16 +387,16 @@ impl RouteWeights {
     }
 
     /// The route's dimensions over `rows` rows of `input`.
-    fn choices(&self, input: SublayerInput<'_>, rows: u64, hidden: u64, shape: &ExpertShape) -> [(&'static str, u64); 7] {
-        let form = input.form.dimensions(hidden);
+    fn choices(&self, input: SublayerInput<'_>, rows: &Dim, shape: &ExpertShape) -> [(&'static str, Dim); 7] {
+        let [parts, norm] = input.form.dimensions(shape.hidden.clone());
         [
-            ("M", rows),
-            ("H", hidden),
-            ("E", shape.count),
-            ("K", shape.selected),
-            form[0],
-            form[1],
-            ("ES", self.expert_scale.extent),
+            ("M", rows.clone()),
+            ("H", shape.hidden.clone()),
+            ("E", shape.count.clone()),
+            ("K", shape.selected.clone()),
+            parts,
+            norm,
+            ("ES", self.expert_scale.extent.clone()),
         ]
     }
 
@@ -351,14 +410,13 @@ impl RouteWeights {
         input: SublayerInput<'_>,
         routes: &mut NativePort,
         scores: &mut NativePort,
-        rows: u64,
-        hidden: u64,
+        rows: &Dim,
         shape: &ExpertShape,
-        epsilon: f32,
+        epsilon: Argument<f32>,
     ) -> Result<(WorkflowTensor, WorkflowTensor), GraphError> {
         let routed = graph.enqueue(
             entry,
-            &self.choices(input, rows, hidden, shape),
+            &self.choices(input, rows, shape),
             routed_route::WorkflowArgs {
                 residual: input.rows.into(),
                 norm: (&self.norm).into(),
@@ -366,8 +424,8 @@ impl RouteWeights {
                 shared_router: (&self.shared_router).into(),
                 routes: routes.tensor_mut().into(),
                 scores: scores.tensor_mut().into(),
-                eps: epsilon,
-                normalize: i32::from(shape.normalize_selected),
+                eps: epsilon.into(),
+                normalize: shape.normalize()?,
                 expert_scale: (&self.expert_scale.tensor).into(),
             },
         )?;
@@ -391,14 +449,14 @@ impl ExpertWeights {
     /// (`LayerBank::stacks`), and their scales.
     fn of<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        planned: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         part: WeightPart,
     ) -> Result<Self, GraphError> {
         let role = |kind| WeightRole { scope, kind };
-        let mut stack = |kind| weight_port(graph, load, role(kind), part, weights);
+        let mut stack = |kind| weight_port(graph, planned, role(kind), part, weights);
         let stacks = [
             stack(WeightKind::ExpertGate)?,
             stack(WeightKind::ExpertUp)?,
@@ -406,8 +464,8 @@ impl ExpertWeights {
         ];
         Ok(Self {
             stacks,
-            gate_scale: WeightScale::per_expert(graph, load, role(WeightKind::ExpertGate), weights, constants)?,
-            up_scale: WeightScale::per_expert(graph, load, role(WeightKind::ExpertUp), weights, constants)?,
+            gate_scale: WeightScale::per_expert(graph, planned, role(WeightKind::ExpertGate), weights, constants)?,
+            up_scale: WeightScale::per_expert(graph, planned, role(WeightKind::ExpertUp), weights, constants)?,
         })
     }
 
@@ -428,34 +486,35 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     handle: RoutedGraphEntries<'a, G>,
     bank: LayerBank<'_, 'a, G>,
-    load: &ModelLoadPlan,
+    topology: &RoutedTopology,
+    shape: &ExpertShape,
+    planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     input: SublayerInput<'_>,
     residual: &WorkflowTensor,
     join: &Join,
-    rows: u64,
-    hidden: u64,
-    shape: &ExpertShape,
-    epsilon: f32,
+    rows: &Dim,
+    epsilon: Argument<f32>,
     split: Option<Split<'_>>,
 ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
     let part = bank.stacks();
-    let mut streamed = StreamedLayer::of(load, scope, bank)?;
-    let scratch = streamed.is_some() && !decodes(rows);
+    let mut streamed = StreamedLayer::of(planned, &topology.bank, shape.bank.as_ref(), scope, bank)?;
+    let decode = decodes(rows);
+    let scratch = streamed.is_some() && !decode;
     match (split, &mut streamed) {
         (None, _) if !scratch => {}
         // A front routes into its crossing; a scratch-served one requests
         // its experts (none while its layer is whole).
-        (Some(Split::Front(crossing)), layer) if !decodes(rows) => {
-            let route = RouteWeights::of(graph, load, scope, weights, constants, input)?;
+        (Some(Split::Front(crossing)), layer) if !decode => {
+            let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
             let Crossing { routes, weights: scores, normalized: into, coefficient: Some(into_coefficient) } = crossing
             else {
                 return Err("a fused layer's front crosses no coefficient".into());
             };
             let (normalized, coefficient) =
-                route.route(graph, handle.route, input, routes, scores, rows, hidden, shape, epsilon)?;
+                route.route(graph, handle.route, input, routes, scores, rows, shape, epsilon)?;
             graph.store(&normalized, into)?;
             graph.store(&coefficient, into_coefficient)?;
             let sequence = match layer {
@@ -466,17 +525,17 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         }
         // A back after its merge set's pass: its rows combined from the
         // pass's.
-        (Some(Split::Combine(back)), _) if !decodes(rows) => {
-            let shared = shared_weights(graph, load, scope, weights)?;
+        (Some(Split::Combine(back, blocks)), _) if !decode => {
+            let shared = shared_weights(graph, planned, scope, weights)?;
             let combined = Combined::of(&back.crossing)?;
-            let output = combine(graph, &handle, &shared, &back.pass(), combined, residual, join, rows, hidden, shape, constants)?;
+            let output = combine(graph, &handle, &shared, &back.pass(blocks), combined, residual, join, rows, shape, constants)?;
             return Ok((output, None));
         }
         _ => return Err("a routed layer's graph disagrees with how its experts are served".into()),
     }
-    let route = RouteWeights::of(graph, load, scope, weights, constants, input)?;
-    let choices = route.choices(input, rows, hidden, shape);
-    let form = input.form.dimensions(hidden);
+    let route = RouteWeights::of(graph, planned, scope, weights, constants, input)?;
+    let choices = route.choices(input, rows, shape);
+    let [parts, norm_extent] = input.form.dimensions(shape.hidden.clone());
     let RouteWeights {
         norm,
         router,
@@ -487,37 +546,36 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         stacks: [mut gate_records, mut up_records, mut down_records],
         gate_scale,
         up_scale,
-    } = ExpertWeights::of(graph, load, scope, weights, constants, part)?;
-    let [shared_gate, shared_up, shared_down] = shared_weights(graph, load, scope, weights)?;
-    let expansion_scales = [("GS", gate_scale.extent), ("US", up_scale.extent)];
+    } = ExpertWeights::of(graph, planned, scope, weights, constants, part)?;
+    let [shared_gate, shared_up, shared_down] = shared_weights(graph, planned, scope, weights)?;
     let [streams, injected] = join.dimensions();
     let experts_dims = [
-        ("M", rows),
-        ("H", hidden),
-        ("E", shape.count),
-        ("K", shape.selected),
-        ("F", shape.intermediate),
-        ("S", shape.shared_intermediate),
-        expansion_scales[0],
-        expansion_scales[1],
+        ("M", rows.clone()),
+        ("H", shape.hidden.clone()),
+        ("E", shape.count.clone()),
+        ("K", shape.selected.clone()),
+        ("F", shape.intermediate.clone()),
+        ("S", shape.shared_intermediate.clone()),
+        ("GS", gate_scale.extent.clone()),
+        ("US", up_scale.extent.clone()),
     ];
     let output_dims = [
-        ("M", rows),
-        ("H", hidden),
-        ("E", shape.count),
-        ("K", shape.selected),
-        ("F", shape.intermediate),
-        ("S", shape.shared_intermediate),
+        ("M", rows.clone()),
+        ("H", shape.hidden.clone()),
+        ("E", shape.count.clone()),
+        ("K", shape.selected.clone()),
+        ("F", shape.intermediate.clone()),
+        ("S", shape.shared_intermediate.clone()),
         streams,
         injected,
-        ("XS", 0),
-        ("TR", 0),
+        ("XS", Dim::from(0)),
+        ("TR", Dim::from(0)),
     ];
     let mut routes = graph.local_for(handle.route, "routes", &choices)?;
     let mut scores = graph.local_for(handle.route, "scores", &choices)?;
-    let normalize = i32::from(shape.normalize_selected);
+    let normalize = shape.normalize()?;
 
-    if decodes(rows) {
+    if decode {
         // The expansion's and output's inputs: the experts' product, the
         // shared product, the coefficient, where they read each choice's
         // record (`DecodeReads`), `E` of what they read, and the sequence
@@ -528,7 +586,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 up: up_records.tensor(),
                 down: down_records.tensor(),
             };
-            DecodeReads::resident(graph, rows, shape.selected, stacks, constants)
+            DecodeReads::resident(graph, rows, &shape.selected, stacks, constants)
         };
         let (expert_product, shared_product, coefficient, reads, experts, sequence, sited) = match handle
             .decode
@@ -544,7 +602,6 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     &mut routes,
                     &mut scores,
                     rows,
-                    hidden,
                     shape,
                     epsilon,
                 )?;
@@ -563,7 +620,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     },
                 )?;
                 let reads = resident(graph, constants)?;
-                (expanded.r0, expanded.r1, coefficient, reads, shape.count, None, None)
+                (expanded.r0, expanded.r1, coefficient, reads, shape.count.clone(), None, None)
             }
             RoutedDecodeEntries::SharedRoute {
                 route,
@@ -581,14 +638,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             let routed = graph.enqueue(
                                 route,
                                 &[
-                                    ("M", rows),
-                                    ("H", hidden),
-                                    ("E", shape.count),
-                                    ("K", shape.selected),
-                                    ("S", shape.shared_intermediate),
-                                    form[0],
-                                    form[1],
-                                    ("ES", expert_scale.extent),
+                                    ("M", rows.clone()),
+                                    ("H", shape.hidden.clone()),
+                                    ("E", shape.count.clone()),
+                                    ("K", shape.selected.clone()),
+                                    ("S", shape.shared_intermediate.clone()),
+                                    parts.clone(),
+                                    norm_extent.clone(),
+                                    ("ES", expert_scale.extent.clone()),
                                 ],
                                 routed_route_shared::WorkflowArgs {
                                     residual: input.rows.into(),
@@ -599,16 +656,16 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     shared_up: (&shared_up).into(),
                                     routes: routes.tensor_mut().into(),
                                     scores: scores.tensor_mut().into(),
-                                    eps: epsilon,
+                                    eps: epsilon.into(),
                                     normalize,
                                     expert_scale: (&expert_scale.tensor).into(),
                                 },
                             )?;
                             let reads = resident(graph, constants)?;
-                            (routed.r0, routed.r1, routed.r2, reads, shape.count, None, None)
+                            (routed.r0, routed.r1, routed.r2, reads, shape.count.clone(), None, None)
                         }
                         Some(layer) => {
-                            let binding = layer.binding();
+                            let bank = layer.numbers();
                             let mut ports = layer.decode_ports(graph)?;
                             let mut hints = layer.hints(
                                 graph,
@@ -619,22 +676,22 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             let mut routing = layer.part(graph, BankPart::Routing)?;
                             let tier = layer.route_tier(graph, &ports, constants)?;
                             let route_dims = [
-                                ("M", rows),
-                                ("H", hidden),
-                                ("E", shape.count),
-                                ("K", shape.selected),
-                                ("S", shape.shared_intermediate),
-                                form[0],
-                                form[1],
-                                ("ES", expert_scale.extent),
-                                ("FW", binding.words.file().width()),
-                                ("AHEAD", hints.ahead),
-                                ("FLIGHT", binding.words.flight),
-                                ("RING", binding.words.ring_words()),
-                                ("P", binding.words.choices),
-                                ("EN", binding.next_experts),
-                                ("GM", layer.map_words()),
-                                ("TM", tier.experts),
+                                ("M", rows.clone()),
+                                ("H", shape.hidden.clone()),
+                                ("E", shape.count.clone()),
+                                ("K", shape.selected.clone()),
+                                ("S", shape.shared_intermediate.clone()),
+                                parts.clone(),
+                                norm_extent.clone(),
+                                ("ES", expert_scale.extent.clone()),
+                                ("FW", bank.file_width.clone()),
+                                ("AHEAD", Dim::from(hints.ahead)),
+                                ("FLIGHT", bank.flight.clone()),
+                                ("RING", bank.ring_words.clone()),
+                                ("P", bank.choices.clone()),
+                                ("EN", bank.next_experts.clone()),
+                                ("GM", bank.map_words.clone()),
+                                ("TM", tier.experts.clone()),
                             ];
                             let BankRoute::Fused(route) = layer.route() else {
                                 return Err("a fused layer's bank holds another form's route".into());
@@ -658,13 +715,13 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     shared_up: (&shared_up).into(),
                                     routes: routes.tensor_mut().into(),
                                     scores: scores.tensor_mut().into(),
-                                    eps: epsilon,
+                                    eps: epsilon.into(),
                                     normalize,
                                     expert_scale: (&expert_scale.tensor).into(),
                                     map: ports.map.tensor().into(),
                                     tier: (&tier.map).into(),
                                     policy: ports.policy.tensor().into(),
-                                    sited: ports.sited(),
+                                    sited: (ports.sited()).into(),
                                     step: ports.step.tensor().into(),
                                     file: ports.file.tensor_mut().into(),
                                     grids: locals.grids.tensor_mut().into(),
@@ -705,24 +762,27 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             let reads = layer.reads(graph, &ports, &locals, constants)?;
                             let sequence = ports.sequence.take();
                             let sited = ports.site.is_some().then_some(ports);
-                            (routed.r0, routed.r1, routed.r2, reads, binding.records, sequence, sited)
+                            (routed.r0, routed.r1, routed.r2, reads, bank.records.clone(), sequence, sited)
                         }
                     };
                 let expert_product = graph
                     .enqueue(
                         gate_up,
                         &[
-                            ("M", rows),
-                            ("H", hidden),
-                            ("E", experts),
-                            ("K", shape.selected),
-                            ("F", shape.intermediate),
-                            ("GS", gate_scale.extent),
-                            ("US", up_scale.extent),
-                            ("LB", magnitude_family_contracts::GluLimit::word(None)),
-                            reads.dimensions()[0],
-                            reads.dimensions()[1],
-                        ],
+                            [
+                                ("M", rows.clone()),
+                                ("H", shape.hidden.clone()),
+                                ("E", experts.clone()),
+                                ("K", shape.selected.clone()),
+                                ("F", shape.intermediate.clone()),
+                                ("GS", gate_scale.extent.clone()),
+                                ("US", up_scale.extent.clone()),
+                                ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(None))),
+                            ]
+                            .as_slice(),
+                            &reads.dimensions(),
+                        ]
+                        .concat(),
                         routed_gate_up::WorkflowArgs {
                             normalized: (&normalized).into(),
                             routes: routes.tensor().into(),
@@ -731,7 +791,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             expert_up: up_records.tensor().into(),
                             tier_gate: (reads.tier.gate.as_ref().ok_or("a fused layer's reads lack its gate")?).into(),
                             tier_up: (&reads.tier.up).into(),
-                            activation: super::FUSED_ACTIVATION,
+                            activation: (super::FUSED_ACTIVATION).into(),
                             gate_scale: (&gate_scale.tensor).into(),
                             up_scale: (&up_scale.tensor).into(),
                             // The fused form's experts are unclamped (`is_fused`).
@@ -831,7 +891,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     }
 
     let (normalized, coefficient) =
-        route.route(graph, handle.route, input, &mut routes, &mut scores, rows, hidden, shape, epsilon)?;
+        route.route(graph, handle.route, input, &mut routes, &mut scores, rows, shape, epsilon)?;
     let experts = ExpertWeights {
         stacks: [gate_records, up_records, down_records],
         gate_scale,
@@ -844,12 +904,12 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         [routes.tensor(), &normalized],
         experts.stacks(),
         rows,
-        [shape.count, shape.selected],
+        [&shape.count, &shape.selected],
         constants,
-        |graph, grouped| expand(graph, handle.experts, &experts, grouped, hidden, shape),
+        |graph, grouped| expand(graph, handle.experts, &experts, grouped, shape),
     )?;
     let combined = Combined { scores: scores.tensor(), normalized: &normalized, coefficient: &coefficient };
-    let output = combine(graph, &handle, &shared, &pass, combined, residual, join, rows, hidden, shape, constants)?;
+    let output = combine(graph, &handle, &shared, &pass, combined, residual, join, rows, shape, constants)?;
     Ok((output, None))
 }
 
@@ -862,32 +922,34 @@ pub(crate) fn group_pass<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     handle: RoutedGraphEntries<'a, G>,
     bank: LayerBank<'_, 'a, G>,
-    load: &ModelLoadPlan,
+    topology: &RoutedTopology,
+    shape: &ExpertShape,
+    planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     ports: &mut PassPorts,
-    rows: u64,
-    hidden: u64,
-    shape: &ExpertShape,
+    blocks: &Dim,
+    rows: &Dim,
 ) -> Result<WorkflowTensor, GraphError> {
     let part = bank.stacks();
-    let mut layer = StreamedLayer::of(load, scope, bank)?;
-    let experts = ExpertWeights::of(graph, load, scope, weights, constants, part)?;
+    let mut layer = StreamedLayer::of(planned, &topology.bank, shape.bank.as_ref(), scope, bank)?;
+    let experts = ExpertWeights::of(graph, planned, scope, weights, constants, part)?;
     super::grouped::pass(
         graph,
         handle.group,
         layer.as_mut(),
         ports,
+        blocks,
         experts.stacks(),
         |tier| match tier {
             RecordTensors { gate: Some(gate), up, down } => Ok([gate, up, down].map(|port| port.tensor().clone())),
             _ => Err("a fused layer's records are gated".into()),
         },
         rows,
-        [shape.count, shape.selected],
+        [&shape.count, &shape.selected],
         constants,
-        |graph, grouped| expand(graph, handle.experts, &experts, grouped, hidden, shape),
+        |graph, grouped| expand(graph, handle.experts, &experts, grouped, shape),
     )
 }
 
@@ -914,11 +976,11 @@ impl<'t> Combined<'t> {
 /// A fused layer's shared expert's gate, up and down.
 fn shared_weights<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<[WorkflowTensor; 3], GraphError> {
-    let mut shared = |kind| weight(graph, load, scope, kind, weights);
+    let mut shared = |kind| weight(graph, planned, scope, kind, weights);
     Ok([shared(WeightKind::SharedGate)?, shared(WeightKind::SharedUp)?, shared(WeightKind::SharedDown)?])
 }
 
@@ -929,26 +991,26 @@ fn expand<'a, G: GraphDraft + 'a>(
     entry: G::Binding<'a, routed_experts::Entry>,
     experts: &ExpertWeights,
     grouped: Grouped<'_, [WorkflowTensor; 3]>,
-    hidden: u64,
     shape: &ExpertShape,
 ) -> Result<WorkflowTensor, GraphError> {
     let ExpertWeights { gate_scale, up_scale, .. } = experts;
     let Grouped { rows, blocks, first, rows_read, input, order, block_experts, used, reads } = grouped;
     let [expert_gate, expert_up, expert_down] = &reads.stacks;
     let [records_gate, records_up, records_down] = &reads.records;
+    let [mapped, step_words] = reads.map_dimensions();
     let dimensions = [
-        ("M", rows),
-        ("H", hidden),
-        ("E", shape.count),
-        ("F", shape.intermediate),
+        ("M", rows.clone()),
+        ("H", shape.hidden.clone()),
+        ("E", shape.count.clone()),
+        ("F", shape.intermediate.clone()),
         ("B", blocks),
-        ("T", TILE_ROWS),
-        ("GS", gate_scale.extent),
-        ("US", up_scale.extent),
-        ("LB", magnitude_family_contracts::GluLimit::word(None)),
-        ("X", reads.mapped),
-        ("QS", reads.step_words()),
-        ("R", reads.count),
+        ("T", Dim::from(TILE_ROWS)),
+        ("GS", gate_scale.extent.clone()),
+        ("US", up_scale.extent.clone()),
+        ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(None))),
+        mapped,
+        step_words,
+        ("R", reads.count.clone()),
     ];
     Ok(graph
         .enqueue(
@@ -969,7 +1031,7 @@ fn expand<'a, G: GraphDraft + 'a>(
                 records_gate: records_gate.into(),
                 records_up: records_up.into(),
                 records_down: records_down.into(),
-                activation: super::FUSED_ACTIVATION,
+                activation: (super::FUSED_ACTIVATION).into(),
                 gate_scale: (&gate_scale.tensor).into(),
                 up_scale: (&up_scale.tensor).into(),
                 // The fused form's experts are unclamped (`is_fused`).
@@ -991,20 +1053,19 @@ fn combine<'a, G: GraphDraft + 'a>(
     combined: Combined<'_>,
     residual: &WorkflowTensor,
     join: &Join,
-    rows: u64,
-    hidden: u64,
+    rows: &Dim,
     shape: &ExpertShape,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError> {
     let [shared_gate, shared_up, shared_down] = shared;
     let [streams, injected] = join.dimensions();
     let dimensions = [
-        ("M", rows),
-        ("H", hidden),
-        ("K", shape.selected),
-        ("B", pass.blocks),
-        ("T", TILE_ROWS),
-        ("S", shape.shared_intermediate),
+        ("M", rows.clone()),
+        ("H", shape.hidden.clone()),
+        ("K", shape.selected.clone()),
+        ("B", pass.blocks.clone()),
+        ("T", Dim::from(TILE_ROWS)),
+        ("S", shape.shared_intermediate.clone()),
         streams,
         injected,
     ];

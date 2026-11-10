@@ -5,8 +5,10 @@
 pub(crate) mod graph;
 pub(crate) mod pooled;
 pub(crate) mod selection;
+pub(crate) mod split;
 
 use super::{PlanError, WeightPush, tail};
+use crate::planning::{AttentionForm, AttentionWidths, GateForm, SeparateGate};
 use crate::{
     AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
     GroupedOutputBinding, GroupedOutputShape, IndexerBinding, LowRankQueryBinding, PickedBinding,
@@ -18,7 +20,7 @@ use magnitude_family_contracts::{
     Operator, OutputForm, OutputProjection, OutputRotary, Pool, PooledRows, ProjectedRows,
     QueryProjection, RmsNorm, Rotary, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
     RowProducer, RowRounding, Selection, SublayerIndex, TokenDomain, ValueNorm, ValueSource,
-    WeightDescriptor, WeightKind,
+    WeightKind,
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, KvCodec};
 use seismic::{DType, Element};
@@ -54,8 +56,6 @@ pub(crate) struct SelectedRead<'a> {
     pub blocks: u64,
     pub heads: u64,
     pub width: u64,
-    pub query: &'a WeightDescriptor,
-    pub key: &'a WeightDescriptor,
     pub query_norm: &'a RmsNorm,
     pub key_norm: &'a RmsNorm,
 }
@@ -78,7 +78,7 @@ pub(crate) fn selected_read(reads: &HistoryReads) -> Result<Option<SelectedRead<
     };
     let IndexerKeys::Pooled(PooledRows {
         rate,
-        projection,
+        projection: _,
         pool: Pool::Mean,
         norm: key_norm,
         rounding: RowRounding::None,
@@ -104,8 +104,6 @@ pub(crate) fn selected_read(reads: &HistoryReads) -> Result<Option<SelectedRead<
         blocks: indexer.top,
         heads: indexer.heads,
         width: indexer.width,
-        query: &indexer.query.projection,
-        key: projection,
         query_norm,
         key_norm,
     }))
@@ -501,12 +499,12 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
         }
     }
     let shape = geometry(0, attention)?;
-    if shape.width < 2 * shape.rotary_pairs {
+    if shape.widths.width < 2 * shape.widths.rotary_pairs {
         return Err(PlanError::Topology("rotary pairs exceed the head width"));
     }
     // The entries turn the published attended row back, which a gate
     // would have already scaled (`attention.seismic`'s `output_rotary`).
-    if shape.output_rotary > 0 && (shape.interleaved_gate > 0 || shape.separate_gate > 0) {
+    if shape.form.output_rotary && shape.form.gate != GateForm::None {
         return Err(PlanError::Unsupported(
             "gated attention with an inverse output rotary",
         ));
@@ -603,9 +601,13 @@ pub(crate) fn shape(
     attention: &Attention,
     site: Option<DecoderSite<'_>>,
 ) -> Result<AttentionShape, PlanError> {
+    let geometry = geometry(hidden, attention)?;
     Ok(AttentionShape {
-        picks: picks(attention, site)?,
-        ..geometry(hidden, attention)?
+        widths: AttentionWidths {
+            picks: picks(attention, site)?,
+            ..geometry.widths
+        },
+        ..geometry
     })
 }
 
@@ -618,17 +620,17 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
         ));
     }
     let width = attention.width;
-    let (interleaved_gate, separate_gate) = match &attention.gate {
-        AttentionGate::None => (0, 0),
-        AttentionGate::Interleaved { .. } => (width, 0),
-        AttentionGate::Separate { granularity, .. } => match granularity {
-            GateGranularity::Element => (0, width),
-            GateGranularity::Head => (0, 1),
-        },
+    let gate = match &attention.gate {
+        AttentionGate::None => GateForm::None,
+        AttentionGate::Interleaved { .. } => GateForm::Interleaved,
+        AttentionGate::Separate { granularity, .. } => GateForm::Separate(match granularity {
+            GateGranularity::Element => SeparateGate::Element,
+            GateGranularity::Head => SeparateGate::Head,
+        }),
     };
     // The rotary layout and output rotary (`RA`, `RT`, `RO`).
     let (rotary_adjacent, rotary_trailing, output_rotary) = match &attention.rotary {
-        Rotary::None | Rotary::Interleaved { .. } => (0, 0, 0),
+        Rotary::None | Rotary::Interleaved { .. } => (false, false, false),
         // The inverse of no rotation is none.
         Rotary::Table {
             pairs,
@@ -636,17 +638,17 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
             output,
             ..
         } => (
-            u64::from(layout.pairs == RotaryPairing::Adjacent),
-            u64::from(layout.placement == RotaryPlacement::Trailing),
-            u64::from(*output == OutputRotary::Inverse && !pairs.is_empty()),
+            layout.pairs == RotaryPairing::Adjacent,
+            layout.placement == RotaryPlacement::Trailing,
+            *output == OutputRotary::Inverse && !pairs.is_empty(),
         ),
     };
-    let query_norm = u64::from(matches!(attention.query_norm, HeadNorm::Rms(_)));
+    let query_norm = matches!(attention.query_norm, HeadNorm::Rms(_));
     let (fresh, key_norm, value_norm, values) = match fresh_rows(attention) {
         FreshRows::Own(rows) => (
-            1,
-            u64::from(matches!(rows.key_norm, HeadNorm::Rms(_))),
-            u64::from(matches!(rows.value_norm, ValueNorm::RmsUnweighted(_))),
+            true,
+            matches!(rows.key_norm, HeadNorm::Rms(_)),
+            matches!(rows.value_norm, ValueNorm::RmsUnweighted(_)),
             match rows.value {
                 ValueSource::Projected(_) => AttentionValues::Projected,
                 ValueSource::RawKey => AttentionValues::RawKey,
@@ -654,31 +656,34 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
             },
         ),
         // A Shared layer projects no keys: its unread `N` is its `NQ`.
-        FreshRows::Shared(_) => (0, query_norm, 0, AttentionValues::Projected),
+        FreshRows::Shared(_) => (false, query_norm, false, AttentionValues::Projected),
     };
     Ok(AttentionShape {
-        hidden,
-        kv_heads: attention.kv_heads,
-        group: attention.heads / attention.kv_heads,
-        rotary_pairs: match &attention.rotary {
-            Rotary::None => 0,
-            Rotary::Interleaved { width, .. } => width / 2,
-            Rotary::Table { pairs, .. } => pairs.len() as u64,
+        form: AttentionForm {
+            gate,
+            fresh,
+            query_norm,
+            key_norm,
+            value_norm,
+            values,
+            sinks: attention.sinks.is_some(),
+            rotary_adjacent,
+            rotary_trailing,
+            output_rotary,
         },
-        width,
-        interleaved_gate,
-        separate_gate,
-        fresh,
-        query_norm,
-        key_norm,
-        value_norm,
-        values,
-        sinks: u64::from(attention.sinks.is_some()),
-        rotary_adjacent,
-        rotary_trailing,
-        output_rotary,
+        widths: AttentionWidths {
+            hidden,
+            kv_heads: attention.kv_heads,
+            group: attention.heads / attention.kv_heads,
+            rotary_pairs: match &attention.rotary {
+                Rotary::None => 0,
+                Rotary::Interleaved { width, .. } => width / 2,
+                Rotary::Table { pairs, .. } => pairs.len() as u64,
+            },
+            width,
+            picks: 0,
+        },
         key_rounding: crate::planning::rounding_args(key_rounding(attention)),
-        picks: 0,
     })
 }
 
@@ -1005,7 +1010,9 @@ pub(super) fn binding(
     let projection = |kind| scalable(kind).map(|weight| weight.element);
     // Rounded rows are stored in BF16 (`magnitude_state::history_codec`),
     // which the entries read as their activation element.
-    if (shape.key_rounding.rounds() || shape.picks > 0) && activation != Element::dense(DType::BF16) {
+    if (shape.key_rounding.rounds() || shape.widths.picks > 0)
+        && activation != Element::dense(DType::BF16)
+    {
         return Err(PlanError::Unsupported(
             "rounded or pooled history rows under an activation other than BF16",
         ));
@@ -1077,7 +1084,7 @@ pub(super) fn binding(
     // The dense entries alone round keys and read an index-list source,
     // and such rows are stored dense whatever the policy (`history_codec`).
     let history = history_codec(attention, history, activation)?;
-    if (shape.key_rounding.rounds() || shape.picks > 0)
+    if (shape.key_rounding.rounds() || shape.widths.picks > 0)
         && history.encoding() != HistoryEncoding::Dense
     {
         return Err(PlanError::Topology(
@@ -1820,7 +1827,7 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>();
                 for binding in &bindings {
                     assert!(binding.shape.key_rounding.rounds());
-                    assert_eq!(binding.shape.picks, 2);
+                    assert_eq!(binding.shape.widths.picks, 2);
                     assert_eq!(binding.shape.stored_key(), 1);
                 }
                 assert!(matches!(
@@ -1901,7 +1908,7 @@ pub(crate) mod tests {
                         _ => panic!("an attention block"),
                     })
                     .collect::<Vec<_>>();
-                assert!(bindings.iter().all(|binding| binding.shape.picks == 2));
+                assert!(bindings.iter().all(|binding| binding.shape.widths.picks == 2));
                 assert!(matches!(
                     bindings[0].picked,
                     Some(crate::PickedBinding::Own(crate::PooledBinding {
@@ -2003,7 +2010,7 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            let mut programs = crate::AttestedPrograms::prepare_draft(
+            let programs = crate::AttestedPrograms::prepare_draft(
                 &draft,
                 &device,
                 crate::TuningContext {
@@ -2080,7 +2087,7 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            let mut programs = crate::AttestedPrograms::prepare_draft(
+            let programs = crate::AttestedPrograms::prepare_draft(
                 &draft,
                 &device,
                 crate::TuningContext {
@@ -2309,15 +2316,15 @@ pub(crate) mod tests {
         let axes = geometry(0, &v41).unwrap();
         assert_eq!(
             (
-                axes.query_norm,
-                axes.key_norm,
-                axes.rotary_adjacent,
-                axes.rotary_trailing,
-                axes.output_rotary,
-                axes.stored_key(),
+                axes.form.query_norm,
+                axes.form.key_norm,
+                axes.form.rotary_adjacent,
+                axes.form.rotary_trailing,
+                axes.form.output_rotary,
+                axes.form.stored_key(),
                 axes.value_rows(),
             ),
-            (0, 1, 1, 1, 1, 1, 0)
+            (false, true, true, true, true, true, 0)
         );
         // Its history is the key plane alone, dense only.
         let dense = history_codec(&v41, KvCodec::Dense, Element::bf16()).unwrap();

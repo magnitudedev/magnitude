@@ -41,7 +41,6 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
-    assessment::prepare_execution_assessment,
     platform::{
         DeviceRequest, HostRoom, MemoryReserves, OpenedPlatform, PlatformConfig, RECOVERY_STABLE_TIME, observe_domains,
         open_selected, select_device,
@@ -116,11 +115,9 @@ pub fn load(load: Load) -> Result<(), String> {
     } = load;
     let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing));
     let Planned { host, manifest, devices, structure, planned } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
-    let definition = &manifest.definition;
-    let context = u32::try_from(definition.decoder.context_limit)
-        .map_err(|_| "the context exceeds the assessment domain")?;
-    let execution =
-        prepare_execution_assessment(definition, &planned, context).map_err(|error| error.to_string())?;
+    let context = manifest.definition.decoder.context_limit;
+    // The charge the load's planning confirmed of its plan.
+    let charge = planned.charge().clone();
     let draft = planned.into_draft();
     // Where a streamed load's experts are stored, none of whose pages the
     // file cache may hold.
@@ -166,7 +163,6 @@ pub fn load(load: Load) -> Result<(), String> {
             }))
         })
         .transpose()?;
-    let charge = execution.memory_charge();
     let bounds = &charge.bounds;
     let process = &bounds.host_process;
     // What the plan holds at load end: in device and upload storage the
@@ -202,7 +198,7 @@ pub fn load(load: Load) -> Result<(), String> {
         ],
         "host bytes",
     )?;
-    let vocabulary = definition.decoder.vocabulary;
+    let vocabulary = manifest.definition.decoder.vocabulary;
     // The load, in a worker process as the service loads.
     let WorkerProcess { transport, retire } =
         start_worker_process(crate::engine::worker(&[])?).map_err(|error| error.to_string())?;

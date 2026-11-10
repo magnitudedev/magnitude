@@ -37,6 +37,7 @@ impl DeviceHandle {
     /// Cheap enumeration of unopened physical Metal devices. This performs no
     /// queue creation, native compilation, or profiling.
     pub fn discover() -> Vec<Self> {
+        seismic_lang::registry::test_device_reached("discovers the Metal devices");
         crate::pooled(|| {
             MTLCopyAllDevices()
                 .into_iter()
@@ -47,6 +48,7 @@ impl DeviceHandle {
 
     /// The system default Metal device.
     pub fn system_default() -> Result<Self, TargetError> {
+        seismic_lang::registry::test_device_reached("opens the default Metal device");
         let device = crate::pooled(|| MTLCreateSystemDefaultDevice())
             .ok_or_else(|| TargetError::DeviceUnavailable("no Metal device".into()))?;
         Ok(Self { device })

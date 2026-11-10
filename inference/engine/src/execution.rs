@@ -1043,7 +1043,18 @@ impl LoadPricing {
         )
         .unwrap();
         let planned = match banked {
-            true => resident.clone().with_ceiling_bank::<magnitude_executor::AssessmentMemoryCharge>(&definition, None).unwrap().into_draft(),
+            true => {
+                let structure = |draft: &magnitude_executor::ExecutionPlanDraft| {
+                    magnitude_executor::assessment::StructuralCharge::of(&definition, draft)
+                        .map(|charge| (charge, ()))
+                        .map_err(|error| -> magnitude_executor::PlanError { panic!("the fixture outlines: {error}") })
+                };
+                match resident.floor_forms(&definition, None, structure).unwrap() {
+                    magnitude_executor::FloorForms::Banked { bank, .. } => bank.form.draft,
+                    // A backend that streams no experts (CPU) holds them whole.
+                    magnitude_executor::FloorForms::Resident(held) => held.draft,
+                }
+            }
             false => resident.clone(),
         };
         let executor = device.topology().executor_identity(device.info().id()).expect("a device is of its topology's revision");
@@ -2011,7 +2022,7 @@ mod tests {
         standing.retain(|request| request.outstanding(&topology, &executor, &records, costs));
         assert_eq!(
             PointRequests::new(root.path()).outstanding(&topology, &executor, storage, &records, costs).unwrap(),
-            [standing, requests.to_vec()].concat()
+            magnitude_executor::assessment::Outstanding { standing, loads: requests.to_vec() }
         );
     }
 }

@@ -328,7 +328,7 @@ impl HeaderCache {
 
     fn index_entries(&self, header: &[u8], entries: &[Entry<'_>], digest: &str) {
         for entry in entries.iter().filter(|entry| shared(entry)) {
-            self.index_head(&header[entry.head.start..entry.head.end], digest);
+            self.index_head(&header[entry.head().start..entry.head().end], digest);
         }
     }
 

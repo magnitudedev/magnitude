@@ -243,8 +243,11 @@ mod tests {
             &mut measurer,
             device,
             &KernelCache::measurement_records(cache),
-            &[magnitude_executor::assessment::PointRequest::Storage { directory: cache.to_owned() }],
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            &magnitude_executor::assessment::Outstanding {
+                standing: vec![magnitude_executor::assessment::PointRequest::Storage { directory: cache.to_owned() }],
+                loads: Vec::new(),
+            },
+            magnitude_executor::assessment::requests::JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(60)),
             &mut |_| Attempt::Proceed,
             &mut |_, _| {},
         )

@@ -5,9 +5,11 @@
 //! the bytes end inside the header it says which entry they end in and how many more bytes the
 //! header needs: certainly (`minimum`) and probably (`estimate`, extrapolated inside a string
 //! array), so a reader growing a prefix (from a file, or by range requests) asks for about as many
-//! as remain. Values are decoded only on request ([`Entry::value`]). Whether the engine accepts
-//! the tensors themselves (their types, geometry and offsets) is decided on the complete header
-//! ([`super::read_header`]).
+//! as remain. A reader grows the prefix in a [`HeaderBytes`], whose walk continues where the walk
+//! of the shorter prefix stopped, so each byte is walked once however many reads the header takes.
+//! Values are decoded only on request ([`Entry::value`]), without checking their strings again.
+//! Whether the engine accepts the tensors themselves (their types, geometry and offsets) is
+//! decided on the complete header ([`Header::directory`]).
 
 use super::{
     Array, ByteOrder, Error, Metadata, Scalar, StoredType, Strings, Value, ValueType, invalid,
@@ -94,7 +96,10 @@ pub struct EntryHead<'a> {
 /// One complete metadata entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry<'a> {
-    pub head: EntryHead<'a>,
+    /// Private, as is `value`: only the walk makes an entry, so its head
+    /// states what its value's bytes hold, which they decode by
+    /// ([`Self::value`], reading its strings back unchecked).
+    head: EntryHead<'a>,
     pub end: usize,
     /// The value's bytes: everything after the value type (a scalar) or the element count (an
     /// array).
@@ -102,7 +107,12 @@ pub struct Entry<'a> {
     order: ByteOrder,
 }
 
-impl Entry<'_> {
+impl<'a> Entry<'a> {
+    /// The entry's key, stored type, count and where its fixed part lies.
+    pub fn head(&self) -> EntryHead<'a> {
+        self.head
+    }
+
     /// The entry's bytes in the header.
     pub fn range(&self) -> Range<usize> {
         self.head.start..self.end
@@ -169,243 +179,68 @@ impl TensorInfo<'_> {
 
 /// The structure of the GGUF header `bytes` begin, or why they can't begin one.
 pub fn walk(bytes: &[u8]) -> Result<Walk<'_>, Error> {
-    let mut walker = Walker {
-        cursor: Cursor {
-            bytes,
-            offset: 0,
-            order: ByteOrder::Little,
-        },
-        preamble: None,
-        entries: Vec::new(),
-        alignment: DEFAULT_ALIGNMENT,
-    };
-    let Some(magic) = walker.cursor.take(4)? else {
-        let missing = PREAMBLE_BYTES - bytes.len();
-        return walker.stop(None, missing, missing);
-    };
-    if magic != b"GGUF" {
-        return Err(invalid("not a GGUF container"));
-    }
-    let Some(version) = walker.cursor.take(4)? else {
-        let missing = PREAMBLE_BYTES - bytes.len();
-        return walker.stop(None, missing, missing);
-    };
-    if version == [0, 0, 0, 3] {
-        walker.cursor.order = ByteOrder::Big;
-    }
-    let version = u32_of(walker.cursor.order, version.try_into().expect("four bytes"));
-    let (Some(tensor_count), Some(entry_count)) = (walker.cursor.u64()?, walker.cursor.u64()?)
-    else {
-        let missing = PREAMBLE_BYTES - bytes.len();
-        return walker.stop(None, missing, missing);
-    };
-    if !matches!(version, 2 | 3) {
-        return Err(invalid(format!("unsupported GGUF version {version}")));
-    }
-    let preamble = Preamble {
-        version,
-        byte_order: walker.cursor.order,
-    };
-    walker.preamble = Some(preamble);
-    if tensor_count
-        .checked_add(entry_count)
-        .is_none_or(|count| count > (HEADER_LIMIT - PREAMBLE_BYTES) as u64 / SMALLEST_ITEM_BYTES)
-    {
-        return Err(beyond());
-    }
-    let (tensor_count, entry_count) = (tensor_count as usize, entry_count as usize);
-    let tensors_estimate = tensor_count * TENSOR_ESTIMATE;
-    let mut keys = HashSet::new();
-    for index in 0..entry_count {
-        let rest = (entry_count - index - 1) * ENTRY_ESTIMATE + tensors_estimate;
-        let start = walker.cursor.offset;
-        let Some(key) = walker.cursor.string()? else {
-            return walker.stop(None, 12, ENTRY_ESTIMATE + rest);
-        };
-        if !keys.insert(key) {
-            return Err(invalid(format!("duplicate metadata {key:?}")));
-        }
-        let Some(value_type) = walker.cursor.u32()? else {
-            return walker.stop(None, 4, ENTRY_ESTIMATE + rest);
-        };
-        let (stored, count, head_end, value_start) = if value_type == 9 {
-            let (Some(element), Some(count)) = (walker.cursor.u32()?, walker.cursor.u64()?) else {
-                return walker.stop(None, 12, ENTRY_ESTIMATE + rest);
-            };
-            if element == 9 {
-                return Err(invalid("nested or oversized GGUF array"));
-            }
-            let element = ValueType::from_id(element)?;
-            let head_end = walker.cursor.offset;
-            let open = EntryHead {
-                key,
-                stored: StoredType::Array(element),
-                count,
-                start,
-                end: head_end,
-            };
-            // Every element takes at least its type's width, so the count is bounded before
-            // anything is read.
-            let elements = usize::try_from(count)
-                .ok()
-                .filter(|elements| {
-                    elements
-                        .checked_mul(element.width())
-                        .is_some_and(|length| length <= HEADER_LIMIT - head_end)
-                })
-                .ok_or_else(|| invalid("nested or oversized GGUF array"))?;
-            if element == ValueType::String {
-                for read in 0..elements {
-                    let before = walker.cursor.offset;
-                    if walker.cursor.string()?.is_none() {
-                        let left = elements - read;
-                        let average = if read < MEASURED_STRINGS {
-                            STRING_ESTIMATE
-                        } else {
-                            ((before - head_end) / read)
-                                .clamp(STRING_ESTIMATE_BOUNDS.0, STRING_ESTIMATE_BOUNDS.1)
-                        };
-                        let in_string = bytes.len() - before;
-                        return walker.stop(
-                            Some(open),
-                            (left * 8).saturating_sub(in_string),
-                            (left * average).saturating_sub(in_string) + rest,
-                        );
-                    }
-                }
-            } else {
-                let length = elements * element.width();
-                let Some(values) = walker.cursor.take(length)? else {
-                    let missing = head_end + length - bytes.len();
-                    return walker.stop(Some(open), missing, missing + rest);
-                };
-                if element == ValueType::Bool {
-                    values.iter().try_for_each(|byte| valid_bool(*byte))?;
-                }
-            }
-            (StoredType::Array(element), count, head_end, head_end)
-        } else {
-            let kind = ValueType::from_id(value_type)?;
-            let value_start = walker.cursor.offset;
-            if kind == ValueType::String {
-                let Some(length) = walker.cursor.u64()? else {
-                    return walker.stop(None, 8, ENTRY_ESTIMATE + rest);
-                };
-                let head_end = walker.cursor.offset;
-                let length = usize::try_from(length)
-                    .ok()
-                    .filter(|length| *length <= HEADER_LIMIT - head_end)
-                    .ok_or_else(beyond)?;
-                let Some(text) = walker.cursor.take(length)? else {
-                    let missing = head_end + length - bytes.len();
-                    let open = EntryHead {
-                        key,
-                        stored: StoredType::Scalar(kind),
-                        count: 1,
-                        start,
-                        end: head_end,
-                    };
-                    return walker.stop(Some(open), missing, missing + rest);
-                };
-                utf8(text)?;
-                (StoredType::Scalar(kind), 1, head_end, value_start)
-            } else {
-                let width = kind.width();
-                let Some(value) = walker.cursor.take(width)? else {
-                    return walker.stop(None, width, width + rest);
-                };
-                if kind == ValueType::Bool {
-                    valid_bool(value[0])?;
-                }
-                (StoredType::Scalar(kind), 1, value_start, value_start)
-            }
-        };
-        let entry = Entry {
-            head: EntryHead {
-                key,
-                stored,
-                count,
-                start,
-                end: head_end,
-            },
-            end: walker.cursor.offset,
-            value: &bytes[value_start..walker.cursor.offset],
-            order: walker.cursor.order,
-        };
-        if key == ALIGNMENT_KEY {
-            walker.alignment = super::alignment(&entry.value())?;
-        }
-        walker.entries.push(entry);
-    }
-    let alignment = usize::try_from(walker.alignment).unwrap_or(usize::MAX);
-    let tensors_start = walker.cursor.offset;
-    let mut tensors = Vec::new();
-    for index in 0..tensor_count {
-        let before = walker.cursor.offset;
-        let left = tensor_count - index;
-        let average = if index == 0 {
-            TENSOR_ESTIMATE
-        } else {
-            (before - tensors_start) / index
-        };
-        let estimate = (left * average)
-            .saturating_add(alignment)
-            .saturating_sub(bytes.len() - before);
-        let Some(name) = walker.cursor.string()? else {
-            return walker.stop(None, 8, estimate);
-        };
-        let Some(rank) = walker.cursor.u32()? else {
-            return walker.stop(None, 4, estimate);
-        };
-        if !(1..=MAX_TENSOR_RANK).contains(&rank) {
-            return Err(invalid(format!(
-                "invalid or duplicate tensor directory entry {name:?}"
-            )));
-        }
-        let fixed = rank as usize * 8 + 4 + 8;
-        let Some(descriptor) = walker.cursor.take(fixed)? else {
-            return walker.stop(None, fixed, estimate);
-        };
-        let (dimensions, rest) = descriptor.split_at(rank as usize * 8);
-        let (type_id, offset) = rest.split_at(4);
-        let order = walker.cursor.order;
-        tensors.push(TensorInfo {
-            name,
-            type_id: u32_of(order, type_id.try_into().expect("four bytes")),
-            offset: u64_of(order, offset.try_into().expect("eight bytes")),
-            dimensions,
-            order,
-        });
-    }
-    let data_offset = walker
-        .cursor
-        .offset
-        .checked_next_multiple_of(alignment)
-        .filter(|end| *end <= HEADER_LIMIT)
-        .ok_or_else(beyond)?;
-    Ok(Walk::Complete(Header {
-        preamble,
-        entries: walker.entries,
-        tensors,
-        alignment: walker.alignment,
-        data_offset,
-    }))
+    let mut walked = Progress::default();
+    walked.advance(bytes)?;
+    Ok(walked.view(bytes))
 }
 
-/// Reads from `source` onto `bytes` until they hold a whole GGUF header (padding aside), returning
-/// its aligned tensor-data offset. Each read asks for the walk's estimate of the rest, so the bytes
-/// may run past the header by up to the last estimate. A source that ends first is a truncated
-/// header.
-pub fn read_header_bytes(source: &mut impl Read, bytes: &mut Vec<u8>) -> Result<usize, Error> {
-    loop {
-        let wanted = match walk(bytes)? {
-            Walk::Complete(header) => return Ok(header.data_offset),
-            Walk::Incomplete(prefix) => prefix.estimate,
-        };
-        if source.by_ref().take(wanted as u64).read_to_end(bytes)? == 0 {
-            return Err(Error::Truncated {
-                offset: bytes.len() as u64,
-            });
+/// The bytes of a GGUF header as a reader grows them, with their walk. The bytes are only ever
+/// extended, so each walk continues where the one before stopped: however many reads a header
+/// takes, each of its bytes is walked (its strings checked) once, and the reader ends with the
+/// whole header's walk in hand.
+#[derive(Default)]
+pub struct HeaderBytes {
+    bytes: Vec<u8>,
+    walked: Progress,
+}
+
+impl HeaderBytes {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn extend_from_slice(&mut self, more: &[u8]) {
+        self.bytes.extend_from_slice(more);
+    }
+
+    /// Appends up to `limit` bytes read from `source`, returning how many.
+    pub fn read_from(&mut self, source: &mut impl Read, limit: usize) -> std::io::Result<usize> {
+        source.by_ref().take(limit as u64).read_to_end(&mut self.bytes)
+    }
+
+    /// The walk of the bytes in hand, continuing the walk of the bytes before.
+    pub fn walk(&mut self) -> Result<Walk<'_>, Error> {
+        self.walked.advance(&self.bytes)?;
+        Ok(self.walked.view(&self.bytes))
+    }
+
+    /// Reads from `source` onto the bytes until they hold a whole GGUF header (padding aside),
+    /// returning its walk. Each read asks for the walk's estimate of the rest, so the bytes may run
+    /// past the header by up to the last estimate. A source that ends first is a truncated header.
+    pub fn read(&mut self, source: &mut impl Read) -> Result<Header<'_>, Error> {
+        loop {
+            self.walked.advance(&self.bytes)?;
+            let Stop::Incomplete { estimate, .. } = self.walked.stop else {
+                break;
+            };
+            if self.read_from(source, estimate)? == 0 {
+                return Err(Error::Truncated {
+                    offset: self.bytes.len() as u64,
+                });
+            }
+        }
+        match self.walked.view(&self.bytes) {
+            Walk::Complete(header) => Ok(header),
+            Walk::Incomplete(_) => unreachable!("the reads end at a whole header"),
         }
     }
 }
@@ -416,6 +251,16 @@ fn beyond() -> Error {
 
 fn utf8(bytes: &[u8]) -> Result<&str, Error> {
     std::str::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8 in GGUF header"))
+}
+
+/// Text the walk checked ([`utf8`]), read back without checking it again.
+fn checked(text: &[u8]) -> &str {
+    debug_assert!(std::str::from_utf8(text).is_ok());
+    // SAFETY: only text the walk checked comes here: the ranges a `Progress` holds, read back from
+    // the bytes it walked (a `HeaderBytes` only ever extends its bytes), and the strings in the
+    // values of the entries it reports, which nothing else constructs or changes (an `Entry`'s
+    // head and value are private), so each decodes by the head the walk checked it by.
+    unsafe { std::str::from_utf8_unchecked(text) }
 }
 
 fn valid_bool(byte: u8) -> Result<(), Error> {
@@ -447,34 +292,501 @@ fn u64_of(order: ByteOrder, bytes: [u8; 8]) -> u64 {
     }
 }
 
-/// The walk's state: what it has read, and what it reports where the bytes end.
-struct Walker<'a> {
-    cursor: Cursor<'a>,
-    preamble: Option<Preamble>,
-    entries: Vec<Entry<'a>>,
+/// Where a walk stopped, with everything it read before as offsets into the bytes it walked, so a
+/// walk of those bytes extended continues from here. It moves only past what the walk read whole
+/// (an item, or the whole strings of a string array the bytes end in), so a walk that finds the
+/// bytes invalid leaves it where it was, and walking them again finds the same error.
+struct Progress {
+    /// Where the walk continues: the start of the next item, or of the next string of `array`.
+    offset: usize,
+    preamble: Option<Counted>,
+    /// The keys of `entries`.
+    keys: HashSet<Box<str>>,
+    entries: Vec<Walked>,
+    /// The alignment `entries` declare.
     alignment: u64,
+    /// The string array the walk stopped in, when it did.
+    array: Option<OpenArray>,
+    /// Where the tensor descriptors start, once every entry is walked.
+    tensors_start: Option<usize>,
+    tensors: Vec<WalkedTensor>,
+    stop: Stop,
 }
 
-impl<'a> Walker<'a> {
-    fn stop(
-        self,
-        open: Option<EntryHead<'a>>,
+impl Default for Progress {
+    /// The walk of no bytes.
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            preamble: None,
+            keys: HashSet::new(),
+            entries: Vec::new(),
+            alignment: DEFAULT_ALIGNMENT,
+            array: None,
+            tensors_start: None,
+            tensors: Vec::new(),
+            stop: Stop::Incomplete {
+                open: None,
+                minimum: PREAMBLE_BYTES,
+                estimate: PREAMBLE_BYTES,
+            },
+        }
+    }
+}
+
+/// A preamble with the counts it declares.
+#[derive(Clone, Copy, Debug)]
+struct Counted {
+    preamble: Preamble,
+    tensors: usize,
+    entries: usize,
+}
+
+/// Where a walk ends: inside the header ([`Prefix`]) or at its end ([`Header`]).
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    Incomplete {
+        open: Option<Head>,
         minimum: usize,
         estimate: usize,
-    ) -> Result<Walk<'a>, Error> {
-        let room = HEADER_LIMIT.saturating_sub(self.cursor.bytes.len());
-        let minimum = minimum.max(1);
-        if minimum > room {
-            return Err(beyond());
+    },
+    Complete {
+        preamble: Preamble,
+        data_offset: usize,
+    },
+}
+
+/// Why a walk ends before the header does: the bytes end, or they can't begin a header.
+enum Halt {
+    Stopped(Stop),
+    Invalid(Error),
+}
+
+impl From<Error> for Halt {
+    fn from(error: Error) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+/// An [`EntryHead`], its key by where it ends.
+#[derive(Clone, Copy, Debug)]
+struct Head {
+    key_end: usize,
+    stored: StoredType,
+    count: u64,
+    start: usize,
+    end: usize,
+}
+
+/// An [`Entry`].
+#[derive(Clone, Copy, Debug)]
+struct Walked {
+    head: Head,
+    value_start: usize,
+    end: usize,
+}
+
+/// A string array whose first `read` strings are walked.
+#[derive(Clone, Copy, Debug)]
+struct OpenArray {
+    head: Head,
+    elements: usize,
+    read: usize,
+}
+
+/// A [`TensorInfo`].
+struct WalkedTensor {
+    name: Range<usize>,
+    type_id: u32,
+    offset: u64,
+    dimensions: Range<usize>,
+}
+
+impl Head {
+    fn view(self, bytes: &[u8]) -> EntryHead<'_> {
+        EntryHead {
+            // A key's text follows its eight-byte length.
+            key: checked(&bytes[self.start + 8..self.key_end]),
+            stored: self.stored,
+            count: self.count,
+            start: self.start,
+            end: self.end,
         }
-        Ok(Walk::Incomplete(Prefix {
-            preamble: self.preamble,
-            entries: self.entries,
-            alignment: self.alignment,
-            open,
-            minimum,
-            estimate: estimate.clamp(minimum, room),
-        }))
+    }
+}
+
+impl Walked {
+    fn view(self, bytes: &[u8], order: ByteOrder) -> Entry<'_> {
+        Entry {
+            head: self.head.view(bytes),
+            end: self.end,
+            value: &bytes[self.value_start..self.end],
+            order,
+        }
+    }
+}
+
+impl WalkedTensor {
+    fn view<'a>(&self, bytes: &'a [u8], order: ByteOrder) -> TensorInfo<'a> {
+        TensorInfo {
+            name: checked(&bytes[self.name.clone()]),
+            type_id: self.type_id,
+            offset: self.offset,
+            dimensions: &bytes[self.dimensions.clone()],
+            order,
+        }
+    }
+}
+
+/// The walk stopping where `held` bytes end, the header needing at least `minimum` and probably
+/// `estimate` more; an error when that would take it past [`HEADER_LIMIT`].
+fn stop(held: usize, open: Option<Head>, minimum: usize, estimate: usize) -> Halt {
+    let room = HEADER_LIMIT.saturating_sub(held);
+    let minimum = minimum.max(1);
+    if minimum > room {
+        return Halt::Invalid(beyond());
+    }
+    Halt::Stopped(Stop::Incomplete {
+        open,
+        minimum,
+        estimate: estimate.clamp(minimum, room),
+    })
+}
+
+/// The preamble `bytes` begin.
+fn preamble(bytes: &[u8]) -> Result<Counted, Halt> {
+    let short = || {
+        let missing = PREAMBLE_BYTES - bytes.len();
+        stop(bytes.len(), None, missing, missing)
+    };
+    let mut cursor = Cursor {
+        bytes,
+        offset: 0,
+        order: ByteOrder::Little,
+    };
+    let Some(magic) = cursor.take(4)? else {
+        return Err(short());
+    };
+    if magic != b"GGUF" {
+        return Err(invalid("not a GGUF container").into());
+    }
+    let Some(version) = cursor.take(4)? else {
+        return Err(short());
+    };
+    if version == [0, 0, 0, 3] {
+        cursor.order = ByteOrder::Big;
+    }
+    let version = u32_of(cursor.order, version.try_into().expect("four bytes"));
+    let (Some(tensor_count), Some(entry_count)) = (cursor.u64()?, cursor.u64()?) else {
+        return Err(short());
+    };
+    if !matches!(version, 2 | 3) {
+        return Err(invalid(format!("unsupported GGUF version {version}")).into());
+    }
+    if tensor_count
+        .checked_add(entry_count)
+        .is_none_or(|count| count > (HEADER_LIMIT - PREAMBLE_BYTES) as u64 / SMALLEST_ITEM_BYTES)
+    {
+        return Err(beyond().into());
+    }
+    Ok(Counted {
+        preamble: Preamble {
+            version,
+            byte_order: cursor.order,
+        },
+        tensors: tensor_count as usize,
+        entries: entry_count as usize,
+    })
+}
+
+impl Progress {
+    /// Walks `bytes`, which extend the bytes walked before, from where that walk stopped.
+    fn advance(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if let Stop::Incomplete { .. } = self.stop {
+            self.stop = match self.walk(bytes) {
+                Ok(stop) | Err(Halt::Stopped(stop)) => stop,
+                Err(Halt::Invalid(error)) => return Err(error),
+            };
+        }
+        Ok(())
+    }
+
+    /// The walk of `bytes`, which are the bytes walked.
+    fn view<'a>(&self, bytes: &'a [u8]) -> Walk<'a> {
+        let order = self
+            .preamble
+            .map_or(ByteOrder::Little, |counted| counted.preamble.byte_order);
+        let entries = self
+            .entries
+            .iter()
+            .map(|walked| walked.view(bytes, order))
+            .collect();
+        match self.stop {
+            Stop::Incomplete {
+                open,
+                minimum,
+                estimate,
+            } => Walk::Incomplete(Prefix {
+                preamble: self.preamble.map(|counted| counted.preamble),
+                entries,
+                alignment: self.alignment,
+                open: open.map(|head| head.view(bytes)),
+                minimum,
+                estimate,
+            }),
+            Stop::Complete {
+                preamble,
+                data_offset,
+            } => Walk::Complete(Header {
+                preamble,
+                entries,
+                tensors: self
+                    .tensors
+                    .iter()
+                    .map(|tensor| tensor.view(bytes, order))
+                    .collect(),
+                alignment: self.alignment,
+                data_offset,
+            }),
+        }
+    }
+
+    fn walk(&mut self, bytes: &[u8]) -> Result<Stop, Halt> {
+        let held = bytes.len();
+        let counted = match self.preamble {
+            Some(counted) => counted,
+            None => {
+                let counted = preamble(bytes)?;
+                self.preamble = Some(counted);
+                self.offset = PREAMBLE_BYTES;
+                counted
+            }
+        };
+        let order = counted.preamble.byte_order;
+        let tensors_estimate = counted.tensors * TENSOR_ESTIMATE;
+        while self.entries.len() < counted.entries {
+            let rest =
+                (counted.entries - self.entries.len() - 1) * ENTRY_ESTIMATE + tensors_estimate;
+            let mut cursor = Cursor {
+                bytes,
+                offset: self.offset,
+                order,
+            };
+            let (head, value_start) = match self.array {
+                Some(array) => {
+                    self.strings(&mut cursor, array, rest)?;
+                    (array.head, array.head.end)
+                }
+                None => self.entry(&mut cursor, rest)?,
+            };
+            let walked = Walked {
+                head,
+                value_start,
+                end: cursor.offset,
+            };
+            let entry = walked.view(bytes, order);
+            if entry.head.key == ALIGNMENT_KEY {
+                self.alignment = super::alignment(&entry.value())?;
+            }
+            self.keys.insert(entry.head.key.into());
+            self.entries.push(walked);
+            self.array = None;
+            self.offset = cursor.offset;
+        }
+        let alignment = usize::try_from(self.alignment).unwrap_or(usize::MAX);
+        let tensors_start = *self.tensors_start.get_or_insert(self.offset);
+        while self.tensors.len() < counted.tensors {
+            let index = self.tensors.len();
+            let mut cursor = Cursor {
+                bytes,
+                offset: self.offset,
+                order,
+            };
+            let before = cursor.offset;
+            let left = counted.tensors - index;
+            let average = if index == 0 {
+                TENSOR_ESTIMATE
+            } else {
+                (before - tensors_start) / index
+            };
+            let estimate = (left * average)
+                .saturating_add(alignment)
+                .saturating_sub(held - before);
+            let Some(name) = cursor.string()? else {
+                return Err(stop(held, None, 8, estimate));
+            };
+            let name_range = before + 8..cursor.offset;
+            let Some(rank) = cursor.u32()? else {
+                return Err(stop(held, None, 4, estimate));
+            };
+            if !(1..=MAX_TENSOR_RANK).contains(&rank) {
+                return Err(invalid(format!(
+                    "invalid or duplicate tensor directory entry {name:?}"
+                ))
+                .into());
+            }
+            let dimensions = rank as usize * 8;
+            let fixed = dimensions + 4 + 8;
+            let Some(descriptor) = cursor.take(fixed)? else {
+                return Err(stop(held, None, fixed, estimate));
+            };
+            let (type_id, offset) = descriptor[dimensions..].split_at(4);
+            let descriptor_start = cursor.offset - fixed;
+            self.tensors.push(WalkedTensor {
+                name: name_range,
+                type_id: u32_of(order, type_id.try_into().expect("four bytes")),
+                offset: u64_of(order, offset.try_into().expect("eight bytes")),
+                dimensions: descriptor_start..descriptor_start + dimensions,
+            });
+            self.offset = cursor.offset;
+        }
+        let data_offset = self
+            .offset
+            .checked_next_multiple_of(alignment)
+            .filter(|end| *end <= HEADER_LIMIT)
+            .ok_or_else(beyond)?;
+        Ok(Stop::Complete {
+            preamble: counted.preamble,
+            data_offset,
+        })
+    }
+
+    /// Walks the metadata entry `cursor` is at, returning its head and where its value starts.
+    fn entry(&mut self, cursor: &mut Cursor<'_>, rest: usize) -> Result<(Head, usize), Halt> {
+        let held = cursor.bytes.len();
+        let start = cursor.offset;
+        let Some(key) = cursor.string()? else {
+            return Err(stop(held, None, 12, ENTRY_ESTIMATE + rest));
+        };
+        if self.keys.contains(key) {
+            return Err(invalid(format!("duplicate metadata {key:?}")).into());
+        }
+        let key_end = cursor.offset;
+        let Some(value_type) = cursor.u32()? else {
+            return Err(stop(held, None, 4, ENTRY_ESTIMATE + rest));
+        };
+        if value_type == 9 {
+            let (Some(element), Some(count)) = (cursor.u32()?, cursor.u64()?) else {
+                return Err(stop(held, None, 12, ENTRY_ESTIMATE + rest));
+            };
+            if element == 9 {
+                return Err(invalid("nested or oversized GGUF array").into());
+            }
+            let element = ValueType::from_id(element)?;
+            let head = Head {
+                key_end,
+                stored: StoredType::Array(element),
+                count,
+                start,
+                end: cursor.offset,
+            };
+            // Every element takes at least its type's width, so the count is bounded before
+            // anything is read.
+            let elements = usize::try_from(count)
+                .ok()
+                .filter(|elements| {
+                    elements
+                        .checked_mul(element.width())
+                        .is_some_and(|length| length <= HEADER_LIMIT - head.end)
+                })
+                .ok_or_else(|| invalid("nested or oversized GGUF array"))?;
+            if element == ValueType::String {
+                self.strings(
+                    cursor,
+                    OpenArray {
+                        head,
+                        elements,
+                        read: 0,
+                    },
+                    rest,
+                )?;
+            } else {
+                let length = elements * element.width();
+                let Some(values) = cursor.take(length)? else {
+                    let missing = head.end + length - held;
+                    return Err(stop(held, Some(head), missing, missing + rest));
+                };
+                if element == ValueType::Bool {
+                    values.iter().try_for_each(|byte| valid_bool(*byte))?;
+                }
+            }
+            return Ok((head, head.end));
+        }
+        let kind = ValueType::from_id(value_type)?;
+        let value_start = cursor.offset;
+        if kind == ValueType::String {
+            let Some(length) = cursor.u64()? else {
+                return Err(stop(held, None, 8, ENTRY_ESTIMATE + rest));
+            };
+            let head = Head {
+                key_end,
+                stored: StoredType::Scalar(kind),
+                count: 1,
+                start,
+                end: cursor.offset,
+            };
+            let length = usize::try_from(length)
+                .ok()
+                .filter(|length| *length <= HEADER_LIMIT - head.end)
+                .ok_or_else(beyond)?;
+            let Some(text) = cursor.take(length)? else {
+                let missing = head.end + length - held;
+                return Err(stop(held, Some(head), missing, missing + rest));
+            };
+            utf8(text)?;
+            return Ok((head, value_start));
+        }
+        let width = kind.width();
+        let Some(value) = cursor.take(width)? else {
+            return Err(stop(held, None, width, width + rest));
+        };
+        if kind == ValueType::Bool {
+            valid_bool(value[0])?;
+        }
+        let head = Head {
+            key_end,
+            stored: StoredType::Scalar(kind),
+            count: 1,
+            start,
+            end: value_start,
+        };
+        Ok((head, value_start))
+    }
+
+    /// Walks the strings of `array` from its `read`th, which `cursor` is at. Where the bytes end
+    /// first, the walk stops there, and continues from there.
+    fn strings(
+        &mut self,
+        cursor: &mut Cursor<'_>,
+        array: OpenArray,
+        rest: usize,
+    ) -> Result<(), Halt> {
+        let held = cursor.bytes.len();
+        for read in array.read..array.elements {
+            let before = cursor.offset;
+            if cursor.string()?.is_none() {
+                let left = array.elements - read;
+                let average = if read < MEASURED_STRINGS {
+                    STRING_ESTIMATE
+                } else {
+                    ((before - array.head.end) / read)
+                        .clamp(STRING_ESTIMATE_BOUNDS.0, STRING_ESTIMATE_BOUNDS.1)
+                };
+                let in_string = held - before;
+                let halt = stop(
+                    held,
+                    Some(array.head),
+                    (left * 8).saturating_sub(in_string),
+                    (left * average).saturating_sub(in_string) + rest,
+                );
+                if let Halt::Stopped(_) = halt {
+                    self.array = Some(OpenArray { read, ..array });
+                    self.offset = before;
+                }
+                return Err(halt);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -547,7 +859,7 @@ impl<'a> Decoder<'a> {
         let length = u64_of(self.order, self.take()) as usize;
         let (text, rest) = self.bytes.split_at(length);
         self.bytes = rest;
-        std::str::from_utf8(text).expect("a walked string is UTF-8")
+        checked(text)
     }
 
     fn bool(&mut self) -> bool {
@@ -706,6 +1018,47 @@ mod tests {
             (short.preamble, short.open, short.minimum),
             (None, None, 21)
         );
+    }
+
+    #[test]
+    fn a_growing_prefix_walks_as_the_prefix_walked_whole() {
+        let bytes = header(5_000);
+        let mut grown = HeaderBytes::new();
+        let mut held = 0;
+        for cut in (0..=bytes.len()).step_by(997).chain([bytes.len()]) {
+            grown.extend_from_slice(&bytes[held..cut]);
+            held = cut;
+            assert_eq!(grown.walk().unwrap(), walk(&bytes[..cut]).unwrap(), "at {cut}");
+        }
+        let mut read = HeaderBytes::new();
+        let whole = read.read(&mut bytes.as_slice()).unwrap();
+        let Ok(Walk::Complete(expected)) = walk(&bytes) else {
+            panic!("a whole header");
+        };
+        assert_eq!(whole, expected);
+    }
+
+    #[test]
+    fn a_walk_that_fails_fails_the_same_way_when_walked_again() {
+        let mut bytes = header(3_000);
+        let Ok(Walk::Complete(whole)) = walk(&bytes) else {
+            panic!("a whole header");
+        };
+        let tokens = whole.entries[1];
+        let broken = tokens.head.end + tokens.range().len() / 2;
+        let at = (broken..)
+            .find(|at| bytes[*at..].starts_with(b"token-"))
+            .unwrap();
+        bytes[at] = 0xff;
+        let mut grown = HeaderBytes::new();
+        grown.extend_from_slice(&bytes[..broken]);
+        assert!(matches!(grown.walk(), Ok(Walk::Incomplete(_))));
+        grown.extend_from_slice(&bytes[broken..]);
+        for _ in 0..2 {
+            assert!(
+                matches!(grown.walk(), Err(Error::Invalid(message)) if message.contains("UTF-8"))
+            );
+        }
     }
 
     #[test]

@@ -173,6 +173,9 @@ fn a_request_reads_an_expert_its_tier_unmapped() {
         harness.request(&experts).complete().unwrap();
     }
     eventually("the reserve never unmapped expert 0", || harness.in_tier(0, 0).is_none());
+    // Its record graced, a request takes it back unread: the file holds it
+    // alone once the grace retired.
+    eventually("expert 0's grace never retired", || residency::lock(&harness.watcher.state).core.directory.host(0).graced() == 0);
     let step = harness.request(&[0]);
     let (record, verdict) = harness.answer(0, step.sequence(), 0);
     assert_eq!(verdict, Some(Answer::Answered));

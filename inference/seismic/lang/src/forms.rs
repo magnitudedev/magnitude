@@ -88,7 +88,9 @@ pub fn names(backend: BackendName) -> &'static [&'static str] {
 
 /// The values of `backend`'s forms for representation `id` ([`admitted`]),
 /// decided once per backend over the registry's representations: every
-/// native node a graph binds reads them.
+/// native node a graph binds reads them, and so does every host query of a
+/// form (`metal_packing_of`, `cuda_gemm_fold_of`, `cpu_int8_of`), which
+/// planning makes per weight of every model.
 fn values(backend: BackendName, id: RepresentationId) -> Option<&'static [u32]> {
     type Table = std::sync::OnceLock<Vec<Option<Vec<u32>>>>;
     static CUDA: Table = Table::new();
@@ -237,12 +239,10 @@ fn cuda_gemm_fold(axes: &registry::DecodeAxes) -> bool {
 }
 
 /// Whether CUDA's GEMM folds representation `id`'s codes
-/// (`cuda_gemm_fold`); false for storage other than packed rows.
+/// (`cuda_gemm_fold`, its `GEMM_FOLD` form, [`values`]); false for storage
+/// other than packed rows.
 pub fn cuda_gemm_fold_of(id: RepresentationId) -> bool {
-    match (&registry::representation_info(id).kind, registry::decode_axes(id)) {
-        (registry::RepresentationKind::PackedRows(_), Some(axes)) => cuda_gemm_fold(&axes),
-        _ => false,
-    }
+    values(BackendName::Cuda, id).is_some_and(|values| values[0] == 1)
 }
 
 /// Whether CUDA's int8 GEMM (`gemm_tile_s8`, a declaration's `INT8 = 1`)
@@ -460,10 +460,18 @@ impl MetalPacking {
 }
 
 /// Metal's token-packing admission of representation `id`
-/// (`MetalPacking`); `None` for storage other than packed rows, or which
-/// the form does not serve.
+/// (`MetalPacking`), as its `PACK` forms value it ([`values`]); `None` for
+/// storage other than packed rows, or which the form does not serve.
 pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
-    metal_packing(&registry::decode_axes(id)?)
+    let values = values(BackendName::Metal, id)?;
+    let [pack, centre, offset, residue, folds, ..] = *<&[u32; METAL_FORMS.len()]>::try_from(values)
+        .expect("Metal's forms are valued in the order of its names");
+    (pack == 1).then_some(MetalPacking {
+        folds,
+        centre,
+        offset,
+        residue: residue == 1,
+    })
 }
 
 /// The token-packing GEMM (`packing_layout`, `packing_factors`).
@@ -582,7 +590,7 @@ fn metal_int8(axes: &registry::DecodeAxes) -> Option<MetalInt8> {
 /// (`weights::Codes`) and widens the floating dense elements
 /// (`weights::DenseRows`).
 pub fn cpu_int8_of(id: RepresentationId) -> bool {
-    cpu_int8(registry::representation_info(id))
+    values(BackendName::Cpu, id).is_some_and(|values| values[0] == 1)
 }
 
 /// [`cpu_int8_of`]'s rule over the representation's registry record.
@@ -807,6 +815,25 @@ mod tests {
                 _ => false,
             };
             assert_eq!(int8.of(info.id), u32::from(main), "{}", info.name);
+        }
+    }
+
+    /// The host's queries of a form read the table the forms are decided in
+    /// once (`values`), and take what its rule decides of every
+    /// representation of the registry.
+    #[test]
+    fn form_queries_are_their_rules() {
+        for info in registry::representations() {
+            let packed = matches!(info.kind, registry::RepresentationKind::PackedRows(_));
+            let axes = registry::decode_axes(info.id);
+            assert_eq!(metal_packing_of(info.id), axes.as_ref().and_then(metal_packing), "{}", info.name);
+            assert_eq!(
+                cuda_gemm_fold_of(info.id),
+                packed && axes.as_ref().is_some_and(cuda_gemm_fold),
+                "{}",
+                info.name
+            );
+            assert_eq!(cpu_int8_of(info.id), cpu_int8(info), "{}", info.name);
         }
     }
 

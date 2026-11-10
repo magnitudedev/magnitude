@@ -1,29 +1,27 @@
 use super::{
     GroupRows,
-    block::{BlockGraphInputs, checked_block_graph_draft},
+    block::{BlockGraphInputs, ClassNumber, certify_block},
     classes::{
         BlockGraphEnumeration, BlockOutputScales, BlockServed, FamilyOutline, Holder, Passes, StagedClass, Topology, UnreadScales,
-        block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
+        block_class_numbers, block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
         block_upload_regions, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
         slot_scores,
     },
     entry::{
-        EntryTokens, TARGET_TABLE, embedding_weight, entry_graph_topology, keeps_token_rows,
-        notice_bytes, notice_rows, notifies_selection, target_weight,
+        EntryTokens, certify_entry, notice_bytes, notice_rows, target_view,
     },
     heap::{
         GraphCounts, PlannedHeap, PlannedSealedGraphs, SealedGraphsHeap, block_binding_storage,
         block_graph_storage,
     },
     prepared::{BlockGraphShape, block_scopes},
-    weights::{CheckedLandingEntries, activation},
 };
 use crate::{
     ModelLoadPlan, PassLaunches, ResourceLimits, StateResourcePlan, TargetProgramPlan,
     operators::{
         block, paired_block,
         per_layer::graph::{
-            CheckedPerLayerEntryEntries, per_layer_entry, per_layer_entry_class_slice,
+            CheckedPerLayerEntryEntries, per_layer_entry, per_layer_entry_class_slice, split_entry,
         },
         routed::{
             split::{OnceStage, RunStage, Stage},
@@ -31,13 +29,13 @@ use crate::{
         },
     },
     programs::{
-        graph::{GraphError, RowForm},
+        graph::{GraphError, RowForm, draft::Certified},
         native_constants::{CheckedGraphFamilyResources, CheckedGraphResources, GraphConstant},
     },
 };
 use magnitude_family_contracts::{Decoder, WeightKind};
 use seismic::{
-    BackendName, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphClassSlice, NativeGraphLayout,
+    BackendName, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphClassSlice, NativeGraphLayout, NativeGraphOutline,
     NativeGraphMetadata,
 };
 use std::collections::BTreeMap;
@@ -54,7 +52,7 @@ pub(crate) fn checked_target_family_storage(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedGraphResources, GraphError> {
-    certify_target_family(backend, load, geometry, state, plan, limits, PassLaunches::whole_chain(limits))
+    certify_target_family::<NativeGraphLayout>(backend, load, geometry, state, plan, limits, PassLaunches::whole_chain(limits))
         .map(|certificate| certificate.resources)
 }
 
@@ -70,7 +68,7 @@ pub(crate) fn checked_target_family(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<CheckedTargetFamily, GraphError> {
-    certify_target_family(backend, load, geometry, state, plan, limits, pass)?.checked(limits)
+    certify_target_family::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?.checked(limits)
 }
 
 /// [`checked_target_family`] of `plan`'s family and of the same target's
@@ -84,7 +82,7 @@ pub(crate) fn checked_target_and_undrafted(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
-    let [target, undrafted] = certify_target_and_undrafted(backend, load, geometry, state, plan, limits, pass)?;
+    let [target, undrafted] = certify_target_and_undrafted::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?;
     Ok([target.checked(limits)?, undrafted.checked(limits)?])
 }
 
@@ -133,7 +131,7 @@ pub(crate) fn pass_buffer_bytes(
     experts.checked_add(table).ok_or_else(|| "pass buffer bytes overflow".to_owned())
 }
 
-pub(super) struct TargetFamilyCertificate {
+pub(super) struct TargetFamilyCertificate<L = NativeGraphLayout> {
     pub(super) outline: FamilyOutline,
     /// How each block is served (`block_served`).
     pub(super) served: Vec<BlockServed>,
@@ -153,22 +151,22 @@ pub(super) struct TargetFamilyCertificate {
     /// its layouts place, the launch's controls, which its blocks bind
     /// (`LaunchControlLayout`), and each block's (`block_upload_regions`).
     pub(super) upload_regions: Vec<u64>,
-    pub(super) entries: BTreeMap<EntryTokens, NativeGraphLayout>,
+    pub(super) entries: BTreeMap<EntryTokens, L>,
     /// The per-layer entry graph's layout, of a per-layer entry.
-    pub(super) per_layer: Option<NativeGraphLayout>,
+    pub(super) per_layer: Option<L>,
     /// Per block, what each row regime's classes seal into, those that
     /// list their launch's history row tiles apart.
     /// Per block, its certified graphs by topology (`class_topology`).
-    pub(super) blocks: Vec<BTreeMap<Topology, CertifiedBlockGraph>>,
+    pub(super) blocks: Vec<BTreeMap<Topology, CertifiedBlockGraph<L>>>,
     /// Per tapped block, its untapped graphs' (`FamilyOutline::untapped`):
     /// its undrafted shape's, as a load without the drafter certifies them;
     /// none for a block that taps nothing.
-    pub(super) untapped: Vec<BTreeMap<Topology, CertifiedBlockGraph>>,
+    pub(super) untapped: Vec<BTreeMap<Topology, CertifiedBlockGraph<L>>>,
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
 }
 
-impl TargetFamilyCertificate {
+impl<L: Certified> TargetFamilyCertificate<L> {
     /// What the assessment charges of it, its prompt groups of each pass
     /// size's places up to `limits`' chain places.
     fn checked(self, limits: ResourceLimits) -> Result<CheckedTargetFamily, GraphError> {
@@ -187,9 +185,9 @@ impl TargetFamilyCertificate {
 
 /// What every class of one block's row regime prepares to: one topology.
 #[derive(Clone)]
-pub(super) struct CertifiedBlockGraph {
+pub(super) struct CertifiedBlockGraph<L = NativeGraphLayout> {
     /// The layout its plans seal into.
-    pub(super) layout: NativeGraphLayout,
+    pub(super) layout: L,
     /// The host heap of the vectors each of its prepared graphs owns
     /// (`owned_vectors_heap`). Every weight, constant and state port is a
     /// port of the graph, and the layout holds its classes to its ports,
@@ -197,7 +195,7 @@ pub(super) struct CertifiedBlockGraph {
     pub(super) owned: HostHeap,
 }
 
-pub(super) fn certify_target_family(
+pub(super) fn certify_target_family<L: Certified>(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
@@ -205,7 +203,7 @@ pub(super) fn certify_target_family(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
     pass: PassLaunches,
-) -> Result<TargetFamilyCertificate, GraphError> {
+) -> Result<TargetFamilyCertificate<L>, GraphError> {
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     FamilyLayouts::of_entries(backend, load, geometry, plan, &outline)?
         .certify(outline, load, geometry, state, plan, limits, pass)
@@ -216,7 +214,7 @@ pub(super) fn certify_target_family(
 /// alone seals: from one certification of the layouts they share, each
 /// family's enumeration, bindings, upload regions, census and floor extents
 /// its own. A plan that drafts with nothing has one family, twice.
-pub(super) fn certify_target_and_undrafted(
+pub(super) fn certify_target_and_undrafted<L: Certified>(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
@@ -224,7 +222,7 @@ pub(super) fn certify_target_and_undrafted(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
     pass: PassLaunches,
-) -> Result<[TargetFamilyCertificate; 2], GraphError> {
+) -> Result<[TargetFamilyCertificate<L>; 2], GraphError> {
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     let undrafted = outline.undrafted();
     let mut layouts = FamilyLayouts::of_entries(backend, load, geometry, plan, &outline)?;
@@ -245,7 +243,7 @@ enum Included {
 
 /// One block shape's certified graphs by topology, with what each adds to
 /// its family's resources.
-type ShapeLayouts = BTreeMap<Topology, (CertifiedBlockGraph, Included)>;
+type ShapeLayouts<L> = BTreeMap<Topology, (CertifiedBlockGraph<L>, Included)>;
 
 /// The layouts a target's families seal into, each certified once: the
 /// entries', and each block shape's (`BlockGraphShape`, which decides
@@ -253,15 +251,15 @@ type ShapeLayouts = BTreeMap<Topology, (CertifiedBlockGraph, Included)>;
 /// blocks of a shape): the launches' own, and its group's at the passes
 /// the group runs. The families of one target differ only in which shape
 /// each block is of, so each reads its blocks' layouts here.
-struct FamilyLayouts {
-    entries: BTreeMap<EntryTokens, NativeGraphLayout>,
-    per_layer: Option<NativeGraphLayout>,
-    launches: Vec<(BlockGraphShape, ShapeLayouts)>,
+struct FamilyLayouts<L> {
+    entries: BTreeMap<EntryTokens, L>,
+    per_layer: Option<L>,
+    launches: Vec<(BlockGraphShape, ShapeLayouts<L>)>,
     /// A shape's group graphs at a group's passes: a block's own, its
     /// combines and its passes and fills; or, of a tapped block's untapped
     /// shape (`true`), its combines alone. A block of that shape in another
     /// family certifies its own.
-    groups: Vec<(BlockGraphShape, Passes, bool, ShapeLayouts)>,
+    groups: Vec<(BlockGraphShape, Passes, bool, ShapeLayouts<L>)>,
     /// The passes a group runs beside each workspace arena found: a
     /// function of the arena alone, since a block's pass is of its shape
     /// without its drafter's writes, of which every family has each
@@ -269,7 +267,7 @@ struct FamilyLayouts {
     passes: Vec<(u64, Passes)>,
 }
 
-impl FamilyLayouts {
+impl<L: Certified> FamilyLayouts<L> {
     /// The entry graphs' layouts, the same in every family of the target.
     fn of_entries(
         backend: BackendName,
@@ -279,51 +277,30 @@ impl FamilyLayouts {
         outline: &FamilyOutline,
     ) -> Result<Self, GraphError> {
         let FamilyOutline { ref row_classes, largest_rows, .. } = *outline;
-        let mut entries = BTreeMap::new();
-        let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
-        for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
-            let weight = embedding_weight(load)?;
-            let elements = [("EW", weight.resident), ("A", activation(geometry))];
-            let graph = entry_graph_topology(
-                NativeGraphMetadata::new_template(backend),
-                &elements,
-                notifies_selection(load).then_some(&[][..]),
-                landing.as_ref().map(CheckedLandingEntries::entries),
-                keeps_token_rows(load),
-                weight,
-                geometry,
-                largest_rows,
-                source,
-            )?
-            .graph;
-            let layout = graph
-                .seal_template()
-                .and_then(|template| {
-                    template.certify(&[
-                        NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())
-                    ])
-                })
-                .map_err(|error| format!("target entry graph: {error}"))?;
-            entries.insert(source, layout);
-        }
+        let entries = [EntryTokens::Uploaded, EntryTokens::Selected]
+            .into_iter()
+            .map(|source| Ok((source, certify_entry(backend, load, geometry, source, row_classes, largest_rows)?)))
+            .collect::<Result<BTreeMap<_, _>, GraphError>>()?;
         let per_layer = match (plan.per_layer(), &geometry.entry.per_layer) {
             (None, None) => None,
             (Some(binding), Some(entry)) => {
                 let checked = CheckedPerLayerEntryEntries::new(binding);
                 let mut graph = NativeGraphMetadata::new_template(backend);
+                let (topology, numbers) = split_entry(&binding, entry);
+                let topology = crate::programs::graph::facts::constant_reals(topology);
                 per_layer_entry(
                     &mut graph,
                     checked.entries(),
-                    target_weight(load, WeightKind::PerLayerModelProjection)?,
-                    target_weight(load, WeightKind::PerLayerProjectionNorm)?,
-                    binding,
-                    entry,
-                    largest_rows,
+                    &topology,
+                    &crate::programs::graph::facts::constant(numbers),
+                    &target_view(load, WeightKind::PerLayerModelProjection)?,
+                    &target_view(load, WeightKind::PerLayerProjectionNorm)?,
+                    &seismic::Dim::from(largest_rows),
                 )?;
                 let layout = graph
                     .seal_template()
                     .and_then(|template| {
-                        template.certify(&[per_layer_entry_class_slice(row_classes.iter().copied())])
+                        L::of(&template, &[per_layer_entry_class_slice(row_classes.iter().copied())])
                     })
                     .map_err(|error| format!("per-layer entry graph: {error}"))?;
                 Some(layout)
@@ -344,7 +321,7 @@ impl FamilyLayouts {
         plan: &TargetProgramPlan,
         limits: ResourceLimits,
         pass: PassLaunches,
-    ) -> Result<TargetFamilyCertificate, GraphError> {
+    ) -> Result<TargetFamilyCertificate<L>, GraphError> {
         let backend = outline.backend;
         let FamilyOutline { ref row_classes, largest_rows, max_slots, max_segments, tap_width, ref tapped, untapped_rows, .. } = outline;
         let distinct_blocks = (0..geometry.blocks.len())
@@ -361,25 +338,30 @@ impl FamilyLayouts {
         let once = |index: usize, stage: OnceStage, rows: u64| {
             let slot = plan.blocks()[index];
             let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
-            let (graph, constants, owned) = checked_block_graph_draft(
-                NativeGraphMetadata::new_template(backend),
+            // A fill reads no rows.
+            let (slice, classes) = match stage {
+                OnceStage::Pass => (
+                    block::feed_forward_class_slice(
+                        &paired,
+                        rows,
+                        rows,
+                        NativeGraphClassSlice::new().dimension("M", [rows]),
+                    )?,
+                    &[(None, "M", ClassNumber::Rows)][..],
+                ),
+                OnceStage::Fill => (NativeGraphClassSlice::new(), &[][..]),
+            };
+            let certified = certify_block::<L>(
+                backend,
                 slot,
                 None,
                 BlockGraphInputs::of_class(load, geometry, state, index, once_class(rows, stage), rows),
-            )?;
-            let slice = match stage {
-                OnceStage::Pass => block::feed_forward_class_slice(
-                    &paired,
-                    rows,
-                    rows,
-                    NativeGraphClassSlice::new().dimension("M", [rows]),
-                )?,
-                OnceStage::Fill => NativeGraphClassSlice::new(),
-            };
-            let layout = graph
-                .seal_template()
-                .and_then(|template| template.certify(&[slice]))
-                .map_err(|error| format!("target block {index}'s {stage:?}: {error}"))?;
+                classes,
+                &[vec![slice]],
+            )
+            .map_err(|error| error.context(format!("target block {index}'s {stage:?}")))?;
+            let [(layout, (constants, owned))] = <[_; 1]>::try_from(certified)
+                .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
             Ok::<_, GraphError>((layout, constants, owned))
         };
         // A block's run graphs of each row regime: its launches' own (`group`
@@ -428,6 +410,7 @@ impl FamilyLayouts {
                     if rows.is_empty() {
                         continue;
                     }
+                    let classes = block_class_numbers(&paired, !listings.is_empty());
                     let stages = RunStage::sealed(split, resident, largest).iter().filter(|&&stage| (stage == RunStage::Combine) == group);
                     for &stage in stages {
                         // The regime's class the template is drafted at.
@@ -435,8 +418,15 @@ impl FamilyLayouts {
                             (largest, 1, 1, listings.last().copied().unwrap_or(0), u64::from(scored)),
                             Stage::Run(stage),
                         );
-                        let (graph, constants, owned) = checked_block_graph_draft(
-                            NativeGraphMetadata::new_template(backend),
+                        let slices = rows
+                            .iter()
+                            .map(|&rows| {
+                                let grouped = if stage == RunStage::Combine { passes.rows() } else { rows };
+                                block_class_slice(&paired, rows, grouped, max_slots, max_segments, &listings, scored, picked)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let certified = certify_block::<L>(
+                            backend,
                             slot,
                             tap_width
                                 .map(|width| (width, tapped[index].positions()))
@@ -445,18 +435,12 @@ impl FamilyLayouts {
                                 residual: !untapped && outline.exports_residual(index),
                                 ..BlockGraphInputs::of_class(load, geometry, state, index, drafted, passes.rows())
                             },
-                        )?;
-                        let slices = rows
-                            .iter()
-                            .map(|&rows| {
-                                let grouped = if stage == RunStage::Combine { passes.rows() } else { rows };
-                                block_class_slice(&paired, rows, grouped, max_slots, max_segments, &listings, scored, picked)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let layout = graph
-                            .seal_template()
-                            .and_then(|template| template.certify(&slices))
-                            .map_err(|error| format!("target block {index}: {error}"))?;
+                            &classes,
+                            &[slices],
+                        )
+                        .map_err(|error| error.context(format!("target block {index}")))?;
+                        let [(layout, (constants, owned))] = <[_; 1]>::try_from(certified)
+                            .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
                         graphs.insert(
                             class_topology(drafted),
                             (CertifiedBlockGraph { layout, owned }, Included::Classes(constants, rows.clone())),
@@ -579,7 +563,7 @@ impl FamilyLayouts {
                 blocks[index] = blocks[first].clone();
             }
         }
-        let certified = |graphs: ShapeLayouts| {
+        let certified = |graphs: ShapeLayouts<L>| {
             graphs.into_iter().map(|(topology, (graph, _))| (topology, graph)).collect::<BTreeMap<_, _>>()
         };
         let blocks = blocks.into_iter().map(certified).collect::<Vec<_>>();
@@ -636,7 +620,7 @@ impl FamilyLayouts {
         // The bindings a load makes of them: one for each entry graph, and one
         // for every block's every class, whichever block sealed its plan.
         let mut bound = HostHeap::default();
-        let mut binding = |layout: &NativeGraphLayout| {
+        let mut binding = |layout: &L| {
             bound = bound
                 .plus(layout.bound_heap())
                 .ok_or("planned graph binding heap overflows")?;
@@ -710,8 +694,8 @@ impl FamilyLayouts {
             .ok_or("target binding charge overflows")?;
         // A graph writes the input its topology's layout places: every class
         // of the topology seals into it.
-        let upload = |layout: &NativeGraphLayout| layout.storage_bytes().upload;
-        let largest = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
+        let upload = |layout: &L| layout.storage_bytes().upload;
+        let largest = |layouts: &mut dyn Iterator<Item = &L>| {
             layouts.map(upload).max().filter(|&bytes| bytes > 0)
         };
         let upload_regions = largest(&mut entries.values())

@@ -74,6 +74,17 @@ pub(in crate::experts) struct Layer {
     pub landing: Option<std::sync::Arc<crate::experts::landing::DeviceWords>>,
     /// The records its scratch lists name.
     pub lists: ListRecords,
+    /// Its scratch request's tier list (the request's experts the host tier
+    /// keeps whole, which the fill's tier copy reads) and seed list (a
+    /// prompt group's last step's seeds, which its seed copy and commit
+    /// read), both stamped with the step they were written for
+    /// (`Scratch::fix_rounds`). Each layer's own: a step whose request here
+    /// was never answered (its wait expired, or the request failed) finds
+    /// only lists of earlier steps here, and copies nothing, where a list
+    /// shared by the layers would hold an earlier layer's, stamped with the
+    /// same step, whose seeds name records of that layer's group.
+    pub tiered: Words,
+    pub seeds: Words,
 }
 
 /// The records a layer's scratch lists name, its device readers' extents
@@ -204,10 +215,6 @@ pub(in crate::experts) struct LoadWords {
     pub flags: Vec<Words>,
     /// Each scratch round's convert list.
     pub lists: Vec<Words>,
-    /// The tier list: a request's experts the host tier keeps whole, which
-    /// the fill's tier copy reads (`Scratch::fix_rounds`).
-    pub tiered: Words,
-    pub seeds: Words,
 }
 
 /// The bank's extents the watcher serves by.
@@ -225,8 +232,10 @@ pub(in crate::experts) struct Extents {
     /// The staging records reads ahead leave free for demand
     /// (`ExpertBankPlan::demand_records`).
     pub demand: usize,
-    /// The tier records each group keeps ready or graced for the reads
-    /// ahead (`ExpertBankPlan::tier_reserve`), which hold no expert.
+    /// The tier records each group keeps holding no expert mapped (ready,
+    /// graced, or taken by a read ahead's landing in flight,
+    /// `HostRecords::reserved`) for the reads ahead
+    /// (`ExpertBankPlan::tier_reserve`).
     pub reserve: usize,
     /// Who places into the bank (`ExpertBankPlan::placer`): where the
     /// device does, landings are into tier records, answered as -2 - t;

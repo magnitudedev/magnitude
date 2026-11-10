@@ -4,6 +4,7 @@
 //! (`operators::<op>::graph`).
 
 pub(crate) mod draft;
+pub(crate) mod facts;
 pub(crate) mod readout;
 pub(crate) mod tap;
 
@@ -88,7 +89,7 @@ pub(crate) fn serial_family(
 /// graph construction. The topology code branches on these same predicates,
 /// so classes of equal form share node order, edges and exports, and one
 /// certified layout can serve all of them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RowForm {
     attention_decode: bool,
     attention_prepared_append: bool,
@@ -101,7 +102,7 @@ impl RowForm {
         Self {
             attention_decode: attention::graph::decodes(rows),
             attention_prepared_append: rows > 1 && attention::graph::decodes(rows),
-            recurrent_chunked: gated_delta::graph::chunked(rows),
+            recurrent_chunked: gated_delta::graph::chunked(&seismic::Dim::from(rows)),
             routed_decode: routed::fused_graph::decodes(rows),
         }
     }

@@ -16,7 +16,10 @@ use magnitude_family_contracts::{
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DType, Element, GgufScales, Layout, MetalPacking, OperandRecipe};
+use crate::operators::{code, scalar};
+use crate::programs::graph::GraphError;
+use crate::programs::graph::facts::{Numbers, constant};
+use seismic::{Argument, BackendName, DType, Dim, Element, GgufScales, Layout, MetalPacking, OperandRecipe};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -461,8 +464,8 @@ pub enum AttentionValues {
 
 /// A rounding as the entries take it (`rounding.seismic`'s four scalars):
 /// the one conversion of a [`RowRounding`] to them, for every entry that
-/// rounds a row. It keys specializations (the dense entries' `KR` is
-/// [`RoundingArgs::rounds`]), so the floor is held as its bits.
+/// rounds a row. A graph holds its scalars as numbers
+/// ([`RoundingArgs::words`]) and its floor, held as its bits, as a real.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RoundingArgs {
     pub block: i32,
@@ -484,6 +487,18 @@ impl RoundingArgs {
         f32::from_bits(self.amax_floor_bits)
     }
 
+    /// A graph's part of it: its integer scalars as numbers and its floor
+    /// as a real, which reach only its entries' arguments; none where it
+    /// rounds nothing.
+    pub(crate) fn part(self) -> Option<(RoundingWords<u64>, f64)> {
+        self.rounds().then(|| {
+            (
+                RoundingWords { block: code(self.block), element: code(self.element), scale: code(self.scale) },
+                f64::from(self.amax_floor()),
+            )
+        })
+    }
+
     /// Whether the Metal and CUDA entries can round a `width`-value row
     /// with it (`round_lanes`): they spread the row over 32 lanes of
     /// `width / 32` values, and a run lies within one lane or spans a power
@@ -502,6 +517,47 @@ impl RoundingArgs {
         // stays within a lane or spans a power of two of whole lanes.
         let runs = width / block;
         width.is_multiple_of(32) && (runs.is_multiple_of(32) || runs.is_power_of_two())
+    }
+}
+
+/// A rounding's integer scalars (`block`, `element`, `scale`) as numbers of
+/// a graph; its floor is a real ([`RoundingArgs::part`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RoundingWords<D = Dim> {
+    pub block: D,
+    pub element: D,
+    pub scale: D,
+}
+
+impl<D> Numbers<D> for RoundingWords<D> {
+    type Of<E> = RoundingWords<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> RoundingWords<E> {
+        RoundingWords { block: f(self.block), element: f(self.element), scale: f(self.scale) }
+    }
+}
+
+/// A rounding as an entry's four scalar arguments.
+#[derive(Clone, Copy)]
+pub(crate) struct RoundingArguments {
+    pub block: Argument<i32>,
+    pub element: Argument<i32>,
+    pub scale: Argument<i32>,
+    pub amax_floor: Argument<f32>,
+}
+
+impl RoundingArguments {
+    /// The arguments of a graph's rounding part ([`RoundingArgs::part`]):
+    /// every scalar 0 where it has none.
+    pub(crate) fn of(part: Option<(&RoundingWords, &Argument<f64>)>) -> Result<Self, GraphError> {
+        Ok(match part {
+            Some((words, amax_floor)) => Self {
+                block: scalar(&words.block, "a rounding's run")?,
+                element: scalar(&words.element, "a rounding's element code")?,
+                scale: scalar(&words.scale, "a rounding's scale code")?,
+                amax_floor: amax_floor.f32(),
+            },
+            None => Self { block: 0.into(), element: 0.into(), scale: 0.into(), amax_floor: 0.0.into() },
+        })
     }
 }
 
@@ -529,66 +585,47 @@ pub fn rounding_args(rounding: RowRounding) -> RoundingArgs {
     }
 }
 
-/// The static axes the attention entries are specialized to. Optional
-/// parts of the operator are axes of extent 0 or 1 (`attention.seismic`).
+/// The static axes the attention entries are specialized to: its
+/// structure and its numbers. Optional parts of the operator are axes of
+/// extent 0 or 1 (`attention.seismic`), which its [`AttentionForm`]
+/// decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AttentionShape {
-    /// `D`: the hidden width.
-    pub hidden: u64,
-    /// `KV`: key/value heads.
-    pub kv_heads: u64,
-    /// `G`: query heads per key/value head.
-    pub group: u64,
-    /// `P`: rotated pairs of a head.
-    pub rotary_pairs: u64,
-    /// `W = 2P + S`: the head width.
-    pub width: u64,
-    /// `I` ∈ {0, W}: gate columns after each query head's W columns.
-    pub interleaved_gate: u64,
-    /// `U` ∈ {0, 1, W}: separate gate values per query head.
-    pub separate_gate: u64,
-    /// `F` ∈ {0, 1}: whether the layer projects and appends its own keys and
-    /// values.
-    pub fresh: u64,
-    /// `NQ` ∈ {0, 1}: whether queries are RMS-normalized per head.
-    pub query_norm: u64,
-    /// `N` ∈ {0, 1}: whether keys are RMS-normalized per head (a Shared
-    /// layer, which projects none, takes its `NQ`).
-    pub key_norm: u64,
-    /// `NV` ∈ {0, 1}: whether values are RMS-normalized per head.
-    pub value_norm: u64,
-    /// Where the values come from (`VK` for stored keys).
-    pub values: AttentionValues,
-    /// `SK` ∈ {0, 1}: whether each query head has a sink logit
-    /// (`Attention::sinks`).
-    pub sinks: u64,
-    /// `RA` ∈ {0, 1}: rotary pairs of adjacent dimensions, else half-split.
-    pub rotary_adjacent: u64,
-    /// `RT` ∈ {0, 1}: rotary pairs over the trailing `2P` dimensions, else
-    /// the leading ones.
-    pub rotary_trailing: u64,
-    /// `RO` ∈ {0, 1}: whether the attended row is turned back by the inverse
-    /// rotation (`OutputRotary::Inverse`).
-    pub output_rotary: u64,
+    pub form: AttentionForm,
+    pub widths: AttentionWidths<u64>,
     /// The layer's trained key rounding (`ProjectedRows::rounding`), applied
     /// to each prepared key before it is attended and stored: the dense
-    /// entries' `KR` ([`AttentionShape::rounds_keys`]) and their four
-    /// `key_*` scalars. The dense entries alone hold it.
+    /// entries' `KR` ([`Self::rounds_keys`]) and their four `key_*`
+    /// scalars.
     pub key_rounding: RoundingArgs,
-    /// `KS`: the picks each row reads from the layer's second, index-list
-    /// source (its selection's `top`); 0 for a layer reading one source.
-    /// The dense attending entries alone hold it.
-    pub picks: u64,
 }
 
 impl AttentionShape {
+    /// Its numbers as constant dimensions, with its form: what every
+    /// arithmetic of it below is computed from ([`AttentionWidths`]).
+    fn dims(&self) -> (AttentionForm, AttentionWidths<Dim>) {
+        (self.form, constant(self.widths))
+    }
+
     pub fn heads(&self) -> u64 {
-        self.kv_heads * self.group
+        self.dims().1.heads().fixed()
     }
 
     /// `KR` ∈ {0, 1}: whether the dense entries round each prepared key.
     pub fn rounds_keys(&self) -> u64 {
         u64::from(self.key_rounding.rounds())
+    }
+
+    /// `I` ∈ {0, W}: gate columns after each query head's W columns.
+    pub fn interleaved_gate(&self) -> u64 {
+        let (form, widths) = self.dims();
+        widths.interleaved_gate(&form).fixed()
+    }
+
+    /// `U` ∈ {0, 1, W}: separate gate values per query head.
+    pub fn separate_gate(&self) -> u64 {
+        let (form, widths) = self.dims();
+        widths.separate_gate(&form).fixed()
     }
 
     /// Whether the shape takes a form beyond the base dense mix every
@@ -597,96 +634,83 @@ impl AttentionShape {
     /// rounded keys or picks. Only such a shape's decode classes may attend
     /// with the prefill entry (`operators::attention::graph::dense_decodes`).
     pub fn extends_base_form(&self) -> bool {
-        self.query_norm != self.key_norm
-            || self.values == AttentionValues::StoredKey
-            || self.rotary_adjacent != 0
-            || self.rotary_trailing != 0
-            || self.output_rotary != 0
+        let form = &self.form;
+        form.query_norm != form.key_norm
+            || form.stored_key()
+            || form.rotary_adjacent
+            || form.rotary_trailing
+            || form.output_rotary
             || self.key_rounding.rounds()
-            || self.picks != 0
+            || self.widths.picks != 0
     }
 
     /// `Q`: query (and interleaved gate) projection rows.
     pub fn query_rows(&self) -> u64 {
-        self.heads() * (self.width + self.interleaved_gate)
+        let (form, widths) = self.dims();
+        widths.query_rows(&form).fixed()
     }
 
     /// `GR`: separate gate projection rows.
     pub fn gate_rows(&self) -> u64 {
-        self.heads() * self.separate_gate
+        let (form, widths) = self.dims();
+        widths.gate_rows(&form).fixed()
     }
 
     /// `K`: key projection rows.
     pub fn key_rows(&self) -> u64 {
-        self.fresh * self.kv_heads * self.width
+        let (form, widths) = self.dims();
+        widths.key_rows(&form).fixed()
     }
 
     /// `V`: value projection rows.
     pub fn value_rows(&self) -> u64 {
-        match self.values {
-            AttentionValues::Projected => self.key_rows(),
-            AttentionValues::RawKey | AttentionValues::StoredKey => 0,
-        }
+        let (form, widths) = self.dims();
+        widths.value_rows(&form).fixed()
     }
 
     /// `VK` ∈ {0, 1}: whether the values are the stored keys.
     pub fn stored_key(&self) -> u64 {
-        u64::from(self.values == AttentionValues::StoredKey)
+        u64::from(self.form.stored_key())
     }
 
     /// Unrotated columns of a head.
     pub fn static_width(&self) -> u64 {
-        self.width - 2 * self.rotary_pairs
+        self.dims().1.static_width().fixed()
     }
 
-    /// The projection entry's dimensions at `rows` rows.
-    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
-        [
-            ("M", rows),
-            ("D", self.hidden),
-            ("Q", self.query_rows()),
-            ("GR", self.gate_rows()),
-            ("K", self.key_rows()),
-            ("V", self.value_rows()),
-        ]
+    /// The projection entry's dimensions at `rows` rows: the query
+    /// segment projects the query rows, or a low-rank query's `query_rank`
+    /// rows of `qr`.
+    pub fn project_dimensions(
+        &self,
+        rows: u64,
+        query_rank: Option<u64>,
+    ) -> [(&'static str, u64); 6] {
+        let (form, widths) = self.dims();
+        let query_rank = query_rank.map(Dim::from);
+        fixed(widths.project_dimensions(&form, Dim::from(rows), query_rank.as_ref()))
     }
 
     /// Projection of history rows has no query or gate outputs.
     pub fn key_value_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
-        let mut dimensions = self.project_dimensions(rows);
-        dimensions[2].1 = 0;
-        dimensions[3].1 = 0;
-        dimensions
+        let (form, widths) = self.dims();
+        fixed(widths.key_value_dimensions(&form, Dim::from(rows)))
     }
 
     /// The static axes of the fused attention entries.
     pub fn mix_statics(&self) -> [(&'static str, u64); 15] {
-        [
-            ("KV", self.kv_heads),
-            ("G", self.group),
-            ("P", self.rotary_pairs),
-            ("S", self.static_width()),
-            ("I", self.interleaved_gate),
-            ("U", self.separate_gate),
-            ("F", self.fresh),
-            ("NQ", self.query_norm),
-            ("N", self.key_norm),
-            ("NV", self.value_norm),
-            ("SK", self.sinks),
-            ("RA", self.rotary_adjacent),
-            ("RT", self.rotary_trailing),
-            ("RO", self.output_rotary),
-            ("VK", self.stored_key()),
-        ]
+        let (form, widths) = self.dims();
+        fixed(widths.mix_statics(&form))
     }
 
     /// The static axes of the dense fused entries: the shared ones, then
     /// the key rounding and the second source's picks, which no K8/V4 entry
     /// holds.
     pub fn dense_mix_statics(&self) -> Vec<(&'static str, u64)> {
+        let widths = self.dims().1;
         self.mix_statics()
             .into_iter()
-            .chain([("KR", self.rounds_keys()), ("KS", self.picks)])
+            .chain(fixed(widths.dense_statics(self.key_rounding.rounds())))
             .collect()
     }
 
@@ -705,13 +729,11 @@ impl AttentionShape {
         segments: u64,
         selected_rows: u64,
     ) -> Vec<(&'static str, u64)> {
+        let widths = self.dims().1;
         self.mix_dimensions(rows, history_rows, segments)
             .into_iter()
-            .chain([
-                ("KR", self.rounds_keys()),
-                ("KS", self.picks),
-                ("TS", selected_rows),
-            ])
+            .chain(fixed(widths.dense_statics(self.key_rounding.rounds())))
+            .chain([("TS", selected_rows)])
             .collect()
     }
 
@@ -723,7 +745,247 @@ impl AttentionShape {
         history_rows: u64,
         segments: u64,
     ) -> [(&'static str, u64); 18] {
-        let [kv, g, p, s, i, u, f, nq, n, nv, sk, ra, rt, ro, vk] = self.mix_statics();
+        let (form, widths) = self.dims();
+        fixed(widths.mix_dimensions(
+            &form,
+            Dim::from(rows),
+            Dim::from(history_rows),
+            Dim::from(segments),
+        ))
+    }
+}
+
+/// Named dimensions of constant [`Dim`]s as their values.
+fn fixed<const N: usize>(dimensions: [(&'static str, Dim); N]) -> [(&'static str, u64); N] {
+    dimensions.map(|(name, dimension)| (name, dimension.fixed()))
+}
+
+/// Where an attention's gate values come from: none, `W` columns after each
+/// query head's in its projection (`I = W`), or a separate projection
+/// segment ([`SeparateGate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GateForm {
+    None,
+    Interleaved,
+    Separate(SeparateGate),
+}
+
+/// `U`: a separate gate's values per query head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SeparateGate {
+    /// `U = 1`: one gate value per head.
+    Head,
+    /// `U = W`: one gate value per column.
+    Element,
+}
+
+/// An [`AttentionShape`]'s structure: its flags and kinds, which decide its
+/// graphs' topology. It holds no number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttentionForm {
+    /// `I`, `U`: the gate.
+    pub gate: GateForm,
+    /// `F`: whether the layer projects and appends its own keys and values.
+    pub fresh: bool,
+    /// `NQ`, `N`, `NV`: the per-head RMS norms (a Shared layer's `N` is its
+    /// `NQ`).
+    pub query_norm: bool,
+    pub key_norm: bool,
+    pub value_norm: bool,
+    pub values: AttentionValues,
+    /// `SK`: a sink logit per query head.
+    pub sinks: bool,
+    /// `RA`, `RT`, `RO`: the rotary layout and output rotary.
+    pub rotary_adjacent: bool,
+    pub rotary_trailing: bool,
+    pub output_rotary: bool,
+}
+
+impl AttentionForm {
+    /// Whether the projection has a separate gate segment (`GR > 0`).
+    pub(crate) fn gated_separately(&self) -> bool {
+        matches!(self.gate, GateForm::Separate(_))
+    }
+
+    /// Whether the projection has a value segment (`V > 0`).
+    pub(crate) fn projects_values(&self) -> bool {
+        self.fresh && self.values == AttentionValues::Projected
+    }
+
+    /// `VK`: whether the values are the stored keys.
+    pub(crate) fn stored_key(&self) -> bool {
+        self.values == AttentionValues::StoredKey
+    }
+}
+
+/// An [`AttentionShape`]'s numbers: `D`, `KV`, `G`, `P`, `W` and `KS`. As
+/// [`Dim`]s, with its [`AttentionForm`], they are the one owner of the
+/// shape's arithmetic, which a graph's builder records and the shape's
+/// own accessors evaluate at constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttentionWidths<D> {
+    /// `D`: the hidden width.
+    pub hidden: D,
+    /// `KV`: key/value heads.
+    pub kv_heads: D,
+    /// `G`: query heads per key/value head.
+    pub group: D,
+    /// `P`: rotated pairs of a head.
+    pub rotary_pairs: D,
+    /// `W = 2P + S`: the head width.
+    pub width: D,
+    /// `KS`: the picks each row reads from the layer's second, index-list
+    /// source (its selection's `top`); 0 for a layer reading one source.
+    /// The dense attending entries alone hold it.
+    pub picks: D,
+}
+
+impl<D> Numbers<D> for AttentionWidths<D> {
+    type Of<E> = AttentionWidths<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> AttentionWidths<E> {
+        AttentionWidths {
+            hidden: f(self.hidden),
+            kv_heads: f(self.kv_heads),
+            group: f(self.group),
+            rotary_pairs: f(self.rotary_pairs),
+            width: f(self.width),
+            picks: f(self.picks),
+        }
+    }
+}
+
+/// `1` where `flag` holds, else `0`: a 0/1 axis.
+pub(crate) fn axis(flag: bool) -> Dim {
+    Dim::from(u64::from(flag))
+}
+
+impl AttentionWidths<Dim> {
+    /// `KV · G`: the query heads.
+    pub(crate) fn heads(&self) -> Dim {
+        &self.kv_heads * &self.group
+    }
+
+    /// `I`: gate columns after each query head's.
+    pub(crate) fn interleaved_gate(&self, form: &AttentionForm) -> Dim {
+        match form.gate {
+            GateForm::Interleaved => self.width.clone(),
+            GateForm::None | GateForm::Separate(_) => Dim::from(0),
+        }
+    }
+
+    /// `U`: separate gate values per query head.
+    pub(crate) fn separate_gate(&self, form: &AttentionForm) -> Dim {
+        match form.gate {
+            GateForm::None | GateForm::Interleaved => Dim::from(0),
+            GateForm::Separate(SeparateGate::Head) => Dim::from(1),
+            GateForm::Separate(SeparateGate::Element) => self.width.clone(),
+        }
+    }
+
+    /// `Q`: query (and interleaved gate) projection rows.
+    pub(crate) fn query_rows(&self, form: &AttentionForm) -> Dim {
+        self.heads() * (&self.width + self.interleaved_gate(form))
+    }
+
+    /// `GR`: separate gate projection rows.
+    pub(crate) fn gate_rows(&self, form: &AttentionForm) -> Dim {
+        self.heads() * self.separate_gate(form)
+    }
+
+    /// `KV · W`: a row's keys or values.
+    pub(crate) fn key_width(&self) -> Dim {
+        &self.kv_heads * &self.width
+    }
+
+    /// `K`: key projection rows.
+    pub(crate) fn key_rows(&self, form: &AttentionForm) -> Dim {
+        match form.fresh {
+            true => self.key_width(),
+            false => Dim::from(0),
+        }
+    }
+
+    /// `V`: value projection rows.
+    pub(crate) fn value_rows(&self, form: &AttentionForm) -> Dim {
+        match form.projects_values() {
+            true => self.key_width(),
+            false => Dim::from(0),
+        }
+    }
+
+    /// `S`: a head's unrotated columns.
+    pub(crate) fn static_width(&self) -> Dim {
+        &self.width - &self.rotary_pairs * 2
+    }
+
+    /// The projection entry's dimensions at `rows` rows: its query segment
+    /// projects the query rows, or a low-rank query's `query_rank` rows of
+    /// `qr`.
+    pub(crate) fn project_dimensions(
+        &self,
+        form: &AttentionForm,
+        rows: Dim,
+        query_rank: Option<&Dim>,
+    ) -> [(&'static str, Dim); 6] {
+        [
+            ("M", rows),
+            ("D", self.hidden.clone()),
+            ("Q", query_rank.cloned().unwrap_or_else(|| self.query_rows(form))),
+            ("GR", self.gate_rows(form)),
+            ("K", self.key_rows(form)),
+            ("V", self.value_rows(form)),
+        ]
+    }
+
+    /// A projection of history rows alone: no query or gate outputs.
+    pub(crate) fn key_value_dimensions(
+        &self,
+        form: &AttentionForm,
+        rows: Dim,
+    ) -> [(&'static str, Dim); 6] {
+        let mut dimensions = self.project_dimensions(form, rows, None);
+        dimensions[2].1 = Dim::from(0);
+        dimensions[3].1 = Dim::from(0);
+        dimensions
+    }
+
+    /// The static axes of the fused attention entries.
+    pub(crate) fn mix_statics(&self, form: &AttentionForm) -> [(&'static str, Dim); 15] {
+        [
+            ("KV", self.kv_heads.clone()),
+            ("G", self.group.clone()),
+            ("P", self.rotary_pairs.clone()),
+            ("S", self.static_width()),
+            ("I", self.interleaved_gate(form)),
+            ("U", self.separate_gate(form)),
+            ("F", axis(form.fresh)),
+            ("NQ", axis(form.query_norm)),
+            ("N", axis(form.key_norm)),
+            ("NV", axis(form.value_norm)),
+            ("SK", axis(form.sinks)),
+            ("RA", axis(form.rotary_adjacent)),
+            ("RT", axis(form.rotary_trailing)),
+            ("RO", axis(form.output_rotary)),
+            ("VK", axis(form.stored_key())),
+        ]
+    }
+
+    /// The dense fused entries' own static axes: whether they round keys
+    /// (`rounds`) and the second source's picks, which no K8/V4 entry holds.
+    pub(crate) fn dense_statics(&self, rounds: bool) -> [(&'static str, Dim); 2] {
+        [("KR", axis(rounds)), ("KS", self.picks.clone())]
+    }
+
+    /// The fused entries' dimensions for `rows` rows over `history_rows`
+    /// history rows read in `segments` visible spans.
+    pub(crate) fn mix_dimensions(
+        &self,
+        form: &AttentionForm,
+        rows: Dim,
+        history_rows: Dim,
+        segments: Dim,
+    ) -> [(&'static str, Dim); 18] {
+        let [kv, g, p, s, i, u, f, nq, n, nv, sk, ra, rt, ro, vk] = self.mix_statics(form);
         [
             ("M", rows),
             ("T", history_rows),
@@ -777,7 +1039,7 @@ pub struct AttentionBinding {
     /// A grouped output's first product (`OutputProjection::GroupedLowRank`'s
     /// `a`); none for a full output projection.
     pub grouped: Option<GroupedOutputBinding>,
-    /// The second source a row reads by its picks (`KS = shape.picks`);
+    /// The second source a row reads by its picks (`KS = shape.widths.picks`);
     /// none for a layer reading one source.
     pub picked: Option<PickedBinding>,
 }
@@ -886,17 +1148,31 @@ pub enum CandidatesBinding {
 /// the restricted indexers' `top` picks (`candidate_rows`' `K`, which fills
 /// a pool of fewer units).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CandidatePool {
-    pub blocks: u64,
-    pub block_units: u64,
-    pub top: u64,
+pub struct CandidatePool<D = u64> {
+    pub blocks: D,
+    pub block_units: D,
+    pub top: D,
 }
 
 impl CandidatePool {
+    /// [`CandidatePool::units`] of the model's pool.
+    pub fn units(&self) -> u64 {
+        constant(*self).units().fixed()
+    }
+}
+
+impl CandidatePool<Dim> {
     /// The most units a row's pool list holds: its blocks' units, which
     /// the fill never exceeds (`top ≤ blocks · block_units`).
-    pub fn units(&self) -> u64 {
-        self.blocks * self.block_units
+    pub(crate) fn units(&self) -> Dim {
+        &self.blocks * &self.block_units
+    }
+}
+
+impl<D> Numbers<D> for CandidatePool<D> {
+    type Of<E> = CandidatePool<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> CandidatePool<E> {
+        CandidatePool { blocks: f(self.blocks), block_units: f(self.block_units), top: f(self.top) }
     }
 }
 
@@ -905,7 +1181,7 @@ impl AttentionBinding {
     /// `(Q, W)`: the attended heads, or a grouped output's `a` products.
     pub fn output_input(&self) -> (u64, u64) {
         match self.grouped {
-            None => (self.shape.heads(), self.shape.width),
+            None => (self.shape.heads(), self.shape.widths.width),
             Some(grouped) => (grouped.shape.groups, grouped.shape.rank),
         }
     }

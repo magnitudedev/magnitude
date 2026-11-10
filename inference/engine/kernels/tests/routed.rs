@@ -6465,6 +6465,120 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
     }
 }
 
+/// Every choice of an expert has its expert's one source while the host
+/// maps and unmaps its tier record during the route, as a landing's end
+/// and a park do: every decode row routes to the same experts (a zero
+/// router), and a host thread flips each expert's tier word between none
+/// and record e with release stores for as long as the launches run. A
+/// route that read the tier word once per choice could source two rows of
+/// one expert differently, one absent and one tier-held, whose tier wait
+/// and assignment then drop the one or serve it twice.
+#[test]
+fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let (h, e, k, m) = (64u64, 32u64, 8u64, constants::DECODE_ROWS as u64);
+    let choices = m * k;
+    let table = SlotTable::file(FLIGHT, choices);
+    let statics = [("H", h), ("E", e), ("K", k), ("ES", 0), ("AHEAD", 0), ("EN", e), ("TM", e)];
+    let entry = routed_select_streamed::native_entry_with(routed_select_streamed::Elements {
+        NW: seismic::Element::f32(),
+        RNW: seismic::Element::f32(),
+        RW: seismic::Element::f32(),
+        A: seismic::Element::bf16(),
+    });
+    let implementation = entry.offered(&device).unwrap().unwrap();
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(seismic::NativeSpecialization::new(), |specialization, name| {
+            let (_, value) = statics.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+            specialization.with_static(name.clone(), *value)
+        });
+    let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
+    let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&device, element, shape).unwrap();
+    let words = |shape: &[u64]| shared_i32(&device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
+    let f32 = seismic::Element::f32();
+    let tier = seismic::Tensor::words(&device, seismic::Element::i32(), &[e]).unwrap();
+    let store = |expert: u64, record: i32| tier.store_release(expert * 4, record as u32).unwrap();
+    (0..e).for_each(|expert| store(expert, -1));
+    let mut unpriced = policy_words(0, 0, [1, 100, 0]);
+    unpriced[constants::POLICY_PRICED as usize] = 0;
+    let mut resolved = policy_words(0, 0, [0; 3]);
+    resolved[constants::POLICY_RESOLVED as usize] = 1;
+    let map = shared_i32(&device, &[e, constants::MAP_WORDS], &map_words(&vec![(-1, 0, 0); e as usize]));
+    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &unpriced);
+    let next_policy = shared_i32(&device, &[constants::POLICY_WORDS], &resolved);
+    let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64));
+    let residual = f32_tensor(&device, &[m, h], &vec![1.0; (m * h) as usize]);
+    let flipping = std::sync::atomic::AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut held = false;
+            while flipping.load(std::sync::atomic::Ordering::Relaxed) {
+                held = !held;
+                (0..e).for_each(|expert| store(expert, if held { expert as i32 } else { -1 }));
+            }
+        });
+        let finish = || flipping.store(false, std::sync::atomic::Ordering::Relaxed);
+        for launch in 0..4000 {
+            let mut routes = zeros(seismic::Element::i32(), &[m, k]);
+            let mut sources = zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]);
+            kernel
+                .call(routed_select_streamed::Args {
+                    residual: &residual,
+                    norm: &zeros(f32, &[h]),
+                    router_norm: &zeros(f32, &[h]),
+                    router: &zeros(f32, &[e, h]),
+                    bias: &zeros(f32, &[e]),
+                    expert_scale: &zeros(f32, &[0]),
+                    routes: &mut routes,
+                    weights: &mut zeros(f32, &[m, k]),
+                    epsilon: 1e-6,
+                    score: 0,
+                    normalization: 0,
+                    normalization_epsilon: 1e-6,
+                    scale: 1.0,
+                    map: &map,
+                    tier: &tier,
+                    policy: &policy,
+                    sited: 1,
+                    step: &step,
+                    file: &mut words(&table.extents()),
+                    grids: &mut zeros(seismic::Element::i32(), &[constants::DECODE_GRIDS, 3]),
+                    sources: &mut sources,
+                    next_router_norm: &zeros(f32, &[h]),
+                    next_router: &zeros(f32, &[e, h]),
+                    next_bias: &zeros(f32, &[e]),
+                    after_router_norm: &zeros(f32, &[h]),
+                    after_router: &zeros(f32, &[e, h]),
+                    after_bias: &zeros(f32, &[e]),
+                    next_policy: &next_policy,
+                    rings: &mut zeros(seismic::Element::i32(), &[0, constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * choices]),
+                    routing: &mut words(&[FLIGHT, constants::RING_EXPERTS + 2 * choices]),
+                })
+                .inspect_err(|_| finish())
+                .unwrap();
+            let routes = read_i32(&routes);
+            let records = &read_i32(&sources)[..choices as usize];
+            let first = |expert: i32| routes.iter().position(|&routed| routed == expert).unwrap();
+            let split = (0..choices as usize).find(|&c| records[c] != records[first(routes[c])]);
+            if let Some(c) = split {
+                finish();
+                panic!(
+                    "{:?}, launch {launch}: choice {c} of expert {} sourced {}, its first choice {}",
+                    device.backend(),
+                    routes[c],
+                    records[c],
+                    records[first(routes[c])]
+                );
+            }
+        }
+        finish();
+    });
+}
+
 /// The tier wait sources each landed choice where the route assigned its
 /// expert: the CPU's pending site names its tier record, the link's record
 /// reads it in place; a failed read, or a failed step, sources none.

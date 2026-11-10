@@ -14,8 +14,8 @@ use magnitude_engine::options::{
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, NumericalProfile, Operation, Outcome,
-    PhysicalDecision, ProgramFamily, RequestId, ReservedResources, Sampling, SelectSpec, Shaping,
-    StateBindings, TokenId, TuningSettings, WorkKind,
+    PhysicalDecision, ProgramFamily, RequestId, ReservedResources, ResumeState, Sampling, SelectSpec,
+    Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_scheduler::owner::{BetweenFlights, MemoryHost, between_flights};
@@ -360,6 +360,14 @@ pub struct Sequence {
     pub selected: Option<TokenId>,
 }
 
+/// A sequence's accepted state and selection, which sequences open from
+/// as it stood ([`Engine::open_from`]), as the service resumes a cached
+/// prefix.
+pub struct Checkpoint {
+    state: ResumeState,
+    selected: Option<TokenId>,
+}
+
 /// Host and device times of one step. All times are `seismic::host_seconds`.
 pub struct Step {
     pub start: f64,
@@ -480,6 +488,11 @@ impl Engine {
     }
 
     pub fn open_sequence(&mut self) -> Result<Sequence, String> {
+        Ok(Sequence { request: self.open_request(None)?, position: 0, selected: None })
+    }
+
+    /// A request opened with fresh state, or `from`'s.
+    fn open_request(&mut self, from: Option<&ResumeState>) -> Result<RequestId, String> {
         let request = RequestId(self.next_request);
         self.next_request += 1;
         self.domain
@@ -488,14 +501,8 @@ impl Engine {
             .bindings
             .as_mut()
             .expect("no flight holds the state bindings");
-        self.domain
-            .open_state(bindings, request, None)
-            .map_err(text)?;
-        Ok(Sequence {
-            request,
-            position: 0,
-            selected: None,
-        })
+        self.domain.open_state(bindings, request, from).map_err(text)?;
+        Ok(request)
     }
 
     /// Prefetch the stored-table rows the sequence reads as it feeds
@@ -507,6 +514,21 @@ impl Engine {
             prefetched.wait();
         }
         Ok(())
+    }
+
+    /// The sequence's accepted state and selection ([`Checkpoint`]).
+    pub fn checkpoint(&self, sequence: &Sequence) -> Result<Checkpoint, String> {
+        Ok(Checkpoint { state: self.domain.resume_state(sequence.request)?, selected: sequence.selected })
+    }
+
+    /// A sequence opened from `checkpoint`: its state, position and
+    /// selection as the checkpoint's sequence stood.
+    pub fn open_from(&mut self, checkpoint: &Checkpoint) -> Result<Sequence, String> {
+        Ok(Sequence {
+            request: self.open_request(Some(&checkpoint.state))?,
+            position: checkpoint.state.position(),
+            selected: checkpoint.selected,
+        })
     }
 
     pub fn close(&mut self, sequence: Sequence) -> Result<(), String> {

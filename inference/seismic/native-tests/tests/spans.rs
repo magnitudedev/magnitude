@@ -27,7 +27,7 @@ fn a_sampled_run_reads_the_device_time_between_its_marks() {
         let mut marks = vec![graph.span_mark()];
         for calls in [first, second] {
             for _ in 0..calls {
-                value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: 1.0 }).unwrap().value;
+                value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: seismic::Argument::from(1.0) }).unwrap().value;
             }
             marks.push(graph.span_mark());
         }

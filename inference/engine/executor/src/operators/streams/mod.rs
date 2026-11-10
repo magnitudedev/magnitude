@@ -25,21 +25,25 @@ use magnitude_family_contracts::{
 use seismic::Element;
 
 /// The geometry of a decoder's streams: S streams of `hidden`, and how its
-/// mix sites form their coefficients.
+/// mix sites form their coefficients. The stream count is topology (the
+/// graphs repeat over it); the width and rank are numbers `D`. Sinkhorn
+/// mixing carries `M`: the model's numerics (`SinkhornMixing`), or in a
+/// graph's numbers (`numbers`) its iteration count, a number the kernel
+/// loops over, whose topology holds the epsilons as reals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StreamsGeometry {
-    pub hidden: u64,
+pub struct StreamsGeometry<D = u64, M = SinkhornMixing> {
+    pub hidden: D,
     pub streams: u64,
-    pub mixing: StreamsMixing,
+    pub mixing: StreamsMixing<D, M>,
 }
 
 /// How every mix site of a decoder forms its coefficients
 /// (`HyperConnectionMixing`): through a low-rank bottleneck, or by one
-/// Sinkhorn projection.
+/// Sinkhorn projection of numerics `M`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StreamsMixing {
-    LowRank { rank: u64 },
-    Sinkhorn(SinkhornMixing),
+pub enum StreamsMixing<D = u64, M = SinkhornMixing> {
+    LowRank { rank: D },
+    Sinkhorn(M),
 }
 
 /// The Sinkhorn mixing's numerics, as `stream_mix_sinkhorn` takes them: its
@@ -72,7 +76,113 @@ impl std::hash::Hash for SinkhornMixing {
     }
 }
 
+impl SinkhornMixing {
+    /// Its epsilons as a graph's topology holds them.
+    pub(crate) fn topology(self) -> SinkhornTopology<f64> {
+        SinkhornTopology {
+            epsilon: f64::from(self.epsilon),
+            norm_epsilon: f64::from(self.norm_epsilon),
+        }
+    }
+}
+
+/// The Sinkhorn mixing's epsilons as a graph's topology holds them, as
+/// reals `R` (`SinkhornMixing`); its iteration count is a number of the
+/// graph's streams geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SinkhornTopology<R = seismic::Argument<f64>> {
+    pub epsilon: R,
+    pub norm_epsilon: R,
+}
+
+impl<R> crate::programs::graph::facts::Numbers<R> for SinkhornTopology<R> {
+    type Of<E> = SinkhornTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> SinkhornTopology<E> {
+        SinkhornTopology {
+            epsilon: f(self.epsilon),
+            norm_epsilon: f(self.norm_epsilon),
+        }
+    }
+}
+
+impl<D> crate::programs::graph::facts::Numbers<D> for StreamsGeometry<D, D> {
+    type Of<E> = StreamsGeometry<E, E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> StreamsGeometry<E, E> {
+        StreamsGeometry {
+            hidden: f(self.hidden),
+            streams: self.streams,
+            mixing: match self.mixing {
+                StreamsMixing::LowRank { rank } => StreamsMixing::LowRank { rank: f(rank) },
+                StreamsMixing::Sinkhorn(iterations) => StreamsMixing::Sinkhorn(f(iterations)),
+            },
+        }
+    }
+}
+
+impl<D: Clone, M> StreamsGeometry<D, M> {
+    /// The width of a row of the streams, `S * H`.
+    pub fn width(&self) -> D
+    where
+        D: std::ops::Mul<u64, Output = D>,
+    {
+        self.hidden.clone() * self.streams
+    }
+
+    /// The low-rank sites' geometry, of low-rank mixing.
+    pub fn low_rank(&self) -> Option<LowRankGeometry<D>> {
+        match &self.mixing {
+            StreamsMixing::LowRank { rank } => Some(LowRankGeometry {
+                hidden: self.hidden.clone(),
+                streams: self.streams,
+                rank: rank.clone(),
+            }),
+            StreamsMixing::Sinkhorn(_) => None,
+        }
+    }
+
+    /// The Sinkhorn numerics, of Sinkhorn mixing.
+    pub fn sinkhorn(&self) -> Option<&M> {
+        match &self.mixing {
+            StreamsMixing::Sinkhorn(mixing) => Some(mixing),
+            StreamsMixing::LowRank { .. } => None,
+        }
+    }
+
+    /// The width of a row of the streams' join values `IN`: an inject value
+    /// per stream, and under Sinkhorn mixing the comb after them.
+    pub fn join_width(&self) -> u64 {
+        match self.mixing {
+            StreamsMixing::LowRank { .. } => self.streams,
+            StreamsMixing::Sinkhorn(_) => self.streams + self.streams * self.streams,
+        }
+    }
+}
+
+impl<D> StreamsGeometry<D, D> {
+    /// Its numbers as a graph builder takes them.
+    pub(crate) fn dims(self) -> StreamsGeometry<seismic::Dim, seismic::Dim>
+    where
+        D: Into<seismic::Dim>,
+    {
+        crate::programs::graph::facts::Numbers::map(self, &mut Into::into)
+    }
+}
+
 impl StreamsGeometry {
+    /// Its numbers as a graph's numbers hold them: the Sinkhorn iteration
+    /// count in place of the mixing's numerics, whose epsilons the graph's
+    /// topology holds (`SinkhornMixing::topology`).
+    pub(crate) fn numbers(self) -> StreamsGeometry<u64, u64> {
+        StreamsGeometry {
+            hidden: self.hidden,
+            streams: self.streams,
+            mixing: match self.mixing {
+                StreamsMixing::LowRank { rank } => StreamsMixing::LowRank { rank },
+                StreamsMixing::Sinkhorn(mixing) => StreamsMixing::Sinkhorn(u64::from(mixing.iterations)),
+            },
+        }
+    }
+
     /// The streams of `decoder`: none for a single residual stream.
     pub(crate) fn of(decoder: &Decoder) -> Result<Option<Self>, PlanError> {
         Self::from_residual(decoder.hidden, &decoder.residual)
@@ -102,53 +212,31 @@ impl StreamsGeometry {
         }))
     }
 
-    /// The width of a row of the streams, `S * H`.
-    pub fn width(&self) -> u64 {
-        self.streams * self.hidden
-    }
-
-    /// The low-rank sites' geometry, of low-rank mixing.
-    pub fn low_rank(&self) -> Option<LowRankGeometry> {
-        match self.mixing {
-            StreamsMixing::LowRank { rank } => Some(LowRankGeometry {
-                hidden: self.hidden,
-                streams: self.streams,
-                rank,
-            }),
-            StreamsMixing::Sinkhorn(_) => None,
-        }
-    }
-
-    /// The Sinkhorn numerics, of Sinkhorn mixing.
-    pub fn sinkhorn(&self) -> Option<SinkhornMixing> {
-        match self.mixing {
-            StreamsMixing::Sinkhorn(mixing) => Some(mixing),
-            StreamsMixing::LowRank { .. } => None,
-        }
-    }
-
-    /// The width of a row of the streams' join values `IN`: an inject value
-    /// per stream, and under Sinkhorn mixing the comb after them.
-    pub fn join_width(&self) -> u64 {
-        match self.mixing {
-            StreamsMixing::LowRank { .. } => self.streams,
-            StreamsMixing::Sinkhorn(_) => self.streams + self.streams * self.streams,
-        }
-    }
 }
 
 /// S low-rank streams of `hidden`, and the rank of their mix sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LowRankGeometry {
-    pub hidden: u64,
+pub struct LowRankGeometry<D = u64> {
+    pub hidden: D,
     pub streams: u64,
-    pub rank: u64,
+    pub rank: D,
 }
 
-impl LowRankGeometry {
+impl<D: Clone> LowRankGeometry<D> {
     /// The width of a row of the streams, `S * H`.
-    pub fn width(&self) -> u64 {
-        self.streams * self.hidden
+    pub fn width(&self) -> D
+    where
+        D: std::ops::Mul<u64, Output = D>,
+    {
+        self.hidden.clone() * self.streams
+    }
+
+    /// Its numbers as a graph builder takes them.
+    pub(crate) fn dims(self) -> LowRankGeometry<seismic::Dim>
+    where
+        D: Into<seismic::Dim>,
+    {
+        LowRankGeometry { hidden: self.hidden.into(), streams: self.streams, rank: self.rank.into() }
     }
 }
 
@@ -158,7 +246,7 @@ impl LowRankGeometry {
 /// the next site reads. A block's graph reads and leaves one, as its input
 /// and output ports; a split block's front leaves it to its back; a run
 /// binds it from graph to graph.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResidualCarry<T> {
     pub rows: T,
     pub pre: Option<T>,

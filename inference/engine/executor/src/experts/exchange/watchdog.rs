@@ -72,14 +72,27 @@ pub(in crate::experts) struct Witness {
 /// are submission boundaries (`watcher::parks`): the device waits there on
 /// the host whoever writes its lane's request, so it is watched as a lane
 /// is. Its value, its step, and where it is.
+#[derive(Clone)]
 pub(in crate::experts) struct Parked {
     pub value: u64,
     pub step: u64,
     pub site: String,
 }
 
-/// The load's park the device waits at, if any ([`Parked`]).
-pub(in crate::experts) type ParkedAt = Box<dyn Fn() -> Option<Parked> + Send>;
+/// What a look finds of the park the device waits at.
+pub(in crate::experts) enum Park {
+    /// The device waits at this park ([`Parked`]).
+    Reached(Parked),
+    /// It waits at none.
+    Clear,
+    /// Another thread holds the parks, so the look cannot tell: the park
+    /// last seen stands, its time running on, so a holder busy at every
+    /// look, or stuck, never hides a park the device waits at.
+    Unseen,
+}
+
+/// The load's park the device waits at ([`Park`]).
+pub(in crate::experts) type ParkedAt = Box<dyn Fn() -> Park + Send>;
 
 /// Whether a step has ended, by whichever exit (`Steps::ended`).
 pub(in crate::experts) type Ended = Box<dyn Fn(u64) -> bool + Send>;
@@ -230,9 +243,9 @@ struct Watch {
     reads: Box<dyn Fn() -> Reads + Send>,
     witnesses: Vec<Witness>,
     open: Vec<Open>,
-    /// The park the device waits at: its value, the host's time able to
-    /// answer without progress when first seen, and the load's events then.
-    park: Option<(u64, Duration, u64)>,
+    /// The park the device waits at, the host's time able to answer
+    /// without progress when first seen, and the load's events then.
+    park: Option<(Parked, Duration, u64)>,
     clock: HostClock,
     serving: Serving,
 }
@@ -276,12 +289,18 @@ impl Watch {
             );
             return Some(report(header, tables, &self.open, oldest.events, now, seen, ended, &engine(), witnesses));
         }
-        match (self.parked)().filter(|at| !ended(at.step)) {
+        let park = match (self.parked)() {
+            Park::Reached(at) => Some(at),
+            Park::Clear => None,
+            Park::Unseen => self.park.as_ref().map(|(at, ..)| at.clone()),
+        };
+        match park.filter(|at| !ended(at.step)) {
             Some(at) => {
-                if self.park.is_none_or(|(value, ..)| value != at.value) {
-                    self.park = Some((at.value, now, seen));
+                if self.park.as_ref().is_none_or(|(recorded, ..)| recorded.value != at.value) {
+                    self.park = Some((at.clone(), now, seen));
                 }
-                let (_, since, events) = self.park.expect("the park is recorded above");
+                let (_, since, events) = self.park.as_ref().expect("the park is recorded above");
+                let (since, events) = (*since, *events);
                 if now - since >= limit {
                     let header = format!(
                         "magnitude-engine: the device is parked at {} (value {}, step {}) and no answer released it past its bound of {limit:?} ({derivation}); \

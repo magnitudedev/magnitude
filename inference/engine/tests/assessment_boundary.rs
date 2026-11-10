@@ -9,7 +9,7 @@
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_engine::{
     assessment::{
-        assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
+        assess_model, finish_model_assessment, header_refusal, kernel_inventory, prepare_model_assessment,
         AssessmentSetup, AssessmentStructure, DrafterVerdict, HeaderExtent, KernelInventory,
         Measurements, ModelAssessment, ModelExecution, ModelFacts, ModelPackagePaths,
         PreparedModelAssessment, ProjectorVerdict, SpeculativeMethod,
@@ -702,6 +702,17 @@ fn cpu_setup() -> AssessmentSetup {
     }
 }
 
+/// The facts of `package`'s finished assessment on the CPU before any
+/// measurement: a bound drafter's memory is charged at its served tier.
+fn assessed_facts(package: &ModelPackagePaths) -> ModelFacts {
+    match finish_model_assessment(&prepared(package), &cpu_setup(), &[], 1)
+        .unwrap_or_else(|error| panic!("operational failure: {error}"))
+    {
+        ModelAssessment::Assessed { facts, .. } => facts,
+        ModelAssessment::Unsupported { unsupported, .. } => panic!("the target plans: {unsupported:?}"),
+    }
+}
+
 fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
     prepare_model_assessment(package, &cpu_structure())
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
@@ -731,9 +742,7 @@ fn an_unsupported_target_reports_its_fingerprint() {
 fn a_target_without_a_drafter_drafts_with_nothing() {
     let scratch = Scratch::new("no-drafter");
     let target = llama().write(&scratch.file("target.gguf"));
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&package(target.clone())) else {
-        panic!("the target plans");
-    };
+    let facts = assessed_facts(&package(target.clone()));
     assert_eq!(facts.drafter, DrafterVerdict::None);
     assert_eq!(facts.fingerprint, ModelFingerprint::from_path(&target).ok());
 }
@@ -743,13 +752,11 @@ fn a_drafter_of_another_width_is_rejected_and_the_target_still_plans() {
     let scratch = Scratch::new("rejected-drafter");
     let target = llama().write(&scratch.file("target.gguf"));
     let draft = dflash(HIDDEN / 2).write(&scratch.file("draft.gguf"));
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+    let facts = assessed_facts(&ModelPackagePaths {
         draft: Some(draft),
         method: ModelMethod::DFlash,
         ..package(target)
-    }) else {
-        panic!("the target plans without the drafter");
-    };
+    });
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
         panic!(
             "a drafter of another width does not bind: {:?}",
@@ -772,13 +779,11 @@ fn a_drafter_with_unsupported_weights_names_them() {
     let mut draft = dflash(HIDDEN);
     draft.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let draft = draft.write(&scratch.file("draft.gguf"));
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+    let facts = assessed_facts(&ModelPackagePaths {
         draft: Some(draft),
         method: ModelMethod::DFlash,
         ..package(target)
-    }) else {
-        panic!("the target plans without the drafter");
-    };
+    });
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
         panic!("Q8_K is not imported: {:?}", facts.drafter);
     };
@@ -798,13 +803,11 @@ fn a_drafter_that_binds_is_bound_with_the_memory_it_adds() {
     let scratch = Scratch::new("bound-drafter");
     let target = llama().write(&scratch.file("target.gguf"));
     let draft = dflash(HIDDEN).write(&scratch.file("draft.gguf"));
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+    let facts = assessed_facts(&ModelPackagePaths {
         draft: Some(draft),
         method: ModelMethod::Auto,
         ..package(target)
-    }) else {
-        panic!("the bundle plans");
-    };
+    });
     let DrafterVerdict::Bound {
         method,
         memory_bytes,
@@ -822,13 +825,11 @@ fn an_unreadable_drafter_is_rejected_without_the_target() {
     let target = llama().write(&scratch.file("target.gguf"));
     let draft = scratch.file("draft.gguf");
     std::fs::write(&draft, &dflash(HIDDEN).bytes()[..64]).unwrap();
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+    let facts = assessed_facts(&ModelPackagePaths {
         draft: Some(draft),
         method: ModelMethod::DFlash,
         ..package(target)
-    }) else {
-        panic!("the target plans without the drafter");
-    };
+    });
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
         panic!("a truncated drafter is rejected: {:?}", facts.drafter);
     };
@@ -1001,9 +1002,7 @@ fn embedded_mtp_heads_stay_bound_beside_a_projector() {
             projector,
             ..package(target.clone())
         };
-        let PreparedModelAssessment::Planned { facts, .. } = prepared(&package) else {
-            panic!("the target plans");
-        };
+        let facts = assessed_facts(&package);
         facts
     };
     for (projector, vision) in [(None, false), (Some(projector), true)] {
@@ -1040,14 +1039,10 @@ fn a_projector_binds_by_its_width_not_the_base_model_names() {
         projector: Some(projector),
         ..package(target.clone())
     };
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(own)) else {
-        panic!("the finetune plans beside its base model's projector");
-    };
+    let facts = assessed_facts(&with(own));
     assert!(facts.capabilities.vision);
     assert_eq!(facts.projector, ProjectorVerdict::Bound);
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(narrow)) else {
-        panic!("a projector of another width leaves the target planning text only");
-    };
+    let facts = assessed_facts(&with(narrow));
     assert!(!facts.capabilities.vision);
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
         panic!("a projector of another width can't feed this decoder: {:?}", facts.projector);
@@ -1074,17 +1069,12 @@ fn a_target_is_assessed_without_another_models_projector() {
     let scratch = Scratch::new("text-only-projector");
     let target = real_header(&scratch, "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf");
     let projector = real_header(&scratch, "mmproj-F16.gguf");
-    let PreparedModelAssessment::Planned { facts: alone, .. } = prepared(&package(target.clone()))
-    else {
-        panic!("the Nemotron target plans");
-    };
+    let alone = assessed_facts(&package(target.clone()));
     assert_eq!(alone.projector, ProjectorVerdict::None);
-    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+    let facts = assessed_facts(&ModelPackagePaths {
         projector: Some(projector),
         ..package(target)
-    }) else {
-        panic!("a projector the family cannot bind never refuses the target");
-    };
+    });
     assert!(!facts.capabilities.vision);
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
         panic!("a Qwen3-VL projector is rejected: {:?}", facts.projector);

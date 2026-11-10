@@ -1504,6 +1504,11 @@ mod internals {
             );
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
+            out.push_str("  /// Whether preparation on a `backend` device takes `specialization` at `elements`, decided without a device.\n");
+            out.push_str("  pub fn native_admission_with(backend: seismic::BackendName, elements: Elements, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeAdmission, seismic::CheckedBundleError> {\n");
+            out.push_str("    seismic::generated::admit_native::<Entry>(backend, specialization, &[\n");
+            element_list(out);
+            out.push_str(&format!("    ], {cpu})\n  }}\n"));
             out.push_str(
                 "  pub fn native_entry_with(elements: Elements) -> seismic::BoundEntry<Entry> {\n",
             );
@@ -1526,6 +1531,8 @@ mod internals {
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
+            out.push_str("  /// Whether preparation on a `backend` device takes `specialization`, decided without a device.\n");
+            out.push_str(&format!("  pub fn native_admission(backend: seismic::BackendName, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeAdmission, seismic::CheckedBundleError> {{ seismic::generated::admit_native::<Entry>(backend, specialization, &[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
             out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation) }}\n"));
@@ -2132,7 +2139,7 @@ mod internals {
                 }
                 TensorAccess::Mutable => "seismic::WorkflowTensorMut<'a>".to_owned(),
             },
-            ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
+            ParameterSummaryKind::Scalar(dtype) => format!("seismic::Argument<{}>", scalar_type(*dtype)),
             ParameterSummaryKind::Index => "seismic::BigUint".to_owned(),
             ParameterSummaryKind::Range => "(seismic::BigUint, seismic::BigUint)".to_owned(),
         }

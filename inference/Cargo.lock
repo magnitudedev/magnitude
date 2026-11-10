@@ -4269,6 +4269,7 @@ dependencies = [
  "libc",
  "seismic-cpu",
  "seismic-cuda",
+ "seismic-lang",
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-topology",

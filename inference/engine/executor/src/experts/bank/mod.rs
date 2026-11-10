@@ -576,10 +576,10 @@ impl ExpertBank {
                 .get(usize::from(round))
                 .ok_or_else(|| format!("bank part {part:?} names no convert round"))?,
             BankPart::ConvertStaged => &load.convert_staged,
-            BankPart::TierList => &load.tiered,
+            BankPart::TierList => &layer.tiered,
             BankPart::TierGrid => &load.tier_grid,
             BankPart::TierStaged => &load.tier_staged,
-            BankPart::SeedList => &load.seeds,
+            BankPart::SeedList => &layer.seeds,
             BankPart::SeedGrid => &load.seed_grid,
             BankPart::SeedStaged => &load.seed_staged,
             BankPart::ScratchGrids => &load.grids,

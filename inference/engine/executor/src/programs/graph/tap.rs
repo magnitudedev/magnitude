@@ -9,10 +9,10 @@
 
 use super::{GraphError, draft::GraphDraft};
 use magnitude_kernels::tap_rows;
-use seismic::{Element, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativePort, WorkflowTensor};
 
 /// Where a block's graph taps its residual stream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct TapPositions {
     /// The residual entering the block.
     pub entry: bool,
@@ -28,12 +28,9 @@ impl TapPositions {
     }
 }
 
-/// A tapped graph's entry, the width of the draft input rows, and the
-/// positions the block taps.
+/// A tapped graph's entry and the positions the block taps.
 pub(crate) struct TapEntry<'a, G: GraphDraft + 'a> {
     pub entry: G::Binding<'a, tap_rows::Entry>,
-    /// `taps · hidden`: the draft input row width.
-    pub width: u64,
     pub positions: TapPositions,
 }
 
@@ -50,29 +47,32 @@ pub(crate) struct TapPorts {
 /// The draft input rows of a tapped graph, before any position is tapped.
 pub(crate) struct Taps<'a, G: GraphDraft + 'a> {
     entry: G::Binding<'a, tap_rows::Entry>,
-    width: u64,
-    hidden_width: u64,
-    rows: u64,
+    /// `T`: the taps the draft input rows hold.
+    taps: Dim,
+    hidden_width: Dim,
+    rows: Dim,
     pub positions: TapPositions,
     pub ports: TapPorts,
 }
 
 impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
+    /// The taps of `tap` into draft input rows `width` wide.
     pub fn new(
         graph: &mut G,
         tap: TapEntry<'a, G>,
-        rows: u64,
-        hidden_width: u64,
+        width: &Dim,
+        rows: &Dim,
+        hidden_width: &Dim,
         activation: Element,
     ) -> Result<Self, GraphError> {
         Ok(Self {
             entry: tap.entry,
-            width: tap.width,
-            hidden_width,
-            rows,
+            taps: width.checked_div(hidden_width).ok_or("draft input rows of no hidden width")?,
+            hidden_width: hidden_width.clone(),
+            rows: rows.clone(),
             positions: tap.positions,
             ports: TapPorts {
-                taps: graph.port_with_class_extent(activation, &[rows, tap.width], 0, "M")?,
+                taps: graph.port_with_class_extent(activation, &[rows, width], 0, "M")?,
                 entry: None,
                 middle: None,
                 output: None,
@@ -88,9 +88,9 @@ impl<'a, G: GraphDraft + 'a> Taps<'a, G> {
         hidden: &WorkflowTensor,
     ) -> Result<NativePort, GraphError> {
         let dimensions = [
-            ("M", self.rows),
-            ("D", self.hidden_width),
-            ("T", self.width / self.hidden_width),
+            ("M", &self.rows),
+            ("D", &self.hidden_width),
+            ("T", &self.taps),
         ];
         let index = graph.input_for(self.entry, "index", &dimensions)?;
         graph.enqueue(

@@ -72,7 +72,11 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     shared.commit_shrink(plan).unwrap();
     assert_eq!(mapped(), [1, 0, -1, -1]);
     let next = sequence + 2;
-    assert_eq!((map.resolve(1, next - 1), map.resolve(1, next)), (None, Some(1)), "moved for the steps not yet begun");
+    assert_eq!(
+        (map.resolve(1, next - 1), map.resolve(1, next)),
+        (Some(1), Some(1)),
+        "moved for the steps not yet begun, and for those its entry resolved"
+    );
     assert_eq!(shared.costs().records, [2]);
     assert_eq!(shared.held(), [vec![1, 2]]);
     // A regrowth adds free records, which the next seeds take; it joins
@@ -132,17 +136,20 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
 
 /// A host tier's shrink keeps the records a prompt group the device is past
 /// still holds claimed in place: a group whose step ended while its
-/// conveyor's reads were still queued (behind other demand reads) holds its
-/// lender's records until those reads end, and the shrink, asked between
-/// flights meanwhile, answers without waiting for them.
+/// conveyor's reads were still in flight (held, `Conveyor::hold_reads`)
+/// holds its lender's records until those reads end, and the shrink, asked
+/// between flights meanwhile, answers without waiting for them. Once the
+/// reads end, the group clears and its claims return.
 #[test]
 fn a_host_shrink_answers_beside_a_past_prompt_group_still_clearing() {
-    let _alone = alone();
     let harness = hosted_prompted("shrink-clearing", 12, 1, 16);
-    let ahead = Ahead::queue("shrink-clearing-ahead", 384);
+    let hold = |held: bool| residency::lock(&harness.watcher.state).scratch.conveyor.hold_reads(held);
+    hold(true);
     let step = harness.prompt_step();
     harness.publish(&step, 0, &[4, 5]);
-    std::thread::sleep(Duration::from_millis(50));
+    eventually("the group's reads were never submitted", || {
+        residency::lock(&harness.watcher.state).scratch.conveyor.reads_in_flight() > 0
+    });
     drop(step);
     let claimed = || {
         let state = residency::lock(&harness.watcher.state);
@@ -156,7 +163,9 @@ fn a_host_shrink_answers_beside_a_past_prompt_group_still_clearing() {
     eventually("the shrink never answered while the group cleared", || shrink.is_finished());
     shrink.join().unwrap().expect("the shrink is served");
     assert_eq!(claimed(), held, "the claimed records stayed in place");
-    ahead.finish();
+    hold(false);
+    harness.watcher.shared().events().notify();
+    eventually("the group never cleared once its reads ended", || claimed().is_empty());
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 

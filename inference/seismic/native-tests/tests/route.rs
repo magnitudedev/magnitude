@@ -661,7 +661,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap();
@@ -670,7 +670,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: (&first.value).into(),
-                    factor: 3.0,
+                    factor: seismic::Argument::from(3.0),
                 },
             )
             .unwrap();
@@ -1724,7 +1724,7 @@ fn scale_chain(
             &kernel,
             scale_rows::WorkflowArgs {
                 x: input.tensor().into(),
-                factor: chain_factor(0),
+                factor: seismic::Argument::from(chain_factor(0)),
             },
         )
         .unwrap()
@@ -1735,7 +1735,7 @@ fn scale_chain(
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: (&value).into(),
-                    factor: chain_factor(node),
+                    factor: seismic::Argument::from(chain_factor(node)),
                 },
             )
             .unwrap()
@@ -1826,7 +1826,7 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
                 &scale,
                 scale_rows::WorkflowArgs {
                     x: x.tensor().into(),
-                    factor: 3.0,
+                    factor: seismic::Argument::from(3.0),
                 },
             )
             .unwrap()
@@ -2203,7 +2203,7 @@ fn external_bindings_are_checked_at_attach() {
                 &scale,
                 scale_rows::WorkflowArgs {
                     x: x.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -2617,7 +2617,7 @@ fn tripling_graph(
             &scale,
             scale_records::WorkflowArgs {
                 x: x.tensor().into(),
-                factor: 3.0,
+                factor: seismic::Argument::from(3.0),
             },
         )
         .unwrap()

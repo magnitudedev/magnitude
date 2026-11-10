@@ -21,17 +21,19 @@ pub(crate) mod graph;
 use crate::SublayerTail;
 use crate::error::PlanError;
 use magnitude_family_contracts::{OutputForm, ShortConv};
-use seismic::Element;
+use crate::programs::graph::facts::{Numbers, constant};
+use seismic::{Dim, Element};
 
-/// Every static axis of a short convolution over a `hidden`-wide residual.
+/// Every static axis of a short convolution over a `hidden`-wide residual:
+/// the model's numbers (`u64`), or a graph's dimensions of them ([`Dim`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ShortConvShape {
+pub struct ShortConvShape<D = u64> {
     /// `H`: the hidden width.
-    pub hidden: u64,
+    pub hidden: D,
     /// `CH`: convolved channels.
-    pub channels: u64,
+    pub channels: D,
     /// `C`: convolution taps, the current row included.
-    pub convolution_width: u64,
+    pub convolution_width: D,
 }
 
 impl ShortConvShape {
@@ -45,46 +47,81 @@ impl ShortConvShape {
         })
     }
 
-    /// `short_conv_project`'s dimensions.
+    /// Its numbers as constant dimensions.
+    pub fn dims(&self) -> ShortConvShape<Dim> {
+        constant(*self)
+    }
+
     pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 3] {
-        [("M", rows), ("H", self.hidden), ("CH", self.channels)]
+        self.dims()
+            .project_dimensions(&Dim::from(rows))
+            .map(|(name, dim)| (name, dim.fixed()))
+    }
+
+    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        self.dims()
+            .output_dimensions(&Dim::from(rows))
+            .map(|(name, dim)| (name, dim.fixed()))
+    }
+}
+
+impl<D> Numbers<D> for ShortConvShape<D> {
+    type Of<E> = ShortConvShape<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> ShortConvShape<E> {
+        ShortConvShape {
+            hidden: f(self.hidden),
+            channels: f(self.channels),
+            convolution_width: f(self.convolution_width),
+        }
+    }
+}
+
+impl ShortConvShape<Dim> {
+    /// `short_conv_project`'s dimensions.
+    pub fn project_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 3] {
+        [
+            ("M", rows.clone()),
+            ("H", self.hidden.clone()),
+            ("CH", self.channels.clone()),
+        ]
     }
 
     /// `short_conv_rows`' dimensions for `slots` slots over `banks` banks
     /// with `tape_rows` tape rows each.
     pub fn rows_dimensions(
         &self,
-        rows: u64,
-        slots: u64,
-        banks: u64,
-        tape_rows: u64,
-    ) -> [(&'static str, u64); 6] {
+        rows: &Dim,
+        slots: &Dim,
+        banks: &Dim,
+        tape_rows: &Dim,
+    ) -> [(&'static str, Dim); 6] {
         [
-            ("M", rows),
-            ("B", slots),
-            ("S", banks),
-            ("CH", self.channels),
-            ("C", self.convolution_width),
-            ("T", tape_rows),
+            ("M", rows.clone()),
+            ("B", slots.clone()),
+            ("S", banks.clone()),
+            ("CH", self.channels.clone()),
+            ("C", self.convolution_width.clone()),
+            ("T", tape_rows.clone()),
         ]
     }
 
     /// `attention_output`'s dimensions: one head of `channels`.
-    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+    pub fn output_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 6] {
         // One residual stream (`scatter` without inject).
         [
-            ("M", rows),
-            ("D", self.hidden),
-            ("SN", 1),
-            ("IN", 0),
-            ("Q", 1),
-            ("W", self.channels),
+            ("M", rows.clone()),
+            ("D", self.hidden.clone()),
+            ("SN", Dim::from(1u64)),
+            ("IN", Dim::from(0u64)),
+            ("Q", Dim::from(1u64)),
+            ("W", self.channels.clone()),
         ]
     }
 
-    /// The tape rows of a window of `window_rows` rows.
-    pub fn tape_rows(&self, window_rows: u64) -> Option<u64> {
-        window_rows.checked_sub(self.convolution_width - 1)
+    /// The tape rows of a window of `window_rows` rows: none where the
+    /// window is narrower than the taps before the current row.
+    pub fn tape_rows(&self, window_rows: &Dim) -> Option<Dim> {
+        window_rows.checked_sub(&self.convolution_width - 1u64)
     }
 }
 

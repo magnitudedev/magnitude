@@ -16,6 +16,7 @@ use magnitude_family_contracts::{
     VisionLinearSite, VisionNorm, VisionNormSite, VisionOperator, VisionStem, VisionUp,
     VisionWeight, WeightKind, WeightRole, WeightScope,
 };
+use crate::programs::graph::facts::Numbers;
 use seismic::Element;
 
 /// The entries a vision program invokes.
@@ -44,7 +45,7 @@ pub struct VisionKernel {
 
 /// How many rows an operand has: one per tower row (the image's patches,
 /// after the stem's register rows), or one per merged cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VisionRows {
     Patches,
     Cells,
@@ -52,7 +53,7 @@ pub enum VisionRows {
 
 /// A value of the tower: a graph input, or the result of an earlier
 /// invocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VisionValue {
     /// The prepared patch rows, `[M, frames · C · P · P]` F32, after the
     /// register rows' zero pixels.
@@ -64,9 +65,11 @@ pub enum VisionValue {
 }
 
 /// The operands of one invocation. Absent optional weights bind an empty
-/// F32 constant of the argument's shape.
-#[derive(Clone, Debug, PartialEq)]
-pub enum VisionOperands {
+/// F32 constant of the argument's shape. Its real scalar arguments are `R`s
+/// ([`Numbers`] over them): the model's floats in a program, their indexes
+/// in a graph's trace key, recorded arguments in its builder.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VisionOperands<R = f32> {
     PatchStem {
         frame: WeightRole,
         next_frame: Option<WeightRole>,
@@ -81,7 +84,7 @@ pub enum VisionOperands {
         bias: Option<WeightRole>,
         /// The result gathers the source rows through the merge order input.
         gathered: bool,
-        epsilon: f32,
+        epsilon: R,
         centered: bool,
         interleave: bool,
     },
@@ -110,8 +113,8 @@ pub enum VisionOperands {
         key_norm: Option<WeightRole>,
         value_norm: bool,
         span: VisionAttentionSpan,
-        log_base: f32,
-        epsilon: f32,
+        log_base: R,
+        epsilon: R,
         unit_scale: bool,
     },
     /// `A(A(conv(value)) * gate)` over the image's patch grid.
@@ -123,8 +126,8 @@ pub enum VisionOperands {
     Pool {
         source: VisionValue,
         standard: Option<(WeightRole, WeightRole)>,
-        weight: f32,
-        scale: f32,
+        weight: R,
+        scale: R,
     },
     Position {
         source: VisionValue,
@@ -141,8 +144,88 @@ pub enum VisionOperands {
         residual: VisionValue,
         projected: VisionValue,
         norm: WeightRole,
-        epsilon: f32,
+        epsilon: R,
     },
+}
+
+impl<R> Numbers<R> for VisionOperands<R> {
+    type Of<E> = VisionOperands<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> VisionOperands<E> {
+        match self {
+            Self::PatchStem { frame, next_frame, bias, table } => {
+                VisionOperands::PatchStem { frame, next_frame, bias, table }
+            }
+            Self::Norm { source, rows, weight, bias, gathered, epsilon, centered, interleave } => {
+                VisionOperands::Norm { source, rows, weight, bias, gathered, epsilon: f(epsilon), centered, interleave }
+            }
+            Self::Linear { x, rows, weight, bias, residual, gate, bounds, activation } => {
+                VisionOperands::Linear { x, rows, weight, bias, residual, gate, bounds, activation }
+            }
+            Self::Clamp { x, rows, minimum, maximum } => VisionOperands::Clamp { x, rows, minimum, maximum },
+            Self::Attention {
+                query,
+                key,
+                value,
+                query_norm,
+                key_norm,
+                value_norm,
+                span,
+                log_base,
+                epsilon,
+                unit_scale,
+            } => {
+                let log_base = f(log_base);
+                VisionOperands::Attention {
+                    query,
+                    key,
+                    value,
+                    query_norm,
+                    key_norm,
+                    value_norm,
+                    span,
+                    log_base,
+                    epsilon: f(epsilon),
+                    unit_scale,
+                }
+            }
+            Self::GatedConvolution { value, gate, kernel } => VisionOperands::GatedConvolution { value, gate, kernel },
+            Self::Pool { source, standard, weight, scale } => {
+                let weight = f(weight);
+                VisionOperands::Pool { source, standard, weight, scale: f(scale) }
+            }
+            Self::Position { source, table } => VisionOperands::Position { source, table },
+            Self::Registers { source, table } => VisionOperands::Registers { source, table },
+            Self::PostNormResidual { residual, projected, norm, epsilon } => {
+                VisionOperands::PostNormResidual { residual, projected, norm, epsilon: f(epsilon) }
+            }
+        }
+    }
+}
+
+impl<R> VisionOperands<R> {
+    /// The weights the invocation reads, in operand order.
+    pub fn weights(&self) -> Vec<WeightRole> {
+        match self {
+            Self::PatchStem { frame, next_frame, bias, table } => {
+                std::iter::once(*frame).chain(*next_frame).chain(*bias).chain(*table).collect()
+            }
+            Self::Norm { weight, bias, .. } => weight.iter().chain(bias).copied().collect(),
+            Self::Linear { weight, bias, bounds, .. } => std::iter::once(*weight)
+                .chain(*bias)
+                .chain(bounds.iter().flat_map(|&(minimum, maximum)| [minimum, maximum]))
+                .collect(),
+            Self::Clamp { minimum, maximum, .. } => vec![*minimum, *maximum],
+            Self::Attention { query_norm, key_norm, .. } => {
+                query_norm.iter().chain(key_norm).copied().collect()
+            }
+            Self::GatedConvolution { kernel, .. } => vec![*kernel],
+            Self::Pool { standard, .. } => {
+                standard.iter().flat_map(|&(bias, scale)| [bias, scale]).collect()
+            }
+            Self::Position { table, .. } | Self::Registers { table, .. } => vec![*table],
+            Self::PostNormResidual { norm, .. } => vec![*norm],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

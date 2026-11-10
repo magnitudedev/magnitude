@@ -78,28 +78,14 @@ impl PlanPrices {
     }
 }
 
-/// How a plan's settle meets a bank's prices that are not measured: the
-/// one decision of what an unmeasured machine's plan holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Unmeasured {
-    /// A load's plan: its bank waits for them (`PlanError::Unpriced`, which
-    /// every host meets by having them measured, `preview::priced`).
-    Waits,
-    /// An assessment's: the bank is sized by memory alone, the largest the
-    /// room admits at the floor pass, its host tier the most host memory
-    /// admits, and its speed is what is pending or unavailable.
-    SizedByMemory,
-}
-
-impl Unmeasured {
-    /// The prices a settle takes of `priced`: none where it sizes by memory.
-    pub(crate) fn prices<T>(self, priced: Priced<T>) -> Result<Option<T>, PlanError> {
-        match (priced, self) {
-            (Priced::Measured(prices), _) => Ok(Some(prices)),
-            (_, Self::SizedByMemory) => Ok(None),
-            (Priced::Pending(reason), Self::Waits) => Err(PlanError::Unpriced { pending: true, reason }),
-            (Priced::Unavailable(reason), Self::Waits) => Err(PlanError::Unpriced { pending: false, reason }),
-        }
+/// The prices a load's settle takes of `priced`: a bank waits for prices
+/// that are not measured (`PlanError::Unpriced`, which every host meets by
+/// having them measured, `preview::priced`).
+pub(crate) fn measured<T>(priced: Priced<T>) -> Result<T, PlanError> {
+    match priced {
+        Priced::Measured(prices) => Ok(prices),
+        Priced::Pending(reason) => Err(PlanError::Unpriced { pending: true, reason }),
+        Priced::Unavailable(reason) => Err(PlanError::Unpriced { pending: false, reason }),
     }
 }
 

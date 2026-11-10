@@ -58,7 +58,7 @@ impl Directory {
     /// A claim of `layer`'s lacked `expert`: the record taken, none
     /// where short.
     fn land(&mut self, layer: usize, expert: usize, keep: usize) -> Option<HostRecord> {
-        match self.claim_landing(layer, expert, keep) {
+        match self.claim_landing(layer, expert, keep, Taking::Out) {
             Claim::Taken(grant) => Some(HostRecord(grant.record())),
             Claim::Short => None,
             Claim::Kept(_) | Claim::Landing => panic!("({layer}, {expert}) is not lacked"),
@@ -873,7 +873,7 @@ fn landed_before(directory: &mut Directory, experts: &[usize]) -> Vec<u32> {
     experts
         .iter()
         .map(|&expert| {
-            let Claim::Taken(grant) = directory.claim_landing(0, expert, 0) else { panic!("a ready record for {expert}") };
+            let Claim::Taken(grant) = directory.claim_landing(0, expert, 0, Taking::Out) else { panic!("a ready record for {expert}") };
             grant.map();
             directory.landed(0, HostRecord(grant.record()), expert, None);
             grant.record()

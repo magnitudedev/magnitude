@@ -1,8 +1,8 @@
 //! Reading one remote GGUF header by exact range requests.
 //!
-//! The reader walks the header ([`magnitude_artifacts::gguf::walk`]) in the bytes in hand and asks
-//! for about as many more as the walk says the header still needs, so a header costs its own
-//! length plus little, in few requests. Every file of a repository after the first is read with
+//! The reader walks the header in the bytes in hand ([`magnitude_artifacts::gguf::HeaderBytes`],
+//! each walk continuing where the last stopped) and asks for about as many more as the walk says
+//! the header still needs, so a header costs its own length plus little, in few requests. Every file of a repository after the first is read with
 //! the headers already read as references: quantizations of one model carry the same tokenizer,
 //! which is nearly all of a header (16 MB of a Gemma 4 header's 16 MB), as a few large metadata
 //! entries. When the walk reaches an entry whose fixed part (key, type and element count) matches
@@ -19,7 +19,7 @@ use std::ops::Range;
 
 use magnitude_service_contracts::InventoryError;
 
-use magnitude_artifacts::gguf::{Entry, EntryHead, HEADER_LIMIT, Walk, walk};
+use magnitude_artifacts::gguf::{Entry, HEADER_LIMIT, HeaderBytes, Walk, walk};
 
 use crate::header_cache::shared;
 use crate::preview::RemoteRanges;
@@ -67,7 +67,7 @@ struct SharedRun<'a> {
 
 impl SharedRun<'_> {
     fn start(&self) -> usize {
-        self.entries[0].head.start
+        self.entries[0].head().start
     }
 
     fn end(&self) -> usize {
@@ -100,7 +100,7 @@ pub(crate) async fn read_header(
     let first = references
         .iter()
         .filter_map(|reference| reference.entries.iter().find(|entry| shared(entry)))
-        .map(|entry| entry.head.end + EDGE_BYTES)
+        .map(|entry| entry.head().end + EDGE_BYTES)
         .min()
         .unwrap_or(INITIAL_READ_BYTES)
         .min(bound);
@@ -109,82 +109,82 @@ pub(crate) async fn read_header(
             "the file ends before its GGUF header does".to_owned(),
         ));
     }
-    let mut bytes = remote.read(0, first).await?;
+    let mut header = HeaderBytes::new();
+    header.extend_from_slice(&remote.read(0, first).await?);
     let mut declined = Vec::new();
     loop {
-        match walk(&bytes).map_err(|error| InventoryError::Integrity(error.to_string()))? {
-            Walk::Complete(header) => {
-                let end = header.data_offset.min(logical_length);
-                if bytes.len() < end {
-                    let rest = remote.read(bytes.len(), end).await?;
-                    bytes.extend_from_slice(&rest);
+        match header
+            .walk()
+            .map_err(|error| InventoryError::Integrity(error.to_string()))?
+        {
+            Walk::Complete(whole) => {
+                let end = whole.data_offset.min(logical_length);
+                let held = header.bytes().len();
+                if held < end {
+                    let rest = remote.read(held, end).await?;
+                    header.extend_from_slice(&rest);
                 }
+                let mut bytes = header.into_bytes();
                 bytes.truncate(end);
                 return Ok(bytes);
             }
             Walk::Incomplete(prefix) => {
-                if bytes.len() + prefix.minimum > logical_length {
+                let (minimum, estimate) = (prefix.minimum, prefix.estimate);
+                let open = prefix.open.map(|open| open.start..open.end);
+                let held = header.bytes().len();
+                if held + minimum > logical_length {
                     return Err(InventoryError::Integrity(
                         "the file ends before its GGUF header does".to_owned(),
                     ));
                 }
-                let estimate = prefix.estimate;
-                if let Some(open) = prefix.open.filter(|open| !declined.contains(&open.start)) {
+                if let Some(open) = open.filter(|open| !declined.contains(&open.start)) {
                     let start = open.start;
-                    let head = bytes[open.start..open.end].to_vec();
+                    let head = header.bytes()[open].to_vec();
                     // The file's own repository first, then any cached header holding an entry
                     // with this fixed part (another repository of the same model, the catalog's).
-                    let lent = if shared_run(&references, &bytes, &open).is_some() {
+                    let lent = if shared_run(&references, &head).is_some() {
                         Vec::new()
                     } else {
-                        sharing(head).await
+                        sharing(head.clone()).await
                     };
                     let lent = lent
                         .iter()
                         .filter_map(|bytes| match walk(bytes) {
-                            Ok(Walk::Complete(header)) if header.entries.iter().any(shared) => {
-                                Some(Reference { bytes, entries: header.entries })
+                            Ok(Walk::Complete(whole)) if whole.entries.iter().any(shared) => {
+                                Some(Reference { bytes, entries: whole.entries })
                             }
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    let run = shared_run(&references, &bytes, &open)
-                        .or_else(|| shared_run(&lent, &bytes, &open));
-                    if let Some(run) = run {
-                        let taken = share(remote, &mut bytes, start, &run, bound).await?;
-                        if taken < run.entries.len() {
-                            declined.push(start + run.entries[taken].head.start - run.start());
+                    match shared_run(&references, &head).or_else(|| shared_run(&lent, &head)) {
+                        Some(run) => {
+                            let taken = share(remote, &mut header, start, &run, bound).await?;
+                            if taken < run.entries.len() {
+                                declined.push(start + run.entries[taken].head().start - run.start());
+                            }
+                            if taken > 0 {
+                                continue;
+                            }
                         }
-                        if taken > 0 {
-                            continue;
-                        }
-                    } else {
-                        declined.push(start);
+                        None => declined.push(start),
                     }
                 }
-                let target = bytes
-                    .len()
+                let target = held
                     .saturating_add(estimate.clamp(MIN_READ_BYTES, MAX_READ_BYTES))
                     .min(bound);
-                let range = remote.read(bytes.len(), target).await?;
-                bytes.extend_from_slice(&range);
+                let range = remote.read(held, target).await?;
+                header.extend_from_slice(&range);
             }
         }
     }
 }
 
-/// The run of large reference entries starting with one whose fixed part is `open`'s.
-fn shared_run<'a>(
-    references: &'a [Reference<'a>],
-    bytes: &[u8],
-    open: &EntryHead<'_>,
-) -> Option<SharedRun<'a>> {
-    let head = &bytes[open.start..open.end];
+/// The run of large reference entries starting with one whose fixed part is `head` (its bytes,
+/// which hold its key).
+fn shared_run<'a>(references: &'a [Reference<'a>], head: &[u8]) -> Option<SharedRun<'a>> {
     references.iter().find_map(|reference| {
         let first = reference.entries.iter().position(|entry| {
-            shared(entry)
-                && entry.head.key == open.key
-                && reference.bytes[entry.head.start..entry.head.end] == *head
+            shared(entry) && reference.bytes[entry.head().start..entry.head().end] == *head
         })?;
         let count = reference.entries[first..]
             .iter()
@@ -204,27 +204,27 @@ fn shared_run<'a>(
 /// follow, about as many as the reference has after it.
 async fn share(
     remote: &mut RemoteRanges<'_>,
-    bytes: &mut Vec<u8>,
+    bytes: &mut HeaderBytes,
     open: usize,
     run: &SharedRun<'_>,
     bound: usize,
 ) -> Result<usize, InventoryError> {
     let reference = run.reference;
-    let held = bytes.len();
+    let held = bytes.bytes().len();
     let target = |offset: usize| open + offset - run.start();
     let end = target(run.end());
     if end > bound || end <= held + WINDOW_BYTES {
         return Ok(0);
     }
-    if bytes[open..] != reference[run.start()..run.start() + held - open] {
+    if bytes.bytes()[open..] != reference[run.start()..run.start() + held - open] {
         return Ok(0);
     }
     let checks = run
         .entries
         .iter()
         .map(|entry| {
-            let (start, end) = (target(entry.head.start), target(entry.end));
-            let middle = target(entry.head.start + entry.range().len() / 2);
+            let (start, end) = (target(entry.head().start), target(entry.end));
+            let middle = target(entry.head().start + entry.range().len() / 2);
             [
                 start..start + EDGE_BYTES,
                 middle - WINDOW_BYTES / 2..middle + WINDOW_BYTES / 2,

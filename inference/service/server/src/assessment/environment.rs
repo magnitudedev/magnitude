@@ -86,8 +86,9 @@ pub fn assessment_structure(
 pub struct AssessmentEnvironment {
     pub id: AssessmentEnvironmentId,
     pub setup: AssessmentSetup,
-    /// The identity of the structure alone, derived once with it: what a model's preparation,
-    /// which reads only the structure, is keyed by.
+    /// The identity of the structure without what the records price of it (its graphs' cost),
+    /// derived once with it: what a model's preparation, which reads nothing the records price,
+    /// is keyed by, so records that land prepare no model again.
     pub structure_id: Arc<str>,
 }
 
@@ -103,20 +104,13 @@ impl AssessmentEnvironment {
     }
 
     /// The environment of what the stored records give assessment now (`stored`,
-    /// [`AssessmentStructure::stored`]): this one's structure identity while its structure is
-    /// this one's, a new one when the records priced an input of it anew.
+    /// [`AssessmentStructure::stored`]): the records price only this structure's graphs, which
+    /// its identity leaves out, so it is this one's.
     pub fn stored(&self, stored: AssessmentSetup) -> Self {
-        let structure_id = if Arc::ptr_eq(&stored.structure, &self.setup.structure) {
-            Arc::clone(&self.structure_id)
-        } else {
-            // The records price the same structure anew: its host sample is the one this
-            // identity was derived from.
-            structure_id(&stored.structure).expect("a stored structure keeps its host sample")
-        };
-        Self::of(stored.structure, structure_id, stored.measurements)
+        Self::of(stored.structure, Arc::clone(&self.structure_id), stored.measurements)
     }
 
-    /// Only stable evidence enters identity: the structure's, and the executor costs once
+    /// Only stable evidence enters identity: the structure's, its graphs' cost, and the executor costs once
     /// derived (that they are pending, or unavailable and why, otherwise), not current usage or
     /// measurement timestamps. The costs enter as the stored records they were derived from (the
     /// structure's identity includes the engine build, which derives costs from records). No
@@ -135,6 +129,7 @@ impl AssessmentEnvironment {
         };
         let material = json!({
             "structure": &*structure_id,
+            "graph_cost": structure.selected.graph_cost,
             "measurements": measured,
         });
         Self {
@@ -157,9 +152,10 @@ fn structure_id(structure: &AssessmentStructure) -> anyhow::Result<Arc<str>> {
     Ok(format!("structure_{:x}", Sha256::digest(identity.to_string().as_bytes())).into())
 }
 
-/// What of `structure` enters identity: the engine build, the selected device and what its graphs
-/// are priced at, the topology's normalized structure, the process limits and their visibility,
-/// the reserves and the configuration models are assessed with.
+/// What of `structure` enters identity: the engine build, the selected device, the topology's
+/// normalized structure, the process limits and their visibility, the reserves and the
+/// configuration models are assessed with. Its graphs' cost, which the records price, enters
+/// the environment's ([`AssessmentEnvironment::of`]).
 fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_json::Value> {
     let host = structure
         .status
@@ -175,7 +171,6 @@ fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_j
     Ok(json!({
         "engine_build": EngineBuild::current().0,
         "device": structure.selected.info.selector().to_string(),
-        "graph_cost": structure.selected.graph_cost,
         "topology": structure.topology.normalized(),
         "process_limits": process_limits,
         "limit_visibility": host.limit_visibility,

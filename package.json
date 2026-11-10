@@ -52,6 +52,7 @@
     "icn:openapi": "cargo run --manifest-path inference/Cargo.toml -p magnitude-service-api --bin export-openapi --",
     "icn:check": "cargo check --manifest-path inference/Cargo.toml --workspace",
     "icn:build": "bun run inference/scripts/build-local.ts",
+    "icn:build:release": "bun run inference/scripts/build-local.ts --release",
     "icn:test": "cargo test --manifest-path inference/Cargo.toml --workspace",
     "icn:serve": "bun run inference/scripts/build-local.ts --serve",
     "icn:doctor": "cargo run --manifest-path inference/Cargo.toml -p magnitude-service-server -- doctor",

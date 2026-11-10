@@ -3,43 +3,46 @@ use super::classes::BlockClass;
 use super::{
     classes::{StagedClass, block_routed},
     heap::owned_vectors_heap,
-    weights::{BankPort, GraphTimeline, WeightPort, activation},
+    weights::{BankPort, BlockWeights, GraphTimeline, GraphWeights, PlannedWeights, WeightPort, activation},
 };
 use crate::{
     ModelLoadPlan, StateResourcePlan, TargetBlockProgramSlot,
     native::{AttestedTargetBlock, OutputScales},
     operators::{
-        block,
+        ExitMix, block,
         block::{
-            BlockState, FeedForwardGraph, MixerEntries, NGramParts, PerLayerParts,
+            BlockState, FeedForwardGraph, MixerEntries, SublayerGraph, SublayersNumbers,
+            SublayersTopology,
         },
-        ngram::graph::{CheckedNGramEntries, NGramStepPorts},
+        ngram::graph::{CheckedNGramEntries, NGramEntries, NGramStepPorts},
         paired_block,
+        per_layer::graph::{CheckedPerLayerEntries, PerLayerEntries},
         routed::{
-            split::{OnceStage, PassPorts, RunStage, SplitPorts, Stage, StagePorts},
+            split::{self, OnceStage, PassPorts, RunStage, SplitBuild, SplitForm, SplitLayer, SplitPorts, Stage},
             streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank},
         },
-        ExitMix,
         streams::{
-            ResidualCarry, StreamsGeometry,
+            ResidualCarry, StreamsGeometry, StreamsMixing,
             graph::{CheckedStreamsEntries, MixingEntries, StreamsEntries, collapse, mix_site, widen},
         },
     },
     programs::{
         graph::{
             GraphError,
-            draft::GraphDraft,
+            draft::{Certified, GraphDraft},
+            facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex, constant, constant_reals},
             tap::{TapEntry, TapPorts, TapPositions, Taps},
         },
-        native_constants::{FamilyConstants, GraphConstant},
+        native_constants::{FamilyConstants, GraphConstant, RecordedConstant},
     },
 };
 use magnitude_family_contracts::{Decoder, ExitNorm, WeightScope};
 #[cfg(test)]
 use seismic::NativeGraphStorageBytes;
 use seismic::{
-    BackendName, Device, Element, HostHeap, NativeGraphLayout, NativeGraphMetadata,
-    NativeGraphPlan, NativePort, NativeTimelinePort, WorkflowTensor,
+    BackendName, ClassFact, Device, Dim, Element, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
+    NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphTraces, NativePort,
+    NativeTimelinePort, Reals, Table, TraceOutput, WorkflowTensor, Argument,
 };
 use std::sync::Arc;
 
@@ -55,7 +58,7 @@ fn slot_lists(
     match slot.mixer() {
         crate::MixerProgramSlot::Attention(binding) => {
             crate::operators::attention::graph::lists_history_tiles(binding)
-                && state.lists_history_tiles(backend, binding.shape.width)
+                && state.lists_history_tiles(backend, binding.shape.widths.width)
         }
         _ => false,
     }
@@ -63,12 +66,12 @@ fn slot_lists(
 
 /// A prepared block graph and the ports of its stage (`StagePorts`): a
 /// run's stage's (`P`, a split layer's front's or back's, none of a whole
-/// block's or a fill's), or its group's pass's (`PassPorts`).
+/// block's or a fill's), or its group's pass's (`PassGraph`). Its weights,
+/// banks and parks name their scopes relative to its block
+/// (`relative_scope`), so equal-shape blocks share it, each binding its own
+/// (`block_scope`).
 #[derive(Clone)]
 pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
-    /// The block it was prepared for, whose roles and layers `weights` and
-    /// `banks` name.
-    pub block: usize,
     pub residual: Option<WorkflowTensor>,
     pub plan: NativeGraphPlan,
     /// The carry it reads: none of a pass, which reads only crossed rows.
@@ -78,7 +81,7 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     pub banks: Vec<(BankPort, NativePort)>,
     /// The park nodes before its calls that wait for the host, and the
     /// publications after its site requests, each with the scope of its
-    /// streamed layer in the block the graph was prepared for, which each
+    /// streamed layer relative to the block (`relative_scope`), which each
     /// run binds (`crate::experts::Parks`).
     pub parks: Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
     /// Host constants bound statically with the weights.
@@ -113,7 +116,26 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
 /// its group's pass's.
 pub(super) enum SealedBlockGraph {
     Run(Arc<PreparedTargetBlockGraph>),
-    Pass(Arc<PreparedTargetBlockGraph<PassPorts>>),
+    Pass(Arc<PreparedTargetBlockGraph<PassGraph>>),
+}
+
+/// The ports of a block graph of a stage ([`Stage`]): a run's, which a
+/// split layer's front or back crosses or merges values through (none of a
+/// whole block's or a fill's), or its merge set's pass's, with the expert
+/// tiles its merged experts hold. A prepared graph is held by which of the
+/// two it has, so a run's graph and a pass's are apart by type.
+enum StagePorts {
+    Run(Option<SplitPorts>),
+    Pass(PassPorts, Dim),
+}
+
+/// A prepared pass's ports, and the expert tiles of the merged experts it
+/// writes, as its graph was built: what each pass binds of the group's
+/// merged buffers.
+#[derive(Clone)]
+pub(crate) struct PassGraph {
+    pub ports: PassPorts,
+    pub blocks: u64,
 }
 
 /// A block's prepared graphs: a run's stages' graph of each class, and its
@@ -126,61 +148,59 @@ pub(super) enum SealedBlockGraph {
 #[derive(Clone)]
 pub(super) struct BlockGraphs {
     pub(super) runs: Vec<(StagedClass, Arc<PreparedTargetBlockGraph>)>,
-    pub(super) passes: Vec<(u64, Arc<PreparedTargetBlockGraph<PassPorts>>)>,
+    pub(super) passes: Vec<(u64, Arc<PreparedTargetBlockGraph<PassGraph>>)>,
     pub(super) untapped: Vec<(StagedClass, Arc<PreparedTargetBlockGraph>)>,
 }
 
 impl SealedBlockGraph {
+    /// The block graph `inputs` names, built from its split at the model's
+    /// own numbers over the load's weights into `layout`.
     pub(super) fn prepare<'a>(
         device: &Device,
         handle: &'a AttestedTargetBlock,
-        tap: Option<TapEntry<'a, seismic::NativeGraph>>,
+        tap: Option<(u64, TapEntry<'a, seismic::NativeGraph>)>,
         slot: TargetBlockProgramSlot,
         inputs: BlockGraphInputs<'_>,
         layout: &NativeGraphLayout,
         family: &FamilyConstants,
     ) -> Result<Self, String> {
-        let BlockGraphInputs { geometry, block_index, rows, stage, .. } = inputs;
+        let stage = inputs.stage;
+        let text = |error: GraphError| error.to_string();
+        let planned = inputs.weights().map_err(text)?;
         let mut graph = device.native_graph_with_layout(layout);
         let mut weights = Vec::new();
         let mut constants = Vec::new();
-        let hidden = stage_input(geometry, block_index, stage)?
-            .map(|carry| carry.try_map(|width| graph.port(Element::f32(), &[rows, width])))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        let mixer = (&handle.mixer).into();
-        let feed_forward = handle.feed_forward.as_ref().map(Into::into);
         let mut banks = Vec::new();
         let mut parks = Vec::new();
         let bank = layer_bank(stage, handle.bank.as_ref().map(BankGraphEntries::from), &mut banks, &mut parks);
-        let streams = handle.streams.as_ref().map(Into::into);
-        let per_layer = match (&handle.per_layer, slot.per_layer()) {
-            (None, None) => None,
-            (Some(kernels), Some(binding)) => Some((kernels.into(), binding)),
-            _ => return Err("the block's per-layer kernels disagree with its binding".into()),
-        };
-        let ngram = match (&handle.ngram, slot.ngram()) {
-            (None, None) => None,
-            (Some(kernels), Some(binding)) => Some((kernels.into(), binding)),
-            _ => return Err("the block's n-gram kernels disagree with its binding".into()),
+        let (shape, numbers) =
+            inputs.split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions))).map_err(text)?;
+        let (shape, numbers) = (constant_reals(shape).tables(Table::from), constant(numbers));
+        let hidden = numbers
+            .input
+            .clone()
+            .map(|carry| carry.try_map(|width| GraphDraft::port(&mut graph, Element::f32(), &[&numbers.sublayers.rows, &width])))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let entries = BlockEntries {
+            tap: tap.map(|(_, tap)| tap),
+            mixer: (&handle.mixer).into(),
+            feed_forward: FeedForwardGraph { entries: handle.feed_forward.as_ref().map(Into::into), bank },
+            per_layer: handle.per_layer.as_ref().map(Into::into),
+            ngram: handle.ngram.as_ref().map(Into::into),
+            streams: handle.streams.as_ref().map(Into::into),
         };
         let parts = block_graph(
             &mut graph,
-            tap,
-            mixer,
-            FeedForwardGraph {
-                entries: feed_forward,
-                bank,
-            },
-            per_layer,
-            ngram,
-            streams,
+            entries,
             hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
-            inputs,
+            &shape,
+            &numbers,
+            &planned,
             &mut weights,
             &mut constants,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(text)?;
         // A graph sealed once stores what it computes; a run's exports its
         // carry.
         if let Stage::Run(_) = stage {
@@ -209,7 +229,6 @@ impl SealedBlockGraph {
         macro_rules! graph {
             ($ports:expr) => {
                 Arc::new(PreparedTargetBlockGraph {
-                    block: block_index,
                     plan,
                     hidden,
                     weights,
@@ -230,7 +249,7 @@ impl SealedBlockGraph {
         }
         Ok(match parts.ports {
             StagePorts::Run(ports) => Self::Run(graph!(ports)),
-            StagePorts::Pass(ports) => Self::Pass(graph!(ports)),
+            StagePorts::Pass(ports, blocks) => Self::Pass(graph!(PassGraph { ports, blocks: blocks.fixed() })),
         })
     }
 }
@@ -298,6 +317,187 @@ impl<'a> BlockGraphInputs<'a> {
             capacity,
             residual: false,
         }
+    }
+}
+
+/// What a block graph's builder branches on apart from its kernel entries
+/// (`BlockGraphInputs::split`): its stage, whether it exports its residual,
+/// its draft taps' positions and element, its routed layer's crossing, the
+/// decoder exit it ends with (the last block of residual streams), and its
+/// sublayers'. No model number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct BlockShape<R = Argument<f64>, T = Table> {
+    stage: Stage,
+    /// Block 0, which widens the embedded rows into residual streams.
+    first: bool,
+    residual: bool,
+    tap: Option<TapPositions>,
+    activation: Element,
+    split: Option<SplitForm>,
+    exit: Option<ExitTopology<R>>,
+    sublayers: SublayersTopology<R, T>,
+}
+
+impl<R, T> BlockShape<R, T> {
+    /// It with its tables `f` of its own (`SublayersTopology::tables`).
+    fn tables<U>(self, f: impl FnMut(T) -> U) -> BlockShape<R, U> {
+        BlockShape {
+            stage: self.stage,
+            first: self.first,
+            residual: self.residual,
+            tap: self.tap,
+            activation: self.activation,
+            split: self.split,
+            exit: self.exit,
+            sublayers: self.sublayers.tables(f),
+        }
+    }
+}
+
+impl<R, T> Numbers<R> for BlockShape<R, T> {
+    type Of<E> = BlockShape<E, T>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> BlockShape<E, T> {
+        BlockShape {
+            stage: self.stage,
+            first: self.first,
+            residual: self.residual,
+            tap: self.tap,
+            activation: self.activation,
+            split: self.split,
+            exit: self.exit.map(|exit| match exit {
+                ExitTopology::LowRank { epsilon } => ExitTopology::LowRank { epsilon: f(epsilon) },
+                ExitTopology::Collapse => ExitTopology::Collapse,
+            }),
+            sublayers: self.sublayers.map(f),
+        }
+    }
+}
+
+/// The decoder's exit at the end of the last block of residual streams: a
+/// low-rank exit site at its norm's epsilon, whose partials the readout
+/// sums, or the collapse of Sinkhorn streams by the last site's pre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ExitTopology<R> {
+    LowRank { epsilon: R },
+    Collapse,
+}
+
+/// Every number a block graph is sized by: the rows a pass groups, its
+/// draft input rows' width, the carry it reads, its routed layer's
+/// crossing and its sublayers'.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct BlockNumbers<D = Dim> {
+    capacity: D,
+    tap: Option<D>,
+    input: Option<ResidualCarry<D>>,
+    split: Option<SplitLayer<D>>,
+    sublayers: SublayersNumbers<D>,
+}
+
+impl<D> Numbers<D> for BlockNumbers<D> {
+    type Of<E> = BlockNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> BlockNumbers<E> {
+        BlockNumbers {
+            capacity: f(self.capacity),
+            tap: self.tap.map(&mut *f),
+            input: self.input.map(|carry| ResidualCarry { rows: f(carry.rows), pre: carry.pre.map(&mut *f) }),
+            split: self.split.map(|layer| layer.map(&mut *f)),
+            sublayers: self.sublayers.map(f),
+        }
+    }
+}
+
+impl<'a> BlockGraphInputs<'a> {
+    /// The block's index as its scopes name it.
+    fn block(&self) -> Result<u32, GraphError> {
+        Ok(u32::try_from(self.block_index).map_err(|_| "target block index exceeds u32")?)
+    }
+
+    /// The load's weights as the block's graph reads them (`BlockWeights`).
+    fn weights(&self) -> Result<BlockWeights<'a>, GraphError> {
+        Ok(BlockWeights { load: self.load, block: self.block()? })
+    }
+
+    /// The block graph as its builder branches on it and the numbers it is
+    /// sized by, its routed layer reading its experts as `bank` says and
+    /// its draft taps (`tap`: the draft input rows' width and the
+    /// positions) as given: the one place its model numbers are read.
+    fn split<G: GraphDraft>(
+        &self,
+        slot: TargetBlockProgramSlot,
+        bank: &LayerBank<'_, '_, G>,
+        tap: Option<(u64, TapPositions)>,
+    ) -> Result<(BlockShape<f64, Arc<[u8]>>, BlockNumbers<u64>), GraphError> {
+        let Self {
+            load,
+            geometry,
+            state,
+            block_index,
+            rows,
+            segments,
+            slots,
+            listed,
+            scored,
+            output_scales,
+            stage,
+            capacity,
+            residual,
+        } = *self;
+        let block = geometry.blocks.get(block_index).ok_or("target block geometry is absent")?;
+        let paired = paired_block(block).map_err(|error| error.to_string())?;
+        let (sublayers, numbers) = block::BlockSublayers {
+            lane: block::BlockLane::Target,
+            paired: &paired,
+            load,
+            geometry,
+            state,
+            block_index,
+            rows,
+            segments,
+            slots,
+            listed,
+            scored,
+            output_scales,
+        }
+        .split(bank, slot.per_layer(), slot.ngram())?;
+        if numbers.streams.is_some() && tap.is_some() {
+            return Err("a draft taps residual streams".into());
+        }
+        let last = block_index + 1 == geometry.blocks.len();
+        let exit = match (&numbers.streams, &geometry.exit.norm) {
+            (None, _) => None,
+            (Some(streams), ExitNorm::HyperConnectionHead(head)) if last => {
+                Some(match (ExitMix::of(head).map_err(|error| error.to_string())?, streams.mixing) {
+                    (ExitMix::Own(site), StreamsMixing::LowRank { .. }) => {
+                        ExitTopology::LowRank { epsilon: site.norm.epsilon }
+                    }
+                    (ExitMix::Previous(_), StreamsMixing::Sinkhorn(_)) => ExitTopology::Collapse,
+                    _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
+                })
+            }
+            (Some(_), ExitNorm::HyperConnectionHead(_)) => None,
+            (Some(_), _) => return Err("residual streams without their exit".into()),
+        };
+        let split = block_routed(geometry, block_index)?.map(|routed| split::split(routed, geometry));
+        Ok((
+            BlockShape {
+                stage,
+                first: block_index == 0,
+                residual,
+                tap: tap.map(|(_, positions)| positions),
+                activation: activation(geometry),
+                split: split.as_ref().map(|(form, _)| *form),
+                exit,
+                sublayers,
+            },
+            BlockNumbers {
+                capacity,
+                tap: tap.map(|(width, _)| width),
+                input: stage_input(geometry, block_index, stage)?,
+                split: split.map(|(_, layer)| layer),
+                sublayers: numbers,
+            },
+        ))
     }
 }
 
@@ -371,75 +571,54 @@ impl BlockGraphParts {
     }
 }
 
-/// One decoder block's graph fragment:its draft tap when tapped, then its
-/// mixer then its feed-forward over `hidden`. The production graph and the
-/// checked metadata route both build blocks through this one function.
+/// A block graph's kernel entries: prepared kernels or checked bindings.
+struct BlockEntries<'p, 'a, G: GraphDraft + 'a> {
+    tap: Option<TapEntry<'a, G>>,
+    mixer: MixerEntries<'a, G>,
+    feed_forward: FeedForwardGraph<'p, 'a, G>,
+    per_layer: Option<PerLayerEntries<'a, G>>,
+    ngram: Option<NGramEntries<'a, G>>,
+    streams: Option<StreamsEntries<'a, G>>,
+}
+
+/// One decoder block's graph fragment, built from its split alone (`shape`
+/// at `numbers`, over `planned`): its draft tap when tapped, then its mixer
+/// then its feed-forward over `hidden`. The production graph and the
+/// recorded metadata route both build blocks through this one function.
 #[allow(clippy::too_many_arguments)]
 fn block_graph<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    tap_entry: Option<TapEntry<'a, G>>,
-    mixer_entries: MixerEntries<'a, G>,
-    feed_forward: FeedForwardGraph<'_, 'a, G>,
-    per_layer_entries: Option<PerLayerParts<'a, G>>,
-    ngram_entries: Option<NGramParts<'a, G>>,
-    streams_entries: Option<StreamsEntries<'a, G>>,
+    entries: BlockEntries<'_, 'a, G>,
     hidden: Option<ResidualCarry<&WorkflowTensor>>,
-    inputs: BlockGraphInputs<'_>,
+    shape: &BlockShape,
+    numbers: &BlockNumbers,
+    planned: &(impl PlannedWeights + ?Sized),
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<BlockGraphParts, GraphError> {
-    let BlockGraphInputs {
-        load,
-        geometry,
-        state,
-        block_index,
-        rows,
-        capacity,
-        segments,
-        slots,
-        listed,
-        scored,
-        output_scales,
-        stage,
-        residual,
-    } = inputs;
-    let block = geometry
-        .blocks
-        .get(block_index)
-        .ok_or("target block geometry is absent")?;
-    let paired = paired_block(block).map_err(|error| error.to_string())?;
-    let sublayers = block::BlockSublayers {
-        lane: block::BlockLane::Target,
-        paired: &paired,
-        load,
-        geometry,
-        state,
-        block_index,
-        rows,
-        segments,
-        slots,
-        listed,
-        scored,
-        output_scales,
-    };
-    let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
+    let BlockEntries { tap: tap_entry, mixer: mixer_entries, feed_forward, per_layer, ngram, streams: streams_entries } =
+        entries;
+    // A target block's graph names its own block as block 0, the others
+    // relative to it (`relative_scope`).
+    let sublayers = SublayerGraph { block: 0, topology: &shape.sublayers, numbers: &numbers.sublayers, weights: planned };
+    let rows = &numbers.sublayers.rows;
+    let streams = numbers.sublayers.streams.as_ref();
     if streams.is_some() != streams_entries.is_some() {
         return Err("the block's streams entries disagree with its residual form".into());
     }
-    if streams.is_some() && tap_entry.is_some() {
-        return Err("a draft taps residual streams".into());
-    }
     // A graph sealed once is the routed layer's alone, reading no rows: a
     // streamed step's fill, or a merge set's pass over its crossed rows.
-    let stage = match stage {
+    let stage = match shape.stage {
         Stage::Once(once) => {
             let (output, ports) = match once {
                 OnceStage::Fill => (sublayers.fill(graph, feed_forward, weights, constants)?, StagePorts::Run(None)),
                 OnceStage::Pass => {
-                    let routed = block_routed(geometry, block_index)?.ok_or("a pass of a block without a routed layer")?;
-                    let mut ports = PassPorts::of(graph, routed, geometry, rows, capacity)?;
-                    let output = sublayers.pass(graph, feed_forward, &mut ports, weights, constants)?;
-                    (output, StagePorts::Pass(ports))
+                    let (Some(form), Some(layer)) = (&shape.split, &numbers.split) else {
+                        return Err("a pass of a block without a routed layer".into());
+                    };
+                    let (mut ports, blocks) = PassPorts::of(graph, form, layer, rows, &numbers.capacity)?;
+                    let output = sublayers.pass(graph, feed_forward, &mut ports, &blocks, weights, constants)?;
+                    (output, StagePorts::Pass(ports, blocks))
                 }
             };
             return Ok(BlockGraphParts {
@@ -472,11 +651,15 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             ..tapped
         })
         .filter(|entry| entry.positions.any())
-        .map(|entry| Taps::new(graph, entry, rows, geometry.hidden, activation(geometry)))
+        .map(|entry| {
+            let width = numbers.tap.as_ref().ok_or("a tapped block without its draft input width")?;
+            Taps::new(graph, entry, width, rows, &numbers.sublayers.hidden, shape.activation)
+        })
         .transpose()?;
     // A split block's crossing of its routed layer and the merged rows of
     // its merge set's pass, as this graph's ports.
-    let mut split = SplitPorts::of(graph, stage, block_routed(geometry, block_index)?, geometry, rows, capacity)?;
+    let split_layer = shape.split.as_ref().zip(numbers.split.as_ref());
+    let mut split = SplitPorts::of(graph, stage, split_layer, rows, &numbers.capacity)?;
     let hidden = hidden.ok_or("a block graph of no input rows")?;
     let hidden = ResidualCarry { rows: hidden.rows.clone(), pre: hidden.pre.cloned() };
     // A back reads the carry its front's mixer left.
@@ -488,15 +671,15 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             }
             // Block 0 widens the embedded rows into the streams.
             let hidden = match (streams, streams_entries) {
-                (Some(streams), Some(entries)) if block_index == 0 => {
-                    widen(graph, entries.repeat, streams, &hidden.rows, rows, constants)?
+                (Some(streams), Some(entries)) if shape.first => {
+                    widen(graph, entries.repeat, streams.clone(), &hidden.rows, rows.clone(), constants)?
                 }
                 _ => hidden,
             };
             let (mixed, state_ports) =
                 sublayers.mixer(graph, mixer_entries, streams_entries, &hidden, weights, constants)?;
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
-                if paired.feed_forward.is_none() {
+                if shape.sublayers.feed_forward.is_none() {
                     return Err("a draft taps the feed-forward of a lone mixer block".into());
                 }
                 taps.ports.middle = Some(taps.tap(graph, &mixed.rows)?);
@@ -511,9 +694,9 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         mixed,
         weights,
         constants,
-        split.as_mut().map(SplitPorts::split),
+        split.as_mut().map(SplitBuild::split),
     )?;
-    let ports = StagePorts::Run(split);
+    let ports = StagePorts::Run(split.map(SplitBuild::into_ports));
     // A front ends with its request: its output is the residual it mixed.
     if stage == RunStage::Front {
         return Ok(BlockGraphParts {
@@ -529,48 +712,40 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         });
     }
     let ResidualCarry { rows: output, pre } = output;
-    let (output, per_layer) =
-        sublayers.per_layer(graph, per_layer_entries, output, weights, constants)?;
+    let (output, per_layer) = sublayers.per_layer(graph, per_layer, output, weights, constants)?;
     // The n-gram input's windows follow the mixer's bank components, or are
     // the block's bank, over the slot tables it takes as inputs.
-    let (output, ngram) =
-        sublayers.ngram(graph, ngram_entries, &mut state_ports, output, weights, constants)?;
-    let residual = residual.then(|| output.clone());
+    let (output, ngram) = sublayers.ngram(graph, ngram, &mut state_ports, output, weights, constants)?;
+    let residual = shape.residual.then(|| output.clone());
     // The decoder's last block ends with its exit: a low-rank exit site,
     // whose partials the readout sums, or the collapse of Sinkhorn streams
     // by the last site's pre, which the readout normalizes.
-    let last = block_index + 1 == geometry.blocks.len();
     let carry = ResidualCarry { rows: output, pre };
-    let output = match (streams, streams_entries, &geometry.exit.norm) {
+    let output = match (shape.exit, streams, streams_entries.map(|entries| entries.mixing)) {
         (None, _, _) => carry,
-        (Some(streams), Some(entries), ExitNorm::HyperConnectionHead(head)) if last => {
-            let exit = ExitMix::of(head).map_err(|error| error.to_string())?;
-            match (exit, entries.mixing, streams.low_rank()) {
-                (ExitMix::Own(site), MixingEntries::LowRank(sites), Some(low_rank)) => {
-                    let exit = sites.exit.ok_or("low-rank streams without their exit site's entries")?;
-                    let partials = mix_site(
-                        graph,
-                        exit,
-                        load,
-                        WeightScope::Target,
-                        low_rank,
-                        &carry.rows,
-                        rows,
-                        site.norm.epsilon as f32,
-                        false,
-                        weights,
-                    )?
-                    .partials;
-                    ResidualCarry::rows(partials)
-                }
-                (ExitMix::Previous(_), MixingEntries::Sinkhorn(entries), None) => {
-                    ResidualCarry::rows(collapse(graph, entries.collapse, streams, &carry, rows)?)
-                }
-                _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
-            }
+        (Some(ExitTopology::LowRank { epsilon }), Some(streams), Some(MixingEntries::LowRank(sites))) => {
+            let (Some(exit), Some(low_rank)) = (sites.exit, streams.low_rank()) else {
+                return Err("low-rank streams without their exit site's entries".into());
+            };
+            let partials = mix_site(
+                graph,
+                exit,
+                planned,
+                WeightScope::Target,
+                low_rank,
+                &carry.rows,
+                rows.clone(),
+                epsilon.f32(),
+                false,
+                weights,
+            )?
+            .partials;
+            ResidualCarry::rows(partials)
         }
-        (Some(_), Some(_), ExitNorm::HyperConnectionHead(_)) => carry,
-        _ => return Err("residual streams without their exit".into()),
+        (Some(ExitTopology::Collapse), Some(streams), Some(MixingEntries::Sinkhorn(entries))) => {
+            ResidualCarry::rows(collapse(graph, entries.collapse, streams.clone(), &carry, rows.clone())?)
+        }
+        _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
     };
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.output) {
         taps.ports.output = Some(taps.tap(graph, &output.rows)?);
@@ -589,81 +764,83 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     })
 }
 
-/// Check the production block topology from its planned entry bindings
-/// without forming kernels or allocating device storage: the graph, its
-/// constants, and the host heap of the vectors its prepared graph owns
-/// (`owned_vectors_heap`).
-pub(super) fn checked_block_graph_draft(
+/// A block graph's checked entry bindings, from its program slot: what its
+/// topology key holds of its kernels.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CheckedBlockEntries {
+    mixer: block::CheckedMixerEntries,
+    feed_forward: Option<block::CheckedFeedForwardEntries>,
+    bank: Option<CheckedBankEntries>,
+    per_layer: Option<CheckedPerLayerEntries>,
+    ngram: Option<CheckedNGramEntries>,
+    streams: Option<CheckedStreamsEntries>,
+}
+
+impl CheckedBlockEntries {
+    fn new(
+        state: &StateResourcePlan,
+        backend: BackendName,
+        slot: TargetBlockProgramSlot,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            mixer: block::CheckedMixerEntries::new(slot.mixer(), backend, slot_lists(state, backend, slot))?,
+            feed_forward: slot
+                .feed_forward()
+                .map(|slot| block::CheckedFeedForwardEntries::new(slot, backend))
+                .transpose()?,
+            bank: slot.bank().map(|(feed_forward, bank)| CheckedBankEntries::new(feed_forward, bank, backend)).transpose()?,
+            per_layer: slot.per_layer().map(CheckedPerLayerEntries::new).transpose()?,
+            ngram: slot.ngram().map(CheckedNGramEntries::new),
+            streams: slot.block_streams().map(CheckedStreamsEntries::new),
+        })
+    }
+}
+
+/// The metadata graph of a block of `shape` at `numbers` from its checked
+/// `entries`, over `planned`: the graph, its constants, and the host heap of
+/// the vectors its prepared graph owns (`owned_vectors_heap`).
+fn checked_block_graph(
     mut graph: NativeGraphMetadata,
-    slot: TargetBlockProgramSlot,
-    tap: Option<(u64, TapPositions)>,
-    inputs: BlockGraphInputs<'_>,
+    entries: &CheckedBlockEntries,
+    shape: &BlockShape,
+    numbers: &BlockNumbers,
+    planned: &(impl PlannedWeights + ?Sized),
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
-    let BlockGraphInputs { geometry, state, block_index, rows, stage, .. } = inputs;
     let mut weights = Vec::new();
     let mut constants = Vec::new();
-    let tap_elements = [("A", activation(geometry))];
-    let tap_entry = tap.map(|(width, positions)| TapEntry {
-        entry: &tap_elements[..],
-        width,
-        positions,
-    });
-    let hidden = stage_input(geometry, block_index, stage)?
+    let rows = &numbers.sublayers.rows;
+    let hidden = numbers
+        .input
+        .clone()
         .map(|carry| {
-            carry.try_map(|width| GraphDraft::port_with_class_extent(&mut graph, Element::f32(), &[rows, width], 0, "M"))
+            carry.try_map(|width| GraphDraft::port_with_class_extent(&mut graph, Element::f32(), &[rows, &width], 0, "M"))
         })
         .transpose()?;
-    let checked_streams = slot.block_streams().map(CheckedStreamsEntries::new);
-    let streams = checked_streams.as_ref().map(CheckedStreamsEntries::entries);
-    let checked_mixer = block::CheckedMixerEntries::new(
-        slot.mixer(),
-        graph.backend(),
-        slot_lists(state, graph.backend(), slot),
-    )?;
-    let mixer = checked_mixer.entries()?;
-    let checked_feed_forward = slot
-        .feed_forward()
-        .map(|slot| block::CheckedFeedForwardEntries::new(slot, graph.backend()))
-        .transpose()?;
-    let feed_forward = checked_feed_forward
-        .as_ref()
-        .map(|checked| checked.entries());
-    let checked_bank = slot
-        .bank()
-        .map(|(feed_forward, bank)| {
-            CheckedBankEntries::new(feed_forward, bank, graph.backend())
-        })
-        .transpose()?;
+    let tap_elements = [("A", shape.activation)];
     let mut banks = Vec::new();
     let mut parks = Vec::new();
-    let bank = layer_bank(stage, checked_bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
-    let checked_per_layer = block::checked_per_layer(slot.per_layer())?;
-    let per_layer = checked_per_layer
-        .as_ref()
-        .map(|(checked, binding)| (checked.entries(), *binding));
-    let checked_ngram = slot
-        .ngram()
-        .map(|binding| (CheckedNGramEntries::new(binding), binding));
-    let ngram = checked_ngram
-        .as_ref()
-        .map(|(checked, binding)| (checked.entries(), *binding));
+    let bank = layer_bank(shape.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
     let parts = block_graph(
         &mut graph,
-        tap_entry,
-        mixer,
-        FeedForwardGraph {
-            entries: feed_forward,
-            bank,
+        BlockEntries {
+            tap: shape.tap.map(|positions| TapEntry { entry: &tap_elements[..], positions }),
+            mixer: entries.mixer.entries()?,
+            feed_forward: FeedForwardGraph {
+                entries: entries.feed_forward.as_ref().map(block::CheckedFeedForwardEntries::entries),
+                bank,
+            },
+            per_layer: entries.per_layer.as_ref().map(CheckedPerLayerEntries::entries),
+            ngram: entries.ngram.as_ref().map(CheckedNGramEntries::entries),
+            streams: entries.streams.as_ref().map(CheckedStreamsEntries::entries),
         },
-        per_layer,
-        ngram,
-        streams,
         hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
-        inputs,
+        shape,
+        numbers,
+        planned,
         &mut weights,
         &mut constants,
     )?;
-    if let Stage::Run(_) = stage {
+    if let Stage::Run(_) = shape.stage {
         GraphDraft::export(&mut graph, &parts.output.rows)?;
         if let Some(pre) = &parts.output.pre {
             GraphDraft::export(&mut graph, pre)?;
@@ -672,14 +849,125 @@ pub(super) fn checked_block_graph_draft(
     if let Some(residual) = &parts.residual {
         GraphDraft::export(&mut graph, residual)?;
     }
-    let owned = owned_vectors_heap(
-        weights.len(),
-        banks.len(),
-        parks.len(),
-        constants.len(),
-        parts.state_ports(),
-    );
+    let owned = owned_vectors_heap(weights.len(), banks.len(), parks.len(), constants.len(), parts.state_ports());
     Ok((graph, constants, owned))
+}
+
+/// A target block graph's topology key: its backend, its checked entries,
+/// its shape, and its numbers and weights as the facts they are split into.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct BlockKey {
+    backend: BackendName,
+    entries: CheckedBlockEntries,
+    shape: BlockShape<RealIndex, TableIndex>,
+    numbers: BlockNumbers<FactIndex>,
+    weights: GraphWeights<FactIndex>,
+}
+
+/// What a block graph's recording keeps beside its template: its constants,
+/// and the host heap its prepared graph's vectors own, which its topology
+/// alone decides.
+pub(super) struct RecordedBlock {
+    constants: Vec<RecordedConstant>,
+    owned: HostHeap,
+}
+
+impl TraceOutput for RecordedBlock {
+    type Value = (Vec<GraphConstant>, HostHeap);
+    fn at(&self, facts: &[u64], reals: &Reals) -> Option<Self::Value> {
+        Some((self.constants.at(facts, reals)?, self.owned))
+    }
+}
+
+/// The target block graphs' traces, one per topology key.
+pub(super) static BLOCK_TRACES: NativeGraphTraces<BlockKey, RecordedBlock> = NativeGraphTraces::new();
+
+/// The template of a target block graph of `key` at `facts`.
+fn record_block(
+    key: &BlockKey,
+    facts: &[Dim],
+    reals: &Reals,
+) -> Result<(NativeGraphResourceTemplate, RecordedBlock), GraphError> {
+    let facts = Facts::new(facts, reals);
+    let (graph, constants, owned) = checked_block_graph(
+        NativeGraphMetadata::new_template(key.backend),
+        &key.entries,
+        &facts.arguments(key.shape.clone()).tables(|table| facts.table(table)),
+        &facts.dims(key.numbers.clone()),
+        &facts.dims(key.weights.clone()),
+    )?;
+    Ok((
+        graph.seal_template()?,
+        RecordedBlock { constants: constants.iter().map(GraphConstant::recorded).collect(), owned },
+    ))
+}
+
+/// A class dimension of a block graph's slices, and the number of its split
+/// that it varies (`seismic::ClassFact`).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ClassNumber {
+    Rows,
+    Segments,
+    Listed,
+    Slots,
+}
+
+/// The block graph `inputs` names of `slot` on `backend`, with its draft
+/// taps (`tap`), certified over each slice set of `slice_sets`, whose class
+/// dimensions `classes` names: from the block graphs' traces
+/// (`Certified::traced_each`), each with its constants and owned heap.
+pub(super) fn certify_block<L: Certified>(
+    backend: BackendName,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    inputs: BlockGraphInputs<'_>,
+    classes: &[(Option<&'static str>, &'static str, ClassNumber)],
+    slice_sets: &[Vec<NativeGraphClassSlice>],
+) -> Result<Vec<(L, (Vec<GraphConstant>, HostHeap))>, GraphError> {
+    let entries = CheckedBlockEntries::new(inputs.state, backend, slot)?;
+    let (mut banks, mut parks) = (Vec::new(), Vec::new());
+    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
+    let (shape, numbers) = inputs.split(slot, &bank, tap)?;
+    let mut facts = FactSink::new();
+    let numbers = facts.index(BlockNumbers { sublayers: numbers.sublayers.share_classes(), ..numbers });
+    // The key names what the block reads relative to it (`relative_scope`),
+    // as its graph does.
+    let block = inputs.block()?;
+    let weights = facts.index(GraphWeights::of_block(inputs.load, block, shape.exit.is_some())?.relative_to(block));
+    let classes = classes
+        .iter()
+        .map(|&(scope, dimension, number)| {
+            let sublayers = &numbers.sublayers;
+            let fact = match number {
+                ClassNumber::Rows => sublayers.rows,
+                ClassNumber::Segments => sublayers.segments,
+                ClassNumber::Listed => sublayers.listed,
+                ClassNumber::Slots => sublayers.slots,
+            };
+            ClassFact { fact: fact.position(), scope, dimension }
+        })
+        .collect::<Vec<_>>();
+    let shape = facts.index_reals(shape).tables(|bytes| facts.table(bytes));
+    let key = BlockKey { backend, entries, shape, numbers, weights };
+    L::traced_each(&BLOCK_TRACES, &key, &facts, &classes, slice_sets, record_block)
+}
+
+/// The metadata graph of block `inputs` names of `slot`, with its draft taps
+/// (`tap`), at the model's own numbers over its load: its constants and
+/// owned heap beside it.
+#[cfg(test)]
+pub(super) fn checked_block_graph_draft(
+    graph: NativeGraphMetadata,
+    slot: TargetBlockProgramSlot,
+    tap: Option<(u64, TapPositions)>,
+    inputs: BlockGraphInputs<'_>,
+) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
+    let entries = CheckedBlockEntries::new(inputs.state, graph.backend(), slot)?;
+    let (mut banks, mut parks) = (Vec::new(), Vec::new());
+    let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
+    let (shape, numbers) = inputs.split(slot, &bank, tap)?;
+    let planned = inputs.weights()?;
+    checked_block_graph(graph, &entries, &constant_reals(shape).tables(Table::from), &constant(numbers), &planned)
 }
 
 #[cfg(test)]

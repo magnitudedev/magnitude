@@ -29,6 +29,7 @@
 use crate::native::{BankRouteKernels, ExpertBankKernels, LEADS};
 use crate::planning::{BankBinding, BankPart, BankedFeedForward, ExpertBankPlan, RecordTensors, RoutedTensor};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::facts::Numbers;
 use crate::programs::native_constants::GraphConstant;
 use magnitude_kernels::constants::{COLUMNS_GRID, PARK_GRID, ROUND_GRIDS, ROWS_GRID};
 
@@ -76,9 +77,10 @@ impl<'p> GateRecords<'p> {
 }
 use crate::experts::ParkKind;
 use crate::programs::native_target_graph::{
-    BankPort, GraphPark, GraphTimeline, WeightPart, WeightPort, bank_port, weight, weight_port,
+    BankPort, GraphPark, GraphTimeline, WeightPart, WeightPort, bank_port, relative_scope_of, weight, weight_port,
 };
 use crate::ModelLoadPlan;
+use crate::programs::native_target_graph::PlannedWeights;
 use magnitude_family_contracts::{WeightRole, WeightScope};
 use magnitude_kernels::{
     routed_convert, routed_copy, routed_down_project, routed_down_sited, routed_list_grid, routed_list_stage, routed_output_project, routed_pass_map,
@@ -86,7 +88,7 @@ use magnitude_kernels::{
     routed_seed_commit, routed_select_streamed, routed_site_request, routed_step, routed_tier_wait,
 };
 use seismic::{
-    Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
+    Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
@@ -214,6 +216,7 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
 }
 
 /// The route's element assignments by routed form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedRoute {
     Fused([(&'static str, Element); 5]),
     General([(&'static str, Element); 4]),
@@ -221,6 +224,7 @@ enum CheckedRoute {
 
 /// The bank entries' element assignments, from a layer's feed-forward
 /// binding (either routed form) and its bank's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedBankEntries {
     route: CheckedRoute,
     staging: [(&'static str, Element); 3],
@@ -235,12 +239,14 @@ pub(crate) struct CheckedBankEntries {
 
 /// A CPU site's element assignments: its request's, and its combine's by
 /// the layer's routed form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedSite {
     request: [(&'static str, Element); 1],
     combine: CheckedCombine,
 }
 
 /// A combine's projections' and sum's element assignments.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedCombine {
     Fused([(&'static str, Element); 3], [(&'static str, Element); 1]),
     General([(&'static str, Element); 2], [(&'static str, Element); 2]),
@@ -389,14 +395,14 @@ pub(crate) fn served(load: &ModelLoadPlan, scope: WeightScope) -> Option<(&Exper
     Some((bank, bank.layer(scope)?.0))
 }
 
-/// `XS`: the rows of the sources by which the decode entries of the routed
-/// layer of `scope` read each choice ([`DecodeReads`]): of a layer `load`'s
-/// bank serves ([`served`]), the step's source rows; of a resident layer
+/// `XS`: the rows of the sources by which a routed layer's decode entries
+/// read each choice ([`DecodeReads`]): of a layer its bank serves
+/// (`streamed`, [`served`]), the step's source rows; of a resident layer
 /// none, each expert read from its stacks by index.
-pub(crate) fn source_rows(load: &ModelLoadPlan, scope: WeightScope) -> u64 {
-    match served(load, scope) {
-        Some(_) => magnitude_kernels::constants::SOURCE_ROWS,
-        None => 0,
+pub(crate) fn source_rows(streamed: bool) -> u64 {
+    match streamed {
+        true => magnitude_kernels::constants::SOURCE_ROWS,
+        false => 0,
     }
 }
 
@@ -410,54 +416,239 @@ pub(crate) fn expand_form(streamed: bool) -> Result<(), &'static str> {
     }
 }
 
-/// A routed layer the load streams: its place among the bank's layers, its
-/// bank's entries, and the bank ports and timeline nodes its graph declares.
-pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a> {
-    load: &'p ModelLoadPlan,
-    bank: &'p ExpertBankPlan,
+/// How a routed layer's graph reads its experts, beside its numbers: from
+/// the stacks a load holds whole (`Held`), through the bank that streams
+/// them (`Streamed`, its bank's structure), or in its streamed layer's
+/// resident form at its whole bank's home records (`Home`). The graph's
+/// [`LayerBank`] binds the same form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BankForm {
+    Held,
+    Streamed(BankTopology),
+    Home,
+}
+
+/// What decides a streamed layer's graph beside its numbers
+/// ([`BankNumbers`]): whether it has a CPU site and sets its run's step,
+/// the lead its route predicts at (`AHEAD`), what each hint lead binds, the
+/// layer whose policy words its hints bind, who places into its bank, and
+/// its records' resident elements.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BankTopology {
+    pub sited: bool,
+    pub sets_step: bool,
+    pub ahead: u64,
+    pub leads: Vec<HintLead>,
+    /// The layer whose policy words its hints bind, relative to its block.
+    pub next_policy: Option<WeightScope>,
+    pub placer: crate::planning::Placer,
+    pub record: RecordTensors<Element>,
+}
+
+/// What a hint lead binds (`StreamedLayer::hints`): the layer's own hinted
+/// weights, an earlier lead's, or the weights of the predicted layer of
+/// `scope` it has (each hinted port's kind where that layer has the weight),
+/// named relative to the layer's block (`relative_scope_of`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HintLead {
+    Own,
+    Earlier(usize),
+    Layer { scope: WeightScope, kinds: Vec<Option<magnitude_family_contracts::WeightKind>> },
+}
+
+/// Every number a streamed layer's graph is built of
+/// (`ExpertBankPlan::binding` and the bank's layout), in the bank plan's
+/// names: `BANK`, `E`, the slot map's experts, `EN`, `K`, `T`, a round's
+/// `L`, the widest layer's experts, `V`, `TR`, the scratch rounds,
+/// `FLIGHT` and `P`, its tables' slots and widths, `RING`, `GM`, the bank's
+/// choices and their landing list's words, a round list's words, the first
+/// seeded record, the convert's row and column groups, and each routed
+/// tensor's `[N, K]`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BankNumbers<D = Dim> {
+    pub records: D,
+    pub experts: D,
+    pub layer_experts: D,
+    pub next_experts: D,
+    pub selected: D,
+    pub staging: D,
+    pub round_records: D,
+    pub widest: D,
+    pub conveyor: D,
+    pub tier: D,
+    pub rounds: D,
+    pub flight: D,
+    pub choices: D,
+    pub file_width: D,
+    pub file_slots: D,
+    pub ring_words: D,
+    pub site_slots: D,
+    pub site_width: D,
+    pub scratch_slots: D,
+    pub scratch_lanes: D,
+    pub map_words: D,
+    pub bank_choices: D,
+    pub landing_list: D,
+    pub list_words: D,
+    pub seeded_from: D,
+    pub rows_groups: D,
+    pub columns_groups: D,
+    pub matrix: RecordTensors<[D; 2]>,
+}
+
+impl<D> Numbers<D> for BankNumbers<D> {
+    type Of<E> = BankNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> BankNumbers<E> {
+        BankNumbers {
+            records: f(self.records),
+            experts: f(self.experts),
+            layer_experts: f(self.layer_experts),
+            next_experts: f(self.next_experts),
+            selected: f(self.selected),
+            staging: f(self.staging),
+            round_records: f(self.round_records),
+            widest: f(self.widest),
+            conveyor: f(self.conveyor),
+            tier: f(self.tier),
+            rounds: f(self.rounds),
+            flight: f(self.flight),
+            choices: f(self.choices),
+            file_width: f(self.file_width),
+            file_slots: f(self.file_slots),
+            ring_words: f(self.ring_words),
+            site_slots: f(self.site_slots),
+            site_width: f(self.site_width),
+            scratch_slots: f(self.scratch_slots),
+            scratch_lanes: f(self.scratch_lanes),
+            map_words: f(self.map_words),
+            bank_choices: f(self.bank_choices),
+            landing_list: f(self.landing_list),
+            list_words: f(self.list_words),
+            seeded_from: f(self.seeded_from),
+            rows_groups: f(self.rows_groups),
+            columns_groups: f(self.columns_groups),
+            matrix: self.matrix.map(|_, [n, k]| [f(n), f(k)]),
+        }
+    }
+}
+
+/// The form and numbers of the routed layer of `scope` whose graph reads
+/// its experts as `bank` does: the only reading of the load's bank plan.
+pub(crate) fn split<G: GraphDraft>(
+    load: &ModelLoadPlan,
     scope: WeightScope,
-    index: usize,
-    binding: BankBinding,
+    bank: &LayerBank<'_, '_, G>,
+) -> Result<(BankForm, Option<BankNumbers<u64>>), GraphError> {
+    let (plan, index) = match (served(load, scope), bank) {
+        (Some(_), LayerBank::Home) => return Ok((BankForm::Home, None)),
+        (None, LayerBank::Held) => return Ok((BankForm::Held, None)),
+        (Some(served), LayerBank::Streamed(_)) => served,
+        _ => return Err("a routed layer's bank entries disagree with its plan".into()),
+    };
+    let binding = plan.binding(index)?;
+    let layer = &plan.layers()[index];
+    let leads = (0..crate::planning::HINT_LEADS as usize).map(|lead| plan.lead_layer(index, lead)).collect::<Vec<_>>();
+    let leads = leads
+        .iter()
+        .enumerate()
+        .map(|(lead, &predicted)| match leads[..lead].iter().position(|&bound| bound == predicted) {
+            _ if predicted == index => HintLead::Own,
+            Some(earlier) => HintLead::Earlier(earlier),
+            None => {
+                let predicted = &plan.layers()[predicted];
+                HintLead::Layer {
+                    scope: relative_scope_of(predicted.scope, scope),
+                    kinds: predicted.hinted.iter().map(|hint| hint.element.map(|_| hint.kind)).collect(),
+                }
+            }
+        })
+        .collect();
+    let (words, file, site, scratch) =
+        (binding.words, binding.words.file(), binding.words.site(), binding.words.scratch());
+    let topology = BankTopology {
+        sited: plan.sited(index),
+        sets_step: plan.sets_step(index),
+        ahead: plan.ahead(index),
+        leads,
+        next_policy: plan.hints(index, 0).map(|next| relative_scope_of(plan.layers()[next].scope, scope)),
+        placer: binding.placer,
+        record: binding.record.map(|_, tensor| tensor.resident),
+    };
+    let numbers = BankNumbers {
+        records: binding.records,
+        experts: binding.experts,
+        layer_experts: layer.experts,
+        next_experts: binding.next_experts,
+        selected: binding.selected,
+        staging: binding.staging,
+        round_records: binding.round_records,
+        widest: binding.widest,
+        conveyor: binding.conveyor,
+        tier: binding.tier,
+        rounds: words.rounds,
+        flight: words.flight,
+        choices: words.choices,
+        file_width: file.width(),
+        file_slots: file.slots(),
+        ring_words: words.ring_words(),
+        site_slots: site.slots(),
+        site_width: site.width(),
+        scratch_slots: scratch.slots(),
+        scratch_lanes: scratch.lanes(),
+        map_words: plan.group_experts(layer.group),
+        bank_choices: plan.choices(),
+        landing_list: magnitude_kernels::list_extent(plan.choices()),
+        list_words: plan.list_words(),
+        seeded_from: plan.seeded_from(layer.group),
+        rows_groups: u64::try_from(convert_groups(binding.record.up.matrix[0])?).map_err(|_| "convert groups are negative")?,
+        columns_groups: u64::try_from(convert_groups(binding.record.down.matrix[0])?)
+            .map_err(|_| "convert groups are negative")?,
+        matrix: binding.record.map(|_, tensor| tensor.matrix),
+    };
+    Ok((BankForm::Streamed(topology), Some(numbers)))
+}
+
+/// A routed layer the load streams: its bank's structure and numbers, its
+/// bank's entries, and the bank ports and timeline nodes its graph declares.
+pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> {
+    planned: &'p W,
+    topology: &'p BankTopology,
+    numbers: &'p BankNumbers,
+    scope: WeightScope,
     entries: BankGraphEntries<'a, G>,
     ports: &'p mut Vec<(BankPort, NativePort)>,
     parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
 }
 
 /// The extents a streamed layer's decode entries take beside its bank's.
-pub(crate) struct DecodeShape {
+pub(crate) struct DecodeShape<'d> {
     /// `M`: the launch's rows.
-    pub rows: u64,
+    pub rows: &'d Dim,
 }
 
-impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
-    /// The routed layer of `scope` with its `bank`'s graph, when its graph
-    /// reads its experts through the bank that streams them; none of a layer
-    /// the load holds whole, nor of a streamed layer's resident form.
+impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, 'a, G, W> {
+    /// The routed layer of `scope` of `form` with its `bank`'s graph, when
+    /// its graph reads its experts through the bank that streams them; none
+    /// of a layer the load holds whole, nor of a streamed layer's resident
+    /// form.
     pub(crate) fn of(
-        load: &'p ModelLoadPlan,
+        planned: &'p W,
+        form: &'p BankForm,
+        numbers: Option<&'p BankNumbers>,
         scope: WeightScope,
         bank: LayerBank<'p, 'a, G>,
     ) -> Result<Option<Self>, GraphError> {
-        match (served(load, scope), bank) {
-            (Some(_), LayerBank::Home) | (None, LayerBank::Held) => Ok(None),
-            (Some((plan, index)), LayerBank::Streamed(BankGraph { mut entries, ports, parks })) => {
+        match (form, numbers, bank) {
+            (BankForm::Home, None, LayerBank::Home) | (BankForm::Held, None, LayerBank::Held) => Ok(None),
+            (BankForm::Streamed(topology), Some(numbers), LayerBank::Streamed(BankGraph { mut entries, ports, parks })) => {
                 // The plan alone says which layers have a CPU site
                 // (`ExpertBankPlan::sited`): a layer encodes the load's site
                 // entries exactly there, and a sited layer needs them.
-                entries.site = match (plan.sited(index), entries.site) {
+                entries.site = match (topology.sited, entries.site) {
                     (true, None) => return Err("a layer with a CPU site lacks its site entries".into()),
                     (sited, site) => site.filter(|_| sited),
                 };
-                Ok(Some(Self {
-                    load,
-                    bank: plan,
-                    scope,
-                    index,
-                    binding: plan.binding(index)?,
-                    entries,
-                    ports,
-                    parks,
-                }))
+                Ok(Some(Self { planned, topology, numbers, scope, entries, ports, parks }))
             }
             _ => Err("a routed layer's bank entries disagree with its plan".into()),
         }
@@ -466,26 +657,16 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
     /// Whether the layer sets its run's step word
     /// (`ExpertBankPlan::sets_step`), a scratch-served run's in its front.
     pub(crate) fn sets_step(&self) -> bool {
-        self.bank.sets_step(self.index)
+        self.topology.sets_step
     }
 
-    pub(crate) fn binding(&self) -> BankBinding {
-        self.binding
-    }
-
-    /// The layer's experts: its slot map's extent.
-    pub(crate) fn experts(&self) -> u64 {
-        self.bank.layers()[self.index].experts
+    pub(crate) fn numbers(&self) -> &'p BankNumbers {
+        self.numbers
     }
 
     /// The layer's decode route and resolve by its routed form.
     pub(crate) fn route(&self) -> BankRoute<'a, G> {
         self.entries.route
-    }
-
-    /// The rows of the layer's group's map (`GM`, `BankPart::Map`).
-    pub(crate) fn map_words(&self) -> u64 {
-        self.bank.group_experts(self.bank.layers()[self.index].group)
     }
 
     /// What the route's tier port binds of `ports` (`TM`, and the tier map,
@@ -497,13 +678,16 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         constants: &mut Vec<GraphConstant>,
     ) -> Result<RouteTier, GraphError> {
         Ok(match &ports.tier {
-            Some(tier) => RouteTier { experts: self.experts(), map: tier.map.tensor().clone() },
-            None => RouteTier { experts: 0, map: GraphConstant::empty_of(graph, Element::i32(), &[0], constants)? },
+            Some(tier) => RouteTier { experts: self.numbers.layer_experts.clone(), map: tier.map.tensor().clone() },
+            None => RouteTier {
+                experts: Dim::from(0),
+                map: GraphConstant::empty_of(graph, Element::i32(), &[0], constants)?,
+            },
         })
     }
 
-    /// Where a decode launch of `rows` rows reads each choice
-    /// ([`DecodeReads`]): the route's `sources`, and the group's tier
+    /// Where a decode launch reads each choice ([`DecodeReads`]): the
+    /// route's `sources` (the step's source rows), and the group's tier
     /// records, or without a tier graph constants of no records in their
     /// form (the bank's records are reserved, whose views bind as their
     /// reservation's).
@@ -514,32 +698,32 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         locals: &RouteLocals,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<DecodeReads, GraphError> {
-        let binding = self.binding();
+        let numbers = self.numbers;
         let (tier, count) = match &ports.tier {
             Some(tier) => (
-                tier.records.as_ref().map(|_, port| port.tensor().slice_leading(0, binding.tier)),
-                binding.tier,
+                tier.records.as_ref().map(|_, port| port.tensor().slice_leading(0, &numbers.tier)),
+                numbers.tier.clone(),
             ),
             None => (
-                binding.record.try_map(|_, record| {
-                    let [n, k] = record.matrix;
-                    Ok::<_, GraphError>(GraphConstant::empty_of(graph, record.resident, &[0, n, k], constants)?.slice_leading(0, 0))
+                self.topology.record.zip(numbers.matrix.clone()).try_map(|_, (resident, [n, k])| {
+                    Ok::<_, GraphError>(
+                        GraphConstant::empty_of(graph, resident, &[Dim::from(0), n, k], constants)?.slice_leading(0, 0),
+                    )
                 })?,
-                0,
+                Dim::from(0),
             ),
         };
         Ok(DecodeReads {
             sources: locals.snapshot(),
-            rows: source_rows(self.load, self.scope),
+            rows: Dim::from(source_rows(true)),
             tier,
             records: count,
             policy: Some(ports.policy.tensor().clone()),
         })
     }
-
     /// The port of `part` of this layer's bank.
     pub(crate) fn part(&mut self, graph: &mut G, part: BankPart) -> Result<NativePort, GraphError> {
-        bank_port(graph, self.bank, self.scope, part, self.ports)
+        bank_port(graph, self.planned, self.scope, part, self.ports)
     }
 
     /// The port of `part(kind)` of each routed tensor of the record.
@@ -548,9 +732,9 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         graph: &mut G,
         part: impl Fn(RoutedTensor) -> BankPart,
     ) -> Result<RecordTensors<NativePort>, GraphError> {
-        let (bank, scope, record) = (self.bank, self.scope, self.binding().record);
+        let (planned, scope) = (self.planned, self.scope);
         let ports = &mut *self.ports;
-        record.try_map(|kind, _| bank_port(graph, bank, scope, part(kind), ports))
+        self.topology.record.try_map(|kind, _| bank_port(graph, planned, scope, part(kind), ports))
     }
 
     /// The run's step word (its chain place's), which every streamed entry
@@ -562,10 +746,10 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         if !self.sets_step() {
             return Ok((step, None));
         }
-        let sequence = graph.input_for(entries.step, "sequence", &[])?;
+        let sequence = graph.input_for(entries.step, "sequence", &[] as &[(&str, u64)])?;
         graph.enqueue(
             entries.step,
-            &[],
+            &[] as &[(&str, u64)],
             routed_step::WorkflowArgs {
                 step: step.tensor_mut().into(),
                 sequence: sequence.tensor().into(),
@@ -606,16 +790,15 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
     /// absent. The wait declares the list host-written, which orders them
     /// after it.
     pub(crate) fn tier_wait(&mut self, graph: &mut G, ports: WaitPorts<'_>, shape: &DecodeShape) -> Result<(), GraphError> {
-        let binding = self.binding();
+        let numbers = self.numbers;
         let WaitPorts { decode: DecodePorts { step, policy, file, .. }, sources, grid, records } = ports;
-        let table = binding.words.file();
         let list = self.part(graph, BankPart::LandingList)?;
         let dimensions = [
-            ("M", shape.rows),
-            ("K", binding.selected),
-            ("FW", table.width()),
-            ("FLIGHT", table.slots()),
-            ("LW", magnitude_kernels::list_extent(self.bank.choices())),
+            ("M", shape.rows.clone()),
+            ("K", numbers.selected.clone()),
+            ("FW", numbers.file_width.clone()),
+            ("FLIGHT", numbers.file_slots.clone()),
+            ("LW", numbers.landing_list.clone()),
         ];
         self.park(graph, ParkKind::TierWait);
         graph.enqueue(
@@ -630,18 +813,23 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                 landing: list.tensor().into(),
             },
         )?;
-        if binding.placer != crate::planning::Placer::Bank {
+        if self.topology.placer != crate::planning::Placer::Bank {
             return Ok(());
         }
         let staging = self.parts(graph, |kind| BankPart::Staging { kind })?;
         let grids = self.part(graph, BankPart::LandingGrids)?;
-        let tensors = binding.record.zip(self.entries.convert).zip(staging.as_ref());
-        for (kind, (((tensor, convert), staging), destination)) in tensors.zip(records).into_tensors() {
-            let [n, k] = tensor.matrix;
+        let tensors = numbers.matrix.as_ref().zip(self.entries.convert).zip(staging.as_ref());
+        for (kind, ((([n, k], convert), staging), destination)) in tensors.zip(records).into_tensors() {
             let converts = grids.tensor().slice_leading(0, 1).reshape(&[ROUND_GRIDS, 3]).slice_leading(record_grid(kind), record_grid(kind) + 1).reshape(&[3]);
             graph.enqueue_under(
                 convert,
-                &[("V", binding.staging), ("L", self.bank.choices()), ("S", binding.records), ("N", n), ("K", k)],
+                &[
+                    ("V", numbers.staging.clone()),
+                    ("L", numbers.bank_choices.clone()),
+                    ("S", numbers.records.clone()),
+                    ("N", n.clone()),
+                    ("K", k.clone()),
+                ],
                 routed_convert::WorkflowArgs {
                     conveyor: staging.tensor().into(),
                     list: list.tensor().into(),
@@ -682,16 +870,15 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         let (Some(entries), Some(site)) = (self.entries.site, &mut ports.site) else {
             return Ok(());
         };
-        let binding = self.binding();
-        let table = binding.words.site();
+        let numbers = self.numbers;
         graph.enqueue_under(
             entries.request,
             &[
-                ("M", shape.rows),
-                ("H", binding.record.down.matrix[0]),
-                ("K", binding.selected),
-                ("FLIGHT", table.slots()),
-                ("R", table.width()),
+                ("M", shape.rows.clone()),
+                ("H", numbers.matrix.down[0].clone()),
+                ("K", numbers.selected.clone()),
+                ("FLIGHT", numbers.site_slots.clone()),
+                ("R", numbers.site_width.clone()),
             ],
             routed_site_request::WorkflowArgs {
                 step: ports.step.tensor().into(),
@@ -714,10 +901,10 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
     /// site table (`FLIGHT`, `SW`), where the layer has a site: its
     /// projections, then its sum, which waits for the answer when a choice
     /// of the step is the CPU's.
-    pub(crate) fn site_combine(&self) -> Option<(BankCombineEntry<'a, G>, [(&'static str, u64); 2])> {
+    pub(crate) fn site_combine(&self) -> Option<(BankCombineEntry<'a, G>, [(&'static str, Dim); 2])> {
         let entries = self.entries.site?;
-        let table = self.binding().words.site();
-        Some((entries.combine, [("FLIGHT", table.slots()), ("SW", table.width())]))
+        let numbers = self.numbers;
+        Some((entries.combine, [("FLIGHT", numbers.site_slots.clone()), ("SW", numbers.site_width.clone())]))
     }
 
     /// The site's park, between the combine's projections and its sum
@@ -735,18 +922,17 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         &mut self,
         graph: &mut G,
         routes: &WorkflowTensor,
-        rows: u64,
+        rows: &Dim,
     ) -> Result<Option<NativePort>, GraphError> {
         let entries = self.entries;
-        let binding = self.binding();
-        let table = binding.words.scratch();
+        let numbers = self.numbers;
         // The flags are the widest layer's (`BankPart::ScratchFlags`).
         let dimensions = [
-            ("M", rows),
-            ("K", binding.selected),
-            ("E", binding.widest),
-            ("FLIGHT", table.slots()),
-            ("LANES", table.lanes()),
+            ("M", rows.clone()),
+            ("K", numbers.selected.clone()),
+            ("E", numbers.widest.clone()),
+            ("FLIGHT", numbers.scratch_slots.clone()),
+            ("LANES", numbers.scratch_lanes.clone()),
         ];
         let (step, sequence) = self.step(graph)?;
         let mut slots = self.part(graph, BankPart::ScratchTable)?;
@@ -777,11 +963,11 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
     pub(crate) fn pass_sources(
         &mut self,
         graph: &mut G,
-    ) -> Result<(WorkflowTensor, WorkflowTensor, RecordTensors<NativePort>, u64, NativePort), GraphError> {
+    ) -> Result<(WorkflowTensor, WorkflowTensor, RecordTensors<NativePort>, Dim, NativePort), GraphError> {
         let map = self.part(graph, BankPart::SlotMap)?;
         let step = self.part(graph, BankPart::Step)?;
         let entry = self.entries.pass_map;
-        let dimensions = [("E", self.binding().experts)];
+        let dimensions = [("E", self.numbers.experts.clone())];
         let mut resolved = graph.local_for(entry, "resolved", &dimensions)?;
         let mut pass_step = graph.local_for(entry, "pass_step", &dimensions)?;
         graph.enqueue(
@@ -798,7 +984,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
             resolved.tensor().clone(),
             pass_step.tensor().clone(),
             self.parts(graph, |kind| BankPart::Scratch { kind })?,
-            self.binding().records,
+            self.numbers.records.clone(),
             self.part(graph, BankPart::GroupReads)?,
         ))
     }
@@ -824,42 +1010,39 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         constants: &mut Vec<GraphConstant>,
     ) -> Result<WorkflowTensor, GraphError> {
         let entries = self.entries;
-        let binding = self.binding();
+        let numbers = self.numbers;
         // The layer's group's records, its expert stacks, which the device's
         // seed copy writes where it copies into the bank.
         let mut records = match entries.seeding {
             Some(_) => {
-                let (load, scope) = (self.load, self.scope);
-                Some(binding.record.try_map(|kind, _| {
-                    weight_port(graph, load, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
+                let (planned, scope) = (self.planned, self.scope);
+                Some(self.topology.record.try_map(|kind, _| {
+                    weight_port(graph, planned, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
                 })?)
             }
             None => None,
         };
-        let experts = binding.experts;
-        let layout = binding.words;
-        let table = layout.scratch();
-        let [features, hidden] = binding.record.up.matrix;
+        let experts = &numbers.experts;
+        let (scratch_slots, scratch_lanes) = (&numbers.scratch_slots, &numbers.scratch_lanes);
+        let [features, hidden] = &numbers.matrix.up;
         // An up-only record's gate conveyor is empty (`GV` 0), a view of
         // its up's.
-        let gate_conveyor = match binding.record.gate {
-            Some(_) => binding.conveyor,
-            None => 0,
+        let gate_conveyor = match self.topology.record.gate {
+            Some(_) => numbers.conveyor.clone(),
+            None => Dim::from(0),
         };
-        // A round's wait's dimensions, its list of `words_of_list` words.
-        let wait = |words_of_list| {
-            [
-                ("FLIGHT", table.slots()),
-                ("LANES", table.lanes()),
-                ("LW", words_of_list),
-                ("V", binding.conveyor),
-                ("F", features),
-                ("H", hidden),
-                ("E", binding.widest),
-                ("EL", experts),
-                ("GV", gate_conveyor),
-            ]
-        };
+        // A round's wait's dimensions.
+        let wait = [
+            ("FLIGHT", scratch_slots.clone()),
+            ("LANES", scratch_lanes.clone()),
+            ("LW", numbers.list_words.clone()),
+            ("V", numbers.conveyor.clone()),
+            ("F", features.clone()),
+            ("H", hidden.clone()),
+            ("E", numbers.widest.clone()),
+            ("EL", experts.clone()),
+            ("GV", gate_conveyor),
+        ];
         let step = self.part(graph, BankPart::Step)?;
         let mut slots = self.part(graph, BankPart::ScratchTable)?;
         let mut scratch = self.parts(graph, |kind| BankPart::Scratch { kind })?;
@@ -872,9 +1055,9 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         // Beside a host tier, its records, which the tier copy reads in
         // place, and the grid of the tier list it launches on and the list
         // staged in device memory it reads.
-        let mut tier = match binding.tier {
-            0 => None,
-            _ => Some((
+        let mut tier = match numbers.tier.is_zero() {
+            true => None,
+            false => Some((
                 self.parts(graph, |kind| BankPart::Tier { kind })?,
                 self.part(graph, BankPart::TierGrid)?,
                 self.part(graph, BankPart::TierStaged)?,
@@ -911,7 +1094,9 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         // (`routed_pass_map`) reads it only after the park, on every backend,
         // not only where launches keep submission order.
         let map = self.part(graph, BankPart::SlotMap)?;
-        for round in 0..layout.rounds {
+        // The rounds repeat the topology: a trace is its rounds'.
+        let rounds = numbers.rounds.pin();
+        for round in 0..rounds {
             let list = {
                 let round = u8::try_from(round).map_err(|_| "scratch rounds exceed u8")?;
                 self.part(graph, BankPart::ConvertList { round })?
@@ -920,11 +1105,11 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
             self.park(graph, ParkKind::Round(round));
             graph.enqueue(
                 entries.scratch_wait,
-                &wait(self.bank.list_words()),
+                &wait,
                 routed_scratch_wait::WorkflowArgs {
                     step: step.tensor().into(),
                     scratch: slots.tensor_mut().into(),
-                    round: i32::try_from(round).map_err(|_| "scratch rounds exceed i32")?,
+                    round: i32::try_from(round).map_err(|_| "scratch rounds exceed i32")?.into(),
                     list: list.tensor().into(),
                     tiered: tiered.tensor().into(),
                     conveyor_gate: conveyor_gate.arg(),
@@ -941,14 +1126,14 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
             if round == 0 {
                 graph.enqueue(
                     entries.scratch_grids,
-                    &[("FLIGHT", table.slots()), ("LANES", table.lanes()), ("R", layout.rounds)],
+                    &[("FLIGHT", scratch_slots.clone()), ("LANES", scratch_lanes.clone()), ("R", numbers.rounds.clone())],
                     routed_scratch_grids::WorkflowArgs {
                         step: step.tensor().into(),
                         scratch: slots.tensor().into(),
                         grids: grids.tensor_mut().into(),
-                        round_records: i32::try_from(binding.round_records).map_err(|_| "round records exceed i32")?,
-                        rows_groups: convert_groups(binding.record.up.matrix[0])?,
-                        columns_groups: convert_groups(binding.record.down.matrix[0])?,
+                        round_records: numbers.round_records.word().ok_or("round records exceed i32")?,
+                        rows_groups: numbers.rows_groups.word().ok_or("convert groups exceed i32")?,
+                        columns_groups: numbers.columns_groups.word().ok_or("convert groups exceed i32")?,
                     },
                 )?;
                 // Beside a host tier, the tier copy: each expert of the step
@@ -959,7 +1144,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                     let seeding = entries.seeding.ok_or("a host tier's bank seeds by the device")?;
                     graph.enqueue(
                         seeding.list_grid,
-                        &[("L", binding.widest)],
+                        &[("L", numbers.widest.clone())],
                         routed_list_grid::WorkflowArgs {
                             list: tiered.tensor().into(),
                             step: step.tensor().into(),
@@ -967,12 +1152,17 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                             staged: staged.tensor_mut().into(),
                         },
                     )?;
-                    let tensors = binding.record.zip(seeding.seed).zip(records.as_ref()).zip(scratch.as_mut());
-                    for (((tensor, copy), records), scratch) in tensors {
-                        let [n, k] = tensor.matrix;
+                    let tensors = numbers.matrix.as_ref().zip(seeding.seed).zip(records.as_ref()).zip(scratch.as_mut());
+                    for ((([n, k], copy), records), scratch) in tensors {
                         graph.enqueue(
                             copy,
-                            &[("S", binding.tier), ("D", experts), ("L", binding.widest), ("N", n), ("K", k)],
+                            &[
+                                ("S", numbers.tier.clone()),
+                                ("D", experts.clone()),
+                                ("L", numbers.widest.clone()),
+                                ("N", n.clone()),
+                                ("K", k.clone()),
+                            ],
                             routed_copy::WorkflowArgs {
                                 source: records.tensor().into(),
                                 list: staged.tensor().into(),
@@ -990,7 +1180,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                 if let (Some(seeding), Some((seed_grid, staged))) = (entries.seeding, seed_grid.as_mut()) {
                     graph.enqueue(
                         seeding.list_grid,
-                        &[("L", binding.widest)],
+                        &[("L", numbers.widest.clone())],
                         routed_list_grid::WorkflowArgs {
                             list: seeds.tensor().into(),
                             step: step.tensor().into(),
@@ -1002,25 +1192,24 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
             }
             graph.enqueue(
                 entries.list_stage,
-                &[("L", binding.round_records)],
+                &[("L", numbers.round_records.clone())],
                 routed_list_stage::WorkflowArgs {
                     list: list.tensor().into(),
                     step: step.tensor().into(),
                     staged: staged_list.tensor_mut().into(),
                 },
             )?;
-            let tensors = binding.record.zip(entries.convert).zip(conveyor.as_ref());
-            for (kind, (((tensor, convert), conveyor), scratch)) in tensors.zip(scratch.as_mut()).into_tensors() {
-                let [n, k] = tensor.matrix;
+            let tensors = numbers.matrix.as_ref().zip(entries.convert).zip(conveyor.as_ref());
+            for (kind, ((([n, k], convert), conveyor), scratch)) in tensors.zip(scratch.as_mut()).into_tensors() {
                 let converts = grid(grids.tensor(), round, record_grid(kind));
                 graph.enqueue(
                     convert,
                     &[
-                        ("V", binding.conveyor),
-                        ("L", binding.round_records),
-                        ("S", experts),
-                        ("N", n),
-                        ("K", k),
+                        ("V", numbers.conveyor.clone()),
+                        ("L", numbers.round_records.clone()),
+                        ("S", experts.clone()),
+                        ("N", n.clone()),
+                        ("K", k.clone()),
                     ],
                     routed_convert::WorkflowArgs {
                         conveyor: conveyor.tensor().into(),
@@ -1052,18 +1241,23 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         // the scratch fills, so the copy's destination is disjoint from its
         // source by construction. A lender with no record past them seeds
         // nothing.
-        let first = self.bank.seeded_from(self.bank.layers()[self.index].group);
-        let seeded = binding.records.checked_sub(first).ok_or("a bank group's lent records exceed its records")?;
-        if seeded == 0 {
+        let first = &numbers.seeded_from;
+        let seeded = numbers.records.checked_sub(first).ok_or("a bank group's lent records exceed its records")?;
+        if seeded.is_zero() {
             return Ok(scratch.up.tensor().clone());
         }
-        let tensors = binding.record.zip(seeding.seed).zip(scratch.as_ref()).zip(records.as_ref());
-        for (((tensor, seed), scratch), records) in tensors {
-            let [n, k] = tensor.matrix;
-            let mut destination = records.tensor().slice_leading(first, binding.records);
+        let tensors = numbers.matrix.as_ref().zip(seeding.seed).zip(scratch.as_ref()).zip(records.as_ref());
+        for ((([n, k], seed), scratch), records) in tensors {
+            let mut destination = records.tensor().slice_leading(first, &numbers.records);
             graph.enqueue(
                 seed,
-                &[("S", experts), ("D", seeded), ("L", binding.widest), ("N", n), ("K", k)],
+                &[
+                    ("S", experts.clone()),
+                    ("D", seeded.clone()),
+                    ("L", numbers.widest.clone()),
+                    ("N", n.clone()),
+                    ("K", k.clone()),
+                ],
                 routed_copy::WorkflowArgs {
                     source: scratch.tensor().into(),
                     list: staged.tensor().into(),
@@ -1073,10 +1267,15 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                 },
             )?;
         }
-        let mut committed = commits.tensor().slice_leading(first, binding.records);
+        let mut committed = commits.tensor().slice_leading(first, &numbers.records);
         graph.enqueue(
             seeding.seed_commit,
-            &[("X", binding.widest), ("BANK", seeded), ("FLIGHT", table.slots()), ("LANES", table.lanes())],
+            &[
+                ("X", numbers.widest.clone()),
+                ("BANK", seeded),
+                ("FLIGHT", scratch_slots.clone()),
+                ("LANES", scratch_lanes.clone()),
+            ],
             routed_seed_commit::WorkflowArgs {
                 list: seeds.tensor().into(),
                 step: step.tensor().into(),
@@ -1090,15 +1289,19 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
 
 /// A scratch-served step's fill of the streamed routed layer of `scope`, of
 /// any form (`OnceStage::Fill`, `StreamedLayer::fill_scratch`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scratch_fill<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     bank: LayerBank<'_, 'a, G>,
-    load: &ModelLoadPlan,
+    form: &BankForm,
+    numbers: Option<&BankNumbers>,
+    planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError> {
-    let mut layer = StreamedLayer::of(load, scope, bank)?.ok_or("a fill of a layer the load does not stream")?;
+    let mut layer =
+        StreamedLayer::of(planned, form, numbers, scope, bank)?.ok_or("a fill of a layer the load does not stream")?;
     layer.fill_scratch(graph, weights, constants)
 }
 
@@ -1121,13 +1324,7 @@ pub(crate) struct HintPorts<const N: usize> {
     pub rings: NativePort,
 }
 
-impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {
-    /// The leads the layer's route predicts at (`AHEAD`,
-    /// `ExpertBankPlan::ahead`).
-    pub(crate) fn ahead(&self) -> u64 {
-        self.bank.ahead(self.index)
-    }
-
+impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {
     /// The hint ports of this layer, whose own hinted weights, in its
     /// route's order (`operators::routed::hint_kinds`), and policy words are
     /// `own` and `policy`. A weight the next layer has is its own; one it
@@ -1141,31 +1338,27 @@ impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {
         own: [&WorkflowTensor; N],
         policy: &WorkflowTensor,
     ) -> Result<HintPorts<N>, GraphError> {
-        let ahead = self.ahead();
+        let topology = self.topology;
+        let ahead = topology.ahead;
         let mut hinted: [[WorkflowTensor; N]; crate::planning::HINT_LEADS as usize] =
             std::array::from_fn(|_| own.map(Clone::clone));
         let mut policy = policy.clone();
-        let leads = (0..hinted.len()).map(|lead| self.bank.lead_layer(self.index, lead)).collect::<Vec<_>>();
-        for (lead, &layer) in leads.iter().enumerate() {
-            if layer == self.index {
-                continue;
-            }
-            // A layer an earlier lead binds is bound once.
-            if let Some(earlier) = leads[..lead].iter().position(|&bound| bound == layer) {
-                hinted[lead] = hinted[earlier].clone();
-                continue;
-            }
-            let predicted = &self.bank.layers()[layer];
-            for (port, hint) in hinted[lead].iter_mut().zip(&predicted.hinted) {
-                if hint.element.is_some() {
-                    *port = weight(graph, self.load, predicted.scope, hint.kind, weights)?;
+        for (lead, bound) in topology.leads.iter().enumerate() {
+            match bound {
+                HintLead::Own => {}
+                // A layer an earlier lead binds is bound once.
+                HintLead::Earlier(earlier) => hinted[lead] = hinted[*earlier].clone(),
+                HintLead::Layer { scope, kinds } => {
+                    for (port, kind) in hinted[lead].iter_mut().zip(kinds) {
+                        if let Some(kind) = kind {
+                            *port = weight(graph, self.planned, *scope, *kind, weights)?;
+                        }
+                    }
                 }
             }
         }
-        if let Some(next) = self.bank.hints(self.index, 0) {
-            policy = bank_port(graph, self.bank, self.bank.layers()[next].scope, BankPart::Policy, self.ports)?
-                .tensor()
-                .clone();
+        if let Some(next) = topology.next_policy {
+            policy = bank_port(graph, self.planned, next, BankPart::Policy, self.ports)?.tensor().clone();
         }
         Ok(HintPorts {
             ahead,
@@ -1229,9 +1422,9 @@ pub(crate) struct TierPorts {
 /// views of no records of its stacks.
 pub(crate) struct DecodeReads {
     pub sources: WorkflowTensorView,
-    pub rows: u64,
+    pub rows: Dim,
     pub tier: RecordTensors<WorkflowTensorView>,
-    pub records: u64,
+    pub records: Dim,
     /// The layer's policy words; none of a resident layer, whose graph
     /// declares its zero words only where an entry reads them.
     pub policy: Option<WorkflowTensor>,
@@ -1242,18 +1435,24 @@ impl DecodeReads {
     /// choices over its stacks `stacks`.
     pub(crate) fn resident<G: GraphDraft>(
         graph: &mut G,
-        rows: u64,
-        selected: u64,
+        rows: &Dim,
+        selected: &Dim,
         stacks: RecordTensors<&WorkflowTensor>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
         let sources = GraphConstant::row_empty(graph, Element::i32(), rows, selected, constants)?.slice_leading(0, 0);
-        Ok(Self { sources, rows: 0, tier: stacks.map(|_, stack| stack.slice_leading(0, 0)), records: 0, policy: None })
+        Ok(Self {
+            sources,
+            rows: Dim::from(source_rows(false)),
+            tier: stacks.map(|_, stack| stack.slice_leading(0, 0)),
+            records: Dim::from(0),
+            policy: None,
+        })
     }
 
     /// The decode entries' dimensions of them: `XS` and `TR`.
-    pub(crate) fn dimensions(&self) -> [(&'static str, u64); 2] {
-        [("XS", self.rows), ("TR", self.records)]
+    pub(crate) fn dimensions(&self) -> [(&'static str, Dim); 2] {
+        [("XS", self.rows.clone()), ("TR", self.records.clone())]
     }
 }
 
@@ -1282,7 +1481,7 @@ impl RouteLocals {
 /// words (`TM`: the layer's experts, none without a tier) and the tensor, a
 /// graph constant of no words without a tier.
 pub(crate) struct RouteTier {
-    pub experts: u64,
+    pub experts: Dim,
     pub map: WorkflowTensor,
 }
 
@@ -1309,12 +1508,12 @@ pub(crate) fn resident_form(load: &ModelLoadPlan, scope: WeightScope) -> bool {
     streams(load, scope) && load.expert_bank().is_some_and(ExpertBankPlan::reaches_whole)
 }
 
-impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {
+impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {
     pub(crate) fn decode_ports(&mut self, graph: &mut G) -> Result<DecodePorts, GraphError> {
         let (step, sequence) = self.step(graph)?;
-        let tier = match self.binding().tier {
-            0 => None,
-            _ => Some(TierPorts {
+        let tier = match self.numbers.tier.is_zero() {
+            true => None,
+            false => Some(TierPorts {
                 map: self.part(graph, BankPart::TierMap)?,
                 records: self.parts(graph, |kind| BankPart::Tier { kind })?,
             }),

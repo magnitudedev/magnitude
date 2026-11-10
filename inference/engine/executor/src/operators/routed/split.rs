@@ -4,9 +4,52 @@
 //! ports of each graph, and the buffers a load keeps of those values
 //! ([`SplitValues`]).
 
+use crate::programs::graph::facts::{Numbers, constant};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use magnitude_family_contracts::{Decoder, RoutedFfn};
-use seismic::{Element, NativePort};
+use seismic::{Dim, Element, NativePort};
+
+/// What decides a routed layer's crossed and merged values beside their
+/// numbers ([`SplitLayer`]): the element of the experts' input (the
+/// decoder's activations), and whether the layer is of the fused form,
+/// which crosses its shared expert's coefficient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SplitForm {
+    pub activation: Element,
+    pub fused: bool,
+}
+
+/// The numbers of a routed layer's crossed and merged values: its experts,
+/// its selected experts and the width its experts act in.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SplitLayer<D = Dim> {
+    pub experts: D,
+    pub selected: D,
+    pub width: D,
+}
+
+impl<D> Numbers<D> for SplitLayer<D> {
+    type Of<E> = SplitLayer<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> SplitLayer<E> {
+        SplitLayer { experts: f(self.experts), selected: f(self.selected), width: f(self.width) }
+    }
+}
+
+/// The form and numbers of `routed`'s split values in `geometry`: the only
+/// reading of the model they make.
+pub(crate) fn split(routed: &RoutedFfn, geometry: &Decoder) -> (SplitForm, SplitLayer<u64>) {
+    (
+        SplitForm {
+            activation: crate::programs::native_target_graph::activation(geometry),
+            fused: super::is_fused(routed),
+        },
+        SplitLayer {
+            experts: routed.experts,
+            selected: routed.selected,
+            width: routed.expert_hidden(geometry.hidden),
+        },
+    )
+}
 
 /// The part of a block a sealed graph holds: the whole block, or, of a
 /// block whose prompt rows split at its routed layer, its front (its mixer,
@@ -154,30 +197,44 @@ pub(crate) struct Merged<T> {
     pub table: T,
 }
 
-impl Merged<Extents> {
-    /// The merged values of `routed` over a pass of `rows` rows.
-    pub(crate) fn of(routed: &RoutedFfn, geometry: &Decoder, rows: u64) -> Result<Self, String> {
-        let blocks = super::fused_graph::grouped_blocks(rows, routed.experts, routed.selected)?;
+impl Merged<Extents<Dim>> {
+    /// The merged values of a layer of `form` and `layer` over a pass of
+    /// `rows` rows.
+    pub(crate) fn at(form: &SplitForm, layer: &SplitLayer, rows: &Dim) -> Result<Self, String> {
+        let blocks = super::fused_graph::grouped_blocks(rows, &layer.experts, &layer.selected)?;
         Ok(Merged {
-            experts: (
-                crate::programs::native_target_graph::activation(geometry),
-                vec![blocks, super::fused_graph::TILE_ROWS, routed.expert_hidden(geometry.hidden)],
-            ),
-            inverse: (Element::i32(), vec![rows, routed.selected]),
+            experts: (form.activation, vec![blocks, Dim::from(super::fused_graph::TILE_ROWS), layer.width.clone()]),
+            inverse: (Element::i32(), vec![rows.clone(), layer.selected.clone()]),
             table: (Element::i32(), vec![rows + 1]),
         })
     }
 
     /// The expert tiles the merged experts hold.
-    fn blocks(&self) -> u64 {
-        self.experts.1[0]
+    fn blocks(&self) -> Dim {
+        self.experts.1[0].clone()
     }
 }
 
+impl Merged<Extents> {
+    /// The merged values of `routed` over a pass of `rows` rows
+    /// ([`Merged::at`]).
+    pub(crate) fn of(routed: &RoutedFfn, geometry: &Decoder, rows: u64) -> Result<Self, String> {
+        let (form, layer) = split(routed, geometry);
+        let merged = Merged::at(&form, &constant(layer), &Dim::from(rows))?;
+        Ok(Merged { experts: fixed(merged.experts), inverse: fixed(merged.inverse), table: fixed(merged.table) })
+    }
+}
+
+/// Constant extents' values.
+fn fixed((element, extents): Extents<Dim>) -> Extents {
+    (element, extents.iter().map(Dim::fixed).collect())
+}
+
 /// The ports of a merge set's pass (`OnceStage::Pass`): the crossed rows it
-/// groups, over the pass's rows; the merged experts it writes, of `blocks`
-/// tiles, and its rows' positions in them; and the count and first row it
-/// groups, one entry of the row table each.
+/// groups, over the pass's rows; the merged experts it writes and its rows'
+/// positions in them; and the count and first row it groups, one entry of
+/// the row table each. The merged experts' tiles are its graph's
+/// ([`PassPorts::of`]): ports outlive their graph's dimensions.
 #[derive(Clone)]
 pub(crate) struct PassPorts {
     pub crossing: PassCrossing<NativePort>,
@@ -185,27 +242,25 @@ pub(crate) struct PassPorts {
     pub inverse: NativePort,
     pub rows: NativePort,
     pub first: NativePort,
-    pub blocks: u64,
 }
 
 /// The ports of a back after its merge set's pass (`RunStage::Combine`): what
-/// it reads of its rows' crossing; the merged experts, of `blocks` tiles;
-/// and its own rows' positions in them.
+/// it reads of its rows' crossing; the merged experts; and its own rows'
+/// positions in them.
 #[derive(Clone)]
 pub(crate) struct BackPorts {
     pub crossing: BackCrossing<NativePort>,
     pub experts: NativePort,
     pub inverse: NativePort,
-    pub blocks: u64,
 }
 
 impl BackPorts {
-    /// The pass the back combines from.
-    pub(crate) fn pass(&self) -> super::grouped::ExpertsPass {
+    /// The pass the back combines from, of `blocks` expert tiles.
+    pub(crate) fn pass(&self, blocks: &Dim) -> super::grouped::ExpertsPass {
         super::grouped::ExpertsPass {
             output: self.experts.tensor().clone(),
             inverse: self.inverse.tensor().clone(),
-            blocks: self.blocks,
+            blocks: blocks.clone(),
         }
     }
 }
@@ -221,67 +276,70 @@ pub(crate) enum SplitPorts {
 /// A split layer's graph ([`Stage`]): its front, which routes into the
 /// crossing's ports and requests where scratch-served; or its back after
 /// its merge set's pass (`fused_graph::group_pass`, `graph::general_pass`),
-/// which combines its rows from the merged ports.
+/// which combines its rows from the merged ports, of the expert tiles its
+/// graph's merged experts hold.
 pub(crate) enum Split<'c> {
     Front(&'c mut Crossing<NativePort>),
-    Combine(&'c BackPorts),
+    Combine(&'c BackPorts, &'c Dim),
 }
 
-impl SplitPorts {
+/// A split layer's ports as its graph is built: its stage's ports
+/// ([`SplitPorts`], which the graph keeps), with a back's merged experts'
+/// tiles.
+pub(crate) enum SplitBuild {
+    Front(Crossing<NativePort>),
+    Back(BackPorts, Dim),
+}
+
+impl SplitBuild {
     pub(crate) fn split(&mut self) -> Split<'_> {
         match self {
             Self::Front(crossing) => Split::Front(crossing),
-            Self::Back(back) => Split::Combine(back),
+            Self::Back(back, blocks) => Split::Combine(back, blocks),
+        }
+    }
+
+    /// The ports its graph keeps.
+    pub(crate) fn into_ports(self) -> SplitPorts {
+        match self {
+            Self::Front(crossing) => SplitPorts::Front(crossing),
+            Self::Back(back, _) => SplitPorts::Back(back),
         }
     }
 }
 
-/// The ports of a block graph of a stage ([`Stage`]): a run's, which a
-/// split layer's front or back crosses or merges values through (none of a
-/// whole block's or a fill's), or its merge set's pass's. A prepared graph
-/// is held by which of the two it has, so a run's graph and a pass's are
-/// apart by type.
-#[derive(Clone)]
-pub(crate) enum StagePorts {
-    Run(Option<SplitPorts>),
-    Pass(PassPorts),
-}
-
 /// A crossed value's port in `graph`, its rows the graph class's.
-fn crossed<G: GraphDraft>(graph: &mut G, (element, extents): &Extents) -> Result<NativePort, GraphError> {
+fn crossed<G: GraphDraft>(graph: &mut G, (element, extents): &Extents<Dim>) -> Result<NativePort, GraphError> {
     graph.port_with_class_extent(*element, extents, 0, "M")
 }
 
 impl SplitPorts {
     /// The ports in `graph` of a run's graph of `stage` over `rows` rows of a
-    /// block with a `routed` layer, whose passes merge `capacity` rows: none
-    /// of a whole block's.
+    /// block with a routed layer of `split` ([`split`]), whose passes merge
+    /// `capacity` rows: none of a whole block's.
     pub(crate) fn of<G: GraphDraft>(
         graph: &mut G,
         stage: RunStage,
-        routed: Option<&RoutedFfn>,
-        geometry: &Decoder,
-        rows: u64,
-        capacity: u64,
-    ) -> Result<Option<Self>, GraphError> {
-        let routed = || routed.ok_or("a split block without a routed layer");
+        split: Option<(&SplitForm, &SplitLayer)>,
+        rows: &Dim,
+        capacity: &Dim,
+    ) -> Result<Option<SplitBuild>, GraphError> {
+        let routed = || split.ok_or("a split block without a routed layer");
         Ok(match stage {
             RunStage::Whole | RunStage::Resident => None,
-            RunStage::Front => Some(Self::Front(
-                Crossing::of(routed()?, geometry, rows).try_map(|value| crossed(graph, value))?,
-            )),
+            RunStage::Front => {
+                let (form, layer) = routed()?;
+                let crossing = Crossing::at(form, layer, rows).try_map(|value| crossed(graph, value))?;
+                Some(SplitBuild::Front(crossing))
+            }
             RunStage::Combine => {
-                let routed = routed()?;
-                let crossing = Crossing::of(routed, geometry, rows).back().try_map(|value| crossed(graph, value))?;
-                let merged = Merged::of(routed, geometry, capacity)?;
+                let (form, layer) = routed()?;
+                let crossing = Crossing::at(form, layer, rows).back().try_map(|value| crossed(graph, value))?;
+                let merged = Merged::at(form, layer, capacity)?;
                 let experts = graph.port(merged.experts.0, &merged.experts.1)?;
-                let (element, selected) = (merged.inverse.0, merged.inverse.1[1]);
-                Some(Self::Back(BackPorts {
-                    crossing,
-                    experts,
-                    inverse: graph.port_with_class_extent(element, &[rows, selected], 0, "M")?,
-                    blocks: merged.blocks(),
-                }))
+                let (element, selected) = (merged.inverse.0, merged.inverse.1[1].clone());
+                let inverse = graph.port_with_class_extent(element, &[rows.clone(), selected], 0, "M")?;
+                Some(SplitBuild::Back(BackPorts { crossing, experts, inverse }, merged.blocks()))
             }
         })
     }
@@ -289,24 +347,25 @@ impl SplitPorts {
 
 impl PassPorts {
     /// The ports in `graph` of a merge set's pass over `rows` rows of a
-    /// `routed` layer, merging `capacity` rows.
+    /// routed layer of `form` and `layer` ([`split`]), merging `capacity`
+    /// rows, and the expert tiles their merged experts hold.
     pub(crate) fn of<G: GraphDraft>(
         graph: &mut G,
-        routed: &RoutedFfn,
-        geometry: &Decoder,
-        rows: u64,
-        capacity: u64,
-    ) -> Result<Self, GraphError> {
-        let crossing = Crossing::of(routed, geometry, rows).pass().try_map(|value| crossed(graph, value))?;
-        let merged = Merged::of(routed, geometry, capacity)?;
-        Ok(Self {
+        form: &SplitForm,
+        layer: &SplitLayer,
+        rows: &Dim,
+        capacity: &Dim,
+    ) -> Result<(Self, Dim), GraphError> {
+        let crossing = Crossing::at(form, layer, rows).pass().try_map(|value| crossed(graph, value))?;
+        let merged = Merged::at(form, layer, capacity)?;
+        let ports = Self {
             crossing,
             experts: graph.port(merged.experts.0, &merged.experts.1)?,
             inverse: graph.port(merged.inverse.0, &merged.inverse.1)?,
-            rows: graph.port(Element::i32(), &[1])?,
-            first: graph.port(Element::i32(), &[1])?,
-            blocks: merged.blocks(),
-        })
+            rows: graph.port(Element::i32(), &[1u64])?,
+            first: graph.port(Element::i32(), &[1u64])?,
+        };
+        Ok((ports, merged.blocks()))
     }
 }
 
@@ -373,7 +432,7 @@ impl<T> BackCrossing<T> {
 }
 
 /// A value's element and extents.
-pub(crate) type Extents = (Element, Vec<u64>);
+pub(crate) type Extents<D = u64> = (Element, Vec<D>);
 
 /// What a routed layer's prompt rows cross and merge ([`Crossing`],
 /// [`Merged`]). A group's passes run one layer after another, so no two
@@ -487,21 +546,32 @@ impl SplitValues<seismic::Tensor> {
     }
 }
 
-impl Crossing<Extents> {
-    /// The element and extents of each value `routed` crosses over `rows`
-    /// rows: `[rows, K]` routes and weights, the experts' `[rows, H]` input
-    /// in the decoder's activation (in the latent width where latent), and
-    /// the fused form's `[rows]` coefficient.
-    pub(crate) fn of(routed: &RoutedFfn, geometry: &Decoder, rows: u64) -> Self {
-        let choices = vec![rows, routed.selected];
+impl Crossing<Extents<Dim>> {
+    /// The element and extents of each value a layer of `form` and `layer`
+    /// crosses over `rows` rows: `[rows, K]` routes and weights, the
+    /// experts' `[rows, H]` input in the decoder's activation (in the latent
+    /// width where latent), and the fused form's `[rows]` coefficient.
+    pub(crate) fn at(form: &SplitForm, layer: &SplitLayer, rows: &Dim) -> Self {
+        let choices = vec![rows.clone(), layer.selected.clone()];
         Crossing {
             routes: (Element::i32(), choices.clone()),
             weights: (Element::f32(), choices),
-            normalized: (
-                crate::programs::native_target_graph::activation(geometry),
-                vec![rows, routed.expert_hidden(geometry.hidden)],
-            ),
-            coefficient: super::is_fused(routed).then(|| (Element::f32(), vec![rows])),
+            normalized: (form.activation, vec![rows.clone(), layer.width.clone()]),
+            coefficient: form.fused.then(|| (Element::f32(), vec![rows.clone()])),
+        }
+    }
+}
+
+impl Crossing<Extents> {
+    /// The values `routed` crosses over `rows` rows ([`Crossing::at`]).
+    pub(crate) fn of(routed: &RoutedFfn, geometry: &Decoder, rows: u64) -> Self {
+        let (form, layer) = split(routed, geometry);
+        let crossing = Crossing::at(&form, &constant(layer), &Dim::from(rows));
+        Crossing {
+            routes: fixed(crossing.routes),
+            weights: fixed(crossing.weights),
+            normalized: fixed(crossing.normalized),
+            coefficient: crossing.coefficient.map(fixed),
         }
     }
 }

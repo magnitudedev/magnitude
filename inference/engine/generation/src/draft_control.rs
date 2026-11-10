@@ -16,6 +16,12 @@
 //! load's blocks usually are once what it last scored is old
 //! ([`DepthMeans`]).
 //!
+//! The plain decode is the reference every drafting width is compared
+//! against, and while a load drafts no ordinary round measures it. Where it
+//! is measured, it is taken again while its price is unproven or stale.
+//! Where it is not, a plain look takes it once no price it costs at least
+//! lasts any longer.
+//!
 //! A round verifies its drafted block by the drafter's confidence in each
 //! proposal where the drafter gives one: how often a proposal at a depth is
 //! right after the ones before it divides by that confidence
@@ -47,7 +53,8 @@ const COST_SAMPLES: usize = 3;
 /// and a plain decode not taken for that long is taken again, so a price
 /// left by a busier or freer machine lasts no longer.
 const STALE_ROUNDS: u64 = 100;
-/// The share of decode time spent on looks.
+/// The share of decode time spent on looks: wider and plain, each scaled
+/// down where little can be gained.
 const LOOK_SHARE: f64 = 0.01;
 /// The equal shares of [0, 1] a depth's calibration divides the drafter's
 /// confidence into.
@@ -493,15 +500,19 @@ impl RoundCosts {
     }
 
     /// What a round generating `generated` that is a look pays for its
-    /// switches beyond its share: a look after a round that drafted nothing
-    /// drafts for that round alone, so it enters and leaves again whole.
+    /// switches beyond its share: a look that switches (one drafting after
+    /// a round that did not, or a plain one after a round that drafted)
+    /// does so for its round alone, so it switches and switches back whole.
     fn excursion(&self, generated: usize) -> f64 {
-        if self.switching(generated > 0) != Some(Switch::Enter) {
+        let Some(there) = self.switching(generated > 0) else {
             return 0.0;
-        }
-        let enter = self.switch(Switch::Enter).unwrap_or(0.0);
-        let leave = self.switch(Switch::Leave).unwrap_or(0.0);
-        (1.0 - self.switch_weight) * enter + leave
+        };
+        let back = match there {
+            Switch::Enter => Switch::Leave,
+            Switch::Leave => Switch::Enter,
+        };
+        let cost = |switch| self.switch(switch).unwrap_or(0.0);
+        (1.0 - self.switch_weight) * cost(there) + cost(back)
     }
 
     /// The price of a round's launches when both are measured here.
@@ -595,6 +606,8 @@ pub struct DraftLoad {
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
     look_seconds: Mutex<f64>,
+    /// The decode time set aside for the next plain look.
+    plain_seconds: Mutex<f64>,
     /// Whether `costs` holds a duration measured beside the expert bank's
     /// fill ([`Self::settle`]).
     beside_fill: Mutex<bool>,
@@ -629,8 +642,9 @@ struct Block {
 pub struct RoundChoice {
     pub generated: usize,
     pub verified: usize,
-    /// Whether the round drafted wider than its fastest pair, to score the
-    /// deeper proposals.
+    /// Whether the round is a look: wider than its kept width, to score the
+    /// deeper proposals, or plain while drafting, to measure the plain
+    /// decode again.
     pub look: bool,
 }
 
@@ -880,16 +894,16 @@ impl DraftController {
             }
         }
         let (fastest, verified, rate) = fastest;
-        // The plain decode is the one launch no look takes, so while it is
-        // measured here but its cost is unproven or stale it is taken again
-        // in place of drafting: a duration another process held up, or a
-        // machine since freed, would otherwise price it for good.
-        let plain_unsettled = fastest > 0 && {
-            let round = *self.load.rounds.lock().expect("draft load rounds");
-            costs.own.verify.get(&1).is_some_and(|plain| {
+        // The plain decode is the one launch no wider look takes, so while
+        // it is measured here but its cost is unproven or stale it is taken
+        // again in place of drafting: a duration another process held up,
+        // or a machine since freed, would otherwise price it for good.
+        let round = *self.load.rounds.lock().expect("draft load rounds");
+        let plain = costs.own.verify.get(&costs.sequences);
+        let plain_unsettled = fastest > 0
+            && plain.is_some_and(|plain| {
                 !plain.proven() || round.saturating_sub(plain.latest()) >= STALE_ROUNDS
-            })
-        };
+            });
         // How much faster than the fastest pair a width could be at best:
         // its rate if every proposal it drafts were right, over the fastest
         // pair's, less one.
@@ -978,8 +992,41 @@ impl DraftController {
                 kept
             }
         };
-        let generated = if plain_unsettled { 0 } else { generated };
-        if !plain_unsettled {
+        // A plain decode not measured here costs at least what it measured
+        // at no longer a context and among no more requests, while the
+        // machine and the expert bank are as they were then: for as long as
+        // any price lasts. Past that nothing measured bounds it, and it could
+        // be faster than the fastest pair by any amount. It is then a look,
+        // as a wider width is: taken as often as the share of the decode time
+        // for what it could gain pays for what it loses (its round's time
+        // beyond what its token takes at the fastest pair's rate, with the
+        // whole of the switches it makes), on a round of the fastest pair,
+        // so that a width kept past it goes on measuring itself.
+        let plain_look = fastest > 0 && plain.is_none() && {
+            let floor = costs
+                .lesser
+                .iter()
+                .flat_map(|measured| measured.verify.range(..=costs.sequences))
+                .filter(|(_, durations)| round.saturating_sub(durations.latest()) < STALE_ROUNDS)
+                .map(|(_, durations)| durations.cost())
+                .reduce(f64::max);
+            let gain = floor.map_or(1.0, |floor| (1.0 / floor / rate - 1.0).min(1.0));
+            gain > 0.0 && {
+                let mut set_aside = self.load.plain_seconds.lock().expect("draft load look time");
+                *set_aside += LOOK_SHARE * gain * costs.round(fastest, verified);
+                let lost = costs.round(0, 0) + costs.excursion(0) - 1.0 / rate;
+                let due = generated == kept && kept == fastest && *set_aside >= lost;
+                if due {
+                    *set_aside = 0.0;
+                }
+                due
+            }
+        };
+        // A plain decode taken to measure it changes no choice (see
+        // [`Self::costs`]).
+        let measuring = plain_unsettled || plain_look;
+        let generated = if measuring { 0 } else { generated };
+        if !measuring {
             self.chosen = Some(generated > 0);
         }
         *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;

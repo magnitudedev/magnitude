@@ -385,9 +385,10 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &structure,
     )
     .unwrap();
-    let PreparedModelAssessment::Planned { draft: plan, .. } = prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = prepared else {
         panic!("the bundle plans")
     };
+    let plan = execution.draft();
 
     let resolved = resolved();
     let definition = &resolved.manifest.definition;

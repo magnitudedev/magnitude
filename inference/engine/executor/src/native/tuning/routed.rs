@@ -94,7 +94,7 @@ pub(crate) fn group(
     rows: u64,
     shape: RoutedShape,
 ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>), String> {
-    let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
+    let blocks = grouped_blocks(rows, shape.experts, shape.selected)?.fixed();
     let tile = TILE_ROWS as usize;
     let mut order = vec![-1; blocks as usize * tile];
     let mut inverse = vec![0; routes.len()];
@@ -742,7 +742,7 @@ impl EntryTuning for RoutedGroupTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
-        let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
+        let blocks = grouped_blocks(rows, shape.experts, shape.selected)?.fixed();
         let table = |extents: &[u64]| -> Result<CaseState, BuildError> {
             let tensor = inputs.scratch(Element::i32(), extents)?;
             inputs.state(tensor, 0..extents[0])

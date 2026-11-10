@@ -47,15 +47,27 @@
 //! ([`Required`]: the launch graph's times and the composition chain). Every
 //! other figure is held where its point was read and priced from those that
 //! were until then ([`ExecutorCosts`]), so the costs exist, and price every
-//! model, once those are stored; until then they are pending. The walk's steps after it are one plan ([`plan`]),
-//! each figure before those whose prices without it are less far off, so
-//! what a job's time leaves unread is what is priced closest. A job takes
-//! [`MEASUREMENT_SECONDS`] of wall time from its start at most, whatever
-//! the machine: each point samples for its part of the time left, or until
-//! its median is resolved; nothing is submitted that is forecast to end past
-//! it, compiles' waits included, and no point is begun whose making and
-//! fewest passes, where records forecast them, would. A point it ends
-//! before any sample is not recorded, and the next job measures it.
+//! model, once those are stored; until then they are pending. The walk's
+//! steps after it are one plan ([`plan`]), each figure before those whose
+//! prices without it are less far off, so what the budget leaves unread is
+//! what is priced closest.
+//!
+//! Assessment measures a machine once per machine and build, in one job:
+//! its points (the standing requests', [`super::requests::standing`]) take
+//! [`MEASUREMENT_SECONDS`] of wall time from the job's start, whatever the
+//! machine, a budget its points divide rather than a bar they reach
+//! ([`Measured::within`]). Each samples for its part of the time left
+//! beside what the standing points after it are forecast to take at least
+//! ([`Ahead`]), or until its median is resolved, and passes what it does
+//! not take on; nothing is submitted that is forecast to end past the
+//! budget, compiles' waits included, and no point is begun whose making and
+//! fewest passes, where the walk forecasts them, would end past it, or would
+//! leave the required figures after it less than theirs
+//! ([`Measured::starts`]). A standing point the budget cannot hold is
+//! recorded unobtainable ([`unreached`]), so its figure is priced from
+//! those read, unless it reads a required figure, which nothing prices:
+//! that one, like a load's point the job's time ends, is not recorded, and
+//! the next job measures it, resuming from the records stored.
 //!
 //! A history layout's costs are read on a ladder of depths
 //! ([`HISTORY_DEPTHS`], the depths estimates read), as far as a rung fits
@@ -82,6 +94,7 @@
 //! executor has no costs.
 
 use super::demand::{Bytes, Flops, HistoryRead, Work};
+use super::requests::JobDeadlines;
 use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
@@ -193,12 +206,17 @@ const GRAPH_WIDTH: u64 = 64;
 /// makes.
 const CHAIN_LAYER_CALLS: usize = 4;
 
-/// The wall seconds a measurement job takes at most, from its start,
-/// whatever the machine and however many points are requested. Its points,
-/// in the order of who waits on them ([`super::requests`]), each sample for
-/// an equal part of the time left, or until its median is resolved, so a
-/// slower machine takes fewer samples of each point rather than longer, a
-/// faster one ends sooner, and what one job leaves the next resumes.
+/// The wall seconds assessment's measurement of a machine takes, once per
+/// machine and build, from its job's start (discovering the machine,
+/// probing the device and forming kernels among them), whatever the
+/// machine and however many points it has: a budget, not a bar. Its
+/// standing points ([`super::requests::standing`]) divide it in their
+/// order, each sampling for its part of the time left beside the fewest
+/// passes of those after it where forecast ([`Measured::within`]), or
+/// until its median is resolved, so a slower machine takes fewer samples of
+/// each point rather than longer and a faster one ends sooner; a point the
+/// budget cannot hold is priced from those read ([`unreached`]), except a
+/// required figure's, which the next job measures.
 pub const MEASUREMENT_SECONDS: f64 = 10.0;
 
 /// The depths a history layout's ladder is read at, in tokens, as far as
@@ -886,14 +904,16 @@ enum Stop<M> {
     /// times come from records alone, and never where every point is timed
     /// (`M` is uninhabited).
     Missing(M),
-    /// A point cannot be timed: it failed, or is recorded unobtainable. The
+    /// A point cannot be timed: it failed, or is recorded unobtainable (a
+    /// standing figure the job's time could not hold, [`unreached`]). The
     /// job's visited points report it.
     Point(ExecutorCostsError),
     /// The step failed outside any point's timing: a kernel's identity, a
     /// layout's planes, a placement, a record store that cannot be read.
     Failed(ExecutorCostsError),
-    /// The job's deadline passed before a point read a sample: the next job
-    /// measures it.
+    /// The job's time ended before a required figure's point read a sample:
+    /// it is not recorded, and the next job measures it
+    /// ([`Measured::kept`]). Never where times come from records alone.
     Expired,
 }
 
@@ -1501,13 +1521,14 @@ impl Programs {
     /// Hold the formation between its programs for a point that touches
     /// the host (`host`), or any on the host's own device: once no compile
     /// runs, none starts until the hold is dropped, so the point is timed
-    /// with none beside it; the job's deadline passing first expires it.
+    /// with none beside it; its time ending at `deadline` first expires it
+    /// (a load's ends with the job's time, which may outlast the walk's).
     /// No hold for any other point.
-    fn quiet(&self, host: bool) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
+    fn quiet(&self, host: bool, deadline: std::time::Instant) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
         if !self.touches_host(host) {
             return Ok(None);
         }
-        self.formation.hold(self.deadline).map(Some).ok_or(Unformed::Expired)
+        self.formation.hold(deadline).map(Some).ok_or(Unformed::Expired)
     }
 
     /// Every program not formed yet is never formed: the formation thread
@@ -1538,6 +1559,11 @@ trait Times {
     /// What a point no record holds is to these timings ([`Stop::Missing`]).
     type Missing;
 
+    /// Whether its points take parts of a job's time, so the walk forecasts
+    /// what the points after each take at least ([`Walk::ahead`]); a
+    /// start's derivation from records takes none.
+    const MEASURES: bool;
+
     /// The timing of `spec`'s point: its record, or `build`'s point, made
     /// from `programs` formed on a device, measured there for at most its
     /// `share` of the job or until its median is resolved, and its record
@@ -1565,44 +1591,97 @@ trait Times {
     fn done_with(&mut self, route: NativeKind);
 }
 
-/// How a point's reading is forecast, where records forecast it (a deeper
-/// rung from the rung below, a format's streaming rate and throughput from
-/// its pilot): the job starts no point whose making and fewest passes, a
-/// lead and a sample, end past its time, as the first a point submits has
-/// no reading of its own to forecast it by (a GB10's CPU started a 262K rung
-/// 9.6 s into a job and ended it at 10.85 s, 2026-10-22). Its time is the
-/// job's to share ([`Measured::within`]).
+/// How a point's reading is forecast, where the walk forecasts it from what
+/// it read ([`Walk::forecast`]: a deeper rung from the rungs below, a
+/// format's streaming rate and throughput from its pilot, the composition
+/// chain from the probe), and what the standing points after it are: the
+/// job starts no point whose making and fewest passes, a lead and a sample,
+/// end past its time, as the first a point submits has no reading of its
+/// own to forecast it by (a GB10's CPU started a 262K rung 9.6 s into a job
+/// and ended it at 10.85 s, 2026-10-22). Its time is the job's to share
+/// ([`Measured::within`]).
 #[derive(Clone, Copy, Debug)]
 struct Share {
     forecast: Option<Forecast>,
+    /// What the walk's points after it are forecast to take at least.
+    after: Ahead,
     /// Whether the point is timed on the host's clock or reads host
     /// memory, so a compile running beside it would be timed too: it is
     /// timed only while no program forms ([`Programs::quiet`]).
     host: bool,
+    /// Whether it reads a figure the costs require (the probe, or one of
+    /// [`Required`]): one the job's time ends is measured by the next job,
+    /// never priced ([`Measured::kept`]).
+    required: bool,
 }
 
 /// What reading a point is forecast to take: the seconds of one pass of its
-/// calls, and the bytes its making lays out.
+/// calls, and the bytes its making lays out. Its fewest passes, a lead and
+/// a sample, and its making are what it takes at least
+/// ([`Measured::least`]); several points' least combines by [`Self::then`].
 #[derive(Clone, Copy, Debug)]
 struct Forecast {
     pass: f64,
     bytes: u64,
 }
 
-impl Share {
-    /// No forecast.
-    const UNFORECAST: Self = Self { forecast: None, host: false };
+impl Forecast {
+    /// What this point and a `later` one take together at least: their
+    /// passes one after another, and their making's bytes the larger of
+    /// the two, since every point's rotation is views of the job's one
+    /// backing per route ([`Backings`]), which grows to the largest point
+    /// that reads it and is filled once.
+    fn then(self, later: Self) -> Self {
+        Self { pass: self.pass + later.pass, bytes: self.bytes.max(later.bytes) }
+    }
+}
 
-    /// This share where a pass of its point's calls is forecast to take
-    /// `pass` seconds and its making to lay out `bytes`.
-    fn forecast(self, pass: f64, bytes: u64) -> Self {
-        Self { forecast: Some(Forecast { pass, bytes }), ..self }
+/// What the standing points after one are forecast to take at least, each
+/// where the walk forecasts it ([`Walk::ahead`]), and those of them that
+/// read a required figure ([`Required`]): a point's part of the job is the
+/// time left beside the first ([`Measured::within`]), and none begins that
+/// would leave the second less ([`Measured::starts`]), so the required
+/// figures get their fewest passes first and every later point its own. A
+/// point nothing forecasts (one before the probe, the launch graph's, a
+/// figure's other than the walk's) reserves none.
+#[derive(Clone, Copy, Debug)]
+struct Ahead {
+    all: Forecast,
+    required: Forecast,
+}
+
+impl Share {
+    /// No forecast, of itself or of the points after it.
+    const UNFORECAST: Self = Self { forecast: None, after: Ahead::NONE, host: false, required: false };
+
+    /// This share where reading its point is forecast as `forecast`.
+    fn forecast(self, forecast: Forecast) -> Self {
+        Self { forecast: Some(forecast), ..self }
+    }
+
+    /// This share where the standing points after it are forecast as `after`.
+    fn before(self, after: Ahead) -> Self {
+        Self { after, ..self }
     }
 
     /// This share of a point that touches the host ([`Self::host`]).
     fn on_host(self) -> Self {
         Self { host: true, ..self }
     }
+
+    /// This share of a point that reads a required figure
+    /// ([`Self::required`]).
+    fn required(self) -> Self {
+        Self { required: true, ..self }
+    }
+}
+
+impl Ahead {
+    /// Nothing forecast.
+    const NONE: Self = Self {
+        all: Forecast { pass: 0., bytes: 0 },
+        required: Forecast { pass: 0., bytes: 0 },
+    };
 }
 
 /// What a job's caller is told of each point it visits, as soon as it is
@@ -1683,6 +1762,8 @@ struct Retraced<'a> {
 impl Times for Retraced<'_> {
     type Missing = PointKey;
 
+    const MEASURES: bool = false;
+
     fn time(
         &mut self,
         spec: PointSpec,
@@ -1731,52 +1812,189 @@ struct Measured<'a, 'd> {
     /// Told of every point visited, in order, with what became of it, as
     /// soon as it is known.
     visit: &'a mut Visit<'a>,
-    /// When the job's [`MEASUREMENT_SECONDS`] end.
-    deadline: std::time::Instant,
-    /// The points the job has still to visit, its own next among them, in
-    /// the order its requests are measured ([`super::requests`]): each
-    /// samples for an equal part of the time left. A point that ends before
+    /// When the job's time ends, for assessment's standing points and for
+    /// the loads'.
+    deadlines: JobDeadlines,
+    /// Whose points the job is visiting, in the order its requests are
+    /// measured ([`super::requests::measure`]), and how many of theirs it
+    /// has still to visit, its own next among them: each samples for its
+    /// part of their time left ([`Self::within`]). A point that ends before
     /// its part passes the rest to the points after it, and one that takes
     /// longer (its fewest samples longer than its part) takes it from them,
-    /// so the job keeps its time; what it does not reach the next job
-    /// measures.
+    /// so the job keeps its time.
+    whose: Whose,
     left: usize,
+    /// What the standing points after the next are forecast to take at
+    /// least, as the walk forecast them at its latest point: a walk's point
+    /// gives its own, and a standing point between the walk's parts, which
+    /// no walk forecasts, keeps the latest, as the walk's later points
+    /// still follow it.
+    ahead: Ahead,
+}
+
+/// Whose points a job visits ([`super::requests::measure`]): assessment's
+/// standing points first, in [`MEASUREMENT_SECONDS`] from the job's start
+/// whatever time it is given ([`JobDeadlines`]), only a required figure's
+/// left to a later job; then the loads', in what is left of the job's time,
+/// each an equal part, what it does not reach the next job's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Whose {
+    Standing,
+    Loads,
+}
+
+/// Why a standing point that reads no required figure holds no timing: the
+/// job's time could not hold it, so it is recorded unobtainable with this
+/// reason, and its figure priced from those read. Recorded unobtainable
+/// rather than as a record of its own: an unobtainable record is what
+/// already leaves a figure priced from those read ([`ExecutorCosts`]), what
+/// a walk retraced from records takes for a point's end, and what leaves
+/// its request no point to measure
+/// ([`super::requests::PointRequest::outstanding`]); so a point the budget
+/// cannot hold is priced by construction, and nothing schedules a job for
+/// it. A figure outside the walk (the model store's read line, the
+/// reference convert, the host memory's line), which nothing else prices,
+/// is unavailable with this reason. A required figure (the probe, or one of
+/// [`Required`]) is never recorded so, since nothing prices it: the job's
+/// time ending leaves it unrecorded, and the next job measures it
+/// ([`Measured::kept`]). Its record is of the machine as a timing's is,
+/// standing while the point's key does.
+fn unreached() -> Reason {
+    Reason::new(format!(
+        "assessment's {MEASUREMENT_SECONDS} s measurement of this machine could not hold it: its figure is priced from those read"
+    ))
 }
 
 impl Measured<'_, '_> {
-    /// Whether a point of `share` can be read before the job's time ends:
-    /// its forecast making, lead and one sample end before it
-    /// ([`Share::forecast`]), or nothing forecasts it.
-    fn starts(&self, share: Share) -> bool {
-        share.forecast.is_none_or(|Forecast { pass, bytes }| {
-            let seconds = self.backings.filling(bytes) + 2. * pass;
-            std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds)
-                <= self.deadline
-        })
+    /// When the next point's time ends: the standing points' or the loads'
+    /// ([`Whose`]).
+    fn deadline(&self) -> std::time::Instant {
+        match self.whose {
+            Whose::Standing => self.deadlines.standing(),
+            Whose::Loads => self.deadlines.loads(),
+        }
     }
 
-    /// How the next point is sampled in its part of the time the job has
-    /// left ([`Self::left`]): until its median is resolved or its part is
-    /// spent, each sample covering at least tuning's least device time
-    /// (which sets its repetitions: tuning's, the one owner).
-    fn within(&self) -> Measure {
+    /// The fewest seconds reading a point forecast as `forecast` takes: its
+    /// making, at the rate the job's backings filled so far, a lead and one
+    /// sample.
+    fn least(&self, forecast: Forecast) -> f64 {
+        self.backings.filling(forecast.bytes) + 2. * forecast.pass
+    }
+
+    /// Whether a point of `share` can be read before its time ends: its
+    /// forecast making, lead and one sample (none where nothing forecasts
+    /// it), and what the required figures after it are forecast to take at
+    /// least ([`Ahead::required`]), end before it.
+    fn starts(&self, share: Share) -> bool {
+        let own = share.forecast.map_or(0., |forecast| self.least(forecast));
+        let seconds = own + self.least(share.after.required);
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds) <= self.deadline()
+    }
+
+    /// How the next point, forecast to take `own` seconds at least, is
+    /// sampled in its part of its time left: a standing point's is its own
+    /// least and an equal part, of the standing points left, of the time
+    /// beyond it and beyond what the standing points after it are forecast to
+    /// take at least ([`Self::ahead`]); a load's the time left over the
+    /// loads' points left.
+    /// Until its median is resolved or its part is spent, at least one
+    /// sample, each covering at least tuning's least device time (which sets
+    /// its repetitions: tuning's, the one owner).
+    fn within(&self, own: f64) -> Measure {
         let remaining = self
-            .deadline
+            .deadline()
             .saturating_duration_since(std::time::Instant::now())
             .as_secs_f64();
+        let left = self.left.max(1) as f64;
+        let seconds = match self.whose {
+            Whose::Standing => own + (remaining - own - self.least(self.ahead.all)).max(0.) / left,
+            Whose::Loads => remaining / left,
+        };
         Measure {
             stop: seismic::measure::Stop::Within {
                 error_rate: crate::SEARCH_SETTINGS.error_rate,
-                seconds: remaining / self.left.max(1) as f64,
+                seconds,
             },
             min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
         }
+    }
+
+    /// Visit the next point, forecast to take `own` seconds at least: how it
+    /// is sampled ([`Self::within`]) and when its time ends, counted off the
+    /// points left.
+    fn next(&mut self, own: f64) -> (Measure, std::time::Instant) {
+        let visit = (self.within(own), self.deadline());
+        self.left = self.left.saturating_sub(1);
+        visit
+    }
+
+    /// What the job keeps of `outcome`, the point `key`'s, its record in
+    /// `store`, and whether it priced the point: a standing point the job's
+    /// time ended before any sample is recorded unobtainable ([`unreached`]),
+    /// priced from those read, unless it reads a figure the costs require
+    /// (`required`), which nothing prices; that one, like a load's, is left
+    /// unrecorded, and the next job measures it.
+    fn kept<E, G>(
+        &self,
+        key: &PointKey,
+        outcome: Outcome<E, G>,
+        store: &dyn RecordStore<PointKey>,
+        required: bool,
+    ) -> (Outcome<E, G>, bool) {
+        match (outcome, self.whose, required) {
+            (Outcome::Expired, Whose::Standing, false) => {
+                let reason = unreached();
+                match store.store(key, &Record::Unobtainable { reason: reason.clone() }) {
+                    Ok(()) => (Outcome::Skipped(reason), true),
+                    Err(error) => (Outcome::Store(error), false),
+                }
+            }
+            (outcome, _, _) => (outcome, false),
+        }
+    }
+
+    /// Tell the job's caller what became of the point `key` begun at
+    /// `began`, as the job kept it ([`Self::kept`]: its outcome, and whether
+    /// it priced it), and trace one the job spent its time on: its wall
+    /// seconds, its samples, and how it ended (resolved, its part of the
+    /// time spent first, priced, or otherwise), so a run reads how the job's
+    /// time was split.
+    fn tell<E: fmt::Display, G: fmt::Display>(
+        &mut self,
+        key: PointKey,
+        (outcome, priced): (Outcome<E, G>, bool),
+        began: std::time::Instant,
+    ) {
+        let spent = match &outcome {
+            _ if priced => Some((0, "priced")),
+            Outcome::Loaded(_) => None,
+            Outcome::Measured(timing) if timing.resolved() => Some((timing.samples, "resolved")),
+            Outcome::Measured(timing) => Some((timing.samples, "capped")),
+            Outcome::Skipped(_) | Outcome::Unformed(_) => Some((0, "unobtainable")),
+            Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => Some((0, "failed")),
+            Outcome::Expired => Some((0, "expired")),
+        };
+        if let Some((samples, ended)) = spent {
+            tracing::info!(
+                whose = ?self.whose,
+                configuration = ?key.configuration,
+                point = ?key.point,
+                seconds = began.elapsed().as_secs_f64(),
+                samples,
+                ended,
+                "measurement point"
+            );
+        }
+        (self.visit)(key, told(outcome));
     }
 }
 
 impl Times for Measured<'_, '_> {
     /// Every point is timed where no record holds it.
     type Missing = std::convert::Infallible;
+
+    const MEASURES: bool = true;
 
     fn time(
         &mut self,
@@ -1785,15 +2003,22 @@ impl Times for Measured<'_, '_> {
         build: &mut Build<'_>,
         share: Share,
     ) -> Result<Timing, Stop<Self::Missing>> {
+        assert_eq!(self.whose, Whose::Standing, "only assessment's standing requests walk the costs");
         let key = self.records.key(spec);
-        let how = self.within();
-        self.left = self.left.saturating_sub(1);
-        // One no record holds that cannot be read in the time left is not
-        // attempted, so not recorded: the next job reads it.
-        if !self.starts(share) && self.records.load::<Self::Missing>(&key)?.is_none() {
-            return Err(Stop::Expired);
+        let began = std::time::Instant::now();
+        self.ahead = share.after;
+        let starts = self.starts(share);
+        let (how, deadline) = self.next(share.forecast.map_or(0., |forecast| self.least(forecast)));
+        // One no record holds that cannot be read in the time left, or
+        // would leave the required figures after it less than theirs, is
+        // not attempted: it is priced, or, reading a required figure, left
+        // to the next job.
+        if !starts && self.records.load::<Self::Missing>(&key)?.is_none() {
+            let kept = self.kept(&key, Outcome::<CallError, ExecutorCostsError>::Expired, self.records.store, share.required);
+            let result = timed(&kept.0);
+            self.tell(key, kept, began);
+            return result;
         }
-        let deadline = self.deadline;
         // The point is made only when no record holds it and the host
         // attempts it, so a stored or skipped point is never made. Every
         // program is formed, all at once, when the first point no record
@@ -1816,7 +2041,7 @@ impl Times for Measured<'_, '_> {
                 if formed.touches_host(share.host) {
                     backings.settle();
                 }
-                quiet = formed.quiet(share.host)?;
+                quiet = formed.quiet(share.host, deadline)?;
                 Ok(point)
             })],
             &how,
@@ -1829,8 +2054,9 @@ impl Times for Measured<'_, '_> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        let result = timed(&outcome);
-        (self.visit)(key, told(outcome));
+        let kept = self.kept(&key, outcome, self.records.store, share.required);
+        let result = timed(&kept.0);
+        self.tell(key, kept, began);
         // The next point reads zeros where this one wrote.
         self.backings.restore().map_err(Stop::Failed)?;
         result
@@ -3225,8 +3451,8 @@ fn composition_chain(
                     gate_weight: gate.tensor().into(),
                     up_weight: up.tensor().into(),
                     out_rows: rows.tensor().into(),
-                    eps: 1e-6,
-                    activation: 0,
+                    eps: (1e-6).into(),
+                    activation: 0.into(),
                     gate_scale: scale.tensor().into(),
                     up_scale: scale.tensor().into(),
                     gate_bound: expand_bound.tensor().into(),
@@ -3265,15 +3491,15 @@ fn composition_chain(
                     history_key: history_key.tensor_mut().into(),
                     history_value: history_value.tensor_mut().into(),
                     form: form.tensor().into(),
-                    epsilon: 1e-6,
-                    scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
-                    gate_function: 0,
-                    slab_rows: attend.slab_rows,
-                    selected_slab_rows: 1,
-                    key_block: 0,
-                    key_element: 0,
-                    key_scale: 0,
-                    key_amax_floor: 0.0,
+                    epsilon: (1e-6).into(),
+                    scale: (1.0 / (HEAD_WIDTH as f32).sqrt()).into(),
+                    gate_function: 0.into(),
+                    slab_rows: attend.slab_rows.into(),
+                    selected_slab_rows: 1.into(),
+                    key_block: 0.into(),
+                    key_element: 0.into(),
+                    key_scale: 0.into(),
+                    key_amax_floor: 0.0.into(),
                 },
             )
             .map_err(|cause| error(&cause))?;
@@ -3557,7 +3783,7 @@ fn walk<T: Times>(
         point_seconds: MEASUREMENT_SECONDS / points as f64,
         routes,
     };
-    let probe = walk.probe(Share::UNFORECAST, times)?;
+    let probe = walk.probe(Share::UNFORECAST.required(), times)?;
     let mut read = Read::new(walk.routes.len(), probe);
     let mut pending = false;
     let mut missing = None;
@@ -3573,7 +3799,18 @@ fn walk<T: Times>(
                 .sort_by(|near, far| read.overlap(*far).total_cmp(&read.overlap(*near)));
         }
         let step = steps[index];
-        let outcome = walk.step(step, Share::UNFORECAST, &mut read, times);
+        // What the points after it are forecast to take at least, over the
+        // whole plan: the whole walk's are standing whenever its required
+        // part is.
+        let share = match T::MEASURES {
+            true => Share::UNFORECAST.before(walk.ahead(&steps[index + 1..], &read)),
+            false => Share::UNFORECAST,
+        };
+        let share = match step.required() {
+            true => share.required(),
+            false => share,
+        };
+        let outcome = walk.step(step, share, &mut read, times);
         // A route other than device storage's first, which every step but
         // its own weight rates reads, is done with after its last of them.
         if let Step::WeightRate(route, _, _) = step {
@@ -3586,7 +3823,7 @@ fn walk<T: Times>(
             Ok(()) => {}
             Err(stop) => {
                 if let Step::Rung(layout, _) = step {
-                    read.ladder(layout).ended = true;
+                    read.ladder_mut(layout).ended = true;
                 }
                 match stop {
                     Stop::Missing(key) => {
@@ -3730,7 +3967,16 @@ impl Read {
     }
 
     /// `layout`'s ladder, a measured layout's ([`HISTORY_LAYOUTS`]).
-    fn ladder(&mut self, layout: KvCodec) -> &mut Ladder {
+    fn ladder(&self, layout: KvCodec) -> &Ladder {
+        match layout {
+            KvCodec::Dense => &self.dense,
+            KvCodec::AffineK8V4 => &self.affine,
+            KvCodec::RotatedK4V4 => unreachable!("no step reads a layout no entry reads"),
+        }
+    }
+
+    /// [`Self::ladder`], to read into.
+    fn ladder_mut(&mut self, layout: KvCodec) -> &mut Ladder {
         match layout {
             KvCodec::Dense => &mut self.dense,
             KvCodec::AffineK8V4 => &mut self.affine,
@@ -3836,6 +4082,78 @@ impl Read {
 }
 
 impl Walk<'_> {
+    /// What the points of `later` are forecast to take at least, from what
+    /// `read` holds ([`Ahead`]), each where the walk forecasts it.
+    fn ahead(&self, later: &[Step], read: &Read) -> Ahead {
+        later.iter().fold(Ahead::NONE, |ahead, &step| match self.forecast(step, read) {
+            Some(forecast) => Ahead {
+                all: ahead.all.then(forecast),
+                required: match step.required() {
+                    true => ahead.required.then(forecast),
+                    false => ahead.required,
+                },
+            },
+            None => ahead,
+        })
+    }
+
+    /// What reading `step` is forecast to take, from what `read` holds,
+    /// where the walk forecasts it: a format's streaming rate and matrix
+    /// throughput once its pilot is read, the composition chain once the
+    /// probe is, and a rung its ladder reaches once one below it is. A
+    /// forecast whose figures cannot be sized is none here: reading its step
+    /// reports why.
+    fn forecast(&self, step: Step, read: &Read) -> Option<Forecast> {
+        match step {
+            Step::WeightRate(index, format, Pass::Rate) if format != Element::bf16() => {
+                self.streaming(index, format, read).ok().flatten().map(|(_, forecast)| forecast)
+            }
+            Step::Matrix(format) => self.throughput(format, read).ok().flatten(),
+            Step::Chain => self.chain_shape(read).ok().map(|shape| shape.forecast),
+            // A rung no rung below forecasts may have its pilot unread.
+            Step::Rung(layout, rung) => match read.ladder(layout) {
+                ladder if ladder.rungs.is_empty() => None,
+                ladder => match self.reach(layout, rung, ladder) {
+                    Ok(Reach::Reads { forecast, .. }) => forecast,
+                    Ok(Reach::Ends) | Err(_) => None,
+                },
+            },
+            Step::WeightRate(..) | Step::Launch(_) => None,
+        }
+    }
+
+    /// How `format`'s streaming rate along the route at `index` is read,
+    /// once its pilot is (none before): whether its calls rotate, where its
+    /// bytes' time from memory, at the rate memory streams them, is over
+    /// [`UNROTATED`] of its pilot's call; and its forecast, a call at the
+    /// slower of its pilot's rate and memory's, a pass at its sets' calls.
+    fn streaming(&self, index: usize, format: Element, read: &Read) -> Result<Option<(bool, Forecast)>, ExecutorCostsError> {
+        let stream = read.stream(index);
+        let Some((_, rates)) = read.formats[index].iter().find(|(read, _)| *read == format) else {
+            return Ok(None);
+        };
+        let pilot = rates.pilot.bytes_per_second.value;
+        let rotated = pilot / stream > UNROTATED;
+        let bytes = expand_weight_bytes(format, rates.pilot.features)?;
+        let sets = weight_sets(self.cache, bytes, rotated);
+        let call = bytes as f64 / pilot.min(stream);
+        Ok(Some((rotated, Forecast { pass: call * sets as f64, bytes: bytes * sets })))
+    }
+
+    /// What `format`'s matrix throughput is forecast to take, once its pilot
+    /// is read along device storage's first route (none before, nor for the
+    /// activation dtype's, which has no pilot): a call at its matrix rows
+    /// times its pilot's one-row call, about what a CPU takes
+    /// ([`ExecutorCosts::matrix_flops`]) and more than a GPU.
+    fn throughput(&self, format: Element, read: &Read) -> Result<Option<Forecast>, ExecutorCostsError> {
+        let Some((_, rates)) = read.formats[0].iter().find(|(read, _)| *read == format) else {
+            return Ok(None);
+        };
+        let rows = Rows::Matrix.count(self.programs.sizes) as f64;
+        let pass = rows * call_seconds(format, &rates.pilot);
+        Ok(Some(Forecast { pass, bytes: expand_weight_bytes(format, rates.pilot.features)? }))
+    }
+
     /// The probe ([`Step::probe`]): the activation dtype's rate along device
     /// storage's first route, rotating through the sets that span the cache.
     fn probe<T: Times>(&self, share: Share, times: &mut T) -> Result<WeightRate, Stop<T::Missing>> {
@@ -3889,25 +4207,15 @@ impl Walk<'_> {
                         ));
                     }
                     Pass::Rate => {
-                        let stream = read.stream(index);
                         // A format whose pilot was not read has no rates.
-                        let Some((_, rates)) = read.formats[index]
-                            .iter_mut()
-                            .find(|(read, _)| *read == format)
-                        else {
+                        let Some((rotated, forecast)) = self.streaming(index, format, read)? else {
                             return Ok(());
                         };
-                        // The part of a call its bytes' time from memory
-                        // takes, at the rate memory streams them.
-                        let pilot = rates.pilot.bytes_per_second.value;
-                        let rotated = pilot / stream > UNROTATED;
-                        // A call is forecast at the slower of its pilot's
-                        // rate and memory's, a pass at its sets' calls.
-                        let bytes = expand_weight_bytes(format, rates.pilot.features)?;
-                        let sets = weight_sets(self.cache, bytes, rotated);
-                        let call = bytes as f64 / pilot.min(stream);
-                        let share = share.forecast(call * sets as f64, bytes * sets);
-                        let streamed = rate(rotated, times, share)?;
+                        let streamed = rate(rotated, times, share.forecast(forecast))?;
+                        let (_, rates) = read.formats[index]
+                            .iter_mut()
+                            .find(|(read, _)| *read == format)
+                            .expect("a format streamed has its pilot read");
                         rates.streamed = Some(streamed);
                     }
                 }
@@ -3923,7 +4231,7 @@ impl Walk<'_> {
             }
             Step::Rung(layout, rung) => {
                 let activation_rate = read.stream(0);
-                let ladder = read.ladder(layout);
+                let ladder = read.ladder_mut(layout);
                 match layout.spec(DType::BF16, 1, 1).encoding() {
                     HistoryEncoding::Dense => self.rung::<attention_decode::Entry, _>(
                         layout,
@@ -3948,15 +4256,8 @@ impl Walk<'_> {
             }
             Step::Chain => read.chain = Some(self.chain(read, times, share)?),
             Step::Matrix(format) => {
-                // Another format's call is forecast at its matrix rows' times
-                // its pilot's one-row call, about what a CPU takes
-                // ([`ExecutorCosts::matrix_flops`]) and more than a GPU.
-                let share = match read.formats[0].iter().find(|(read, _)| *read == format) {
-                    Some((_, rates)) => {
-                        let rows = Rows::Matrix.count(self.programs.sizes) as f64;
-                        let call = rows * call_seconds(format, &rates.pilot);
-                        share.forecast(call, expand_weight_bytes(format, rates.pilot.features)?)
-                    }
+                let share = match self.throughput(format, read)? {
+                    Some(forecast) => share.forecast(forecast),
                     None => share,
                 };
                 let matrix = matrix(
@@ -4003,6 +4304,41 @@ impl Walk<'_> {
             programs.output.identity()?,
             self.copy.clone(),
         ];
+        let ChainShape { sets, layers, forecast } = self.chain_shape(read)?;
+        let timing = times.time(
+            PointSpec::new(
+                kernels,
+                &[("calls", layers * CHAIN_LAYER_CALLS as u64), ("rows", 1)],
+                &[("depth", depth), ("sets", sets)],
+            ),
+            programs,
+            &mut |device: &Device, formed: &Programs, backings: &mut Backings| {
+                let kernels = ChainKernels::of(formed, chain_format)?;
+                let operands = ChainOperands::new(
+                    device,
+                    backings,
+                    chain_format,
+                    features,
+                    device_route,
+                    depth,
+                    sets,
+                )
+                .map_err(Unformed::Now)?;
+                composition_chain(device, kernels, &operands, layers as usize)
+                    .and_then(|chain| chain.point(GraphTiming::Device))
+                    .map_err(Unformed::Now)
+            },
+            share.forecast(forecast),
+        )?;
+        Ok(ChainRead { timing, layers })
+    }
+
+    /// The composition chain's shape as `read` sizes it ([`Self::chain`]):
+    /// its sets, its layers and its forecast.
+    fn chain_shape(&self, read: &Read) -> Result<ChainShape, ExecutorCostsError> {
+        let chain_format = self.programs.chain;
+        let depth = HISTORY_DEPTHS[0];
+        let (features, _) = self.programs.expand(chain_format);
         // A layer's time as the walk's records price it: its projections'
         // weights at the activation dtype's rate (a forecast, which an
         // M4 Max's Q4_K rate meets within 2%), its attention at the dense
@@ -4034,33 +4370,21 @@ impl Walk<'_> {
         let run = self.point_seconds
             / (2 * seismic::measure::fewest_bounding(crate::SEARCH_SETTINGS.error_rate)) as f64;
         let layers = ((run / layer) as u64).clamp(sets, most);
-        let timing = times.time(
-            PointSpec::new(
-                kernels,
-                &[("calls", layers * CHAIN_LAYER_CALLS as u64), ("rows", 1)],
-                &[("depth", depth), ("sets", sets)],
-            ),
-            programs,
-            &mut |device: &Device, formed: &Programs, backings: &mut Backings| {
-                let kernels = ChainKernels::of(formed, chain_format)?;
-                let operands = ChainOperands::new(
-                    device,
-                    backings,
-                    chain_format,
-                    features,
-                    device_route,
-                    depth,
-                    sets,
-                )
-                .map_err(Unformed::Now)?;
-                composition_chain(device, kernels, &operands, layers as usize)
-                    .and_then(|chain| chain.point(GraphTiming::Device))
-                    .map_err(Unformed::Now)
-            },
-            share.forecast(layer * layers as f64, sets * (weight_bytes + history_bytes)),
-        )?;
-        Ok(ChainRead { timing, layers })
+        Ok(ChainShape {
+            sets,
+            layers,
+            forecast: Forecast { pass: layer * layers as f64, bytes: sets * (weight_bytes + history_bytes) },
+        })
     }
+}
+
+/// The composition chain's shape ([`Walk::chain_shape`]): the sets of
+/// weights and history its layers cycle through, its layers, and what
+/// reading it is forecast to take.
+struct ChainShape {
+    sets: u64,
+    layers: u64,
+    forecast: Forecast,
 }
 
 /// What the composition chain read: its device time over its layers, and
@@ -4267,29 +4591,50 @@ impl Walk<'_> {
         times: &mut T,
         share: Share,
     ) -> Result<(), Stop<T::Missing>> {
-        if ladder.ended {
+        let Reach::Reads { depth, sets, forecast } = self.reach(layout, rung, ladder)? else {
+            ladder.ended = true;
             return Ok(());
-        }
+        };
         let programs = &self.programs;
         let identity = E::program(programs).identity()?;
         let per_token = token_bytes(layout)?;
         let route = self.routes[0];
-        let point = |depth: u64, sets: u64| {
-            PointSpec::new(
-                vec![identity.clone()],
-                &[("rows", 1)],
-                &[("depth", depth), ("sets", sets)],
-            )
+        let point = PointSpec::new(
+            vec![identity],
+            &[("rows", 1)],
+            &[("depth", depth), ("sets", sets)],
+        );
+        let mut build = calls::<E, _>(
+            |formed: &Programs| formed.kernel(E::formed(formed)),
+            move |device, backings| AttendCase::new(device, backings, layout, route, depth, sets),
+            E::args,
+        );
+        let timing = match forecast {
+            // A rung above the first.
+            Some(forecast) => times.time_apart(point, programs, &mut build, share.forecast(forecast))?,
+            None => times.time(point, programs, &mut build, share)?,
         };
-        let build = |depth: u64, sets: u64| {
-            calls::<E, _>(
-                |formed: &Programs| formed.kernel(E::formed(formed)),
-                move |device, backings| {
-                    AttendCase::new(device, backings, layout, route, depth, sets)
-                },
-                E::args,
-            )
-        };
+        match rung {
+            Rung::Pilot => {
+                ladder.rotated =
+                    Some((depth * per_token) as f64 / activation_rate > UNROTATED * timing.median);
+            }
+            Rung::Depth(_) => ladder.rungs.push(MeasuredCost::of(&timing)),
+        }
+        Ok(())
+    }
+
+    /// Whether `layout`'s ladder, as `ladder` holds it, reads `rung`
+    /// ([`Self::rung`]): not once it ended, nor where the rung's plane
+    /// exceeds the largest allocation or one set of it the room, nor, above
+    /// the first, where its call, priced from the slowest rung read at its
+    /// depth per token of the deepest read, exceeds a point's share of the
+    /// job.
+    fn reach(&self, layout: KvCodec, rung: Rung, ladder: &Ladder) -> Result<Reach, ExecutorCostsError> {
+        if ladder.ended {
+            return Ok(Reach::Ends);
+        }
+        let per_token = token_bytes(layout)?;
         let (index, sets) = match rung {
             Rung::Pilot => (0, 1),
             Rung::Depth(index) => {
@@ -4309,40 +4654,36 @@ impl Walk<'_> {
         };
         let depth = HISTORY_DEPTHS[index];
         if largest_plane(layout, depth)? > self.largest || depth * per_token > self.room {
-            ladder.ended = true;
-            return Ok(());
+            return Ok(Reach::Ends);
         }
-        let timing = match (rung, ladder.rungs.last()) {
-            (Rung::Depth(_), Some(_)) => {
-                let below = HISTORY_DEPTHS[index - 1];
+        let forecast = match (rung, ladder.rungs.len()) {
+            (Rung::Depth(_), read @ 1..) => {
+                let deepest = HISTORY_DEPTHS[read - 1];
                 let slowest = ladder
                     .rungs
                     .iter()
                     .map(|cost| cost.value)
                     .fold(0., f64::max);
-                let call = slowest * depth as f64 / below as f64;
+                let call = slowest * depth as f64 / deepest as f64;
                 if call > self.point_seconds {
-                    ladder.ended = true;
-                    return Ok(());
+                    return Ok(Reach::Ends);
                 }
-                times.time_apart(
-                    point(depth, sets),
-                    programs,
-                    &mut build(depth, sets),
-                    share.forecast(call * sets as f64, sets * depth * per_token),
-                )?
+                Some(Forecast { pass: call * sets as f64, bytes: sets * depth * per_token })
             }
-            _ => times.time(point(depth, sets), programs, &mut build(depth, sets), share)?,
+            _ => None,
         };
-        match rung {
-            Rung::Pilot => {
-                ladder.rotated =
-                    Some((depth * per_token) as f64 / activation_rate > UNROTATED * timing.median);
-            }
-            Rung::Depth(_) => ladder.rungs.push(MeasuredCost::of(&timing)),
-        }
-        Ok(())
+        Ok(Reach::Reads { depth, sets, forecast })
     }
+}
+
+/// Whether a ladder reads a rung ([`Walk::reach`]).
+enum Reach {
+    /// The ladder ends before it.
+    Ends,
+    /// It is read at `depth` tokens over `sets` argument sets, forecast
+    /// where a rung below it was read: a rung above the first, which
+    /// releases its rotation once it is timed ([`Times::time_apart`]).
+    Reads { depth: u64, sets: u64, forecast: Option<Forecast> },
 }
 
 /// The executor `executor` names in `topology`, and its identity.
@@ -4362,12 +4703,13 @@ pub(super) fn executor_identity(
 /// each point of a walk goes to `measure_all`, which loads it from the
 /// store or reports it to `attempting`, makes it only when attempted (every
 /// walk's kernels formed with the first, [`ProgramSet::form`]), times it at
-/// the sustained clock for its part of the time the job has left before its
-/// deadline ([`Measured::left`]) or until its median is resolved, and stores
-/// its record; `visit` is told what became of each point as soon as it is
-/// known. A point the deadline ends before any sample expires
-/// ([`Outcome::Expired`]), unrecorded. The device holds no path limit: a
-/// walk passes over a placement's paths by holding them. The walks share
+/// the sustained clock for its part of its time left ([`Measured::within`])
+/// or until its median is resolved, and stores its record; `visit` is told
+/// what became of each point as soon as it is known. A standing point its
+/// time ends before any sample is priced ([`unreached`]), unless it reads a
+/// required figure; that one and a load's expire ([`Outcome::Expired`]),
+/// unrecorded. The device holds no path limit: a walk passes over a
+/// placement's paths by holding them. The walks share
 /// the job's kernels and backings, so a point one walk stored another
 /// loads.
 pub(super) struct Walks<'a, 'd> {
@@ -4377,15 +4719,14 @@ pub(super) struct Walks<'a, 'd> {
 }
 
 impl<'a, 'd> Walks<'a, 'd> {
-    /// The walks of a job on `device` with `left` points to visit, or why
-    /// its executor has no records: it is not of its own topology's
+    /// The walks of a job on `device` whose time ends at `deadlines`, or
+    /// why its executor has no records: it is not of its own topology's
     /// revision.
     pub(super) fn new(
         measurer: &'a mut Measurer,
         device: &'d Device,
         store: &'a dyn RecordStore<PointKey>,
-        deadline: std::time::Instant,
-        left: usize,
+        deadlines: JobDeadlines,
         attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
         visit: &'a mut Visit<'a>,
     ) -> Result<Self, ExecutorCostsError> {
@@ -4402,10 +4743,19 @@ impl<'a, 'd> Walks<'a, 'd> {
             programs: std::cell::OnceCell::new(),
             backings: Backings::default(),
             visit,
-            deadline,
-            left,
+            deadlines,
+            whose: Whose::Standing,
+            left: 0,
+            ahead: Ahead::NONE,
         };
         Ok(Self { topology, executor, measured })
+    }
+
+    /// Begin a request's points: `whose` they are, and `left` of theirs
+    /// still to visit, its own first among them.
+    pub(super) fn begin(&mut self, whose: Whose, left: usize) {
+        self.measured.whose = whose;
+        self.measured.left = left;
     }
 
     /// The records the job stores into.
@@ -4436,27 +4786,32 @@ impl<'a, 'd> Walks<'a, 'd> {
     }
 
     /// Take the point `key` by `make`, on the job's device, under the job's
-    /// attempts and deadline: a point no timing loop measures. What `make`
+    /// attempts and its time: a point no timing loop measures. What `make`
     /// returns is stored and told as the walks' records are; why it fails
     /// is told, nothing stored, and the next job attempts it again.
     pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&'d Device) -> Result<Record, String>) {
+        let began = std::time::Instant::now();
+        let (_, deadline) = self.measured.next(0.);
         let measured = &mut self.measured;
-        if std::time::Instant::now() >= measured.deadline {
-            return (measured.visit)(key, Outcome::Expired);
+        let store = measured.records.store;
+        if std::time::Instant::now() >= deadline {
+            let kept = measured.kept(&key, Outcome::<String, String>::Expired, store, false);
+            return measured.tell(key, kept, began);
         }
         let made = match (measured.attempting)(&key) {
             Attempt::Skip(reason) => Ok(Record::Unobtainable { reason }),
             Attempt::Proceed => make(measured.device),
         };
         let stored = made.and_then(|record| {
-            measured.records.store.store(&key, &record).map_err(|error| error.to_string())?;
+            store.store(&key, &record).map_err(|error| error.to_string())?;
             Ok(record)
         });
-        (measured.visit)(key, match stored {
+        let outcome = match stored {
             Ok(Record::Measured(timing)) => Outcome::Measured(timing),
             Ok(Record::Unobtainable { reason }) => Outcome::Skipped(reason),
-            Err(reason) => Outcome::Failed(reason),
-        });
+            Err(reason) => Outcome::<String, String>::Failed(reason),
+        };
+        measured.tell(key, (outcome, false), began);
     }
 
     /// The job's executor's identity, every point's key's.
@@ -4466,7 +4821,7 @@ impl<'a, 'd> Walks<'a, 'd> {
 
     /// Time the device point `build` makes under `key`, as the job times a
     /// walk's: its record loaded, or attempted and measured for its part of
-    /// the time left, and stored. A point that touches the host (`host`:
+    /// its time left, and stored. A point that touches the host (`host`:
     /// it reads host memory) is timed with no program of the walks forming
     /// beside it ([`Programs::quiet`]).
     pub(super) fn time<F>(&mut self, key: PointKey, host: bool, build: F)
@@ -4483,31 +4838,36 @@ impl<'a, 'd> Walks<'a, 'd> {
     where
         F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
     {
-        let how = self.measured.within();
-        self.measured.left = self.measured.left.saturating_sub(1);
+        let began = std::time::Instant::now();
+        let (how, deadline) = self.measured.next(0.);
         let measured = &mut self.measured;
         let programs = &measured.programs;
         let mut quiet = None;
         let mut outcomes = measured.measurer.measure_all(
             vec![(key, || {
                 let point = build()?;
-                quiet = Self::quiet(programs, host)?;
+                quiet = Self::quiet(programs, host, deadline)?;
                 Ok(point)
             })],
             &how,
-            seismic::measure::Deadline::new(Some(measured.deadline)),
+            seismic::measure::Deadline::new(Some(deadline)),
             store,
             &mut *measured.attempting,
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        (measured.visit)(key, told(outcome));
+        let kept = self.measured.kept(&key, outcome, store, false);
+        self.measured.tell(key, kept, began);
     }
 
     /// A hold on the walks' formation, where one is forming, for a point
-    /// ([`Programs::quiet`]).
-    fn quiet(programs: &std::cell::OnceCell<Formed>, host: bool) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
-        programs.get().map_or(Ok(None), |formed| formed.programs.quiet(host))
+    /// whose time ends at `deadline` ([`Programs::quiet`]).
+    fn quiet(
+        programs: &std::cell::OnceCell<Formed>,
+        host: bool,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
+        programs.get().map_or(Ok(None), |formed| formed.programs.quiet(host, deadline))
     }
 
     /// Time the host point `build` makes under `key` (work on the host's
@@ -4518,26 +4878,28 @@ impl<'a, 'd> Walks<'a, 'd> {
         W: seismic::measure::Work<Error = String, Clock = ()>,
         F: FnOnce() -> Result<W, Unformed<ExecutorCostsError>>,
     {
-        let how = self.measured.within();
-        self.measured.left = self.measured.left.saturating_sub(1);
+        let began = std::time::Instant::now();
+        let (how, deadline) = self.measured.next(0.);
         let measured = &mut self.measured;
         let programs = &measured.programs;
+        let store = measured.records.store;
         let mut quiet = None;
         let mut clocks = seismic::measure::HeldClocks::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let mut outcomes = seismic::measure::measure_all(
             vec![(key, || {
-                quiet = Self::quiet(programs, true)?;
+                quiet = Self::quiet(programs, true, deadline)?;
                 build()
             })],
             &how,
-            seismic::measure::Deadline::new(Some(measured.deadline)),
+            seismic::measure::Deadline::new(Some(deadline)),
             &mut clocks,
-            measured.records.store,
+            store,
             &mut *measured.attempting,
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        (measured.visit)(key, told(outcome));
+        let kept = self.measured.kept(&key, outcome, store, false);
+        self.measured.tell(key, kept, began);
     }
 
     /// What the walks' points were made in and from, which the job's caller
@@ -4690,14 +5052,14 @@ mod tests {
         };
         assert!(programs.formation.begin(deadline), "nothing holds the formation");
         let held = std::thread::scope(|scope| {
-            let hold = scope.spawn(|| programs.quiet(true).is_ok());
+            let hold = scope.spawn(|| programs.quiet(true, deadline).is_ok());
             std::thread::sleep(std::time::Duration::from_millis(20));
             assert!(!hold.is_finished(), "a hold waits for the program forming");
             programs.formation.end();
             hold.join().unwrap()
         });
         assert!(held, "the program formed, the hold is taken");
-        let quiet = programs.quiet(true).unwrap();
+        let quiet = programs.quiet(true, deadline).unwrap();
         assert!(!programs.formation.begin(deadline), "no program begins while held, past the deadline");
         drop(quiet);
         assert!(!programs.formation.begin(deadline), "no program begins past the deadline, held or not");

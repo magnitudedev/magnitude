@@ -5,45 +5,52 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    AttentionBlock, AttentionGraphEntries, AttentionOperands, CheckedAttentionEntries,
-    HistoryTilesPort, IndexerControlPorts, IndexerStatePorts, SelectionBlock, attention,
-    attention_weights,
+    AttentionGraphEntries, AttentionOperands, CheckedAttentionEntries, HistoryTilesPort,
+    IndexerControlPorts, IndexerStatePorts, attention, attention_weights,
 };
+use super::attention::split::{
+    AttentionBlock, AttentionSite, AttentionTopology, SelectionSite, split as attention_split,
+};
+use crate::programs::graph::facts::Numbers;
+use seismic::{Argument, Table};
 use super::attention::pooled::{
     IndexBlock, OwnBlock, PickedBlock, PickedPlane, PickedPorts, PooledSource, PooledWindow,
 };
 use super::attention::PickedSource;
-use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, dense};
+use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, DenseNumbers, dense};
 use super::gated_delta::graph::{
     CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts, RecurrentGraphEntries,
-    RecurrentStatePorts, recurrent,
+    RecurrentStatePorts, RecurrentTopology, recurrent,
 };
 use super::ngram::graph::{
-    NGramBlock, NGramEntries, NGramPorts, NGramStepPorts, ngram as ngram_graph,
+    NGramEntries, NGramNumbers, NGramPorts, NGramStepPorts, NGramTopology, ngram as ngram_graph,
 };
 use super::parallel::DenseBesideRouted;
-use super::parallel::graph::{CheckedParallelEntries, ParallelGraphEntries, parallel};
+use super::parallel::graph::{
+    CheckedParallelEntries, ParallelGraphEntries, ParallelNumbers, ParallelTopology, parallel,
+};
 use super::per_layer::graph::{
-    CheckedPerLayerEntries, PerLayerEntries, PerLayerWeights, per_layer as per_layer_graph,
+    PerLayerEntries, PerLayerNumbers, PerLayerWeights, per_layer as per_layer_graph,
 };
 use super::routed::fused_graph::{
-    self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries,
+    self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries, RoutedTopology,
 };
 use super::routed::graph::{
-    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
-    general_pass, general_routed,
+    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, GeneralRoutedLayer, GeneralRoutedTopology,
+    RoutedSum, general_pass, general_routed, split as general_split,
 };
-use super::routed::Expansion;
 use super::routed::split::{PassPorts, Split};
-use super::routed::streamed::{LayerBank, scratch_fill};
+use super::routed::streamed::{BankForm, BankNumbers, LayerBank, scratch_fill};
+use super::routed::ExpansionForm;
+use super::output::PostNorm;
 use super::short_conv::graph::{
-    CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries, short_conv,
+    CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries, ShortConvTopology, short_conv,
 };
 use super::state_space::graph::{
-    CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries, state_space,
+    CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries, StateSpaceTopology, state_space,
 };
 use super::streams::graph::{SiteEntry, StreamsEntries, join as stream_join, mix_site, sinkhorn_site};
-use super::streams::{ResidualCarry, StreamsGeometry};
+use super::streams::{ResidualCarry, SinkhornTopology, StreamsGeometry};
 use super::{
     FeedForward, InputForm, Join, Mixer, PairedBlock, SublayerInput, SublayerSource,
     attention as attention_operator, bank_component_index, dense_ffn, gated_delta,
@@ -56,20 +63,26 @@ use crate::programs::graph::{
 };
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
-    WeightPort, activation, packed_weight, scaled_weight, weight,
+    PlannedWeights, WeightPort, activation, packed_weight, scaled_weight, weight,
 };
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedShape, MixerProgramSlot, ModelLoadPlan, NGramBinding,
-    PerLayerBinding, ShortConvShape, StateResourcePlan, StateSpaceShape,
+    PerLayerBinding, StateResourcePlan,
 };
 use magnitude_family_contracts::{
-    Attention, Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
+    Attention, Decoder, OutputForm, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort,
+    BackendName, Dim, Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort,
     WorkflowTensor,
 };
+
+/// The post-norm tail of a sublayer ending in `output`, at the layer's
+/// output `scale`; none of a residual tail.
+fn post_norm(output: &OutputForm, scale: f32) -> Option<PostNorm<f64>> {
+    post_norm_epsilon(output).map(|epsilon| PostNorm { epsilon, scale: f64::from(scale) })
+}
 
 /// A block's state ports and their per-launch controls: its attention
 /// mixer's history, and the recurrent bank its mixer or its n-gram input
@@ -215,6 +228,7 @@ impl<'a> From<&'a AttestedFeedForward> for FeedForwardEntries<'a, NativeGraph> {
 }
 
 /// A mixer's checked entry bindings, from its program slot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CheckedMixerEntries {
     Attention(CheckedAttentionEntries),
     Recurrent(CheckedRecurrentEntries),
@@ -258,6 +272,7 @@ impl CheckedMixerEntries {
 }
 
 /// A feed-forward's checked entry bindings, from its program slot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CheckedFeedForwardEntries {
     Dense(CheckedDenseEntries),
     Routed(CheckedRoutedEntries),
@@ -294,23 +309,259 @@ impl CheckedFeedForwardEntries {
     }
 }
 
-/// The per-layer input sublayer's entries and binding, prepared or checked.
-pub(crate) type PerLayerParts<'a, G> = (PerLayerEntries<'a, G>, PerLayerBinding);
+/// What a sublayer reads of the residual: the residual under its input
+/// norm, joined as one stream; a low-rank mix site's partials at its norm's
+/// epsilon; or the input row of a Sinkhorn site of the decoder's numerics
+/// (`SublayerGraph::read`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ReadTopology<R = Argument<f64>> {
+    Norm,
+    Mix { epsilon: R },
+    Sinkhorn(SinkhornTopology<R>),
+}
 
-/// The n-gram input's entries and binding, prepared or checked.
-pub(crate) type NGramParts<'a, G> = (NGramEntries<'a, G>, NGramBinding);
+impl<R> Numbers<R> for ReadTopology<R> {
+    type Of<E> = ReadTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> ReadTopology<E> {
+        match self {
+            Self::Norm => ReadTopology::Norm,
+            Self::Mix { epsilon } => ReadTopology::Mix { epsilon: f(epsilon) },
+            Self::Sinkhorn(mixing) => ReadTopology::Sinkhorn(mixing.map(&mut *f)),
+        }
+    }
+}
 
-/// A per-layer sublayer's checked entry bindings, from its binding.
-pub(crate) fn checked_per_layer(
-    binding: Option<PerLayerBinding>,
-) -> Result<Option<(CheckedPerLayerEntries, PerLayerBinding)>, String> {
-    binding
-        .map(|binding| Ok((CheckedPerLayerEntries::new(binding)?, binding)))
-        .transpose()
+impl ReadTopology<f64> {
+    /// The read of `source` over the decoder's `streams`.
+    fn of(source: SublayerSource<'_>, streams: Option<&StreamsGeometry>) -> Result<Self, GraphError> {
+        Ok(match source {
+            SublayerSource::Norm(_) => Self::Norm,
+            SublayerSource::Mix(_) => Self::Mix { epsilon: source.epsilon() },
+            SublayerSource::Sinkhorn(_) => Self::Sinkhorn(
+                streams
+                    .and_then(StreamsGeometry::sinkhorn)
+                    .ok_or("a Sinkhorn sublayer source without Sinkhorn streams")?
+                    .topology(),
+            ),
+        })
+    }
+}
+
+impl<R> ReadTopology<R> {
+    /// How the sublayer's consumer entry forms its input over `streams`
+    /// residual streams (`InputForm::read`).
+    fn form(&self, streams: u64) -> InputForm {
+        InputForm::read(matches!(self, Self::Mix { .. }), streams)
+    }
+}
+
+/// A block's mixer as its graph branches on it.
+/// Its reals `R` and its model-sourced tables `T` (attention's): the
+/// model's, a key's indices, or its builder's arguments and tables.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum MixerTopology<R = Argument<f64>, T = Table> {
+    Attention(AttentionTopology<R, T>),
+    Recurrent(RecurrentTopology<R>),
+    StateSpace(StateSpaceTopology<R>),
+    ShortConv(ShortConvTopology<R>),
+}
+
+impl<R, T> MixerTopology<R, T> {
+    /// It with its tables `f` of its own.
+    pub(crate) fn tables<U>(self, f: impl FnMut(T) -> U) -> MixerTopology<R, U> {
+        match self {
+            Self::Attention(topology) => MixerTopology::Attention(topology.tables(f)),
+            Self::Recurrent(topology) => MixerTopology::Recurrent(topology),
+            Self::StateSpace(topology) => MixerTopology::StateSpace(topology),
+            Self::ShortConv(topology) => MixerTopology::ShortConv(topology),
+        }
+    }
+}
+
+impl<R, T> Numbers<R> for MixerTopology<R, T> {
+    type Of<E> = MixerTopology<E, T>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> MixerTopology<E, T> {
+        match self {
+            Self::Attention(topology) => MixerTopology::Attention(topology.map(f)),
+            Self::Recurrent(topology) => MixerTopology::Recurrent(topology.map(f)),
+            Self::StateSpace(topology) => MixerTopology::StateSpace(topology.map(f)),
+            Self::ShortConv(topology) => MixerTopology::ShortConv(topology.map(f)),
+        }
+    }
+}
+
+/// A block's mixer's numbers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum MixerNumbers<D = Dim> {
+    Attention(AttentionBlock<D>),
+    Recurrent(RecurrentBlock<D>),
+    StateSpace(StateSpaceBlock<D>),
+    ShortConv(ShortConvBlock<D>),
+}
+
+impl<D> Numbers<D> for MixerNumbers<D> {
+    type Of<E> = MixerNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> MixerNumbers<E> {
+        match self {
+            Self::Attention(numbers) => MixerNumbers::Attention(numbers.map(f)),
+            Self::Recurrent(numbers) => MixerNumbers::Recurrent(numbers.map(f)),
+            Self::StateSpace(numbers) => MixerNumbers::StateSpace(numbers.map(f)),
+            Self::ShortConv(numbers) => MixerNumbers::ShortConv(numbers.map(f)),
+        }
+    }
+}
+
+/// A block's feed-forward as its graph branches on it: a dense one with
+/// its post-norm tail's reals (none without one), or a routed form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FeedForwardTopology<R = Argument<f64>> {
+    Dense { expansion: ExpansionForm, post_norm: Option<PostNorm<R>> },
+    Routed(RoutedTopology),
+    GeneralRouted(GeneralRoutedTopology<R>),
+    Parallel(ParallelTopology<R>),
+}
+
+impl<R> Numbers<R> for FeedForwardTopology<R> {
+    type Of<E> = FeedForwardTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> FeedForwardTopology<E> {
+        match self {
+            Self::Dense { expansion, post_norm } => {
+                FeedForwardTopology::Dense { expansion, post_norm: post_norm.map(|post_norm| post_norm.map(&mut *f)) }
+            }
+            Self::Routed(topology) => FeedForwardTopology::Routed(topology),
+            Self::GeneralRouted(topology) => FeedForwardTopology::GeneralRouted(topology.map(f)),
+            Self::Parallel(topology) => FeedForwardTopology::Parallel(topology.map(f)),
+        }
+    }
+}
+
+/// A block's feed-forward's numbers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FeedForwardNumbers<D = Dim> {
+    Dense(DenseNumbers<D>),
+    Routed(ExpertShape<D>),
+    GeneralRouted(GeneralRoutedLayer<D>),
+    Parallel(ParallelNumbers<D>),
+}
+
+impl<D> Numbers<D> for FeedForwardNumbers<D> {
+    type Of<E> = FeedForwardNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> FeedForwardNumbers<E> {
+        match self {
+            Self::Dense(numbers) => FeedForwardNumbers::Dense(numbers.map(f)),
+            Self::Routed(numbers) => FeedForwardNumbers::Routed(numbers.map(f)),
+            Self::GeneralRouted(numbers) => FeedForwardNumbers::GeneralRouted(numbers.map(f)),
+            Self::Parallel(numbers) => FeedForwardNumbers::Parallel(numbers.map(f)),
+        }
+    }
+}
+
+/// Everything a block's sublayers branch on (`BlockSublayers::split`): its
+/// lane, its norms' epsilon, and each sublayer's read of the residual and
+/// operator topology (each with its own output scale). No model number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SublayersTopology<R = Argument<f64>, T = Table> {
+    pub lane: BlockLane,
+    pub epsilon: R,
+    pub mixer: (ReadTopology<R>, MixerTopology<R, T>),
+    pub feed_forward: Option<(Option<ReadTopology<R>>, FeedForwardTopology<R>)>,
+    /// A per-layer input sublayer's post-norm tail, which it always ends
+    /// in (its layer and activation code are numbers,
+    /// `SublayersNumbers::per_layer`).
+    pub per_layer: Option<PostNorm<R>>,
+    pub ngram: Option<NGramTopology<R, T>>,
+}
+
+impl<R, T> SublayersTopology<R, T> {
+    /// It with its tables `f` of its own (`MixerTopology::tables`).
+    pub(crate) fn tables<U>(self, mut f: impl FnMut(T) -> U) -> SublayersTopology<R, U> {
+        let (read, mixer) = self.mixer;
+        SublayersTopology {
+            lane: self.lane,
+            epsilon: self.epsilon,
+            mixer: (read, mixer.tables(&mut f)),
+            feed_forward: self.feed_forward,
+            per_layer: self.per_layer,
+            ngram: self.ngram.map(|topology| topology.tables(&mut f)),
+        }
+    }
+}
+
+impl<R, T> Numbers<R> for SublayersTopology<R, T> {
+    type Of<E> = SublayersTopology<E, T>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> SublayersTopology<E, T> {
+        let (read, mixer) = self.mixer;
+        SublayersTopology {
+            lane: self.lane,
+            epsilon: f(self.epsilon),
+            mixer: (read.map(&mut *f), mixer.map(&mut *f)),
+            feed_forward: self
+                .feed_forward
+                .map(|(read, topology)| (read.map(|read| read.map(&mut *f)), topology.map(&mut *f))),
+            per_layer: self.per_layer.map(|post_norm| post_norm.map(&mut *f)),
+            ngram: self.ngram.map(|topology| topology.map(&mut *f)),
+        }
+    }
+}
+
+/// Every number a block's sublayers are sized by: the class's rows, slots,
+/// segments and listed history tiles, the decoder's width and streams, and
+/// each sublayer's own. Each operator's class numbers are the block's
+/// (`share_classes`), so one fact varies each class dimension.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SublayersNumbers<D = Dim> {
+    pub rows: D,
+    pub slots: D,
+    pub segments: D,
+    pub listed: D,
+    pub hidden: D,
+    pub streams: Option<StreamsGeometry<D, D>>,
+    pub mixer: MixerNumbers<D>,
+    pub feed_forward: Option<FeedForwardNumbers<D>>,
+    /// A per-layer input's numbers, its layer and its activation code.
+    pub per_layer: Option<(PerLayerNumbers<D>, D, D)>,
+    pub ngram: Option<NGramNumbers<D>>,
+}
+
+impl<D> Numbers<D> for SublayersNumbers<D> {
+    type Of<E> = SublayersNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> SublayersNumbers<E> {
+        SublayersNumbers {
+            rows: f(self.rows),
+            slots: f(self.slots),
+            segments: f(self.segments),
+            listed: f(self.listed),
+            hidden: f(self.hidden),
+            streams: self.streams.map(|streams| streams.map(&mut *f)),
+            mixer: self.mixer.map(f),
+            feed_forward: self.feed_forward.map(|numbers| numbers.map(&mut *f)),
+            per_layer: self.per_layer.map(|(numbers, layer, activation)| (numbers.map(&mut *f), f(layer), f(activation))),
+            ngram: self.ngram.map(|numbers| numbers.map(&mut *f)),
+        }
+    }
+}
+
+impl<D: Clone> SublayersNumbers<D> {
+    /// The operators' class numbers made the block's own: a key indexed
+    /// from it holds one fact for each class dimension, which its classes
+    /// vary (`seismic::ClassFact`).
+    pub(crate) fn share_classes(mut self) -> Self {
+        let (rows, slots, segments) = (&self.rows, &self.slots, &self.segments);
+        match &mut self.mixer {
+            MixerNumbers::Attention(numbers) => numbers.share_classes(rows, segments, &self.listed),
+            MixerNumbers::Recurrent(numbers) => (numbers.rows, numbers.slots) = (rows.clone(), slots.clone()),
+            MixerNumbers::StateSpace(numbers) => (numbers.rows, numbers.slots) = (rows.clone(), slots.clone()),
+            MixerNumbers::ShortConv(numbers) => (numbers.rows, numbers.slots) = (rows.clone(), slots.clone()),
+        }
+        if let Some(numbers) = &mut self.ngram {
+            (numbers.rows, numbers.slots) = (rows.clone(), slots.clone());
+        }
+        self
+    }
 }
 
 /// What a sublayer reads of the residual, and how its output joins it
-/// (`BlockSublayers::read`).
+/// (`SublayerGraph::read`).
 struct SublayerRead {
     input: WorkflowTensor,
     form: InputForm,
@@ -321,7 +572,7 @@ struct SublayerRead {
 
 /// Whose block a graph fragment builds:the scope of its weights, and the
 /// target layer whose history its attention mixer reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BlockLane {
     /// A target decoder block: its own weights, its own history.
     Target,
@@ -330,7 +581,7 @@ pub(crate) enum BlockLane {
     Head { source: u32 },
 }
 
-/// Everything a block's sublayers are built from apart from their entries.
+/// The model a block's sublayers are split from (`BlockSublayers::split`).
 /// `geometry` is the decoder the block belongs to: the target's, or a draft
 /// head's blocks at the head's width.
 pub(crate) struct BlockSublayers<'a> {
@@ -365,11 +616,7 @@ impl BlockSublayers<'_> {
     }
 
     fn scope(&self, sublayer: u32) -> Result<WeightScope, String> {
-        let index = self.index(sublayer)?;
-        Ok(match self.lane {
-            BlockLane::Target => WeightScope::TargetSublayer(index),
-            BlockLane::Head { .. } => WeightScope::HeadSublayer(index),
-        })
+        Ok(scope_of(self.lane, self.index(sublayer)?))
     }
 
     /// The decoder site of the block's attention, whose other layers its
@@ -473,38 +720,275 @@ impl BlockSublayers<'_> {
         })
     }
 
-    /// The decoder's residual streams; an error for a single stream.
-    fn streams_geometry(&self) -> Result<StreamsGeometry, GraphError> {
-        Ok(StreamsGeometry::of(self.geometry)
-            .map_err(|error| error.to_string())?
-            .ok_or("a mix site without residual streams")?)
+    /// The block's sublayers as their graphs branch on them and the numbers
+    /// they are sized by, its routed layer reading its experts as `bank`
+    /// says, its per-layer input and n-gram input bound by `per_layer` and
+    /// `ngram`: the one place a block's model numbers are read.
+    pub(crate) fn split<G: GraphDraft>(
+        &self,
+        bank: &LayerBank<'_, '_, G>,
+        per_layer: Option<PerLayerBinding>,
+        ngram: Option<NGramBinding>,
+    ) -> Result<(SublayersTopology<f64, std::sync::Arc<[u8]>>, SublayersNumbers<u64>), GraphError> {
+        let Self { paired, load, geometry, state, block_index, rows, segments, slots, listed, scored, output_scales, .. } =
+            *self;
+        let hidden = geometry.hidden;
+        let epsilon = paired.epsilon() as f32;
+        let component_index = bank_component_index(&geometry.blocks, block_index).map_err(|error| error.to_string())?;
+        let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
+        let (mixer, mixer_numbers) = match paired.mixer {
+            Mixer::Attention(operator) => {
+                let shape = attention_operator::shape(hidden, operator, self.site()?).map_err(|error| error.to_string())?;
+                // The block reads its history domain's slab tensor, a Shared
+                // layer its source's.
+                let history = state
+                    .target_state()
+                    .layer_history(self.history_layer()?)
+                    .ok_or("attention block has no history domain")?
+                    .store;
+                let (topology, numbers) = attention_split(&AttentionSite {
+                    rows,
+                    segments,
+                    history_rows: u64::try_from(history.rows).map_err(|_| "history rows exceed u64")?,
+                    slab_rows: history.slab_rows,
+                    history_tiles: listed,
+                    shape,
+                    operator,
+                    epsilon,
+                    head_epsilon: attention_operator::head_norm_epsilon(operator, paired.epsilon())
+                        .map_err(|error| error.to_string())? as f32,
+                    post_norm: post_norm(paired.mixer_output, output_scales.mixer),
+                    activation: activation(geometry),
+                    inject_only: false,
+                    // A head's rows read target history and append
+                    // nowhere.
+                    causal_cache: self.lane == BlockLane::Target,
+                    selection: attention_operator::selection_shape(operator, geometry.context_limit)
+                        .map(|shape| {
+                            let (window, blocks) = state
+                                .target_state()
+                                .indexer_history(self.index(0)?.block)
+                                .ok_or("a selected attention block has no indexer history")?;
+                            Ok::<_, GraphError>(SelectionSite {
+                                shape,
+                                scored,
+                                window_rows: u64::try_from(window.rows).map_err(|_| "indexer rows exceed u64")?,
+                                window_slab_rows: window.slab_rows,
+                                block_rows: u64::try_from(blocks.rows).map_err(|_| "indexer rows exceed u64")?,
+                                block_slab_rows: blocks.slab_rows,
+                            })
+                        })
+                        .transpose()?,
+                    picked: self.picked(operator, segments)?,
+                    controls: self.controls(),
+                })?;
+                (
+                    MixerTopology::Attention(topology),
+                    MixerNumbers::Attention(numbers),
+                )
+            }
+            Mixer::GatedDelta(shape) => {
+                let (topology, numbers) = gated_delta::graph::split(
+                    shape,
+                    hidden,
+                    rows,
+                    slots,
+                    epsilon,
+                    state,
+                    component_index,
+                    self.controls(),
+                )?;
+                (MixerTopology::Recurrent(topology), MixerNumbers::Recurrent(numbers))
+            }
+            Mixer::StateSpace(operator) => {
+                let (topology, numbers) = super::state_space::graph::split(
+                    operator,
+                    hidden,
+                    rows,
+                    slots,
+                    epsilon,
+                    state,
+                    component_index,
+                    self.controls(),
+                )?;
+                (MixerTopology::StateSpace(topology), MixerNumbers::StateSpace(numbers))
+            }
+            Mixer::ShortConv(operator) => {
+                let (topology, numbers) = super::short_conv::graph::split(
+                    operator,
+                    hidden,
+                    rows,
+                    slots,
+                    epsilon,
+                    post_norm(paired.mixer_output, output_scales.mixer),
+                    state,
+                    component_index,
+                    self.controls(),
+                )?;
+                (MixerTopology::ShortConv(topology), MixerNumbers::ShortConv(numbers))
+            }
+        };
+        let single = |source: Option<SublayerSource<'_>>, what: &str| -> Result<(), GraphError> {
+            match source {
+                None | Some(SublayerSource::Norm(_)) => Ok(()),
+                Some(_) => Err(format!("a {what} feed-forward over residual streams").into()),
+            }
+        };
+        let scope = self.scope(1)?;
+        let (feed_forward, feed_forward_numbers) = match paired.feed_forward {
+            None => (None, None),
+            Some(sublayer) => {
+                let (topology, numbers) = match sublayer.op {
+                    FeedForward::Dense(operator) => {
+                        single(sublayer.input, "dense")?;
+                        let (expansion, numbers) = dense_ffn::graph::split(load, scope, &operator.up)?;
+                        let post_norm = post_norm(sublayer.output, output_scales.feed_forward);
+                        (FeedForwardTopology::Dense { expansion, post_norm }, FeedForwardNumbers::Dense(numbers))
+                    }
+                    FeedForward::Routed(shape) => {
+                        if sublayer.input.is_none() {
+                            return Err("a routed feed-forward without its input source".into());
+                        }
+                        let (topology, numbers) =
+                            routed_graph::split(load, scope, routed_graph::RoutedSource::Operator { routed: shape, hidden }, bank)?;
+                        (FeedForwardTopology::Routed(topology), FeedForwardNumbers::Routed(numbers))
+                    }
+                    FeedForward::GeneralRouted(operator) => {
+                        if let Some(SublayerSource::Mix(_)) = sublayer.input {
+                            return Err("a general routed feed-forward over low-rank streams".into());
+                        }
+                        let shape =
+                            GeneralRoutedShape::of(hidden, operator).map_err(|error| error.to_string())?;
+                        let (topology, numbers) = general_split(load, scope, &shape, bank)?;
+                        (FeedForwardTopology::GeneralRouted(topology), FeedForwardNumbers::GeneralRouted(numbers))
+                    }
+                    FeedForward::Parallel(branches) => {
+                        single(sublayer.input, "parallel")?;
+                        let (topology, numbers) =
+                            super::parallel::graph::split(load, self.index(1)?, branches, hidden, output_scales.feed_forward, bank)?;
+                        (FeedForwardTopology::Parallel(topology), FeedForwardNumbers::Parallel(numbers))
+                    }
+                };
+                let read = sublayer.input.map(|source| ReadTopology::of(source, streams.as_ref())).transpose()?;
+                (Some((read, topology)), Some(numbers))
+            }
+        };
+        let (per_layer, per_layer_numbers) = match (paired.per_layer, per_layer) {
+            (None, None) => (None, None),
+            (Some(sublayer), Some(binding)) => (
+                Some(
+                    post_norm(sublayer.output, output_scales.per_layer)
+                        .ok_or("a per-layer input sublayer ends in a post-norm tail")?,
+                ),
+                Some((
+                    PerLayerNumbers::of(&binding),
+                    u64::from(sublayer.op.layer),
+                    super::code(dense_ffn::activation_code(sublayer.op.activation)),
+                )),
+            ),
+            _ => return Err("target block per-layer sublayer and its binding disagree".into()),
+        };
+        let (ngram, ngram_numbers) = match (paired.ngram, ngram) {
+            (None, None) => (None, None),
+            (Some(sublayer), Some(binding)) => {
+                let (topology, numbers) = super::ngram::graph::split(
+                    binding,
+                    &sublayer.op.hash,
+                    rows,
+                    slots,
+                    sublayer.op.epsilon as f32,
+                    state,
+                    component_index + paired.mixer.bank_components(),
+                    self.controls(),
+                )?;
+                (Some(topology), Some(numbers))
+            }
+            _ => return Err("target block n-gram input and its binding disagree".into()),
+        };
+        Ok((
+            SublayersTopology {
+                lane: self.lane,
+                epsilon: f64::from(epsilon),
+                mixer: (ReadTopology::of(paired.mixer_input, streams.as_ref())?, mixer),
+                feed_forward,
+                per_layer,
+                ngram,
+            },
+            SublayersNumbers {
+                rows,
+                slots,
+                segments,
+                listed,
+                hidden,
+                streams: streams.map(StreamsGeometry::numbers),
+                mixer: mixer_numbers,
+                feed_forward: feed_forward_numbers,
+                per_layer: per_layer_numbers,
+                ngram: ngram_numbers,
+            },
+        ))
+    }
+}
+
+/// The weight scope of sublayer `index` of a block of `lane`.
+fn scope_of(lane: BlockLane, index: SublayerIndex) -> WeightScope {
+    match lane {
+        BlockLane::Target => WeightScope::TargetSublayer(index),
+        BlockLane::Head { .. } => WeightScope::HeadSublayer(index),
+    }
+}
+
+/// A block's sublayers' graph fragments, built from their split
+/// (`BlockSublayers::split`) alone: at a recording's facts, or at the
+/// model's own numbers (`facts::constant`), over the weights `weights`,
+/// naming its sublayers' scopes as block `block`'s: a target block's graph
+/// its own as block 0 (`relative_scope`), a head's its index in the head.
+pub(crate) struct SublayerGraph<'s, W: ?Sized> {
+    pub block: u32,
+    pub topology: &'s SublayersTopology,
+    pub numbers: &'s SublayersNumbers<Dim>,
+    pub weights: &'s W,
+}
+
+impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
+    fn index(&self, sublayer: u32) -> SublayerIndex {
+        SublayerIndex { block: self.block, sublayer }
     }
 
-    /// What sublayer `sublayer` reads of the residual `hidden` (its
-    /// `source`), and how its output joins it: the residual itself under its
-    /// input norm, joined as one stream; a low-rank mix site's partials over
-    /// the streams, joined by the scatter with the site's inject values; or
-    /// a Sinkhorn site's input row under the sublayer's norm, joined by the
+    fn scope(&self, sublayer: u32) -> WeightScope {
+        scope_of(self.topology.lane, self.index(sublayer))
+    }
+
+    /// The decoder's residual streams; an error for a single stream.
+    fn streams_geometry(&self) -> Result<&StreamsGeometry<Dim, Dim>, GraphError> {
+        Ok(self.numbers.streams.as_ref().ok_or("a mix site without residual streams")?)
+    }
+
+    /// What sublayer `sublayer` reads of the residual `hidden` (`read`),
+    /// and how its output joins it: the residual itself under its input
+    /// norm, joined as one stream; a low-rank mix site's partials over the
+    /// streams, joined by the scatter with the site's inject values; or a
+    /// Sinkhorn site's input row under the sublayer's norm, joined by the
     /// scatter with the site's post | comb, the site's pre carried on.
-    #[allow(clippy::too_many_arguments)]
     fn read<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
-        source: SublayerSource<'_>,
+        read: ReadTopology,
         streams: Option<StreamsEntries<'e, G>>,
         sublayer: u32,
         hidden: &ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
     ) -> Result<SublayerRead, GraphError> {
         let site = streams.and_then(|entries| entries.site(sublayer));
-        match source {
-            SublayerSource::Norm(_) => Ok(SublayerRead {
+        let rows = &self.numbers.rows;
+        match read {
+            ReadTopology::Norm => Ok(SublayerRead {
                 input: hidden.rows.clone(),
                 form: InputForm::SINGLE,
                 join: Join::single(Some("M")),
                 pre: hidden.pre.clone(),
             }),
-            SublayerSource::Mix(_) => {
+            ReadTopology::Mix { epsilon } => {
                 let geometry = self.streams_geometry()?;
                 let (Some(low_rank), Some(SiteEntry::LowRank(entries))) = (geometry.low_rank(), site) else {
                     return Err("a low-rank mix site without low-rank streams and their entries".into());
@@ -512,44 +996,42 @@ impl BlockSublayers<'_> {
                 let site = mix_site(
                     graph,
                     entries,
-                    self.load,
-                    self.scope(sublayer)?,
+                    self.weights,
+                    self.scope(sublayer),
                     low_rank,
                     &hidden.rows,
-                    self.rows,
-                    source.epsilon() as f32,
+                    rows.clone(),
+                    epsilon.f32(),
                     true,
                     weights,
                 )?;
-                let inject = site
-                    .inject
-                    .ok_or("a sublayer's mix site without inject values")?;
+                let inject = site.inject.ok_or("a sublayer's mix site without inject values")?;
                 Ok(SublayerRead {
                     input: site.partials,
-                    form: source.form(geometry.streams),
+                    form: read.form(geometry.streams),
                     join: Join::streams(geometry, inject, Some("M")),
                     pre: None,
                 })
             }
-            SublayerSource::Sinkhorn(_) => {
+            ReadTopology::Sinkhorn(mixing) => {
                 let geometry = self.streams_geometry()?;
-                let (Some(mixing), Some(SiteEntry::Sinkhorn(entry))) = (geometry.sinkhorn(), site) else {
+                let Some(SiteEntry::Sinkhorn(entry)) = site else {
                     return Err("a Sinkhorn mix site without Sinkhorn streams and their entries".into());
                 };
                 let site = sinkhorn_site(
                     graph,
                     entry,
-                    self.load,
-                    self.scope(sublayer)?,
-                    geometry,
+                    self.weights,
+                    self.scope(sublayer),
+                    geometry.clone(),
                     mixing,
                     hidden,
-                    self.rows,
+                    rows.clone(),
                     weights,
                 )?;
                 Ok(SublayerRead {
                     input: site.input,
-                    form: source.form(geometry.streams),
+                    form: read.form(geometry.streams),
                     join: Join::streams(geometry, site.join, Some("M")),
                     pre: Some(site.pre),
                 })
@@ -557,7 +1039,7 @@ impl BlockSublayers<'_> {
         }
     }
 
-    /// The block's mixer over `hidden`: the new residual, and the block's
+    /// The block's mixer over `carry`: the new residual, and the block's
     /// state and control ports.
     pub(crate) fn mixer<'e, G: GraphDraft + 'e>(
         &self,
@@ -568,111 +1050,25 @@ impl BlockSublayers<'_> {
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(ResidualCarry<WorkflowTensor>, BlockState), GraphError> {
-        let Self {
-            paired,
-            load,
-            geometry,
-            state,
-            block_index,
-            rows,
-            segments,
-            slots,
-            listed,
-            scored,
-            output_scales,
-            ..
-        } = *self;
-        let scope = self.scope(0)?;
-        let epsilon = paired.epsilon() as f32;
-        let component_index = bank_component_index(&geometry.blocks, block_index)
-            .map_err(|error| error.to_string())?;
-        let SublayerRead { input: input_rows, form, join, pre } =
-            self.read(graph, paired.mixer_input, streams, 0, carry, weights)?;
+        let scope = self.scope(0);
+        let planned = self.weights;
+        let (read, ref mixer) = self.topology.mixer;
+        let SublayerRead { input: input_rows, form, join, pre } = self.read(graph, read, streams, 0, carry, weights)?;
         let hidden = &carry.rows;
-        let input = SublayerInput {
-            rows: &input_rows,
-            form,
-        };
-        let (mixed, block_state) = match (paired.mixer, entries) {
-            (Mixer::Attention(operator), MixerEntries::Attention(entries)) => {
-                let shape = attention_operator::shape(geometry.hidden, operator, self.site()?)
-                    .map_err(|error| error.to_string())?;
-                let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
-                let operands = AttentionOperands::planned(
-                    graph, load, scope, operator, &shape, true, weights, constants,
-                )?;
-                let attention_weights = attention_weights(
-                    &shape,
-                    operator,
-                    form,
-                    true,
-                    post_norm_epsilon.is_some(),
-                    operands,
-                    |kind| weight(graph, load, scope, kind, weights),
-                )?;
-                // The block reads its history domain's slab tensor, a Shared
-                // layer its source's.
-                let history = state
-                    .target_state()
-                    .layer_history(self.history_layer()?)
-                    .ok_or("attention block has no history domain")?
-                    .store;
-                let (mixed, ports, controls) = attention(
-                    graph,
-                    entries,
-                    &attention_weights,
-                    constants,
-                    input,
-                    hidden,
-                    &join,
-                    AttentionBlock {
-                        rows,
-                        segments,
-                        history_rows: u64::try_from(history.rows)
-                            .map_err(|_| "history rows exceed u64")?,
-                        slab_rows: history.slab_rows,
-                        history_tiles: listed,
-                        shape,
-                        operator,
-                        epsilon,
-                        head_epsilon: attention_operator::head_norm_epsilon(
-                            operator,
-                            paired.epsilon(),
-                        )
-                        .map_err(|error| error.to_string())?
-                            as f32,
-                        post_norm_epsilon: post_norm_epsilon.unwrap_or_default() as f32,
-                        post_norm_scale: output_scales.mixer,
-                        activation: activation(geometry),
-                        inject_only: false,
-                        // A head's rows read target history and append
-                        // nowhere.
-                        causal_cache: self.lane == BlockLane::Target,
-                        selection: attention_operator::selection_shape(
-                            operator,
-                            geometry.context_limit,
-                        )
-                        .map(|shape| {
-                            let (window, blocks) = state
-                                .target_state()
-                                .indexer_history(self.index(0)?.block)
-                                .ok_or("a selected attention block has no indexer history")?;
-                            Ok::<_, GraphError>(SelectionBlock {
-                                shape,
-                                scored,
-                                window_rows: u64::try_from(window.rows)
-                                    .map_err(|_| "indexer rows exceed u64")?,
-                                window_slab_rows: window.slab_rows,
-                                block_rows: u64::try_from(blocks.rows)
-                                    .map_err(|_| "indexer rows exceed u64")?,
-                                block_slab_rows: blocks.slab_rows,
-                            })
-                        })
-                        .transpose()?,
-                        picked: self.picked(operator, segments)?,
-                        controls: self.controls(),
-                    },
-                )?;
+        let input = SublayerInput { rows: &input_rows, form };
+        let (mixed, block_state) = match (mixer, &self.numbers.mixer, entries) {
+            (
+                MixerTopology::Attention(topology),
+                MixerNumbers::Attention(numbers),
+                MixerEntries::Attention(entries),
+            ) => {
+                let operands =
+                    AttentionOperands::planned(graph, planned, scope, topology, numbers, true, weights, constants)?;
+                let attention_weights = attention_weights(topology, numbers, form, true, operands, |kind| {
+                    weight(graph, planned, scope, kind, weights)
+                })?;
+                let (mixed, ports, controls) =
+                    attention(graph, entries, topology, numbers, &attention_weights, constants, input, hidden, &join)?;
                 (
                     mixed,
                     BlockState {
@@ -691,91 +1087,49 @@ impl BlockSublayers<'_> {
                     },
                 )
             }
-            (Mixer::GatedDelta(shape), MixerEntries::Recurrent(entries)) => {
+            (MixerTopology::Recurrent(topology), MixerNumbers::Recurrent(numbers), MixerEntries::Recurrent(entries)) => {
                 let (mixed, ports, controls) = recurrent(
-                    graph,
-                    entries,
-                    state,
-                    load,
-                    scope,
-                    weights,
-                    constants,
-                    input,
-                    hidden,
-                    &join,
-                    RecurrentBlock {
-                        rows,
-                        hidden: geometry.hidden,
-                        slots,
-                        slab_banks: state.target_state().bank_slab_banks()?,
-                        key_heads: shape.key_heads,
-                        value_heads: shape.value_heads,
-                        width: shape.width,
-                        convolution_width: shape.convolution_width,
-                        grouped: matches!(shape.head_mapping, RecurrentHeadMapping::Grouped),
-                        gate_function: gated_delta::gate_function(shape),
-                        epsilon,
-                        component_index,
-                        controls: self.controls(),
-                    },
+                    graph, entries, topology, numbers, planned, scope, weights, constants, input, hidden, &join,
                 )?;
                 (mixed, (ports, controls).into())
             }
-            (Mixer::StateSpace(operator), MixerEntries::StateSpace(entries)) => {
-                let (mixed, ports, controls) = state_space(
-                    graph,
-                    entries,
-                    state,
-                    load,
-                    scope,
-                    weights,
-                    constants,
-                    hidden,
-                    &join,
-                    StateSpaceBlock {
-                        rows,
-                        slots,
-                        slab_banks: state.target_state().bank_slab_banks()?,
-                        shape: StateSpaceShape::of(geometry.hidden, operator)
-                            .map_err(|error| error.to_string())?,
-                        epsilon,
-                        norm_epsilon: operator.norm.epsilon as f32,
-                        component_index,
-                        controls: self.controls(),
-                    },
-                )?;
+            (
+                MixerTopology::StateSpace(topology),
+                MixerNumbers::StateSpace(numbers),
+                MixerEntries::StateSpace(entries),
+            ) => {
+                let (mixed, ports, controls) =
+                    state_space(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
                 (mixed, (ports, controls).into())
             }
-            (Mixer::ShortConv(operator), MixerEntries::ShortConv(entries)) => {
-                let (mixed, window, controls) = short_conv(
-                    graph,
-                    entries,
-                    state,
-                    load,
-                    scope,
-                    weights,
-                    constants,
-                    hidden,
-                    &join,
-                    ShortConvBlock {
-                        rows,
-                        slots,
-                        slab_banks: state.target_state().bank_slab_banks()?,
-                        shape: ShortConvShape::of(geometry.hidden, operator)
-                            .map_err(|error| error.to_string())?,
-                        epsilon,
-                        post_norm_epsilon: post_norm_epsilon(paired.mixer_output)
-                            .unwrap_or_default() as f32,
-                        post_norm_scale: output_scales.mixer,
-                        component_index,
-                        controls: self.controls(),
-                    },
-                )?;
+            (MixerTopology::ShortConv(topology), MixerNumbers::ShortConv(numbers), MixerEntries::ShortConv(entries)) => {
+                let (mixed, window, controls) =
+                    short_conv(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
                 (mixed, BlockState::bank(vec![window], controls))
             }
             _ => return Err("target block mixer and its kernel entries disagree".into()),
         };
         Ok((ResidualCarry { rows: mixed, pre }, block_state))
+    }
+
+    /// The scope of the block's streamed routed layer and how it reads its
+    /// experts: a parallel block's routed branch's.
+    fn routed_layer(&self) -> Result<(WeightScope, &BankForm, Option<&BankNumbers>), GraphError> {
+        match (&self.topology.feed_forward, &self.numbers.feed_forward) {
+            (Some((_, FeedForwardTopology::Routed(topology))), Some(FeedForwardNumbers::Routed(numbers))) => {
+                Ok((self.scope(1), &topology.bank, numbers.bank.as_ref()))
+            }
+            (
+                Some((_, FeedForwardTopology::GeneralRouted(topology))),
+                Some(FeedForwardNumbers::GeneralRouted(numbers)),
+            ) => Ok((self.scope(1), &topology.bank, numbers.bank.as_ref())),
+            (Some((_, FeedForwardTopology::Parallel(topology))), Some(FeedForwardNumbers::Parallel(numbers))) => Ok((
+                DenseBesideRouted::scopes(self.index(1))[1],
+                &topology.routed.bank,
+                numbers.routed.bank.as_ref(),
+            )),
+            _ => Err("a block without a routed layer".into()),
+        }
     }
 
     /// A scratch-served step's fill of the block's streamed routed layer
@@ -787,13 +1141,8 @@ impl BlockSublayers<'_> {
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<WorkflowTensor, GraphError> {
-        let scope = match self.paired.feed_forward.map(|sublayer| sublayer.op) {
-            Some(FeedForward::Routed(_) | FeedForward::GeneralRouted(_)) => self.scope(1)?,
-            // A parallel block's routed branch's.
-            Some(FeedForward::Parallel(_)) => DenseBesideRouted::scopes(self.index(1)?)[1],
-            _ => return Err("a fill of a block without a streamed routed layer".into()),
-        };
-        scratch_fill(graph, feed_forward.bank, self.load, scope, weights, constants)
+        let (scope, form, numbers) = self.routed_layer()?;
+        scratch_fill(graph, feed_forward.bank, form, numbers, self.weights, scope, weights, constants)
     }
 
     /// A merge set's pass over the block's routed layer (`group_pass`,
@@ -804,51 +1153,45 @@ impl BlockSublayers<'_> {
         graph: &mut G,
         feed_forward: FeedForwardGraph<'_, 'e, G>,
         ports: &mut PassPorts,
+        blocks: &Dim,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<WorkflowTensor, GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
-        let (load, rows, hidden) = (self.load, self.rows, self.geometry.hidden);
-        let general = |operator| GeneralRoutedShape::of(hidden, operator).map_err(|error| error.to_string());
-        match (self.paired.feed_forward.map(|sublayer| sublayer.op), entries) {
-            (Some(FeedForward::Routed(shape)), Some(FeedForwardEntries::Routed(entries))) => routed_graph::group_pass(
-                graph,
-                entries,
-                bank,
-                load,
-                self.scope(1)?,
-                weights,
-                constants,
-                ports,
-                rows,
-                hidden,
-                &ExpertShape::of_operator(shape)?,
+        let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
+        let topology = self.topology.feed_forward.as_ref().map(|(_, topology)| topology);
+        match (topology, &self.numbers.feed_forward, entries) {
+            (
+                Some(FeedForwardTopology::Routed(topology)),
+                Some(FeedForwardNumbers::Routed(numbers)),
+                Some(FeedForwardEntries::Routed(entries)),
+            ) => routed_graph::group_pass(
+                graph, entries, bank, topology, numbers, planned, scope, weights, constants, ports, blocks, rows,
             ),
-            (Some(FeedForward::GeneralRouted(operator)), Some(FeedForwardEntries::GeneralRouted(entries))) => {
-                general_pass(
-                    graph,
-                    entries,
-                    bank,
-                    load,
-                    self.scope(1)?,
-                    weights,
-                    constants,
-                    ports,
-                    rows,
-                    &general(operator)?,
-                )
-            }
-            (Some(FeedForward::Parallel(branches)), Some(FeedForwardEntries::Parallel(entries))) => general_pass(
+            (
+                Some(FeedForwardTopology::GeneralRouted(topology)),
+                Some(FeedForwardNumbers::GeneralRouted(numbers)),
+                Some(FeedForwardEntries::GeneralRouted(entries)),
+            ) => general_pass(
+                graph, entries, bank, topology, numbers, planned, scope, weights, constants, ports, blocks, rows,
+            ),
+            (
+                Some(FeedForwardTopology::Parallel(topology)),
+                Some(FeedForwardNumbers::Parallel(numbers)),
+                Some(FeedForwardEntries::Parallel(entries)),
+            ) => general_pass(
                 graph,
                 entries.routed,
                 bank,
-                load,
-                DenseBesideRouted::scopes(self.index(1)?)[1],
+                &topology.routed,
+                &numbers.routed,
+                planned,
+                DenseBesideRouted::scopes(self.index(1))[1],
                 weights,
                 constants,
                 ports,
+                blocks,
                 rows,
-                &general(branches.routed)?,
             ),
             _ => Err("a pass of a block without a routed layer".into()),
         }
@@ -872,24 +1215,9 @@ impl BlockSublayers<'_> {
         split: Option<Split<'_>>,
     ) -> Result<(ResidualCarry<WorkflowTensor>, Option<NativePort>), GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
-        let Self {
-            paired,
-            load,
-            geometry,
-            rows,
-            output_scales,
-            ..
-        } = *self;
-        let scope = self.scope(1)?;
-        let epsilon = paired.epsilon() as f32;
+        let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
+        let epsilon = self.topology.epsilon.f32();
         let mixed = &carry.rows;
-        // A mix site's sublayer reads its site; the others read `mixed`.
-        let read = |graph: &mut G,
-                    weights: &mut Vec<(WeightPort, NativePort)>,
-                    source: Option<SublayerSource<'_>>| {
-            let source = source.ok_or("a routed feed-forward without its input source")?;
-            self.read(graph, source, streams, 1, &carry, weights)
-        };
         // A split layer's front exports the carry it read; the others carry
         // their output rows on with the site's pre.
         let front = matches!(split, Some(Split::Front(_)));
@@ -897,129 +1225,126 @@ impl BlockSublayers<'_> {
             true => carry.clone(),
             false => ResidualCarry { rows: output, pre },
         };
-        let single = |source: Option<SublayerSource<'_>>, what: &str| -> Result<(), GraphError> {
-            match source {
-                None | Some(SublayerSource::Norm(_)) => Ok(()),
-                Some(_) => Err(format!("a {what} feed-forward over residual streams").into()),
-            }
+        let (read, topology, entries) = match (&self.topology.feed_forward, entries) {
+            (None, None) => return Ok((carry.clone(), None)),
+            (Some((read, topology)), Some(entries)) => (*read, topology, entries),
+            _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
-        let output = match (paired.feed_forward, entries) {
-            (None, None) => carry.rows.clone(),
-            (Some(sublayer), Some(entries)) => match (sublayer.op, entries) {
-                (FeedForward::Dense(operator), FeedForwardEntries::Dense(entries)) => {
-                    single(sublayer.input, "dense")?;
-                    dense(
-                        graph,
-                        entries,
-                        load,
-                        scope,
-                        weights,
-                        constants,
-                        mixed,
-                        rows,
-                        epsilon,
-                        Expansion::of(&operator.up),
-                        post_norm_epsilon(sublayer.output).unwrap_or_default() as f32,
-                        output_scales.feed_forward,
-                    )?
-                }
-                (FeedForward::Routed(shape), FeedForwardEntries::Routed(entries)) => {
-                    let SublayerRead { input: input_rows, form, join, pre } =
-                        read(graph, weights, sublayer.input)?;
-                    let (output, sequence) = routed_graph::routed(
-                        graph,
-                        entries,
-                        bank,
-                        load,
-                        scope,
-                        weights,
-                        constants,
-                        SublayerInput {
-                            rows: &input_rows,
-                            form,
-                        },
-                        mixed,
-                        &join,
-                        rows,
-                        geometry.hidden,
-                        &ExpertShape::of_operator(shape)?,
-                        epsilon,
-                        split,
-                    )?;
-                    return Ok((carried(output, pre), sequence));
-                }
-                (
-                    FeedForward::GeneralRouted(operator),
-                    FeedForwardEntries::GeneralRouted(entries),
-                ) => {
-                    let shape = GeneralRoutedShape::of(geometry.hidden, operator).map_err(|error| error.to_string())?;
-                    let routed = |graph: &mut G,
-                                  weights: &mut Vec<(WeightPort, NativePort)>,
-                                  constants: &mut Vec<GraphConstant>,
-                                  input: &WorkflowTensor,
-                                  sum| {
-                        general_routed(
-                            graph, entries, bank, load, scope, weights, constants, input, sum, rows, &shape, epsilon,
-                            split,
-                        )
-                    };
-                    return match sublayer.input {
-                        None | Some(SublayerSource::Norm(_)) => {
-                            let (output, sequence) = routed(graph, weights, constants, mixed, RoutedSum::Residual)?;
-                            Ok((carried(output, carry.pre.clone()), sequence))
+        let output = match (topology, &self.numbers.feed_forward, entries) {
+            (
+                FeedForwardTopology::Dense { expansion, post_norm },
+                Some(FeedForwardNumbers::Dense(numbers)),
+                FeedForwardEntries::Dense(entries),
+            ) => dense(
+                graph,
+                entries,
+                *expansion,
+                numbers,
+                planned,
+                scope,
+                weights,
+                constants,
+                mixed,
+                rows,
+                None,
+                epsilon,
+                post_norm.as_ref(),
+            )?,
+            (
+                FeedForwardTopology::Routed(topology),
+                Some(FeedForwardNumbers::Routed(numbers)),
+                FeedForwardEntries::Routed(entries),
+            ) => {
+                let read = read.ok_or("a routed feed-forward without its input source")?;
+                let SublayerRead { input: input_rows, form, join, pre } =
+                    self.read(graph, read, streams, 1, &carry, weights)?;
+                let (output, sequence) = routed_graph::routed(
+                    graph,
+                    entries,
+                    bank,
+                    topology,
+                    numbers,
+                    planned,
+                    scope,
+                    weights,
+                    constants,
+                    SublayerInput { rows: &input_rows, form },
+                    mixed,
+                    &join,
+                    rows,
+                    epsilon,
+                    split,
+                )?;
+                return Ok((carried(output, pre), sequence));
+            }
+            (
+                FeedForwardTopology::GeneralRouted(topology),
+                Some(FeedForwardNumbers::GeneralRouted(numbers)),
+                FeedForwardEntries::GeneralRouted(entries),
+            ) => {
+                let routed = |graph: &mut G,
+                              weights: &mut Vec<(WeightPort, NativePort)>,
+                              constants: &mut Vec<GraphConstant>,
+                              input: &WorkflowTensor,
+                              sum| {
+                    general_routed(
+                        graph, entries, bank, topology, numbers, planned, scope, weights, constants, input, sum, rows,
+                        epsilon, split,
+                    )
+                };
+                return match read {
+                    None | Some(ReadTopology::Norm) => {
+                        let (output, sequence) = routed(graph, weights, constants, mixed, RoutedSum::Residual)?;
+                        Ok((carried(output, carry.pre.clone()), sequence))
+                    }
+                    // Over Sinkhorn streams the routed branch sums onto
+                    // zeros, and `stream_join` joins it into the streams.
+                    Some(read @ ReadTopology::Sinkhorn(_)) => {
+                        let read = self.read(graph, read, streams, 1, &carry, weights)?;
+                        let (branch, sequence) = routed(graph, weights, constants, &read.input, RoutedSum::Branch)?;
+                        if front {
+                            return Ok((carry.clone(), sequence));
                         }
-                        // Over Sinkhorn streams the routed branch sums onto
-                        // zeros, and `stream_join` joins it into the streams.
-                        Some(source @ SublayerSource::Sinkhorn(_)) => {
-                            let read = self.read(graph, source, streams, 1, &carry, weights)?;
-                            let (branch, sequence) =
-                                routed(graph, weights, constants, &read.input, RoutedSum::Branch)?;
-                            if front {
-                                return Ok((carry.clone(), sequence));
-                            }
-                            let entry = streams
-                                .and_then(|streams| streams.sinkhorn())
-                                .ok_or("a Sinkhorn join without its entry")?
-                                .join;
-                            let joined = stream_join(
-                                graph,
-                                entry,
-                                self.streams_geometry()?,
-                                mixed,
-                                &branch,
-                                read.join.values.as_ref().ok_or("a Sinkhorn site without its join values")?,
-                                rows,
-                            )?;
-                            Ok((ResidualCarry { rows: joined, pre: read.pre }, sequence))
-                        }
-                        Some(SublayerSource::Mix(_)) => {
-                            Err("a general routed feed-forward over low-rank streams".into())
-                        }
-                    };
-                }
-                (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
-                    single(sublayer.input, "parallel")?;
-                    let (output, sequence) = parallel(
-                        graph,
-                        entries,
-                        bank,
-                        load,
-                        self.index(1)?,
-                        weights,
-                        constants,
-                        mixed,
-                        rows,
-                        &GeneralRoutedShape::of(geometry.hidden, branches.routed)
-                            .map_err(|error| error.to_string())?,
-                        epsilon,
-                        Expansion::of(&branches.dense.up),
-                        output_scales.feed_forward,
-                        split,
-                    )?;
-                    return Ok((carried(output, carry.pre.clone()), sequence));
-                }
-                _ => return Err("target block feed-forward and its kernel entries disagree".into()),
-            },
+                        let entry = streams
+                            .and_then(|streams| streams.sinkhorn())
+                            .ok_or("a Sinkhorn join without its entry")?
+                            .join;
+                        let joined = stream_join(
+                            graph,
+                            entry,
+                            self.streams_geometry()?.clone(),
+                            mixed,
+                            &branch,
+                            read.join.values.as_ref().ok_or("a Sinkhorn site without its join values")?,
+                            rows.clone(),
+                        )?;
+                        Ok((ResidualCarry { rows: joined, pre: read.pre }, sequence))
+                    }
+                    Some(ReadTopology::Mix { .. }) => Err("a general routed feed-forward over low-rank streams".into()),
+                };
+            }
+            (
+                FeedForwardTopology::Parallel(topology),
+                Some(FeedForwardNumbers::Parallel(numbers)),
+                FeedForwardEntries::Parallel(entries),
+            ) => {
+                let (output, sequence) = parallel(
+                    graph,
+                    entries,
+                    bank,
+                    topology,
+                    numbers,
+                    planned,
+                    self.index(1),
+                    weights,
+                    constants,
+                    mixed,
+                    rows,
+                    epsilon,
+                    split,
+                )?;
+                return Ok((carried(output, carry.pre.clone()), sequence));
+            }
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
         Ok((ResidualCarry { rows: output, pre: carry.pre.clone() }, None))
@@ -1030,69 +1355,40 @@ impl BlockSublayers<'_> {
     pub(crate) fn per_layer<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
-        parts: Option<PerLayerParts<'e, G>>,
+        entries: Option<PerLayerEntries<'e, G>>,
         residual: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
-        let Self {
-            paired,
-            load,
+        let (tail, numbers, layer, activation, entries) = match (self.topology.per_layer, &self.numbers.per_layer, entries) {
+            (None, None, None) => return Ok((residual, None)),
+            (Some(tail), Some((numbers, layer, activation)), Some(entries)) => (tail, numbers, layer, activation, entries),
+            _ => return Err("target block per-layer sublayer and its kernel entries disagree".into()),
+        };
+        let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(2));
+        let per_layer_weights = PerLayerWeights {
+            gate: scaled_weight(graph, planned, scope, WeightKind::PerLayerGate, weights, constants)?,
+            projection: packed_weight(graph, planned, scope, WeightKind::PerLayerProjection, weights, constants)?,
+            post_norm: weight(graph, planned, scope, WeightKind::PostNorm, weights)?,
+        };
+        let rows_port =
+            graph.port_with_class_extent(Element::f32(), &[rows.clone(), &numbers.layers * &numbers.width], 0, "M")?;
+        let out_rows = GraphConstant::row_identity(graph, rows.clone(), Some("M"))?;
+        let advanced = per_layer_graph(
+            graph,
+            entries,
+            &per_layer_weights,
+            &residual,
+            rows_port.tensor(),
+            out_rows.port().tensor(),
+            numbers,
+            layer.word().ok_or("a per-layer index exceeds i32")?,
+            super::scalar::<i32>(activation, "a per-layer activation code")?,
             rows,
-            output_scales,
-            ..
-        } = *self;
-        match (paired.per_layer, parts) {
-            (None, None) => Ok((residual, None)),
-            (Some(sublayer), Some((entries, binding))) => {
-                let scope = self.scope(2)?;
-                let per_layer_weights = PerLayerWeights {
-                    gate: scaled_weight(
-                        graph,
-                        load,
-                        scope,
-                        WeightKind::PerLayerGate,
-                        weights,
-                        constants,
-                    )?,
-                    projection: packed_weight(
-                        graph,
-                        load,
-                        scope,
-                        WeightKind::PerLayerProjection,
-                        weights,
-                        constants,
-                    )?,
-                    post_norm: weight(graph, load, scope, WeightKind::PostNorm, weights)?,
-                };
-                let rows_port = graph.port_with_class_extent(
-                    Element::f32(),
-                    &[rows, binding.layers * binding.width],
-                    0,
-                    "M",
-                )?;
-                let out_rows = GraphConstant::row_identity(graph, rows, Some("M"))?;
-                let advanced = per_layer_graph(
-                    graph,
-                    entries,
-                    &per_layer_weights,
-                    &residual,
-                    rows_port.tensor(),
-                    out_rows.port().tensor(),
-                    binding,
-                    i32::try_from(sublayer.op.layer).map_err(|_| "per-layer index exceeds i32")?,
-                    dense_ffn::activation_code(sublayer.op.activation),
-                    rows,
-                    post_norm_epsilon(sublayer.output)
-                        .ok_or("a per-layer input sublayer ends in a post-norm tail")?
-                        as f32,
-                    output_scales.per_layer,
-                )?;
-                constants.push(out_rows);
-                Ok((advanced, Some(rows_port)))
-            }
-            _ => Err("target block per-layer sublayer and its kernel entries disagree".into()),
-        }
+            &tail,
+        )?;
+        constants.push(out_rows);
+        Ok((advanced, Some(rows_port)))
     }
 
     /// The block's n-gram input over the streams `residual`, after its
@@ -1103,50 +1399,28 @@ impl BlockSublayers<'_> {
     pub(crate) fn ngram<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
-        parts: Option<NGramParts<'e, G>>,
+        entries: Option<NGramEntries<'e, G>>,
         block: &mut BlockState,
         residual: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<(WorkflowTensor, Option<NGramStepPorts>), GraphError> {
-        let Self {
-            paired,
-            load,
-            geometry,
-            state,
-            block_index,
-            rows,
-            slots,
-            ..
-        } = *self;
-        let (sublayer, (entries, binding)) = match (paired.ngram, parts) {
-            (None, None) => return Ok((residual, None)),
-            (Some(sublayer), Some(parts)) => (sublayer, parts),
+        let (topology, numbers, entries) = match (&self.topology.ngram, &self.numbers.ngram, entries) {
+            (None, None, None) => return Ok((residual, None)),
+            (Some(topology), Some(numbers), Some(entries)) => (topology, numbers, entries),
             _ => return Err("target block n-gram input and its kernel entries disagree".into()),
         };
-        let component_index = bank_component_index(&geometry.blocks, block_index)
-            .map_err(|error| error.to_string())?
-            + paired.mixer.bank_components();
         let (streams, ports) = ngram_graph(
             graph,
             entries,
-            state,
-            load,
-            self.scope(2)?,
+            topology,
+            numbers,
+            self.weights,
+            self.scope(2),
             weights,
             constants,
             &residual,
             block.bank.as_ref().map(|bank| &bank.controls),
-            NGramBlock {
-                rows,
-                slots,
-                slab_banks: state.target_state().bank_slab_banks()?,
-                binding,
-                hash: &sublayer.op.hash,
-                epsilon: sublayer.op.epsilon as f32,
-                component_index,
-                controls: self.controls(),
-            },
         )?;
         let NGramPorts { bank, step, controls } = ports;
         block.join_ngram(bank, controls)?;
@@ -1175,11 +1449,11 @@ pub(crate) fn feed_forward_class_slice(
     };
     if let Some((shape, entries, combine)) = grouped {
         if !routed_graph::decodes(rows) {
-            let blocks = routed_graph::grouped_blocks(rows, shape.experts, shape.selected)?;
+            let blocks = routed_graph::grouped_blocks(rows, shape.experts, shape.selected)?.fixed();
             for entry in entries {
                 slice = slice.scoped(entry, "B", [blocks]);
             }
-            let blocks = routed_graph::grouped_blocks(grouped_rows, shape.experts, shape.selected)?;
+            let blocks = routed_graph::grouped_blocks(grouped_rows, shape.experts, shape.selected)?.fixed();
             slice = slice.scoped(combine, "B", [blocks]);
         }
     }

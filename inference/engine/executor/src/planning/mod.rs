@@ -12,7 +12,7 @@ mod imports;
 pub(crate) use imports::{ImportBacking, ImportPlan};
 mod programs;
 mod prices;
-pub use prices::{PlanPrices, PlanSteps, Unmeasured};
+pub use prices::{PlanPrices, PlanSteps};
 pub(crate) use prices::{BankPrices, Prior};
 mod prompt_room;
 pub(crate) use prompt_room::{grouped, pass_ladder, pass_rows_curve, places_curve, routed_group_seconds, routed_prompt_seconds};
@@ -42,7 +42,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldBound, HeldCharge, HeldCharges, NoBank, Placed, Unplaced, WeightBound, WholeFit, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
+    BackendPlan, BankForm, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FloorForms, HeldForm, HeldBound, HeldCharge, NoBank, Placed, Unplaced, WeightBound, WholeFit, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
     ResolvedPolicy,
 };
 pub use programs::{
@@ -59,6 +59,7 @@ pub use resources::{
     max_image_cells, reads_decoded_history,
 };
 pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions};
+pub(crate) use weights::{AttentionForm, AttentionWidths, GateForm, RoundingArguments, RoundingWords, SeparateGate, axis};
 pub use weights::{
     AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
     DenseBinding, DenseBranchBinding, DenseScales,

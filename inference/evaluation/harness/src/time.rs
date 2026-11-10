@@ -33,9 +33,9 @@
 //! does, and records the last timed sample's groups against their bar
 //! ([`prompt_groups`]).
 
-use crate::rest::{BankRest, STEADY_ATTEMPTS, warm_to_rest};
+use crate::rest::{BankRest, STEADY_ATTEMPTS, decode_context_rows, steady_window};
 use crate::artifacts::Artifacts;
-use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
+use crate::engine::{self, Checkpoint, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
 use crate::fixture::FixtureSet;
 use crate::render::{Rendered, Renderer};
 use crate::steps::{self, attribution, device_end, median, medians, summary, window};
@@ -113,7 +113,7 @@ pub fn run(
         &Load {
             drafter: false,
             proposals: None,
-            context_tokens: longest + time.warm + time.steps + time.attribution_steps + 1,
+            context_tokens: longest + decode_context_rows(time.warm, time.steps, time.attribution_steps),
             // A cell's sequences are held together.
             sequences: std::num::NonZeroUsize::new(widest).expect("a concurrency is positive"),
             decode_rows: widest,
@@ -439,10 +439,11 @@ impl Ceilings {
     }
 }
 
-/// Measure `requests` on `device` in this process, as the measurement job
-/// measures them (`assessment::requests::measure`), each walk given its job
-/// time (`worker::measure::JobTime`), into `store`, until no point is left
-/// expired: the harness is a tool, which may measure in its own process.
+/// Measure `requests` (a load's) on `device` in this process, as the
+/// measurement job measures them (`assessment::requests::measure`), each
+/// walk given its job time (`worker::measure::JobTime`), into `store`,
+/// until no point is left expired: the harness is a tool, which may
+/// measure in its own process.
 /// Why the walks could not run, or stopped before measuring the rest.
 fn measure_requested(
     device: &seismic::Device,
@@ -455,13 +456,13 @@ fn measure_requested(
     let mut time = JobTime::default();
     loop {
         let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-        let deadline = std::time::Instant::now() + time.given();
+        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), time.given());
         let (mut measured, mut failed, mut expired) = (false, false, false);
         let walked = requests::measure(
             &mut measurer,
             device,
             store,
-            requests,
+            &magnitude_executor::assessment::Outstanding { standing: Vec::new(), loads: requests.to_vec() },
             deadline,
             &mut |_| seismic::measure::Attempt::Proceed,
             &mut |_, outcome| match outcome {
@@ -901,11 +902,20 @@ fn overlap(
     }))
 }
 
+/// A cell's decode as [`measure`] runs it: its sequences, each's state at
+/// its history, and the routing of every step before its window.
+struct Decoding<'a> {
+    engine: &'a mut Engine,
+    sequences: &'a mut Vec<Sequence>,
+    checkpoints: Vec<Checkpoint>,
+    warm_expert_steps: Vec<Value>,
+}
+
 /// Measure `time.steps` steps made by `make` after `time.warm`, traced per
 /// submission, then attribute `time.attribution_steps` more by entry.
 fn measure(
     engine: &mut Engine,
-    sequences: &mut [Sequence],
+    sequences: &mut Vec<Sequence>,
     time: &TimeOptions,
     make: &dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>,
 ) -> Result<Value, String> {
@@ -934,151 +944,156 @@ fn measure(
     // What the bank holds as decode begins: where a replay of its routing
     // starts.
     let held = engine.domain.experts_held();
-    let mut warm_expert_steps = Vec::new();
+    // The decode as it begins, each sequence at its history: where a
+    // discarded attempt's decode begins again.
+    let checkpoints = sequences.iter().map(|sequence| engine.checkpoint(sequence)).collect::<Result<Vec<_>, _>>()?;
+    let mut decode = Decoding { engine, sequences, checkpoints, warm_expert_steps: Vec::new() };
     // The window is one span the bank rests across (`BankRest`): warm
-    // steps, then more until one runs at rest, then the window; a window
-    // any step of which the bank moved across is discarded, with what moved,
-    // and the decode warms to rest and runs it again. So no tier fill or
-    // resize is timed as decode, and every figure of the window is of one
-    // steady span.
-    let mut discarded = Vec::new();
-    // What the bank moved across the window last discarded: the decode is
-    // warm, and steps on only to rest.
-    let mut unrested = None;
-    let (summaries, mut submissions, phases, span, cpu, threads, throttling, experts, graphs) = loop {
-        warm_to_rest(time.warm, unrested.take(), || {
-            let before = BankRest::filled(engine)?;
-            run(engine, sequences, &trace)?;
-            warm_expert_steps.extend(expert_step_of(engine)?);
-            Ok(BankRest::moved(before, BankRest::of(engine)?))
-        })?;
-        collect(&trace)?;
-        let mut summaries = Vec::with_capacity(time.steps);
-        let mut previous = None;
-        let mut submissions = Vec::new();
-        // Each measured step's instants on this thread, the next's start
-        // filled in as it begins.
-        let mut phases: Vec<steps::HostPhases> = Vec::with_capacity(time.steps);
-        // The window opens at the end of the first measured step. Collecting
-        // the warm steps' trace waited for everything queued, which under
-        // lookahead includes the first measured step itself: it finished
-        // before any clock here started, so a window opened at its start
-        // would cover one step more than the device ran.
-        let mut span = (f64::NAN, f64::NAN);
-        let mut cpu = (0.0, 0.0);
-        // Each thread kind's processor time, and the quota's throttling, at
-        // the window's start and end.
-        let (mut threads, mut throttling) = (None, None);
-        let (mut threads_end, mut throttling_end) = (None, None);
-        // The load's graphs recorded and updated at the window's start.
-        let mut graphs = engine.graph_replays();
-        // A streamed load's per-layer expert costs at the window's ends.
-        let mut experts = None;
-        let mut moved = None;
-        // The bank after each step is the bank before the next: one reading
-        // a step, and between a step's end and the next's launch nothing
-        // more than the step loop itself does, as served, but for a copy of
-        // the expert costs, which are rendered once the window has closed.
-        let mut rest = BankRest::of(engine)?;
-        let mut expert_costs = Vec::with_capacity(time.steps);
-        // An untimed streamed cell records its window's read timeline
-        // (`seismic_io::timeline`): the warm steps' events dropped.
-        if time.untimed && engine.domain.expert_costs().is_some() {
-            seismic_io::timeline::record();
-            drop(seismic_io::timeline::take());
-        }
-        for index in 0..time.steps {
-            let step = run(engine, sequences, &trace)?;
-            if let Some(last) = phases.last_mut() {
-                last.next = step.start;
+    // steps, then more until one runs at rest, then the window; an attempt
+    // whose window any step the bank moved across is discarded, with what
+    // moved, and the decode begins again from its histories
+    // ([`steady_window`]). So no tier fill or resize is timed as decode,
+    // every figure of the window is of one steady span, and no attempt runs
+    // deeper than the load's context.
+    let ((summaries, mut submissions, phases, span, cpu, threads, throttling, experts, graphs), discarded) = steady_window(
+        &mut decode,
+        time.warm,
+        |decode| {
+            let before = BankRest::filled(decode.engine)?;
+            run(decode.engine, decode.sequences, &trace)?;
+            decode.warm_expert_steps.extend(expert_step_of(decode.engine)?);
+            Ok(BankRest::moved(before, BankRest::of(decode.engine)?))
+        },
+        |decode| {
+            collect(&trace)?;
+            let mut summaries = Vec::with_capacity(time.steps);
+            let mut previous = None;
+            let mut submissions = Vec::new();
+            // Each measured step's instants on this thread, the next's start
+            // filled in as it begins.
+            let mut phases: Vec<steps::HostPhases> = Vec::with_capacity(time.steps);
+            // The window opens at the end of the first measured step. Collecting
+            // the warm steps' trace waited for everything queued, which under
+            // lookahead includes the first measured step itself: it finished
+            // before any clock here started, so a window opened at its start
+            // would cover one step more than the device ran.
+            let mut span = (f64::NAN, f64::NAN);
+            let mut cpu = (0.0, 0.0);
+            // Each thread kind's processor time, and the quota's throttling, at
+            // the window's start and end.
+            let (mut threads, mut throttling) = (None, None);
+            let (mut threads_end, mut throttling_end) = (None, None);
+            // The load's graphs recorded and updated at the window's start.
+            let mut graphs = decode.engine.graph_replays();
+            // A streamed load's per-layer expert costs at the window's ends.
+            let mut experts = None;
+            let mut moved = None;
+            // The bank after each step is the bank before the next: one reading
+            // a step, and between a step's end and the next's launch nothing
+            // more than the step loop itself does, as served, but for a copy of
+            // the expert costs, which are rendered once the window has closed.
+            let mut rest = BankRest::of(decode.engine)?;
+            let mut expert_costs = Vec::with_capacity(time.steps);
+            // An untimed streamed cell records its window's read timeline
+            // (`seismic_io::timeline`): the warm steps' events dropped.
+            if time.untimed && decode.engine.domain.expert_costs().is_some() {
+                seismic_io::timeline::record();
+                drop(seismic_io::timeline::take());
             }
-            phases.push(steps::HostPhases {
-                start: step.start,
-                submitted: step.submitted,
-                finished: step.finished,
-                reconciled: step.reconciled,
-                end: step.end,
-                next: step.end,
-            });
-            let after = BankRest::of(engine)?;
-            if let Some(moves) = BankRest::moved(rest, after) {
-                expert_costs.push((engine.domain.expert_costs(), after.and_then(|after| after.host_slots())));
-                moved = Some((index, moves));
-                break;
-            }
-            rest = after;
-            if index == 0 {
-                span.0 = step.end;
-                cpu.0 = process_cpu_seconds();
-                threads = thread_cpu_seconds();
-                throttling = throttled();
-                graphs = engine.graph_replays();
-                experts = engine.domain.expert_costs();
-            }
-            let mut summary = if engine.lookahead {
-                json!({})
-            } else {
-                let summary = summary(&step, previous)?;
-                previous = Some(device_end(&step));
-                summary
-            };
-            // The step's time, the one every figure of the cell takes
-            // ([`step_intervals`]): from the end of the step before it, as
-            // steps complete one after another.
-            if index > 0 {
-                summary["interval_ms"] = json!((step.end - span.1) * MS);
-            }
-            // The domain's host timing of the step (`TargetHostTiming`): its
-            // launch to its first commit, the previous selection read to
-            // that commit (none or zero for a step queued before it), and
-            // its finish.
-            if let Some(timing) = engine.domain.target_timing() {
-                summary["target_launch_ms"] = json!(timing.launch.as_secs_f64() * MS);
-                summary["target_finish_ms"] = json!(timing.finish.as_secs_f64() * MS);
-                summary["target_selection_to_commit_ms"] =
-                    json!(timing.selection_to_commit.map(|gap| gap.as_secs_f64() * MS));
-            }
-            span.1 = step.end;
-            // The window's end, read together where the process time always
-            // was: nothing run after the last step (an attribution's steps)
-            // counts in its figures.
-            if index + 1 == time.steps {
-                cpu.1 = process_cpu_seconds();
-                threads_end = thread_cpu_seconds();
-                throttling_end = throttled();
-            }
-            expert_costs.push((engine.domain.expert_costs(), rest.and_then(|rest| rest.host_slots())));
-            summaries.push(summary);
-            submissions.extend(step.submissions);
-        }
-        let threads = threads.zip(threads_end);
-        let throttling = throttling.zip(throttling_end);
-        let expert_steps = expert_costs
-            .into_iter()
-            .map(|(costs, host_slots)| expert_step(costs, host_slots))
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some((step, moves)) = moved else {
-            for (summary, expert_step) in summaries.iter_mut().zip(expert_steps) {
-                if let Some(expert_step) = expert_step {
-                    summary["expert_step"] = expert_step;
+            for index in 0..time.steps {
+                let step = run(decode.engine, decode.sequences, &trace)?;
+                if let Some(last) = phases.last_mut() {
+                    last.next = step.start;
                 }
+                phases.push(steps::HostPhases {
+                    start: step.start,
+                    submitted: step.submitted,
+                    finished: step.finished,
+                    reconciled: step.reconciled,
+                    end: step.end,
+                    next: step.end,
+                });
+                let after = BankRest::of(decode.engine)?;
+                if let Some(moves) = BankRest::moved(rest, after) {
+                    expert_costs.push((decode.engine.domain.expert_costs(), after.and_then(|after| after.host_slots())));
+                    moved = Some((index, moves));
+                    break;
+                }
+                rest = after;
+                if index == 0 {
+                    span.0 = step.end;
+                    cpu.0 = process_cpu_seconds();
+                    threads = thread_cpu_seconds();
+                    throttling = throttled();
+                    graphs = decode.engine.graph_replays();
+                    experts = decode.engine.domain.expert_costs();
+                }
+                let mut summary = if decode.engine.lookahead {
+                    json!({})
+                } else {
+                    let summary = summary(&step, previous)?;
+                    previous = Some(device_end(&step));
+                    summary
+                };
+                // The step's time, the one every figure of the cell takes
+                // ([`step_intervals`]): from the end of the step before it, as
+                // steps complete one after another.
+                if index > 0 {
+                    summary["interval_ms"] = json!((step.end - span.1) * MS);
+                }
+                // The domain's host timing of the step (`TargetHostTiming`): its
+                // launch to its first commit, the previous selection read to
+                // that commit (none or zero for a step queued before it), and
+                // its finish.
+                if let Some(timing) = decode.engine.domain.target_timing() {
+                    summary["target_launch_ms"] = json!(timing.launch.as_secs_f64() * MS);
+                    summary["target_finish_ms"] = json!(timing.finish.as_secs_f64() * MS);
+                    summary["target_selection_to_commit_ms"] =
+                        json!(timing.selection_to_commit.map(|gap| gap.as_secs_f64() * MS));
+                }
+                span.1 = step.end;
+                // The window's end, read together where the process time always
+                // was: nothing run after the last step (an attribution's steps)
+                // counts in its figures.
+                if index + 1 == time.steps {
+                    cpu.1 = process_cpu_seconds();
+                    threads_end = thread_cpu_seconds();
+                    throttling_end = throttled();
+                }
+                expert_costs.push((decode.engine.domain.expert_costs(), rest.and_then(|rest| rest.host_slots())));
+                summaries.push(summary);
+                submissions.extend(step.submissions);
             }
-            break (summaries, submissions, phases, span, cpu, threads, throttling, experts, graphs);
-        };
-        // The discarded window's work is collected and dropped, but for its
-        // steps' routing, which a replay of the decode runs through.
-        warm_expert_steps.extend(expert_steps.into_iter().flatten());
-        collect(&trace)?;
-        discarded.push(json!({ "step": step, "moved": moves }));
-        unrested = Some(moves);
-        if discarded.len() == STEADY_ATTEMPTS {
-            return Err(format!(
-                "no decode window of {} steps ran with the expert bank at rest in {STEADY_ATTEMPTS}: {}",
-                time.steps,
-                Value::from(discarded)
-            ));
-        }
-    };
+            let threads = threads.zip(threads_end);
+            let throttling = throttling.zip(throttling_end);
+            let expert_steps = expert_costs
+                .into_iter()
+                .map(|(costs, host_slots)| expert_step(costs, host_slots))
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some((step, moves)) = moved else {
+                for (summary, expert_step) in summaries.iter_mut().zip(expert_steps) {
+                    if let Some(expert_step) = expert_step {
+                        summary["expert_step"] = expert_step;
+                    }
+                }
+                return Ok(Ok((summaries, submissions, phases, span, cpu, threads, throttling, experts, graphs)));
+            };
+            // The discarded window's work is collected and dropped, but for
+            // its steps' routing, which a replay of the decode runs through.
+            decode.warm_expert_steps.extend(expert_steps.into_iter().flatten());
+            collect(&trace)?;
+            Ok(Err(json!({ "step": step, "moved": moves })))
+        },
+        |decode| {
+            for sequence in std::mem::take(decode.sequences) {
+                decode.engine.close(sequence)?;
+            }
+            *decode.sequences = decode.checkpoints.iter().map(|checkpoint| decode.engine.open_from(checkpoint)).collect::<Result<_, _>>()?;
+            selected.borrow_mut().clear();
+            Ok(())
+        },
+    )?;
+    let Decoding { engine, sequences, warm_expert_steps, .. } = decode;
     submissions.extend(collect(&trace)?);
     drop(trace);
     let read_timeline = seismic_io::timeline::recording().then(|| {
@@ -2102,7 +2117,7 @@ fn estimated(
         measurements,
         prepared,
     } = assessment;
-    let PreparedModelAssessment::Planned { facts, draft, execution, .. } = prepared else {
+    let PreparedModelAssessment::Planned { facts, execution, .. } = prepared else {
         return Err(unavailable("the model is unsupported here"));
     };
     let Measurements::Measured { costs: machine, streamed, .. } = measurements else {
@@ -2127,11 +2142,11 @@ fn estimated(
     let host = window_host_slots(cell)?;
     // The bank the plan streams its experts through, whose slots are priced
     // at each count: none where the plan holds them whole.
-    let bank = draft.load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
+    let bank = execution.draft().load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
         let held = magnitude_executor::assessment::HeldSlots { slots, host };
-        let performance = streamed_estimate(machine, figures, execution, draft, bank, &request, held)
+        let performance = streamed_estimate(machine, figures, execution, bank, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {
             return Err(unavailable(format!("at {slots} slots: {performance:?}")));
@@ -2150,7 +2165,7 @@ fn estimated(
             .ok_or("the window's mean step")?;
     // The resident step as the estimate prices it: at the request's rows and
     // the context.
-    let pricing = decode_pricing(draft, machine);
+    let pricing = decode_pricing(execution.draft(), machine);
     let resident = step_seconds(execution.demand(), &pricing, u64::from(request.sequences), context)
         .map_err(|error| error.to_string())?
         .total();

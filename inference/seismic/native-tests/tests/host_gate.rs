@@ -43,7 +43,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 1.0,
+                    factor: seismic::Argument::from(1.0),
                 },
             )
             .unwrap()
@@ -55,7 +55,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -147,7 +147,7 @@ fn an_open_gate_lets_the_run_through() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 3.0,
+                    factor: seismic::Argument::from(3.0),
                 },
             )
             .unwrap()
@@ -195,7 +195,7 @@ fn a_run_binds_every_timeline_node() {
             &kernel,
             scale_rows::WorkflowArgs {
                 x: input.tensor().into(),
-                factor: 1.0,
+                factor: seismic::Argument::from(1.0),
             },
         )
         .unwrap()
@@ -237,7 +237,7 @@ fn timeline_nodes_are_in_the_planned_host_heap() {
             &kernel,
             scale_rows::WorkflowArgs {
                 x: input.tensor().into(),
-                factor: 1.0,
+                factor: seismic::Argument::from(1.0),
             },
         )
         .unwrap()
@@ -248,7 +248,7 @@ fn timeline_nodes_are_in_the_planned_host_heap() {
             &[("M", 1), ("N", 4)],
             scale_rows::WorkflowArgs {
                 x: planned_input.tensor().into(),
-                factor: 1.0,
+                factor: seismic::Argument::from(1.0),
             },
         )
         .unwrap()

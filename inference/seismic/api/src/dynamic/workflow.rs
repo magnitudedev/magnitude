@@ -323,6 +323,7 @@ fn encode_workflow(
                     out.push_result_tensor_view(
                         result,
                         vec![runtime::ViewOperation::LeadingSlice { start, end }],
+                        None,
                     )
                 } else {
                     out.push_result_tensor(result)

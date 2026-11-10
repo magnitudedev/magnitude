@@ -5,11 +5,12 @@
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
 use crate::native::{PostNormKernels, SublayerOutput};
+use crate::programs::graph::facts::Numbers;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_target_graph::{PackedWeight, WeightOperands};
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
-    Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
+    Argument, Dim, Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
     WorkflowTensorRef,
 };
 
@@ -53,6 +54,7 @@ impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>>
 
 /// Entry element assignments of a post-norm tail from the program binding:
 /// the output projection's weight and activation elements, and the norm's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedPostNormEntries {
     project: [(&'static str, Element); 3],
     residual: [(&'static str, Element); 1],
@@ -77,10 +79,11 @@ impl CheckedPostNormEntries {
 /// One post-norm tail over `source` (`[rows, K]` activation rows) with the
 /// `[N, K]` output projection `weight` (and its accumulator-scale port):
 /// the `out_rows` rows of `residual`
-/// plus the normalized projection, times `scale` (1, or the layer's output
-/// scale of `OutputForm::ScaledPostNorm`), as `[out, N]` F32 rows.
+/// plus the normalized projection under `post_norm`'s epsilon, times its
+/// scale (1, or the layer's output scale of `OutputForm::ScaledPostNorm`),
+/// as `[out, N]` F32 rows.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
+pub(crate) fn post_norm<'a, G: GraphDraft + 'a, D: Into<Dim>>(
     graph: &mut G,
     entries: PostNormEntries<'a, G>,
     residual: &WorkflowTensor,
@@ -88,9 +91,8 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     weight: &PackedWeight,
     norm: &WorkflowTensor,
     out_rows: &WorkflowTensor,
-    shape: PostNormShape,
-    epsilon: f32,
-    scale: f32,
+    shape: PostNormShape<D>,
+    post_norm: &PostNorm,
 ) -> Result<WorkflowTensor, GraphError> {
     let PostNormShape {
         rows,
@@ -98,6 +100,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
         inputs,
         outputs,
     } = shape;
+    let [rows, out, inputs, outputs] = [rows, out, inputs, outputs].map(Into::<Dim>::into);
     let PackedWeight {
         weight,
         operands:
@@ -110,12 +113,12 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
         .enqueue(
             entries.project,
             &[
-                ("M", out),
-                ("G", 1),
-                ("K", inputs),
-                ("N", outputs),
-                ("WS", weight_scale.extent),
-                ("WB", weight_bound.extent),
+                ("M", &out),
+                ("G", &Dim::from(1)),
+                ("K", &inputs),
+                ("N", &outputs),
+                ("WS", &weight_scale.extent),
+                ("WB", &weight_bound.extent),
             ],
             project_rows::WorkflowArgs {
                 source,
@@ -128,27 +131,44 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     Ok(graph
         .enqueue(
             entries.residual,
-            &[("M", rows), ("O", out), ("D", outputs)],
+            &[("M", &rows), ("O", &out), ("D", &outputs)],
             post_norm_residual::WorkflowArgs {
                 residual: residual.into(),
                 projected: (&projected).into(),
                 norm: norm.into(),
                 out_rows: out_rows.into(),
-                epsilon,
-                scale,
+                epsilon: post_norm.epsilon.f32(),
+                scale: post_norm.scale.f32(),
             },
         )?
         .value)
 }
 
+/// A post-norm tail's reals: its norm's epsilon and its output scale (1,
+/// or the layer's output scale). A sublayer without a post-norm tail has
+/// none (`Option<PostNorm>`). Its reals `R`: the model's (`f64`), a key's
+/// (`RealIndex`), or its builder's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PostNorm<R = Argument<f64>> {
+    pub epsilon: R,
+    pub scale: R,
+}
+
+impl<R> Numbers<R> for PostNorm<R> {
+    type Of<E> = PostNorm<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> PostNorm<E> {
+        PostNorm { epsilon: f(self.epsilon), scale: f(self.scale) }
+    }
+}
+
 /// The extents of one post-norm tail: residual rows, output rows (the rows
 /// `source` holds), and the projection's input and output widths.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PostNormShape {
-    pub rows: u64,
-    pub out: u64,
-    pub inputs: u64,
-    pub outputs: u64,
+pub(crate) struct PostNormShape<D = Dim> {
+    pub rows: D,
+    pub out: D,
+    pub inputs: D,
+    pub outputs: D,
 }
 
 #[cfg(test)]

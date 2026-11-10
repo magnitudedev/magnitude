@@ -1,15 +1,388 @@
 use crate::{
     ModelLoadPlan,
+    planning::BankPart,
     programs::{
-        graph::{GraphError, draft::GraphDraft},
+        graph::{
+            GraphError,
+            draft::GraphDraft,
+            facts::{Numbers, constant},
+        },
         native_constants::GraphConstant,
     },
 };
-use magnitude_family_contracts::{Decoder, WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{SublayerIndex, Decoder, ProgressiveCodeDepth, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{import_dense, repack_weight, selection_notice, stored_rows};
 use seismic::{
-    Element, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
+    Dim, Element, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
 };
+
+/// How a load holds a planned weight's values, as its graphs read them
+/// (`crate::planning::Holding`): topology, never a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ViewHolding {
+    /// Every value, imported at load.
+    Whole,
+    /// A streamed gathered table, its slots filled as `StreamedFill` says.
+    Streamed(StreamedFill),
+    /// A routed expert stack in the load's expert bank.
+    Banked,
+}
+
+/// How a streamed table's slots are filled (`crate::TableFill`): by the
+/// host as stored records, or imported, with landing slots for a read of
+/// selected rows (`lands`) or without.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum StreamedFill {
+    Stored,
+    Imported { lands: bool },
+}
+
+/// What a graph reads of one planned weight (`WeightPlan`): its
+/// representation and holding as topology, its extents as numbers. The one
+/// route from a load's weights to its graphs ([`PlannedWeights`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WeightView<D = Dim> {
+    pub role: WeightRole,
+    /// The representation its import reads (`WeightPlan::upload`).
+    pub upload: Element,
+    pub resident: Element,
+    pub holding: ViewHolding,
+    /// The source code depth a progressive placement retains.
+    pub progressive: Option<ProgressiveCodeDepth>,
+    /// Its resident shape: a streamed table's slots', a banked stack's
+    /// group's records'.
+    pub shape: Vec<D>,
+    /// Its second-level scale's resident extent `S` (`WeightScalePlan`), of
+    /// a weight with one: 1 for a matrix, its matrices for a stack.
+    pub scale: Option<D>,
+    /// Its packing bound's extent `B`, of a weight with one.
+    pub bound: Option<D>,
+    /// The shape `[R, F]` of a streamed table's directory; `[0, 1]` of a
+    /// weight held otherwise (`WeightPlan::directory_shape`).
+    pub directory: [D; 2],
+    /// A banked stack's layer's experts: its home records' `E`.
+    pub home: Option<D>,
+}
+
+impl WeightView<u64> {
+    /// The view of `load`'s planned weight of `role`.
+    pub(crate) fn planned(load: &ModelLoadPlan, role: WeightRole) -> Result<Self, GraphError> {
+        let plan = load
+            .weights()
+            .find(|plan| plan.role == role)
+            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
+        Ok(Self::of(load, plan))
+    }
+
+    /// The view of `plan`, a weight of `load`.
+    pub(crate) fn of(load: &ModelLoadPlan, plan: &crate::WeightPlan) -> Self {
+        let holding = match plan.holding {
+            crate::Holding::Whole => ViewHolding::Whole,
+            crate::Holding::Streamed(streamed) => ViewHolding::Streamed(match streamed.fill {
+                crate::planning::TableFill::Stored => StreamedFill::Stored,
+                crate::planning::TableFill::Imported(_) => StreamedFill::Imported { lands: plan.lands_selected_rows() },
+            }),
+            crate::Holding::Banked { .. } => ViewHolding::Banked,
+        };
+        let home = plan
+            .banked()
+            .and(load.expert_bank())
+            .and_then(|bank| bank.layer(plan.role.scope))
+            .map(|(_, layer)| layer.experts);
+        Self {
+            role: plan.role,
+            upload: plan.upload,
+            resident: plan.resident,
+            holding,
+            progressive: plan.progressive_depth(),
+            shape: plan.shape.clone(),
+            scale: plan.scale.as_ref().map(|scale| scale.extent),
+            bound: (plan.bound != 0).then_some(plan.bound),
+            directory: plan.directory_shape(),
+            home,
+        }
+    }
+}
+
+impl<D> Numbers<D> for WeightView<D> {
+    type Of<E> = WeightView<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> WeightView<E> {
+        WeightView {
+            role: self.role,
+            upload: self.upload,
+            resident: self.resident,
+            holding: self.holding,
+            progressive: self.progressive,
+            shape: self.shape.map(&mut *f),
+            scale: self.scale.map(&mut *f),
+            bound: self.bound.map(&mut *f),
+            directory: self.directory.map(&mut *f),
+            home: self.home.map(&mut *f),
+        }
+    }
+}
+
+impl<D> WeightView<D> {
+    /// Whether a read of rows the device selected from its table is landed:
+    /// a table held whole is read as it is, an imported streamed table only
+    /// through its landing slots.
+    pub(crate) fn reads_landed(&self) -> Result<bool, GraphError> {
+        match self.holding {
+            ViewHolding::Whole | ViewHolding::Banked => Ok(false),
+            ViewHolding::Streamed(StreamedFill::Imported { lands: true }) => Ok(true),
+            ViewHolding::Streamed(StreamedFill::Stored | StreamedFill::Imported { lands: false }) => Err(format!(
+                "planned weight {:?} has no landing slots for a read of selected rows",
+                self.role
+            )
+            .into()),
+        }
+    }
+}
+
+impl WeightView {
+    /// A gathered table's rows as its readers address them (`V`): a
+    /// streamed table's slots (`WeightPlan::table_slots`), else its first
+    /// extent.
+    fn table_rows(&self) -> Result<Dim, GraphError> {
+        let rows = match self.holding {
+            ViewHolding::Streamed(_) => self.shape.split_last().map(|(_, slots)| {
+                slots.iter().fold(Dim::from(1), |product, extent| &product * extent)
+            }),
+            ViewHolding::Whole | ViewHolding::Banked => self.shape.first().cloned(),
+        };
+        Ok(rows.ok_or_else(|| format!("planned weight {:?} is no table of rows", self.role))?)
+    }
+}
+
+/// The element and extents of one part of a streamed routed layer's bank
+/// (`ExpertBankPlan::part_shape`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BankPartView<D = Dim> {
+    pub scope: WeightScope,
+    pub part: BankPart,
+    pub element: Element,
+    pub extents: Vec<D>,
+}
+
+impl<D> Numbers<D> for BankPartView<D> {
+    type Of<E> = BankPartView<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> BankPartView<E> {
+        BankPartView { scope: self.scope, part: self.part, element: self.element, extents: self.extents.map(f) }
+    }
+}
+
+/// A load's weights as a graph builder reads them: the load itself, its
+/// numbers constants, or a recording's [`GraphWeights`], its numbers facts.
+/// Every weight helper of the graphs reads weights through it and nothing
+/// else of the load.
+pub(crate) trait PlannedWeights: PlannedBank {
+    /// The view of the planned weight of `role`.
+    fn weight(&self, role: WeightRole) -> Result<WeightView, GraphError>;
+}
+
+/// A load's expert bank as a graph builder reads its parts: the bank itself,
+/// the load's, or a recording's [`GraphWeights`].
+pub(crate) trait PlannedBank {
+    /// Part `part` of the bank of the streamed routed layer of `scope`.
+    fn bank_part(&self, scope: WeightScope, part: BankPart) -> Result<BankPartView, GraphError>;
+}
+
+impl PlannedBank for crate::ExpertBankPlan {
+    fn bank_part(&self, scope: WeightScope, part: BankPart) -> Result<BankPartView, GraphError> {
+        Ok(constant(bank_part_view(self, scope, part)?))
+    }
+}
+
+impl PlannedWeights for ModelLoadPlan {
+    fn weight(&self, role: WeightRole) -> Result<WeightView, GraphError> {
+        Ok(constant(WeightView::planned(self, role)?))
+    }
+}
+
+impl PlannedBank for ModelLoadPlan {
+    fn bank_part(&self, scope: WeightScope, part: BankPart) -> Result<BankPartView, GraphError> {
+        let bank = self.expert_bank().ok_or_else(|| format!("{scope:?} has no expert bank"))?;
+        bank.bank_part(scope, part)
+    }
+}
+
+fn bank_part_view(
+    bank: &crate::ExpertBankPlan,
+    scope: WeightScope,
+    part: BankPart,
+) -> Result<BankPartView<u64>, GraphError> {
+    let (layer, _) = bank
+        .layer(scope)
+        .ok_or_else(|| format!("{scope:?} is not a streamed routed layer"))?;
+    let (element, extents) = bank.part_shape(layer, part)?;
+    Ok(BankPartView { scope, part, element, extents })
+}
+
+/// The weights a recorded graph reads, split from a load
+/// ([`GraphWeights::of`], [`GraphWeights::of_block`]): what its key holds (with [`FactIndex`]
+/// numbers) and what its recorder reads ([`Dim`] numbers).
+///
+/// [`FactIndex`]: crate::programs::graph::facts::FactIndex
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GraphWeights<D = Dim> {
+    weights: Vec<WeightView<D>>,
+    banks: Vec<BankPartView<D>>,
+}
+
+impl GraphWeights<u64> {
+    /// The weights of `load` whose roles `reads` selects: every weight a
+    /// graph's builder may read, and no bank part. A weight the builder
+    /// reads beyond them is missing from its recording, which fails as the
+    /// load would without it.
+    pub(crate) fn of(load: &ModelLoadPlan, reads: impl Fn(WeightRole) -> bool) -> Self {
+        Self {
+            weights: load.weights().filter(|plan| reads(plan.role)).map(|plan| WeightView::of(load, plan)).collect(),
+            banks: Vec::new(),
+        }
+    }
+
+    /// What a graph of target block `block` may read: its sublayers'
+    /// weights, with the target's own of the exit block (`exit`), and every
+    /// part of its streamed layers' banks, with the weights and policy of
+    /// each layer they lead to (`ExpertBankPlan::lead_layer`).
+    pub(crate) fn of_block(load: &ModelLoadPlan, block: u32, exit: bool) -> Result<Self, GraphError> {
+        let own = |scope: WeightScope| match scope {
+            WeightScope::TargetSublayer(index) | WeightScope::TargetBranch { sublayer: index, .. } => {
+                index.block == block
+            }
+            WeightScope::Target => exit,
+            _ => false,
+        };
+        // Its streamed layers, and the layers their hint leads predict,
+        // whose hinted weights and policy they bind.
+        let mut banks = Vec::new();
+        let mut leads = Vec::new();
+        if let Some(bank) = load.expert_bank() {
+            for index in 0..bank.layers().len() {
+                let scope = bank.layers()[index].scope;
+                if !own(scope) {
+                    continue;
+                }
+                banks.extend(
+                    bank.held_parts(index)?
+                        .into_iter()
+                        .map(|(part, element, extents)| BankPartView { scope, part, element, extents }),
+                );
+                for lead in 0..crate::planning::HINT_LEADS as usize {
+                    let next = bank.layers()[bank.lead_layer(index, lead)].scope;
+                    if !leads.contains(&next) {
+                        leads.push(next);
+                        if !own(next) {
+                            banks.push(bank_part_view(bank, next, BankPart::Policy)?);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self { banks, ..Self::of(load, |role| own(role.scope) || leads.contains(&role.scope)) })
+    }
+}
+
+/// The weights of `load` as a graph of target block `block` reads them:
+/// every scope relative to the block (`relative_scope`), as its key holds
+/// them, resolved to the block's own.
+pub(crate) struct BlockWeights<'l> {
+    pub load: &'l ModelLoadPlan,
+    pub block: u32,
+}
+
+impl PlannedWeights for BlockWeights<'_> {
+    fn weight(&self, role: WeightRole) -> Result<WeightView, GraphError> {
+        self.load.weight(WeightRole { scope: absolute_scope(role.scope, self.block), ..role })
+    }
+}
+
+impl PlannedBank for BlockWeights<'_> {
+    fn bank_part(&self, scope: WeightScope, part: BankPart) -> Result<BankPartView, GraphError> {
+        self.load.bank_part(absolute_scope(scope, self.block), part)
+    }
+}
+
+/// The scope a scope relative to target block `block` names
+/// (`relative_scope`'s inverse).
+pub(crate) fn absolute_scope(scope: WeightScope, block: u32) -> WeightScope {
+    relative_scope(scope, block.wrapping_neg())
+}
+
+/// `scope` relative to the target block of `base` (`relative_scope`): what
+/// a streamed layer of `base` names of another layer.
+pub(crate) fn relative_scope_of(scope: WeightScope, base: WeightScope) -> WeightScope {
+    match base {
+        WeightScope::TargetSublayer(index) | WeightScope::TargetBranch { sublayer: index, .. } => {
+            relative_scope(scope, index.block)
+        }
+        _ => scope,
+    }
+}
+
+/// `scope` relative to target block `block`: block `block + k`'s as block
+/// `k` (wrapping), any other as it is. A block graph names what it reads
+/// so, the block itself block 0, so blocks of one topology at any index
+/// share its traces and its prepared graph (`block_scope`).
+pub(crate) fn relative_scope(scope: WeightScope, block: u32) -> WeightScope {
+    let relative = |index: SublayerIndex| SublayerIndex { block: index.block.wrapping_sub(block), ..index };
+    match scope {
+        WeightScope::TargetSublayer(index) => WeightScope::TargetSublayer(relative(index)),
+        WeightScope::TargetBranch { sublayer, branch } => WeightScope::TargetBranch { sublayer: relative(sublayer), branch },
+        scope => scope,
+    }
+}
+
+impl<D> GraphWeights<D> {
+    /// Its scopes relative to target block `block` (`relative_scope`).
+    pub(crate) fn relative_to(self, block: u32) -> Self {
+        Self {
+            weights: self
+                .weights
+                .into_iter()
+                .map(|view| WeightView {
+                    role: WeightRole { scope: relative_scope(view.role.scope, block), ..view.role },
+                    ..view
+                })
+                .collect(),
+            banks: self
+                .banks
+                .into_iter()
+                .map(|part| BankPartView { scope: relative_scope(part.scope, block), ..part })
+                .collect(),
+        }
+    }
+}
+
+impl<D> Numbers<D> for GraphWeights<D> {
+    type Of<E> = GraphWeights<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> GraphWeights<E> {
+        GraphWeights {
+            weights: self.weights.into_iter().map(|view| view.map(&mut *f)).collect(),
+            banks: self.banks.into_iter().map(|part| part.map(&mut *f)).collect(),
+        }
+    }
+}
+
+impl PlannedWeights for GraphWeights {
+    fn weight(&self, role: WeightRole) -> Result<WeightView, GraphError> {
+        self.weights
+            .iter()
+            .find(|view| view.role == role)
+            .cloned()
+            .ok_or_else(|| format!("missing planned weight {role:?}").into())
+    }
+}
+
+impl PlannedBank for GraphWeights {
+    fn bank_part(&self, scope: WeightScope, part: BankPart) -> Result<BankPartView, GraphError> {
+        self.banks
+            .iter()
+            .find(|view| view.scope == scope && view.part == part)
+            .cloned()
+            .ok_or_else(|| format!("bank part {part:?} of {scope:?} is not among the recorded weights").into())
+    }
+}
 
 /// What a graph's weight port binds of the resident weight of `role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,16 +443,13 @@ pub(crate) struct BankPort {
 /// in the shape the bank allocates it.
 pub(crate) fn bank_port<G: GraphDraft>(
     graph: &mut G,
-    bank: &crate::ExpertBankPlan,
+    bank: &(impl PlannedBank + ?Sized),
     scope: WeightScope,
-    part: crate::planning::BankPart,
+    part: BankPart,
     ports: &mut Vec<(BankPort, NativePort)>,
 ) -> Result<NativePort, GraphError> {
-    let (layer, _) = bank
-        .layer(scope)
-        .ok_or_else(|| format!("{scope:?} is not a streamed routed layer"))?;
-    let (element, extents) = bank.part_shape(layer, part)?;
-    let port = graph.port(element, &extents)?;
+    let view = bank.bank_part(scope, part)?;
+    let port = graph.port(view.element, &view.extents)?;
     ports.push((BankPort { scope, part }, port.clone()));
     Ok(port)
 }
@@ -117,39 +487,34 @@ impl WeightPart {
 /// The port of the planned weight of `role`'s `part`.
 pub(crate) fn weight_port<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     role: WeightRole,
     part: WeightPart,
     ports: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<NativePort, GraphError> {
-    let plan = load
-        .weights()
-        .find(|plan| plan.role == role)
-        .ok_or_else(|| format!("missing planned weight {role:?}"))?;
-    let port = match (part, &plan.scale) {
-        (WeightPart::Values, _) => graph.port(plan.resident, &plan.shape),
-        (WeightPart::Scale, Some(scale)) => graph.port(Element::f32(), &[scale.extent]),
-        (WeightPart::Scale, None) => {
-            return Err(format!("planned weight {role:?} has no second-level scale").into());
-        }
-        (WeightPart::Bound, _) if plan.bound != 0 => graph.port(Element::f32(), &[plan.bound]),
-        (WeightPart::Bound, _) => {
-            return Err(format!("planned weight {role:?} has no packing bound").into());
-        }
-        (WeightPart::Directory, _) => match plan.streamed() {
-            Some(_) => graph.port(Element::i32(), &plan.directory_shape()),
-            None => {
-                return Err(
-                    format!("planned weight {role:?} is held whole and has no directory").into(),
-                );
+    let view = weights.weight(role)?;
+    let port = match part {
+        WeightPart::Values => graph.port(view.resident, &view.shape),
+        WeightPart::Scale => match view.scale {
+            Some(extent) => graph.port(Element::f32(), &[extent]),
+            None => return Err(format!("planned weight {role:?} has no second-level scale").into()),
+        },
+        WeightPart::Bound => match view.bound {
+            Some(extent) => graph.port(Element::f32(), &[extent]),
+            None => return Err(format!("planned weight {role:?} has no packing bound").into()),
+        },
+        WeightPart::Directory => match view.holding {
+            ViewHolding::Streamed(_) => graph.port(Element::i32(), &view.directory),
+            ViewHolding::Whole | ViewHolding::Banked => {
+                return Err(format!("planned weight {role:?} is held whole and has no directory").into());
             }
         },
         // The group's records' shape at its layer's experts.
-        (WeightPart::Home, _) => match (plan.banked(), load.expert_bank().and_then(|bank| bank.layer(role.scope))) {
-            (Some(_), Some((_, layer))) => {
-                graph.port(plan.resident, &[&[layer.experts][..], &plan.shape[1..]].concat())
+        WeightPart::Home => match view.home {
+            Some(experts) => graph.port(view.resident, &[&[experts][..], &view.shape[1..]].concat()),
+            None => {
+                return Err(format!("planned weight {role:?} is no banked stack and has no home records").into());
             }
-            _ => return Err(format!("planned weight {role:?} is no banked stack and has no home records").into()),
         },
     }?;
     ports.push((WeightPort { role, part }, port.clone()));
@@ -163,7 +528,7 @@ pub(crate) fn weight_port<G: GraphDraft>(
 pub(crate) struct RowDirectory {
     pub tensor: WorkflowTensor,
     /// Its entries and their fields: the readers' `R` and `F`.
-    pub shape: [u64; 2],
+    pub shape: [Dim; 2],
 }
 
 impl RowDirectory {
@@ -177,7 +542,7 @@ impl RowDirectory {
         constants.push(directory);
         Ok(Self {
             tensor,
-            shape: [0, 1],
+            shape: [Dim::from(0), Dim::from(1)],
         })
     }
 }
@@ -190,11 +555,11 @@ impl RowDirectory {
 pub(crate) struct GatheredTable {
     pub table: WorkflowTensor,
     /// The rows of `table`: the readers' `V`.
-    pub rows: u64,
+    pub rows: Dim,
     role: WeightRole,
     /// The shape of a streamed table's directory; `[0, 1]` of a table held
     /// whole.
-    directory_shape: [u64; 2],
+    directory_shape: [Dim; 2],
     /// The empty directory, declared by the graph's first read by rows.
     direct: Option<RowDirectory>,
     /// The directory's port, declared by the graph's first read of selected
@@ -206,28 +571,21 @@ impl GatheredTable {
     /// The planned table of `scope` and `kind`.
     pub(crate) fn of<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
         kind: WeightKind,
         ports: &mut Vec<(WeightPort, NativePort)>,
     ) -> Result<Self, GraphError> {
         let role = WeightRole { scope, kind };
-        let plan = load
-            .weights()
-            .find(|plan| plan.role == role)
-            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
-        let rows = match plan.streamed() {
-            Some(_) => plan.table_slots(),
-            None => plan.shape[0],
-        };
-        let table = weight_port(graph, load, role, WeightPart::Values, ports)?
+        let view = weights.weight(role)?;
+        let table = weight_port(graph, weights, role, WeightPart::Values, ports)?
             .tensor()
             .clone();
         Ok(Self {
             table,
-            rows,
+            rows: view.table_rows()?,
             role,
-            directory_shape: plan.directory_shape(),
+            directory_shape: view.directory,
             direct: None,
             directory: None,
         })
@@ -254,20 +612,20 @@ impl GatheredTable {
     fn directory<G: GraphDraft>(
         &mut self,
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         ports: &mut Vec<(WeightPort, NativePort)>,
     ) -> Result<RowDirectory, GraphError> {
         if let Some(directory) = &self.directory {
             return Ok(directory.clone());
         }
-        let tensor = weight_port(graph, load, self.role, WeightPart::Directory, ports)?
+        let tensor = weight_port(graph, weights, self.role, WeightPart::Directory, ports)?
             .tensor()
             .clone();
         Ok(self
             .directory
             .insert(RowDirectory {
                 tensor,
-                shape: self.directory_shape,
+                shape: self.directory_shape.clone(),
             })
             .clone())
     }
@@ -287,45 +645,27 @@ impl GatheredTable {
     pub(crate) fn read_selected<'a, G: GraphDraft + 'a, T>(
         &mut self,
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         landing: Option<LandingEntries<'a, G>>,
         selection: seismic::WorkflowTensorRef<'_>,
-        rows: u64,
+        rows: &Dim,
         class: Option<&'static str>,
         reader: impl FnOnce(&mut G, &RowDirectory) -> Result<T, GraphError>,
     ) -> Result<(T, Option<LandedReadPorts>), GraphError> {
-        let plan = load
-            .weights()
-            .find(|plan| plan.role == self.role)
-            .ok_or_else(|| format!("missing planned weight {:?}", self.role))?;
-        if !reads_landed(plan)? {
+        let view = weights.weight(self.role)?;
+        if !view.reads_landed()? {
             let directory = self.by_rows(graph, constants)?;
             return Ok((reader(graph, &directory)?, None));
         }
         let landing =
             landing.ok_or_else(|| format!("a landed read of {:?} without its entries", self.role))?;
-        let directory = self.directory(graph, load, ports)?;
-        let (value, ports) = landed_read(graph, plan, landing, selection, rows, class, |graph| {
+        let directory = self.directory(graph, weights, ports)?;
+        let (value, ports) = landed_read(graph, &view, landing, selection, rows, class, |graph| {
             reader(graph, &directory)
         })?;
         Ok((value, Some(ports)))
-    }
-}
-
-/// Whether a read of rows the device selected from `plan`'s table is
-/// landed: a table held whole is read as it is, and an imported streamed
-/// table only through its landing slots.
-pub(super) fn reads_landed(plan: &crate::WeightPlan) -> Result<bool, GraphError> {
-    match (plan.streamed().is_some(), plan.lands_selected_rows()) {
-        (false, _) => Ok(false),
-        (true, true) => Ok(true),
-        (true, false) => Err(format!(
-            "planned weight {:?} has no landing slots for a read of selected rows",
-            plan.role
-        )
-        .into()),
     }
 }
 
@@ -339,18 +679,19 @@ pub(super) fn reads_landed(plan: &crate::WeightPlan) -> Result<bool, GraphError>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     graph: &mut G,
-    plan: &crate::WeightPlan,
+    plan: &WeightView,
     landing: LandingEntries<'a, G>,
     selection: seismic::WorkflowTensorRef<'_>,
-    rows: u64,
+    rows: &Dim,
     class: Option<&'static str>,
     reader: impl FnOnce(&mut G) -> Result<T, GraphError>,
 ) -> Result<(T, LandedReadPorts), GraphError> {
-    let port = |graph: &mut G, element, extents: &[u64], axis| match class {
+    let port = |graph: &mut G, element, extents: &[&Dim], axis| match class {
         Some(dimension) => graph.port_with_class_extent(element, extents, axis, dimension),
         None => graph.port(element, extents),
     };
-    let mut notice = port(graph, Element::i32(), &[rows, 2], 0)?;
+    let two = Dim::from(2);
+    let mut notice = port(graph, Element::i32(), &[rows, &two], 0)?;
     graph.enqueue::<selection_notice::Entry>(
         landing.notice,
         &[("M", rows)],
@@ -362,10 +703,11 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     let noticed = graph.timeline(seismic::timeline::Signal);
     let gate = graph.timeline(seismic::timeline::Wait);
     // The import's `[B, N, K]` view of the landing rows.
-    let width = plan.shape[1];
-    let staging = port(graph, plan.upload, &[1, rows, width], 1)?;
-    let landed = port(graph, plan.resident, &[1, rows, width], 1)?;
-    let dimensions = [("B", 1), ("N", rows), ("K", width)];
+    let width = plan.shape.get(1).ok_or_else(|| format!("landed table {:?} is not a matrix", plan.role))?;
+    let one = Dim::from(1);
+    let staging = port(graph, plan.upload, &[&one, rows, width], 1)?;
+    let landed = port(graph, plan.resident, &[&one, rows, width], 1)?;
+    let dimensions = [("B", &one), ("N", rows), ("K", width)];
     let converted = match landing.import {
         LandingImport::Dense(entry) => {
             graph
@@ -396,7 +738,7 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     Ok((
         value,
         LandedReadPorts {
-            rows,
+            rows: rows.clone(),
             notice,
             noticed,
             gate,
@@ -454,20 +796,18 @@ impl<'a> LandingEntries<'a, seismic::NativeGraph> {
 /// The checked entries of the landed reads of the table `role`, for the
 /// metadata graphs that certify a family's storage: `None` of a table
 /// without landing slots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedLandingEntries {
     import: crate::ImportProgramSlot,
     elements: [(&'static str, Element); 2],
 }
 
 impl CheckedLandingEntries {
-    pub(crate) fn of(load: &ModelLoadPlan, role: WeightRole) -> Result<Option<Self>, String> {
-        let plan = load
-            .weights()
-            .find(|plan| plan.role == role)
-            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
-        Ok(plan.lands_selected_rows().then(|| Self {
-            import: crate::ImportProgramSlot::of(plan),
-            elements: [("E", plan.upload), ("U", plan.resident)],
+    pub(crate) fn of(weights: &(impl PlannedWeights + ?Sized), role: WeightRole) -> Result<Option<Self>, GraphError> {
+        let view = weights.weight(role)?;
+        Ok(matches!(view.holding, ViewHolding::Streamed(StreamedFill::Imported { lands: true })).then(|| Self {
+            import: crate::ImportProgramSlot::between(view.upload, view.resident),
+            elements: [("E", view.upload), ("U", view.resident)],
         }))
     }
 
@@ -490,8 +830,9 @@ impl CheckedLandingEntries {
 /// conversion reads and writes (`[1, rows, ..]`), and its read signal.
 #[derive(Clone)]
 pub(crate) struct LandedReadPorts {
-    /// The rows the read names (`DeviceTable::read_selected`).
-    pub rows: u64,
+    /// The rows the read names (`DeviceTable::read_selected`): fixed in a
+    /// prepared graph, which alone is queued.
+    pub rows: Dim,
     pub notice: NativePort,
     pub noticed: NativeTimelinePort<seismic::timeline::Reached>,
     pub gate: NativeTimelinePort<seismic::timeline::Gate>,
@@ -510,7 +851,7 @@ impl LandedReadPorts {
         let read = table
             .device()
             .ok_or("a landed read of a table held whole")?
-            .read_selected(self.rows)?;
+            .read_selected(self.rows.fixed())?;
         self.bind(bindings, &read)?;
         Ok(read)
     }
@@ -561,22 +902,19 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entry: G::Binding<'a, stored_rows::Entry>,
     table: &mut GatheredTable,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     ports: &mut Vec<(WeightPort, NativePort)>,
     rows: &WorkflowTensor,
-    count: u64,
+    count: &Dim,
 ) -> Result<(WorkflowTensor, StoredReadPorts), GraphError> {
-    let plan = load
-        .weights()
-        .find(|plan| plan.role == table.role)
-        .ok_or_else(|| format!("missing planned weight {:?}", table.role))?;
-    if !plan.stored_in_slots() {
+    let view = weights.weight(table.role)?;
+    if !matches!(view.holding, ViewHolding::Streamed(StreamedFill::Stored)) {
         return Err(format!("planned weight {:?} is not a stored table", table.role).into());
     }
-    let [records, record_rows, width] = plan.shape[..] else {
+    let [records, record_rows, width] = &view.shape[..] else {
         return Err(format!("stored table {:?} is not records of rows", table.role).into());
     };
-    let directory = table.directory(graph, load, ports)?;
+    let directory = table.directory(graph, weights, ports)?;
     let gate = graph.timeline(seismic::timeline::Wait);
     let decoded = graph
         .enqueue(
@@ -586,8 +924,8 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
                 ("C", records),
                 ("P", record_rows),
                 ("W", width),
-                ("R", directory.shape[0]),
-                ("F", directory.shape[1]),
+                ("R", &directory.shape[0]),
+                ("F", &directory.shape[1]),
             ],
             stored_rows::WorkflowArgs {
                 slots: (&table.table).into(),
@@ -604,14 +942,14 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
 /// (plan admission refused a scaled one: `PlanError::UnportedScale`).
 pub(crate) fn weight<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<seismic::WorkflowTensor, GraphError> {
     weight_port(
         graph,
-        load,
+        weights,
         WeightRole { scope, kind },
         WeightPart::Values,
         ports,
@@ -632,19 +970,19 @@ pub(crate) struct ScaledWeight {
 #[derive(Clone)]
 pub(crate) struct WeightScale {
     pub tensor: WorkflowTensor,
-    pub extent: u64,
+    pub extent: Dim,
 }
 
 impl WeightScale {
     /// The second-level scale of the planned weight of `role`.
     pub(crate) fn planned<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         role: WeightRole,
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
-        let (port, extent) = weight_scale_port(graph, load, role, ports, constants)?;
+        let (port, extent) = weight_scale_port(graph, weights, role, ports, constants)?;
         Ok(Self {
             tensor: port.tensor().clone(),
             extent,
@@ -656,15 +994,15 @@ impl WeightScale {
     /// absent operand where it has none.
     pub(crate) fn per_expert<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         role: WeightRole,
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
-        match planned_scale_extent(load, role)? {
-            0 => Self::absent(graph, constants),
-            extent => Ok(Self {
-                tensor: weight_port(graph, load, role, WeightPart::Scale, ports)?
+        match weights.weight(role)?.scale {
+            None => Self::absent(graph, constants),
+            Some(extent) => Ok(Self {
+                tensor: weight_port(graph, weights, role, WeightPart::Scale, ports)?
                     .tensor()
                     .clone(),
                 extent,
@@ -679,7 +1017,7 @@ impl WeightScale {
     ) -> Result<Self, GraphError> {
         Ok(Self {
             tensor: GraphConstant::absent(graph, constants)?.tensor().clone(),
-            extent: 0,
+            extent: Dim::from(0),
         })
     }
 }
@@ -696,14 +1034,14 @@ impl WeightOperands {
     /// The operands of the planned weight of `role`.
     pub(crate) fn planned<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         role: WeightRole,
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
         Ok(Self {
-            scale: WeightScale::planned(graph, load, role, ports, constants)?,
-            bound: PackingBound::planned(graph, load, role, ports, constants)?,
+            scale: WeightScale::planned(graph, weights, role, ports, constants)?,
+            bound: PackingBound::planned(graph, weights, role, ports, constants)?,
         })
     }
 
@@ -726,27 +1064,22 @@ impl WeightOperands {
 #[derive(Clone)]
 pub(crate) struct PackingBound {
     pub tensor: WorkflowTensor,
-    pub extent: u64,
+    pub extent: Dim,
 }
 
 impl PackingBound {
     /// The packing bound of the planned weight of `role`.
     pub(crate) fn planned<G: GraphDraft>(
         graph: &mut G,
-        load: &ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         role: WeightRole,
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
-        let extent = load
-            .weights()
-            .find(|plan| plan.role == role)
-            .map(|plan| plan.bound)
-            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
-        match extent {
-            0 => Self::absent(graph, constants),
-            _ => Ok(Self {
-                tensor: weight_port(graph, load, role, WeightPart::Bound, ports)?
+        match weights.weight(role)?.bound {
+            None => Self::absent(graph, constants),
+            Some(extent) => Ok(Self {
+                tensor: weight_port(graph, weights, role, WeightPart::Bound, ports)?
                     .tensor()
                     .clone(),
                 extent,
@@ -761,7 +1094,7 @@ impl PackingBound {
     ) -> Result<Self, GraphError> {
         Ok(Self {
             tensor: GraphConstant::absent(graph, constants)?.tensor().clone(),
-            extent: 0,
+            extent: Dim::from(0),
         })
     }
 }
@@ -774,60 +1107,31 @@ pub(crate) struct PackedWeight {
     pub operands: WeightOperands,
 }
 
-/// Register one scope-owned readout representation and its scale lifetime.
-pub(crate) fn projection_ports<G: GraphDraft>(
-    graph: &mut G,
-    load: &ModelLoadPlan,
-    scope: WeightScope,
-    certified: bool,
-    ports: &mut Vec<(WeightPort, NativePort)>,
-    constants: &mut Vec<GraphConstant>,
-) -> Result<crate::programs::graph::readout::ProjectionPorts, GraphError> {
-    use crate::programs::graph::readout::{HeadPlans, ProjectionPorts};
-    Ok(match HeadPlans::of(load, scope)?.selected() {
-        HeadPlans::Packed(_) => {
-            let (weight, scale, scale_extent) =
-                scaled_weight_ports(graph, load, scope, WeightKind::Output, ports, constants)?;
-            ProjectionPorts::Packed {
-                weight,
-                scale,
-                scale_extent,
-            }
-        }
-        plans @ HeadPlans::Progressive(_) => {
-            let depth = plans.depth().ok_or("progressive projection has no depth")?;
-            let planes = magnitude_family_contracts::ProgressivePlane::ALL
-                .into_iter()
-                .filter(|plane| {
-                    certified || *plane != magnitude_family_contracts::ProgressivePlane::Radius
-                })
-                .map(|plane| {
-                    Ok((
-                        plane,
-                        weight_port(
-                            graph,
-                            load,
-                            WeightRole {
-                                scope,
-                                kind: WeightKind::OutputPlane(plane),
-                            },
-                            WeightPart::Values,
-                            ports,
-                        )?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, GraphError>>()?;
-            ProjectionPorts::Progressive { depth, planes }
-        }
-        HeadPlans::Qualified { .. } => unreachable!("a recipe was selected above"),
-    })
+/// A head projection's ports registered as the weight parts they bind
+/// (`StoredHead::ports`), an absent scale as the absent constant.
+pub(crate) struct RegisteredPorts<'p, W: PlannedWeights + ?Sized> {
+    pub weights: &'p W,
+    pub ports: &'p mut Vec<(WeightPort, NativePort)>,
+    pub constants: &'p mut Vec<GraphConstant>,
+}
+
+impl<G: GraphDraft, W: PlannedWeights + ?Sized> crate::programs::graph::readout::ProjectionBinding<G>
+    for RegisteredPorts<'_, W>
+{
+    fn weight(&mut self, graph: &mut G, role: WeightRole) -> Result<NativePort, GraphError> {
+        weight_port(graph, self.weights, role, WeightPart::Values, self.ports)
+    }
+
+    fn scale(&mut self, graph: &mut G, role: WeightRole) -> Result<(NativePort, Dim), GraphError> {
+        weight_scale_port(graph, self.weights, role, self.ports, self.constants)
+    }
 }
 
 /// The port of a weight an entry binds with a per-tensor accumulator-scale
 /// port (`[S] f32`, S ∈ {0, 1}).
 pub(crate) fn scaled_weight<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
@@ -835,10 +1139,10 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
 ) -> Result<ScaledWeight, GraphError> {
     let role = WeightRole { scope, kind };
     Ok(ScaledWeight {
-        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+        weight: weight_port(graph, weights, role, WeightPart::Values, ports)?
             .tensor()
             .clone(),
-        scale: WeightScale::planned(graph, load, role, ports, constants)?,
+        scale: WeightScale::planned(graph, weights, role, ports, constants)?,
     })
 }
 
@@ -846,7 +1150,7 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
 /// and packing bound.
 pub(crate) fn packed_weight<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
@@ -854,10 +1158,10 @@ pub(crate) fn packed_weight<G: GraphDraft>(
 ) -> Result<PackedWeight, GraphError> {
     let role = WeightRole { scope, kind };
     Ok(PackedWeight {
-        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+        weight: weight_port(graph, weights, role, WeightPart::Values, ports)?
             .tensor()
             .clone(),
-        operands: WeightOperands::planned(graph, load, role, ports, constants)?,
+        operands: WeightOperands::planned(graph, weights, role, ports, constants)?,
     })
 }
 
@@ -865,40 +1169,31 @@ pub(crate) fn packed_weight<G: GraphDraft>(
 /// builders. Registration and absent-scale lifetime have one authority.
 pub(crate) fn scaled_weight_ports<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     kind: WeightKind,
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<(NativePort, NativePort, u64), GraphError> {
+) -> Result<(NativePort, NativePort, Dim), GraphError> {
     let role = WeightRole { scope, kind };
-    let weight = weight_port(graph, load, role, WeightPart::Values, ports)?;
-    let (scale, extent) = weight_scale_port(graph, load, role, ports, constants)?;
+    let weight = weight_port(graph, weights, role, WeightPart::Values, ports)?;
+    let (scale, extent) = weight_scale_port(graph, weights, role, ports, constants)?;
     Ok((weight, scale, extent))
 }
 
 /// Register the accumulator-scale operand, including its absent lifetime.
 pub(crate) fn weight_scale_port<G: GraphDraft>(
     graph: &mut G,
-    load: &ModelLoadPlan,
+    weights: &(impl PlannedWeights + ?Sized),
     role: WeightRole,
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<(NativePort, u64), GraphError> {
-    let extent = planned_scale_extent(load, role)?;
-    let scale = match extent {
-        0 => GraphConstant::absent(graph, constants)?,
-        1 => weight_port(graph, load, role, WeightPart::Scale, ports)?,
-        _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
-    };
-    Ok((scale, extent))
-}
-
-fn planned_scale_extent(load: &ModelLoadPlan, role: WeightRole) -> Result<u64, String> {
-    load.weights()
-        .find(|plan| plan.role == role)
-        .map(crate::WeightPlan::scale_extent)
-        .ok_or_else(|| format!("missing planned weight {role:?}"))
+) -> Result<(NativePort, Dim), GraphError> {
+    match weights.weight(role)?.scale {
+        None => Ok((GraphConstant::absent(graph, constants)?, Dim::from(0))),
+        Some(extent) if extent.equals(1) => Ok((weight_port(graph, weights, role, WeightPart::Scale, ports)?, extent)),
+        Some(_) => Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
+    }
 }
 
 pub(crate) fn activation(geometry: &Decoder) -> Element {

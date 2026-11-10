@@ -11,7 +11,7 @@ use crate::planning::RecordTensors;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use magnitude_kernels::routed_group;
-use seismic::{NativePort, WorkflowTensor};
+use seismic::{Dim, NativePort, WorkflowTensor};
 
 /// The grouped experts' rows over the blocks the grouping filled, each
 /// grouped choice's position in them (`inverse`), and the blocks they
@@ -19,7 +19,7 @@ use seismic::{NativePort, WorkflowTensor};
 pub(crate) struct ExpertsPass {
     pub output: WorkflowTensor,
     pub inverse: WorkflowTensor,
-    pub blocks: u64,
+    pub blocks: Dim,
 }
 
 /// Where the grouped experts are read, each form's expert stacks `S`:
@@ -29,30 +29,30 @@ pub(crate) struct ExpertsPass {
 /// map holds it for the step.
 struct Sources<S> {
     stacks: S,
-    map: Option<(WorkflowTensor, WorkflowTensor, S, u64)>,
+    map: Option<(WorkflowTensor, WorkflowTensor, S, Dim)>,
 }
 
 /// What an expert entry reads beside the grouping: the stacks by expert,
-/// the map (`[X, MAP_WORDS]`), its rows `mapped` (`X`, 0 without a map),
-/// and the step it holds records for (`[QS]`, none without a map), and the
-/// records it places experts in and their count (`R`; the stacks, of the
-/// experts, without a map).
+/// the map (`[X, MAP_WORDS]`) and the step it holds records for, the map's
+/// rows `mapped` where the reads go through one, and the records it places
+/// experts in and their count (`R`; the stacks, of the experts, without a
+/// map).
 pub(super) struct Reads<S> {
     pub stacks: S,
     pub map: WorkflowTensor,
     pub step: WorkflowTensor,
     pub records: S,
-    pub count: u64,
-    pub mapped: u64,
+    pub count: Dim,
+    pub mapped: Option<Dim>,
 }
 
 impl<S> Reads<S> {
-    /// `QS`, the step's words: a step pair where the reads go through a
-    /// map, none without one.
-    pub fn step_words(&self) -> u64 {
-        match self.mapped {
-            0 => 0,
-            _ => magnitude_kernels::constants::STEP_WORDS,
+    /// `X` and `QS`: the map's rows and the step's words (a step pair),
+    /// both 0 without a map.
+    pub fn map_dimensions(&self) -> [(&'static str, Dim); 2] {
+        match &self.mapped {
+            Some(mapped) => [("X", mapped.clone()), ("QS", Dim::from(magnitude_kernels::constants::STEP_WORDS))],
+            None => [("X", Dim::from(0)), ("QS", Dim::from(0))],
         }
     }
 }
@@ -62,8 +62,8 @@ impl<S> Reads<S> {
 /// tiles (the grouping's `order`, `block_experts` and `used`), read through
 /// `reads`.
 pub(super) struct Grouped<'t, S> {
-    pub rows: u64,
-    pub blocks: u64,
+    pub rows: &'t Dim,
+    pub blocks: Dim,
     pub first: &'t WorkflowTensor,
     pub rows_read: &'t WorkflowTensor,
     pub input: &'t WorkflowTensor,
@@ -83,8 +83,8 @@ pub(super) fn class<'a, G: GraphDraft + 'a, S: Clone>(
     group: G::Binding<'a, routed_group::Entry>,
     [routes, input]: [&WorkflowTensor; 2],
     stacks: S,
-    rows: u64,
-    [experts, selected]: [u64; 2],
+    rows: &Dim,
+    [experts, selected]: [&Dim; 2],
     constants: &mut Vec<GraphConstant>,
     expand: impl FnOnce(&mut G, Grouped<'_, S>) -> Result<WorkflowTensor, GraphError>,
 ) -> Result<ExpertsPass, GraphError> {
@@ -115,15 +115,16 @@ pub(super) fn class<'a, G: GraphDraft + 'a, S: Clone>(
 /// the form's expert entry, whose rows the pass stores into its merged
 /// experts.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn pass<'a, G: GraphDraft + 'a, S: Clone>(
+pub(super) fn pass<'a, G: GraphDraft + 'a, S: Clone, W: crate::programs::native_target_graph::PlannedWeights + ?Sized>(
     graph: &mut G,
     group: G::Binding<'a, routed_group::Entry>,
-    layer: Option<&mut StreamedLayer<'_, 'a, G>>,
+    layer: Option<&mut StreamedLayer<'_, 'a, G, W>>,
     ports: &mut PassPorts,
+    blocks: &Dim,
     stacks: S,
     scratch: impl FnOnce(&RecordTensors<NativePort>) -> Result<S, GraphError>,
-    rows: u64,
-    [experts, selected]: [u64; 2],
+    rows: &Dim,
+    [experts, selected]: [&Dim; 2],
     constants: &mut Vec<GraphConstant>,
     expand: impl FnOnce(&mut G, Grouped<'_, S>) -> Result<WorkflowTensor, GraphError>,
 ) -> Result<WorkflowTensor, GraphError> {
@@ -132,13 +133,13 @@ pub(super) fn pass<'a, G: GraphDraft + 'a, S: Clone>(
         Some((map, step, tier, records, reads)) => (
             Sources {
                 stacks: scratch(tier)?,
-                map: Some((map.clone(), step.clone(), stacks, *records)),
+                map: Some((map.clone(), step.clone(), stacks, records.clone())),
             },
             Some(reads),
         ),
         None => (Sources { stacks, map: None }, None),
     };
-    let PassPorts { crossing, experts: into, inverse, rows: read, first, blocks } = ports;
+    let PassPorts { crossing, experts: into, inverse, rows: read, first } = ports;
     let pass = grouped(
         graph,
         group,
@@ -147,7 +148,7 @@ pub(super) fn pass<'a, G: GraphDraft + 'a, S: Clone>(
         [Some(inverse), reads],
         sources,
         rows,
-        *blocks,
+        blocks.clone(),
         [experts, selected],
         constants,
         expand,
@@ -169,18 +170,18 @@ fn grouped<'a, G: GraphDraft + 'a, S: Clone>(
     [first, rows_read]: [&WorkflowTensor; 2],
     [inverse, counts]: [Option<&mut NativePort>; 2],
     sources: Sources<S>,
-    rows: u64,
-    blocks: u64,
-    [experts, selected]: [u64; 2],
+    rows: &Dim,
+    blocks: Dim,
+    [experts, selected]: [&Dim; 2],
     constants: &mut Vec<GraphConstant>,
     expand: impl FnOnce(&mut G, Grouped<'_, S>) -> Result<WorkflowTensor, GraphError>,
 ) -> Result<ExpertsPass, GraphError> {
     let tables = [
-        ("M", rows),
-        ("E", experts),
-        ("K", selected),
-        ("B", blocks),
-        ("T", TILE_ROWS),
+        ("M", rows.clone()),
+        ("E", experts.clone()),
+        ("K", selected.clone()),
+        ("B", blocks.clone()),
+        ("T", Dim::from(TILE_ROWS)),
     ];
     let mut order = graph.local_for(group, "order", &tables)?;
     let mut local = None;
@@ -210,21 +211,28 @@ fn grouped<'a, G: GraphDraft + 'a, S: Clone>(
         },
     )?;
     let reads = match sources.map {
-        Some((map, step, records, count)) => Reads { stacks: sources.stacks, map, step, records, count, mapped: experts },
+        Some((map, step, records, count)) => Reads {
+            stacks: sources.stacks,
+            map,
+            step,
+            records,
+            count,
+            mapped: Some(experts.clone()),
+        },
         None => Reads {
             records: sources.stacks.clone(),
             stacks: sources.stacks,
             map: absent_map(graph, constants)?,
             step: GraphConstant::empty_of(graph, seismic::Element::i32(), &[0], constants)?,
-            count: experts,
-            mapped: 0,
+            count: experts.clone(),
+            mapped: None,
         },
     };
     let output = expand(
         graph,
         Grouped {
             rows,
-            blocks,
+            blocks: blocks.clone(),
             first,
             rows_read,
             input,

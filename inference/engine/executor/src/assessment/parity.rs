@@ -2,8 +2,11 @@
 //! served catalog target, on every executor of every recorded machine, at
 //! the standard service's limits and at the KL harness's, each at one
 //! conversation (the load the resident-only planner charged), is placed
-//! whole (and fits) wherever the resident-only planner's charge fits. Plans only:
-//! no device is opened and no payload read.
+//! whole (and fits) wherever the resident-only planner's charge fits. And
+//! the assessment's closed form over the same plan (`assess_execution_fit`
+//! over its floor forms) fits it whole exactly where the load planner
+//! places it whole and fitting. Plans only: no device is opened and no
+//! payload read.
 //!
 //! The resident-only planner's charge is ported from its source at
 //! `c15abaf8a`, `inference/engine/executor/src/planning/assessment.rs`
@@ -242,6 +245,9 @@ struct Row {
     /// Main fits resident and this planner does not place it whole and
     /// fitting.
     regression: bool,
+    /// The assessment's verdict of holding it whole differs from this
+    /// planner's placement.
+    diverged: bool,
     /// The row's planning broke an invariant.
     panicked: bool,
 }
@@ -271,10 +277,11 @@ fn row(
     executor: &Executor,
     workload: Workload,
 ) -> Row {
+    let began = std::time::Instant::now();
     let reserves = MemoryReserves::of_machine(None);
     let backend = executor.backend();
     let head = format!("{name} | {machine}:{} | {}@{}", backend.as_str(), workload.label, workload.context);
-    let failed = |stage: &str, error: String| Row { line: format!("{head} | {stage} fails: {error}"), regression: false, panicked: false };
+    let failed = |stage: &str, error: String| Row { line: format!("{head} | {stage} fails: {error}"), regression: false, diverged: false, panicked: false };
     let mut definition = definition.clone();
     definition.decoder.context_limit = workload.context;
     let Some(pricing) = pricing(machine, backend) else {
@@ -317,6 +324,14 @@ fn row(
         Ok(fit) => need(&fit),
         Err(error) => return failed("whole's fit", error.to_string()),
     };
+    // The assessment's closed form over the same plan: whole where it fits
+    // a whole form at its floor of places.
+    let assessing = std::time::Instant::now();
+    let assessed = match assessed(&definition, &draft, pricing, topology, status, &reserves) {
+        Ok(assessed) => assessed,
+        Err(error) => return failed("assessment", error),
+    };
+    let assessment_ms = assessing.elapsed().as_secs_f64() * 1e3;
     let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None) {
         Ok(Placed::Whole(placed)) => {
             let fits = match room.fit(placed.draft(), placed.charge()) {
@@ -332,17 +347,44 @@ fn row(
     let gb = |bytes: u64| bytes as f64 / 1e9;
     let whole_limits = whole.policy().limits();
     let line = format!(
-        "{head} | room {:.2} | main {:.2} {} | ours whole {:.2} {} | placed {} | main: {} | ours: {}",
+        "{head} | room {:.2} | main {:.2} {} | ours whole {:.2} {} | placed {} | assessed {} | assessment {assessment_ms:.1} ms of {:.1} ms | main: {} | ours: {}",
         gb(main_room),
         gb(main_need),
         if main_fits { "fits" } else { "short" },
         gb(whole_need),
         if whole_fits { "fits" } else { "short" },
         verdict.0,
+        assessed.0,
+        began.elapsed().as_secs_f64() * 1e3,
         terms(&main, 1, 1 + usize::from(limits.lookahead)),
         terms(&whole_charge, whole_limits.chain_capacity.get(), whole_limits.target_successor_banks()),
     );
-    Row { line, regression: main_fits && !verdict.1, panicked: false }
+    Row { line, regression: main_fits && !verdict.1, diverged: assessed.1 != verdict.1, panicked: false }
+}
+
+/// The assessment's verdict of `draft` (`assess_execution_fit` over its
+/// floor forms) and whether it fits it whole.
+fn assessed(
+    definition: &ModelDefinition,
+    draft: &ExecutionPlanDraft,
+    pricing: GraphPricing,
+    topology: &DeviceTopology,
+    status: &Status,
+    reserves: &MemoryReserves,
+) -> Result<(String, bool), String> {
+    let forms = draft
+        .floor_forms(definition, None, |draft| {
+            super::StructuralCharge::of(definition, draft).map(|charge| (charge, ())).map_err(|error| crate::PlanError::ResourcePlanning(format!("{error:?}")))
+        })
+        .map_err(|error| error.to_string())?;
+    let prepared = super::prepare_execution_assessment(definition, forms).map_err(|error| format!("{error:?}"))?;
+    Ok(match super::assess_execution_fit(definition, &prepared, pricing, topology, status, reserves).map_err(|error| format!("{error:?}"))? {
+        super::ExecutionAssessment::Fits(fit) => match fit.bank.as_ref().is_none_or(|bank| bank.whole()) {
+            true => ("whole, fits".to_owned(), true),
+            false => (format!("streams {} slots", fit.bank.as_ref().map_or(0, |bank| bank.slots)), false),
+        },
+        super::ExecutionAssessment::DoesNotFit(_) => ("short".to_owned(), false),
+    })
 }
 
 /// The chain a served target's load is placed whole on, of `context` on
@@ -387,11 +429,10 @@ fn lfm2_5_8b_on_an_a10_8q_is_placed_whole_on_the_longest_chain_its_room_holds() 
 }
 
 /// Every served catalog target is placed whole, fitting, on every recorded
-/// machine's every executor under every workload where the resident-only
-/// planner's charge of it fits; the table of both charges, term by term,
-/// is printed for every row.
-#[test]
-fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it() {
+/// machine's every executor of `backend` under every workload where the
+/// resident-only planner's charge of it fits; the table of both charges,
+/// term by term, is printed for every row.
+fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: BackendName) {
     let machines: [(&str, DeviceTopology); 9] = [
         ("m4_pro", recorded::m4_pro()),
         ("m4_pro_without_unified_memory", recorded::m4_pro_without_unified_memory()),
@@ -419,8 +460,8 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it() {
                         let (name, definition, manifest) = (&target.0, &target.1, &target.2);
                         let (machine, topology) = (machine.0, &machine.1);
                         let status = unopened(topology);
-                        for executor in topology.executors() {
-                            for workload in workloads(executor.backend(), definition) {
+                        for executor in topology.executors().iter().filter(|executor| executor.backend() == backend) {
+                            for workload in workloads(backend, definition) {
                                 // A row that panics is reported as its own failure, so
                                 // the rest of the sweep still prints.
                                 let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -439,11 +480,17 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it() {
                                             .unwrap_or("a panic without a message")
                                     ),
                                     regression: false,
+                                    diverged: false,
                                     panicked: true,
                                 });
                                 // Each row as it is computed, so a partial sweep still
                                 // yields its rows.
-                                println!("{}{}", if computed.regression { "REGRESSION " } else { "" }, computed.line);
+                                println!(
+                                    "{}{}{}",
+                                    if computed.regression { "REGRESSION " } else { "" },
+                                    if computed.diverged { "DIVERGED " } else { "" },
+                                    computed.line
+                                );
                                 rows.push(computed);
                             }
                         }
@@ -457,15 +504,38 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it() {
     rows.sort_by(|a, b| a.line.cmp(&b.line));
     let panicked = rows.iter().filter(|row| row.panicked).map(|row| row.line.as_str()).collect::<Vec<_>>();
     let regressions = rows.iter().filter(|row| row.regression).map(|row| row.line.as_str()).collect::<Vec<_>>();
+    let diverged = rows.iter().filter(|row| row.diverged).map(|row| row.line.as_str()).collect::<Vec<_>>();
     assert!(
-        panicked.is_empty() && regressions.is_empty(),
-        "of {} rows, {} broke an invariant and {} fit the resident-only planner and are not placed whole and fitting:\n{}\n{}",
+        panicked.is_empty() && regressions.is_empty() && diverged.is_empty(),
+        "of {} rows, {} broke an invariant, {} fit the resident-only planner and are not placed whole and fitting, and {} are assessed whole where they are not placed whole and fitting or the reverse:\n{}\n{}\n{}",
         rows.len(),
         panicked.len(),
         regressions.len(),
+        diverged.len(),
         panicked.join("\n"),
-        regressions.join("\n")
+        regressions.join("\n"),
+        diverged.join("\n")
     );
+}
+
+#[test]
+fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it_on_cpu() {
+    every_target_is_placed_whole_wherever_the_resident_planner_fits_it(BackendName::Cpu);
+}
+
+#[test]
+fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it_on_metal() {
+    every_target_is_placed_whole_wherever_the_resident_planner_fits_it(BackendName::Metal);
+}
+
+#[test]
+fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it_on_cuda() {
+    every_target_is_placed_whole_wherever_the_resident_planner_fits_it(BackendName::Cuda);
+}
+
+#[test]
+fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it_on_vulkan() {
+    every_target_is_placed_whole_wherever_the_resident_planner_fits_it(BackendName::Vulkan);
 }
 
 /// Qwen3.6 35B-A3B q4 with its catalog draft at 4,096 tokens, on the
@@ -516,7 +586,7 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
             service(backend, &definition),
         )
         .unwrap_or_else(|error| panic!("{machine}: {error}"));
-        if let Err(error) = draft.placed::<crate::DraftedCharge>(&definition, None) {
+        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None) {
             panic!("{machine}: {error}");
         }
     }

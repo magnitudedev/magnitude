@@ -31,7 +31,69 @@ use magnitude_family_contracts::{
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_family_contracts::{HistoryReads, NGramGate, ShortConv, StateSpace};
-use seismic::Element;
+use crate::programs::graph::GraphError;
+use seismic::{Argument, ArgumentWord, Dim, Element};
+
+/// The target store's recurrent bank as a graph of `N` of its components
+/// reads it ([`split_bank`]): its banks, the banks a slab holds, and each
+/// component's extents past its bank axis. Their elements are topology.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RecurrentBank<D, const N: usize> {
+    pub banks: D,
+    pub slab_banks: D,
+    pub components: [Vec<D>; N],
+}
+
+impl<D: Clone, const N: usize> RecurrentBank<D, N> {
+    /// The `[banks, ..]` extents of component `index` of the `N`.
+    pub(crate) fn extents(&self, index: usize) -> Vec<D> {
+        std::iter::once(self.banks.clone())
+            .chain(self.components[index].iter().cloned())
+            .collect()
+    }
+}
+
+impl<D, const N: usize> crate::programs::graph::facts::Numbers<D> for RecurrentBank<D, N> {
+    type Of<E> = RecurrentBank<E, N>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> RecurrentBank<E, N> {
+        RecurrentBank {
+            banks: f(self.banks),
+            slab_banks: f(self.slab_banks),
+            components: self.components.map(|component| component.into_iter().map(&mut *f).collect()),
+        }
+    }
+}
+
+/// The `N` recurrent components of the target store from `component_index`
+/// on: their elements, and the bank they lie in ([`RecurrentBank`]).
+pub(crate) fn split_bank<const N: usize>(
+    state: &crate::StateResourcePlan,
+    component_index: usize,
+) -> Result<([Element; N], RecurrentBank<u64, N>), crate::programs::graph::GraphError> {
+    let store = state.target_state();
+    let banks = u64::try_from(store.bank_capacity.storage_total().map_err(|error| error.to_string())?)
+        .map_err(|_| "recurrent bank count exceeds u64")?;
+    let slab_banks = u64::from(store.bank_slab_banks()?);
+    let components = store
+        .recurrent_components
+        .get(component_index..component_index + N)
+        .ok_or_else(|| format!("recurrent state components {component_index}..+{N} are absent"))?;
+    let elements = std::array::from_fn(|index| Element::dense(components[index].dtype));
+    let extents = components
+        .iter()
+        .map(|component| {
+            component
+                .shape
+                .iter()
+                .map(|&extent| u64::try_from(extent).map_err(|_| "recurrent state extent exceeds u64".to_owned()))
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let components = extents
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("{N} components were taken"));
+    Ok((elements, RecurrentBank { banks, slab_banks, components }))
+}
 
 /// How a sublayer's output joins the residual (`scatter`): into `streams`
 /// hyper-connection streams by a mix site's join values (`[M, IN]`: a
@@ -41,9 +103,9 @@ use seismic::Element;
 pub(crate) struct Join {
     /// The mix site's join values; none for one stream.
     pub values: Option<seismic::WorkflowTensor>,
-    pub streams: u64,
+    pub streams: Dim,
     /// The width `IN` of a row of the join values.
-    pub width: u64,
+    pub width: Dim,
     /// The class dimension the joined rows follow in their graph, if any.
     pub class: Option<&'static str>,
 }
@@ -54,23 +116,23 @@ impl Join {
     pub(crate) fn single(class: Option<&'static str>) -> Self {
         Self {
             values: None,
-            streams: 1,
-            width: 0,
+            streams: Dim::from(1),
+            width: Dim::from(0),
             class,
         }
     }
 
     /// The join into `geometry`'s streams by a site's join `values`, its
     /// rows following the class dimension `class`.
-    pub(crate) fn streams(
-        geometry: streams::StreamsGeometry,
+    pub(crate) fn streams<E: Clone>(
+        geometry: &streams::StreamsGeometry<E, E>,
         values: seismic::WorkflowTensor,
         class: Option<&'static str>,
     ) -> Self {
         Self {
             values: Some(values),
-            streams: geometry.streams,
-            width: geometry.join_width(),
+            streams: Dim::from(geometry.streams),
+            width: Dim::from(geometry.join_width()),
             class,
         }
     }
@@ -81,22 +143,25 @@ impl Join {
     pub(crate) fn inject<G: crate::programs::graph::draft::GraphDraft>(
         &self,
         graph: &mut G,
-        rows: u64,
+        rows: impl Into<Dim>,
         constants: &mut Vec<crate::programs::native_constants::GraphConstant>,
     ) -> Result<seismic::WorkflowTensor, crate::programs::graph::GraphError> {
         match &self.values {
             Some(values) => Ok(values.clone()),
             None => {
                 crate::programs::native_constants::GraphConstant::absent_inject(
-                    graph, rows, self.class, constants,
+                    graph,
+                    &rows.into(),
+                    self.class,
+                    constants,
                 )
             }
         }
     }
 
     /// The output entries' join dimensions `SN` and `IN`.
-    pub(crate) fn dimensions(&self) -> [(&'static str, u64); 2] {
-        [("SN", self.streams), ("IN", self.width)]
+    pub(crate) fn dimensions(&self) -> [(&'static str, Dim); 2] {
+        [("SN", self.streams.clone()), ("IN", self.width.clone())]
     }
 }
 
@@ -153,6 +218,16 @@ impl InputForm {
         normalized: false,
     };
 
+    /// How a sublayer's consumer entry forms its input over `streams`
+    /// residual streams: a low-rank mix site's partials (`low_rank`), or
+    /// one normalized row (the residual's, or a Sinkhorn site's input).
+    pub(crate) fn read(low_rank: bool, streams: u64) -> Self {
+        match low_rank {
+            true => Self { parts: streams, normalized: false },
+            false => Self::SINGLE,
+        }
+    }
+
     /// The decoder readout's input form: a low-rank exit site's partial
     /// rows, one per hyper-connection stream, unnormalized; or the final row
     /// under the exit norm (a Sinkhorn exit's collapse of the streams among
@@ -175,14 +250,14 @@ impl InputForm {
 
     /// The consumer entries' input dimensions `PT` and `NM` over rows of
     /// `width`.
-    pub(crate) fn dimensions(&self, width: u64) -> [(&'static str, u64); 2] {
-        [("PT", self.parts), ("NM", self.norm_extent(width))]
+    pub(crate) fn dimensions<D: From<u64>>(&self, width: D) -> [(&'static str, D); 2] {
+        [("PT", D::from(self.parts)), ("NM", self.norm_extent(width))]
     }
 
     /// The extent of the input norm over rows of `width`: 0 when the form
     /// normalizes nothing.
-    pub(crate) fn norm_extent(&self, width: u64) -> u64 {
-        if self.normalized { width } else { 0 }
+    pub(crate) fn norm_extent<D: From<u64>>(&self, width: D) -> D {
+        if self.normalized { width } else { D::from(0) }
     }
 }
 
@@ -802,16 +877,9 @@ impl SublayerSource<'_> {
     }
 
     /// How the sublayer's consumer entry forms its input over `streams`
-    /// residual streams: one normalized row (the residual's, or a Sinkhorn
-    /// site's input), or a low-rank site's partials.
+    /// residual streams (`InputForm::read`).
     pub fn form(&self, streams: u64) -> InputForm {
-        match self {
-            Self::Norm(_) | Self::Sinkhorn(_) => InputForm::SINGLE,
-            Self::Mix(_) => InputForm {
-                parts: streams,
-                normalized: false,
-            },
-        }
+        InputForm::read(matches!(self, Self::Mix(_)), streams)
     }
 }
 
@@ -1414,4 +1482,17 @@ fn routed_feed_forward<'a>(
         }
     }
     Ok(FeedForward::GeneralRouted(routed))
+}
+
+/// A non-negative code of a form (an activation, a gate function, a
+/// rounding's element) as a graph's number, which reaches only its entries'
+/// arguments ([`scalar`]).
+pub(crate) fn code(code: i32) -> u64 {
+    u64::try_from(code).expect("a form's code is non-negative")
+}
+
+/// A number a kernel's integer argument takes (a count, or a code of a
+/// form the graph does not branch on): guarded to fit the argument's word.
+pub(crate) fn scalar<T: ArgumentWord>(dim: &Dim, what: &str) -> Result<Argument<T>, GraphError> {
+    dim.word::<T>().ok_or_else(|| format!("{what} exceeds its argument").into())
 }

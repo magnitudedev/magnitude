@@ -8,6 +8,8 @@ mod certify;
 mod classes;
 mod entry;
 mod heap;
+#[cfg(test)]
+mod outline_parity;
 mod prepared;
 #[cfg(test)]
 mod tests;
@@ -19,6 +21,8 @@ pub(crate) use bound::{BankRun, BoundTargetGraphs, GroupBuffers, TokenRow, place
 pub(crate) use certify::{CheckedTargetFamily, checked_target_and_undrafted, checked_target_family, pass_buffer_bytes};
 #[cfg(test)]
 pub(crate) use certify::checked_target_family_storage;
+#[cfg(test)]
+pub(crate) use outline_parity::{recorded_traces, target_outline_differences};
 pub(crate) use classes::{LaunchControl, LaunchControlLayout};
 #[cfg(test)]
 pub(crate) use entry::checked_entry_graph_storage;
@@ -27,10 +31,10 @@ pub use heap::{PlannedSealedGraphs, SealedGraphsHeap};
 pub(crate) use prepared::block_scopes;
 pub use prepared::{PreparedTargetGraphs, SealReport};
 pub(crate) use weights::{
-    BankPort, CheckedLandingEntries, GatheredTable, GraphPark, GraphTimeline, LandedReadPorts,
-    LandingEntries, PackedWeight, PackingBound, RowDirectory, ScaledWeight, StoredReadPorts,
-    WeightOperands, WeightPart, WeightPort, WeightScale, activation, bank_port, packed_weight,
-    projection_ports, scaled_weight, scaled_weight_ports, stored_table_rows, weight, weight_port,
+    BankPort, CheckedLandingEntries, GatheredTable, GraphPark, GraphTimeline, GraphWeights, LandedReadPorts, LandingEntries,
+    PackedWeight, PackingBound, PlannedWeights, RowDirectory, ScaledWeight, StoredReadPorts, WeightOperands, WeightPart, WeightPort, WeightScale, WeightView,
+    activation, bank_port, packed_weight, relative_scope_of,
+    RegisteredPorts, scaled_weight, scaled_weight_ports, stored_table_rows, weight, weight_port,
     weight_scale_port,
 };
 

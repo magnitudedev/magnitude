@@ -152,7 +152,7 @@ pub(super) fn qualify_attention(
     const ENTRY: &str = "attention";
     let shape = binding.shape;
     let (hidden, kv_heads, width, heads) =
-        (shape.hidden, shape.kv_heads, shape.width, shape.heads());
+        (shape.widths.hidden, shape.widths.kv_heads, shape.widths.width, shape.heads());
     let residual_values = (0..rows.residual_width(hidden))
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();
@@ -185,12 +185,12 @@ pub(super) fn qualify_attention(
             zeros(grouped.element, &[shape.groups * shape.rank, shape.inputs])
         })
         .transpose()?;
-    let query_norm = zeros(Element::f32(), &[shape.query_norm, width])?;
-    let key_norm = zeros(Element::f32(), &[shape.key_norm, width])?;
-    let value_norm = zeros(Element::f32(), &[shape.value_norm, width])?;
+    let query_norm = zeros(Element::f32(), &[u64::from(shape.form.query_norm), width])?;
+    let key_norm = zeros(Element::f32(), &[u64::from(shape.form.key_norm), width])?;
+    let value_norm = zeros(Element::f32(), &[u64::from(shape.form.value_norm), width])?;
     // The sink logits (zero rows without sinks).
-    let sinks = zeros(Element::f32(), &[shape.sinks, heads])?;
-    let pairs = [shape.rotary_pairs];
+    let sinks = zeros(Element::f32(), &[u64::from(shape.form.sinks), heads])?;
+    let pairs = [shape.widths.rotary_pairs];
     let rotary_components = zeros(Element::i32(), &pairs)?;
     let rotary_frequencies = zeros(Element::f32(), &pairs)?;
     let rotary_amplitudes = zeros(Element::f32(), &pairs)?;
@@ -209,9 +209,9 @@ pub(super) fn qualify_attention(
         device,
         &[
             0,
-            shape.rotary_adjacent,
-            shape.rotary_trailing,
-            shape.output_rotary,
+            u64::from(shape.form.rotary_adjacent),
+            u64::from(shape.form.rotary_trailing),
+            u64::from(shape.form.output_rotary),
             shape.stored_key(),
         ],
         &[],
@@ -226,9 +226,9 @@ pub(super) fn qualify_attention(
         device,
         &[
             0,
-            shape.rotary_adjacent,
-            shape.rotary_trailing,
-            shape.output_rotary,
+            u64::from(shape.form.rotary_adjacent),
+            u64::from(shape.form.rotary_trailing),
+            u64::from(shape.form.output_rotary),
             shape.stored_key(),
             shape.rounds_keys(),
         ],
@@ -238,12 +238,12 @@ pub(super) fn qualify_attention(
     )?;
     let selected_rows = semantic_i32(
         device,
-        &[1, shape.picks],
-        &vec![-1; shape.picks as usize],
+        &[1, shape.widths.picks],
+        &vec![-1; shape.widths.picks as usize],
         ENTRY,
         label,
     )?;
-    let selected = zeros(binding.activation, &[0, shape.kv_heads, shape.width])?;
+    let selected = zeros(binding.activation, &[0, shape.widths.kv_heads, shape.widths.width])?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
     let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
@@ -316,11 +316,11 @@ pub(super) fn qualify_attention(
             low_rank_kernels.is_some()
         ),
     };
-    let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate])?;
-    let mixed_gate = per_head(&projected.r1, &[1, heads, shape.separate_gate])?;
-    let fresh_rows = [shape.fresh, 1, kv_heads * width];
+    let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate()])?;
+    let mixed_gate = per_head(&projected.r1, &[1, heads, shape.separate_gate()])?;
+    let fresh_rows = [u64::from(shape.form.fresh), 1, kv_heads * width];
     let mixed_key = per_head(&projected.r2, &fresh_rows)?;
-    let mixed_value = match shape.values {
+    let mixed_value = match shape.form.values {
         AttentionValues::Projected => per_head(&projected.r3, &fresh_rows)?,
         AttentionValues::RawKey => per_head(&projected.r2, &fresh_rows)?,
         // Stored-key values take no value of their own (`VK`).

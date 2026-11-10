@@ -302,9 +302,9 @@ fn free_after_submitted_read(backend: BackendName) {
             &kernel,
             slab_scale::WorkflowArgs {
                 x: input.tensor().into(),
-                slab_rows: 256,
-                factor: 2.0,
-                delay_ms: 80,
+                slab_rows: seismic::Argument::from(256),
+                factor: seismic::Argument::from(2.0),
+                delay_ms: seismic::Argument::from(80),
             },
         )
         .unwrap()
@@ -363,7 +363,7 @@ fn queued_graph_keeps_slab_placement_fixed_until_submission_or_drop() {
             &kernel,
             scale_rows::WorkflowArgs {
                 x: input.tensor().into(),
-                factor: 2.0,
+                factor: seismic::Argument::from(2.0),
             },
         )
         .unwrap()

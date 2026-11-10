@@ -2373,17 +2373,22 @@ impl ManagedModelStore {
     }
 
     /// A local GGUF's facts and classification. Its header is read only when the file changed or
-    /// was never classified, and then from the header cache when it holds it.
+    /// was never classified, and then from the header cache when it holds it; a file read here is
+    /// classified from that read.
     pub fn classify_local_gguf(
         &self,
         path: &Path,
         architectures: &crate::candidate_files::RecognizedArchitectures,
     ) -> Result<(crate::gguf::LocalGguf, crate::candidate_files::HeaderClassification), InventoryError>
     {
-        let mut read = None;
-        let gguf = crate::inventory::local_gguf_cached(&self.cache, path, |header| {
-            self.write_header(header);
-            read = Some(header.to_vec());
+        let mut classified = None;
+        let gguf = crate::inventory::local_gguf_cached(&self.cache, path, |local| {
+            self.write_header(&local.header);
+            classified = Some(crate::candidate_files::classify(
+                &local.directory,
+                &local.gguf.inspection,
+                architectures,
+            ));
         })?;
         let size_bytes = std::fs::metadata(path)
             .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?
@@ -2398,11 +2403,16 @@ impl ManagedModelStore {
         {
             return Ok((gguf, classification.for_file(size_bytes)));
         }
-        let header = match read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest)) {
-            Some(header) => header,
-            None => self.local_gguf_header(path)?.1,
+        let classification = match classified {
+            Some(classification) => classification,
+            None => {
+                let header = match self.cache.read_header(&gguf.inspection.header_digest) {
+                    Some(header) => header,
+                    None => self.local_gguf_header(path)?.1,
+                };
+                crate::candidate_files::classify_header(&header, architectures)?
+            }
         };
-        let classification = crate::candidate_files::classify_header(&header, architectures)?;
         self.cache
             .write_index(ModelIndexKind::CandidateClassification, &evidence, &classification);
         Ok((gguf, classification.for_file(size_bytes)))
@@ -4637,11 +4647,11 @@ mod tests {
         let Ok(Walk::Complete(layout)) = walk(&header) else {
             panic!("complete header");
         };
-        let entry = |key: &str| layout.entries.iter().find(|entry| entry.head.key == key).unwrap();
+        let entry = |key: &str| layout.entries.iter().find(|entry| entry.head().key == key).unwrap();
         let (nextn, tokens) = (entry("qwen35.nextn_predict_layers"), entry("tokenizer.ggml.tokens"));
-        let mut moved = header[..nextn.head.start].to_vec();
+        let mut moved = header[..nextn.head().start].to_vec();
         moved.extend_from_slice(&header[nextn.end..tokens.end]);
-        moved.extend_from_slice(&header[nextn.head.start..nextn.end]);
+        moved.extend_from_slice(&header[nextn.head().start..nextn.end]);
         moved.extend_from_slice(&header[tokens.end..]);
         let prefix_shape = ModelShape::from_header_prefix(&moved[..SHAPE_PREFIX_BYTES]).unwrap();
         let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();

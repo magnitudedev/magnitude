@@ -285,15 +285,18 @@ pub(crate) fn block_scopes(block: usize) -> Result<[WeightScope; 2], String> {
     Ok([0, 1].map(|sublayer| WeightScope::TargetSublayer(SublayerIndex { block, sublayer })))
 }
 
-/// A target sublayer (or branch) scope of a graph prepared for block `from`,
-/// moved to block `to`: the same sublayer (or branch) at the same offset
-/// from the block, so a scope of a later block (a streamed route's layers
-/// ahead) moves with it. A decoder-wide scope (the exit site the last block
-/// ends with) is every block's own.
-pub(super) fn block_scope(scope: WeightScope, from: usize, to: usize) -> Result<WeightScope, String> {
+/// A target sublayer (or branch) scope a block graph names relative to its
+/// block (`relative_scope`), bound for block `to`: the same sublayer (or
+/// branch) at the same offset from the block, so a scope of a later block
+/// (a streamed route's layers ahead) moves with it. A decoder-wide scope
+/// (the exit site the last block ends with) is every block's own.
+pub(super) fn block_scope(scope: WeightScope, to: usize) -> Result<WeightScope, String> {
+    // An offset is a wrapped `u32` (`relative_scope`): earlier blocks wrap
+    // below zero.
     let moved = |block: u32| {
-        (u64::from(block) + to as u64)
-            .checked_sub(from as u64)
+        i64::try_from(to)
+            .ok()
+            .map(|to| to + i64::from(block as i32))
             .and_then(|block| u32::try_from(block).ok())
             .ok_or_else(|| format!("block graph scope {scope:?} moves outside the target"))
     };
@@ -544,7 +547,7 @@ impl PreparedTargetGraphs {
             ));
         }
         let certificate =
-            certify_target_family(device.backend(), load, geometry, state, plan, limits, pass)
+            certify_target_family::<seismic::NativeGraphLayout>(device.backend(), load, geometry, state, plan, limits, pass)
                 .map_err(|error| error.to_string())?;
         let TargetFamilyCertificate { outline, served, passes, group: certificate_group, .. } = certificate;
         let largest_rows = outline.largest_rows;
@@ -662,11 +665,7 @@ impl PreparedTargetGraphs {
             };
             let tap = match (positions.any(), tap_width, &handles.taps) {
                 (false, ..) => None,
-                (true, Some(width), Some(taps)) => Some(TapEntry {
-                    entry: &taps.tap,
-                    width,
-                    positions,
-                }),
+                (true, Some(width), Some(taps)) => Some((width, TapEntry { entry: &taps.tap, positions })),
                 _ => return Err("a tapped block has no tap entry".to_owned()),
             };
             // A pass merges its own rows (`Passes::lengths`); a back combines

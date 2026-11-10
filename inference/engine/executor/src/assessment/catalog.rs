@@ -40,7 +40,7 @@ const REQUIRED: [&str; 1] = ["qwen3.8-flash-next:gguf:q4"];
 
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
-fn support_levels() -> BTreeMap<String, String> {
+pub(super) fn support_levels() -> BTreeMap<String, String> {
     let catalog: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../../../catalog/models.json")).unwrap();
     catalog["models"]
@@ -66,7 +66,7 @@ fn support_levels() -> BTreeMap<String, String> {
 }
 
 /// The standard service's limits, as assessment plans them.
-const LIMITS: ResourceLimits = ResourceLimits {
+pub(super) const LIMITS: ResourceLimits = ResourceLimits {
     max_launch_rows: 512,
     max_launch_slots: 8,
     max_selected_rows: 8,
@@ -255,21 +255,25 @@ fn sort(line: String, served: bool, failures: &mut Vec<String>, refused: &mut Ve
 
 /// Whether `reason` is a fact of the device or its backend, which refuses
 /// every model alike, rather than of the model.
-fn refused_by_the_device(reason: &UnstreamedExperts) -> bool {
+pub(super) fn refused_by_the_device(reason: &UnstreamedExperts) -> bool {
     use UnstreamedExperts::*;
     matches!(reason, Backend(_) | Unreserved(_) | Unreservable { .. } | Untiered { .. })
 }
 
 /// The components a plain load of a target selects: neither an embedded
 /// head nor vision.
-const SELECTION: ComponentSelection = ComponentSelection {
+pub(super) const SELECTION: ComponentSelection = ComponentSelection {
     head: false,
     vision: false,
 };
 
+/// The target with its draft head, as a load that drafts through it selects
+/// it.
+const HEAD_SELECTION: ComponentSelection = ComponentSelection { head: true, vision: false };
+
 /// The package of catalog target `component` alone, its directory
 /// `target`.
-fn target_manifest(
+pub(super) fn target_manifest(
     path: &Path,
     target: &magnitude_artifacts::gguf::Directory,
     identity: PackageIdentity,
@@ -291,7 +295,7 @@ fn target_manifest(
 
 /// The plain load of `manifest` on `backend`, as the standard service
 /// plans it.
-fn plain_load(
+pub(super) fn plain_load(
     manifest: &PackageManifest,
     definition: &magnitude_family_contracts::ModelDefinition,
     backend: BackendName,
@@ -303,7 +307,7 @@ fn plain_load(
 /// Where the experts of `definition` stream on `backend`: the device's and
 /// the host tier's reservations of the recorded machine of the backend.
 /// Experts that do not stream are refused with their reason.
-fn bank_reservations(
+pub(super) fn bank_reservations(
     definition: &magnitude_family_contracts::ModelDefinition,
     backend: BackendName,
 ) -> Result<(seismic::Reservation, crate::planning::HostTier), PlanError> {
@@ -854,7 +858,40 @@ fn plan_and_charge_separate_draft(
 /// (`magnitude_engine::host::bind_draft`): a block drafter as a separate
 /// draft, a prediction-head or assistant file as a head in the draft
 /// component.
-fn bind_catalog_draft(
+/// Every served target that has a catalog draft ([`served_targets`]), with
+/// its definition bound with the draft ([`bind_catalog_draft`]: a separate
+/// draft or a draft head) and its package carrying the draft's file.
+pub(super) fn served_drafted_targets() -> Vec<(String, magnitude_family_contracts::ModelDefinition, PackageManifest)> {
+    served_targets()
+        .into_iter()
+        .filter_map(|(name, declared, manifest)| {
+            let component = headers::index()
+                .iter()
+                .find(|component| component.model.as_str() == name && component.role == ComponentRole::Draft)?;
+            let draft = headers::component(component);
+            let family = FAMILIES
+                .iter()
+                .find(|family| family.recognizes(&headers::target(&name)))
+                .unwrap_or_else(|| panic!("{name}: a family recognizes the served target"));
+            let definition = bind_catalog_draft(*family, &declared, &draft)
+                .unwrap_or_else(|error| panic!("{name}: its draft binds: {error}"));
+            let manifest = PackageManifest {
+                draft: Some(ComponentManifest {
+                    files: vec![ComponentFile {
+                        path: component.path.clone(),
+                        size: draft.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+                    }],
+                    identity: ArtifactIdentity([9; 32]),
+                    tensors: draft.tensors.clone(),
+                }),
+                ..manifest
+            };
+            Some((name, definition, manifest))
+        })
+        .collect()
+}
+
+pub(super) fn bind_catalog_draft(
     family: &dyn ModelFamily,
     declared: &magnitude_family_contracts::ModelDefinition,
     draft: &magnitude_artifacts::gguf::Directory,
@@ -1055,4 +1092,316 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
     println!("outside this test:\n{}", outside.join("\n"));
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(!finalized.is_empty(), "no catalog load offers views");
+}
+
+/// How the outlines of a test of graph traces were answered, and how long
+/// each took: from a trace recorded before, or by recording one.
+#[derive(Default)]
+struct TraceTally {
+    answered: (u32, std::time::Duration),
+    recorded: (u32, std::time::Duration),
+}
+
+impl TraceTally {
+    /// `outline`'s result, tallied as answered where the family's count of
+    /// traces recorded (`traces`) did not move, else as recorded.
+    fn outline<T>(&mut self, traces: impl Fn() -> usize, outline: impl FnOnce() -> T) -> T {
+        let before = traces();
+        let began = std::time::Instant::now();
+        let outlined = outline();
+        let elapsed = began.elapsed();
+        let tally = if traces() == before { &mut self.answered } else { &mut self.recorded };
+        *tally = (tally.0 + 1, tally.1 + elapsed);
+        outlined
+    }
+
+    /// Print the tally over `rows` rows, `traces` traces recorded in all.
+    fn report(&self, rows: usize, traces: usize) {
+        let mean = |(count, total): (u32, std::time::Duration)| total.checked_div(count.max(1)).unwrap_or_default();
+        println!(
+            "{rows} rows; {traces} traces recorded for {} outlines ({:?} each), {} outlines answered by a trace ({:?} each)",
+            self.recorded.0,
+            mean(self.recorded),
+            self.answered.0,
+            mean(self.answered)
+        );
+    }
+}
+
+/// The state `load` of `definition` plans for `method` at the standard
+/// service's limits, its domain unbounded for the purpose.
+fn state_at_limits(
+    definition: &magnitude_family_contracts::ModelDefinition,
+    load: &ModelLoadPlan,
+    method: PlannedMethod,
+) -> Result<crate::StateResourcePlan, String> {
+    ResourcePlanner::state_plan(
+        definition,
+        load,
+        method,
+        KvCodec::AffineK8V4,
+        LIMITS,
+        ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent },
+    )
+}
+
+/// What a test of graph traces compares of each graph class: its storage,
+/// plan heap and bound heap.
+fn class_terms<'a, C: crate::programs::graph::draft::Certified + 'a>(
+    certified: impl IntoIterator<Item = &'a C>,
+) -> Vec<(seismic::NativeGraphStorageBytes, seismic::HostHeap, seismic::HostHeap)> {
+    certified.into_iter().map(|class| (class.storage_bytes(), class.plan_heap(), class.bound_heap())).collect()
+}
+
+/// A served draft head's load at the standard service's limits on
+/// `backend`, its state and its program plan, for the tests of its graph
+/// traces; none where the target has no resident form there.
+fn head_plans(
+    name: &str,
+    definition: &magnitude_family_contracts::ModelDefinition,
+    manifest: &PackageManifest,
+    backend: BackendName,
+    method: PlannedMethod,
+) -> Option<(ModelLoadPlan, crate::StateResourcePlan, crate::ProgramPlan)> {
+    let layout = resident_layout(ExecutionPath::Native, backend);
+    let load = ModelLoadPlan::derive(manifest, definition, HEAD_SELECTION, layout, method, LIMITS).ok()?;
+    let line = format!("{name} {}", backend.as_str());
+    let state = state_at_limits(definition, &load, method).unwrap_or_else(|error| panic!("{line}: its state plans: {error}"));
+    let program = load
+        .program_plan(definition, KvCodec::AffineK8V4)
+        .unwrap_or_else(|error| panic!("{line}: its program plan: {error}"));
+    Some((load, state, program))
+}
+
+/// Every served target's heads: each target's own (from its file alone)
+/// and its catalog draft's ([`served_drafted_targets`]), each named by the
+/// component it comes from.
+fn served_heads() -> impl Iterator<Item = (&'static str, (String, magnitude_family_contracts::ModelDefinition, PackageManifest))> {
+    (served_targets().into_iter().map(|target| ("target", target)))
+        .chain(served_drafted_targets().into_iter().map(|drafted| ("draft", drafted)))
+}
+
+/// A draft head's method in the tests of its graph traces.
+const HEAD_METHOD: PlannedMethod = PlannedMethod::Mtp {
+    greedy_proposals: 1,
+    sampled_proposals: 1,
+    widths: crate::DraftWidths::Adaptive,
+};
+
+/// Every served target's state copy graphs, outlined from the family's graph
+/// traces (`seismic::trace`: recorded once per topology, answering every
+/// later model its guards and shapes admit), hold exactly what the load's
+/// layouts of the same classes hold, layout by layout, on `backend` at
+/// the standard service's limits: storage, census and both host heaps. How
+/// many traces were recorded for how many outlines, and the time of an
+/// outline a trace answered against one it recorded, are printed.
+fn every_served_target_outlines_its_state_copies_from_traces(backend: BackendName) {
+    use crate::programs::native_state::{certify_copy_family, copy_traces_recorded, state_copy_classes};
+    let row_classes = magnitude_batching::row_classes(LIMITS.max_launch_rows)
+        .into_iter()
+        .map(|rows| rows as u64)
+        .collect::<Vec<_>>();
+    let (mut rows, mut failures, mut tally) = (0, Vec::new(), TraceTally::default());
+    for (name, definition, manifest) in served_targets() {
+        // A target need not have a resident form on every backend.
+        let Ok(load) = plain_load(&manifest, &definition, backend) else {
+            continue;
+        };
+        let line = format!("{name} {}", backend.as_str());
+        let state = state_at_limits(&definition, &load, PlannedMethod::Plain)
+            .unwrap_or_else(|error| panic!("{line}: its state plans: {error}"));
+        let classes = state_copy_classes(state.target_state(), state.head_state(), &row_classes)
+            .unwrap_or_else(|error| panic!("{line}: its copy classes: {error}"));
+        let outlined = tally.outline(copy_traces_recorded, || certify_copy_family::<seismic::NativeGraphOutline>(backend, &classes));
+        let certified = certify_copy_family::<seismic::NativeGraphLayout>(backend, &classes);
+        rows += 1;
+        match (outlined, certified) {
+            (Ok((storage, graphs, outlines)), Ok((held, recorded_graphs, layouts))) => {
+                let (outlined, laid) = (class_terms(&outlines), class_terms(&layouts));
+                if storage != held || graphs != recorded_graphs || outlined != laid {
+                    failures.push(format!("{line}: outlined {storage:?} {outlined:?}, laid out {held:?} {laid:?}"));
+                }
+            }
+            (outlined, certified) => failures.push(format!(
+                "{line}: outlined {:?}, laid out {:?}",
+                outlined.err(),
+                certified.err()
+            )),
+        }
+    }
+    tally.report(rows, copy_traces_recorded());
+    assert!(rows > 0);
+    assert!(failures.is_empty(), "{} of {rows} rows differ:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_target_outlines_its_state_copies_from_traces_on_cpu() {
+    every_served_target_outlines_its_state_copies_from_traces(BackendName::Cpu);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_target_outlines_its_state_copies_from_traces_on_metal() {
+    every_served_target_outlines_its_state_copies_from_traces(BackendName::Metal);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_target_outlines_its_state_copies_from_traces_on_cuda() {
+    every_served_target_outlines_its_state_copies_from_traces(BackendName::Cuda);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_target_outlines_its_state_copies_from_traces_on_vulkan() {
+    every_served_target_outlines_its_state_copies_from_traces(BackendName::Vulkan);
+}
+
+/// Every causal draft head of a served target ([`served_heads`]: its own
+/// or its catalog draft's) outlines its head graphs
+/// from the head's traces exactly as its own recording lays them out, on
+/// `backend` where it loads: per row, the family's storage and each class's
+/// storage, plan heap and bound heap. The counts of traces recorded, and the
+/// time of an outline a trace answered against one it recorded, are printed.
+fn every_served_head_outlines_its_graphs_from_traces(backend: BackendName) {
+    use crate::programs::native_head::{certify_head_family, head_graph_classes, head_traces_recorded};
+    let (mut rows, mut failures, mut tally) = (0, Vec::new(), TraceTally::default());
+    for (component, (name, definition, manifest)) in served_heads() {
+        let Some(head) = definition.head.as_ref() else {
+            continue;
+        };
+        if !matches!(crate::operators::head_form(head, &definition.decoder), Ok(crate::operators::HeadForm::Causal)) {
+            continue;
+        }
+        let head_block = crate::operators::CausalHeadBlock::of(head, &head.blocks[0])
+            .unwrap_or_else(|error| panic!("{name}: its head block: {error}"));
+        // A target need not have a resident form on every backend.
+        let Some((load, state, program)) = head_plans(&name, &definition, &manifest, backend, HEAD_METHOD) else {
+            continue;
+        };
+        let line = format!("{name} {component} {}", backend.as_str());
+        let (Some(head_program), Some(head_state)) = (program.head(), state.head_state()) else {
+            panic!("{line}: a selected causal head plans no head program or state");
+        };
+        let history = head_state.sole_history().unwrap_or_else(|error| panic!("{line}: {error}"));
+        let classes = head_graph_classes(
+            LIMITS,
+            history.rows as u64,
+            history.slab_rows,
+            head_state.span_limit(),
+            HEAD_METHOD.draft_rows(),
+        )
+        .unwrap_or_else(|error| panic!("{line}: its head classes: {error}"));
+        let binding = head_program.blocks()[0];
+        let outlined = tally.outline(head_traces_recorded, || {
+            certify_head_family::<seismic::NativeGraphOutline>(backend, &load, &definition.decoder, head_block, binding, &classes)
+                .map(|(storage, outlines)| (storage, class_terms(outlines.values())))
+        });
+        let laid = certify_head_family::<seismic::NativeGraphLayout>(backend, &load, &definition.decoder, head_block, binding, &classes)
+            .map(|(storage, layouts)| (storage, class_terms(layouts.values())));
+        rows += 1;
+        match (outlined, laid) {
+            (Ok(outlined), Ok(laid)) if outlined == laid => {}
+            (outlined, laid) => failures.push(format!("{line}: outlined {outlined:?}, laid out {laid:?}")),
+        }
+    }
+    tally.report(rows, head_traces_recorded());
+    assert!(rows > 0);
+    assert!(failures.is_empty(), "{} of {rows} rows differ:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_head_outlines_its_graphs_from_traces_on_cpu() {
+    every_served_head_outlines_its_graphs_from_traces(BackendName::Cpu);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_head_outlines_its_graphs_from_traces_on_metal() {
+    every_served_head_outlines_its_graphs_from_traces(BackendName::Metal);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_head_outlines_its_graphs_from_traces_on_cuda() {
+    every_served_head_outlines_its_graphs_from_traces(BackendName::Cuda);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_head_outlines_its_graphs_from_traces_on_vulkan() {
+    every_served_head_outlines_its_graphs_from_traces(BackendName::Vulkan);
+}
+
+/// Every shared draft head of a served target ([`served_heads`]: a shared
+/// head is a draft component's, so it comes from a catalog draft)
+/// outlines its head graphs
+/// from the shared head's traces exactly as its own recording lays them
+/// out, on `backend` where it loads (as
+/// `every_served_head_outlines_its_graphs_from_traces`).
+fn every_served_shared_head_outlines_its_graphs_from_traces(backend: BackendName) {
+    use crate::programs::native_shared_head::{
+        SharedHeadGeometry, certify_shared_head_family, shared_head_graph_classes, shared_head_traces_recorded,
+    };
+    let (mut rows, mut failures, mut tally) = (0, Vec::new(), TraceTally::default());
+    for (component, (name, definition, manifest)) in served_heads() {
+        let Some(head) = definition.head.as_ref() else {
+            continue;
+        };
+        if !matches!(crate::operators::head_form(head, &definition.decoder), Ok(crate::operators::HeadForm::Shared(_))) {
+            continue;
+        }
+        // A target need not have a resident form on every backend.
+        let Some((load, state, program)) = head_plans(&name, &definition, &manifest, backend, HEAD_METHOD) else {
+            continue;
+        };
+        let line = format!("{name} {component} {}", backend.as_str());
+        let shared = program
+            .shared_head()
+            .unwrap_or_else(|| panic!("{line}: a selected shared head plans no program"));
+        let geometry = SharedHeadGeometry::new(&definition, &state, shared)
+            .unwrap_or_else(|error| panic!("{line}: its shared head geometry: {error}"));
+        let classes = shared_head_graph_classes(LIMITS, HEAD_METHOD.draft_rows())
+            .unwrap_or_else(|error| panic!("{line}: its shared head classes: {error}"));
+        let outlined = tally.outline(shared_head_traces_recorded, || {
+            certify_shared_head_family::<seismic::NativeGraphOutline>(backend, &load, &geometry, classes.iter().copied())
+                .map(|(storage, outlines)| (storage, class_terms(outlines.values())))
+        });
+        let laid = certify_shared_head_family::<seismic::NativeGraphLayout>(backend, &load, &geometry, classes.iter().copied())
+            .map(|(storage, layouts)| (storage, class_terms(layouts.values())));
+        rows += 1;
+        match (outlined, laid) {
+            (Ok(outlined), Ok(laid)) if outlined == laid => {}
+            (outlined, laid) => failures.push(format!("{line}: outlined {outlined:?}, laid out {laid:?}")),
+        }
+    }
+    tally.report(rows, shared_head_traces_recorded());
+    assert!(rows > 0);
+    assert!(failures.is_empty(), "{} of {rows} rows differ:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_shared_head_outlines_its_graphs_from_traces_on_cpu() {
+    every_served_shared_head_outlines_its_graphs_from_traces(BackendName::Cpu);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_shared_head_outlines_its_graphs_from_traces_on_metal() {
+    every_served_shared_head_outlines_its_graphs_from_traces(BackendName::Metal);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_shared_head_outlines_its_graphs_from_traces_on_cuda() {
+    every_served_shared_head_outlines_its_graphs_from_traces(BackendName::Cuda);
+}
+
+#[test]
+#[ignore = "the served catalog's headers: run on a rig host"]
+fn every_served_shared_head_outlines_its_graphs_from_traces_on_vulkan() {
+    every_served_shared_head_outlines_its_graphs_from_traces(BackendName::Vulkan);
 }

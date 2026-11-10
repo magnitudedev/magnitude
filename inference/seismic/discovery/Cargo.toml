@@ -9,6 +9,7 @@ license.workspace = true
 # their pinning.
 [dependencies]
 seismic-topology.workspace = true
+seismic-lang.workspace = true
 seismic-cpu.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true

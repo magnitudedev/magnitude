@@ -4,19 +4,18 @@
 //! and the join of a sublayer whose output joins nothing itself.
 
 use super::{
-    BlockStreams, LowRankGeometry, MixDownBinding, MixUpBinding, ResidualCarry, SinkhornMixing,
+    BlockStreams, LowRankGeometry, MixDownBinding, MixUpBinding, ResidualCarry, SinkhornTopology,
     Sites, StreamsGeometry,
 };
-use crate::ModelLoadPlan;
 use crate::native::{MixingKernels, StreamsKernels};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_target_graph::{PlannedWeights, WeightPort, weight};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     repeat_rows, stream_collapse, stream_join, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 /// The kernel entries of one mix site: `stream_mix_down` (with inject
 /// values at a sublayer's site, without at the exit) and `stream_mix_up`.
@@ -140,6 +139,7 @@ impl<'a> From<&'a StreamsKernels> for StreamsEntries<'a, NativeGraph> {
 }
 
 /// The element assignments of a mix site's entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedSiteEntries {
     down: [(&'static str, Element); 4],
     up: [(&'static str, Element); 3],
@@ -147,12 +147,14 @@ pub(crate) struct CheckedSiteEntries {
 
 /// The element assignments of a block's mix sites' entries: the low-rank
 /// sites', or the Sinkhorn entries', which bind none.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedMixing {
     LowRank(Sites<CheckedSiteEntries>),
     Sinkhorn([(&'static str, Element); 0]),
 }
 
 /// The element assignments of a block's streams entries from its binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedStreamsEntries {
     mixing: CheckedMixing,
     repeat: [(&'static str, Element); 0],
@@ -212,21 +214,25 @@ pub(crate) fn up_elements(binding: MixUpBinding) -> [(&'static str, Element); 3]
 }
 
 /// The streams of `rows` embedded rows `[rows, H]`: S copies of each.
-pub(crate) fn widen<'a, G: GraphDraft + 'a>(
+pub(crate) fn widen<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entry: G::Binding<'a, repeat_rows::Entry>,
-    geometry: StreamsGeometry,
+    geometry: StreamsGeometry<D, D>,
     embedded: &WorkflowTensor,
-    rows: u64,
+    rows: impl Into<Dim>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<ResidualCarry<WorkflowTensor>, GraphError> {
+) -> Result<ResidualCarry<WorkflowTensor>, GraphError>
+where
+    D: Into<Dim>,
+{
+    let (geometry, rows) = (geometry.dims(), rows.into());
     let copies = GraphConstant::f32(graph, &vec![1.0; geometry.streams as usize])?;
     let scales = copies.port().tensor().clone();
     constants.push(copies);
     let streams = graph
         .enqueue(
             entry,
-            &[("M", rows), ("H", geometry.hidden), ("S", geometry.streams)],
+            &[("M", rows.clone()), ("H", geometry.hidden.clone()), ("S", Dim::from(geometry.streams))],
             repeat_rows::WorkflowArgs {
                 rows: embedded.into(),
                 scales: (&scales).into(),
@@ -238,7 +244,7 @@ pub(crate) fn widen<'a, G: GraphDraft + 'a>(
     let pre = geometry
         .sinkhorn()
         .map(|_| {
-            let one_hot = GraphConstant::row_one_hot(graph, rows, geometry.streams, Some("M"))?;
+            let one_hot = GraphConstant::row_one_hot(graph, rows.clone(), geometry.streams, Some("M"))?;
             let pre = one_hot.port().tensor().clone();
             constants.push(one_hot);
             Ok::<_, GraphError>(pre)
@@ -258,23 +264,28 @@ pub(crate) struct MixSite {
 /// norm, down and up weights (and, `injected`, its inject weights) are the
 /// scope's hyper-connection roles.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mix_site<'a, G: GraphDraft + 'a>(
+pub(crate) fn mix_site<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entries: SiteEntries<'a, G>,
-    load: &ModelLoadPlan,
+    load: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    geometry: LowRankGeometry,
+    geometry: LowRankGeometry<D>,
     residual: &WorkflowTensor,
-    rows: u64,
-    epsilon: f32,
+    rows: impl Into<Dim>,
+    epsilon: Argument<f32>,
     injected: bool,
     weights: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<MixSite, GraphError> {
-    let (h, s, r) = (geometry.hidden, geometry.streams, geometry.rank);
+) -> Result<MixSite, GraphError>
+where
+    D: Into<Dim>,
+{
+    let geometry = geometry.dims();
+    let rows = rows.into();
+    let (h, s, r) = (&geometry.hidden, Dim::from(geometry.streams), &geometry.rank);
     // The mix entries read the streams and their norm as `[.., S, H]`.
-    let streams = residual.reshape(&[rows, s, h]);
+    let streams = residual.reshape(&[&rows, &s, h]);
     let norm =
-        weight(graph, load, scope, WeightKind::HyperConnectionNorm, weights)?.reshape(&[s, h]);
+        weight(graph, load, scope, WeightKind::HyperConnectionNorm, weights)?.reshape(&[&s, h]);
     let down = weight(graph, load, scope, WeightKind::HyperConnectionDown, weights)?;
     let up = weight(graph, load, scope, WeightKind::HyperConnectionUp, weights)?;
     let inject_weight = if injected {
@@ -285,18 +296,18 @@ pub(crate) fn mix_site<'a, G: GraphDraft + 'a>(
             WeightKind::HyperConnectionInject,
             weights,
         )?
-        .reshape(&[s, s * h])
+        .reshape(&[s.clone(), &s * h])
     } else {
         down.slice_leading(0, 0)
     };
     let mixed = graph.enqueue(
         entries.down,
         &[
-            ("M", rows),
+            ("M", &rows),
             ("H", h),
-            ("S", s),
+            ("S", &s),
             ("LR", r),
-            ("C", u64::from(injected)),
+            ("C", &Dim::from(u64::from(injected))),
         ],
         stream_mix_down::WorkflowArgs {
             hidden: (&streams).into(),
@@ -309,7 +320,7 @@ pub(crate) fn mix_site<'a, G: GraphDraft + 'a>(
     let partials = graph
         .enqueue(
             entries.up,
-            &[("M", rows), ("H", h), ("S", s), ("LR", r)],
+            &[("M", &rows), ("H", h), ("S", &s), ("LR", r)],
             stream_mix_up::WorkflowArgs {
                 low: (&mixed.r0).into(),
                 up_weight: (&up).into(),
@@ -338,23 +349,33 @@ pub(crate) struct SinkhornSite {
 /// the previous site's pre: its function, base and scale weights are the
 /// scope's hyper-connection roles.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a>(
+pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entry: G::Binding<'a, stream_mix_sinkhorn::Entry>,
-    load: &ModelLoadPlan,
+    load: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    geometry: StreamsGeometry,
-    mixing: SinkhornMixing,
+    geometry: StreamsGeometry<D, D>,
+    mixing: SinkhornTopology,
     carry: &ResidualCarry<WorkflowTensor>,
-    rows: u64,
+    rows: impl Into<Dim>,
     weights: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<SinkhornSite, GraphError> {
-    let (h, s) = (geometry.hidden, geometry.streams);
+) -> Result<SinkhornSite, GraphError>
+where
+    D: Into<Dim>,
+{
+    let geometry = geometry.dims();
+    let rows = rows.into();
+    let (h, s) = (&geometry.hidden, Dim::from(geometry.streams));
+    let iterations = geometry
+        .sinkhorn()
+        .ok_or("a Sinkhorn site over low-rank streams")?
+        .word::<u32>()
+        .ok_or("Sinkhorn iterations exceed u32")?;
     let previous = carry
         .pre
         .as_ref()
         .ok_or("Sinkhorn streams without the previous site's pre")?;
-    let streams = carry.rows.reshape(&[rows, s, h]);
+    let streams = carry.rows.reshape(&[&rows, &s, h]);
     let mut weight = |kind| weight(graph, load, scope, kind, weights);
     let (function, base, scale) = (
         weight(WeightKind::HyperConnectionFunction)?,
@@ -363,16 +384,16 @@ pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a>(
     );
     let site = graph.enqueue(
         entry,
-        &[("M", rows), ("H", h), ("S", s)],
+        &[("M", &rows), ("H", h), ("S", &s)],
         stream_mix_sinkhorn::WorkflowArgs {
             hidden: (&streams).into(),
             previous: previous.into(),
             function: (&function).into(),
             base: (&base).into(),
             scale: (&scale).into(),
-            epsilon: mixing.epsilon,
-            norm_epsilon: mixing.norm_epsilon,
-            iterations: mixing.iterations,
+            epsilon: mixing.epsilon.f32(),
+            norm_epsilon: mixing.norm_epsilon.f32(),
+            iterations,
         },
     )?;
     Ok(SinkhornSite {
@@ -384,21 +405,26 @@ pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a>(
 
 /// The decoder's exit over `carry`'s Sinkhorn streams: their collapse by the
 /// last site's pre `[rows, H]`, which the readout normalizes.
-pub(crate) fn collapse<'a, G: GraphDraft + 'a>(
+pub(crate) fn collapse<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entry: G::Binding<'a, stream_collapse::Entry>,
-    geometry: StreamsGeometry,
+    geometry: StreamsGeometry<D, D>,
     carry: &ResidualCarry<WorkflowTensor>,
-    rows: u64,
-) -> Result<WorkflowTensor, GraphError> {
-    let (h, s) = (geometry.hidden, geometry.streams);
+    rows: impl Into<Dim>,
+) -> Result<WorkflowTensor, GraphError>
+where
+    D: Into<Dim>,
+{
+    let geometry = geometry.dims();
+    let rows = rows.into();
+    let (h, s) = (&geometry.hidden, Dim::from(geometry.streams));
     let pre = carry.pre.as_ref().ok_or("the exit of Sinkhorn streams without the last site's pre")?;
     Ok(graph
         .enqueue(
             entry,
-            &[("M", rows), ("H", h), ("S", s)],
+            &[("M", &rows), ("H", h), ("S", &s)],
             stream_collapse::WorkflowArgs {
-                hidden: (&carry.rows.reshape(&[rows, s, h])).into(),
+                hidden: (&carry.rows.reshape(&[&rows, &s, h])).into(),
                 pre: pre.into(),
             },
         )?
@@ -408,23 +434,27 @@ pub(crate) fn collapse<'a, G: GraphDraft + 'a>(
 /// The F32 output `y` `[rows, H]` of a sublayer whose output entry joins
 /// nothing itself, joined into the `[rows, S * H]` streams `residual` with
 /// its site's join values `values` (`stream_join`).
-pub(crate) fn join<'a, G: GraphDraft + 'a>(
+pub(crate) fn join<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entry: G::Binding<'a, stream_join::Entry>,
-    geometry: StreamsGeometry,
+    geometry: StreamsGeometry<D, D>,
     residual: &WorkflowTensor,
     y: &WorkflowTensor,
     values: &WorkflowTensor,
-    rows: u64,
-) -> Result<WorkflowTensor, GraphError> {
+    rows: impl Into<Dim>,
+) -> Result<WorkflowTensor, GraphError>
+where
+    D: Into<Dim>,
+{
+    let geometry = geometry.dims();
     Ok(graph
         .enqueue(
             entry,
             &[
-                ("M", rows),
-                ("H", geometry.hidden),
-                ("SN", geometry.streams),
-                ("IN", geometry.join_width()),
+                ("M", rows.into()),
+                ("H", geometry.hidden.clone()),
+                ("SN", Dim::from(geometry.streams)),
+                ("IN", Dim::from(geometry.join_width())),
             ],
             stream_join::WorkflowArgs {
                 residual: residual.into(),

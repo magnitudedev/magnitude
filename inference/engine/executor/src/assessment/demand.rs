@@ -768,7 +768,7 @@ fn ngram_output_row_bytes(binding: &crate::NGramBinding) -> Result<u64, Assessme
 /// The decode entries' `XS` of the routed layer of `scope`, as its graph
 /// states it (`streamed::source_rows`).
 fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1] {
-    [("XS", streamed::source_rows(load, scope))]
+    [("XS", streamed::source_rows(streamed::served(load, scope).is_some()))]
 }
 
 /// The routing of the routed layer of `scope` doing `work`: `resident` of a
@@ -1305,7 +1305,7 @@ impl DecodeDemand {
                 MixerProgramSlot::Attention(binding) => {
                     input(&mut step, scope, binding.norm)?;
                     let shape = binding.shape;
-                    let query = if shape.interleaved_gate > 0 {
+                    let query = if shape.form.gate == crate::planning::GateForm::Interleaved {
                         WeightKind::QueryGate
                     } else {
                         WeightKind::Query
@@ -1374,7 +1374,8 @@ impl DecodeDemand {
                             .map_err(demand_error)?;
                     let (row_bytes, window) =
                         history_read(&layout.target_history, LayerRef::Target(layer))?;
-                    let flops_per_token = 2 * shape.kv_heads * shape.group * (2 * shape.width);
+                    let widths = shape.widths;
+                    let flops_per_token = 2 * widths.kv_heads * widths.group * (2 * widths.width);
                     let read = |window| HistoryRead {
                         layout: Some(history_layout),
                         bytes_per_token: row_bytes,
@@ -1390,7 +1391,7 @@ impl DecodeDemand {
                             &layout.target_history,
                             layer,
                             source,
-                            (shape.picks, flops_per_token),
+                            (shape.widths.picks, flops_per_token),
                             binding.activation,
                             weight,
                         )?,

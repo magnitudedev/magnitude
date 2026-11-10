@@ -29,7 +29,7 @@ use super::Shared;
 use super::telemetry::Admitted;
 use super::core::{At, Core, ReadTable};
 use crate::experts::directory::{Directory, HostRecord, Point};
-use crate::experts::host_records::Claim;
+use crate::experts::host_records::{Claim, Taking};
 use crate::experts::compute::Urgency;
 use super::Step;
 use crate::experts::landing::{Answer, Converting, DeviceLanding, DeviceWords, Ended, Landing};
@@ -845,7 +845,8 @@ impl Prefetch {
         let Some(record) = self.staging.take_beyond(staging) else {
             return Err(Short::Staging);
         };
-        let Claim::Taken(grant) = core.directory.claim_landing(target, expert, tier) else {
+        let taking = if hinted.is_some() { Taking::Ahead } else { Taking::Out };
+        let Claim::Taken(grant) = core.directory.claim_landing(target, expert, tier, taking) else {
             self.staging.release(record);
             return Err(Short::Tier);
         };

@@ -78,7 +78,7 @@ fn a_read_that_never_ends_trips_with_no_read_line() {
         slots.request(6, 0);
         vec![Watched { kind: Kind::File, layer: 3, slots }]
     };
-    let mut stuck = watch(unanswered(), Box::new(|| None), Box::new(|_| false), flight(7), began);
+    let mut stuck = watch(unanswered(), Box::new(|| Park::Clear), Box::new(|_| false), flight(7), began);
     let (after, report) = looks(&mut stuck, began, &unpriced, limit * 3).expect("a read that never ends trips");
     assert!(after > limit && after <= limit * 2 + limit / 5, "tripped after {after:?}");
     assert!(report.contains("past its bound") && report.contains("no read line yet"), "{report}");
@@ -88,7 +88,7 @@ fn a_read_that_never_ends_trips_with_no_read_line() {
         outstanding: true,
         engine: EngineWork { ended: ended.fetch_add(1, std::sync::atomic::Ordering::Relaxed), reading: Vec::new(), last_ended: HashMap::new() },
     });
-    let mut slow = watch(unanswered(), Box::new(|| None), Box::new(|_| false), progressing, began);
+    let mut slow = watch(unanswered(), Box::new(|| Park::Clear), Box::new(|_| false), progressing, began);
     assert!(looks(&mut slow, began, &unpriced, limit * 10).is_none(), "tripped while its reads progressed");
 }
 
@@ -103,7 +103,7 @@ fn the_watchdogs_thread_trips_with_its_report_and_stops_when_dropped() {
         let (tripped, report) = mpsc::channel();
         let watchdog = Watchdog::start(
             vec![Watched { kind: Kind::File, layer: 3, slots }],
-            Box::new(|| None),
+            Box::new(|| Park::Clear),
             ended,
             Arc::default(),
             Box::new(idle),
@@ -138,7 +138,7 @@ fn an_unanswered_lane_of_each_kind_trips_with_its_report() {
         slots.request(5, lane);
         slots.answer(5, lane, false);
         slots.request(6, lane);
-        let mut watch = watch(vec![Watched { kind, layer: 3, slots }], Box::new(|| None), Box::new(|_| false), Box::new(idle), began);
+        let mut watch = watch(vec![Watched { kind, layer: 3, slots }], Box::new(|| Park::Clear), Box::new(|_| false), Box::new(idle), began);
         let (after, report) = looks(&mut watch, began, &bounds, limit * 2).unwrap_or_else(|| panic!("{kind:?}: never tripped"));
         assert!(after > limit, "{kind:?}: tripped before its bound");
         let slot = 6 % table.slots();
@@ -178,7 +178,7 @@ fn a_lane_whose_read_is_in_flight_trips_only_past_its_volumes_bound() {
         let reading = (0..count).map(|piece| flight(piece, since)).collect::<Vec<_>>();
         Box::new(move || Reads { outstanding: true, engine: EngineWork { ended: 7, reading: reading.clone(), last_ended: HashMap::new() } })
     };
-    let reading = |reads| watch(unanswered(), Box::new(|| None), Box::new(|_| false), reads, began);
+    let reading = |reads| watch(unanswered(), Box::new(|| Park::Clear), Box::new(|_| false), reads, began);
     // Sixteen pieces in flight ten lane bounds, none ending: within 320 ms.
     assert!(looks(&mut reading(flying(16, began)), began, &bounds, limit * 10).is_none(), "tripped while the volume was within its bound");
     // The last of the window, alone in flight, no sooner than the window's.
@@ -234,12 +234,39 @@ fn only_a_lane_the_device_waits_on_trips() {
     // Step 3 ended without its answer (a device error): nothing waits.
     let mut watch = watch(
         vec![Watched { kind: Kind::Scratch, layer: 0, slots: scratch }, Watched { kind: Kind::File, layer: 0, slots: file }],
-        Box::new(|| None),
+        Box::new(|| Park::Clear),
         Box::new(|step| step == 3),
         Box::new(idle),
         began,
     );
     assert!(looks(&mut watch, began, &bounds(limit, volumes(1e-3)), limit * 10).is_none(), "tripped on a lane nothing waits on");
+}
+
+/// A park the device waits at trips the watchdog at its bound though
+/// another thread holds the parks at every other look: a look that cannot
+/// see the park leaves the one last seen standing, its time running on,
+/// and a holder that never lets go hides no park either.
+#[test]
+fn a_park_unseen_while_its_holder_is_busy_still_trips_at_its_bound() {
+    let (limit, began) = (Duration::from_millis(30), Instant::now());
+    let bounds = bounds(limit, volumes(1e-3));
+    let reached = || Park::Reached(Parked { value: 853, step: 5, site: "layer 7 Round(2)".into() });
+    let looked = std::sync::atomic::AtomicU64::new(0);
+    let alternating: ParkedAt = Box::new(move || match looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 {
+        0 => reached(),
+        _ => Park::Unseen,
+    });
+    let mut busy = watch(Vec::new(), alternating, Box::new(|_| false), Box::new(idle), began);
+    let (after, report) = looks(&mut busy, began, &bounds, limit * 3).expect("a park unseen at every other look never tripped");
+    assert!(after > limit && after <= limit * 2, "tripped at {after:?}, its bound {limit:?}");
+    assert!(report.contains("parked at layer 7 Round(2) (value 853, step 5)"), "{report}");
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let stuck: ParkedAt = Box::new(move || match first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        true => reached(),
+        false => Park::Unseen,
+    });
+    let mut held = watch(Vec::new(), stuck, Box::new(|_| false), Box::new(idle), began);
+    assert!(looks(&mut held, began, &bounds, limit * 3).is_some(), "a park whose holder never let go never tripped");
 }
 
 /// A park the device reached and no answer released trips the watchdog
@@ -249,7 +276,7 @@ fn only_a_lane_the_device_waits_on_trips() {
 fn a_reached_unreleased_park_trips_whoever_writes_its_request() {
     let (limit, began) = (Duration::from_millis(30), Instant::now());
     let bounds = bounds(limit, volumes(1e-3));
-    let parked = || -> ParkedAt { Box::new(|| Some(Parked { value: 853, step: 5, site: "layer 7 Round(2)".into() })) };
+    let parked = || -> ParkedAt { Box::new(|| Park::Reached(Parked { value: 853, step: 5, site: "layer 7 Round(2)".into() })) };
     let mut tripping = watch(Vec::new(), parked(), Box::new(|_| false), Box::new(idle), began);
     let (after, report) = looks(&mut tripping, began, &bounds, limit * 2).expect("a reached park never tripped");
     assert!(after > limit, "tripped before its bound");

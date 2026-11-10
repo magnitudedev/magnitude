@@ -17,6 +17,8 @@
 pub mod assess;
 #[cfg(test)]
 mod catalog;
+#[cfg(test)]
+mod draft_traces;
 pub mod cost;
 pub mod demand;
 pub mod estimate;
@@ -28,17 +30,21 @@ pub mod miss_model;
 pub mod misses;
 #[cfg(test)]
 mod parity;
+#[cfg(test)]
+mod target_outlines;
 pub mod priced;
 pub mod requests;
 pub mod step;
 pub mod streamed;
 pub mod streaming;
 pub mod streaming_costs;
+#[cfg(test)]
+mod vision_traces;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,
+    assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, StructuralCharge,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
     ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, ModelPlacement, PreparedExecutionAssessment, Residency,
 };
@@ -59,7 +65,7 @@ pub use cost::{
 };
 pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
-pub use requests::{PointRequest, PointRequests, SiteRequest, Waiter};
+pub use requests::{Outstanding, PointRequest, PointRequests, SiteRequest, Waiter};
 pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
 pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
 pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};

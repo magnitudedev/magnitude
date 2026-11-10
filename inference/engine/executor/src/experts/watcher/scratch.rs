@@ -202,13 +202,12 @@ fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: us
     composed
 }
 
-/// The load's scratch words: each chain place's flags, each scratch
-/// round's convert list, the tier list and the seed list.
+/// The load's scratch words: each chain place's flags and each scratch
+/// round's convert list. A layer's tier and seed lists are its own
+/// (`Layer::tiered`, `Layer::seeds`).
 pub(super) struct ScratchWords {
     pub(super) flags: Vec<Words>,
     pub(super) lists: Vec<Words>,
-    pub(super) tiered: Words,
-    pub(super) seeds: Words,
 }
 
 /// Each layer's conveyor form, of layers whose routed tensors read the
@@ -682,7 +681,7 @@ impl Scratch {
         for listed in converted {
             listed.release(&mut self.conveyor);
         }
-        let settled = self.conveyor.settle(|ticket| ticket.wait_until(Instant::now()));
+        let settled = self.conveyor.settle();
         for &(layer, ..) in &settled.landed {
             self.mark(shared, layer, Mark::Landed);
         }
@@ -932,7 +931,7 @@ impl Scratch {
         let grants = match core.extents.placer {
             crate::planning::Placer::Tier => landed
                 .into_iter()
-                .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0) {
+                .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0, crate::experts::host_records::Taking::Out) {
                     crate::experts::host_records::Claim::Taken(grant) => Some((layer, expert, record, grant)),
                     _ => None,
                 })
@@ -1288,7 +1287,7 @@ impl Scratch {
                 })
                 .collect::<Vec<_>>();
             let seeds = ListBounds { from: core.layers[layer].experts as u64, to: core.layers[layer].lists.bank - first as u64, lent: 0 };
-            self.words.seeds.publish_list(sequence, &pairs, seeds);
+            core.layers[layer].seeds.publish_list(sequence, &pairs, seeds);
             seeded = pairs.len() as u64;
         }
         // The rounds fix the device's order of the request's experts: a
@@ -1302,7 +1301,7 @@ impl Scratch {
         // The tier list, which the tier copy reads after round 0's answer.
         self.tiers[index].deferred.retain(|expert| !tiered.contains(expert));
         let tier = ListBounds { from: core.layers[layer].lists.tier, to: core.layers[layer].experts as u64, lent: 0 };
-        self.words.tiered.publish_list(sequence, &listed, tier);
+        core.layers[layer].tiered.publish_list(sequence, &listed, tier);
         // The request's answer: the count its rounds convert, final now,
         // before round 0's.
         let table = &core.layers[layer].scratch;

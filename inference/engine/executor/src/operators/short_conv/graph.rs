@@ -6,22 +6,25 @@
 //! contract, so the block binds the recurrent control ports; its bank is the
 //! window alone.
 
-use crate::operators::Join;
-use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
+use crate::operators::gated_delta::graph::{RecurrentControlPorts, bank_ports, slab_banks};
+use crate::operators::{Join, RecurrentBank, split_bank};
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
+use crate::operators::output::{CheckedPostNormEntries, PostNorm, PostNormShape, TailEntries, post_norm};
 use crate::programs::graph::{
     GraphError,
     draft::{ControlSource, GraphDraft},
 };
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, packed_weight, scaled_weight, weight};
-use crate::{
-    ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, SublayerTail,
-    native::ShortConvKernels,
+use crate::programs::native_target_graph::{
+    PlannedWeights, WeightPort, packed_weight, scaled_weight, weight,
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use crate::{
+    ShortConvBinding, ShortConvShape, StateResourcePlan, SublayerTail, native::ShortConvKernels,
+};
+use magnitude_family_contracts::{ShortConv, WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 pub(crate) struct ShortConvGraphEntries<'a, G: GraphDraft + 'a> {
     pub project: G::Binding<'a, short_conv_project::Entry>,
@@ -40,6 +43,7 @@ impl<'a> From<&'a ShortConvKernels> for ShortConvGraphEntries<'a, NativeGraph> {
 }
 
 /// Entry element assignments from the program binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedShortConvEntries {
     project: [(&'static str, Element); 5],
     rows: [(&'static str, Element); 1],
@@ -82,86 +86,133 @@ impl CheckedShortConvEntries {
     }
 }
 
-/// One short-convolution block at one graph class.
-pub(crate) struct ShortConvBlock {
-    pub rows: u64,
-    pub slots: u64,
-    pub slab_banks: u32,
-    pub shape: ShortConvShape,
+/// What decides a short-convolution block's graph beside its entries: no
+/// model number. Its reals `R` (`RecurrentTopology`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShortConvTopology<R = Argument<f64>> {
     /// The input norm's epsilon.
-    pub epsilon: f32,
-    /// The post-norm's epsilon and the output scale, read only by a
-    /// post-norm tail.
-    pub post_norm_epsilon: f32,
-    pub post_norm_scale: f32,
-    /// Index of this layer's window in the store's recurrent components.
-    pub component_index: usize,
+    pub epsilon: R,
+    /// The post-norm tail's reals; none for a residual tail.
+    pub post_norm: Option<PostNorm<R>>,
+    /// The element of the layer's window.
+    pub window: [Element; 1],
     /// How the graph takes its launch's slot tables.
     pub controls: ControlSource,
+}
+
+impl<R> Numbers<R> for ShortConvTopology<R> {
+    type Of<E> = ShortConvTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> ShortConvTopology<E> {
+        ShortConvTopology {
+            epsilon: f(self.epsilon),
+            post_norm: self.post_norm.map(|post_norm| post_norm.map(&mut *f)),
+            window: self.window,
+            controls: self.controls,
+        }
+    }
+}
+
+/// The numbers of one short-convolution block at one graph class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShortConvBlock<D = Dim> {
+    pub rows: D,
+    pub slots: D,
+    pub shape: ShortConvShape<D>,
+    /// The layer's window, also its tape.
+    pub bank: RecurrentBank<D, 1>,
+}
+
+impl<D> Numbers<D> for ShortConvBlock<D> {
+    type Of<E> = ShortConvBlock<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> ShortConvBlock<E> {
+        ShortConvBlock {
+            rows: f(self.rows),
+            slots: f(self.slots),
+            shape: self.shape.map(f),
+            bank: self.bank.map(f),
+        }
+    }
+}
+
+/// The topology and numbers of the short-convolution block of `conv` over a
+/// `hidden`-wide residual at a class of `rows` rows and `slots` slots, its
+/// window `state`'s component `component_index`, with `post_norm`'s reals
+/// where its output joins the residual through a post-norm.
+pub(crate) fn split(
+    conv: &ShortConv,
+    hidden: u64,
+    rows: u64,
+    slots: u64,
+    epsilon: f32,
+    post_norm: Option<PostNorm<f64>>,
+    state: &StateResourcePlan,
+    component_index: usize,
+    controls: ControlSource,
+) -> Result<(ShortConvTopology<f64>, ShortConvBlock<u64>), GraphError> {
+    let (window, bank) = split_bank(state, component_index)?;
+    Ok((
+        ShortConvTopology {
+            epsilon: f64::from(epsilon),
+            post_norm,
+            window,
+            controls,
+        },
+        ShortConvBlock {
+            rows,
+            slots,
+            shape: ShortConvShape::of(hidden, conv).map_err(|error| error.to_string())?,
+            bank,
+        },
+    ))
 }
 
 pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: ShortConvGraphEntries<'a, G>,
-    state: &StateResourcePlan,
-    load: &ModelLoadPlan,
+    topology: &ShortConvTopology,
+    block: &ShortConvBlock,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    weights: &mut Vec<(WeightPort, NativePort)>,
+    ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     join: &Join,
-    block: ShortConvBlock,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
-    let shape = block.shape;
+    let shape = &block.shape;
     let mut scaled =
-        |graph: &mut G, kind| scaled_weight(graph, load, scope, kind, weights, constants);
+        |graph: &mut G, kind| scaled_weight(graph, weights, scope, kind, ports, constants);
     let input_gate = scaled(graph, WeightKind::ShortConvInputGate)?;
     let output_gate = scaled(graph, WeightKind::ShortConvOutputGate)?;
     let value = scaled(graph, WeightKind::ShortConvValue)?;
     let output = packed_weight(
         graph,
-        load,
+        weights,
         scope,
         WeightKind::RecurrentOutput,
-        weights,
+        ports,
         constants,
     )?;
-    let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
+    let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
 
-    let store = state.target_state();
-    let banks = u64::try_from(
-        store
-            .bank_capacity
-            .storage_total()
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|_| "recurrent bank count exceeds u64")?;
-    let component = store
-        .recurrent_components
-        .get(block.component_index)
-        .ok_or("short convolution window component is absent")?;
-    let extents = std::iter::once(Ok(banks))
-        .chain(component.shape.iter().map(|extent| {
-            u64::try_from(*extent).map_err(|_| "recurrent state extent exceeds u64".to_owned())
-        }))
-        .collect::<Result<Vec<_>, String>>()?;
-    let tape_rows = extents
-        .get(1)
-        .and_then(|rows| shape.tape_rows(*rows))
+    let [mut window] = bank_ports(graph, &topology.window, &block.bank)?;
+    let [window_extents] = &block.bank.components;
+    let tape_rows = window_extents
+        .first()
+        .and_then(|rows| shape.tape_rows(rows))
         .ok_or("short convolution window is narrower than its taps")?;
-    let mut window = graph.port(Element::dense(component.dtype), &extents)?;
+    let slab_banks = slab_banks(&block.bank)?;
 
     let projection = graph
         .enqueue(
             kernels.project,
             &[
-                shape.project_dimensions(block.rows).as_slice(),
+                shape.project_dimensions(&block.rows).as_slice(),
                 &[
-                    ("BS", input_gate.scale.extent),
-                    ("CS", output_gate.scale.extent),
-                    ("XS", value.scale.extent),
+                    ("BS", input_gate.scale.extent.clone()),
+                    ("CS", output_gate.scale.extent.clone()),
+                    ("XS", value.scale.extent.clone()),
                 ],
             ]
             .concat(),
@@ -171,16 +222,17 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 b_weight: (&input_gate.weight).into(),
                 c_weight: (&output_gate.weight).into(),
                 x_weight: (&value.weight).into(),
-                eps: block.epsilon,
+                eps: topology.epsilon.f32(),
                 b_scale: (&input_gate.scale.tensor).into(),
                 c_scale: (&output_gate.scale.tensor).into(),
                 x_scale: (&value.scale.tensor).into(),
             },
         )?
         .value;
-    let dimensions = shape.rows_dimensions(block.rows, block.slots, banks, tape_rows);
+    let dimensions =
+        shape.rows_dimensions(&block.rows, &block.slots, &block.bank.banks, &tape_rows);
     let input = |graph: &mut G, name: &str| {
-        graph.control_for(block.controls, kernels.rows, name, &dimensions)
+        graph.control_for(topology.controls, kernels.rows, name, &dimensions)
     };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
@@ -202,23 +254,23 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 previous_tape: controls.previous_tape.tensor().into(),
                 following_bank: controls.following_bank.tensor().into(),
                 window: window.tensor_mut().into(),
-                slab_banks: block.slab_banks,
+                slab_banks,
             },
         )?
         .value;
-    let mixed = match kernels.output {
-        TailEntries::Residual(entry) => {
+    let mixed = match (kernels.output, &topology.post_norm) {
+        (TailEntries::Residual(entry), None) => {
             // One output head of every channel.
-            let gated = gated.reshape(&[block.rows, 1, shape.channels]);
-            let inject = join.inject(graph, block.rows, constants)?;
+            let gated = gated.reshape(&[block.rows.clone(), Dim::from(1u64), shape.channels.clone()]);
+            let inject = join.inject(graph, &block.rows, constants)?;
             graph
                 .enqueue(
                     entry,
                     &[
-                        shape.output_dimensions(block.rows).as_slice(),
+                        shape.output_dimensions(&block.rows).as_slice(),
                         &[
-                            ("OS", output.operands.scale.extent),
-                            ("OB", output.operands.bound.extent),
+                            ("OS", output.operands.scale.extent.clone()),
+                            ("OB", output.operands.bound.extent.clone()),
                         ],
                     ]
                     .concat(),
@@ -233,9 +285,9 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 )?
                 .value
         }
-        TailEntries::PostNorm(entries) => {
+        (TailEntries::PostNorm(entries), Some(tail)) => {
             let norm = weight(graph, WeightKind::PostNorm)?;
-            let out_rows = GraphConstant::row_identity(graph, block.rows, Some("M"))?;
+            let out_rows = GraphConstant::row_identity(graph, &block.rows, Some("M"))?;
             let mixed = post_norm(
                 graph,
                 entries,
@@ -245,17 +297,17 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 &norm,
                 out_rows.port().tensor(),
                 PostNormShape {
-                    rows: block.rows,
-                    out: block.rows,
-                    inputs: shape.channels,
-                    outputs: shape.hidden,
+                    rows: block.rows.clone(),
+                    out: block.rows.clone(),
+                    inputs: shape.channels.clone(),
+                    outputs: shape.hidden.clone(),
                 },
-                block.post_norm_epsilon,
-                block.post_norm_scale,
+                tail,
             )?;
             constants.push(out_rows);
             mixed
         }
+        _ => return Err("a short convolution's output entries disagree with its post-norm tail".into()),
     };
     Ok((mixed, window, controls))
 }

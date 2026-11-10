@@ -2998,35 +2998,57 @@ impl NativeImplementation {
                 .ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()))?;
             statics = statics.with_static(name.clone(), value);
         }
+        self.scratch_bound_over(&self.scratch_configurations(&statics)?, dimension)
+    }
+
+    /// The configurations [`Self::scratch_bound`] charges at `statics`: one
+    /// admitted configuration for each admitted assignment of the
+    /// parameters the scratch buffers read, in the walk's order. A function
+    /// of the statics alone, so a caller may keep it for every call at them;
+    /// `Inadmissible` where none is admitted.
+    pub fn scratch_configurations(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
         let mut read = Vec::new();
         for buffer in &self.scratch {
             buffer.parameters(&mut read);
         }
-        let mut bound = vec![0u64; self.scratch.len()];
-        let mut admitted = false;
-        let mut failure = None;
-        self.walk_admitted_of(&statics, &read, |configuration| {
-            admitted = true;
-            for (buffer, bytes) in self.scratch.iter().zip(&mut bound) {
-                match buffer.charge(dimension, &|name| configuration.param(name)) {
-                    Ok(charge) => *bytes = (*bytes).max(charge),
-                    Err(error) => {
-                        failure = Some(NativeScratchBoundError::Charge {
-                            scratch: buffer.name.clone(),
-                            params: configuration.params().clone(),
-                            error,
-                        });
-                        return false;
-                    }
-                }
-            }
+        let mut configurations = Vec::new();
+        self.walk_admitted_of(statics, &read, |configuration| {
+            configurations.push(configuration.clone());
             true
         })?;
-        match failure {
-            Some(failure) => Err(failure),
-            None if admitted => Ok(bound),
-            None => Err(NativeSpecializationError::Inadmissible.into()),
+        if configurations.is_empty() {
+            return Err(NativeSpecializationError::Inadmissible);
         }
+        Ok(configurations)
+    }
+
+    /// Each scratch buffer's largest charge at `dimension` over
+    /// `configurations` ([`Self::scratch_configurations`] at the statics
+    /// `dimension` holds): the bound [`Self::scratch_bound`] walks to, as
+    /// arithmetic. The first configuration in order whose charge cannot be
+    /// evaluated is an error naming it.
+    pub fn scratch_bound_over(
+        &self,
+        configurations: &[NativeSpecialization],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        let mut bound = vec![0u64; self.scratch.len()];
+        for configuration in configurations {
+            for (buffer, bytes) in self.scratch.iter().zip(&mut bound) {
+                let charge = buffer
+                    .charge(dimension, &|name| configuration.param(name))
+                    .map_err(|error| NativeScratchBoundError::Charge {
+                        scratch: buffer.name.clone(),
+                        params: configuration.params().clone(),
+                        error,
+                    })?;
+                *bytes = (*bytes).max(charge);
+            }
+        }
+        Ok(bound)
     }
 
     /// The declaration with each parameter's values reordered so its
@@ -3213,6 +3235,18 @@ impl NativeImplementation {
                 .or_insert(range);
         }
         bounds
+    }
+
+    /// Whether the `where` condition can hold at some configuration of the
+    /// parameter domains with each static dimension within the inclusive
+    /// bounds `statics` supplies: false only where it is false throughout
+    /// ([`NativeCondition::may_hold`]).
+    pub fn may_admit(&self, statics: &impl Fn(&str) -> Option<(u64, u64)>) -> bool {
+        let Some(constraint) = &self.constraint else {
+            return true;
+        };
+        let bounds = self.parameter_bounds();
+        constraint.may_hold(statics, &|name| bounds.get(name).copied().flatten())
     }
 
     /// Whether the `where` condition evaluates without failing at `statics`

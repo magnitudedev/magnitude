@@ -41,7 +41,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -52,7 +52,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: landing.tensor().into(),
-                    factor: 3.0,
+                    factor: seismic::Argument::from(3.0),
                 },
             )
             .unwrap()
@@ -120,7 +120,7 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
                 &[("M", 4), ("N", n)],
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -143,7 +143,7 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
                     &kernel,
                     scale_rows::WorkflowArgs {
                         x: input.tensor().into(),
-                        factor: 2.0,
+                        factor: seismic::Argument::from(2.0),
                     },
                 )
                 .unwrap()
@@ -195,7 +195,7 @@ fn a_store_takes_one_exact_external_port() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()

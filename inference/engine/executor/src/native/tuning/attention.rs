@@ -21,7 +21,7 @@ use super::{
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    DECODE_ROWS, indexer_project_dimensions, low_rank_query_dimensions, project_dimensions,
+    DECODE_ROWS, indexer_project_dimensions, query_projection_dimensions,
     rotary_amplitudes, rotary_components, rotary_frequencies, selected_segments,
 };
 use crate::programs::invocation_demand::Launch;
@@ -74,7 +74,7 @@ fn decode_starts(
     // work; start at the default partition count and let the search compare
     // wider choices on the rows this variant actually serves.
     let wide_verification =
-        mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2) && mix.shape.width >= 512;
+        mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2) && mix.shape.widths.width >= 512;
     let desired_parts = if wide_verification {
         default_parts
     } else {
@@ -82,7 +82,7 @@ fn decode_starts(
     };
     let mut starts = match backend {
         seismic::BackendName::Cuda
-            if mix.shape.width <= 256
+            if mix.shape.widths.width <= 256
                 && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2)
                 && limits.max_rows >= 2 =>
         {
@@ -94,7 +94,7 @@ fn decode_starts(
                 |choice| choice.param("MATRIX") == Some(1) && choice.param("QREG") == Some(1),
                 |choice| {
                     let warps = choice.param("WARPS").unwrap_or(1);
-                    let tokens = (warps * 16 / mix.shape.group).max(1);
+                    let tokens = (warps * 16 / mix.shape.widths.group).max(1);
                     // Share history across the widest served verification
                     // tile with the fewest row warps. Register-held queries
                     // need room per thread, so start at the fewest column
@@ -132,10 +132,10 @@ fn decode_starts(
             )
         }
         seismic::BackendName::Metal
-            if mix.shape.width <= 256
-                && ((mix.shape.group <= 4
+            if mix.shape.widths.width <= 256
+                && ((mix.shape.widths.group <= 4
                     && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2))
-                    || mix.shape.group == 8) =>
+                    || mix.shape.widths.group == 8) =>
         {
             nearest(
                 implementation,
@@ -147,14 +147,14 @@ fn decode_starts(
                     // K/V tile across four verification rows. Seed it at the
                     // measured tile geometry; the tuner still compares legal
                     // configurations over all served rows and contexts.
-                    let wide_group = mix.shape.group == 8;
+                    let wide_group = mix.shape.widths.group == 8;
                     let packed_g8 = wide_group
-                        && mix.shape.width == 256
+                        && mix.shape.widths.width == 256
                         && history >= 16_384
                         && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2);
                     let history_parts = history
                         .min(65_536)
-                        .saturating_mul(mix.shape.width)
+                        .saturating_mul(mix.shape.widths.width)
                         .saturating_mul(7)
                         .div_ceil(4 * if wide_group { 512 * 1024 } else { 256 * 1024 });
                     // Fewer than 32 partitions underfill the G8 decode grid on
@@ -191,7 +191,7 @@ fn decode_starts(
         // DECODE_GRID threadgroups, no partition holding under 64 KiB of
         // encoded history, rows of one token each over eight simdgroups.
         seismic::BackendName::Metal => {
-            let target_parts = (DECODE_GRID / mix.shape.kv_heads.max(1))
+            let target_parts = (DECODE_GRID / mix.shape.widths.kv_heads.max(1))
                 .min(bytes_per_head.div_ceil(64 * 1024))
                 .max(1)
                 .next_power_of_two();
@@ -402,10 +402,10 @@ impl EntryTuning for AttentionProjectTuning {
         let [_, statics @ ..] = if self.binding.key_value_only {
             shape.key_value_dimensions(0)
         } else {
-            project_dimensions(&shape, rank, 0)
+            shape.project_dimensions(0, rank)
         };
         if projection_shape(inputs, &self.scopes, query)?
-            != (rank.unwrap_or(shape.query_rows()), shape.hidden)
+            != (rank.unwrap_or(shape.query_rows()), shape.widths.hidden)
         {
             return Err("the query projection disagrees with the binding".into());
         }
@@ -421,7 +421,7 @@ impl EntryTuning for AttentionProjectTuning {
             &self.scopes,
             &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
         )?);
-        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.widths.hidden)?;
         statics.extend([("PT", parts), ("NM", norm)]);
         Ok(statics)
     }
@@ -437,7 +437,7 @@ impl EntryTuning for AttentionProjectTuning {
     ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.binding.shape;
         let query_kind = operators::attention::query_segment_kind(operator(inputs, &self.scopes)?);
-        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.widths.hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -465,7 +465,7 @@ impl EntryTuning for AttentionProjectTuning {
                     value: segment(shape.value_rows(), WeightKind::Value)?,
                     hidden: inputs.activation(
                         Element::f32(),
-                        &[point.rows, parts * shape.hidden],
+                        &[point.rows, parts * shape.widths.hidden],
                         index as u64 + 1,
                     )?,
                     input_norm: inputs.input_norm(
@@ -567,8 +567,13 @@ impl EntryTuning for IndexerProjectTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let hidden = self.binding.shape.hidden;
-        let [_, statics @ ..] = indexer_project_dimensions(hidden, self.selection.shape, 0);
+        let hidden = self.binding.shape.widths.hidden;
+        let [_, statics @ ..] = indexer_project_dimensions(
+            hidden,
+            self.selection.shape.heads,
+            self.selection.shape.width,
+            0,
+        );
         if projection_shape(inputs, &self.scopes, WeightKind::IndexerQuery)?
             != (statics[1].1, hidden)
         {
@@ -599,7 +604,7 @@ impl EntryTuning for IndexerProjectTuning {
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
-        let hidden = self.binding.shape.hidden;
+        let hidden = self.binding.shape.widths.hidden;
         let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -694,7 +699,7 @@ impl EntryTuning for LowRankQueryProjectTuning {
         if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), rank) {
             return Err("the low-rank query's up projection disagrees with the binding".into());
         }
-        let [_, statics @ ..] = low_rank_query_dimensions(&shape, rank, 0);
+        let [_, statics @ ..] = query_projection_dimensions(0, rank, shape.query_rows());
         let mut statics = [statics.as_slice(), &[("PT", 1), ("NM", rank)]].concat();
         let [query, gate, key, value] = Self::operand_kinds(query);
         statics.extend(scale_statics(
@@ -1005,12 +1010,12 @@ impl EntryTuning for AttentionOutputTuning {
         let shape = self.shape;
         let (q, w) = self.input;
         if projection_shape(inputs, &self.scopes, WeightKind::AttentionOutput)?
-            != (shape.hidden, q * w)
+            != (shape.widths.hidden, q * w)
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
         let mut statics = vec![
-            ("D", shape.hidden),
+            ("D", shape.widths.hidden),
             ("Q", q),
             ("W", w),
             (
@@ -1047,7 +1052,7 @@ impl EntryTuning for AttentionOutputTuning {
                 Ok(AttentionOutputCase {
                     hidden: inputs.activation(
                         Element::f32(),
-                        &[point.rows, streams * shape.hidden],
+                        &[point.rows, streams * shape.widths.hidden],
                         seed + 1,
                     )?,
                     inject: inputs.activation(Element::f32(), &[point.rows, inject], seed + 3)?,
@@ -1404,7 +1409,7 @@ impl MixHistory for DenseMixHistory {
     ) -> Result<Self, BuildError> {
         let shape = mix.shape;
         let mut plane = |name: &str, seed: u64| {
-            let extents = [rows, shape.kv_heads, shape.width];
+            let extents = [rows, shape.widths.kv_heads, shape.widths.width];
             let plane = inputs.shared(
                 format!("{name}-{}-{extents:?}", mix.activation.name()),
                 |inputs| inputs.activation(mix.activation, &extents, seed),
@@ -1415,7 +1420,7 @@ impl MixHistory for DenseMixHistory {
         let value = if shape.stored_key() == 1 {
             DenseMixValues::Key(inputs.activation(
                 mix.activation,
-                &[0, shape.kv_heads, shape.width],
+                &[0, shape.widths.kv_heads, shape.widths.width],
                 0x76,
             )?)
         } else {
@@ -1510,20 +1515,20 @@ impl MixHistory for AffineMixHistory {
                 let plane = inputs.shared(
                     format!(
                         "{name}-affine-{rows}x{}x{}-{:?}",
-                        shape.kv_heads, shape.width, mix.codec
+                        shape.widths.kv_heads, shape.widths.width, mix.codec
                     ),
                     |inputs| build(inputs),
                 )?;
                 inputs.slab_state(plane, view, appended.clone())
             };
         let geometry = mix.codec.affine_geometry().map_err(|e| e.to_string())?;
-        let pairs = [rows, shape.kv_heads, geometry.key_coefficients as u64];
-        let value_pairs = [rows, shape.kv_heads, geometry.value_coefficients as u64];
+        let pairs = [rows, shape.widths.kv_heads, geometry.key_coefficients as u64];
+        let value_pairs = [rows, shape.widths.kv_heads, geometry.value_coefficients as u64];
         Ok(Self {
             key_codes: plane("history_key_codes", &|inputs| {
                 Self::codes(
                     inputs,
-                    &[rows, shape.kv_heads, geometry.key_codes as u64],
+                    &[rows, shape.widths.kv_heads, geometry.key_codes as u64],
                     0x6b,
                 )
             })?,
@@ -1533,7 +1538,7 @@ impl MixHistory for AffineMixHistory {
             value_codes: plane("history_value_codes", &|inputs| {
                 Self::codes(
                     inputs,
-                    &[rows, shape.kv_heads, geometry.value_codes as u64],
+                    &[rows, shape.widths.kv_heads, geometry.value_codes as u64],
                     0x76,
                 )
             })?,
@@ -1565,7 +1570,7 @@ impl MixHistory for AffineMixHistory {
 impl AttentionMix {
     /// The index-list source the layers' picks read; none without picks.
     fn index_list(&self) -> Option<PickedRows> {
-        match (self.shape.picks, self.picked) {
+        match (self.shape.widths.picks, self.picked) {
             (0, None) => None,
             (picks, Some(picked)) if picks > 0 => Some(picked),
             _ => unreachable!("a unit's layers pick rows exactly when they read an index-list source"),
@@ -1591,7 +1596,7 @@ impl AttentionMix {
         };
         let context = point.context.unwrap_or(0);
         let reach = picked.reach(self.window, context);
-        let picks = self.shape.picks;
+        let picks = self.shape.widths.picks;
         coordinates
             .iter()
             .zip(row_slots)
@@ -1613,7 +1618,7 @@ impl AttentionMix {
     /// The dense entries' `KR` and `KS` statics; none for the affine ones.
     fn dense_statics(&self) -> Vec<(&'static str, u64)> {
         match self.dense() {
-            true => vec![("KR", self.shape.rounds_keys()), ("KS", self.shape.picks)],
+            true => vec![("KR", self.shape.rounds_keys()), ("KS", self.shape.widths.picks)],
             false => Vec::new(),
         }
     }
@@ -1776,8 +1781,8 @@ impl AttentionMix {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        let (heads, width) = (shape.heads(), shape.width);
-        let fresh_rows = [shape.fresh, rows, shape.kv_heads * width];
+        let (heads, width) = (shape.heads(), shape.widths.width);
+        let fresh_rows = [u64::from(shape.form.fresh), rows, shape.widths.kv_heads * width];
         let selected_rows = self.picks(
             point,
             &tables.coordinates[..rows as usize],
@@ -1790,8 +1795,8 @@ impl AttentionMix {
             .map(|(index, scope)| {
                 let seed = 4 * index as u64;
                 // Head norms are the layers' own weights, or none.
-                let mut head_norm = |present: u64, kind| {
-                    if present > 0 {
+                let mut head_norm = |present: bool, kind| {
+                    if present {
                         inputs
                             .weight(scope, kind)?
                             .reshape(&[1, width])
@@ -1800,16 +1805,16 @@ impl AttentionMix {
                         inputs.f32s(&[0, width], &[])
                     }
                 };
-                let query_norm = head_norm(shape.query_norm, WeightKind::QueryNorm)?;
+                let query_norm = head_norm(shape.form.query_norm, WeightKind::QueryNorm)?;
                 // A Shared layer's unread key norm port takes its query norm
                 // (`graph::attention`).
-                let key_norm = if shape.fresh == 0 {
+                let key_norm = if !shape.form.fresh {
                     query_norm.clone()
                 } else {
-                    head_norm(shape.key_norm, WeightKind::KeyNorm)?
+                    head_norm(shape.form.key_norm, WeightKind::KeyNorm)?
                 };
                 // Sinks are the layers' own logits, or none.
-                let sinks = if shape.sinks > 0 {
+                let sinks = if shape.form.sinks {
                     inputs
                         .weight(scope, WeightKind::AttentionSinks)?
                         .reshape(&[1, heads])
@@ -1821,25 +1826,29 @@ impl AttentionMix {
                     query_norm,
                     key_norm,
                     value_norm: inputs.f32s(
-                        &[shape.value_norm, width],
-                        &vec![1.0; (shape.value_norm * width) as usize],
+                        &[u64::from(shape.form.value_norm), width],
+                        &vec![1.0; (u64::from(shape.form.value_norm) * width) as usize],
                     )?,
                     sinks,
                     query: inputs.activation(
                         self.activation,
-                        &[rows, heads, width + shape.interleaved_gate],
+                        &[rows, heads, width + shape.interleaved_gate()],
                         seed + 1,
                     )?,
                     gate: inputs.activation(
                         self.activation,
-                        &[rows, heads, shape.separate_gate],
+                        &[rows, heads, shape.separate_gate()],
                         seed + 2,
                     )?,
                     key: inputs.activation(self.activation, &fresh_rows, seed + 3)?,
                     // Stored-key values take no value of their own (`VK`).
                     value: inputs.activation(
                         self.activation,
-                        &[shape.fresh * (1 - shape.stored_key()), rows, shape.kv_heads * width],
+                        &[
+                            u64::from(shape.form.fresh && !shape.form.stored_key()),
+                            rows,
+                            shape.widths.kv_heads * width,
+                        ],
                         seed + 4,
                     )?,
                     rotary_components: inputs.i32s(&[pairs], &components)?,
@@ -1871,19 +1880,19 @@ impl AttentionMix {
                         &vec![u32::MAX; (rows * self.words()) as usize],
                     )?,
                     block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
-                    selected_rows: inputs.i32s(&[rows, shape.picks], &selected_rows)?,
+                    selected_rows: inputs.i32s(&[rows, shape.widths.picks], &selected_rows)?,
                     selected: inputs.activation(
                         self.activation,
-                        &[plane_rows, shape.kv_heads, shape.width],
+                        &[plane_rows, shape.widths.kv_heads, shape.widths.width],
                         0x77,
                     )?,
                     key_rounding: shape.key_rounding,
                     form: inputs.i32s(
                         &[
                             0,
-                            shape.rotary_adjacent,
-                            shape.rotary_trailing,
-                            shape.output_rotary,
+                            u64::from(shape.form.rotary_adjacent),
+                            u64::from(shape.form.rotary_trailing),
+                            u64::from(shape.form.output_rotary),
                             shape.stored_key(),
                         ]
                         .into_iter()
@@ -2193,24 +2202,27 @@ mod tests {
                     listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
-                        hidden: 2560,
-                        kv_heads: 4,
-                        group,
-                        rotary_pairs: 32,
-                        width: 256,
-                        interleaved_gate: 256,
-                        separate_gate: 0,
-                        fresh: 1,
-                        query_norm: 1,
-                        key_norm: 1,
-                        value_norm: 0,
-                        values: crate::AttentionValues::Projected,
-                        sinks: 0,
-                        rotary_adjacent: 0,
-                        rotary_trailing: 0,
-                        output_rotary: 0,
+                        form: crate::planning::AttentionForm {
+                            gate: crate::planning::GateForm::Interleaved,
+                            fresh: true,
+                            query_norm: true,
+                            key_norm: true,
+                            value_norm: false,
+                            values: crate::AttentionValues::Projected,
+                            sinks: false,
+                            rotary_adjacent: false,
+                            rotary_trailing: false,
+                            output_rotary: false,
+                        },
                         key_rounding: crate::RoundingArgs::NONE,
-                        picks: 0,
+                        widths: crate::planning::AttentionWidths {
+                            hidden: 2560,
+                            kv_heads: 4,
+                            group,
+                            rotary_pairs: 32,
+                            width: 256,
+                            picks: 0,
+                        },
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -2302,24 +2314,27 @@ mod tests {
                 listing: PrefillListing::Every,
                 activation: Element::bf16(),
                 shape: AttentionShape {
-                    hidden: 1536,
-                    kv_heads,
-                    group,
-                    rotary_pairs: 64,
-                    width,
-                    interleaved_gate: 0,
-                    separate_gate: 0,
-                    fresh: 1,
-                    query_norm: 1,
-                    key_norm: 1,
-                    value_norm: 1,
-                    values: crate::AttentionValues::Projected,
-                    sinks: 0,
-                    rotary_adjacent: 0,
-                    rotary_trailing: 0,
-                    output_rotary: 0,
+                    form: crate::planning::AttentionForm {
+                        gate: crate::planning::GateForm::None,
+                        fresh: true,
+                        query_norm: true,
+                        key_norm: true,
+                        value_norm: true,
+                        values: crate::AttentionValues::Projected,
+                        sinks: false,
+                        rotary_adjacent: false,
+                        rotary_trailing: false,
+                        output_rotary: false,
+                    },
                     key_rounding: crate::RoundingArgs::NONE,
-                    picks: 0,
+                    widths: crate::planning::AttentionWidths {
+                        hidden: 1536,
+                        kv_heads,
+                        group,
+                        rotary_pairs: 64,
+                        width,
+                        picks: 0,
+                    },
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
@@ -2400,24 +2415,27 @@ mod tests {
                     listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
-                        hidden: 2048,
-                        kv_heads: 4,
-                        group,
-                        rotary_pairs: 32,
-                        width,
-                        interleaved_gate: 0,
-                        separate_gate: 0,
-                        fresh: 1,
-                        query_norm: 1,
-                        key_norm: 1,
-                        value_norm: 0,
-                        values: crate::AttentionValues::Projected,
-                        sinks: 0,
-                        rotary_adjacent: 0,
-                        rotary_trailing: 0,
-                        output_rotary: 0,
+                        form: crate::planning::AttentionForm {
+                            gate: crate::planning::GateForm::None,
+                            fresh: true,
+                            query_norm: true,
+                            key_norm: true,
+                            value_norm: false,
+                            values: crate::AttentionValues::Projected,
+                            sinks: false,
+                            rotary_adjacent: false,
+                            rotary_trailing: false,
+                            output_rotary: false,
+                        },
                         key_rounding: crate::RoundingArgs::NONE,
-                        picks: 0,
+                        widths: crate::planning::AttentionWidths {
+                            hidden: 2048,
+                            kv_heads: 4,
+                            group,
+                            rotary_pairs: 32,
+                            width,
+                            picks: 0,
+                        },
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -2470,7 +2488,7 @@ mod tests {
                         .is_empty()
                 );
                 mix.decode_rows = Some(2..DECODE_ROWS + 1);
-                mix.shape.width = 512;
+                mix.shape.widths.width = 512;
                 mix.codec.key_width = 512;
                 if let magnitude_state::HistoryValue::Own { width, .. } = &mut mix.codec.value {
                     *width = 512;
@@ -2522,24 +2540,27 @@ mod tests {
             listing: PrefillListing::Every,
             activation: Element::bf16(),
             shape: AttentionShape {
-                hidden: 2560,
-                kv_heads: 4,
-                group: 4,
-                rotary_pairs: 64,
-                width: 256,
-                interleaved_gate: 256,
-                separate_gate: 0,
-                fresh: 1,
-                query_norm: 1,
-                key_norm: 1,
-                value_norm: 0,
-                values: crate::AttentionValues::Projected,
-                sinks: 0,
-                rotary_adjacent: 0,
-                rotary_trailing: 0,
-                output_rotary: 0,
+                form: crate::planning::AttentionForm {
+                    gate: crate::planning::GateForm::Interleaved,
+                    fresh: true,
+                    query_norm: true,
+                    key_norm: true,
+                    value_norm: false,
+                    values: crate::AttentionValues::Projected,
+                    sinks: false,
+                    rotary_adjacent: false,
+                    rotary_trailing: false,
+                    output_rotary: false,
+                },
                 key_rounding: crate::RoundingArgs::NONE,
-                picks: 0,
+                widths: crate::planning::AttentionWidths {
+                    hidden: 2560,
+                    kv_heads: 4,
+                    group: 4,
+                    rotary_pairs: 64,
+                    width: 256,
+                    picks: 0,
+                },
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
@@ -2658,24 +2679,27 @@ mod tests {
             listing: PrefillListing::Every,
             activation: Element::bf16(),
             shape: AttentionShape {
-                hidden: 4096,
-                kv_heads: 1,
-                group: 64,
-                rotary_pairs: 32,
-                width: 512,
-                interleaved_gate: 0,
-                separate_gate: 0,
-                fresh: 1,
-                query_norm: 0,
-                key_norm: 1,
-                value_norm: 0,
-                values: crate::AttentionValues::Projected,
-                sinks: 0,
-                rotary_adjacent: 0,
-                rotary_trailing: 0,
-                output_rotary: 0,
+                form: crate::planning::AttentionForm {
+                    gate: crate::planning::GateForm::None,
+                    fresh: true,
+                    query_norm: false,
+                    key_norm: true,
+                    value_norm: false,
+                    values: crate::AttentionValues::Projected,
+                    sinks: false,
+                    rotary_adjacent: false,
+                    rotary_trailing: false,
+                    output_rotary: false,
+                },
                 key_rounding: crate::RoundingArgs::NONE,
-                picks,
+                widths: crate::planning::AttentionWidths {
+                    hidden: 4096,
+                    kv_heads: 1,
+                    group: 64,
+                    rotary_pairs: 32,
+                    width: 512,
+                    picks,
+                },
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
@@ -2754,24 +2778,27 @@ mod tests {
             listing: PrefillListing::Listed { capacity: 65536 },
             activation: Element::bf16(),
             shape: AttentionShape {
-                hidden: 2048,
-                kv_heads: 2,
-                group: 16,
-                rotary_pairs: 32,
-                width: 128,
-                interleaved_gate: 0,
-                separate_gate: 0,
-                fresh: 1,
-                query_norm: 1,
-                key_norm: 1,
-                value_norm: 0,
-                values: crate::AttentionValues::Projected,
-                sinks: 0,
-                rotary_adjacent: 0,
-                rotary_trailing: 0,
-                output_rotary: 0,
+                form: crate::planning::AttentionForm {
+                    gate: crate::planning::GateForm::None,
+                    fresh: true,
+                    query_norm: true,
+                    key_norm: true,
+                    value_norm: false,
+                    values: crate::AttentionValues::Projected,
+                    sinks: false,
+                    rotary_adjacent: false,
+                    rotary_trailing: false,
+                    output_rotary: false,
+                },
                 key_rounding: crate::RoundingArgs::NONE,
-                picks: 0,
+                widths: crate::planning::AttentionWidths {
+                    hidden: 2048,
+                    kv_heads: 2,
+                    group: 16,
+                    rotary_pairs: 32,
+                    width: 128,
+                    picks: 0,
+                },
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
