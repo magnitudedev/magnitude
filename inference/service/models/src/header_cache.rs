@@ -275,7 +275,7 @@ impl HeaderCache {
     /// any repository: references for reading another file's header without fetching that entry
     /// (see `remote_header`). Each is verified against its digest; an evicted one is skipped.
     pub(crate) fn sharing(&self, head: &[u8]) -> Vec<Vec<u8>> {
-        self.heads_backfilled.call_once(|| self.backfill_heads());
+        self.start_backfill();
         let Some(list) = read_bytes(&self.heads.join(hex_sha256(head)), HEADS_INDEX_BYTES) else {
             return Vec::new();
         };
@@ -340,6 +340,26 @@ impl HeaderCache {
             .collect::<Vec<_>>()
             .join("\n");
         write_bytes_atomic(&path, &self.heads_lock, kept.as_bytes(), HEADS_INDEX_BYTES);
+    }
+
+    /// Indexes the headers stored before the index existed, once per cache: on its own thread the
+    /// first time a read looks for references, so no read waits for it, and never again once
+    /// `heads/.backfilled` marks the cache indexed whole (every header stored since is indexed as
+    /// it is written).
+    fn start_backfill(&self) {
+        self.heads_backfilled.call_once(|| {
+            let marker = self.heads.join(".backfilled");
+            if marker.exists() {
+                return;
+            }
+            let cache = self.clone();
+            std::thread::spawn(move || {
+                cache.backfill_heads();
+                if fs::create_dir_all(&cache.heads).is_ok() {
+                    let _ = fs::write(&marker, b"");
+                }
+            });
+        });
     }
 
     /// Indexes the headers stored before the index existed (the release catalog's among them)
