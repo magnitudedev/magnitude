@@ -3125,6 +3125,11 @@ mod tests {
                 context_bytes: 0,
                 overhead_bytes: 0,
             },
+            placement: magnitude_service_contracts::models::ModelPlacement {
+                device_bytes: 0,
+                host_bytes: 0,
+                disk_bytes: 0,
+            },
             residency: magnitude_service_contracts::models::ModelResidency::Resident {
                 performance: magnitude_service_contracts::models::ModelPerformance::Pending,
             },
@@ -3928,8 +3933,8 @@ mod tests {
     #[tokio::test]
     async fn standard_models_list_the_served_context() {
         let ModelAssessment::Fits {
-            profile, served: _, assessment_id, memory, memory_breakdown, residency, projector,
-            drafter,
+            profile, served: _, assessment_id, memory, memory_breakdown, placement, residency,
+            projector, drafter,
         } = fits_assessment()
         else {
             unreachable!()
@@ -3942,6 +3947,7 @@ mod tests {
             assessment_id,
             memory,
             memory_breakdown,
+            placement,
             residency,
             projector,
             drafter,

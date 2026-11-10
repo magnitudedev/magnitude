@@ -67,6 +67,50 @@ pub struct MemoryBreakdown {
     pub overhead_bytes: u64,
 }
 
+/// Where a fitting plan places the model on this machine before any load,
+/// by tier, from the plan and its fit. `device_bytes` is what the fit
+/// requires of the serving device's memory (its allocation domains: GPU
+/// memory, or unified memory on Apple silicon), and `host_bytes` what the
+/// plan holds in host RAM beside a discrete device: what the fit requires
+/// of its staging domains (host tables' row caches, graphs, the process and
+/// a streamed plan's host tier at its landing reserve), and the host tier's
+/// slots beyond that reserve, which grow into the host memory the fit
+/// leaves (`ModelLoadPlan::host_tier_bytes`); none on unified memory, where
+/// host RAM is the device's memory. The two sum to the fit's required
+/// bytes, its [`MemoryBreakdown`]'s weights, context and overhead, and that
+/// growth. `disk_bytes` is what the plan reads from
+/// the model file as steps name it rather than holding it
+/// (`ModelLoadPlan::unheld_bytes`): the routed experts neither its bank nor
+/// its host tier holds, and the rows of side tables (n-gram tables) beyond
+/// their slots and row caches, as stored. A plan that holds every weight
+/// whole reads none from disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelPlacement {
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+impl ModelPlacement {
+    /// The placement of `load`, whose fit reached `domains`.
+    pub fn of(load: &crate::ModelLoadPlan, domains: &[DomainFit]) -> Result<Self, String> {
+        let required = |role: DomainRole| {
+            domains
+                .iter()
+                .filter(|domain| domain.role == role)
+                .try_fold(0u64, |total, domain| total.checked_add(domain.required_bytes))
+                .ok_or_else(|| "required bytes overflow".to_owned())
+        };
+        Ok(Self {
+            device_bytes: required(DomainRole::Allocation)?,
+            host_bytes: required(DomainRole::Staging)?
+                .checked_add(load.host_tier_bytes()?)
+                .ok_or_else(|| "host bytes overflow".to_owned())?,
+            disk_bytes: load.unheld_bytes()?,
+        })
+    }
+}
+
 /// Whether the standard workload fits, each verdict with its own evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionAssessment {
@@ -75,14 +119,15 @@ pub enum ExecutionAssessment {
 }
 
 /// The standard workload fits every domain the load touches at the served
-/// context `fit_context_tokens`, requiring `breakdown` across them, the
-/// plan's routed experts held in `bank`, whole or streamed (none for a plan
-/// that banks no experts).
+/// context `fit_context_tokens`, requiring `breakdown` across them, placed
+/// by tier as `placement`, the plan's routed experts held in `bank`, whole
+/// or streamed (none for a plan that banks no experts).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionFit {
     pub fit_context_tokens: u32,
     pub domains: Vec<DomainFit>,
     pub breakdown: MemoryBreakdown,
+    pub placement: ModelPlacement,
     pub bank: Option<crate::planning::ExpertBankPlan>,
 }
 
@@ -606,6 +651,7 @@ pub fn assess_execution_fit(
         return Ok(ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens: prepared.fit_context_tokens,
             breakdown: prepared.charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
+            placement: ModelPlacement::of(draft.load(), &fit.domains).map_err(AssessmentError::Memory)?,
             domains: fit.domains,
             bank: draft.load().expert_bank().cloned(),
         }));
@@ -624,6 +670,7 @@ pub fn assess_execution_fit(
     Ok(match draft.with_held_experts(definition, crate::HeldBound::room(bound), prices, crate::Unmeasured::SizedByMemory, &mut held, room, confirm)? {
         Ok((held, (breakdown, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens: prepared.fit_context_tokens,
+            placement: ModelPlacement::of(held.draft().load(), &domains).map_err(AssessmentError::Memory)?,
             domains,
             breakdown,
             bank: held.draft().load().expert_bank().cloned(),
@@ -803,8 +850,15 @@ pub(crate) mod tests {
             panic!("the fixture fits every supported host");
         };
         assert_eq!(fit.residency(), Residency::Resident);
-        let ExecutionFit { fit_context_tokens, domains, breakdown, .. } = fit;
+        let ExecutionFit { fit_context_tokens, domains, breakdown, placement, .. } = fit;
         assert_eq!(fit_context_tokens, 150_000);
+        // A resident plan of no side table reads nothing from disk, and
+        // its tiers hold what its domains require.
+        assert_eq!(placement.disk_bytes, 0);
+        assert_eq!(
+            placement.device_bytes + placement.host_bytes,
+            breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes
+        );
         assert!(breakdown.weights_bytes > 0 && breakdown.context_bytes > 0);
         assert_eq!(
             breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes,

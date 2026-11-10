@@ -2204,6 +2204,7 @@ export const ModelAssessment = S.Union(
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
       memoryBreakdown: S.suspend((): S.Schema<MemoryBreakdown, MemoryBreakdownEncoded> => MemoryBreakdown),
+      placement: S.suspend((): S.Schema<ModelPlacement, ModelPlacementEncoded> => ModelPlacement),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
       projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
       residency: S.suspend((): S.Schema<ModelResidency, ModelResidencyEncoded> => ModelResidency),
@@ -2808,6 +2809,14 @@ export const ModelPerformance = S.Union(
 )
 export type ModelPerformance = S.Schema.Type<typeof ModelPerformance>
 export type ModelPerformanceEncoded = S.Schema.Encoded<typeof ModelPerformance>
+
+export const ModelPlacement = S.Struct({
+  deviceBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  diskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  hostBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelPlacement = S.Schema.Type<typeof ModelPlacement>
+export type ModelPlacementEncoded = S.Schema.Encoded<typeof ModelPlacement>
 
 export const ModelReasoningCapabilities = S.Struct({
   defaultEffort: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),

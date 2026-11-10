@@ -2739,6 +2739,21 @@ pub struct MemoryBreakdown {
     pub overhead_bytes: u64,
 }
 
+/// Where a fitting model is placed on this machine before any load, by tier: `device_bytes` held
+/// in the serving device's memory (GPU memory, or unified memory on Apple silicon), `host_bytes`
+/// held in host RAM beside a discrete device (a streamed model's host tier, host tables, graphs
+/// and the process; none on unified memory), the two together the memory breakdown's total and the
+/// host tier's growth into the host memory the fit leaves, and `disk_bytes` read from the model file as needed rather than held (routed experts neither the
+/// expert bank nor the host tier holds, and side-table rows beyond their caches, as stored).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelPlacement {
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub disk_bytes: u64,
+}
+
 /// An estimated decode speed at one context depth, in tokens per second per conversation, from
 /// the costs measured of this machine's selected executor: what the engine's own kernels achieve
 /// on it.
@@ -2937,8 +2952,8 @@ pub enum MeasurementState {
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
     /// A fitting model at `served`, the largest context tier within `profile` at which its
-    /// standard workload fits this computer, how it holds its weights, and its decode-speed
-    /// estimates held that way up to `served`.
+    /// standard workload fits this computer, where it is placed by tier, how it holds its weights,
+    /// and its decode-speed estimates held that way up to `served`.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
@@ -2946,6 +2961,7 @@ pub enum ModelAssessment {
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         memory_breakdown: MemoryBreakdown,
+        placement: ModelPlacement,
         residency: ModelResidency,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,

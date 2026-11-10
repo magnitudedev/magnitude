@@ -57,6 +57,7 @@ export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel =
       },
       assessment: {
         _tag: "Fits",
+    placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
         profile: { contextLength: 32_768 },
         served: { contextLength: 32_768 },
         assessmentId: ModelAssessmentIdSchema.make("setup-assessment"),
@@ -133,6 +134,7 @@ export const makeFoundModel = (
     },
     assessment: {
       _tag: "Fits",
+    placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
       profile: { contextLength: 32_768 },
       served: { contextLength: 32_768 },
       assessmentId: ModelAssessmentIdSchema.make("found-assessment"),

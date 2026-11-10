@@ -96,6 +96,7 @@ describe("local model serving projection", () => {
               served: { contextLength: 4096 },
               memory: [],
               memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+              placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
               residency: {
                 _tag: "Resident",
                 performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
@@ -196,6 +197,7 @@ describe("automatic assessment projection", () => {
           served: { contextLength: 4096 },
           memory: [],
           memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+          placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
           residency: {
             _tag: "Resident",
             performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
@@ -248,6 +250,7 @@ describe("automatic assessment projection", () => {
               assessmentId: "assessment",
               memory: [],
               memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+              placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
               residency: {
                 _tag: "Streamed",
                 bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },

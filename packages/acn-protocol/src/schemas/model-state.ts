@@ -909,6 +909,20 @@ export const LocalModelMemorySchema = Schema.Struct({
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
 /**
+ * Where a fitting model is placed on this machine before any load, by tier: `deviceBytes` held in
+ * the serving device's memory (GPU memory, or unified memory on Apple silicon), `hostBytes` in host
+ * RAM beside a discrete device (a streamed model's host tier, host tables, graphs and the process;
+ * none on unified memory), and `diskBytes` read from the model file as needed rather than held (streamed experts neither tier
+ * holds, and side-table rows beyond their caches).
+ */
+export const LocalModelPlacementSchema = Schema.Struct({
+  deviceBytes: NonNegativeSafeInteger,
+  hostBytes: NonNegativeSafeInteger,
+  diskBytes: NonNegativeSafeInteger,
+})
+export type LocalModelPlacement = typeof LocalModelPlacementSchema.Type
+
+/**
  * Where a streamed fit keeps the experts its bank lacks: read from the model file (unified
  * memory), or in a host-RAM tier as host memory lets it grow, the rest read from the file (a
  * discrete device).
@@ -946,7 +960,8 @@ export type LocalModelFitResidency = typeof LocalModelFitResidencySchema.Type
 
 /**
  * A fitting model served at `served`, the largest context tier within its own `profile` that fits
- * this computer, how it holds its weights, and its decode speed held that way up to it.
+ * this computer, where it is placed by tier, how it holds its weights, and its decode speed held
+ * that way up to it.
  */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
@@ -954,6 +969,7 @@ export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   profile: ServingProfileSchema,
   served: ServingProfileSchema,
   memory: LocalModelMemorySchema,
+  placement: LocalModelPlacementSchema,
   residency: LocalModelFitResidencySchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type

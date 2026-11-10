@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, MemoryBreakdown, ModelAssessmentId, ModelCapabilities, ModelPerformance,
+        MemoryAssessment, MemoryBreakdown, ModelAssessmentId, ModelPlacement, ModelCapabilities, ModelPerformance,
         ModelReasoningCapabilities, ModelResidency, PerformanceEvidence, ServingProfile,
     };
 
@@ -404,6 +404,11 @@ mod tests {
                 weights_bytes: 30,
                 context_bytes: 10,
                 overhead_bytes: 10,
+            },
+            placement: ModelPlacement {
+                device_bytes: 50,
+                host_bytes: 0,
+                disk_bytes: 0,
             },
             residency: ModelResidency::Resident {
                 performance: ModelPerformance::Estimated {

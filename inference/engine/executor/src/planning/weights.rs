@@ -262,6 +262,20 @@ impl WeightPlan {
         self.shape[..self.shape.len() - 1].iter().product()
     }
 
+    /// The stored bytes of a streamed table's rows its slots do not hold
+    /// (its landing slots hold a read's rows only until it converts them),
+    /// each as the model file stores it: what its steps read from the file.
+    /// None of a weight held otherwise.
+    pub fn unheld_bytes(&self) -> Result<u64, String> {
+        let Some(streamed) = self.streamed() else {
+            return Ok(0);
+        };
+        let held = self.table_slots().saturating_sub(streamed.landing_rows).min(streamed.table_rows);
+        representation_bytes(self.source, &[1, self.table_width()])?
+            .checked_mul(streamed.table_rows - held)
+            .ok_or_else(|| "unheld table bytes overflow".to_owned())
+    }
+
     /// The width of a streamed table's rows.
     pub fn table_width(&self) -> u64 {
         self.shape[self.shape.len() - 1]
@@ -1250,6 +1264,27 @@ impl ModelLoadPlan {
         })
     }
 
+    /// The stored bytes of the model's weights the load does not hold, read
+    /// from its file as steps name them: the experts neither its expert bank
+    /// nor its host tier holds ([`super::ExpertBankPlan::unheld_bytes`]), each
+    /// streamed table's rows beyond its slots ([`WeightPlan::unheld_bytes`])
+    /// and each host table's beyond its row cache. None of a load that holds
+    /// every weight whole.
+    pub fn unheld_bytes(&self) -> Result<u64, String> {
+        let overflow = || "unheld weight bytes overflow".to_owned();
+        let experts = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::unheld_bytes)?;
+        let tables = weight_storages(self)?
+            .into_iter()
+            .try_fold(experts, |total, (_, weight)| total.checked_add(weight.unheld_bytes()?).ok_or_else(overflow))?;
+        self.host_tables.iter().try_fold(tables, |total, table| {
+            let rows = table.shape[0];
+            (table.bytes / rows)
+                .checked_mul(rows - crate::streamed_table::cached_rows(rows))
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(overflow)
+        })
+    }
+
     /// Physical weight demand by component, with tied storage owned by its
     /// first component, exactly as the resident byte total.
     pub fn weight_demands(&self) -> Result<[ClaimDemand; 3], String> {
@@ -1289,8 +1324,10 @@ impl ModelLoadPlan {
     }
 
     /// The host tier's slots beyond its landing reserve; none without a
-    /// tier.
-    fn host_tier_bytes(&self) -> Result<u64, String> {
+    /// tier. A fit charges the tier at that reserve, and the tier grows to
+    /// its slots into the host memory the fit leaves
+    /// (`ExecutionPlanDraft::with_host_tier`).
+    pub fn host_tier_bytes(&self) -> Result<u64, String> {
         let Some(bank) = self.bank.as_ref().filter(|bank| bank.host_ceiling().is_some()) else {
             return Ok(0);
         };

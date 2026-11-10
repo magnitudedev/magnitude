@@ -38,6 +38,7 @@ const fits = assessed({
   profile: { contextLength: 32_768 },
   served: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 } },
+  placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
   residency: {
     _tag: "Resident",
     performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
@@ -362,6 +363,7 @@ describe("local models state", () => {
             drafter: { _tag: "None" },
             memory: [],
             memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+            placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
             residency: {
               _tag: "Resident",
               performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },

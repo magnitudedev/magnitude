@@ -24,7 +24,7 @@ use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
 use magnitude_executor::assessment::{DomainFit, ExecutionFit, ExecutionShortfall, PerformanceEstimate};
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
-    KnownUnsupportedReason, MemoryAssessment, MemoryBreakdown, ModelAssessment, ModelAssessmentId,
+    KnownUnsupportedReason, MemoryAssessment, MemoryBreakdown, ModelAssessment, ModelPlacement, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
     ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelResidency,
     ModelServingConfiguration, PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
@@ -491,6 +491,7 @@ pub(crate) fn model_assessment(
                     fit_context_tokens,
                     domains,
                     breakdown,
+                    placement,
                     ..
                 },
             residency,
@@ -505,6 +506,11 @@ pub(crate) fn model_assessment(
                 weights_bytes: breakdown.weights_bytes,
                 context_bytes: breakdown.context_bytes,
                 overhead_bytes: breakdown.overhead_bytes,
+            },
+            placement: ModelPlacement {
+                device_bytes: placement.device_bytes,
+                host_bytes: placement.host_bytes,
+                disk_bytes: placement.disk_bytes,
             },
             residency: model_residency(residency, &performance_depths(fit_context_tokens))?,
             projector,

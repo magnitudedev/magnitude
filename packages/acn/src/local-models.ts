@@ -201,6 +201,7 @@ export const projectAssessment = (
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
         breakdown: assessment.memoryBreakdown,
       },
+      placement: assessment.placement,
       residency: projectFitResidency(assessment.residency, snapshot.measurement),
     })
   }

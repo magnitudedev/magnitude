@@ -796,6 +796,22 @@ impl ExpertBankPlan {
         self.slots == self.widest().get()
     }
 
+    /// The stored bytes of the experts neither the bank's slots nor its host
+    /// tier's host slots hold (the tier's slots include the bank's), each
+    /// as its model file stores it: what the plan's misses read from the
+    /// file. None of a whole bank.
+    pub fn unheld_bytes(&self) -> Result<u64, String> {
+        let overflow = || "unheld expert bytes overflow".to_owned();
+        self.layers().iter().try_fold(0u64, |total, layer| {
+            let expert = self.groups()[layer.group]
+                .record
+                .iter()
+                .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
+            let held = Self::layer_slots(self.slots, layer.experts).max(Self::layer_slots(self.host_slots, layer.experts));
+            (layer.experts - held).checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
+        })
+    }
+
     /// Whether growth reaches every expert ([`Self::ceiling`]): only such a
     /// bank is ever whole, each expert at its home record.
     pub fn reaches_whole(&self) -> bool {

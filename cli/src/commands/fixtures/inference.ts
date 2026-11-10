@@ -101,6 +101,7 @@ export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag:
   assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
   environmentId: ENVIRONMENT_ID,
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 } },
+  placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
   residency: { _tag: "Resident", performance: performance(CONTEXT_LENGTH) },
 })
 

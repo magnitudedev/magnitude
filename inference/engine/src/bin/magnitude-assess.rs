@@ -704,6 +704,7 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                     fit_context_tokens,
                     domains,
                     breakdown,
+                    placement,
                     bank: planned,
                 },
             residency,
@@ -715,6 +716,11 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                 "weightsBytes": breakdown.weights_bytes,
                 "contextBytes": breakdown.context_bytes,
                 "overheadBytes": breakdown.overhead_bytes,
+            },
+            "placement": {
+                "deviceBytes": placement.device_bytes,
+                "hostBytes": placement.host_bytes,
+                "diskBytes": placement.disk_bytes,
             },
             "expertBank": planned.as_ref().map(bank),
             "residency": match residency {

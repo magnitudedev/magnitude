@@ -7815,13 +7815,14 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "A fitting model at `served`, the largest context tier within `profile` at which its\nstandard workload fits this computer, how it holds its weights, and its decode-speed\nestimates held that way up to `served`.",
+            "description": "A fitting model at `served`, the largest context tier within `profile` at which its\nstandard workload fits this computer, where it is placed by tier, how it holds its weights,\nand its decode-speed estimates held that way up to `served`.",
             "required": [
               "profile",
               "served",
               "assessmentId",
               "memory",
               "memoryBreakdown",
+              "placement",
               "residency",
               "projector",
               "drafter",
@@ -7845,6 +7846,9 @@
               },
               "memoryBreakdown": {
                 "$ref": "#/components/schemas/MemoryBreakdown"
+              },
+              "placement": {
+                "$ref": "#/components/schemas/ModelPlacement"
               },
               "residency": {
                 "$ref": "#/components/schemas/ModelResidency"
@@ -9408,6 +9412,33 @@
           }
         ],
         "description": "A fitting model's speed estimates from this machine's measurements."
+      },
+      "ModelPlacement": {
+        "type": "object",
+        "description": "Where a fitting model is placed on this machine before any load, by tier: `device_bytes` held\nin the serving device's memory (GPU memory, or unified memory on Apple silicon), `host_bytes`\nheld in host RAM beside a discrete device (a streamed model's host tier, host tables, graphs\nand the process; none on unified memory), the two together the memory breakdown's total and the\nhost tier's growth into the host memory the fit leaves, and `disk_bytes` read from the model file as needed rather than held (routed experts neither the\nexpert bank nor the host tier holds, and side-table rows beyond their caches, as stored).",
+        "required": [
+          "deviceBytes",
+          "hostBytes",
+          "diskBytes"
+        ],
+        "properties": {
+          "deviceBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hostBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "diskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "ModelReasoningCapabilities": {
         "type": "object",
