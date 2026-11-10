@@ -13,6 +13,7 @@ export {
   localModelServingState,
   localModelContextLimit,
   localModelServingProfile,
+  localModelSizeBytes,
   localModelStorageBytes,
   preselectedDrafterCandidate,
 } from "@magnitudedev/sdk"

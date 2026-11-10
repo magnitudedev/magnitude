@@ -15,6 +15,7 @@ import {
   localModelAllocation,
   localModelExpertFacts,
   localModelIsInstalled,
+  localModelSizeBytes,
   promptGroupPlacesFact,
   localModelServingState,
   preselectedDrafterCandidate,
@@ -323,7 +324,7 @@ export const renderModelsList = ({ models, unsupported, hidden, all, preparation
     renderTable(listed, [
       { heading: "MODEL", value: ({ presentation }) => presentation.displayName },
       { heading: "QUANT", value: modelQuant },
-      { heading: "SIZE", value: (model) => formatStorageSize(model.storageBytes) },
+      { heading: "SIZE", value: (model) => formatStorageSize(localModelSizeBytes(model)) },
       { heading: "SPEED", value: (model) => assessmentSpeed(modelAssessment(model)) },
       { heading: "CONTEXT", value: modelContext },
       { heading: "SOURCE", value: modelSource },

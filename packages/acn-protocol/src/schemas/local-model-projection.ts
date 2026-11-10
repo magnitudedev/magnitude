@@ -157,6 +157,13 @@ export const localModelInstalledBytes = (model: LocalModel): Option.Option<numbe
 export const localModelStorageBytes = (model: LocalModel): Option.Option<number> =>
   Option.orElse(localModelInstalledBytes(model), () => Option.some(model.storageBytes))
 
+/** A model's size: its files' once known, else the size of the first download in progress. */
+export const localModelSizeBytes = (model: LocalModel): number => {
+  if (model.storageBytes > 0) return model.storageBytes
+  const state = model.acquisitionState
+  return state._tag === "Installing" || state._tag === "Updating" ? state.progress.totalBytes : 0
+}
+
 export const localModelIsInstalled = (model: LocalModel): boolean => Option.isSome(localModelInstallation(model))
 
 export const installedLocalModels = (

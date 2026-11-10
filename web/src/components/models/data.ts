@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { ladderBitWidths, quantBitWidth } from "@magnitudedev/client-common"
+import { ladderBitWidths, localModelSizeBytes, quantBitWidth } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -86,7 +86,7 @@ export const onThisComputer = (model: LocalModel) => {
 
 /** A model on this computer as a quant this machine runs; while its first download runs, its size is the download's. */
 export const quantOf = (model: LocalModel, unified: boolean): QuantView => {
-  const sizeBytes = model.storageBytes > 0 ? model.storageBytes : transferOf(model)?.totalBytes ?? 0
+  const sizeBytes = localModelSizeBytes(model)
   return quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes, downloadBytes: sizeBytes }, assessmentOf(model), unified, model.servingState._tag === "Assessing")
 }
 
