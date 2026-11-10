@@ -2569,6 +2569,7 @@ dependencies = [
  "magnitude-ggml",
  "seismic",
  "seismic-build",
+ "seismic-cpu",
  "seismic-lang",
  "seismic-native-tests",
  "seismic-std",

@@ -16,6 +16,8 @@ seismic-lang.workspace = true
 [dev-dependencies]
 magnitude-ggml.workspace = true
 seismic-lang.workspace = true
+# The head-to-head's pool of a chosen size (`examples/kernel_h2h.rs`).
+seismic-cpu.workspace = true
 # The shared test-device selector.
 seismic-native-tests.workspace = true
 seismic-std.workspace = true
