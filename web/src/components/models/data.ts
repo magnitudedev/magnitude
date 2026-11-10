@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { fitPlacementPhrase, ladderBitWidths, localModelSizeBytes, quantBitWidth } from "@magnitudedev/client-common"
+import { fitPlacementPhrase, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -30,11 +30,11 @@ const quantNameOf = (model: LocalModel): string => model._tag === "Catalog" ? mo
 const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
   model.servingState._tag === "Assessed" ? model.servingState.assessment : null
 
-export const phraseOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): PlacementPhrase =>
-  fitPlacementPhrase(assessment, unified)
+export const phraseOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, memory: ServingMemory): PlacementPhrase =>
+  fitPlacementPhrase(assessment, memory)
 
-const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): readonly PlacementTier[] => [
-  { kind: unified ? "Unified" : "Device", bytes: assessment.placement.deviceBytes },
+const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, memory: ServingMemory): readonly PlacementTier[] => [
+  { kind: memory === "Device" ? "Device" : "Unified", bytes: assessment.placement.deviceBytes },
   { kind: "Host", bytes: assessment.placement.hostBytes },
   { kind: "Disk", bytes: assessment.placement.diskBytes },
 ]
@@ -48,7 +48,7 @@ const speedOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>): n
 }
 
 /** One quant as this machine would run it, from its assessment. */
-export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number }, assessment: LocalModelAssessment | null, unified: boolean, measuring = false): QuantView => {
+export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number }, assessment: LocalModelAssessment | null, memory: ServingMemory, measuring = false): QuantView => {
   const fits = assessment?._tag === "Fits" ? assessment : null
   return {
     key: quant.key,
@@ -61,8 +61,8 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     fits: fits !== null,
     measuring: measuring || (fits !== null && fits.residency.performance._tag === "Pending"),
     speed: fits ? speedOf(fits) : null,
-    phrase: fits ? phraseOf(fits, unified) : null,
-    placement: fits ? tiersOf(fits, unified) : [],
+    phrase: fits ? phraseOf(fits, memory) : null,
+    placement: fits ? tiersOf(fits, memory) : [],
     servedContext: fits?.served.contextLength ?? null,
     quality: null,
   }
@@ -83,9 +83,9 @@ export const onThisComputer = (model: LocalModel) => {
 }
 
 /** A model on this computer as a quant this machine runs; while its first download runs, its size is the download's. */
-export const quantOf = (model: LocalModel, unified: boolean): QuantView => {
+export const quantOf = (model: LocalModel, memory: ServingMemory): QuantView => {
   const sizeBytes = localModelSizeBytes(model)
-  return quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes, downloadBytes: sizeBytes }, assessmentOf(model), unified, model.servingState._tag === "Assessing")
+  return quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes, downloadBytes: sizeBytes }, assessmentOf(model), memory, model.servingState._tag === "Assessing")
 }
 
 const directoryOf = (path: string) => path.replace(/[\\/][^\\/]*$/, "")
@@ -107,10 +107,10 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
 }
 
 /** A model on this computer as the Your models list shows it. */
-export const ownedModel = (model: LocalModel, unified: boolean): OwnedModel => {
+export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel => {
   const developer = Option.getOrNull(developerOf(model))
   const assessment = assessmentOf(model)
-  const quant = quantOf(model, unified)
+  const quant = quantOf(model, memory)
   return {
     modelId: model.modelId,
     name: model.presentation.displayName,
@@ -154,7 +154,7 @@ export const unrunnableFile = (model: UnsupportedLocalModel): UnrunnableFile => 
 }
 
 /** A recommended tested model as an offered model: its ladder's rungs as this machine would run them, the chosen one marked. */
-export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, unified: boolean): OfferedModel | null => {
+export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, memory: ServingMemory): OfferedModel | null => {
   const rungs = recommendation.rungs.flatMap(id => { const model = models.get(id); return model ? [model] : [] })
   const first = rungs[0]
   if (!first || first._tag !== "Catalog") return null
@@ -169,7 +169,7 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, unified), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) }))),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) }))),
     recommended: Option.getOrNull(recommendation.chosen),
   }
 }

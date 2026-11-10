@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import type { CatalogFormModelId, CustomLocalModel } from "@magnitudedev/sdk"
-import { useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
 import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
@@ -20,8 +20,8 @@ export function OnboardingScreen() {
   const models = useLocalModels()
   const { install } = useLocalModelMutations()
   const [usOnly, setUsOnly] = useState(false)
-  const unified = Result.isSuccess(hardware) && hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
-  const recommendations = useRecommendations(usOnly, unified)
+  const memory = Result.isSuccess(hardware) ? deriveHardwareRoles(hardware.value).servingMemory : "Device"
+  const recommendations = useRecommendations(usOnly, memory)
   const local = Result.isSuccess(models) ? models.value : null
   const found = (local?.models ?? []).filter((model): model is CustomLocalModel => model._tag === "Custom" && model.origin._tag === "Found")
   const owned = new Set((local?.models ?? []).filter(onThisComputer).map(model => String(model.modelId)))

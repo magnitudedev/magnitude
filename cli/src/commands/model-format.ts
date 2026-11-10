@@ -19,6 +19,7 @@ import {
   localModelServingProfile,
   localModelServingState,
   localModelUnservedContext,
+  type ServingMemory,
 } from "@magnitudedev/client-common"
 import {
   comparisonTokensPerSecond,
@@ -240,19 +241,21 @@ export const assessmentContext = (assessment: Option.Option<LocalModelAssessment
 })
 
 /** How an assessed quant runs on this machine: "Fits in memory", "Streams from SSD". */
-export const assessmentPlacement = (assessment: Option.Option<LocalModelAssessment>, unifiedMemory: boolean): string =>
-  Option.match(fits(assessment), { onNone: () => "—", onSome: (value) => fitPlacementPhrase(value, unifiedMemory) })
+const servingMemoryLabel: Record<ServingMemory, string> = { Unified: "Unified memory", Device: "GPU memory", System: "System memory" }
+
+export const assessmentPlacement = (assessment: Option.Option<LocalModelAssessment>, memory: ServingMemory): string =>
+  Option.match(fits(assessment), { onNone: () => "—", onSome: (value) => fitPlacementPhrase(value, memory) })
 
 /** Where a fitting quant's bytes are, by tier, and its decode speed at each assessed context depth. */
-export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment>, unifiedMemory: boolean): string[] =>
+export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment>, memory: ServingMemory): string[] =>
   Option.match(fits(assessment), {
     onNone: () => [],
     onSome: (value) => [
       "",
-      `Placement - ${fitPlacementPhrase(value, unifiedMemory)}`,
+      `Placement - ${fitPlacementPhrase(value, memory)}`,
       renderFields([
-        [unifiedMemory ? "Unified memory" : "GPU memory", formatMemorySize(value.placement.deviceBytes)],
-        ...(unifiedMemory || value.placement.hostBytes === 0 ? [] : [["Host RAM", formatMemorySize(value.placement.hostBytes)] as const]),
+        [servingMemoryLabel[memory], formatMemorySize(value.placement.deviceBytes)],
+        ...(memory !== "Device" || value.placement.hostBytes === 0 ? [] : [["Host RAM", formatMemorySize(value.placement.hostBytes)] as const]),
         ...(value.placement.diskBytes === 0 ? [] : [["Read from disk", formatMemorySize(value.placement.diskBytes)] as const]),
       ]),
       "",
@@ -270,7 +273,7 @@ export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment
 export const renderQuantLadder = (
   rungs: readonly LocalModel[],
   chosen: Option.Option<string>,
-  unifiedMemory: boolean,
+  memory: ServingMemory,
 ): string => {
   const widths = ladderBitWidths(rungs.map(quantName))
   return renderTable(rungs, [
@@ -278,7 +281,7 @@ export const renderQuantLadder = (
     { heading: "SIZE", value: (model) => formatStorageSize(model.storageBytes) },
     { heading: "SPEED", value: (model) => assessmentSpeed(modelAssessment(model)) },
     { heading: "CONTEXT", value: (model) => assessmentContext(modelAssessment(model)) },
-    { heading: "PLACEMENT", value: (model) => assessmentPlacement(modelAssessment(model), unifiedMemory) },
+    { heading: "PLACEMENT", value: (model) => assessmentPlacement(modelAssessment(model), memory) },
     { heading: "MODEL ID", value: ({ modelId }) => modelId },
   ])
 }

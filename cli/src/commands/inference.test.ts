@@ -45,7 +45,7 @@ import { registerInferenceCommands } from "./inference"
 import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
 import { asJson, jsonDocument, renderCommandError, runCommand } from "./output"
-import { findModel } from "./model-format"
+import { findModel, fitDetailSections } from "./model-format"
 import { describeLocalHardware } from "./inference-format"
 import {
   addModelFolder,
@@ -380,9 +380,18 @@ describe("recommendations, families, and assessment progress", () => {
   })
 })
 
+describe("placement wording", () => {
+  it("says a model on a machine without a GPU in use is held in system memory", () => {
+    const sections = fitDetailSections(Option.some(fitsAssessment()), "System")
+    expect(sections).toContain("Placement - Fits in memory")
+    expect(sections.join("\n")).toMatch(/System memory\s+\S/)
+    expect(sections.join("\n")).not.toMatch(/GPU|Host RAM/)
+  })
+})
+
 describe("Hugging Face search", () => {
   it("lists repositories with their base model and how their recommended quant runs here, and those not checked in time apart", () => {
-    const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), unifiedMemory: false })
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), memory: "Device" })
     expect(output).toBe([
       "Hugging Face models matching \"qwen test\"",
       "",
@@ -401,13 +410,13 @@ describe("Hugging Face search", () => {
 
   it("labels a repository whose files need access on Hugging Face", () => {
     const [first, ...rest] = makeSearchResponse().results
-    const output = renderSearch({ query: "qwen test", response: makeSearchResponse({ results: [{ ...first!, gated: true }, ...rest] }), unifiedMemory: false })
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse({ results: [{ ...first!, gated: true }, ...rest] }), memory: "Device" })
     expect(output).toContain("Qwen Test Uncensored · Requires access on Hugging Face")
   })
 
   it("lists results of architectures Magnitude doesn't run apart, with why", () => {
     const response = makeSearchResponse({ results: [...makeSearchResponse().results, makeUnsupportedSearchResult()] })
-    const output = renderSearch({ query: "qwen test", response, unifiedMemory: false })
+    const output = renderSearch({ query: "qwen test", response, memory: "Device" })
     expect(output).toContain([
       "Can't run in Magnitude",
       "",
@@ -415,7 +424,7 @@ describe("Hugging Face search", () => {
       "DeepSeek V4 Flash  deepseek4     Magnitude doesn't run deepseek4 yet  unsloth/DeepSeek-V4-Flash-GGUF",
     ].join("\n"))
     expect(output.split("Can't run in Magnitude")[0]).not.toContain("DeepSeek")
-    const only = renderSearch({ query: "deepseek", response: makeSearchResponse({ results: [makeUnsupportedSearchResult()] }), unifiedMemory: false })
+    const only = renderSearch({ query: "deepseek", response: makeSearchResponse({ results: [makeUnsupportedSearchResult()] }), memory: "Device" })
     expect(only).toContain("No Hugging Face models that run in Magnitude match \"deepseek\".")
     expect(only).not.toContain("See every quant")
   })
@@ -423,7 +432,7 @@ describe("Hugging Face search", () => {
 
 describe("candidate inspection", () => {
   it("prints the repository step with verdicts, drafters, and the download command", () => {
-    const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()], unifiedMemory: false })
+    const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()], memory: "Device" })
     const lines = output.split("\n")
     expect(lines.slice(0, 21)).toEqual([
       "Qwen Test Uncensored",
@@ -473,7 +482,7 @@ describe("candidate inspection", () => {
 
   it("uses a selected version for the drafter list and hint", () => {
     const inspection = makeInspection({ selectedVersion: Option.some("Q6_K_P") })
-    const output = renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })
+    const output = renderInspection({ inspection, drafters: [], models: [], memory: "Device" })
     expect(output).toContain("Fits (selected) · already on this computer")
     expect(output.trimEnd().split("\n").at(-1)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q6_K_P`)
   })
@@ -483,7 +492,7 @@ describe("candidate inspection", () => {
       inspection: makeInspection({ versions: [], unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) }),
       drafters: [],
       models: [],
-      unifiedMemory: false,
+      memory: "Device",
     })
     expect(output).toContain("Magnitude can't run this model: No kernels for the deepseek4 architecture.")
     expect(output).not.toContain("VERSION")
@@ -494,9 +503,9 @@ describe("candidate inspection", () => {
     const tooLarge = makeInspection({
       versions: makeInspection().versions.map((version) => ({ ...version, recommended: false, assessment: Option.some(doesNotFitAssessment()) })),
     })
-    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [], unifiedMemory: false })).toContain("No version of this model runs on this computer. Every version is too large for this machine.")
+    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [], memory: "Device" })).toContain("No version of this model runs on this computer. Every version is too large for this machine.")
     const nothingRuns = makeInspection({ versions: [makeInspection().versions[0]!, makeInspection().versions[3]!] })
-    expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [], unifiedMemory: false })).toContain(
+    expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [], memory: "Device" })).toContain(
       "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
     )
   })
@@ -1005,7 +1014,7 @@ const encode = <A>(document: { readonly encode: (value: A) => Effect.Effect<unkn
 describe("--json output", () => {
 
   it("encodes Option fields as present or absent keys", () => {
-    const search = encode(searchJson, { query: "q", response: makeSearchResponse(), unifiedMemory: false })
+    const search = encode(searchJson, { query: "q", response: makeSearchResponse(), memory: "Device" })
     const results = search.results as Record<string, unknown>[]
     expect(results[0]).toMatchObject({ repository: TEST_REPOSITORY, variantOf: "qwen-test:gguf:q4", downloads: 48_213 })
     expect(results[1]).not.toHaveProperty("variantOf")
@@ -1014,7 +1023,7 @@ describe("--json output", () => {
   })
 
   it("includes structured unsupported reasons and drafter verdicts", () => {
-    const document = encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], unifiedMemory: false })
+    const document = encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], memory: "Device" })
     const versions = (document.inspection as { versions: Record<string, unknown>[] }).versions
     expect(versions[3]!.assessment).toMatchObject({
       _tag: "Unsupported",
@@ -1030,9 +1039,9 @@ describe("--json output", () => {
     const inspection = makeInspection({
       versions: [recommended!, { ...recommended!, label: "Q3_K_M", recommended: false, assessment: Option.some(unreadableAssessment()) }],
     })
-    const output = renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })
+    const output = renderInspection({ inspection, drafters: [], models: [], memory: "Device" })
     expect(output).toMatch(/Q3_K_M.*Unsupported: Magnitude can't read this file/)
-    const document = encode(inspectionJson, { inspection, drafters: [], models: [], unifiedMemory: false })
+    const document = encode(inspectionJson, { inspection, drafters: [], models: [], memory: "Device" })
     const unreadable = (document.inspection as { versions: Record<string, unknown>[] }).versions[1]!.assessment
     expect(unreadable).toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "Unreadable" }] })
     expect(unreadable).not.toHaveProperty("profile")
@@ -1209,7 +1218,7 @@ describe("--json internal identities", () => {
       encode(modelsListJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
       encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
       encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false }),
-      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], unifiedMemory: false }),
+      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], memory: "Device" }),
       encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(internal)
@@ -1222,7 +1231,7 @@ describe("--json internal identities", () => {
       .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, served: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] })
     expect(hardware.currentModel).toMatchObject({ _tag: "Custom", modelId: FOUND_MODEL_ID, servingState: { _tag: "Assessed" } })
-    const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [], unifiedMemory: false })
+    const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [], memory: "Device" })
     expect((inspection.inspection as { versions: { assessment?: Record<string, unknown> }[] }).versions[3]!.assessment)
       .toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "WeightTypes" }] })
   })

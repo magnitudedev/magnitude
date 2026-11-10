@@ -132,18 +132,18 @@ const renderRecommendation = (hardware: LocalInferenceHardware) => (
   { recommendation, chosen: model, rungs }: RecommendedCatalogModel,
   index: number,
 ): string => {
-  const unifiedMemory = deriveHardwareRoles(hardware).unifiedMemory
+  const memory = deriveHardwareRoles(hardware).servingMemory
   const assessment = modelAssessment(model)
   const capabilities = capabilityLabels(model)
   const expertFields = localModelExpertFacts(model, Option.some(hardware))
   const { developer } = recommendation
   return [
     `${index + 1}. ${formatLocalModelDisplayName(model)} - ${developer.name} (${developer.country}) - Intelligence ${intelligenceLabel(model)}`,
-    `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, unifiedMemory)}`,
+    `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, memory)}`,
     `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : " - below 20 tok/s on this computer"}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     `   Acceleration ${accelerationLabel(model)}${capabilities.length > 0 ? ` - ${capabilities.join(", ")}` : ""}`,
-    indent(renderQuantLadder(rungs, Option.some(model.modelId), unifiedMemory), "   "),
+    indent(renderQuantLadder(rungs, Option.some(model.modelId), memory), "   "),
   ].join("\n")
 }
 

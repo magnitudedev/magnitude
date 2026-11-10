@@ -55,11 +55,18 @@ export interface LocalHardwareDevice {
   readonly placesOnHost: boolean
 }
 
+/**
+ * The memory a model is held in while it serves: unified memory, a GPU's own memory beside host RAM, or system memory
+ * when it runs on the CPU.
+ */
+export type ServingMemory = "Unified" | "Device" | "System"
+
 export interface LocalHardwareRoles {
   /** The machine's title: its product name, then its CPU; never an accelerator's name. */
   readonly machineName: string
   /** Whether host RAM is the active device's own memory (Apple Silicon, or a serving integrated GPU). */
   readonly unifiedMemory: boolean
+  readonly servingMemory: ServingMemory
   /** Every usable accelerator, the one holding the active device first. */
   readonly devices: readonly LocalHardwareDevice[]
 }
@@ -84,10 +91,13 @@ export const deriveHardwareRoles = (hardware: LocalInferenceHardware): LocalHard
     }
   })
   const isAppleSilicon = hardware.platform === "MacOS" && hardware.architecture === "Arm64"
+  const unifiedMemory = hardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory")
+  const servingGpu = devices.some(({ role, dedicatedMemoryBytes }) => role._tag === "InUse" && Option.isSome(dedicatedMemoryBytes))
   return {
     machineName: uniqueNames([...Option.toArray(hardware.productName), ...Option.toArray(hardware.processor)]).join(" · ")
       || (isAppleSilicon ? "Apple Silicon" : "CPU"),
-    unifiedMemory: hardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory"),
+    unifiedMemory,
+    servingMemory: unifiedMemory ? "Unified" : servingGpu ? "Device" : "System",
     devices: [...devices.filter(({ role }) => role._tag === "InUse"), ...devices.filter(({ role }) => role._tag === "Available")],
   }
 }

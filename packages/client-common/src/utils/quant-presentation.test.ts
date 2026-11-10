@@ -49,8 +49,9 @@ describe("quant presentation", () => {
   })
 
   it("says a discrete GPU's model is split only when its weights and conversation don't all fit in GPU memory", () => {
-    expect(fitPlacementPhrase(resident(12 * GB, GB), false)).toBe("Fits in GPU")
-    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), false)).toBe("GPU and RAM")
-    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), true)).toBe("Fits in memory")
+    expect(fitPlacementPhrase(resident(12 * GB, GB), "Device")).toBe("Fits in GPU")
+    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "Device")).toBe("GPU and RAM")
+    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "Unified")).toBe("Fits in memory")
+    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "System")).toBe("Fits in memory")
   })
 })

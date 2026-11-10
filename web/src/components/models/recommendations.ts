@@ -2,7 +2,7 @@ import { useMemo } from "react"
 import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { CountryCodeSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
-import { useAgentClient, useLocalModels } from "@magnitudedev/client-common"
+import { useAgentClient, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { offeredFromRecommendation, runnableFamily } from "./data"
 import type { OfferedModel } from "./expanding-model"
 import type { RunnableFamily } from "./explore-modal"
@@ -23,7 +23,7 @@ export interface RecommendationsView {
  * The service's recommendations for this machine as offered models, optionally only US developers', and the families
  * it runs. While any rung is still being measured the order is not final, so `measuring` says how far along it is.
  */
-export function useRecommendations(usOnly: boolean, unified: boolean): RecommendationsView {
+export function useRecommendations(usOnly: boolean, memory: ServingMemory): RecommendationsView {
   const client = useAgentClient()
   const developerCountry = usOnly ? Option.some(CountryCodeSchema.make("US")) : Option.none()
   const recommendations = useAtomValue(client.Models.GetRecommendations({ developerCountry })).result
@@ -36,10 +36,10 @@ export function useRecommendations(usOnly: boolean, unified: boolean): Recommend
       ready: true,
       measuring: complete ? null : { settled: measured, total: rungs },
       offered: recommendations.value.models.flatMap(recommendation => {
-        const model = offeredFromRecommendation(recommendation, byId, unified)
+        const model = offeredFromRecommendation(recommendation, byId, memory)
         return model ? [{ recommendation, model }] : []
       }),
       families: recommendations.value.families.map(runnableFamily),
     }
-  }, [recommendations, models, unified])
+  }, [recommendations, models, memory])
 }

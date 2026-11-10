@@ -16,7 +16,7 @@ describe("models show with a named version that doesn't run here", () => {
       `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude models pull ${TEST_REPOSITORY}:Q8_K_P --force`,
       `The recommended version is Q4_K_P. Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`,
     ].join("\n"))
-    expect(renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })).not.toContain("No version of this model runs")
+    expect(renderInspection({ inspection, drafters: [], models: [], memory: "Device" })).not.toContain("No version of this model runs")
   })
 
   it("explains an unsupported version with its reasons and points to the recommended version", () => {
@@ -42,11 +42,11 @@ describe("models show with a named version that doesn't run here", () => {
 
   it("never marks a named version that can't run as selected", () => {
     for (const label of ["Q8_K_P", "Q2_K_P"]) {
-      const output = renderInspection({ inspection: makeInspection({ selectedVersion: Option.some(label) }), drafters: [], models: [], unifiedMemory: false })
+      const output = renderInspection({ inspection: makeInspection({ selectedVersion: Option.some(label) }), drafters: [], models: [], memory: "Device" })
       expect(output).not.toContain("(selected)")
       expect(output).toMatch(/^Q4_K_P .*Fits \(recommended\)$/m)
     }
-    expect(renderInspection({ inspection: makeInspection({ selectedVersion: Option.some("Q6_K_P") }), drafters: [], models: [], unifiedMemory: false }))
+    expect(renderInspection({ inspection: makeInspection({ selectedVersion: Option.some("Q6_K_P") }), drafters: [], models: [], memory: "Device" }))
       .toMatch(/^Q6_K_P .*Fits \(selected\) · already on this computer$/m)
   })
 

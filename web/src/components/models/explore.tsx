@@ -3,7 +3,7 @@ import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
 import type { CatalogFormModelId, HuggingFaceRepositoryId, HuggingFaceSearchResult, LocalModel } from "@magnitudedev/sdk"
-import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
 import { onThisComputer, quantView, transferOf } from "./data"
@@ -30,7 +30,7 @@ const trustedPublisher = (repository: string, base: string | undefined) => {
 }
 
 /** Search results grouped by the model they quantize: one offered model per base, one rung per repository's recommended quant. */
-const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified: boolean): { readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] } => {
+const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: ServingMemory): { readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] } => {
   const groups = new Map<string, HuggingFaceSearchResult[]>()
   const unrunnable: UnrunnableFile[] = []
   const unchecked: UnrunnableFile[] = []
@@ -59,7 +59,7 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified:
         || right.downloads - left.downloads)
     const quants = ordered.flatMap(member => Option.match(member.recommended, {
       onNone: () => [],
-      onSome: version => [quantView({ key: version.modelId, name: version.label, repository: member.repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes }, version.assessment, unified)],
+      onSome: version => [quantView({ key: version.modelId, name: version.label, repository: member.repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes }, version.assessment, memory)],
     }))
     const fastest = quants.find(quant => quant.fits)
     const first = members.flatMap(member => Option.toArray(member.recommended))[0]
@@ -84,7 +84,7 @@ interface ExploreProps {
   readonly setOpen: (open: boolean) => void
   readonly query: string
   readonly setQuery: (value: string) => void
-  readonly unified: boolean
+  readonly memory: ServingMemory
   readonly machine: string
   readonly recommended: readonly OfferedModel[]
   readonly measuring: { readonly settled: number; readonly total: number } | null
@@ -158,7 +158,7 @@ function Searched({ settled, props }: { settled: string; props: ExploreProps }) 
     : Result.isFailure(page) && shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
     : {
         _tag: "Results",
-        ...offeredFromSearch([...shown, ...(current?.results ?? [])], props.unified),
+        ...offeredFromSearch([...shown, ...(current?.results ?? [])], props.memory),
         more: loading ? "Loading" : Option.isSome(next) ? more : null,
       }
   return <ExploreModal {...props} results={results} download={download} />

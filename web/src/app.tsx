@@ -35,6 +35,7 @@ import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
   activeLocalModel,
+  deriveHardwareRoles,
   useAgentClient,
   type ApplicationPage,
   useLocalModels,
@@ -82,13 +83,13 @@ function ModelsPage() {
   const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
   const open = explore.open || Option.isSome(linkedQuery)
   const query = Option.getOrElse(linkedQuery, () => explore.query)
-  const unified = Result.isSuccess(hardware) && hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
+  const memory = Result.isSuccess(hardware) ? deriveHardwareRoles(hardware.value).servingMemory : "Device"
   const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
-  const recommendations = useRecommendations(false, unified)
+  const recommendations = useRecommendations(false, memory)
   const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])
   return <>
     <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
-    <Explore open={open} query={query} unified={unified} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}
+    <Explore open={open} query={query} memory={memory} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}
       setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
   </>

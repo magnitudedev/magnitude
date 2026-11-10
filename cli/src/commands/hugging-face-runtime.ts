@@ -15,6 +15,7 @@ import {
   unsupportedReasonGroups,
   type UnsupportedReasonGroup,
   unsupportedReasonMessages,
+  type ServingMemory,
 } from "@magnitudedev/client-common"
 import {
   CatalogComponentSchema,
@@ -81,12 +82,12 @@ const baseLabel = (result: HuggingFaceSearchResult): string => Option.match(resu
 export interface SearchView {
   readonly query: string
   readonly response: HuggingFaceSearchResponse
-  readonly unifiedMemory: boolean
+  readonly memory: ServingMemory
 }
 
 const reasonsLine = (reasons: readonly UnsupportedReason[]) => unsupportedReasonMessages(reasons).join(". ")
 
-export const renderSearch = ({ query, response, unifiedMemory }: SearchView): string => {
+export const renderSearch = ({ query, response, memory }: SearchView): string => {
   const supported = response.results.flatMap((result) => Option.isSome(result.unsupported) ? [] : Option.match(result.recommended, {
     onNone: () => [],
     onSome: (recommended) => [{ result, recommended }],
@@ -107,7 +108,7 @@ export const renderSearch = ({ query, response, unifiedMemory }: SearchView): st
           { heading: "QUANT", value: ({ result, recommended }) => formatQuantLabel(recommended.label, Option.some(result.repository)) },
           { heading: "SIZE", value: ({ recommended }) => formatStorageSize(recommended.sizeBytes) },
           { heading: "SPEED", value: ({ recommended }) => assessmentSpeed(Option.some(recommended.assessment)) },
-          { heading: "PLACEMENT", value: ({ recommended }) => assessmentPlacement(Option.some(recommended.assessment), unifiedMemory) },
+          { heading: "PLACEMENT", value: ({ recommended }) => assessmentPlacement(Option.some(recommended.assessment), memory) },
           { heading: "DOWNLOADS", value: ({ result }) => formatDownloads(result.downloads) },
           { heading: "REPOSITORY", value: ({ result }) => result.repository },
         ]).trimEnd(),
@@ -168,7 +169,7 @@ export const readSearch = (
 }).pipe(Effect.map(({ response, hardware }): SearchView => ({
   query,
   response,
-  unifiedMemory: deriveHardwareRoles(hardware).unifiedMemory,
+  memory: deriveHardwareRoles(hardware).servingMemory,
 })))
 
 export const searchHuggingFace = (
@@ -234,7 +235,7 @@ export interface InspectionView {
   readonly inspection: CandidateInspection
   readonly drafters: readonly DrafterCandidate[]
   readonly models: readonly LocalModel[]
-  readonly unifiedMemory: boolean
+  readonly memory: ServingMemory
 }
 
 const variantOfLabel = (models: readonly LocalModel[], variantOf: CatalogFormModelId): string =>
@@ -327,7 +328,7 @@ export const downloadSizeLine = (
     : `${total} (${present.map(([part, bytes]) => `${part} ${formatStorageSize(bytes)}`).join(" + ")})`
 }
 
-export const renderInspection = ({ inspection, drafters, models, unifiedMemory }: InspectionView): string => {
+export const renderInspection = ({ inspection, drafters, models, memory }: InspectionView): string => {
   const header = inspectionHeader(inspection, models)
   if (Option.isSome(inspection.unsupportedArchitecture)) return ensureTrailingNewline([
     ...header,
@@ -347,7 +348,7 @@ export const renderInspection = ({ inspection, drafters, models, unifiedMemory }
     { heading: "SIZE", value: ({ sizeBytes }) => formatStorageSize(sizeBytes) },
     { heading: "SPEED", value: ({ assessment }) => assessmentSpeed(assessment) },
     { heading: "CONTEXT", value: ({ assessment }) => assessmentContext(assessment) },
-    { heading: "PLACEMENT", value: ({ assessment }) => assessmentPlacement(assessment, unifiedMemory) },
+    { heading: "PLACEMENT", value: ({ assessment }) => assessmentPlacement(assessment, memory) },
     { heading: "ON THIS COMPUTER", value: (version) => versionVerdict(version, version.label === selectedLabel) },
   ]).trimEnd()
   const runnable = chosen !== undefined && isRunnable(chosen)
@@ -355,7 +356,7 @@ export const renderInspection = ({ inspection, drafters, models, unifiedMemory }
     "",
     renderDrafterChoices(drafters, Option.map(preselectedDrafterCandidate(drafters), ({ reference }) => reference)),
   ]
-  const chosenFit = chosen === undefined ? [] : fitDetailSections(chosen.assessment, unifiedMemory)
+  const chosenFit = chosen === undefined ? [] : fitDetailSections(chosen.assessment, memory)
   const chosenSections = chosen === undefined || chosenFit.length === 0
     ? []
     : ["", `How ${chosen.label} runs on this computer`, ...chosenFit]
@@ -418,7 +419,7 @@ export const readInspection = (client: CliModelsClient, reference: string) => Ef
     inspection,
     drafters,
     models: catalogProducts(catalog),
-    unifiedMemory: deriveHardwareRoles(hardware).unifiedMemory,
+    memory: deriveHardwareRoles(hardware).servingMemory,
   } satisfies InspectionView
 })
 

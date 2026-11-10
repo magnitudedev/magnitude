@@ -1,5 +1,6 @@
 import { Option } from "effect"
 import type { LocalModelFitsAssessment } from "@magnitudedev/sdk"
+import type { ServingMemory } from "./hardware-memory"
 
 /**
  * A quant's weight bit width, read from its quant name: `UD-Q4_K_XL`, `IQ4_XS` and `MXFP4` are 4-bit, `Q8_0` is
@@ -38,11 +39,11 @@ export type FitPlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory
  * alone or split with host RAM), or its experts streamed from RAM or disk. A discrete GPU's model is split when its
  * weights and conversation don't all fit in GPU memory; host RAM always holds some tables and the process beside it.
  */
-export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, unifiedMemory: boolean): FitPlacementPhrase => {
+export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, memory: ServingMemory): FitPlacementPhrase => {
   if (assessment.residency._tag === "Streamed") {
     return assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
   }
-  if (unifiedMemory) return "Fits in memory"
+  if (memory !== "Device") return "Fits in memory"
   const { weightsBytes, contextBytes } = assessment.memory.breakdown
   return assessment.placement.deviceBytes < weightsBytes + contextBytes ? "GPU and RAM" : "Fits in GPU"
 }

@@ -503,7 +503,7 @@ export const otherVersionsCommand = (model: LocalModel): string =>
 
 export const renderModelDetail = (view: ModelDetailView): string => {
   const { model, models } = view
-  const unifiedMemory = deriveHardwareRoles(view.hardware).unifiedMemory
+  const memory = deriveHardwareRoles(view.hardware).servingMemory
   const ladder = catalogLadder(model, models)
   const description = model._tag === "Catalog" ? model.presentation.description.trim() : ""
   return ensureTrailingNewline([
@@ -529,8 +529,8 @@ export const renderModelDetail = (view: ModelDetailView): string => {
       ...(modelContext(model) === "—" ? [] : [["Context", modelContext(model)]] as const),
       ...(model._tag === "Catalog" ? [["Acceleration", accelerationLabel(model)]] as const : []),
     ]),
-    ...fitDetailSections(modelAssessment(model), unifiedMemory),
-    ...(ladder.length > 1 ? ["", "Quants", renderQuantLadder(ladder, Option.some(model.modelId), unifiedMemory).trimEnd()] : []),
+    ...fitDetailSections(modelAssessment(model), memory),
+    ...(ladder.length > 1 ? ["", "Quants", renderQuantLadder(ladder, Option.some(model.modelId), memory).trimEnd()] : []),
     ...drafterSection(view),
     ...(model._tag === "Catalog" ? ["", `Other versions: ${otherVersionsCommand(model)}`] : []),
   ].join("\n"))

@@ -628,8 +628,8 @@ describe("--json never leaks internals", () => {
       ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
       encode(hardwareJson, { hardware: makeHardware(), models: [catalogs[1]!] }),
-      encode(searchJson, { query: "q", response: makeSearchResponse(), unifiedMemory: false }),
-      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: all, unifiedMemory: false }),
+      encode(searchJson, { query: "q", response: makeSearchResponse(), memory: "Device" }),
+      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: all, memory: "Device" }),
     ]
 
     const status = await runBoth({ getCatalog: succeed(state) }, (options) => listModels({ ...options, all: true }))

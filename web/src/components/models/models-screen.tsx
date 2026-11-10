@@ -3,7 +3,7 @@ import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { CircleNotchIcon, MagnifyingGlassIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
-import { modelDownloadFailureMessage, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, modelDownloadFailureMessage, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
@@ -41,11 +41,11 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
   const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set())
   if (Result.isFailure(models)) return <><h1 className={pageLayout.pageTitle}>Models</h1><ErrorNotice title="Couldn’t load your models" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
   if (!Result.isSuccess(models) || !Result.isSuccess(hardware)) return <ModelsSkeleton />
-  const unified = hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
+  const memory = deriveHardwareRoles(hardware.value).servingMemory
   const onComputer = models.value.models.filter(model => !removed.has(model.modelId) && (model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"))
   const byId = new Map<string, LocalModel>(onComputer.map(model => [model.modelId, model]))
-  const owned = onComputer.map(model => ownedModel(model, unified))
-  const hidden = models.value.hidden.map(model => ownedModel(model, unified))
+  const owned = onComputer.map(model => ownedModel(model, memory))
+  const hidden = models.value.hidden.map(model => ownedModel(model, memory))
   const action = (view: OwnedModel) => {
     const model = byId.get(view.modelId)
     if (!model) return null
