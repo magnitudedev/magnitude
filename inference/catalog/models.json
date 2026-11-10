@@ -12,7 +12,6 @@
     { "id": "liquid", "name": "Liquid AI", "country": "US", "huggingFaceOrganizations": ["LiquidAI"] },
     { "id": "nvidia", "name": "NVIDIA", "country": "US", "huggingFaceOrganizations": ["nvidia"] },
     { "id": "meta", "name": "Meta", "country": "US", "huggingFaceOrganizations": ["meta-llama", "facebook", "meta-models"] },
-    { "id": "openbmb", "name": "OpenBMB", "country": "CN", "huggingFaceOrganizations": ["openbmb"] },
     { "id": "deepseek", "name": "DeepSeek", "country": "CN", "huggingFaceOrganizations": ["deepseek-ai"] },
     { "id": "poolside", "name": "Poolside", "country": "US", "huggingFaceOrganizations": ["poolside"] },
     { "id": "zai", "name": "Z.ai", "country": "CN", "huggingFaceOrganizations": ["zai-org"] },
@@ -209,44 +208,6 @@
       }
     },
     {
-      "id": "gemma-4-e2b-it-qat",
-      "displayName": "Gemma 4 E2B",
-      "lab": "google",
-      "description": "Very small dense model with per-layer embeddings optimized for on-device use.",
-      "releaseDate": "2026-04-02",
-      "parameterization": { "architecture": "dense", "totalParameters": 5100000000 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
-          "projector": { "path": "mmproj-BF16.gguf" },
-          "license": "apache-2.0"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "mtp",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/gemma-4-E2B-it-qat-MTP-GGUF",
-          "path": "gemma-4-E2B-it-qat-MTP-Q4_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 7.8,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-e2b"
-          ]
-        }
-      }
-    },
-    {
       "id": "gemma-4-e4b-it-qat",
       "displayName": "Gemma 4 E4B",
       "lab": "google",
@@ -280,80 +241,6 @@
           "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
           "evidenceUrls": [
             "https://artificialanalysis.ai/models/gemma-4-e4b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "lfm2.5-2.6b",
-      "displayName": "Liquid LFM2.5 2.6B",
-      "lab": "liquid",
-      "description": "Compact dense Liquid model tuned for fast on-device tool use and coding workflows.",
-      "releaseDate": "2026-08-04",
-      "parameterization": { "architecture": "dense", "totalParameters": 2600000000 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "license": "lfm1.0"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/LFM2.5-2.6B-DSpark-GGUF",
-          "path": "LFM2.5-2.6B-DSpark-Q8_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 8.4,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/lfm2-5-2-6b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "lfm2.5-8b-a1b",
-      "displayName": "Liquid LFM2.5 8B-A1B",
-      "lab": "liquid",
-      "description": "Low-active-parameter Liquid MoE optimized for fast local reasoning and tool use.",
-      "releaseDate": "2026-05-28",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 8300000000, "activeParameters": 1500000000 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "LiquidAI/LFM2.5-8B-A1B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "license": "lfm1.0"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF",
-          "path": "LFM2.5-8B-A1B-DSpark-Q8_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 7.2,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/lfm2-5-8b-a1b"
           ]
         }
       }
@@ -422,172 +309,6 @@
             "https://huggingface.co/LiquidAI/LFM3-1.7B",
             "https://artificialanalysis.ai/models/minicpm5-2b",
             "https://artificialanalysis.ai/models/qwen3-5-9b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "lfm3-vl-2b",
-      "displayName": "Liquid LFM3-VL 2B",
-      "lab": "liquid",
-      "description": "Compact Liquid vision-language model for on-device image understanding and agents, with a quantization-aware distilled (QAD) Q4.",
-      "releaseDate": "2026-10-27",
-      "parameterization": { "architecture": "dense", "totalParameters": 1918181888 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "LiquidAI/LFM3-VL-2B-GGUF",
-          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "projector": {"path": "mmproj-LFM3-VL-2B-BF16.gguf"},
-          "license": "lfm1.0"
-        }
-      ],
-      "artificialAnalysis": {
-        "score": 12.8,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-27",
-          "methodology": "Liquid AI publishes only multimodal results for LFM3-VL 2B. Scaled the Artificial Analysis estimates of the three compared models it publishes, Qwen3.5 4B (13.1), Gemma 4 E2B (7.8) and Gemma 4 12B (14.2), by the geometric mean of LFM3-VL 2B's thinking-mode ratios against each over the ten category averages of Liquid AI's release comparison. The scaled estimates are approximately 13.3, 11.1 and 14.1; their geometric mean rounds to 12.8. The categories are multimodal, so this is a multimodal proxy for the Intelligence Index, not a measured language score.",
-          "evidenceUrls": [
-            "https://huggingface.co/LiquidAI/LFM3-VL-2B",
-            "https://artificialanalysis.ai/models/qwen3-5-4b",
-            "https://artificialanalysis.ai/models/gemma-4-e2b",
-            "https://artificialanalysis.ai/models/gemma-4-12b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "minicpm5-1b",
-      "displayName": "MiniCPM5 1B",
-      "lab": "openbmb",
-      "description": "Compact dense model for on-device reasoning and tool use.",
-      "releaseDate": "2026-05-21",
-      "parameterization": { "architecture": "dense", "totalParameters": 1080632832 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "openbmb/MiniCPM5-1B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "license": "apache-2.0"
-        }
-      ],
-      "artificialAnalysis": {
-        "score": 8.8,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/minicpm5-1b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "minicpm5-2b",
-      "displayName": "MiniCPM5 2B",
-      "lab": "openbmb",
-      "description": "Compact dense model with native long context, tool use, and reasoning for on-device work.",
-      "releaseDate": "2026-09-07",
-      "parameterization": { "architecture": "dense", "totalParameters": 2516756480 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "openbmb/MiniCPM5-2B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "license": "apache-2.0"
-        }
-      ],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/MiniCPM5-2B-DSpark-GGUF", "path": "MiniCPM5-2.6B-DSpark.gguf" } },
-      "artificialAnalysis": {
-        "score": 12.5,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/minicpm5-2b"
-        }
-      }
-    },
-    {
-      "id": "minicpm-v-4.7-1b",
-      "displayName": "MiniCPM-V 4.7 1B",
-      "lab": "openbmb",
-      "description": "Compact multimodal model for on-device image, document, and video understanding.",
-      "releaseDate": "2026-10-12",
-      "parameterization": {"architecture": "dense", "totalParameters": 1006209856},
-      "support": {"level": "supported"},
-      "sources": [
-        {
-          "repository": "openbmb/MiniCPM-V-4.7-1B-gguf",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "projector": {"path": "mmproj-model-f16-4x.gguf"},
-          "license": "apache-2.0"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/MiniCPM-V-4.7-1B-DSpark-GGUF",
-          "path": "MiniCPM-V-4.7-1B-DSpark-Q8_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 5.9,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-13",
-          "methodology": "Scaled MiniCPM-V 4.6 1.3B's Artificial Analysis estimated score of 5.69026588282761 by the geometric mean (1.0412483709715992) of MiniCPM-V 4.7 1B's ratios on all 25 benchmarks in OpenBMB's Instruct-mode 4x visual-compression comparison, inverting the lower-is-better MMHal-Hallrate ratio; rounded 5.924980080889518 to 5.9. The published 1B table contains multimodal benchmarks, not the language benchmarks used for the 35B estimate, so this is a multimodal proxy for the Intelligence Index, not a measured language score.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/minicpm-v4-6-1-3b",
-            "https://github.com/OpenBMB/MiniCPM-V/blob/main/assets/minicpmv4.7/overall_performance_1b_instruct.png"
-          ]
-        }
-      }
-    },
-    {
-      "id": "minicpm-v-4.7-35b-a3b",
-      "displayName": "MiniCPM-V 4.7 35B-A3B",
-      "lab": "openbmb",
-      "description": "Multimodal MoE with a large knowledge footprint and low active compute for image, document, and video understanding.",
-      "releaseDate": "2026-10-12",
-      "parameterization": {"architecture": "mixtureOfExperts", "totalParameters": 34659889792, "activeParameters": 3000000000},
-      "support": {"level": "supported"},
-      "sources": [
-        {
-          "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "projector": {"path": "mmproj-model-f16-4x.gguf"},
-          "license": "apache-2.0"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/MiniCPM-V-4.7-35B-A3B-DSpark-GGUF",
-          "path": "MiniCPM-V-4.7-35B-A3B-DSpark-Q8_0.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 19.1,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-10-13",
-          "methodology": "Scaled the measured Qwen3.6 35B-A3B Intelligence Index score of 18.2 by the geometric mean of MiniCPM-V 4.7 35B-A3B's ratios against that language backbone on OpenBMB's eight Instruct-mode benchmarks: CMMLU, MMLU-Pro, SuperGPQA, IFBench, AIME26, LiveCodeBench v6, BFCL-V4 and tau2-Bench; rounded to 19.1.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
-            "https://github.com/OpenBMB/MiniCPM-V/blob/main/assets/minicpmv4.7/overall_performance_35ba3b_language.png"
           ]
         }
       }
@@ -805,39 +526,6 @@
           "methodologyVersion": "4.3.2",
           "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/nvidia-nemotron-3-super-120b-a12b"
-        }
-      }
-    },
-    {
-      "id": "nemotron-3.5-lightning-30b-a3b",
-      "displayName": "Nemotron 3.5 Lightning 30B-A3B",
-      "lab": "nvidia",
-      "description": "Efficient hybrid MoE model for local reasoning, coding, and agentic workflows.",
-      "releaseDate": "2026-08-11",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 30000000000, "activeParameters": 3000000000 },
-      "support": { "level": "supported" },
-      "sources": [
-        {
-          "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
-          "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
-          "license": "openmdw-1.1"
-        }
-      ],
-      "speculativeDecoding": {
-        "method": "dflash",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF",
-          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf"
-        }
-      },
-      "artificialAnalysis": {
-        "score": 12.9,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
         }
       }
     },

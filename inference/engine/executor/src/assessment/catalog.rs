@@ -103,9 +103,24 @@ pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::Model
         if crate::operators::admit(&definition, false).is_err() {
             continue;
         }
-        targets.push((name.to_owned(), definition, target_manifest(component, &target, identity)));
+        targets.push((name.to_owned(), definition, target_manifest(&component.path, &target, identity)));
     }
     targets
+}
+
+/// Pinned artifact `name`'s target, as [`served_targets`] gives a catalog
+/// target's.
+pub(super) fn artifact_target(name: &str) -> (String, magnitude_family_contracts::ModelDefinition, PackageManifest) {
+    let identity = PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
+    let target = headers::artifact(name);
+    let family = FAMILIES
+        .iter()
+        .find(|family| family.recognizes(&target))
+        .unwrap_or_else(|| panic!("{name}: a family recognizes the target"));
+    let definition = family
+        .inspect(&target, None, identity)
+        .unwrap_or_else(|error| panic!("{name}: its family inspects it: {error}"));
+    (name.to_owned(), definition, target_manifest(Path::new(name), &target, identity))
 }
 
 #[test]
@@ -153,7 +168,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             refused.push(format!("{name}: {error}"));
             continue;
         }
-        let manifest = target_manifest(component, &target, identity);
+        let manifest = target_manifest(&component.path, &target, identity);
         for backend in BackendName::ALL {
             let load = match plain_load(&manifest, &definition, backend) {
                 Ok(load) => load,
@@ -255,7 +270,7 @@ const SELECTION: ComponentSelection = ComponentSelection {
 /// The package of catalog target `component` alone, its directory
 /// `target`.
 fn target_manifest(
-    component: &CatalogComponent,
+    path: &Path,
     target: &magnitude_artifacts::gguf::Directory,
     identity: PackageIdentity,
 ) -> PackageManifest {
@@ -263,7 +278,7 @@ fn target_manifest(
         identity,
         target: ComponentManifest {
             files: vec![ComponentFile {
-                path: component.path.clone(),
+                path: path.to_owned(),
                 size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
             }],
             identity: identity.target,
@@ -351,7 +366,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         if !routes {
             continue;
         }
-        let manifest = target_manifest(component, &target, identity);
+        let manifest = target_manifest(&component.path, &target, identity);
         for backend in BackendName::ALL {
             let (reservation, host) = match bank_reservations(&definition, backend) {
                 Ok(substrate) => substrate,
@@ -576,43 +591,49 @@ pub(super) const fn catalog_draft(model: &'static str) -> Header {
     Header::Catalog(model, ComponentRole::Draft)
 }
 
-/// Separate drafts of the qualification artifacts (target's catalog model,
-/// draft header) and their target families. Each plans its draft program and
+/// Catalog model `model`'s target.
+const fn catalog_target(model: &'static str) -> Header {
+    Header::Catalog(model, ComponentRole::Target)
+}
+
+/// Separate drafts of the qualification artifacts (target header, draft
+/// header) and their target families: the catalog's, and pinned artifacts of
+/// architectures the catalog does not list. Each plans its draft program and
 /// charges its weights, state and every draft graph class from headers
 /// alone, on every backend: the draft graphs are sealed exactly, in
 /// metadata, for the planned method's proposals.
-const SEPARATE_DRAFTS: [(&str, Header, &dyn ModelFamily); 6] = [
+const SEPARATE_DRAFTS: [(Header, Header, &dyn ModelFamily); 6] = [
     (
-        "qwen3.6-35b-a3b:gguf:q4",
+        catalog_target("qwen3.6-35b-a3b:gguf:q4"),
         catalog_draft("qwen3.6-35b-a3b:gguf:q4"),
         &Qwen35Family,
     ),
     (
-        "lfm2.5-2.6b:gguf:q4",
-        catalog_draft("lfm2.5-2.6b:gguf:q4"),
+        Header::Artifact("lfm2.5-2.6b-q4"),
+        Header::Artifact("lfm2.5-2.6b-dspark"),
         &Lfm2Family,
     ),
     (
-        "qwen3.8-27b:gguf:q4",
+        catalog_target("qwen3.8-27b:gguf:q4"),
         Header::Artifact("qwen3.8-27b-dspark"),
         &Qwen35Family,
     ),
     // The catalog's DFlash2 draft.
     (
-        "qwen3.8-27b:gguf:q4",
+        catalog_target("qwen3.8-27b:gguf:q4"),
         catalog_draft("qwen3.8-27b:gguf:q4"),
         &Qwen35Family,
     ),
     // An NVFP4 draft (scaled fusion and feed-forward) beside a Q4_K_M
     // target, and beside the NVFP4 target (a scaled vocabulary projection).
     (
-        "nemotron-3.5-lightning-30b-a3b:gguf:q4",
-        catalog_draft("nemotron-3.5-lightning-30b-a3b:gguf:q4"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-q4"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-dflash"),
         &NemotronHFamily,
     ),
     (
-        "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat",
-        catalog_draft("nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-nvfp4"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-dflash"),
         &NemotronHFamily,
     ),
 ];
@@ -627,14 +648,10 @@ pub(super) fn synthetic_separate_draft_directory(draft: Header) -> magnitude_art
         Header::Catalog("qwen3.6-35b-a3b:gguf:q4", ComponentRole::Draft) => {
             &[true, true, true, true, true, false]
         }
-        Header::Catalog("lfm2.5-2.6b:gguf:q4", ComponentRole::Draft) => &[false; 5],
+        Header::Artifact("lfm2.5-2.6b-dspark") => &[false; 5],
         Header::Artifact("qwen3.8-27b-dspark") => &[false; 5],
         Header::Catalog("qwen3.8-27b:gguf:q4", ComponentRole::Draft) => &[false; 5],
-        Header::Catalog(
-            "nemotron-3.5-lightning-30b-a3b:gguf:q4"
-            | "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat",
-            ComponentRole::Draft,
-        ) => &[false; 6],
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-dflash") => &[false; 6],
         draft => panic!("no synthetic attention semantics for {draft}"),
     };
     let mut directory = draft.directory();
@@ -652,7 +669,7 @@ pub(super) fn synthetic_separate_draft_directory(draft: Header) -> magnitude_art
 fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
     for (target, draft, family) in SEPARATE_DRAFTS {
         plan_and_charge_separate_draft(
-            (target, &headers::target(target)),
+            (&target.to_string(), &target.directory()),
             (&draft.to_string(), &synthetic_separate_draft_directory(draft)),
             family,
         );

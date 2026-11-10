@@ -8759,7 +8759,7 @@ mod tests {
                 .resolver
                 .set_custom_model_enrichment(Arc::new(Recommends {
                     drafter: drafter.clone(),
-                    variant_of: "lfm2.5-2.6b:gguf:q4".parse().unwrap(),
+                    variant_of: "qwen3.5-4b:gguf:q4".parse().unwrap(),
                     method: method.clone(),
                 }));
 

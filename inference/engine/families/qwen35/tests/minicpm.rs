@@ -9,6 +9,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_family_qwen35::{inspect_components, minicpm};
 
+/// A released MiniCPM-V 4.7 model with its projector, pinned artifacts outside the catalog.
 fn definition(large: bool) -> ModelDefinition {
     let model = if large {
         "minicpm-v-4.7-35b-a3b"
@@ -16,8 +17,8 @@ fn definition(large: bool) -> ModelDefinition {
         "minicpm-v-4.7-1b"
     };
     inspect_components(
-        &headers::target(&format!("{model}:gguf:q4")),
-        Some(&headers::projector(&format!("{model}:gguf:q4"))),
+        &headers::artifact(&format!("{model}-q4")),
+        Some(&headers::artifact(&format!("{model}-mmproj"))),
         PackageIdentity {
             target: ArtifactIdentity([0; 32]),
             projector: Some(ArtifactIdentity([1; 32])),
@@ -39,8 +40,8 @@ fn width(projector: &magnitude_artifacts::gguf::Directory) -> u64 {
 #[test]
 fn another_models_projector_is_a_mismatch() {
     use magnitude_artifacts::UnsupportedReason;
-    let gemma = headers::projector("gemma-4-e2b-it-qat:gguf:q4");
-    let own = headers::projector("minicpm-v-4.7-1b:gguf:q4");
+    let gemma = headers::projector("gemma-4-e4b-it-qat:gguf:q4");
+    let own = headers::artifact("minicpm-v-4.7-1b-mmproj");
     for error in [
         minicpm::describe_projector(&gemma, width(&gemma)).unwrap_err(),
         magnitude_family_qwen::describe_projector(&gemma, width(&gemma)).unwrap_err(),
@@ -52,7 +53,7 @@ fn another_models_projector_is_a_mismatch() {
             "{error}"
         );
     }
-    let target = headers::target("minicpm-v-4.7-1b:gguf:q4");
+    let target = headers::artifact("minicpm-v-4.7-1b-q4");
     assert_eq!(
         minicpm::describe_projector(&target, width(&own)).unwrap_err().reasons,
         [UnsupportedReason::Unreadable]
@@ -96,7 +97,7 @@ fn both_released_projectors_bind_the_exact_tower_and_merger() {
 #[test]
 fn unsupported_compression_and_unknown_weights_are_refused() {
     use magnitude_artifacts::gguf::{Scalar, Value};
-    let mut p = headers::projector("minicpm-v-4.7-1b:gguf:q4");
+    let mut p = headers::artifact("minicpm-v-4.7-1b-mmproj");
     let original = p.clone();
     p.metadata
         .iter_mut()

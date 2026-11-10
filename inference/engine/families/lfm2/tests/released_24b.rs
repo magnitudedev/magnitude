@@ -1,4 +1,4 @@
-//! The four official LFM2.5 24B-A2B GGUF inventories at the catalog's pinned revision.
+//! The three official LFM2.5 24B-A2B GGUF inventories at the catalog's pinned revision.
 
 use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
 use magnitude_family_common::headers;
@@ -7,7 +7,7 @@ use magnitude_family_lfm2::inspect_components;
 
 #[test]
 fn released_quantizations_bind_the_complete_24b_decoder() {
-    for variant in ["q4", "q5", "q6", "q8"] {
+    for variant in ["q4", "q6", "q8"] {
         let directory = headers::target(&format!("lfm2.5-24b-a2b:gguf:{variant}"));
         let definition = inspect_components(
             &directory,

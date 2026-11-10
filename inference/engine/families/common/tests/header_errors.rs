@@ -118,7 +118,7 @@ fn every_unbound_tensor_is_named() {
 /// A projector that declares no type is unreadable, not another model's.
 #[test]
 fn a_projector_of_no_declared_type_is_unreadable() {
-    let mut projector = magnitude_family_common::headers::projector("lfm3-vl-2b:gguf:q4-qat");
+    let mut projector = magnitude_family_common::headers::artifact("lfm3-vl-2b-mmproj");
     projector
         .metadata
         .retain(|entry| entry.name != "clip.vision.projector_type");

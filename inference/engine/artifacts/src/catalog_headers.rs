@@ -88,9 +88,13 @@ impl ArtifactHeader {
 
 /// The artifacts outside the catalog whose headers tests read: the Qwen3.8
 /// 27B and Nemotron 3.5 Bolt and Super VL DSpark drafts, the Qwen3.6 27B
-/// target the Qwen3.6 27B DFlash draft's publication binds to and
-/// bartowski's Gemma 4 E2B Q4_K_M (which keeps the sharing layers'
-/// projections the catalog's file omits).
+/// target the Qwen3.6 27B DFlash draft's publication binds to, Gemma 4 E2B
+/// QAT with its projector and bartowski's Gemma 4 E2B Q4_K_M (which keeps the
+/// sharing layers' projections the QAT file omits), and the releases of
+/// architectures and drafts the engine supports but the catalog does not
+/// list: LFM2.5 2.6B and 8B-A1B with their DSpark drafts, LFM3-VL 2B,
+/// MiniCPM5 2B with its DSpark draft, MiniCPM-V 4.7 1B and 35B-A3B, and
+/// Nemotron 3.5 Lightning 30B-A3B with its DFlash draft.
 pub fn artifacts() -> Vec<ArtifactHeader> {
     [
         (
@@ -122,6 +126,114 @@ pub fn artifacts() -> Vec<ArtifactHeader> {
             "bartowski/google_gemma-4-E2B-it-GGUF",
             "81012ba3538e061d5ee003f11f25335b17f82e2d",
             "google_gemma-4-E2B-it-Q4_K_M.gguf",
+        ),
+        (
+            "gemma-4-e2b-it-qat-q4",
+            "unsloth/gemma-4-E2B-it-qat-GGUF",
+            "66a399f68ddd113b06dff02fca9523e55465d11d",
+            "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+        ),
+        (
+            "gemma-4-e2b-it-qat-mmproj",
+            "unsloth/gemma-4-E2B-it-qat-GGUF",
+            "66a399f68ddd113b06dff02fca9523e55465d11d",
+            "mmproj-BF16.gguf",
+        ),
+        (
+            "lfm2.5-2.6b-q4",
+            "LiquidAI/LFM2.5-2.6B-GGUF",
+            "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+            "LFM2.5-2.6B-Q4_K_M.gguf",
+        ),
+        (
+            "lfm2.5-2.6b-dspark",
+            "magnitudedev/LFM2.5-2.6B-DSpark-GGUF",
+            "60103108e36ef66c2591c2b1ea3e6530a4e2c3b0",
+            "LFM2.5-2.6B-DSpark-Q8_0.gguf",
+        ),
+        (
+            "lfm2.5-8b-a1b-q4",
+            "LiquidAI/LFM2.5-8B-A1B-GGUF",
+            "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
+            "LFM2.5-8B-A1B-Q4_K_M.gguf",
+        ),
+        (
+            "lfm2.5-8b-a1b-dspark",
+            "magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF",
+            "0e2ce447c266c98603073cf9927a56130b9dca43",
+            "LFM2.5-8B-A1B-DSpark-Q8_0.gguf",
+        ),
+        (
+            "lfm3-vl-2b-q4-qat",
+            "LiquidAI/LFM3-VL-2B-GGUF",
+            "7c3b4a43c9023e80bf234fec5e826a3365c8dda8",
+            "LFM3-VL-2B-QAD-Q4_0.gguf",
+        ),
+        (
+            "lfm3-vl-2b-mmproj",
+            "LiquidAI/LFM3-VL-2B-GGUF",
+            "7c3b4a43c9023e80bf234fec5e826a3365c8dda8",
+            "mmproj-LFM3-VL-2B-BF16.gguf",
+        ),
+        (
+            "minicpm5-2b-q4",
+            "openbmb/MiniCPM5-2B-GGUF",
+            "2079a22f3beaa4e306449978533478fe0522f4b3",
+            "MiniCPM5-2B-Q4_K_M.gguf",
+        ),
+        (
+            "minicpm5-2b-dspark",
+            "magnitudedev/MiniCPM5-2B-DSpark-GGUF",
+            "fbc306afa97f19283820af3089f9306f7b2051cb",
+            "MiniCPM5-2.6B-DSpark.gguf",
+        ),
+        (
+            "minicpm-v-4.7-1b-q4",
+            "openbmb/MiniCPM-V-4.7-1B-gguf",
+            "59cd286146b6ce70f818508ccf512e11438d8957",
+            "MiniCPM-V-4_7-1B-Q4_K_M.gguf",
+        ),
+        (
+            "minicpm-v-4.7-1b-mmproj",
+            "openbmb/MiniCPM-V-4.7-1B-gguf",
+            "59cd286146b6ce70f818508ccf512e11438d8957",
+            "mmproj-model-f16-4x.gguf",
+        ),
+        (
+            "minicpm-v-4.7-35b-a3b-q4",
+            "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
+            "3c3f7e84f14a760ff26d17ab5932d4aa996227c0",
+            "MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf",
+        ),
+        (
+            "minicpm-v-4.7-35b-a3b-mmproj",
+            "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
+            "3c3f7e84f14a760ff26d17ab5932d4aa996227c0",
+            "mmproj-model-f16-4x.gguf",
+        ),
+        (
+            "nemotron-3.5-lightning-30b-a3b-nvfp4",
+            "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+            "88d7ce0b0fa385c5108866ce5d33690927531a37",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf",
+        ),
+        (
+            "nemotron-3.5-lightning-30b-a3b-q4",
+            "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+            "88d7ce0b0fa385c5108866ce5d33690927531a37",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_K_M.gguf",
+        ),
+        (
+            "nemotron-3.5-lightning-30b-a3b-q8",
+            "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+            "88d7ce0b0fa385c5108866ce5d33690927531a37",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf",
+        ),
+        (
+            "nemotron-3.5-lightning-30b-a3b-dflash",
+            "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF",
+            "4f5b414b9388a4543dcc4b24758e09d68140a6fe",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf",
         ),
     ]
     .into_iter()

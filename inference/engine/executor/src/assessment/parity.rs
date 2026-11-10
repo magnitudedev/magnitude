@@ -361,7 +361,7 @@ fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageM
     }
 }
 
-/// LFM2.5 8B-A1B q4 on the A10-8Q's CUDA, graphs at CUDA's unmeasured
+/// LFM2.5 8B-A1B q4 (a pinned artifact outside the catalog) on the A10-8Q's CUDA, graphs at CUDA's unmeasured
 /// bound, at the service's limits. At its declared 128,000 tokens main's
 /// charge fits (a chain of one launch), while every expert held whole at a
 /// whole-context prompt's chain of 250 launches is short of the room: the
@@ -370,7 +370,7 @@ fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageM
 /// which it keeps.
 #[test]
 fn lfm2_5_8b_on_an_a10_8q_is_placed_whole_on_the_longest_chain_its_room_holds() {
-    let target = served_targets().into_iter().find(|target| target.0 == "lfm2.5-8b-a1b:gguf:q4").expect("the catalog serves LFM2.5 8B-A1B q4");
+    let target = super::catalog::artifact_target("lfm2.5-8b-a1b-q4");
     let topology = recorded::a10_8q();
     let status = unopened(&topology);
     let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cuda).unwrap();

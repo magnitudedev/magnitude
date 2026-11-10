@@ -1,8 +1,7 @@
-//! Interpretation of every LFM2 catalog variant's real GGUF header
-//! (`headers::catalog`).
+//! Interpretation of the LFM2.5 2.6B and 8B-A1B releases' real GGUF headers,
+//! pinned artifacts outside the catalog (`headers::artifact`).
 
 use magnitude_artifacts::{
-    catalog_headers::ComponentRole,
     gguf::{Directory, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
@@ -14,29 +13,9 @@ use magnitude_family_contracts::{
 use magnitude_family_common::{headers, TextInput};
 use magnitude_family_lfm2::{inspect_components, recognize, Architecture};
 
-struct Variant {
-    model: String,
-    variant: String,
-    directory: Directory,
-}
-
-/// Every catalog target of the two models the geometry brief documents
-/// (`expected`); the 24B-A2B binds in `released_24b.rs`.
-fn catalog() -> Vec<Variant> {
-    headers::index()
-        .iter()
-        .filter_map(|component| {
-            let (model, variant) = component.model.split_once(':')?;
-            (component.role == ComponentRole::Target
-                && matches!(model, "lfm2.5-2.6b" | "lfm2.5-8b-a1b"))
-            .then(|| Variant {
-                model: model.to_owned(),
-                variant: variant.to_owned(),
-                directory: headers::component(component),
-            })
-        })
-        .collect()
-}
+/// The two models the geometry brief documents (`expected`); the catalog's
+/// 24B-A2B binds in `released_24b.rs`.
+const MODELS: [&str; 2] = ["lfm2.5-2.6b", "lfm2.5-8b-a1b"];
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -49,15 +28,12 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, String> {
     inspect_components(directory, None, identity()).map_err(|error| error.to_string())
 }
 
+/// The model's Q4_K_M release.
 fn variant(model: &str) -> Directory {
-    catalog()
-        .into_iter()
-        .find(|variant| variant.model == model && variant.variant == "gguf:q4")
-        .expect("catalog variant")
-        .directory
+    headers::artifact(&format!("{model}-q4"))
 }
 
-/// Geometry the catalog models are documented to have.
+/// Geometry the models are documented to have.
 struct Expected {
     architecture: Architecture,
     layers: usize,
@@ -85,7 +61,7 @@ fn expected(model: &str) -> Expected {
             leading_dense: 2,
             rope_base: 5.0e6,
         },
-        other => panic!("unexpected catalog model {other}"),
+        other => panic!("unexpected model {other}"),
     }
 }
 
@@ -176,19 +152,12 @@ fn check_block(block: &Block, index: usize, expected: &Expected, directory: &Dir
 }
 
 #[test]
-fn every_catalog_variant_binds_its_documented_geometry() {
-    let catalog = catalog();
-    assert_eq!(catalog.len(), 8, "four quantizations of two models");
-    for Variant {
-        model,
-        variant,
-        directory,
-    } in &catalog
-    {
+fn every_release_binds_its_documented_geometry() {
+    for model in MODELS {
+        let directory = &variant(model);
         let expected = expected(model);
         assert_eq!(recognize(directory).unwrap(), expected.architecture);
-        let definition =
-            inspect(directory).unwrap_or_else(|error| panic!("{model} {variant}: {error}"));
+        let definition = inspect(directory).unwrap_or_else(|error| panic!("{model}: {error}"));
         assert!(definition.deferred_forms().is_empty());
         let decoder = &definition.decoder;
         assert_eq!(

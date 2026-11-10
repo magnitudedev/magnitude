@@ -1,5 +1,4 @@
 use magnitude_artifacts::{
-    catalog_headers::ComponentRole,
     gguf::{Directory, Scalar, Value},
     ArtifactIdentity, PackageIdentity,
 };
@@ -14,8 +13,6 @@ use magnitude_artifacts::UnsupportedReason;
 use magnitude_family_contracts::FamilyError;
 use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
 
-const VARIANTS: [&str; 2] = ["minicpm5-2b:gguf:q4", "minicpm5-2b:gguf:q8"];
-
 fn identity() -> PackageIdentity {
     PackageIdentity {
         target: ArtifactIdentity([7; 32]),
@@ -27,18 +24,14 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
     inspect_components(directory, None, identity())
 }
 
+/// MiniCPM5 2B Q4_K_M, a pinned artifact: the catalog lists no llama target.
 fn minicpm5() -> Directory {
-    headers::target(VARIANTS[0])
+    headers::artifact("minicpm5-2b-q4")
 }
 
 #[test]
-fn every_minicpm5_variant_binds_the_admitted_feature_set() {
-    let definitions = VARIANTS.map(|file| {
-        inspect(&headers::target(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
-    });
-    // Variants differ only in encodings, which the definition does not carry.
-    assert_eq!(definitions[0], definitions[1]);
-    let model = &definitions[0];
+fn minicpm5_binds_the_admitted_feature_set() {
+    let model = &inspect(&minicpm5()).unwrap();
     assert_eq!(model.family.0, "llama");
     assert!(model.deferred_forms().is_empty());
     assert!(model.head.is_none() && model.vision.is_none());
@@ -133,14 +126,10 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
 }
 
 #[test]
-fn claims_no_other_catalog_component() {
+fn claims_no_catalog_component() {
     for component in headers::index() {
-        // MiniCPM5's targets, the 1B and the 2B.
-        let expected = component.model.starts_with("minicpm5-")
-            && component.role == ComponentRole::Target;
-        assert_eq!(
-            LlamaFamily.recognizes(&headers::component(component)),
-            expected,
+        assert!(
+            !LlamaFamily.recognizes(&headers::component(component)),
             "{} {}",
             component.model,
             component.role

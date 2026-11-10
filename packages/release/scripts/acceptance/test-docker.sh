@@ -12,7 +12,7 @@ set -euo pipefail
 test "$#" -ge 1 && test "$#" -le 2 || { echo 'Usage: test-docker.sh IMAGE [VERSION]' >&2; exit 2; }
 image=$1
 version=${2:-}
-model=minicpm5-1b:gguf:q4
+model=lfm3-1.7b:gguf:q4-qat
 name="magnitude-smoke-$$"
 volume="$name-data"
 key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"

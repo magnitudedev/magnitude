@@ -20,8 +20,12 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
     inspect_components(directory, None, identity())
 }
 
-fn catalog(model: &str) -> Directory {
-    headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4"))
+/// The QAT Q4 target: the catalog's, or E2B's pinned artifact, which the catalog does not list.
+fn qat(model: &str) -> Directory {
+    match model {
+        "e2b" => artifact("gemma-4-e2b-it-qat-q4"),
+        _ => headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    }
 }
 
 /// `(layer, key/value rows, head width)` of every sharing layer.
@@ -43,7 +47,7 @@ fn sharing_layers(definition: &ModelDefinition) -> Vec<(usize, u64, u64)> {
 }
 
 fn with_sharing_projections(model: &str, hidden: u64) -> (Directory, ModelDefinition) {
-    let plain = catalog(model);
+    let plain = qat(model);
     let definition = inspect(&plain).unwrap();
     let mut directory = plain;
     for (layer, rows, width) in sharing_layers(&definition) {
@@ -94,7 +98,7 @@ fn a_sharing_layer_projection_of_another_geometry_is_unrecognized() {
 
 #[test]
 fn an_owning_layer_still_requires_its_key_projection() {
-    let mut directory = catalog("e2b");
+    let mut directory = qat("e2b");
     directory
         .tensors
         .retain(|tensor| tensor.name != "blk.14.attn_k.weight");
@@ -106,16 +110,16 @@ fn an_owning_layer_still_requires_its_key_projection() {
 
 /// The released bartowski `google_gemma-4-E2B-it-Q4_K_M.gguf` header
 /// (repository revision 81012ba3538e061d5ee003f11f25335b17f82e2d) carries the
-/// 60 sharing-layer tensors of layers 15..=34 the catalog's file omits, and
+/// 60 sharing-layer tensors of layers 15..=34 the QAT file omits, and
 /// otherwise the same tensor names and Gemma 4 metadata.
 #[test]
-fn the_released_bartowski_e2b_header_interprets_like_the_catalog_file() {
+fn the_released_bartowski_e2b_header_interprets_like_the_qat_file() {
     let bartowski = artifact("gemma-4-e2b-it-bartowski-q4_k_m");
-    let catalog = catalog("e2b");
+    let qat = qat("e2b");
     let extra = bartowski
         .tensors
         .iter()
-        .filter(|tensor| catalog.tensor(&tensor.name).is_none())
+        .filter(|tensor| qat.tensor(&tensor.name).is_none())
         .map(|tensor| tensor.name.as_str())
         .collect::<Vec<_>>();
     let expected = (15..35)
@@ -124,5 +128,5 @@ fn the_released_bartowski_e2b_header_interprets_like_the_catalog_file() {
         })
         .collect::<Vec<_>>();
     assert_eq!(extra, expected);
-    assert_eq!(inspect(&bartowski).unwrap(), inspect(&catalog).unwrap());
+    assert_eq!(inspect(&bartowski).unwrap(), inspect(&qat).unwrap());
 }

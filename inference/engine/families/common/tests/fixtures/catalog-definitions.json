@@ -17,10 +17,6 @@
     "target": "ebb1f3f6d924a94c7155721ae52fe5a7a7f9282d96646bc864709fbcae68ecee",
     "draft": "rejected"
   },
-  "gemma-4-e2b-it-qat:gguf:q4": {
-    "target": "dd8ae0abcdeef19f53849c035174f4fd23a9582c047dd64ab4aaf9eff85e3d3d",
-    "draft": "rejected"
-  },
   "gemma-4-e4b-it-qat:gguf:q4": {
     "target": "cbf1f4251e560cf9a5c66d704143d8ef9fc5b04b634e8424920ae780c28682ff",
     "draft": "rejected"
@@ -46,22 +42,6 @@
   "laguna-s-2.1:gguf:q8": {
     "target": "unrecognized"
   },
-  "lfm2.5-2.6b:gguf:q4": {
-    "target": "6546f2a0ab5deefffbb705977a8361c52125565429bda1e2978899832b6658b2",
-    "draft": "6d5c7d8567bd38eadcfaaff3d1610e32a8a5bc4aa5450f7bfe55737d49d22687"
-  },
-  "lfm2.5-2.6b:gguf:q5": {
-    "target": "6546f2a0ab5deefffbb705977a8361c52125565429bda1e2978899832b6658b2",
-    "draft": "6d5c7d8567bd38eadcfaaff3d1610e32a8a5bc4aa5450f7bfe55737d49d22687"
-  },
-  "lfm2.5-2.6b:gguf:q6": {
-    "target": "6546f2a0ab5deefffbb705977a8361c52125565429bda1e2978899832b6658b2",
-    "draft": "6d5c7d8567bd38eadcfaaff3d1610e32a8a5bc4aa5450f7bfe55737d49d22687"
-  },
-  "lfm2.5-2.6b:gguf:q8": {
-    "target": "6546f2a0ab5deefffbb705977a8361c52125565429bda1e2978899832b6658b2",
-    "draft": "6d5c7d8567bd38eadcfaaff3d1610e32a8a5bc4aa5450f7bfe55737d49d22687"
-  },
   "lfm2.5-24b-a2b:gguf:q4": {
     "target": "69f71d4275e69dcf6beba0db738dfdb72685ca5a7e536f41854168c3d243a42c"
   },
@@ -71,82 +51,11 @@
   "lfm2.5-24b-a2b:gguf:q8": {
     "target": "69f71d4275e69dcf6beba0db738dfdb72685ca5a7e536f41854168c3d243a42c"
   },
-  "lfm2.5-8b-a1b:gguf:q4": {
-    "target": "11b4299926a3baa59d7fd93f0cf5f30a97ede32547d816fd339131a89f9ac312",
-    "draft": "3763931e366c3b0a3a6145866a44a37e0952c632685d4c955654a72def0c53d8"
-  },
-  "lfm2.5-8b-a1b:gguf:q5": {
-    "target": "11b4299926a3baa59d7fd93f0cf5f30a97ede32547d816fd339131a89f9ac312",
-    "draft": "3763931e366c3b0a3a6145866a44a37e0952c632685d4c955654a72def0c53d8"
-  },
-  "lfm2.5-8b-a1b:gguf:q6": {
-    "target": "11b4299926a3baa59d7fd93f0cf5f30a97ede32547d816fd339131a89f9ac312",
-    "draft": "3763931e366c3b0a3a6145866a44a37e0952c632685d4c955654a72def0c53d8"
-  },
-  "lfm2.5-8b-a1b:gguf:q8": {
-    "target": "11b4299926a3baa59d7fd93f0cf5f30a97ede32547d816fd339131a89f9ac312",
-    "draft": "3763931e366c3b0a3a6145866a44a37e0952c632685d4c955654a72def0c53d8"
-  },
   "lfm3-1.7b:gguf:q4-qat": {
     "target": "f49238218058a2a9ffa1b4e7d7869d9f520e6e9b608ae798d0fdaa591afbf16b"
   },
   "lfm3-1.7b:gguf:q8": {
     "target": "f49238218058a2a9ffa1b4e7d7869d9f520e6e9b608ae798d0fdaa591afbf16b"
-  },
-  "lfm3-vl-2b:gguf:q4-qat": {
-    "target": "5d7c919981d60dc84752768b70c5ae92cb4d7c43fce14e21a848d83c52c19702"
-  },
-  "lfm3-vl-2b:gguf:q6": {
-    "target": "5d7c919981d60dc84752768b70c5ae92cb4d7c43fce14e21a848d83c52c19702"
-  },
-  "lfm3-vl-2b:gguf:q8": {
-    "target": "5d7c919981d60dc84752768b70c5ae92cb4d7c43fce14e21a848d83c52c19702"
-  },
-  "minicpm-v-4.7-1b:gguf:q4": {
-    "target": "2ae3481fa19dbcd47cbf445a0eb2f95c43b1feeaf05996a79cebd61718d4ac87",
-    "draft": "570470dd9fa532779d441474aa6306403de79735498292879b5fb62adc9e33b8"
-  },
-  "minicpm-v-4.7-1b:gguf:q5": {
-    "target": "2ae3481fa19dbcd47cbf445a0eb2f95c43b1feeaf05996a79cebd61718d4ac87",
-    "draft": "570470dd9fa532779d441474aa6306403de79735498292879b5fb62adc9e33b8"
-  },
-  "minicpm-v-4.7-1b:gguf:q6": {
-    "target": "2ae3481fa19dbcd47cbf445a0eb2f95c43b1feeaf05996a79cebd61718d4ac87",
-    "draft": "570470dd9fa532779d441474aa6306403de79735498292879b5fb62adc9e33b8"
-  },
-  "minicpm-v-4.7-1b:gguf:q8": {
-    "target": "2ae3481fa19dbcd47cbf445a0eb2f95c43b1feeaf05996a79cebd61718d4ac87",
-    "draft": "570470dd9fa532779d441474aa6306403de79735498292879b5fb62adc9e33b8"
-  },
-  "minicpm-v-4.7-35b-a3b:gguf:q4": {
-    "target": "c492da37b967e24e1dc301ffa560f2567decbb55c26170eb78fa5cd4ea78e0cb",
-    "draft": "6c545349ade38e5a28ca848786348d959d823e65067065f2e6d4ac6625d35771"
-  },
-  "minicpm-v-4.7-35b-a3b:gguf:q5": {
-    "target": "c492da37b967e24e1dc301ffa560f2567decbb55c26170eb78fa5cd4ea78e0cb",
-    "draft": "6c545349ade38e5a28ca848786348d959d823e65067065f2e6d4ac6625d35771"
-  },
-  "minicpm-v-4.7-35b-a3b:gguf:q6": {
-    "target": "c492da37b967e24e1dc301ffa560f2567decbb55c26170eb78fa5cd4ea78e0cb",
-    "draft": "6c545349ade38e5a28ca848786348d959d823e65067065f2e6d4ac6625d35771"
-  },
-  "minicpm-v-4.7-35b-a3b:gguf:q8": {
-    "target": "c492da37b967e24e1dc301ffa560f2567decbb55c26170eb78fa5cd4ea78e0cb",
-    "draft": "6c545349ade38e5a28ca848786348d959d823e65067065f2e6d4ac6625d35771"
-  },
-  "minicpm5-1b:gguf:q4": {
-    "target": "c93fa8263788defb918f06bd1c7731047a65d165fdfc0bff44b3303166be3ac2"
-  },
-  "minicpm5-1b:gguf:q8": {
-    "target": "c93fa8263788defb918f06bd1c7731047a65d165fdfc0bff44b3303166be3ac2"
-  },
-  "minicpm5-2b:gguf:q4": {
-    "target": "e48e620ae44e40072e4426cf5948edd3dfc17ca779b2e556b4f84045b280eae8",
-    "draft": "f0dbfb2201064fec89e3874abef8fa4e1d80c009e610cac8e22ee8a04eb7b46b"
-  },
-  "minicpm5-2b:gguf:q8": {
-    "target": "e48e620ae44e40072e4426cf5948edd3dfc17ca779b2e556b4f84045b280eae8",
-    "draft": "f0dbfb2201064fec89e3874abef8fa4e1d80c009e610cac8e22ee8a04eb7b46b"
   },
   "muse-glimmer-30b:gguf:q4": {
     "target": "481a678a69e9455cba6f7076536933bacb400120ea125a5f26addf41f162cd8e",
@@ -176,18 +85,6 @@
   "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat": {
     "target": "e0a023e7dd41d33c4b5747c1a61bba4ab0d1361fe4e8cb7bce8eefaae108e47f",
     "draft": "8972adb3be46f0c0367b2ce33b362ee68ba335b769394ead8d2fee7f23c53291"
-  },
-  "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat": {
-    "target": "082ef7023e240390337fe9b16cb002f77129adaaaa92baf0d1dac3136bb9afbb",
-    "draft": "b24bb45ec0cafd7cf0ad3458fb00b1806d53d42663a75e1514679209e02f533c"
-  },
-  "nemotron-3.5-lightning-30b-a3b:gguf:q4": {
-    "target": "055f6d3dc11af4e37e78596bda30202031b88fe2d3d8784fd563e18d2927eb58",
-    "draft": "b24bb45ec0cafd7cf0ad3458fb00b1806d53d42663a75e1514679209e02f533c"
-  },
-  "nemotron-3.5-lightning-30b-a3b:gguf:q8": {
-    "target": "055f6d3dc11af4e37e78596bda30202031b88fe2d3d8784fd563e18d2927eb58",
-    "draft": "b24bb45ec0cafd7cf0ad3458fb00b1806d53d42663a75e1514679209e02f533c"
   },
   "nemotron-3.5-super-vl-120b-a12b:gguf:q2": {
     "target": "50b49cf863ccd6b4e0336af2c7676e34e14f52e1aa45e3de5286f0ec62d0a8ff",

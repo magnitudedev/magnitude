@@ -1,5 +1,6 @@
 //! Interpretation of Google's Gemma 4 QAT assistant drafters against their
-//! catalog targets (`headers::target`). Each
+//! catalog targets (`headers::target`; E2B's, which the catalog does not list,
+//! at its pinned artifact). Each
 //! assistant directory carries the metadata and tensor directory published in
 //! `mtp-gemma-4-<size>-it.gguf` beside its target, without tokenizer keys.
 
@@ -84,8 +85,12 @@ fn published(model: &str) -> &'static Published {
 }
 
 fn target(model: &str) -> ModelDefinition {
+    let directory = match model {
+        "e2b" => headers::artifact("gemma-4-e2b-it-qat-q4"),
+        _ => headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    };
     inspect_components(
-        &headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+        &directory,
         None,
         PackageIdentity {
             target: ArtifactIdentity([7; 32]),

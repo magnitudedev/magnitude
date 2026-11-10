@@ -88,10 +88,10 @@ it("shows download guidance without a copy action when no model is available", (
 })
 
 it("keeps OpenClaw model selection separate from its terminal command", () => {
-  const model = Schema.decodeUnknownSync(ProviderModelIdSchema)("gemma-4-e2b-it-qat:gguf:q4")
+  const model = Schema.decodeUnknownSync(ProviderModelIdSchema)("gemma-4-e4b-it-qat:gguf:q4")
   const html = renderToStaticMarkup(<TooltipProvider><HarnessCommand harness={missing.id} name="OpenClaw" version={Option.none()} models={[{ id: model, label: "Gemma (Q4)" }]} defaultModel={model} platform="darwin" /></TooltipProvider>)
   expect(html).toContain("openclaw tui")
-  expect(html).toContain("/model magnitude/gemma-4-e2b-it-qat:gguf:q4")
+  expect(html).toContain("/model magnitude/gemma-4-e4b-it-qat:gguf:q4")
   expect(html).not.toContain("--model")
   expect(html).toContain("inside it")
 })

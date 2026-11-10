@@ -238,7 +238,7 @@ describe("local provider offerings", () => {
   })
 
   it("never offers a disabled catalog model even when it fits and is installed", () => {
-    const model = catalogAssessed("minicpm5-1b:gguf:q4")
+    const model = catalogAssessed("lfm3-1.7b:gguf:q4-qat")
     const disabled = unavailable(model, { _tag: "Disabled", reason: "not yet qualified" })
     const projection = projectLocalProviderOfferings([disabled])
     expect(projection.offerings).toEqual([])

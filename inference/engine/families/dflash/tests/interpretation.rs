@@ -33,7 +33,8 @@ const fn catalog_draft(model: &'static str) -> Header {
     Header::Catalog(model, ComponentRole::Draft)
 }
 
-/// Every catalog draft with its target.
+/// Every catalog draft with its target, and the pinned drafts of the
+/// architectures the catalog does not list.
 const PAIRS: [(Header, Header); 6] = [
     (
         catalog_draft("qwen3.6-35b-a3b:gguf:q4"),
@@ -44,20 +45,20 @@ const PAIRS: [(Header, Header); 6] = [
         catalog_target("muse-glimmer-30b:gguf:q4"),
     ),
     (
-        catalog_draft("nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat"),
-        catalog_target("nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-dflash"),
+        Header::Artifact("nemotron-3.5-lightning-30b-a3b-nvfp4"),
     ),
     (
-        catalog_draft("lfm2.5-2.6b:gguf:q4"),
-        catalog_target("lfm2.5-2.6b:gguf:q4"),
+        Header::Artifact("lfm2.5-2.6b-dspark"),
+        Header::Artifact("lfm2.5-2.6b-q4"),
     ),
     (
-        catalog_draft("lfm2.5-8b-a1b:gguf:q4"),
-        catalog_target("lfm2.5-8b-a1b:gguf:q4"),
+        Header::Artifact("lfm2.5-8b-a1b-dspark"),
+        Header::Artifact("lfm2.5-8b-a1b-q4"),
     ),
     (
-        catalog_draft("minicpm5-2b:gguf:q4"),
-        catalog_target("minicpm5-2b:gguf:q4"),
+        Header::Artifact("minicpm5-2b-dspark"),
+        Header::Artifact("minicpm5-2b-q4"),
     ),
 ];
 
@@ -68,9 +69,9 @@ fn family(target: Header) -> &'static dyn ModelFamily {
             &Qwen35Family
         }
         "muse-glimmer-30b" => &MuseGlimmerFamily,
-        "nemotron-3.5-lightning-30b-a3b" => &NemotronHFamily,
-        "lfm2.5-2.6b" | "lfm2.5-8b-a1b" => &Lfm2Family,
-        "minicpm5-2b" => &LlamaFamily,
+        "nemotron-3.5-lightning-30b-a3b-nvfp4" => &NemotronHFamily,
+        "lfm2.5-2.6b-q4" | "lfm2.5-8b-a1b-q4" => &Lfm2Family,
+        "minicpm5-2b-q4" => &LlamaFamily,
         other => panic!("no family for {other}"),
     }
 }

@@ -1,5 +1,6 @@
-//! Interpretation of every catalog Gemma 4 header (`headers::target`), plus
-//! negative cases derived from them.
+//! Interpretation of every catalog Gemma 4 header (`headers::target`) and of
+//! Gemma 4 E2B's, which the catalog does not list, at pinned artifacts
+//! (`headers::artifact`), plus negative cases derived from them.
 
 use magnitude_artifacts::{
     gguf::{Array, Directory, Metadata, Scalar, Value},
@@ -16,7 +17,17 @@ use magnitude_family_contracts::{
 use magnitude_family_gemma4::{describe_projector, inputs, inspect_components, recognize};
 
 fn target(model: &str) -> Directory {
-    headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4"))
+    match model {
+        "e2b" => headers::artifact("gemma-4-e2b-it-qat-q4"),
+        _ => headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    }
+}
+
+fn projector(model: &str) -> Directory {
+    match model {
+        "e2b" => headers::artifact("gemma-4-e2b-it-qat-mmproj"),
+        _ => headers::projector(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    }
 }
 
 fn identity() -> PackageIdentity {
@@ -377,7 +388,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         ("26b-a4b", 2816, 27, 1152, 16, false, true),
         ("31b", 5376, 27, 1152, 16, false, true),
     ] {
-        let projector = headers::projector(&format!("gemma-4-{model}-it-qat:gguf:q4"));
+        let projector = projector(model);
         let vision = describe_projector(&projector, output).unwrap();
         assert_eq!(
             (vision.hidden, vision.output_hidden),
@@ -428,7 +439,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
     }
     let model = inspect_components(
         &target("e2b"),
-        Some(&headers::projector("gemma-4-e2b-it-qat:gguf:q4")),
+        Some(&projector("e2b")),
         identity(),
     )
     .unwrap();

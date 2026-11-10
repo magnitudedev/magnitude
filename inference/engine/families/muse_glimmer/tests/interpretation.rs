@@ -50,7 +50,7 @@ fn another_models_projector_is_a_mismatch() {
         .and_then(Value::unsigned)
         .unwrap();
     for (projector, width) in [
-        (headers::projector("gemma-4-e2b-it-qat:gguf:q4"), width),
+        (headers::projector("gemma-4-e4b-it-qat:gguf:q4"), width),
         (own, width + 1),
     ] {
         let error =
