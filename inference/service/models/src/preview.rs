@@ -12,7 +12,8 @@ use magnitude_artifacts::catalog_headers::ArtifactHeader;
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceCredential,
     HuggingFaceModelCatalog,
-    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
+    HuggingFaceBaseRelation, HuggingFaceModelBase, HuggingFaceModelSearchRequest,
+    HuggingFaceModelSearchResult, HuggingFaceModelSearchResults, HuggingFaceRecommendedVersion,
     HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation, ModelPreviewSource,
     ModelSource, ResolvedComponent, ResolvedModel,
@@ -29,7 +30,7 @@ use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
 use crate::lineage::CatalogLineage;
-use crate::search_shape::{CatalogFingerprints, HeaderVerdicts, RepositoryModel};
+use crate::search_shape::{CatalogFingerprints, HeaderVerdicts, RecommendedVersions, RepositoryModel};
 
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
@@ -42,6 +43,9 @@ const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const SEARCH_SHAPE_CONCURRENCY: usize = 8;
+/// How long inspecting a result's repository for its recommended version may take before the
+/// result is shown without one.
+const RECOMMENDATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Live Hub search and immutable resolution for the service's API. Catalog publication and
 /// managed inventory do not depend on these queries.
@@ -51,6 +55,7 @@ pub struct HuggingFaceDiscovery {
     verdicts: Arc<dyn HeaderVerdicts>,
     lineage: Arc<CatalogLineage>,
     catalog: Arc<dyn CatalogFingerprints>,
+    recommendations: Arc<dyn RecommendedVersions>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
@@ -62,6 +67,7 @@ impl HuggingFaceDiscovery {
         verdicts: Arc<dyn HeaderVerdicts>,
         lineage: Arc<CatalogLineage>,
         catalog: Arc<dyn CatalogFingerprints>,
+        recommendations: Arc<dyn RecommendedVersions>,
     ) -> Self {
         Self {
             models,
@@ -69,6 +75,7 @@ impl HuggingFaceDiscovery {
             verdicts,
             lineage,
             catalog,
+            recommendations,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -101,6 +108,7 @@ impl HuggingFaceDiscovery {
             "gated",
             "gguf",
             "siblings",
+            "baseModels",
         ] {
             url.query_pairs_mut().append_pair("expand", field);
         }
@@ -166,8 +174,13 @@ impl HuggingFaceDiscovery {
         // engine doesn't know is told by its header alone.
         let mut results = futures_util::stream::iter(kept)
             .map(|mut result| async move {
-                let model = self.read_model_file(&mut result, catalog).await;
-                model.then_some(result)
+                if !self.read_model_file(&mut result, catalog).await {
+                    return None;
+                }
+                if result.unsupported.is_empty() {
+                    result.recommended = self.recommended_version(&result).await;
+                }
+                Some(result)
             })
             .buffered(SEARCH_SHAPE_CONCURRENCY)
             .filter_map(std::future::ready)
@@ -219,6 +232,12 @@ impl HuggingFaceDiscovery {
                 unsupported,
             }) => {
                 result.architecture = Some(architecture.clone());
+                if result.base.is_none() {
+                    result.base = base_repositories.first().map(|repository| HuggingFaceModelBase {
+                        repository: repository.clone(),
+                        relation: HuggingFaceBaseRelation::Unknown,
+                    });
+                }
                 let variant_of = shape.and_then(|shape| shape.variant_of(catalog));
                 result.developer = crate::model_developers().resolve(DeveloperEvidence {
                     repository: Some(&result.repository),
@@ -243,6 +262,24 @@ impl HuggingFaceDiscovery {
             None => {}
         }
         true
+    }
+
+    /// The version inspection recommends of `result`'s repository at its commit; none when it
+    /// can't be inspected within [`RECOMMENDATION_TIMEOUT`].
+    async fn recommended_version(
+        &self,
+        result: &HuggingFaceModelSearchResult,
+    ) -> Option<HuggingFaceRecommendedVersion> {
+        let inspect = self
+            .recommendations
+            .recommended_version(result.repository.clone(), result.commit.clone());
+        tokio::time::timeout(RECOMMENDATION_TIMEOUT, inspect)
+            .await
+            .map_err(|_| {
+                tracing::debug!(repository = %result.repository, "search recommendation timed out");
+            })
+            .ok()
+            .flatten()
     }
 }
 
@@ -492,6 +529,8 @@ struct HubSearchModel {
     gguf: Option<serde_json::Value>,
     #[serde(default)]
     siblings: Option<Vec<HubSearchSibling>>,
+    #[serde(default, rename = "baseModels")]
+    base_models: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,6 +572,11 @@ impl HubSearchModel {
             developer,
             version_count,
             unsupported: Vec::new(),
+            base: self
+                .base_models
+                .as_ref()
+                .and_then(crate::lineage::hub_base_model),
+            recommended: None,
         })
     }
 }
@@ -3676,6 +3720,7 @@ mod tests {
                 catalog_with_target("catalog/Llama-GGUF", &commit),
             ),
             StubCatalog::empty(),
+            NoRecommendations::new(),
         );
         let exercise = || async {
             discovery
@@ -3928,12 +3973,24 @@ mod tests {
         let (endpoint, _) = search_hub();
         let (_temporary, store) = stub_store(endpoint).await;
         let catalog = catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40));
+        let recommended = HuggingFaceRecommendedVersion {
+            label: "Q4_K_M".to_owned(),
+            model_id: "hf:community/Llama-Finetune-GGUF/model-Q4_K_M.gguf".parse().unwrap(),
+            size_bytes: 4_000_000_000,
+            download_bytes: 4_000_000_000,
+            assessment: magnitude_service_contracts::models::ModelAssessment::Unsupported {
+                profile: None,
+                reasons: Vec::new(),
+                detail: String::new(),
+            },
+        };
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
             NoRefusals::new(),
             CatalogLineage::new(Arc::clone(&store), catalog),
             StubCatalog::empty(),
+            Arc::new(StubRecommendations(Some(recommended.clone()))),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
@@ -3978,6 +4035,25 @@ mod tests {
             )],
             "an unsupported architecture is listed with its reason"
         );
+        assert_eq!(
+            results.results[2].base,
+            Some(HuggingFaceModelBase {
+                repository: "base/Llama".to_owned(),
+                relation: HuggingFaceBaseRelation::Quantized,
+            }),
+            "a result's base is the Hub's baseModels with its relation"
+        );
+        assert_eq!(results.results[0].base, None, "baseModels naming no model is no base");
+        assert!(
+            results.results[..4]
+                .iter()
+                .all(|result| result.recommended.as_ref() == Some(&recommended)),
+            "a supported result carries its repository's recommended version"
+        );
+        assert_eq!(
+            results.results[4].recommended, None,
+            "an unsupported result is never inspected"
+        );
     }
 
     /// Each catalog model's fingerprint, supplied directly.
@@ -3991,6 +4067,28 @@ mod tests {
 
     impl CatalogFingerprints for StubCatalog {
         fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
+            Box::pin(async move { self.0.clone() })
+        }
+    }
+
+    /// Recommendations of one fixed version for every repository; the inspection that chooses
+    /// them is the server's, tested there.
+    struct StubRecommendations(Option<HuggingFaceRecommendedVersion>);
+
+    struct NoRecommendations;
+
+    impl NoRecommendations {
+        fn new() -> Arc<dyn RecommendedVersions> {
+            Arc::new(StubRecommendations(None))
+        }
+    }
+
+    impl RecommendedVersions for StubRecommendations {
+        fn recommended_version(
+            &self,
+            _: String,
+            _: String,
+        ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>> {
             Box::pin(async move { self.0.clone() })
         }
     }
@@ -4257,6 +4355,7 @@ mod tests {
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
             ),
             Arc::new(StubCatalog(catalog)),
+            NoRecommendations::new(),
         )
     }
 
@@ -4641,6 +4740,35 @@ mod tests {
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
+    /// Without the Hub's `baseModels`, a result's base is the first base model its model file's
+    /// header names, in the header's order, of a relation the header doesn't state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_without_hub_lineage_takes_its_base_from_its_header() {
+        use crate::test_gguf::Meta;
+        let header = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("llama")),
+                ("general.base_model.count", Meta::U32(2)),
+                ("general.base_model.0.repo_url", Meta::Str("https://huggingface.co/Zeta/Base-8B")),
+                ("general.base_model.1.repo_url", Meta::Str("https://huggingface.co/Alpha/Other-8B")),
+            ],
+            &["token_embd.weight"],
+        );
+        let (endpoint, _, _) = serve_repositories(vec![
+            StubRepository::new("someone/Base-8B-Finetune-GGUF", Some("llama"))
+                .file("Base-8B-Finetune-Q4_K_M.gguf", 5_000_000_000, Some(header)),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["llama"], Vec::new())).await;
+        assert_eq!(
+            results["someone/Base-8B-Finetune-GGUF"].base,
+            Some(HuggingFaceModelBase {
+                repository: "zeta/base-8b".to_owned(),
+                relation: HuggingFaceBaseRelation::Unknown,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_projector_never_stands_in_for_the_model() {
         let llama = || {
@@ -4703,6 +4831,7 @@ mod tests {
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
             ),
             Arc::new(StubCatalog(Vec::new())),
+            NoRecommendations::new(),
         );
         let results = search_all(&discovery).await;
         assert_eq!(
@@ -4971,6 +5100,7 @@ mod tests {
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
             ),
             StubCatalog::empty(),
+            NoRecommendations::new(),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {

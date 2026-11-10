@@ -261,14 +261,11 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       SearchHuggingFaceModels: (request) =>
         observeRpcDefects("SearchHuggingFaceModels", customModelCommands.searchHuggingFace(request)),
 
-      InspectModelCandidate: ({ reference }) =>
-        observeRpcDefects("InspectModelCandidate", customModelCommands.inspectCandidate(reference)),
-
       // Like every ACN subscription, it stays open after its last update until the subscriber leaves.
       StreamModelCandidateInspection: ({ reference }) =>
         observeRpcStreamDefects(
           "StreamModelCandidateInspection",
-          customModelCommands.inspectCandidateWithProgress(reference).pipe(Stream.concat(Stream.never)),
+          customModelCommands.inspectCandidate(reference).pipe(Stream.concat(Stream.never)),
         ),
 
       ListDrafterCandidates: ({ target, other }) =>

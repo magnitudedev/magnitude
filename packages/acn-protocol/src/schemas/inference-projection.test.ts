@@ -98,12 +98,21 @@ it("rejects an active device that is not reported", () => {
     .toBe("Left")
 })
 it("rejects a device placement on a store that is not a memory domain", () => {
-  const volume = { store: store("volume"), current_free_bytes: 8 }
+  const volume = { store: store("volume"), current_free_bytes: 8, roles: [] }
   const value = projectInferenceHardware(snapshot({
     volumes: [volume], physical_devices: [gpu],
     access_paths: [paths[0], { ...paths[1], store: "volume" }],
   }), none)
   expect(Effect.runSync(Effect.either(value))._tag).toBe("Left")
+})
+it("reports the free bytes of the model store's volume, and none without one", () => {
+  const volume = (id: string, roles: string[], free: number) => ({ store: store(id), current_free_bytes: free, roles })
+  const storage = (volumes: unknown[]) =>
+    Effect.runSync(projectInferenceHardware(snapshot({ volumes }), none)).modelStorage
+  expect(storage([volume("cache", ["kernel_cache"], 3), volume("models", ["model_store"], 8)])).toEqual(Option.some({ freeBytes: 8 }))
+  expect(storage([volume("both", ["model_store", "kernel_cache"], 5)])).toEqual(Option.some({ freeBytes: 5 }))
+  expect(storage([volume("cache", ["kernel_cache"], 3)])).toEqual(Option.none())
+  expect(storage([])).toEqual(Option.none())
 })
 it("admits no snapshot without host RAM and its free reading, or without a serving device", () => {
   const { host_ram: _, ...withoutHost } = fields()

@@ -21,7 +21,9 @@ use magnitude_service_contracts::models::{
     ModelFileRole, ModelId, ModelPackage, ModelPackageSource, RecommendableModel,
     RecommendableModelCatalog, ServableModelBundle,
 };
-use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
+use magnitude_service_contracts::{
+    HuggingFaceBaseRelation, HuggingFaceModelBase, HuggingFaceRepositoryRequest, InventoryError,
+};
 use serde::Deserialize;
 
 use crate::cache::ModelIndexKind;
@@ -625,6 +627,34 @@ fn hub_base_model_ids(value: &serde_json::Value) -> Vec<String> {
     ids
 }
 
+/// The model a repository derives from, as a Hub `baseModels` value states it: the first model of
+/// its first entry that names one, with that entry's relation (`unknown` for one the Hub adds).
+#[must_use]
+pub(crate) fn hub_base_model(value: &serde_json::Value) -> Option<HuggingFaceModelBase> {
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries.iter().collect::<Vec<_>>(),
+        entry => vec![entry],
+    };
+    entries.into_iter().find_map(|entry| {
+        let repository = entry
+            .get("models")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .find_map(|model| model.get("id").and_then(serde_json::Value::as_str))?;
+        let relation = match entry.get("relation").and_then(serde_json::Value::as_str) {
+            Some("quantized") => HuggingFaceBaseRelation::Quantized,
+            Some("finetune") => HuggingFaceBaseRelation::Finetune,
+            Some("merge") => HuggingFaceBaseRelation::Merge,
+            Some("adapter") => HuggingFaceBaseRelation::Adapter,
+            _ => HuggingFaceBaseRelation::Unknown,
+        };
+        Some(HuggingFaceModelBase {
+            repository: repository.to_owned(),
+            relation,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +675,35 @@ mod tests {
             ])),
             ["A/a", "B/b"]
         );
+    }
+
+    #[test]
+    fn a_hub_base_model_is_the_first_named_with_its_relation() {
+        assert_eq!(
+            hub_base_model(&serde_json::json!({
+                "relation": "quantized",
+                "models": [{"id": "Qwen/Qwen3.6-35B-A3B"}]
+            })),
+            Some(HuggingFaceModelBase {
+                repository: "Qwen/Qwen3.6-35B-A3B".to_owned(),
+                relation: HuggingFaceBaseRelation::Quantized,
+            })
+        );
+        assert_eq!(
+            hub_base_model(&serde_json::json!([
+                {"relation": "finetune", "models": []},
+                {"relation": "merge", "models": [{"id": "A/a"}, {"id": "B/b"}]}
+            ])),
+            Some(HuggingFaceModelBase {
+                repository: "A/a".to_owned(),
+                relation: HuggingFaceBaseRelation::Merge,
+            })
+        );
+        assert_eq!(
+            hub_base_model(&serde_json::json!({"relation": "distillation", "models": [{"id": "C/c"}]}))
+                .map(|base| base.relation),
+            Some(HuggingFaceBaseRelation::Unknown)
+        );
+        assert_eq!(hub_base_model(&serde_json::json!([])), None);
     }
 }

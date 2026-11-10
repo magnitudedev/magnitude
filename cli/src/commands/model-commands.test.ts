@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Effect, Option, Stream } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
   CatalogFormModelIdSchema,
@@ -67,7 +67,7 @@ import {
   type ModelsStatusView,
 } from "./inference-runtime"
 
-type Handler = (payload: never) => Effect.Effect<unknown, unknown>
+type Handler = (payload: never) => Effect.Effect<unknown, unknown> | Stream.Stream<unknown, unknown>
 
 const fakeService = (handlers: Record<string, Handler>) => {
   const models = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, vi.fn(handler)]))
@@ -109,6 +109,9 @@ const runBoth = async <O extends { readonly json?: boolean }>(
 }
 
 const succeed = (value: unknown = {}): Handler => () => Effect.succeed(value)
+/** The inspection subscription: its result, then open until the subscriber leaves. */
+const inspected = (inspection: unknown): Handler => () =>
+  Stream.concat(Stream.make({ _tag: "Inspected", inspection }), Stream.never)
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -384,7 +387,7 @@ describe("adding models with a drafter", () => {
   it("catalog inspect passes a huggingface.co link through and prints the repository step", async () => {
     const link = `https://huggingface.co/${TEST_REPOSITORY}`
     const { text, json, models } = await runBoth({
-      inspectModelCandidate: succeed(makeInspection()),
+      streamModelCandidateInspection: inspected(makeInspection()),
       getCatalog: succeed(catalogState([makeCatalogModel()])),
       listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => commandEffect({
@@ -392,7 +395,7 @@ describe("adding models with a drafter", () => {
       render: renderInspection,
       json: asJson(options, inspectionJson),
     }))
-    expect(models.inspectModelCandidate).toHaveBeenCalledWith({ reference: link })
+    expect(models.streamModelCandidateInspection).toHaveBeenCalledWith({ reference: link })
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({
       target: { _tag: "Candidate", source: { _tag: "HuggingFace", repository: TEST_REPOSITORY, commit: TEST_COMMIT }, files: ["Qwen-Test-Q4_K_P.gguf"] },
       other: Option.none(),

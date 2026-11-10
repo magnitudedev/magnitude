@@ -306,6 +306,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     Arc::new(EngineHeaderVerdicts),
                     lineage,
                     candidates.clone(),
+                    candidates.clone(),
                 )))
                 .with_model_candidates(candidates)
                 .with_identity(ServerIdentity {

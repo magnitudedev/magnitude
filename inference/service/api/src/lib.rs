@@ -2454,6 +2454,11 @@ mod tests {
                         developer: None,
                         version_count: Some(3),
                         unsupported: Vec::new(),
+                        base: Some(magnitude_service_contracts::HuggingFaceModelBase {
+                            repository: "Qwen/Qwen3.6-35B-A3B".to_owned(),
+                            relation: magnitude_service_contracts::HuggingFaceBaseRelation::Quantized,
+                        }),
+                        recommended: None,
                     }],
                 })
             })
@@ -2586,6 +2591,11 @@ mod tests {
             "qwen3.6-35b-a3b:gguf:q4"
         );
         assert!(search_body["results"][0].get("lastModified").is_none());
+        assert_eq!(
+            search_body["results"][0]["base"],
+            serde_json::json!({ "repository": "Qwen/Qwen3.6-35B-A3B", "relation": "quantized" })
+        );
+        assert!(search_body["results"][0].get("recommended").is_none());
 
         let resolve = test_app(state)
             .oneshot(

@@ -1,5 +1,5 @@
 import { Command } from "@commander-js/extra-typings"
-import { Effect, Option } from "effect"
+import { Effect, Option, Stream } from "effect"
 import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
@@ -108,10 +108,14 @@ const capture = async (command: () => Effect.Effect<void> | Promise<void>) => {
   return { stdout, stderr, exitCode: process.exitCode }
 }
 
-const fakeClient = (handlers: Record<string, (payload: never) => Effect.Effect<unknown, unknown>>) => {
+const fakeClient = (handlers: Record<string, (payload: never) => Effect.Effect<unknown, unknown> | Stream.Stream<unknown, unknown>>) => {
   const models = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, vi.fn(handler)]))
   return { client: { models } as unknown as CliModelsClient, models }
 }
+
+/** The inspection subscription: its result, then open until the subscriber leaves. */
+const inspected = (inspection: unknown) => () =>
+  Stream.concat(Stream.make({ _tag: "Inspected", inspection }), Stream.never)
 
 const run = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.either(effect))
 
@@ -591,13 +595,13 @@ describe("pull and model mutations", () => {
       label: "mtp.gguf",
     })
     const { client, models } = fakeClient({
-      inspectModelCandidate: () => Effect.succeed(makeInspection({ selectedVersion: Option.some("Q6_K_P") })),
+      streamModelCandidateInspection: inspected(makeInspection({ selectedVersion: Option.some("Q6_K_P") })),
       listDrafterCandidates: () => Effect.succeed({ candidates: [makeDrafterCandidate(), other], entered: Option.none() }),
       addHuggingFaceModel: () => Effect.succeed(added("Started", Option.some(other))),
     })
     const input = `${TEST_REPOSITORY}:Q6_K_P`
     await run(pull(client, input, pullReference(input), drafterArgument("../drafters/mtp.gguf")))
-    expect(models.inspectModelCandidate).toHaveBeenCalledWith({ reference: input })
+    expect(models.streamModelCandidateInspection).toHaveBeenCalledWith({ reference: input })
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({
       target: {
         _tag: "Candidate",
@@ -617,7 +621,7 @@ describe("pull and model mutations", () => {
 
   it("resolves the version a Hugging Face file link names", async () => {
     const { client, models } = fakeClient({
-      inspectModelCandidate: () => Effect.succeed(makeInspection({ selectedVersion: Option.some("Q4_K_P") })),
+      streamModelCandidateInspection: inspected(makeInspection({ selectedVersion: Option.some("Q4_K_P") })),
       addHuggingFaceModel: () => Effect.succeed(added("Started")),
     })
     const link = `https://huggingface.co/${TEST_REPOSITORY}/blob/main/Qwen-Test-Q4_K_P.gguf`

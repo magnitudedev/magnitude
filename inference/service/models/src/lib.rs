@@ -60,7 +60,8 @@ pub use package_service::{
     speculative_servable_model_bundle_key,
 };
 pub use search_shape::{
-    CatalogFingerprints, HeaderExtent, HeaderVerdicts, ModelShape, SHAPE_PREFIX_BYTES,
+    CatalogFingerprints, HeaderExtent, HeaderVerdicts, ModelShape, RecommendedVersions,
+    SHAPE_PREFIX_BYTES,
 };
 pub use weight_lineage::{SampleRead, WeightSample};
 pub use preview::{

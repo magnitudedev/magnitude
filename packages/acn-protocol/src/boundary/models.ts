@@ -19,7 +19,6 @@ import {
   AutomaticModelLocationKindSchema,
   AddedModelSchema,
   CatalogComponentSchema,
-  CandidateInspectionSchema,
   CandidateInspectionUpdateSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
@@ -177,16 +176,10 @@ const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
   error: ModelCandidateError,
 }).pipe(replaySafe)
 
-/** A Hugging Face URL, `owner/repo`, `owner/repo:QUANT`, or local GGUF path, inspected without changes. */
-const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
-  payload: Schema.Struct({ reference: NonEmptyString }),
-  success: CandidateInspectionSchema,
-  error: ModelCandidateError,
-}).pipe(replaySafe)
-
 /**
- * The same inspection as it goes: its progress in order, then the inspection itself. Like every ACN
- * subscription, it stays open after the inspection until the subscriber leaves.
+ * A Hugging Face URL, `owner/repo`, `owner/repo:QUANT`, or local GGUF path, inspected without changes:
+ * its progress in order, then the inspection itself. Like every ACN subscription, it stays open after
+ * the inspection until the subscriber leaves.
  */
 const StreamModelCandidateInspection = Rpc.make("StreamModelCandidateInspection", {
   payload: Schema.Struct({ reference: NonEmptyString }),
@@ -292,7 +285,6 @@ export const Models = {
   stopSlot: StopSlot,
   previewSlotLoad: PreviewSlotLoad,
   searchHuggingFaceModels: SearchHuggingFaceModels,
-  inspectModelCandidate: InspectModelCandidate,
   streamModelCandidateInspection: StreamModelCandidateInspection,
   listDrafterCandidates: ListDrafterCandidates,
   listModelLocations: ListModelLocations,

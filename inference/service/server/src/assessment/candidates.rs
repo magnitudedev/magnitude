@@ -31,7 +31,8 @@ use magnitude_service_contracts::models::{
     SpeculativeDraftSource, SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ComponentRole, ContentIdentity, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
+    ComponentRole, ContentIdentity, HuggingFaceRecommendedVersion, HuggingFaceRepositoryFile,
+    HuggingFaceRepositoryRequest,
     HuggingFaceRepositorySnapshot, InventoryError, ModelPreviewComponentRole,
     ModelPreviewComponentSource, ModelPreviewSource, ResolvedModel,
 };
@@ -45,7 +46,7 @@ use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
-    CachedModelAssessment, CachedModelPresentation, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelAcquisition,
+    CachedModelAssessment, CachedModelPresentation, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelAcquisition, RecommendedVersions,
     CustomModelEnrichment, CustomModelEnrichmentResult,
     CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
     ServableModelBundleKey, WeightSample, refresh_hugging_face_repository,
@@ -3010,6 +3011,35 @@ impl CustomModelAcquisition for ManagedModelCandidates {
 impl CatalogFingerprints for ManagedModelCandidates {
     fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
         Box::pin(async move { self.catalog_facts().await.fingerprints.clone() })
+    }
+}
+
+impl RecommendedVersions for ManagedModelCandidates {
+    /// The version the repository's inspection at `commit` recommends, with its verdict.
+    fn recommended_version(
+        &self,
+        repository: String,
+        commit: String,
+    ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>> {
+        Box::pin(async move {
+            let repository = HuggingFaceRepositoryId::new(repository).ok()?;
+            let inspection = self
+                .inspect_hugging_face(repository, commit, &InspectionProgress::silent())
+                .await
+                .map_err(|error| tracing::debug!(%error, "search recommendation inspection failed"))
+                .ok()?;
+            let version = inspection
+                .versions
+                .into_iter()
+                .find(|version| version.recommended)?;
+            Some(HuggingFaceRecommendedVersion {
+                label: version.label,
+                model_id: version.model_id,
+                size_bytes: version.size_bytes,
+                download_bytes: version.download_bytes,
+                assessment: version.assessment?,
+            })
+        })
     }
 }
 

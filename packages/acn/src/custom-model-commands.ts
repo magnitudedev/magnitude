@@ -24,7 +24,6 @@ import {
   preselectedDrafterCandidate,
   sameModelId,
   type AutomaticModelLocationKind,
-  type CandidateInspection,
   type CandidateInspectionProgress,
   type CandidateInspectionUpdate,
   type CatalogFormModelId,
@@ -36,6 +35,7 @@ import {
   type DrafterChoice,
   type DrafterReference,
   type DrafterTarget,
+  type HuggingFaceBaseRelation,
   type HuggingFaceFormModelId,
   type HuggingFaceRepositoryId,
   type HuggingFaceSearchResponse,
@@ -103,6 +103,14 @@ export interface ExternalModelFiles {
   readonly location: Option.Option<ModelLocationKind>
 }
 
+const baseRelation: Record<Native.HuggingFaceBaseRelation, HuggingFaceBaseRelation> = {
+  quantized: "Quantized",
+  finetune: "Finetune",
+  merge: "Merge",
+  adapter: "Adapter",
+  unknown: "Unknown",
+}
+
 const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "catalog_model_not_hideable",
   message: `${modelId} is a catalog model. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
@@ -133,9 +141,8 @@ export interface CustomModelCommandsApi {
     readonly query: string
     readonly limit: Option.Option<number>
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
-  readonly inspectCandidate: (reference: string) => Effect.Effect<CandidateInspection, ModelCandidateError>
-  /** The same inspection as it goes: its progress in order, then the inspection itself. */
-  readonly inspectCandidateWithProgress: (reference: string) => Stream.Stream<CandidateInspectionUpdate, ModelCandidateError>
+  /** A reference inspected without changes, as it goes: its progress in order, then the inspection itself. */
+  readonly inspectCandidate: (reference: string) => Stream.Stream<CandidateInspectionUpdate, ModelCandidateError>
   /** The drafter choices, and the listed candidate a different drafter (`other`) resolves to. */
   readonly listDrafterCandidates: (
     target: DrafterTarget,
@@ -415,19 +422,6 @@ export const CustomModelCommandsLive: Layer.Layer<
     })))
   })
 
-  const inspect = (reference: string) => Effect.gen(function* () {
-    const parsed = yield* parse(reference)
-    const native = yield* icn.inspect(parsed._tag === "HuggingFace"
-      ? { _tag: "HuggingFace", repository: parsed.repository, revision: parsed.revision }
-      : { _tag: "Local", path: parsed.path },
-    ).pipe(Effect.catchAll(candidateFailed(reference)))
-    return yield* productInspection(
-      native,
-      parsed._tag === "HuggingFace" ? parsed : { file: Option.none(), quant: Option.none() },
-      reference,
-    )
-  })
-
   const productProgress = (snapshot: Native.ModelAssessmentsSnapshot, native: Native.CandidateInspectionProgress): CandidateInspectionProgress => ({
     phase: native.phase._tag === "CheckingDrafters"
       ? { _tag: "CheckingDrafters", version: native.phase.version, completed: native.phase.completed, total: native.phase.total }
@@ -439,7 +433,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     })),
   })
 
-  const inspectWithProgress = (reference: string) => Stream.unwrap(Effect.gen(function* () {
+  const inspect = (reference: string) => Stream.unwrap(Effect.gen(function* () {
     const parsed = yield* parse(reference)
     const snapshot = yield* assessmentsSnapshot
     return icn.inspectWithProgress(parsed._tag === "HuggingFace"
@@ -752,7 +746,8 @@ export const CustomModelCommandsLive: Layer.Layer<
       limit: Option.getOrElse(limit, () => 20),
     }).pipe(
       Effect.catchAll(candidateFailed(query)),
-      Effect.map(({ results }) => ({
+      Effect.zip(assessmentsSnapshot),
+      Effect.map(([{ results }, snapshot]) => ({
         results: results.flatMap((result) => {
           const repository = Schema.decodeUnknownOption(HuggingFaceRepositoryIdSchema)(result.repository)
           if (Option.isNone(repository)) return []
@@ -768,14 +763,23 @@ export const CustomModelCommandsLive: Layer.Layer<
             ...presentField("architecture", Option.filter(result.architecture, (value) => value.length > 0)),
             ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
               Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
+            ...presentField("base", Option.map(result.base, ({ repository, relation }) => ({
+              repository,
+              relation: baseRelation[relation],
+            }))),
+            ...presentField("recommended", Option.map(result.recommended, (version) => ({
+              label: version.label,
+              modelId: version.modelId,
+              sizeBytes: version.sizeBytes,
+              downloadBytes: version.downloadBytes,
+              assessment: Schema.encodeSync(LocalModelAssessmentSchema)(projectAssessment(snapshot, version.assessment)),
+            }))),
           }))
         }),
       })),
     ),
 
     inspectCandidate: inspect,
-
-    inspectCandidateWithProgress: inspectWithProgress,
 
     listDrafterCandidates,
 

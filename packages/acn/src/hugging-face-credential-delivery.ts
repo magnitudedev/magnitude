@@ -7,7 +7,6 @@ import { HuggingFaceAccount } from "./hugging-face-account"
 /** What clients cache from the Hub through ICN, which reads differently for another account or none. */
 const hubReadOperations = [
   Models.searchHuggingFaceModels._tag,
-  Models.inspectModelCandidate._tag,
   Models.streamModelCandidateInspection._tag,
   Models.listDrafterCandidates._tag,
 ] as const

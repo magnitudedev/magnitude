@@ -5577,6 +5577,16 @@ impl magnitude_service_models::CatalogFingerprints for NoCatalogFingerprints {
     }
 }
 
+impl magnitude_service_models::RecommendedVersions for NoCatalogFingerprints {
+    fn recommended_version(
+        &self,
+        _: String,
+        _: String,
+    ) -> BoxFuture<'_, Option<magnitude_service_contracts::HuggingFaceRecommendedVersion>> {
+        Box::pin(async { None })
+    }
+}
+
 /// Search applies the engine's interpretation to the model file header it reads, so a repository
 /// whose header the engine refuses is shown disabled with the engine's reasons: a tokenizer the
 /// leading metadata declares, read from the first bytes alone, and a tensor no admitted role binds,
@@ -5638,6 +5648,7 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
         super::engine_architectures(),
         Arc::new(crate::assessment::assessor::EngineHeaderVerdicts),
         CatalogLineage::new(Arc::clone(&models), catalog),
+        Arc::new(NoCatalogFingerprints),
         Arc::new(NoCatalogFingerprints),
     );
     let results = magnitude_service_contracts::HuggingFaceModelCatalog::search(

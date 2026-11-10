@@ -11,13 +11,13 @@ use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves, VolumeReserves};
+use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
-    HardwareExecutorAvailability, HardwareGrant, HardwareHostRam, HardwareObservedStore,
+    HardwareExecutorAvailability, HardwareGrant, HardwareHostRam,
     HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareProvider, HardwareReportedBy,
-    HardwareSnapshot, HardwareStore, HardwareTransferPath, InventoryError,
+    HardwareSnapshot, HardwareStore, HardwareTransferPath, HardwareVolume, InventoryError,
 };
 use seismic::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::assessment::environment::ServingDevice;
 use crate::build_identity;
+use crate::model_store::ServedVolumes;
 use crate::memory_domains::{store_domain_id, store_identity_id};
 use crate::residency::controller::ModelInstances;
 
@@ -81,7 +82,7 @@ impl ResidentMemory for ModelInstances {
 pub struct HardwareInventory {
     inventory: Arc<Inventory>,
     reserves: MemoryReserves,
-    volumes: Arc<VolumeReserves>,
+    volumes: Arc<ServedVolumes>,
     serving: ServingDevice,
     machine: Arc<MachineDescription>,
     resident: Arc<dyn ResidentMemory>,
@@ -94,14 +95,14 @@ impl HardwareInventory {
     pub fn new(
         inventory: Arc<Inventory>,
         reserves: MemoryReserves,
-        volumes: Arc<VolumeReserves>,
+        volumes: ServedVolumes,
         serving: ServingDevice,
         resident: Arc<dyn ResidentMemory>,
     ) -> Self {
         Self {
             inventory,
             reserves,
-            volumes,
+            volumes: Arc::new(volumes),
             serving,
             machine: Arc::new(MachineDescription::discover()),
             resident,
@@ -114,7 +115,7 @@ impl HardwareInventory {
     fn snapshot_with(
         inventory: &Inventory,
         reserves: &MemoryReserves,
-        volumes: &VolumeReserves,
+        volumes: &ServedVolumes,
         serving: ServingDevice,
         machine: &MachineDescription,
         resident: Option<&MemoryObservation>,
@@ -223,11 +224,11 @@ fn snapshot(
     topology: &DeviceTopology,
     status: &Status,
     reserves: &MemoryReserves,
-    volumes: &VolumeReserves,
+    served: &ServedVolumes,
     serving: ServingDevice,
     machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
-    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable).with_volumes(volumes);
+    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable).with_volumes(&served.reserves);
     let path_index = |id| {
         let index = topology
             .access_paths()
@@ -340,11 +341,12 @@ fn snapshot(
                 store: store(each)?.0,
                 current_free_bytes: None,
             }),
-            StoreKind::Volume(_) => {
+            StoreKind::Volume(volume) => {
                 let (store, current_free_bytes) = store(each)?;
-                volumes.push(HardwareObservedStore {
+                volumes.push(HardwareVolume {
                     store,
                     current_free_bytes,
+                    roles: served.roles(volume),
                 });
             }
         }
@@ -513,6 +515,8 @@ fn parse_linux_physical_cores(text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_executor::platform::VolumeReserves;
+    use magnitude_service_contracts::HardwareVolumeRole;
 
     #[test]
     fn physical_cores_separate_smt_threads_and_sockets() {
@@ -588,6 +592,33 @@ mod tests {
         assert_eq!(device_memory[1].current_free_bytes, None);
     }
 
+    /// A volume the service keeps a path on carries that path's role, and only that volume.
+    #[test]
+    fn served_volumes_carry_their_roles() {
+        let directory = std::env::temp_dir().join(format!("served-volume-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let inventory = Inventory::discover(&[directory.clone()]).unwrap();
+        let mut served = ServedVolumes::new(Arc::new(VolumeReserves::new(None)));
+        served.tag(&directory, HardwareVolumeRole::ModelStore).unwrap();
+        served.tag(&directory, HardwareVolumeRole::KernelCache).unwrap();
+        served.tag(&directory, HardwareVolumeRole::ModelStore).unwrap();
+        let observed = HardwareInventory::snapshot_with(
+            &inventory,
+            &MemoryReserves::of_machine(None),
+            &served,
+            ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+            &MachineDescription::discover(),
+            None,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(observed.volumes.len(), 1);
+        assert_eq!(
+            observed.volumes[0].roles,
+            vec![HardwareVolumeRole::ModelStore, HardwareVolumeRole::KernelCache]
+        );
+    }
+
     #[test]
     fn snapshot_keeps_physical_identity_and_all_placement_references() {
         let inventory = Inventory::discover(&[]).unwrap();
@@ -596,7 +627,7 @@ mod tests {
         let observed = HardwareInventory::snapshot_with(
             &inventory,
             &MemoryReserves::of_machine(None),
-            &VolumeReserves::new(None),
+            &ServedVolumes::new(Arc::new(VolumeReserves::new(None))),
             serving,
             &MachineDescription::discover(),
             None,

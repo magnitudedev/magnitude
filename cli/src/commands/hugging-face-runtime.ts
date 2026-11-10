@@ -35,7 +35,7 @@ import {
   type LocalModelSyncOutcome,
   type UnsupportedReason,
 } from "@magnitudedev/sdk"
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import { renderDrafterChoices } from "./drafter-output"
 import { catalogProducts, readCatalog, withClient, type CliModelsClient } from "./inference-client"
 import { CandidateInspectionJsonSchema } from "./json-schemas"
@@ -335,9 +335,20 @@ const listCandidateDrafters = (client: CliModelsClient, inspection: CandidateIns
     }).pipe(Effect.map(({ candidates }) => candidates)),
   })
 
+/** The candidate inspection's result: the subscription stays open after it, so its first `Inspected` update ends the read. */
+const inspectCandidateReference = (client: CliModelsClient, reference: string) =>
+  client.models.streamModelCandidateInspection({ reference }).pipe(
+    Stream.filterMap((update) => update._tag === "Inspected" ? Option.some(update.inspection) : Option.none()),
+    Stream.runHead,
+    Effect.flatMap(Option.match({
+      onNone: () => Effect.fail(new ModelCommandError({ message: `The inspection of ${reference} ended without a result.` })),
+      onSome: Effect.succeed,
+    })),
+  )
+
 export const readInspection = (client: CliModelsClient, reference: string) => Effect.gen(function* () {
   const [inspection, catalog] = yield* Effect.all([
-    client.models.inspectModelCandidate({ reference }),
+    inspectCandidateReference(client, reference),
     readCatalog(client),
   ])
   const drafters = yield* listCandidateDrafters(client, inspection)
@@ -522,7 +533,7 @@ const addHuggingFaceModel = (
     })
     return { _tag: "HuggingFace" as const, repository: reference.repository, versionRequested, added }
   }
-  const inspection = yield* client.models.inspectModelCandidate({ reference: input })
+  const inspection = yield* inspectCandidateReference(client, input)
   if (inspection.source._tag !== "HuggingFace") {
     return yield* new ModelCommandError({ message: `${input} is not a Hugging Face repository.` })
   }

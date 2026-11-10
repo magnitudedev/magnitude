@@ -457,6 +457,19 @@ mod tests {
         }
     }
 
+    impl magnitude_service_models::RecommendedVersions for NoFingerprints {
+        fn recommended_version(
+            &self,
+            _: String,
+            _: String,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Option<magnitude_service_contracts::HuggingFaceRecommendedVersion>,
+        > {
+            Box::pin(async { None })
+        }
+    }
+
     /// Every Hub request presents the configured token, and the Hub rejects it here, so the
     /// token passes through every request and fallback path while everything is logged.
     #[tokio::test]
@@ -518,6 +531,7 @@ mod tests {
                     diagnostics: Vec::new(),
                 },
             ),
+            std::sync::Arc::new(NoFingerprints),
             std::sync::Arc::new(NoFingerprints),
         );
         discovery

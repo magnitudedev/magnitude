@@ -126,6 +126,10 @@ export const projectInferenceHardware = (
     accelerators,
     activeDeviceId: LocalInferenceDeviceIdSchema.make(active.executor.id),
     memoryDomains,
+    modelStorage: Option.map(
+      Option.fromNullable(hardware.volumes.find(volume => volume.roles.includes("model_store"))),
+      volume => ({ freeBytes: volume.current_free_bytes }),
+    ),
   }
 })
 

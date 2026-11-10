@@ -27,7 +27,9 @@ use magnitude_artifacts::gguf::{
     walk,
 };
 use magnitude_service_contracts::models::{ModelFingerprint, ModelId, UnsupportedReason};
-use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
+use magnitude_service_contracts::{
+    HuggingFaceRecommendedVersion, HuggingFaceRepositoryRequest, InventoryError,
+};
 use reqwest::header::RANGE;
 use serde::{Deserialize, Serialize};
 
@@ -44,12 +46,23 @@ pub const MAX_MODEL_FILE_READS: usize = 3;
 const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Versions the cached outcome: a change to how the model file is found or what is kept of it
 /// drops older entries.
-const CACHE_VERSION: &str = "model-file.v7";
+const CACHE_VERSION: &str = "model-file.v8";
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Each catalog model's shape fingerprint, as its first variant's model ID, in catalog order.
 pub trait CatalogFingerprints: Send + Sync {
     fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>>;
+}
+
+/// A repository's recommended version at a commit, chosen and assessed as candidate inspection
+/// chooses and assesses it; none when no version fits or the repository can't be inspected. The
+/// server supplies its inspection.
+pub trait RecommendedVersions: Send + Sync {
+    fn recommended_version(
+        &self,
+        repository: String,
+        commit: String,
+    ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>>;
 }
 
 /// How much of a model file's header search holds: all of it through its tensor directory, or
@@ -85,7 +98,8 @@ pub struct ModelShape {
 }
 
 /// What a repository's commit holds for search: the model file's architecture, shape (absent
-/// when its header doesn't state one), the repositories its header declares as base models and
+/// when its header doesn't state one), the repositories its header declares as base models (in
+/// its order) and
 /// the engine's refusal of its header (empty when it refuses nothing), headers read that hold no model file, headers read that are all drafters'
 /// (a drafter repository, never a model result), or headers read that are all projectors' (no GGUF
 /// model at all, never a result).
@@ -423,14 +437,16 @@ async fn read_repository_model(
             projectors_only &= file == FileKind::Projector;
             continue;
         };
-        let base_repositories = metadata
-            .as_ref()
-            .map(|directory| {
-                crate::candidate_files::base_model_repositories(&crate::gguf::base_models(directory))
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // In the header's order: its first base model is the one it derives from.
+        let mut base_repositories = Vec::new();
+        for base in metadata.as_ref().map(crate::gguf::base_models).unwrap_or_default() {
+            let named = crate::candidate_files::base_model_repositories(std::slice::from_ref(&base));
+            for repository in named {
+                if !base_repositories.contains(&repository) {
+                    base_repositories.push(repository);
+                }
+            }
+        }
         // Keys a writer put after the token list (some put the shape's, or an appended MTP head
         // count) are seen only in the whole header. A prefix's shape stands when the header ends
         // in the prefix, when it is a catalog model's, or when no catalog model is even of its

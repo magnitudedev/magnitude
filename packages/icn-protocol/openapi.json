@@ -6256,25 +6256,6 @@
         },
         "additionalProperties": false
       },
-      "HardwareObservedStore": {
-        "type": "object",
-        "description": "A volume, with the space the OS reports available to this process.",
-        "required": [
-          "store",
-          "current_free_bytes"
-        ],
-        "properties": {
-          "store": {
-            "$ref": "#/components/schemas/HardwareStore"
-          },
-          "current_free_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
       "HardwarePhysicalDevice": {
         "type": "object",
         "description": "One piece of hardware, with every executor that views it.",
@@ -6427,9 +6408,9 @@
           "volumes": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HardwareObservedStore"
+              "$ref": "#/components/schemas/HardwareVolume"
             },
-            "description": "The filesystems of the model store and the kernel cache."
+            "description": "The filesystems of the model store and the kernel cache, each tagged with its roles."
           },
           "access_paths": {
             "type": "array",
@@ -6517,6 +6498,40 @@
         },
         "additionalProperties": false
       },
+      "HardwareVolume": {
+        "type": "object",
+        "description": "A volume, with the space the OS reports available to this process and what the service\nkeeps on it.",
+        "required": [
+          "store",
+          "current_free_bytes",
+          "roles"
+        ],
+        "properties": {
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
+          },
+          "current_free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareVolumeRole"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareVolumeRole": {
+        "type": "string",
+        "description": "What the service keeps on a volume.",
+        "enum": [
+          "model_store",
+          "kernel_cache"
+        ]
+      },
       "HealthResponse": {
         "type": "object",
         "required": [
@@ -6563,12 +6578,40 @@
         "type": "string",
         "description": "The repository-relative GGUF weights selector used in a Hugging Face model identity."
       },
+      "HuggingFaceBaseRelation": {
+        "type": "string",
+        "description": "How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`\nwhen only its GGUF names the base.",
+        "enum": [
+          "quantized",
+          "finetune",
+          "merge",
+          "adapter",
+          "unknown"
+        ]
+      },
       "HuggingFaceCredential": {
         "type": "object",
         "description": "The Hugging Face token presented on every later Hub request; without one, Hub requests are\nanonymous. It is write-only: no response carries it.",
         "properties": {
           "token": {
             "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceModelBase": {
+        "type": "object",
+        "description": "The model a repository derives from.",
+        "required": [
+          "repository",
+          "relation"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/HuggingFaceBaseRelation"
           }
         },
         "additionalProperties": false
@@ -6593,7 +6636,7 @@
       },
       "HuggingFaceModelSearchResult": {
         "type": "object",
-        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has. `version_count` is how many GGUFs the repository's file list offers\n(split shards counted once, projectors excluded), approximate since drafters are not told apart.",
+        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has. `version_count` is how many GGUFs the repository's file list offers\n(split shards counted once, projectors excluded), approximate since drafters are not told apart.\n`base` is the model the repository derives from: the Hub's `baseModels`, else its model file's\n`general.base_model.*`. `recommended` is the version inspection recommends on this machine,\nabsent when none fits or the repository could not be inspected in time.",
         "required": [
           "repository",
           "commit",
@@ -6653,6 +6696,12 @@
             "items": {
               "$ref": "#/components/schemas/UnsupportedReason"
             }
+          },
+          "base": {
+            "$ref": "#/components/schemas/HuggingFaceModelBase"
+          },
+          "recommended": {
+            "$ref": "#/components/schemas/HuggingFaceRecommendedVersion"
           }
         },
         "additionalProperties": false
@@ -6669,6 +6718,39 @@
             "items": {
               "$ref": "#/components/schemas/HuggingFaceModelSearchResult"
             }
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceRecommendedVersion": {
+        "type": "object",
+        "description": "A repository's recommended version, chosen and assessed as candidate inspection chooses and\nassesses it. `download_bytes` is what adding it downloads, its projector included; zero when it\nis already on this computer.",
+        "required": [
+          "label",
+          "modelId",
+          "sizeBytes",
+          "downloadBytes",
+          "assessment"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assessment": {
+            "$ref": "#/components/schemas/ModelAssessment"
           }
         },
         "additionalProperties": false

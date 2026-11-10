@@ -1612,13 +1612,6 @@ export const HardwareHostRam = S.Struct({
 export type HardwareHostRam = S.Schema.Type<typeof HardwareHostRam>
 export type HardwareHostRamEncoded = S.Schema.Encoded<typeof HardwareHostRam>
 
-export const HardwareObservedStore = S.Struct({
-  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
-})
-export type HardwareObservedStore = S.Schema.Type<typeof HardwareObservedStore>
-export type HardwareObservedStoreEncoded = S.Schema.Encoded<typeof HardwareObservedStore>
-
 export const HardwarePhysicalDevice = S.Struct({
   executors: S.Array(S.suspend((): S.Schema<HardwareExecutor, HardwareExecutorEncoded> => HardwareExecutor)),
   id: S.suspend((): S.Schema<HardwarePhysicalDeviceId, HardwarePhysicalDeviceIdEncoded> => HardwarePhysicalDeviceId),
@@ -1695,9 +1688,7 @@ export const HardwareSnapshot = S.Struct({
   transfer_paths: S.Array(
     S.suspend((): S.Schema<HardwareTransferPath, HardwareTransferPathEncoded> => HardwareTransferPath),
   ),
-  volumes: S.Array(
-    S.suspend((): S.Schema<HardwareObservedStore, HardwareObservedStoreEncoded> => HardwareObservedStore),
-  ),
+  volumes: S.Array(S.suspend((): S.Schema<HardwareVolume, HardwareVolumeEncoded> => HardwareVolume)),
 })
 export type HardwareSnapshot = S.Schema.Type<typeof HardwareSnapshot>
 export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
@@ -1722,6 +1713,18 @@ export const HardwareTransferPath = S.Struct({
 export type HardwareTransferPath = S.Schema.Type<typeof HardwareTransferPath>
 export type HardwareTransferPathEncoded = S.Schema.Encoded<typeof HardwareTransferPath>
 
+export const HardwareVolume = S.Struct({
+  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  roles: S.Array(S.suspend((): S.Schema<HardwareVolumeRole, HardwareVolumeRoleEncoded> => HardwareVolumeRole)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
+})
+export type HardwareVolume = S.Schema.Type<typeof HardwareVolume>
+export type HardwareVolumeEncoded = S.Schema.Encoded<typeof HardwareVolume>
+
+export const HardwareVolumeRole = S.Union(S.Literal("model_store"), S.Literal("kernel_cache"))
+export type HardwareVolumeRole = S.Schema.Type<typeof HardwareVolumeRole>
+export type HardwareVolumeRoleEncoded = S.Schema.Encoded<typeof HardwareVolumeRole>
+
 export const HealthResponse = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   instanceId: S.String,
@@ -1741,11 +1744,28 @@ export const HuggingFaceArtifactSelector = S.String
 export type HuggingFaceArtifactSelector = S.Schema.Type<typeof HuggingFaceArtifactSelector>
 export type HuggingFaceArtifactSelectorEncoded = S.Schema.Encoded<typeof HuggingFaceArtifactSelector>
 
+export const HuggingFaceBaseRelation = S.Union(
+  S.Literal("quantized"),
+  S.Literal("finetune"),
+  S.Literal("merge"),
+  S.Literal("adapter"),
+  S.Literal("unknown"),
+)
+export type HuggingFaceBaseRelation = S.Schema.Type<typeof HuggingFaceBaseRelation>
+export type HuggingFaceBaseRelationEncoded = S.Schema.Encoded<typeof HuggingFaceBaseRelation>
+
 export const HuggingFaceCredential = S.Struct({
   token: S.optionalWith(S.String, { exact: true, as: "Option" }),
 })
 export type HuggingFaceCredential = S.Schema.Type<typeof HuggingFaceCredential>
 export type HuggingFaceCredentialEncoded = S.Schema.Encoded<typeof HuggingFaceCredential>
+
+export const HuggingFaceModelBase = S.Struct({
+  relation: S.suspend((): S.Schema<HuggingFaceBaseRelation, HuggingFaceBaseRelationEncoded> => HuggingFaceBaseRelation),
+  repository: S.String,
+})
+export type HuggingFaceModelBase = S.Schema.Type<typeof HuggingFaceModelBase>
+export type HuggingFaceModelBaseEncoded = S.Schema.Encoded<typeof HuggingFaceModelBase>
 
 export const HuggingFaceModelSearchRequest = S.Struct({
   limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1756,6 +1776,10 @@ export type HuggingFaceModelSearchRequestEncoded = S.Schema.Encoded<typeof Huggi
 
 export const HuggingFaceModelSearchResult = S.Struct({
   architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  base: S.optionalWith(
+    S.suspend((): S.Schema<HuggingFaceModelBase, HuggingFaceModelBaseEncoded> => HuggingFaceModelBase),
+    { exact: true, as: "Option" },
+  ),
   commit: S.String,
   developer: S.optionalWith(
     S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
@@ -1766,6 +1790,13 @@ export const HuggingFaceModelSearchResult = S.Struct({
   lastModified: S.optionalWith(S.String, { exact: true, as: "Option" }),
   likes: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   private: S.Boolean,
+  recommended: S.optionalWith(
+    S.suspend(
+      (): S.Schema<HuggingFaceRecommendedVersion, HuggingFaceRecommendedVersionEncoded> =>
+        HuggingFaceRecommendedVersion,
+    ),
+    { exact: true, as: "Option" },
+  ),
   repository: S.String,
   tags: S.Array(S.String),
   unsupported: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
@@ -1787,6 +1818,16 @@ export const HuggingFaceModelSearchResults = S.Struct({
 })
 export type HuggingFaceModelSearchResults = S.Schema.Type<typeof HuggingFaceModelSearchResults>
 export type HuggingFaceModelSearchResultsEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResults>
+
+export const HuggingFaceRecommendedVersion = S.Struct({
+  assessment: S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  label: S.String,
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type HuggingFaceRecommendedVersion = S.Schema.Type<typeof HuggingFaceRecommendedVersion>
+export type HuggingFaceRecommendedVersionEncoded = S.Schema.Encoded<typeof HuggingFaceRecommendedVersion>
 
 export const HuggingFaceRepositoryFile = S.Struct({
   content: S.suspend((): S.Schema<ContentIdentity, ContentIdentityEncoded> => ContentIdentity),

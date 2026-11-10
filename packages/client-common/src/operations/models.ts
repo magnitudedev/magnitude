@@ -134,6 +134,12 @@ const StopActiveLocalModel = mutation(
   }
 );
 
+const StopLocalModel = mutation(Rpcs.stopModel, (client) => client.models.stopModel, {
+  scope: ({ modelId }) =>
+    Mutation.MutationScope(`local-model-residency:${modelId}`),
+  synchronize: () => synchronizeCatalog,
+});
+
 const LoadSlot = mutation(Rpcs.loadSlot, (client) => client.models.loadSlot, {
   scope: ({ slotId }) =>
     Mutation.MutationScope(`model-slot-instance:${slotId}`),
@@ -158,8 +164,8 @@ const SearchHuggingFaceModels = query(
 );
 
 /**
- * The same inspection as it goes: the latest progress, then the inspection, which stays cached so
- * reopening the repository shows it at once.
+ * The one candidate inspection, as it goes: the latest progress, then the inspection, which stays
+ * cached so reopening the repository shows it at once.
  */
 const StreamModelCandidateInspection = streamQuery(
   Rpcs.streamModelCandidateInspection,
@@ -261,6 +267,7 @@ export const Models = Group.make({
   RemoveLocalModel,
   LoadLocalModel,
   StopActiveLocalModel,
+  StopLocalModel,
   LoadSlot,
   StopSlot,
   AddHuggingFaceModel,

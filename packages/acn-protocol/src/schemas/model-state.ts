@@ -1485,6 +1485,26 @@ export const LocalModelsStateSchema = Schema.Struct({
 }, { message: () => "local models must have unique canonical model IDs" }))
 export type LocalModelsState = typeof LocalModelsStateSchema.Type
 
+/** How a repository derives from its base model; `Unknown` when only its GGUF names the base. */
+export const HuggingFaceBaseRelationSchema = Schema.Literal("Quantized", "Finetune", "Merge", "Adapter", "Unknown")
+export type HuggingFaceBaseRelation = typeof HuggingFaceBaseRelationSchema.Type
+
+export const HuggingFaceModelBaseSchema = Schema.Struct({
+  repository: HuggingFaceRepositoryIdSchema,
+  relation: HuggingFaceBaseRelationSchema,
+})
+export type HuggingFaceModelBase = typeof HuggingFaceModelBaseSchema.Type
+
+/** A repository's recommended version, chosen and assessed exactly as its inspection chooses and assesses it. */
+export const HuggingFaceRecommendedVersionSchema = Schema.Struct({
+  label: NonEmptyString,
+  modelId: CustomFormModelIdSchema,
+  sizeBytes: NonNegativeSafeInteger,
+  downloadBytes: NonNegativeSafeInteger,
+  assessment: LocalModelAssessmentSchema,
+})
+export type HuggingFaceRecommendedVersion = typeof HuggingFaceRecommendedVersionSchema.Type
+
 export const HuggingFaceSearchResultSchema = Schema.Struct({
   repository: HuggingFaceRepositoryIdSchema,
   displayName: NonEmptyString,
@@ -1496,6 +1516,8 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
   unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
   gated: Schema.Boolean,
   versionCount: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
+  base: Schema.optionalWith(HuggingFaceModelBaseSchema, { as: "Option", exact: true }),
+  recommended: Schema.optionalWith(HuggingFaceRecommendedVersionSchema, { as: "Option", exact: true }),
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
@@ -1903,6 +1925,12 @@ export const LocalInferenceMemoryDomainSchema = Schema.Struct({
   totalBytes: NonNegativeSafeInteger,
   availableBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
 })
+/** The volume holding the model store: the bytes downloads may still write there, above its reserve. */
+export const LocalInferenceModelStorageSchema = Schema.Struct({
+  freeBytes: NonNegativeSafeInteger,
+})
+export type LocalInferenceModelStorage = typeof LocalInferenceModelStorageSchema.Type
+
 export const LocalInferenceHardwareSchema = Schema.Struct({
   platform: Schema.Literal("MacOS", "Linux", "Windows"),
   architecture: Schema.Literal("Arm64", "X64"),
@@ -1915,6 +1943,7 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   /** The active device: the one a resident model runs on, and otherwise the service's serving device. */
   activeDeviceId: LocalInferenceDeviceIdSchema,
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
+  modelStorage: Schema.optionalWith(LocalInferenceModelStorageSchema, { as: "Option", exact: true }),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)
   const acceleratorIds = hardware.accelerators.map(({ acceleratorId }) => acceleratorId)

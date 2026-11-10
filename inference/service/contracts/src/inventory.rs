@@ -593,13 +593,24 @@ pub struct HardwareHostRam {
     pub current_free_bytes: u64,
 }
 
-/// A volume, with the space the OS reports available to this process.
+/// What the service keeps on a volume.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareVolumeRole {
+    ModelStore,
+    KernelCache,
+}
+
+/// A volume, with the space the OS reports available to this process and what the service
+/// keeps on it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HardwareObservedStore {
+pub struct HardwareVolume {
     pub store: HardwareStore,
     pub current_free_bytes: u64,
+    pub roles: Vec<HardwareVolumeRole>,
 }
 
 /// Memory the OS does not manage, owned by one physical device. Its headroom
@@ -711,8 +722,8 @@ pub struct HardwareSnapshot {
     /// Memory the OS manages; every machine has it.
     pub host_ram: HardwareHostRam,
     pub device_memory: Vec<HardwareDeviceMemory>,
-    /// The filesystems of the model store and the kernel cache.
-    pub volumes: Vec<HardwareObservedStore>,
+    /// The filesystems of the model store and the kernel cache, each tagged with its roles.
+    pub volumes: Vec<HardwareVolume>,
     pub access_paths: Vec<HardwareAccessPath>,
     pub transfer_paths: Vec<HardwareTransferPath>,
 }
@@ -780,12 +791,51 @@ pub struct HuggingFaceModelSearchRequest {
     pub limit: u32,
 }
 
+/// How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`
+/// when only its GGUF names the base.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HuggingFaceBaseRelation {
+    Quantized,
+    Finetune,
+    Merge,
+    Adapter,
+    Unknown,
+}
+
+/// The model a repository derives from.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HuggingFaceModelBase {
+    pub repository: String,
+    pub relation: HuggingFaceBaseRelation,
+}
+
+/// A repository's recommended version, chosen and assessed as candidate inspection chooses and
+/// assesses it. `download_bytes` is what adding it downloads, its projector included; zero when it
+/// is already on this computer.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HuggingFaceRecommendedVersion {
+    pub label: String,
+    pub model_id: crate::models::ModelId,
+    pub size_bytes: u64,
+    pub download_bytes: u64,
+    pub assessment: crate::models::ModelAssessment,
+}
+
 /// One repository. `unsupported` is empty for a repository whose architecture the engine runs,
 /// else it names that architecture. `variant_of` is the catalog model whose shape fingerprint the
 /// repository's GGUF has. `version_count` is how many GGUFs the repository's file list offers
 /// (split shards counted once, projectors excluded), approximate since drafters are not told apart.
+/// `base` is the model the repository derives from: the Hub's `baseModels`, else its model file's
+/// `general.base_model.*`. `recommended` is the version inspection recommends on this machine,
+/// absent when none fits or the repository could not be inspected in time.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResult {
     pub repository: String,
@@ -815,12 +865,18 @@ pub struct HuggingFaceModelSearchResult {
     #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
     pub version_count: Option<u32>,
     pub unsupported: Vec<crate::models::UnsupportedReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub base: Option<HuggingFaceModelBase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub recommended: Option<HuggingFaceRecommendedVersion>,
 }
 
 /// Results of every architecture, unsupported ones last; catalog and drafter repositories
 /// excluded.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
     pub results: Vec<HuggingFaceModelSearchResult>,

@@ -59,7 +59,7 @@ describe("Hugging Face credential delivery to ICN", () => {
       yield* SubscriptionRef.set(session, { username: Option.none(), token: Option.none() })
       yield* Effect.sleep("10 millis")
     })))
-    expect(pokes).toEqual(["SearchHuggingFaceModels", "InspectModelCandidate", "StreamModelCandidateInspection", "ListDrafterCandidates"])
+    expect(pokes).toEqual(["SearchHuggingFaceModels", "StreamModelCandidateInspection", "ListDrafterCandidates"])
     expect(order.at(-1)).toBe("configure none")
   })
 

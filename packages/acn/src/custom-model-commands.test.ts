@@ -16,6 +16,7 @@ import {
   CandidateInspection,
   CandidateInspectionProgress,
   DrafterCandidate as NativeDrafterCandidate,
+  ModelAssessment as NativeModelAssessment,
   ModelDownload as NativeModelDownload,
   type ModelDownload,
   type ModelDownloadEncoded,
@@ -139,6 +140,14 @@ interface Recorded {
   prunes: number
 }
 
+/** The inspection a reference's inspection ends with. */
+const inspected = (commands: Effect.Effect.Success<typeof CustomModelCommands>, reference: string) =>
+  commands.inspectCandidate(reference).pipe(
+    Stream.filterMap((update) => update._tag === "Inspected" ? Option.some(update.inspection) : Option.none()),
+    Stream.runHead,
+    Effect.map(Option.getOrThrow),
+  )
+
 const harness = (options: {
   readonly config?: ReturnType<typeof customModelsConfig>
   readonly inspect?: ReturnType<typeof inspection>
@@ -181,6 +190,14 @@ const harness = (options: {
         unsupported: [],
         variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
         developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
+        base: Option.some({ repository: "Qwen/Qwen3.6-35B-A3B", relation: "finetune" }),
+        recommended: Option.some({
+          label: "Q2_K",
+          modelId: "hf:HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/model-Q2_K.gguf",
+          sizeBytes: 50,
+          downloadBytes: 60,
+          assessment: Schema.decodeUnknownSync(NativeModelAssessment)(unsupportedQ2K),
+        }),
       }, {
         repository: "unsloth/DeepSeek-V4-Flash-GGUF",
         architecture: Option.some("deepseek4"),
@@ -195,6 +212,8 @@ const harness = (options: {
         unsupported: [{ _tag: "Architecture", architecture: "deepseek4" }],
         variantOf: Option.none(),
         developer: Option.none(),
+        base: Option.none(),
+        recommended: Option.none(),
       }],
     }) as never,
     resolveRepository: () => Effect.die("unused"),
@@ -203,9 +222,9 @@ const harness = (options: {
       : Effect.fail(options.inspectFailure as never),
     inspectWithProgress: () => Stream.concat(
       Stream.fromIterable((options.progress ?? []).map((progress) => ({ _tag: "Progress" as const, progress }))),
-      options.progressFailure === undefined
+      options.progressFailure === undefined && options.inspectFailure === undefined
         ? Stream.make({ _tag: "Inspected" as const, inspection: options.inspect ?? inspection() })
-        : Stream.fail(options.progressFailure as never),
+        : Stream.fail((options.progressFailure ?? options.inspectFailure) as never),
     ) as never,
     drafters: (request) => Effect.suspend(() => {
       recorded.drafterRequests.push(request)
@@ -317,12 +336,16 @@ describe("finding models", () => {
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
       gated: false,
+      base: Option.some({ repository: "Qwen/Qwen3.6-35B-A3B", relation: "Finetune" }),
     })
+    expect(result.results[0]?.recommended.pipe(Option.map(({ label, downloadBytes, assessment }) =>
+      [label, downloadBytes, assessment._tag]))).toEqual(Option.some(["Q2_K", 60, "Unsupported"]))
+    expect(result.results[1]).toMatchObject({ base: Option.none(), recommended: Option.none() })
   })
 
   it("inspects owner/repo:QUANT and selects that version", async () => {
     const { run } = harness()
-    const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF:q2_k"))
+    const result = await run((commands) => inspected(commands, "owner/model-GGUF:q2_k"))
     expect(result.displayName).toBe("model")
     expect(result.selectedVersion).toEqual(Option.some("Q2_K"))
     expect(result.versions.map(({ modelId }) => modelId)).toEqual([
@@ -340,7 +363,7 @@ describe("finding models", () => {
         progressOf({ _tag: "CheckingDrafters", version: "Q4_K_M", completed: 0, total: 1 }, [undefined, unsupportedQ2K]),
       ],
     })
-    const updates = await run((commands) => Stream.runCollect(commands.inspectCandidateWithProgress("owner/model-GGUF:q2_k")))
+    const updates = await run((commands) => Stream.runCollect(commands.inspectCandidate("owner/model-GGUF:q2_k")))
     const [reading, checking, drafters, done] = [...updates]
     expect([...updates].map(({ _tag }) => _tag)).toEqual(["Inspecting", "Inspecting", "Inspecting", "Inspected"])
     expect(reading?._tag === "Inspecting" && reading.progress.phase).toEqual({ _tag: "ReadingHeaders", completed: 1, total: 2 })
@@ -359,7 +382,7 @@ describe("finding models", () => {
         body: { error: { type: "server_error", code: "inventory_error", message: "upstream model service failed: timed out" } },
       },
     })
-    const result = await run((commands) => Stream.runCollect(commands.inspectCandidateWithProgress("owner/model-GGUF")).pipe(Effect.either))
+    const result = await run((commands) => Stream.runCollect(commands.inspectCandidate("owner/model-GGUF")).pipe(Effect.either))
     expect(result._tag === "Left" && result.left).toMatchObject({
       _tag: "ModelSourceUnavailable",
       reason: "SourceUnreachable",
@@ -378,7 +401,7 @@ describe("finding models", () => {
       }],
     })
     const { run } = harness({ inspect: unreadable })
-    const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF"))
+    const result = await run((commands) => inspected(commands, "owner/model-GGUF"))
     expect(result.versions[1]?.assessment).toEqual(Option.some({
       _tag: "Unsupported",
       environmentId: expect.any(String),
@@ -396,7 +419,7 @@ describe("finding models", () => {
         body: { error: { code: "integrity_failed", message: "unknown GGUF tensor type 31" } },
       },
     })
-    const rejected = await integrity.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    const rejected = await integrity.run((commands) => inspected(commands, "owner/model-GGUF").pipe(Effect.either))
     expect(rejected._tag === "Left" && rejected.left).toMatchObject({
       _tag: "ModelSourceUnavailable",
       reason: "Unreadable",
@@ -411,18 +434,18 @@ describe("finding models", () => {
         body: { error: { code: "inventory_error", message: "upstream model service failed: timed out" } },
       },
     })
-    const failed = await upstream.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    const failed = await upstream.run((commands) => inspected(commands, "owner/model-GGUF").pipe(Effect.either))
     expect(failed._tag === "Left" && failed.left).toMatchObject({ reason: "SourceUnreachable", retryable: true })
 
     const invalid = harness({
       inspectFailure: { _tag: "GeneratedClientInvalidResponseError", status: 418, message: "undeclared status" },
     })
-    const unreadable = await invalid.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    const unreadable = await invalid.run((commands) => inspected(commands, "owner/model-GGUF").pipe(Effect.either))
     expect(unreadable._tag === "Left" && unreadable.left._tag).toBe("ModelSourceUnavailable")
     expect(unreadable._tag === "Left" && unreadable.left.message).not.toMatch(/reach|connection/i)
 
     const transport = harness({ inspectFailure: { _tag: "GeneratedClientTransportError", cause: new Error("refused") } })
-    const unreachable = await transport.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    const unreachable = await transport.run((commands) => inspected(commands, "owner/model-GGUF").pipe(Effect.either))
     expect(unreachable._tag === "Left" && unreachable.left).toMatchObject({ _tag: "ModelSourceUnavailable", reason: "ServiceUnreachable", retryable: true })
   })
 
@@ -446,7 +469,7 @@ describe("finding models", () => {
       message: "Sign in to Hugging Face to use this model.",
     })
     const terms = await refused("hugging_face_terms_required", true).run((commands) =>
-      commands.inspectCandidate(`https://huggingface.co/${repository}`).pipe(Effect.either))
+      inspected(commands, `https://huggingface.co/${repository}`).pipe(Effect.either))
     expect(terms._tag === "Left" && terms.left).toMatchObject({
       _tag: "HuggingFaceAccessRequired",
       repository,
@@ -466,8 +489,8 @@ describe("finding models", () => {
       },
     })
     const message = "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
-    const inspected = await missing(false).run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
-    expect(inspected._tag === "Left" && inspected.left).toMatchObject({
+    const notFound = await missing(false).run((commands) => inspected(commands, "nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
+    expect(notFound._tag === "Left" && notFound.left).toMatchObject({
       _tag: "ModelRepositoryNotFound",
       reference: "nobody-xyz/does-not-exist-GGUF",
       message,
@@ -476,7 +499,7 @@ describe("finding models", () => {
       repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false
     }).pipe(Effect.either))
     expect(added._tag === "Left" && added.left).toMatchObject({ _tag: "ModelRepositoryNotFound", message })
-    const signedIn = await missing(true).run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
+    const signedIn = await missing(true).run((commands) => inspected(commands, "nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
     expect(signedIn._tag === "Left" && signedIn.left).toMatchObject({
       message: "Repository not found, or your Hugging Face account doesn't have access to it. Check the name.",
     })
@@ -495,7 +518,7 @@ describe("finding models", () => {
         },
       },
     })
-    const result = await run((commands) => commands.inspectCandidate("meta-llama/Llama-3.2-1B-Instruct").pipe(Effect.either))
+    const result = await run((commands) => inspected(commands, "meta-llama/Llama-3.2-1B-Instruct").pipe(Effect.either))
     expect(result._tag === "Left" && result.left).toMatchObject({
       _tag: "ModelSourceUnavailable",
       reason: "Unavailable",
@@ -506,7 +529,7 @@ describe("finding models", () => {
 
   it("refuses a version the repository does not have", async () => {
     const { run } = harness()
-    const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF:IQ1_M").pipe(Effect.either))
+    const result = await run((commands) => inspected(commands, "owner/model-GGUF:IQ1_M").pipe(Effect.either))
     expect(result._tag === "Left" && result.left._tag).toBe("InvalidModelReference")
   })
 
