@@ -35,7 +35,6 @@ export function OnboardingScreen() {
     { label: "Measuring how models run on your machine", done: (preparation?.assessment.complete ?? false) && recommendations.ready && recommendations.measuring === null,
       detail: preparation && preparation.assessment.totalModels > 0 ? `${preparation.assessment.settledModels} of ${plural(preparation.assessment.totalModels, "model")}` : null,
       fraction: preparation && preparation.assessment.totalModels > 0 ? preparation.assessment.settledModels / preparation.assessment.totalModels : null },
-    { label: "Choosing models for your machine", done: recommendations.ready, detail: null, fraction: null },
   ]
   const active = progress.findIndex(step => !step.done)
   const steps: readonly PreparationStep[] | null = active === -1 ? null
