@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
-import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, type CatalogFormModelId, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
+import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
 import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
@@ -66,10 +66,10 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: 
     return {
       key,
       catalog: false,
-      name: base && base.relation === "Quantized" ? base.repository.split("/").pop() ?? lead.displayName : lead.displayName,
+      name: base && base.relation === "Quantized" ? repositoryDisplayName(base.repository) : lead.displayName,
       lab: developer ? labForDeveloper(developer.lab) : undefined,
       country: developer?.country ?? null,
-      fineTuneOf: base && base.relation === "Finetune" ? base.repository.split("/").pop() ?? null : null,
+      fineTuneOf: base && base.relation === "Finetune" ? repositoryDisplayName(base.repository) : null,
       drafter: null,
       contextLimit: first && first.assessment._tag === "Fits" ? first.assessment.profile.contextLength : null,
       quants,
