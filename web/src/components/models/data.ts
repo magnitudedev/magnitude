@@ -123,6 +123,7 @@ export const ownedModel = (model: LocalModel, unified: boolean): OwnedModel => {
     quant,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
     location: locationOf(model),
+    found: model._tag === "Custom" && model.origin._tag === "Found",
     drafter: drafterOf(model),
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
   }

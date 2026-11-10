@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react"
-import { CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
+import { CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
+import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { HuggingFaceLogo, LabLogo, modelLabs, type ModelLab } from "../model-logo"
 import { cn } from "@/lib/utils"
 import { ContextText, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
@@ -19,6 +20,7 @@ export interface OwnedModel {
   readonly quant: QuantView
   readonly contextLimit: number | null
   readonly location: string | null
+  readonly found: boolean
   readonly drafter: { readonly method: string; readonly sizeBytes: number | null; readonly attached: boolean } | null
   readonly searchText: string
 }
@@ -65,16 +67,33 @@ function FilterMenu({ filters, setFilters, labs }: { filters: ModelFilters; setF
   </span>
 }
 
-/** A model's ⋯ menu: other quants of it on Hugging Face, and removing this one. */
-function ModelMenu({ onExploreQuants, onRemove }: { onExploreQuants: () => void; onRemove: () => void }) {
+/**
+ * A model's ⋯ menu: other quants of it on Hugging Face, and taking this one away: a model found in another app's
+ * folder is hidden at once (its files stay), a download is deleted once confirmed.
+ */
+function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; onExploreQuants: () => void; onRemove: () => void }) {
   const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
+  const item = "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800"
   return <span ref={ref} className="relative" onClick={event => event.stopPropagation()}>
     <Button size="icon-sm" variant="ghost" aria-label="More" onClick={() => setOpen(value => !value)}><DotsThreeIcon className="size-4" /></Button>
     {open && <div className="absolute right-0 top-8 z-20 w-48 rounded-lg border border-slate-200 bg-white p-1 text-[13px] text-slate-800 shadow-lg dark:border-slate-750 dark:bg-slate-850 dark:text-slate-200">
-      <button type="button" onClick={() => { setOpen(false); onExploreQuants() }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800"><MagnifyingGlassIcon className="size-3.5" />Explore other quants</button>
-      <button type="button" onClick={() => { setOpen(false); onRemove() }} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-red-600 hover:bg-slate-100 dark:text-red-400 dark:hover:bg-slate-800"><TrashIcon className="size-3.5" />Remove</button>
+      <button type="button" onClick={() => { setOpen(false); onExploreQuants() }} className={item}><MagnifyingGlassIcon className="size-3.5" />Explore other quants</button>
+      {model.found
+        ? <button type="button" onClick={() => { setOpen(false); onRemove() }} className={item}><EyeSlashIcon className="size-3.5" />Hide</button>
+        : <button type="button" onClick={() => { setOpen(false); setConfirming(true) }} className={cn(item, "text-red-600 dark:text-red-400")}><TrashIcon className="size-3.5" />Delete…</button>}
     </div>}
+    <Dialog open={confirming} onOpenChange={setConfirming}>
+      <DialogContent showCloseButton={false}>
+        <DialogTitle className="font-heading text-base font-semibold">Delete {model.name}?</DialogTitle>
+        <p className="text-[13px] text-slate-600 dark:text-slate-400">This removes its {formatStorageSize(model.quant.sizeBytes)} of files from this computer. You can download it again later.</p>
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
+          <Button variant="destructive" onClick={() => { setConfirming(false); onRemove() }}><TrashIcon />Delete</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   </span>
 }
 
@@ -135,18 +154,18 @@ export function YourModels({ models, unrunnable, action, onExploreQuants, onRemo
     </span>
     <FilterMenu filters={filters} setFilters={setFilters} labs={labs} />
   </>}>
-    {shown.length === 0 ? <p className="text-[13px] text-slate-500">No models match.</p> : <div className="divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
+    {shown.length === 0 ? <p className="text-[13px] text-slate-500">No models match.</p> : <div className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
       {shown.map(model => {
         const isOpen = open === model.modelId
-        return <div key={model.modelId} className={cn(isOpen && "bg-slate-50 dark:bg-slate-800/40")}>
+        return <div key={model.modelId} className={cn("first:rounded-t-xl last:rounded-b-xl", isOpen && "bg-slate-50 dark:bg-slate-800/40")}>
           <div role="button" tabIndex={0} aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : model.modelId)} onKeyDown={event => { if (event.key === "Enter") setOpen(isOpen ? null : model.modelId) }}
-            className="grid cursor-pointer grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
+            className="grid cursor-pointer grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 rounded-[inherit] px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
             <LabMark lab={model.lab} className="size-7" />
             <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} /></span>
             <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
             <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
             <span className="flex justify-end" onClick={event => event.stopPropagation()}>{action(model)}</span>
-            <ModelMenu onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
+            <ModelMenu model={model} onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
           </div>
           {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onAddDrafter={() => onAddDrafter(model)} /></div>}
         </div>
