@@ -353,6 +353,7 @@ fn prefill_specializations_on(
                     specialization
                         .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                         .with_param("DIRECT", direct)
+                        .with_param("KEYS", 8)
                 } else {
                     specialization
                 },

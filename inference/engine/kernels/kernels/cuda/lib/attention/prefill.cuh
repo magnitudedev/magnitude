@@ -556,22 +556,38 @@ __device__ __forceinline__ void put_row(u8 *tile, int row, int first, const floa
 // `counts` holds each query tile's partition count. Entries without key
 // partitions (a grid z extent of 1) pass null scratch.
 //
-// An index-list source (an entry defining ATTENTION_PICKS nonzero: its
-// KS > 0, `picked`) keeps its state in the partition after the key
-// partitions'.
-#ifndef ATTENTION_PICKS
-#define ATTENTION_PICKS 0
-#endif
-constexpr bool PICKS = ATTENTION_PICKS != 0;
 struct Split {
     float *partials;    // [parts][M][KV * G][W]
     float *statistics;  // [parts][M][KV * G][2]
     u32 *counts;        // [query tiles]
-    // The index-list source's state (PICKS), [M][KV * G][W] and
-    // [M][KV * G][2]. Every tile then publishes partials and the merge folds
-    // this state in.
-    float *picked_partials;
-    float *picked_statistics;
+};
+
+// An index-list source (an entry defining ATTENTION_PICKS, its KS picks a
+// row, nonzero): row `token`'s picks (`rows`, [M][KS] ordinals of the
+// selected plane, -1 for none) each name a selected vector (`selected`, a
+// slab plane [TS][KV][W] of the activation element), read as key and value.
+// `attend` scans a query tile's picks as one more span after the fresh span,
+// its tokens' lists in token order (key ordinal j * KS + pick is token j's
+// pick), so a staged tile of picked rows serves every query head of its
+// token, as history tiles serve the tile's.
+#ifndef ATTENTION_PICKS
+#define ATTENTION_PICKS 0
+#endif
+constexpr int PICK_COUNT = ATTENTION_PICKS;
+constexpr bool PICKS = PICK_COUNT > 0;
+struct Picked {
+    const int *rows;
+    u64 row_stride, pick_stride;
+    const u32 *selected;
+    u64 slab_rows, vector_stride, head_stride;
+
+    __device__ __forceinline__ int at(long long token, int pick) const {
+        return rows[static_cast<u64>(token) * row_stride + static_cast<u64>(pick) * pick_stride];
+    }
+    __device__ __forceinline__ const u8 *vector(int row, int kv) const {
+        return slab::row(selected, row, slab_rows, vector_stride * Act::bytes) +
+               static_cast<u64>(kv) * head_stride * Act::bytes;
+    }
 };
 
 // A prefill launch's WorkList selection (`indexer_select`'s per-row block
@@ -627,7 +643,7 @@ struct PrefillRows {
     }
 
     __device__ __forceinline__ void partitioned(Block block, int active) const {
-        if ((block.parts > 1 || PICKS) && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
+        if (block.parts > 1 && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
             split.counts[block.tile] = active;
     }
 
@@ -664,7 +680,7 @@ struct PrefillRows {
                                           float denominator) const {
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
-        if (active > 1 || PICKS) {
+        if (active > 1) {
             // A partition's partial: the output relative to its row maximum,
             // and (maximum, denominator).
             const u64 slot =
@@ -973,7 +989,8 @@ __device__ __forceinline__ void list(const Inputs &in, int *bases, int *lists, u
 
 template <class History, class Rows>
 __device__ __forceinline__ void attend(const Inputs &in, const History &history, const Rows &rows,
-                                       Block block, const Selection &selection = Selection{}) {
+                                       Block block, const Selection &selection = Selection{},
+                                       const Picked &picked = Picked{}) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
     constexpr bool CODED = History::CODED;
@@ -990,15 +1007,26 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 #endif
     static_assert(!INLINE || (W >= 128 && (W <= 256 || W == 512) && MMA_THREADS % KEYS == 0),
                   "inline decoding takes whole 16-byte pair rows and whole rows per thread group");
+    static_assert(!(PICKS && CODED), "picked rows are activation vectors");
     const int kv = block.kv;
     const long long first_token = static_cast<long long>(block.tile) * QT;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const int spans = static_cast<int>(SEISMIC_DIM_R);
+    // The key sequence's last span: the fresh span (index `spans`), or with
+    // an index-list source the tile's picks (index `spans` + 1), whose keys
+    // are pick ordinals.
+    const int last = spans + (PICKS ? 1 : 0);
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int g = lane / 4;
     const int t = lane % 4;
     const float query_scale = in.scale * LOG2E;
+    // Picks span key `ordinal`'s selected row: its token's pick, -1 for none.
+    auto pick_row = [&](int ordinal) {
+        constexpr int LIST = PICKS ? PICK_COUNT : 1;
+        const long long token = first_token + ordinal / LIST;
+        return token < rows_total ? picked.at(token, ordinal % LIST) : -1;
+    };
 
     extern __shared__ __align__(16) u8 shared[];
     // With Q_REGISTERS the query tile is staged in the K/V stages' region and
@@ -1024,8 +1052,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 #ifdef ATTENTION_AFFINE_HISTORY
     auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + (b % CODE_STAGES) * CODE_STAGE_BYTES; };
 #endif
-    int *table = reinterpret_cast<int *>(shared + REGION);  // [R + 1][4]
-    float *exchange = reinterpret_cast<float *>(table + (spans + 1) * 4);  // [WARPS * COLUMNS][W]
+    int *table = reinterpret_cast<int *>(shared + REGION);  // [last + 1][4]
+    float *exchange = reinterpret_cast<float *>(table + (last + 1) * 4);  // [WARPS * COLUMNS][W]
 
     if (warp < WARPS * COLUMNS)
         rows.stage_queries(in, history, q_tile, exchange, block, first_token, warp, lane);
@@ -1049,6 +1077,20 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         table[index * 4 + 2] = common_lo;
         table[index * 4 + 3] = common_hi;
     }
+    // The picks span: ordinals up to the tile's last named pick (an indexer
+    // pads a short list with -1), each key masked by its own pick, so it has
+    // no common interval.
+    if constexpr (PICKS) {
+        if (threadIdx.x == 0) {
+            table[last * 4 + 0] = table[last * 4 + 1] = 0;
+            table[last * 4 + 2] = table[last * 4 + 3] = 0;
+        }
+        __syncthreads();
+        int named = 0;
+        for (int ordinal = threadIdx.x; ordinal < QT * PICK_COUNT; ordinal += THREADS)
+            if (pick_row(ordinal) >= 0) named = ordinal + 1;
+        if (named > 0) atomicMax(&table[last * 4 + 1], named);
+    }
     __syncthreads();
 
     // The warp's query fragments (row block warp % WARPS, every 16-column
@@ -1071,9 +1113,9 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     }
 
     auto settle = [&](Tile tile) {
-        while (tile.span <= spans && tile.first >= table[tile.span * 4 + 1]) {
+        while (tile.span <= last && tile.first >= table[tile.span * 4 + 1]) {
             ++tile.span;
-            if (tile.span <= spans) tile.first = table[tile.span * 4 + 0];
+            if (tile.span <= last) tile.first = table[tile.span * 4 + 0];
         }
         return tile;
     };
@@ -1088,7 +1130,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     const bool listing = selection.words > 0;
     const int total_tiles = listing
         ? static_cast<int>(selection.listed[block.tile])
-        : static_cast<int>(reduce::span_total(static_cast<u64>(spans) + 1, span_tiles, lane));
+        : static_cast<int>(reduce::span_total(static_cast<u64>(last) + 1, span_tiles, lane));
     const int parts = block.parts;
     const int per = max(Rows::MIN_TILES, (total_tiles + parts - 1) / parts);
     const int active = max(1, (total_tiles + per - 1) / per);
@@ -1105,13 +1147,13 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // the span tiles; the whole warp calls it).
     auto nth = [&](int index) {
         if (listing) {
-            if (index >= total_tiles) return Tile{spans + 1, 0, index};
+            if (index >= total_tiles) return Tile{last + 1, 0, index};
             const int *entry = selection.lists + (static_cast<long long>(block.tile) * selection.capacity + index) * 2;
             return Tile{entry[0], entry[1], index};
         }
-        const reduce::Located at = reduce::span_locate(static_cast<u64>(spans) + 1, index, span_tiles, lane);
+        const reduce::Located at = reduce::span_locate(static_cast<u64>(last) + 1, index, span_tiles, lane);
         const int span = static_cast<int>(at.span);
-        if (span > spans) return Tile{spans + 1, 0};
+        if (span > last) return Tile{last + 1, 0};
         return Tile{span, table[span * 4 + 0] + (index - static_cast<int>(at.offset)) * KEYS};
     };
     // Fresh tile `tile` into operand stage b (the keys' piece, and with the
@@ -1121,6 +1163,26 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         rows.template stage_fresh<History>(in, k_tile(buffer), v_tile(buffer), tile.first,
                                            table[tile.span * 4 + 1], kv, piece, column0, thread,
                                            threads, exchange);
+    };
+    // Picks tile `tile` into operand stage b: its picks' selected vectors
+    // (zero for none or past the span), the keys' piece and with the last
+    // piece the values' window from column0, from the same vector.
+    auto stage_picked = [&](Tile tile, int buffer, int piece, int column0) {
+        const int end = table[tile.span * 4 + 1];
+        auto vector = [&](int r) -> const u8 * {
+            const int ordinal = tile.first + r;
+            const int row = ordinal < end ? pick_row(ordinal) : -1;
+            return row >= 0 ? picked.vector(row, kv) : nullptr;
+        };
+        stage_slab<F32_ACTIVATION, PIECE_CHUNKS>(k_tile(buffer), KEYS, [&](int r) -> const u8 * {
+            const u8 *at = vector(r);
+            return at != nullptr ? at + piece * PIECE * Act::bytes : nullptr;
+        }, threadIdx.x, MMA_THREADS);
+        if (piece + 1 < PIECES) return;
+        stage_slab<F32_ACTIVATION, WINDOW_CHUNKS>(v_tile(buffer), KEYS, [&](int r) -> const u8 * {
+            const u8 *at = vector(r);
+            return at != nullptr ? at + column0 * Act::bytes : nullptr;
+        }, threadIdx.x, MMA_THREADS);
     };
     // The unit after (tile, piece): the tile's next key piece, else the next
     // tile's first.
@@ -1285,10 +1347,17 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         }
         if (!computes) return;
 
+        const bool picks = PICKS && current.span > spans;
         if (current.span != cached_span) {
             cached_span = current.span;
-            interval_a = valid_a ? span(in, token_a, current.span, spans) : Span{0, 0};
-            interval_b = valid_b ? span(in, token_b, current.span, spans) : Span{0, 0};
+            // A row reads its own token's picks, each masked by its pick.
+            auto interval = [&](bool valid, long long token) {
+                if (!valid) return Span{0, 0};
+                const int own = static_cast<int>(token - first_token) * PICK_COUNT;
+                return picks ? Span{own, own + PICK_COUNT} : span(in, token, current.span, spans);
+            };
+            interval_a = interval(valid_a, token_a);
+            interval_b = interval(valid_b, token_b);
             raw_a = interval_a;
             raw_b = interval_b;
         }
@@ -1308,6 +1377,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     const int key = current.first + 8 * n + 2 * t + (e & 1);
                     const Span &interval = e < 2 ? interval_a : interval_b;
                     if (key < interval.lo || key >= interval.hi) {
+                        s[n][e] = NEG_INF;
+                    } else if (picks && pick_row(key) < 0) {
                         s[n][e] = NEG_INF;
                     } else if (listing &&
                                !selection.reads(e < 2 ? token_a : token_b, current.span, spans, key,
@@ -1406,6 +1477,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                         stage_history(history, k_tile(buffer), v_tile(buffer), tile.first,
                                       table[tile.span * 4 + 1], kv, tile_piece, column0);
                     }
+                } else if (PICKS && tile.span > spans) {
+                    stage_picked(tile, buffer, tile_piece, column0);
                 } else {
                     stage_fresh(tile, buffer, tile_piece, column0, threadIdx.x, MMA_THREADS);
                 }
@@ -1508,76 +1581,23 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
     const int query_head = static_cast<int>(blockIdx.y);
     const int column = static_cast<int>(threadIdx.x);
     const int count = static_cast<int>(split.counts[tile]);
-    if (count <= 1 && !PICKS) return;
+    if (count <= 1) return;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const u64 heads = KV * G;
     for (long long token = static_cast<long long>(tile) * QT;
          token < min(static_cast<long long>(tile + 1) * QT, rows_total); ++token) {
         const u64 slot = static_cast<u64>(token) * heads + query_head;
         float denominator, accumulated;
-        float maximum =
+        const float maximum =
             merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
                   split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
                   denominator, accumulated);
-        // The index-list source's state, after the key partitions'.
-        if (PICKS && split.picked_statistics[slot * 2 + 1] > 0.0f) {
-            const float picked = split.picked_statistics[slot * 2];
-            const float next = fmaxf(maximum, picked);
-            const float carry = seismic_ex2_approx(maximum - next);
-            const float weight = seismic_ex2_approx(picked - next);
-            denominator = __fmaf_rn(split.picked_statistics[slot * 2 + 1], weight, denominator * carry);
-            accumulated = __fmaf_rn(split.picked_partials[slot * W + column], weight, accumulated * carry);
-            maximum = next;
-        }
         element::put<Act>(gated,
                           static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                               static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
                               static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
                           attention::gated(in, token, query_head, column,
                                            accumulated / normalizer(in, query_head, maximum, denominator)));
-    }
-}
-
-// The index-list source (KS > 0): one warp per (row `row`, query head
-// `head`), after L1 put the queries in `queries` as `Ops` operands. Its
-// softmax state over the row's `picks` picks (`picks_at(pick)`, -1 for none;
-// each the kv head's vector `vector(picked)` of the source's plane, read as
-// key and value) at `scale` (the exp2 domain) is `split`'s picked state.
-template <class Ops, class Picks, class Vector>
-__device__ __forceinline__ void picked(const u16 *queries, const Split &split, Picks picks_at, int picks,
-                                       Vector vector, float scale, u64 row, int head, int lane) {
-    const u64 state = row * KV * G + head;
-    float q[DPL];
-    float accumulated[DPL];
-#pragma unroll
-    for (int d = 0; d < DPL; ++d) {
-        q[d] = Ops::value(queries[state * W + lane * DPL + d]);
-        accumulated[d] = 0.0f;
-    }
-    float maximum = -__int_as_float(0x7f800000);
-    float denominator = 0.0f;
-    for (int pick = 0; pick < picks; ++pick) {
-        const int at = picks_at(pick);
-        if (at < 0) continue;
-        float x[DPL];
-        element::span<Act, DPL, true>(vector(at, head / G), lane * DPL, x);
-        float dot = 0.0f;
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) dot = __fmaf_rn(q[d], x[d], dot);
-        const float score = seismic_warp_sum_f32(dot) * scale;
-        const float next = fmaxf(maximum, score);
-        const float carry = seismic_ex2_approx(maximum - next);
-        const float weight = seismic_ex2_approx(score - next);
-        denominator = __fmaf_rn(denominator, carry, weight);
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) accumulated[d] = __fmaf_rn(accumulated[d], carry, weight * x[d]);
-        maximum = next;
-    }
-#pragma unroll
-    for (int d = 0; d < DPL; ++d) split.picked_partials[state * W + lane * DPL + d] = accumulated[d];
-    if (lane == 0) {
-        split.picked_statistics[state * 2] = maximum;
-        split.picked_statistics[state * 2 + 1] = denominator;
     }
 }
 

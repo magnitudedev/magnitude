@@ -160,11 +160,10 @@ impl<'a, G: GraphDraft + 'a> Clone for DenseDecodeEntries<'a, G> {
 /// entry on `backend`. A shape of the base form
 /// (`AttentionShape::extends_base_form`) always does, so the decode entry's
 /// refusal of it stands. Where the decode declaration holds no form of an
-/// extended shape (CUDA's and Vulkan's, which declare neither rounded keys
-/// nor index-list picks: only `KR = KS = 0`), the prefill entry, tuned on
-/// those classes, attends them. A selected read's decode rows read the
-/// indexer's segments, which only the decode entry takes, so its refusal
-/// stands.
+/// extended shape (CUDA's, which declares none of the extended forms), the
+/// prefill entry, tuned on those classes, attends them. A selected read's
+/// decode rows read the indexer's segments, which only the decode entry
+/// takes, so its refusal stands.
 pub(crate) fn dense_decodes(
     backend: seismic::BackendName,
     binding: AttentionBinding,
@@ -2429,9 +2428,10 @@ mod tests {
 
     /// DeepSeek V4.1's window attention (64 query heads over one 512-wide
     /// head, adjacent trailing pairs turned back) decodes through the decode
-    /// entry on Metal (its matrix form, in head groups of 8) and on CPU, as
-    /// a Qwen-shaped layer does; CUDA's and Vulkan's decode entries hold
-    /// none of the new forms, so both attend them with their prefill entries.
+    /// entry on Metal (its matrix form, in head groups of 8), on Vulkan (its
+    /// matrix form, the queries from its prepare launch) and on CPU, as a
+    /// Qwen-shaped layer does; CUDA's decode entry holds none of the new
+    /// forms, so CUDA attends them with its prefill entry.
     #[test]
     fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
@@ -2505,12 +2505,13 @@ mod tests {
         assert!(decodes(BackendName::Metal, v41));
         assert!(decodes(BackendName::Cpu, v41));
         assert!(decodes(BackendName::Metal, qwen));
+        assert!(decodes(BackendName::Vulkan, v41));
         assert!(!decodes(BackendName::Cuda, v41));
         assert!(decodes(BackendName::Cuda, qwen));
         // Each new form alone (a key norm without a query norm, adjacent
-        // pairs, trailing pairs, the output rotary, V4.1's own): CUDA's and
-        // Vulkan's decode entries declare none of them and their prefill
-        // entries all of them.
+        // pairs, trailing pairs, the output rotary, V4.1's own): CUDA's
+        // decode entry declares none of them and its prefill entry all of
+        // them; Vulkan's and CPU's entries declare all of them.
         let holds = |backend, shape: AttentionShape| {
             // The prefill's block and listing axes at one block, unlisted.
             let mut statics = shape.dense_mix_statics();
@@ -2553,9 +2554,8 @@ mod tests {
             assert_eq!(holds(backend, qwen), (true, true), "{backend:?}");
         }
         for form in forms {
-            for backend in [BackendName::Cuda, BackendName::Vulkan] {
-                assert_eq!(holds(backend, form), (false, true), "{backend:?} {form:?}");
-            }
+            assert_eq!(holds(BackendName::Cuda, form), (false, true), "{form:?}");
+            assert_eq!(holds(BackendName::Vulkan, form), (true, true), "{form:?}");
             assert_eq!(holds(BackendName::Cpu, form), (true, true), "{form:?}");
         }
     }

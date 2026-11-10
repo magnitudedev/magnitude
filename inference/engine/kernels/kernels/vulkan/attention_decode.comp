@@ -29,16 +29,35 @@
 // The grouped-query matrix form: the prefill body's L2 over decode rows
 // (`lib/attention/prefill.glsl`, PREFILL_DECODE), 16 matrix rows per
 // subgroup; history tiles are staged as f16 and the products are cooperative
-// matrices.
+// matrices. A group whose prepared queries exceed the shared bytes takes
+// them, and its fresh rows, from the prefill's L1 (PREFILL_PREPARED,
+// `attention_decode_prepare`).
 #define PREFILL_DECODE
 #define PREFILL_ROWS (16u * uint(SEISMIC_TUNE_SIMDS))
 #define PREFILL_PARTS uint(SEISMIC_TUNE_PARTS)
+#define PREFILL_PREPARED (SEISMIC_STATIC_G * (2 * SEISMIC_STATIC_P + SEISMIC_STATIC_S) * 2 > 32768)
+// A row's index-list picks (KS > 0), the last key tiles of its sequence.
+#define PREFILL_PICKS (SEISMIC_DIM_KS != 0)
+#define PREFILL_PICK_ROWS SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS)
+#define PREFILL_PICK_COUNT uint(SEISMIC_DIM_KS)
+#define PREFILL_PICK_PLANE SEISMIC_PTR(SEISMIC_BUFFER_SELECTED)
+#define PREFILL_PICK_SLAB_ROWS uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS)
 #include "lib/attention/prefill.glsl"
 
-void attention_decode_partial() {
-    prefill_attend(attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
-        prefill_scratch(0ul, 0ul, 0ul, 0ul));
+attention_history decode_history() {
+    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
 }
+
+// L1's planes (`attention_decode_prepare`, which runs only where
+// PREFILL_PREPARED): the queries, the fresh keys and values.
+prefill_scratch decode_scratch() {
+    return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), 0ul);
+}
+
+void attention_decode_prepare() { prefill_prepare(decode_history(), decode_scratch()); }
+
+void attention_decode_partial() { prefill_attend(decode_history(), decode_scratch()); }
 
 void attention_decode_merge() { prefill_decode_merge(); }
 
@@ -235,4 +254,14 @@ void attention_decode_merge() {
         gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
 
+// The vector form holds no group too wide for its shared bytes (its `where`),
+// so its specializations never launch L1.
+void attention_decode_prepare() {}
+
 #endif
+
+void attention_decode_rotate() {
+    attention_rotate_output(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+        ATTENTION_AMPLITUDE_BUFFER);
+}

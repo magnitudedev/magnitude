@@ -67,5 +67,9 @@ void attention_prefill_picks() {
         uint(SEISMIC_DIM_KS), SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS));
 }
 void attention_prefill_merge() { prefill_merge(prefill_scratch_planes(), prefill_picked_planes()); }
-void attention_prefill_rotate() { prefill_rotate(); }
+void attention_prefill_rotate() {
+    attention_rotate_output(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+        ATTENTION_AMPLITUDE_BUFFER);
+}
 void attention_prefill_list() { prefill_list(); }

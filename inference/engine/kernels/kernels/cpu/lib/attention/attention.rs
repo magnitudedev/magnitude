@@ -506,41 +506,64 @@ impl Online<'_> {
         mut load_key: impl FnMut(usize, &mut [f32]),
         mut load_value: impl FnMut(usize, &mut [f32]),
     ) {
-        let g = self.maximum.len();
-        let w = row.len();
         let mut first = 0;
         while first < count {
             let n = BLOCK.min(count - first);
             for j in 0..n {
                 load_key(first + j, row);
-                for head in 0..g {
-                    scores[head * BLOCK + j] = reduce::dot(&queries[head * w..][..w], row) * scale;
-                }
+                score(self.maximum.len(), queries, scale, row, scores, j);
             }
-            for head in 0..g {
-                let scores = &mut scores[head * BLOCK..][..n];
-                let next = self.maximum[head].max(reduce::max(scores));
-                for score in scores.iter_mut() {
-                    *score = math::exp(*score - next);
-                }
-                let carry = math::exp(self.maximum[head] - next);
-                self.denominator[head] = self.denominator[head].mul_add(carry, reduce::sum(scores));
-                for value in &mut self.accumulator[head * w..][..w] {
-                    *value *= carry;
-                }
-                self.maximum[head] = next;
-            }
-            for j in 0..n {
-                load_value(first + j, row);
-                for head in 0..g {
-                    let weight = scores[head * BLOCK + j];
-                    for (value, v) in self.accumulator[head * w..][..w].iter_mut().zip(row.iter()) {
-                        *value = weight.mul_add(*v, *value);
-                    }
-                }
-            }
+            self.absorb_scored(scores, n, row, |j, out| load_value(first + j, out));
             first += n;
         }
+    }
+
+    /// Absorbs a block of `n` keys whose scores are in `scores` (G * BLOCK,
+    /// key j of head h at h * BLOCK + j): the online-softmax update, then
+    /// value j (`load_value(j, out)`, F32 into `row`) into each head's
+    /// output in key order.
+    #[inline(always)]
+    pub fn absorb_scored(
+        &mut self,
+        scores: &mut [f32],
+        n: usize,
+        row: &mut [f32],
+        mut load_value: impl FnMut(usize, &mut [f32]),
+    ) {
+        let g = self.maximum.len();
+        let w = row.len();
+        for head in 0..g {
+            let scores = &mut scores[head * BLOCK..][..n];
+            let next = self.maximum[head].max(reduce::max(scores));
+            for score in scores.iter_mut() {
+                *score = math::exp(*score - next);
+            }
+            let carry = math::exp(self.maximum[head] - next);
+            self.denominator[head] = self.denominator[head].mul_add(carry, reduce::sum(scores));
+            for value in &mut self.accumulator[head * w..][..w] {
+                *value *= carry;
+            }
+            self.maximum[head] = next;
+        }
+        for j in 0..n {
+            load_value(j, row);
+            for head in 0..g {
+                let weight = scores[head * BLOCK + j];
+                for (value, v) in self.accumulator[head * w..][..w].iter_mut().zip(row.iter()) {
+                    *value = weight.mul_add(*v, *value);
+                }
+            }
+        }
+    }
+}
+
+/// Key `j`'s scores against the `g` `queries` [G][W] (`row` holding it),
+/// scaled, into `scores` at head * BLOCK + j.
+#[inline(always)]
+fn score(g: usize, queries: &[f32], scale: f32, row: &[f32], scores: &mut [f32], j: usize) {
+    let w = row.len();
+    for head in 0..g {
+        scores[head * BLOCK + j] = reduce::dot(&queries[head * w..][..w], row) * scale;
     }
 }
 
@@ -780,7 +803,11 @@ mod affine_neon {
 /// Absorbs the part `range` of a row's key sequence (its admitted history
 /// `spans`, then its `fresh` span) into `state`: history rows through
 /// `history_key(token, out)` / `history_value(token, out)`, fresh rows through
-/// `fresh_key(token, out)` / `fresh_value(token, out)`. `scores` holds G *
+/// `fresh_key(token, out)` / `fresh_value(token, out)`. The keys `selected`
+/// reads absorb in blocks of BLOCK consecutive ones from the range's start,
+/// history and fresh alike: a key's block, and so the row's reduction order,
+/// depends on its position alone, never on which keys are still fresh (how
+/// many rows share the launch) or where its spans fall. `scores` holds G *
 /// BLOCK values, `row` W.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -799,26 +826,33 @@ pub fn attend_rows(
     mut fresh_key: impl FnMut(usize, &mut [f32]),
     mut fresh_value: impl FnMut(usize, &mut [f32]),
 ) {
-    walk(spans, fresh, range, selected, |keys, first, count| match keys {
-        Keys::History => state.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| history_key(first + j, out),
-            |j, out| history_value(first + j, out),
-        ),
-        Keys::Fresh => state.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| fresh_key(first + j, out),
-            |j, out| fresh_value(first + j, out),
-        ),
+    // The block's keys so far: where each lives.
+    let mut pending = [(Keys::History, 0usize); BLOCK];
+    let mut n = 0;
+    walk(spans, fresh, range, selected, |keys, first, count| {
+        for token in first..first + count {
+            match keys {
+                Keys::History => history_key(token, row),
+                Keys::Fresh => fresh_key(token, row),
+            }
+            score(state.maximum.len(), queries, scale, row, scores, n);
+            pending[n] = (keys, token);
+            n += 1;
+            if n == BLOCK {
+                state.absorb_scored(scores, n, row, |j, out| match pending[j] {
+                    (Keys::History, token) => history_value(token, out),
+                    (Keys::Fresh, token) => fresh_value(token, out),
+                });
+                n = 0;
+            }
+        }
     });
+    if n > 0 {
+        state.absorb_scored(scores, n, row, |j, out| match pending[j] {
+            (Keys::History, token) => history_value(token, out),
+            (Keys::Fresh, token) => fresh_value(token, out),
+        });
+    }
 }
 
 /// Absorbs a row's index-list picks (`selected_rows`, -1 for none), each

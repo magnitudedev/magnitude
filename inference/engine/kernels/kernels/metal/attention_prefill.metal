@@ -19,15 +19,11 @@
 // The worklist scratch: the query tiles' (span, first) lists, their counts,
 // then the rows' span ordinals.
 #define PREFILL_LIST_TILES uint((SEISMIC_DIM_M + SEISMIC_TUNE_QT - 1) / SEISMIC_TUNE_QT)
-// The attend grid's key partitions (its z extent, attention.seismic). An
-// index-list source's state (KS > 0) is the partition after them: the
-// partials and statistics scratch hold one more partition's records there.
+// The attend grid's key partitions (its z extent, attention.seismic).
 #define PREFILL_PARTS_DIVISOR                                                                              \
     (PREFILL_LIST_TILES * uint(SEISMIC_DIM_KV) * ((ATTENTION_QUERY_GROUP + SEISMIC_TUNE_HEADS - 1) / SEISMIC_TUNE_HEADS))
 #define PREFILL_PARTS                                                                                      \
     metal::max(1u, uint((uint(SEISMIC_TUNE_SPLIT_GROUPS) + PREFILL_PARTS_DIVISOR - 1) / PREFILL_PARTS_DIVISOR))
-#define PREFILL_PICKED(records, width)                                                                     \
-    ((records) + ulong(PREFILL_PARTS) * SEISMIC_DIM_M * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP * (width))
 #define PREFILL_WORKLIST(selection, worklist)                                                              \
     attention::prefill_selection{selection,                                                                \
         (worklist) + ulong(PREFILL_LIST_TILES) * PREFILL_LIST_CAPACITY * 2 + PREFILL_LIST_TILES,          \
@@ -40,7 +36,9 @@
 #error "prefill attention stages 2-byte activations in threadgroup memory"
 #endif
 
-// The three launches over dense history (bodies in lib/attention/attention.h).
+// The launches over dense history (bodies in lib/attention/attention.h). A
+// layer with picks (KS > 0) runs prepare, which only appends the rows, then
+// the shared-tile launch; the others prepare, attend, merge and rotate.
 
 kernel void attention_prefill_prepare(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
@@ -67,7 +65,8 @@ kernel void attention_prefill_prepare(
         attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
+        int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1 || SEISMIC_DIM_KS != 0,
         group, simd, lane, attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
         uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)));
 }
@@ -104,7 +103,7 @@ kernel void attention_prefill_attend(
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
-        PREFILL_WORKLIST(selection, worklist), sinks, SEISMIC_DIM_KS != 0);
+        PREFILL_WORKLIST(selection, worklist), sinks);
 }
 
 kernel void attention_prefill_merge(
@@ -121,27 +120,56 @@ kernel void attention_prefill_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
-        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
-        SEISMIC_DIM_KS != 0, PREFILL_PICKED(partials, ATTENTION_W), PREFILL_PICKED(statistics, 2));
+        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
-// The index-list source (KS > 0, `attention::prefill_picked`): threadgroup
-// (row, query head), one simdgroup, after L1 prepared the queries; its state
-// is the partition after the key partitions' (`PREFILL_PICKED`).
-kernel void attention_prefill_picks(
+// A layer with picks (KS > 0): threadgroup (kv head, row), the shared-tile
+// form of `attention_decode` (`attention::decode_shared`) over the row's
+// whole key sequence (its visible keys, its fresh keys prepared in place,
+// then its KS picks gathered into KEYS-key tiles), all G query heads of the
+// kv head as the rows of its products, publishing the finished row itself:
+// the output rotary (RO = 1) and the gate, after prepare appended every row.
+kernel void attention_prefill_shared(
+    device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
+    device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const attention::Scalar *key [[buffer(SEISMIC_BUFFER_KEY)]],
+    device const attention::Scalar *value [[buffer(SEISMIC_BUFFER_VALUE)]],
+    device const float *query_norm [[buffer(SEISMIC_BUFFER_QUERY_NORM)]],
+    device const float *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],
+    device const float *value_norm [[buffer(SEISMIC_BUFFER_VALUE_NORM)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
+    device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
+    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
+    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
     device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
     device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
-    device const attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
-    device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
+    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup uchar *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+#if SEISMIC_STATIC_KS != 0
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::prefill_picked(queries, selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS),
-        PREFILL_PICKED(partials, ATTENTION_W), PREFILL_PICKED(statistics, 2), SEISMIC_DIM_KS,
-        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, group.x, group.y, lane);
+    attention::decode_shared<SEISMIC_TUNE_KEYS, 1, SEISMIC_DIM_KS, true, SEISMIC_DIM_RO != 0>(
+        attention::dense_history{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
+        rotary_amplitudes, coordinates, visible, fresh, nullptr, nullptr, shared, SEISMIC_DIM_R,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, 1,
+        group.x, 0, group.y, thread_index, simd, lane,
+        attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)},
+        attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
+            uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)),
+        attention::shared_result{query, gate, sinks, result, SEISMIC_PARAM_GATE_FUNCTION != 0});
+#endif
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

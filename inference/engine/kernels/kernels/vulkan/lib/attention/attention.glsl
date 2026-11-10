@@ -454,3 +454,27 @@ void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint
         (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column, head);
     attention_store_gated(query, gate, result, row, head, column, attended);
 }
+
+// The output rotary (RO = 1), after every query head's output is stored in
+// `result` ([rows][KV * G][W] activations): workgroup (row, query head),
+// invocation `pair` turns its pair of the published row back by the row's
+// negated angles (the portable `output_rotary`), in F32, and publishes it
+// again. Every attention entry with the output rotary launches it last.
+void attention_rotate_output(uint64_t result, uint64_t coordinates, uint64_t components, uint64_t frequencies,
+    uint64_t amplitudes) {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t head = gl_WorkGroupID.y;
+    const uint pair = gl_LocalInvocationIndex;
+    if (pair >= ATTENTION_P)
+        return;
+    float cosine, sine;
+    rotary_turn(coordinates + row * 16ul, 1ul, components, 1ul, frequencies, 1ul, amplitudes, 1ul, pair, cosine, sine);
+    const rotary_layout pairs = ATTENTION_ROTARY;
+    const uint lo = rotary_leading(pair, pairs);
+    const uint hi = rotary_partner(lo, pairs.p, pairs.first, pairs.adjacent);
+    const uint64_t row_at = (row * uint64_t(ATTENTION_KV * ATTENTION_G) + head) * ATTENTION_W;
+    const float low = element_at(ELEMENT_ACT, result, row_at + lo);
+    const float high = element_at(ELEMENT_ACT, result, row_at + hi);
+    element_put(ELEMENT_ACT, result, row_at + lo, low * cosine + high * sine);
+    element_put(ELEMENT_ACT, result, row_at + hi, high * cosine - low * sine);
+}
