@@ -4,7 +4,7 @@ import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol"
 import { INFERENCE_PLANNER_BUNDLE, inferenceExecutablePath } from "@magnitudedev/release"
 import { currentHost, hostById } from "@magnitudedev/release/targets"
 import { Schema } from "effect"
-import { buildInferenceBinary, INFERENCE_ROOT } from "./compile"
+import { buildInferenceBinary, INFERENCE_ROOT, type InferenceBuildProfile } from "./compile"
 import { installationEnvironment } from "./smoke"
 
 /** The development installation, laid out exactly as a release installation. */
@@ -32,6 +32,8 @@ const run = async (command: readonly string[], diagnostics: "all" | "errors"): P
 export interface BuildLocalInferenceOptions {
   /** Print successful build diagnostics, or retain them only for a failed build. */
   readonly diagnostics?: "all" | "errors"
+  /** The incremental debug build, or the optimized build a release ships. */
+  readonly profile?: InferenceBuildProfile
 }
 
 /**
@@ -41,11 +43,12 @@ export interface BuildLocalInferenceOptions {
  */
 export const buildLocalInference = async ({
   diagnostics = "all",
+  profile = "development",
 }: BuildLocalInferenceOptions = {}): Promise<{ readonly installationPath: string }> => {
   const host = hostById(currentHost())
   await run(["bun", "run", "catalog:build-bundle"], diagnostics)
-  console.log(`[dev] Building the inference service for ${host.id}...`)
-  const build = await buildInferenceBinary({ host, profile: "development", diagnostics })
+  console.log(`[dev] Building the ${profile} inference service for ${host.id}...`)
+  const build = await buildInferenceBinary({ host, profile, diagnostics })
   const target = resolve(INFERENCE_ROOT, "target")
   const staging = await mkdtemp(resolve(target, ".development-"))
   try {
@@ -77,14 +80,14 @@ export const buildLocalInference = async ({
 }
 
 if (import.meta.main) {
-  const result = await buildLocalInference()
+  const result = await buildLocalInference({ profile: process.argv.includes("--release") ? "release" : "development" })
   if (process.argv.includes("--serve")) {
     const child = Bun.spawn([
       resolve(DEVELOPMENT_INSTALLATION, inferenceExecutablePath(hostById(currentHost()))),
       "serve",
       "--installation",
       result.installationPath,
-      ...process.argv.slice(2).filter((argument) => argument !== "--serve"),
+      ...process.argv.slice(2).filter((argument) => argument !== "--serve" && argument !== "--release"),
     ], {
       cwd: INFERENCE_ROOT,
       env: installationEnvironment(DEVELOPMENT_INSTALLATION),
