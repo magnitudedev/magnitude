@@ -530,15 +530,19 @@ native rows_topk for metal from "metal/rows_topk.metal":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((256 + 8 + 4) * 4)
 
-# CUDA: Metal's form, a block of 256 threads per row.
+# CUDA: Metal's form at a block of 1024 threads per row, each walk over the
+# row a chunk of 8192 ordinals at a time with every thread's 8 loads issued
+# together, so a decode row's select is a few rounds of loads, not one load a
+# step (V4.1's K 512 of 8192 at 256 threads walking one ordinal at a time:
+# 64.4 us on an RTX 3090).
 native rows_topk for cuda from "cuda/rows_topk.cu":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
         threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((256 + 8 + 4) * 4)
+        threads_per_threadgroup (1024, 1, 1)
+        shared_bytes ((256 + 32 + 4) * 4)
 
-# Vulkan: CUDA's form, a workgroup of 256 invocations per row.
+# Vulkan: Metal's form, a workgroup of 256 invocations per row.
 native rows_topk for vulkan from "vulkan/rows_topk.comp":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
@@ -686,21 +690,27 @@ native candidate_rows for cpu from "cpu/candidate_rows.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: a thread per row, walking its picked blocks and its spans once, as
-# the CPU native does.
+# Metal: a threadgroup of 256 threads per row: the taken units are [0, X)
+# and the picked blocks, owned as ranges by the picks' threads, cut at the
+# list spans (their offsets scanned into scratch) and placed by a scan.
 native candidate_rows for metal from "metal/candidate_rows.metal":
+    scratch offsets bytes (M * (R + 1) * 4)
     launch candidate_rows:
-        threadgroups (ceil_div(M, 64), 1, 1)
-        threads_per_threadgroup (64, 1, 1)
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
-# CUDA: as Metal, a thread per row.
+# CUDA: as Metal, a block of 256 threads per row.
 native candidate_rows for cuda from "cuda/candidate_rows.cu":
+    scratch offsets bytes (M * (R + 1) * 4)
     launch candidate_rows:
-        threadgroups (ceil_div(M, 64), 1, 1)
-        threads_per_threadgroup (64, 1, 1)
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: as CUDA, an invocation per row.
+# Vulkan: as Metal, a workgroup of 256 invocations per row; group memory the
+# scans' subgroup sums and X.
 native candidate_rows for vulkan from "vulkan/candidate_rows.comp":
+    scratch offsets bytes (M * (R + 1) * 4)
     launch candidate_rows:
-        threadgroups (ceil_div(M, 64), 1, 1)
-        threads_per_threadgroup (64, 1, 1)
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((8 + 2) * 4)

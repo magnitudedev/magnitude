@@ -26,7 +26,7 @@ template <uint ROWS, uint LANES> constexpr uint output_tile() {
 // The product packets each simdgroup stages at once (`project_channels`).
 template <uint LANES> constexpr uint output_stage() {
     constexpr uint COLUMNS = uint(SEISMIC_DIM_F) > uint(SEISMIC_DIM_S) ? uint(SEISMIC_DIM_F) : uint(SEISMIC_DIM_S);
-    return stage_packets<uint(SEISMIC_DIM_K) + 1u, LANES, (COLUMNS + 31u) / 32u>();
+    return stage_packets<uint(SEISMIC_DIM_K) + 1u, LANES, (COLUMNS + 31u) / 32u, false>();
 }
 
 // Each simdgroup's region of the projections in threadgroup memory, in

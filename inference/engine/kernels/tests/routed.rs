@@ -2595,16 +2595,6 @@ fn native_decode_expand_and_output_match_reference_rows(
         let [gate_scale, up_scale] = block.routed.expansion_scales(device);
         for (index, mapping) in mappings.iter().enumerate() {
             let output_mapping = output_mapping(device, index, mapping);
-            // Metal's output reads a row's features in at most eight lane
-            // passes: wider experts admit fewer rows per threadgroup.
-            let value = |name| output_mapping.iter().find(|(key, _)| *key == name).map(|(_, v)| *v);
-            if let (seismic::BackendName::Metal, Some(rows_per_group), Some(lanes)) =
-                (device.backend(), value("ROWS"), value("LANES"))
-            {
-                if f.max(s).div_ceil(32 * lanes) * rows_per_group > 8 {
-                    continue;
-                }
-            }
             let label =
                 format!("rows {rows} mapping {mapping:?} output {output_mapping:?} INT8 {int8}");
             let statics = [("H", h), ("K", k), ("F", f), ("S", s)];
@@ -2618,6 +2608,19 @@ fn native_decode_expand_and_output_match_reference_rows(
             if is_cpu(device) {
                 specialization = specialization.with_param("INT8", u64::from(int8));
                 output_specialization = output_specialization.with_param("INT8", u64::from(int8));
+            }
+            let output_elements = || routed_output::Elements {
+                A: seismic::Element::bf16(),
+                EDW: block.expert_down.element(),
+                SDW: block.shared_down.element(),
+            };
+            // A mapping the output's declaration does not admit at these
+            // statics (a wider expert admits fewer rows per threadgroup).
+            if !routed_output::native_entry_with(output_elements())
+                .specialization_valid(&device, &output_specialization)
+                .unwrap()
+            {
+                continue;
             }
             let expanded = routed_expand::native_for_device_with(
                 &device,
@@ -2660,16 +2663,8 @@ fn native_decode_expand_and_output_match_reference_rows(
                 2e-3,
                 |_| 0.0,
             );
-            let output_native = routed_output::native_for_device_with(
-                &device,
-                routed_output::Elements {
-                    A: seismic::Element::bf16(),
-                    EDW: block.expert_down.element(),
-                    SDW: block.shared_down.element(),
-                },
-                &output_specialization,
-            )
-            .unwrap();
+            let output_native =
+                routed_output::native_for_device_with(&device, output_elements(), &output_specialization).unwrap();
             let output = |sources: &seismic::Tensor, scores: &seismic::Tensor, expert_down: &seismic::Tensor| {
                 let value = output_native
                     .call(routed_output::Args {
@@ -7024,3 +7019,133 @@ fn dead_host(death: &str) -> ! {
     }
 }
 
+
+/// The time of `routed_select_streamed` on Metal at DeepSeek V4.1 Flash's
+/// decode shape: one row (M = 1) over its 5120-wide residual, a BF16 router
+/// of 384 experts and BF16 norms (as its GGUF binds them), top 6 by
+/// sqrt-softplus. Three launches as a step encodes them: a whole group's
+/// layer whose next layer holds every expert (no leads; the resident load),
+/// a whole group's layer with both leads' hints (AHEAD 2), and a streamed
+/// layer with both leads, every expert absent (each choice resolved absent
+/// and requested). SIMDGROUPS stays at its default 8: each launch is timed
+/// as the default of its own survey, every parameter fixed, the formed
+/// default its only program. It prints each one's median device seconds a
+/// call and, as context, the rate at which it reads its routers.
+#[test]
+#[ignore = "times routed_select_streamed at V4.1's decode shape on Metal; run it by name under a timed hold"]
+fn routed_select_streamed_at_deepseek_v41_decode_shape_times() {
+    let Some(device) = streaming_device().filter(|device| device.backend() == seismic::BackendName::Metal) else {
+        return;
+    };
+    let (h, e, k, m) = (5120u64, 384u64, 6u64, 1u64);
+    let choices = m * k;
+    let bf16 = seismic::Element::bf16();
+    let f32 = seismic::Element::f32();
+    let elements = || routed_select_streamed::Elements { NW: bf16, RNW: bf16, RW: bf16, A: bf16 };
+    let entry = routed_select_streamed::native_entry_with(elements());
+    let table = SlotTable::file(FLIGHT, choices);
+    let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&device, element, shape).unwrap();
+    let words = |shape: &[u64]| shared_i32(&device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
+    let residual = f32_tensor(&device, &[m, h], &(0..h).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect::<Vec<_>>());
+    let router = |seed: u64| {
+        let values = (0..e * h).map(|i| (((i * 2654435761 + seed) % 1009) as f32 - 504.0) / 5040.0).collect::<Vec<_>>();
+        bf16_tensor(&device, &[e, h], &values)
+    };
+    let ones = bf16_tensor(&device, &[h], &vec![1.0; h as usize]);
+    let routers = [router(1), router(2), router(3)];
+    let map = shared_i32(&device, &[e, constants::MAP_WORDS], &map_words(&vec![(-1, 0, 0); e as usize]));
+    let tier = seismic::Tensor::words(&device, seismic::Element::i32(), &[e]).unwrap();
+    (0..e).for_each(|expert| tier.store_release(expert * 4, u32::MAX).unwrap());
+    let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64));
+    for (name, whole, ahead) in [("whole, no leads", 1, 0u64), ("whole, AHEAD 2", 1, 2), ("streamed, AHEAD 2", 0, 2)] {
+        let policy = shared_i32(&device, &[constants::POLICY_WORDS], &policy_words(whole, 0, [0; 3]));
+        // The next layer resolved exactly when no lead is launched.
+        let next_policy = shared_i32(&device, &[constants::POLICY_WORDS], &policy_words(i32::from(ahead == 0), 0, [0; 3]));
+        let statics = [("H", h), ("E", e), ("K", k), ("ES", 0), ("AHEAD", ahead), ("EN", e), ("TM", e)];
+        let implementation = entry.offered(&device).unwrap().unwrap();
+        let configuration = implementation
+            .statics
+            .iter()
+            .fold(seismic::NativeSpecialization::new(), |specialization, name| {
+                let (_, value) = statics.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
+                specialization.with_static(name.clone(), *value)
+            })
+            .with_param("SIMDGROUPS", 8);
+        let mut routes = zeros(seismic::Element::i32(), &[m, k]);
+        let mut weights = zeros(f32, &[m, k]);
+        let mut file = words(&table.extents());
+        let mut grids = zeros(seismic::Element::i32(), &[constants::DECODE_GRIDS, 3]);
+        let mut sources = zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]);
+        let mut rings = zeros(seismic::Element::i32(), &[ahead, constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * choices]);
+        let mut routing = words(&[FLIGHT, constants::RING_EXPERTS + 2 * choices]);
+        let biases = [zeros(f32, &[e]), zeros(f32, &[e]), zeros(f32, &[e])];
+        let expert_scale = zeros(f32, &[0]);
+        let point = seismic::TuningPoint {
+            label: "m1".into(),
+            weight: 1.0,
+            class: None,
+            cost: 1.0,
+            workload: seismic::WorkloadRotation::All,
+            rotation: vec![routed_select_streamed::Args {
+                residual: &residual,
+                norm: &ones,
+                router_norm: &ones,
+                router: &routers[0],
+                bias: &biases[0],
+                expert_scale: &expert_scale,
+                routes: &mut routes,
+                weights: &mut weights,
+                epsilon: 1e-6,
+                score: 2,
+                normalization: 1,
+                normalization_epsilon: 1e-6,
+                scale: 1.0,
+                map: &map,
+                tier: &tier,
+                policy: &policy,
+                sited: 0,
+                step: &step,
+                file: &mut file,
+                grids: &mut grids,
+                sources: &mut sources,
+                next_router_norm: &ones,
+                next_router: &routers[1],
+                next_bias: &biases[1],
+                after_router_norm: &ones,
+                after_router: &routers[2],
+                after_bias: &biases[2],
+                next_policy: &next_policy,
+                rings: &mut rings,
+                routing: &mut routing,
+            }],
+            initialize: None,
+            written: Default::default(),
+        };
+        let result = routed_select_streamed::native_tune_with(
+            &device,
+            elements(),
+            &configuration,
+            vec![point],
+            tuning_requirement(),
+            seismic::Strategy::Survey(seismic::SurveyPlan {
+                samples: 15,
+                min_sample_seconds: 0.001,
+                domains: Default::default(),
+            }),
+        )
+        .unwrap();
+        let [record] = &result.configurations[..] else {
+            panic!("{name}: a fixed configuration surveys itself alone");
+        };
+        let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+            panic!("{name}: the default is measured");
+        };
+        let median = points[0].median_seconds;
+        let bytes = (1 + ahead) * e * h * 2;
+        println!(
+            "routed_select_streamed v41 m1 {name}: {:.1} us a call; {bytes} router bytes at {:.1} GB/s",
+            median * 1e6,
+            bytes as f64 / median / 1e9
+        );
+    }
+}

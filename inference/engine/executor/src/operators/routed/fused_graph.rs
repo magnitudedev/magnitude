@@ -1095,8 +1095,9 @@ mod tests {
     use super::*;
     use seismic::{BackendName, Layout};
 
-    /// A down projection wider than the Metal kernel's register budget
-    /// admits (`ceil_div(F, 32 * LANES) * ROWS <= 8`: at most 8,192) is
+    /// A down projection the Metal kernel's defaults cannot hold within its
+    /// register budget (`routed_down`'s `where` in `routed.seismic`: at K 2,
+    /// F 16,384, ROWS 2 LANES 16 hold 16 weight packets a lane, past 8) is
     /// outside the kernel's domain, and graph construction names the call.
     #[test]
     fn a_call_outside_its_kernel_domain_fails_graph_construction() {

@@ -18,9 +18,16 @@ template <uint ROWS, uint LANES> constexpr uint down_tile() {
     return (32u / LANES) * ROWS;
 }
 
-// The product packets each simdgroup stages at once (`project_channels`).
+// The product packets each simdgroup stages at once (`project_channels`),
+// at 16 lanes too where the includer defines ROUTED_DOWN_STAGES_AT_16
+// (`routed_down`).
 template <uint LANES> constexpr uint down_stage() {
-    return stage_packets<uint(SEISMIC_DIM_K), LANES, (uint(SEISMIC_DIM_F) + 31u) / 32u>();
+#ifdef ROUTED_DOWN_STAGES_AT_16
+    constexpr bool AT_16 = true;
+#else
+    constexpr bool AT_16 = false;
+#endif
+    return stage_packets<uint(SEISMIC_DIM_K), LANES, (uint(SEISMIC_DIM_F) + 31u) / 32u, AT_16>();
 }
 
 // Each simdgroup's region of the projections in threadgroup memory, in

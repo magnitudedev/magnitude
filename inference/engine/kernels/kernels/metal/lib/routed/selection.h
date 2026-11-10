@@ -11,7 +11,10 @@
 //   select_columns: SIMDGROUPS logit columns of the decode rows over a
 //     router norm and router (`routing::Gemv`).
 //   select_row: one row's choices by one simdgroup (`select::rank`), their
-//     normalization and scales into `routes` and `weights`.
+//     normalization and scales into `routes` and `weights`, from logits a
+//     launch's earlier stores (`device const float *`) or its own
+//     threadgroups' (`arrive::coherent_device<float>`, read by the last to
+//     arrive).
 
 #include "router.h"
 #include "select.h"
@@ -46,7 +49,7 @@ inline void publish_normalized(device const float *residual, device const uchar 
 // of EXPERTS experts: the entry's own by default).
 template <uint EXPERTS = uint(SEISMIC_DIM_E)>
 inline void select_columns(device const float *residual, device const uchar *router_norm, ulong router_norm0,
-    device const uchar *router, device float *logits, threadgroup const float *inverses, uint group,
+    device const uchar *router, arrive::coherent_device<float> logits, threadgroup const float *inverses, uint group,
     threadgroup uchar *shared, constant ulong *seismic_words, uint simd, uint lane) {
     const uint k = uint(SEISMIC_DIM_H);
     const routing::Rows<RouterNorm> in{residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, router_norm,
@@ -58,7 +61,8 @@ inline void select_columns(device const float *residual, device const uchar *rou
 }
 
 // One row's selection by one simdgroup, stored by lane 0.
-inline void select_row(ulong row, device const float *logits, device const float *bias,
+template <typename Logits>
+inline void select_row(ulong row, Logits logits, device const float *bias,
     device const float *expert_scale, device int *routes, device float *weights, constant ulong *seismic_words,
     uint lane) {
     constexpr uint K = SEISMIC_DIM_K;

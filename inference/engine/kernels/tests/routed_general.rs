@@ -1603,21 +1603,30 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     }
 }
 
-/// The mapping of `routed_down` beside decode mapping `index` for experts of
-/// `features` columns: Metal tiles its channels itself (ROWS channels per
-/// lane group of LANES lanes, at most 8 weight packets per lane); elsewhere
+/// The mapping of `routed_down` beside decode mapping `index` at `statics`:
+/// Metal tiles its channels itself (ROWS channels per lane group of LANES
+/// lanes), from the configurations its declaration admits there; elsewhere
 /// the expansion's mapping.
 fn down_mapping(
     device: &seismic::Device,
     index: usize,
     mapping: &[(&'static str, u64)],
-    features: usize,
+    statics: &[(&str, usize)],
 ) -> Vec<(&'static str, u64)> {
     match device.backend() {
         seismic::BackendName::Metal => {
+            let bf16 = seismic::Element::bf16();
+            let entry = routed_down::native_entry_with(routed_down::Elements {
+                A: bf16,
+                EDW: bf16,
+                R: seismic::Element::f32(),
+            });
             let admissible = [(2u64, 16u64), (4, 32), (1, 16), (8, 16), (1, 32)]
                 .into_iter()
-                .filter(|(rows, lanes)| (features as u64).div_ceil(32 * lanes) * rows <= 8)
+                .filter(|&(rows, lanes)| {
+                    let candidate = specialization(device, statics, &[("ROWS", rows), ("LANES", lanes)]);
+                    entry.specialization_valid(device, &candidate).unwrap()
+                })
                 .collect::<Vec<_>>();
             let (rows, lanes) = admissible[index % admissible.len()];
             vec![("ROWS", rows), ("LANES", lanes)]
@@ -1994,7 +2003,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                 let (no_tier_gate, no_tier_up, no_tier_down) =
                     (experts.gate.as_ref().map(no_tier), no_tier(&experts.up), no_tier(&experts.down));
                 for (index, mapping) in decode_mappings(device).into_iter().enumerate() {
-                    let down = down_mapping(device, index, &mapping, f);
+                    let down = down_mapping(device, index, &mapping, &statics);
                     for int8 in arithmetic_variants(device) {
                         let label = format!(
                             "{:?} {} rows {m} {mapping:?} down {down:?} INT8 {int8}",

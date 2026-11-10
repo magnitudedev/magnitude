@@ -429,20 +429,26 @@ fn decode_output_join[M, H, SN, IN, K, SF, R](residual: &tensor[M, SN * H] f32,
 # Metal: the K choices and the shared expert project side by side, one
 # simdgroup each, over a tile of (32 / LANES) * ROWS output channels; each
 # lane group of LANES lanes owns ROWS channels and issues all their packet
-# loads at once, against the product row: read straight into registers at 16
-# or 32 lanes, below 16 staged once a simdgroup in threadgroup memory for its
-# lane groups to share. LANES sets each projection's summation order (so it is
-# arithmetic); down to 4 lanes, a short down row still keeps several loads
-# in flight a lane. The projections meet in threadgroup memory, and one
-# thread per channel carries the slot-order sum. A lane holds
-# ROWS * ceil(F / (32 LANES)) weight packets in registers (at most 8: more
-# spill). (CUDA: the mma16
+# loads at once, against the product row: read straight into registers, or
+# staged once a simdgroup in threadgroup memory for its lane groups to share
+# (`routed::stage_packets`: below 16 lanes, a simdgroup's share of 16 KB,
+# 256 / SIMDGROUPS packets of 64 bytes, at most the row). LANES sets each
+# projection's summation order (so it is arithmetic); down to 4 lanes, a
+# short down row still keeps several loads in flight a lane. The projections
+# meet in threadgroup memory, and one thread per channel carries the
+# slot-order sum. A lane holds ROWS * ceil_div(PACKETS, LANES) weight
+# packets in registers, PACKETS the row's or, where staged, the stage's; the
+# `where` of each decode down projection (`routed_output`, `routed_down` and
+# their `_project` forms) admits at most 8, as more spill: natural
+# expressions have no comparisons, so `1 - min(1, LANES / 16)` reads
+# LANES < 16, `min(1, LANES / 16) - LANES / 32` LANES == 16, and
+# `min(1, X / 3)` X > 2. (CUDA: the mma16
 # swap-AB GEMV per choice in slot order.)
 native routed_output for metal from "metal/routed_output.metal":
     static (H, SN, IN, K, F, S)
     params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
-    where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
+    where K < 32 and ROWS * ceil_div(ceil_div(max(F, S), 32) - (1 - min(1, LANES / 16)) * (ceil_div(max(F, S), 32) - min(ceil_div(max(F, S), 32), 256 / (K + 1))), LANES) <= 8
     launch routed_output when XS > 0:
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
@@ -1035,7 +1041,8 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
 # register with an excluded entry), then takes K single-argmax rounds over
 # the lane heads (the single-pass top-K).
 # Metal's GEMV is `routed_route`'s (`metal/lib/routed/router.h`): the K1 GEMV
-# body over the router input each threadgroup stages; its GEMM is
+# body over the router input each threadgroup stages, whose last threadgroup
+# to arrive selects (decode rows take one launch); its GEMM is
 # `routed_route`'s tiles (`metal/lib/routed/logits.h`).
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K, ES)
@@ -1043,6 +1050,7 @@ native routed_select for metal from "metal/routed_select.metal":
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
+    scratch arrivals bytes (4) sync when M <= DECODE_ROWS
     launch routed_select_stage when M > DECODE_ROWS:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1053,7 +1061,7 @@ native routed_select for metal from "metal/routed_select.metal":
     launch routed_select_gemm when M > DECODE_ROWS:
         threadgroups (ceil_div(E, 32), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch routed_select_select:
+    launch routed_select_select when M > DECODE_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -1541,12 +1549,14 @@ native routed_up for cpu from "cpu/routed_up.rs":
 # output channels per threadgroup; the projections meet in threadgroup
 # memory, and one thread per channel carries the slot-order sum. (CUDA: the
 # storing lane carries each channel's running sum across the choices in
-# registers.)
+# registers.) Metal stages at 16 lanes too, past 2 packets a lane
+# (`routed::stage_packets`), and admits a call only where its defaults
+# (ROWS 2 LANES 16) hold, so a call they cannot serve is outside its domain.
 native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
     params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
-    where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
+    where K <= 32 and ROWS * ceil_div(ceil_div(F, 32) - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * min(1, ceil_div(ceil_div(F, 32), LANES) / 3)) * (ceil_div(F, 32) - min(ceil_div(F, 32), 256 / K)), LANES) <= 8 and 2 * ceil_div(ceil_div(F, 32) - min(1, ceil_div(ceil_div(F, 32), 16) / 3) * (ceil_div(F, 32) - min(ceil_div(F, 32), 256 / K)), 16) <= 8
     launch routed_down when XS > 0:
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         unless (policy[POLICY_WHOLE])

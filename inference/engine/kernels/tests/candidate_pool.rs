@@ -307,3 +307,61 @@ fn candidate_pool_matches_the_masked_top_k() {
     check(&Case::new(65_536, 2048, 8, 512, &[65_536, 30_001, 16_385, 9_000, 400], 0, 5), "v4.1 continuous");
     check(&Case::new(20_000, 2048, 8, 512, &[20_000, 16_390], 3, 6), "v4.1 three levels");
 }
+
+/// The time of `candidate_rows` on Metal at DeepSeek V4.1 Flash's decode
+/// shape as its producing layer serves it: one row (M = 1), its pool of
+/// B = 2048 blocks of BU = 8 units filled to K = 512, over a list of one
+/// span (R = 1). Two contexts: 2048 units, whose 256 blocks are all picked
+/// (`rows_topk` takes every block of a row with at most B, then -1), and
+/// 32768 units, 2048 of whose 4096 blocks are picked, every other one, so
+/// each block is its own entry (the most entries B picks make). The entry
+/// has no parameter: each context is timed as the default of its own
+/// survey, the formed default its only program. It prints each one's
+/// median device seconds a call.
+#[test]
+#[ignore = "times candidate_rows at V4.1's decode shape on Metal; run it by name under a timed hold"]
+fn candidate_rows_at_deepseek_v41_decode_shape_times() {
+    let Some(device) = offering(&candidate_rows::native_entry())
+        .into_iter()
+        .find(|device| device.backend() == seismic::BackendName::Metal)
+    else {
+        return;
+    };
+    let (b, bu, k) = (2048usize, 8usize, 512usize);
+    for (units, stride) in [(2048usize, 1usize), (32768, 2)] {
+        let picked = (0..b).map(|pick| pick * stride).take_while(|block| block * bu < units);
+        let picks = picked.map(|block| block as i32).chain(std::iter::repeat(-1)).take(b).collect::<Vec<_>>();
+        let blocks = ints(&device, &[1, b as u64], &picks);
+        let spans = ints(&device, &[1, 1, 2], &[0, units as i32]);
+        let form = Tensor::from_host(&device, Element::i32(), &[0, bu as u64, k as u64], &[]).unwrap();
+        let point = seismic::TuningPoint {
+            label: "m1".into(),
+            weight: 1.0,
+            class: None,
+            cost: 1.0,
+            workload: seismic::WorkloadRotation::All,
+            rotation: vec![candidate_rows::Args { blocks: &blocks, spans: &spans, form: &form }],
+            initialize: None,
+            written: Default::default(),
+        };
+        let result = candidate_rows::native_tune(
+            &device,
+            &seismic::NativeSpecialization::new(),
+            vec![point],
+            seismic::NumericalRequirement::BitExact,
+            seismic::Strategy::Survey(seismic::SurveyPlan {
+                samples: 15,
+                min_sample_seconds: 0.001,
+                domains: Default::default(),
+            }),
+        )
+        .unwrap();
+        let [record] = &result.configurations[..] else {
+            panic!("candidate_rows c{units}: a fixed configuration surveys itself alone");
+        };
+        let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+            panic!("candidate_rows c{units}: the default is measured");
+        };
+        println!("candidate_rows v41 m1 c{units}: {:.1} us a call", points[0].median_seconds * 1e6);
+    }
+}
