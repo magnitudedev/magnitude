@@ -2648,11 +2648,18 @@ pub struct NativeGraphResourceTemplate {
 /// combination of its listed dimension values. A regime's classes are the
 /// union of its slices, so correlated dimensions (slots bounded by rows) are
 /// fixed together per slice. Every slice of a regime names the same
-/// dimensions.
+/// dimensions. A dimension's values are a set, held ascending and distinct:
+/// a value listed twice adds no class, and every combination is formed
+/// once.
 #[derive(Clone, Debug, Default)]
 pub struct NativeGraphClassSlice {
     dimensions: Vec<(&'static str, Vec<u64>)>,
     scoped: Vec<(&'static str, &'static str, Vec<u64>)>,
+}
+
+/// `values` ascending, each once.
+fn distinct(values: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    values.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect()
 }
 
 impl NativeGraphClassSlice {
@@ -2662,7 +2669,7 @@ impl NativeGraphClassSlice {
 
     /// The values of a class dimension for every node that declares it.
     pub fn dimension(mut self, name: &'static str, values: impl IntoIterator<Item = u64>) -> Self {
-        self.dimensions.push((name, values.into_iter().collect()));
+        self.dimensions.push((name, distinct(values)));
         self
     }
 
@@ -2675,8 +2682,7 @@ impl NativeGraphClassSlice {
         name: &'static str,
         values: impl IntoIterator<Item = u64>,
     ) -> Self {
-        self.scoped
-            .push((scope, name, values.into_iter().collect()));
+        self.scoped.push((scope, name, distinct(values)));
         self
     }
 

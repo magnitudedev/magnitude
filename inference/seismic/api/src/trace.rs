@@ -166,15 +166,40 @@ pub(crate) struct Guard {
     relation: Relation,
     right: Expr,
     held: bool,
+    /// The facts its sides read, ascending: a class it is checked at varies
+    /// only these.
+    reads: Vec<usize>,
 }
 
 impl Guard {
+    fn new(left: Expr, relation: Relation, right: Expr, held: bool) -> Self {
+        let mut reads = Vec::new();
+        fact_reads(&left, &mut reads);
+        fact_reads(&right, &mut reads);
+        reads.sort_unstable();
+        reads.dedup();
+        Self { left, relation, right, held, reads }
+    }
+
     /// Whether the branch goes the same way at `facts`: both sides evaluate
     /// and compare as they did.
     fn holds(&self, facts: &[u64]) -> bool {
         match (self.left.evaluate(facts), self.right.evaluate(facts)) {
             (Some(left), Some(right)) => self.relation.holds(left, right) == self.held,
             _ => false,
+        }
+    }
+}
+
+/// The facts `expr` reads, appended to `reads`.
+fn fact_reads(expr: &Expr, reads: &mut Vec<usize>) {
+    match expr {
+        Expr::Constant(_) => {}
+        Expr::Fact(index) => reads.push(*index),
+        Expr::Apply(application) => {
+            let (_, left, right) = &**application;
+            fact_reads(left, reads);
+            fact_reads(right, reads);
         }
     }
 }
@@ -337,7 +362,7 @@ impl Dim {
     fn compare(&self, relation: Relation, right: &Self) -> bool {
         let held = relation.holds(self.value, right.value);
         if let Some(recording) = Self::recording(self, right) {
-            recording.guard(Guard { left: self.expression(), relation, right: right.expression(), held });
+            recording.guard(Guard::new(self.expression(), relation, right.expression(), held));
         }
         held
     }
@@ -821,51 +846,90 @@ pub struct ClassFact {
     pub dimension: &'static str,
 }
 
-/// Every point of `facts` the classes of `slices` take: `facts` with each
-/// class fact at each value its slice gives it, over every combination
-/// within a slice (a slice fixes correlated dimensions together).
-///
-/// # Panics
-///
-/// Where a slice gives a class fact no values: the family names a class
-/// dimension its slices do not vary.
-fn class_points(facts: &[u64], classes: &[ClassFact], slices: &[NativeGraphClassSlice]) -> Vec<Vec<u64>> {
-    let mut points = vec![facts.to_vec()];
-    for slice in slices {
-        let lists = classes
+/// The classes of a slice set at a model: its `facts`, and for each slice
+/// the values each class fact takes there (a slice fixes
+/// correlated dimensions together; of class facts naming one fact, the last
+/// gives its value, as it is the last written). A class point is `facts`
+/// with each class fact at one of its slice's values, over every
+/// combination within a slice; a guard is checked only over the class facts
+/// it reads ([`Guard::reads`]), so a branch that reads one class varies only
+/// that class, and the combinations of the classes it does not read, which
+/// cannot change its outcome, are never formed.
+struct ClassPoints {
+    facts: Vec<u64>,
+    slices: Vec<Vec<(usize, Vec<u64>)>>,
+}
+
+impl ClassPoints {
+    /// # Panics
+    ///
+    /// Where a slice gives a class fact no values: the family names a class
+    /// dimension its slices do not vary.
+    fn of(facts: &[u64], classes: &[ClassFact], slices: &[NativeGraphClassSlice]) -> Self {
+        let slices = slices
             .iter()
-            .map(|class| {
-                slice.class_values(class.scope, class.dimension).unwrap_or_else(|| {
-                    panic!("class fact {class:?} names a dimension its slices do not vary")
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut digits = vec![0; classes.len()];
-        'combinations: loop {
-            let mut point = facts.to_vec();
-            for ((class, values), &digit) in classes.iter().zip(&lists).zip(&digits) {
-                point[class.fact] = values[digit];
-            }
-            if !points.contains(&point) {
-                points.push(point);
-            }
-            for (digit, values) in digits.iter_mut().zip(&lists) {
-                *digit += 1;
-                if *digit < values.len() {
-                    continue 'combinations;
+            .map(|slice| {
+                let mut varying: Vec<(usize, Vec<u64>)> = Vec::with_capacity(classes.len());
+                for class in classes {
+                    let values = slice.class_values(class.scope, class.dimension).unwrap_or_else(|| {
+                        panic!("class fact {class:?} names a dimension its slices do not vary")
+                    });
+                    assert!(!values.is_empty(), "class fact {class:?} takes no values in a slice");
+                    let values = values.to_vec();
+                    match varying.iter_mut().find(|(fact, _)| *fact == class.fact) {
+                        Some(entry) => entry.1 = values,
+                        None => varying.push((class.fact, values)),
+                    }
                 }
-                *digit = 0;
-            }
-            break;
-        }
+                varying
+            })
+            .collect();
+        Self { facts: facts.to_vec(), slices }
     }
-    points
+
+    /// A point at which `guard` does not go the way it went, if any: the
+    /// model's own facts, then each slice's combinations of the class facts
+    /// the guard reads.
+    fn failure(&self, guard: &Guard) -> Option<Vec<u64>> {
+        if !guard.holds(&self.facts) {
+            return Some(self.facts.clone());
+        }
+        let mut point = self.facts.clone();
+        for slice in &self.slices {
+            let read = slice
+                .iter()
+                .filter(|(fact, _)| guard.reads.binary_search(fact).is_ok())
+                .collect::<Vec<_>>();
+            if read.is_empty() {
+                continue;
+            }
+            let mut digits = vec![0; read.len()];
+            'combinations: loop {
+                for ((fact, values), &digit) in read.iter().zip(&digits) {
+                    point[*fact] = values[digit];
+                }
+                if !guard.holds(&point) {
+                    return Some(point);
+                }
+                for (digit, (_, values)) in digits.iter_mut().zip(&read) {
+                    *digit += 1;
+                    if *digit < values.len() {
+                        continue 'combinations;
+                    }
+                    *digit = 0;
+                }
+                break;
+            }
+            point.copy_from_slice(&self.facts);
+        }
+        None
+    }
 }
 
 impl<X: TraceOutput> Trace<X> {
     /// Whether every branch its builder took goes the same way at every
     /// point of `points`.
-    fn holds_at(&self, points: &[Vec<u64>]) -> bool {
+    fn holds_at(&self, points: &ClassPoints) -> bool {
         first_failure(&self.guards, points).is_none()
     }
 
@@ -877,7 +941,7 @@ impl<X: TraceOutput> Trace<X> {
     /// Where one does not: the family certifies one template over classes
     /// its builder builds differently, so it must split them (by its key or
     /// its slices).
-    fn assert_holds_at(&self, points: &[Vec<u64>]) {
+    fn assert_holds_at(&self, points: &ClassPoints) {
         assert_branches_hold(&self.guards, points);
     }
 }
@@ -889,7 +953,7 @@ fn answer_from<X: TraceOutput>(
     known: &[(Arc<Trace<X>>, std::cell::OnceCell<Option<Answer<X::Value>>>)],
     facts: &[u64],
     reals: &Reals,
-    points: &[Vec<u64>],
+    points: &ClassPoints,
     slices: &[NativeGraphClassSlice],
 ) -> Option<Result<(NativeGraphOutline, X::Value), NativeGraphMetadataError>> {
     known.iter().find_map(|(trace, answer)| {
@@ -901,21 +965,17 @@ fn answer_from<X: TraceOutput>(
     })
 }
 
-/// The first of `guards` that fails at a point of `points`, and the point.
-fn first_failure<'g>(guards: &'g [Guard], points: &[Vec<u64>]) -> Option<(&'g Guard, Vec<u64>)> {
-    guards.iter().find_map(|guard| {
-        points
-            .iter()
-            .find(|point| !guard.holds(point))
-            .map(|point| (guard, point.clone()))
-    })
+/// The first of `guards` that fails at a class point of `points`, and the
+/// point.
+fn first_failure<'g>(guards: &'g [Guard], points: &ClassPoints) -> Option<(&'g Guard, Vec<u64>)> {
+    guards.iter().find_map(|guard| points.failure(guard).map(|point| (guard, point)))
 }
 
 /// # Panics
 ///
 /// Where a guard fails at a point of `points`: a template certified over
 /// classes its builder branches between.
-fn assert_branches_hold(guards: &[Guard], points: &[Vec<u64>]) {
+fn assert_branches_hold(guards: &[Guard], points: &ClassPoints) {
     if let Some((guard, point)) = first_failure(guards, points) {
         panic!("a template is certified over classes its builder branches between: {guard:?} fails at {point:?}");
     }
@@ -952,7 +1012,7 @@ impl<K: Clone + Eq + Hash, X: TraceOutput> NativeGraphTraces<K, X> {
             .collect();
         let mut outlines = Vec::with_capacity(slice_sets.len());
         for slices in slice_sets {
-            let points = class_points(facts, classes, slices);
+            let points = ClassPoints::of(facts, classes, slices);
             if let Some(outline) = answer_from(&known, facts, reals, &points, slices) {
                 outlines.push(outline.map_err(E::from)?);
                 continue;
@@ -991,7 +1051,7 @@ impl<K: Clone + Eq + Hash, X: TraceOutput> NativeGraphTraces<K, X> {
     ) -> Result<(Vec<NativeGraphLayout>, X::Value), E> {
         let trace = Trace::record(key, facts, reals, record)?;
         for slices in slice_sets {
-            trace.assert_holds_at(&class_points(facts, classes, slices));
+            trace.assert_holds_at(&ClassPoints::of(facts, classes, slices));
         }
         let points = trace
             .template
@@ -1083,22 +1143,59 @@ mod tests {
     #[test]
     fn class_guards_hold_at_every_class_of_the_slices() {
         let step = chunked(1);
-        let points = class_points(&[64, 1], &ROWS, &rows(&[1, 2, 4, 8, 16]));
-        assert_eq!(points.len(), 5);
+        let points = ClassPoints::of(&[64, 1], &ROWS, &rows(&[1, 2, 4, 8, 16]));
+        assert_eq!(points.slices, vec![vec![(1, vec![1, 2, 4, 8, 16])]]);
         assert!(first_failure(&step, &points).is_none());
         // Every class of a later model's slices on the same side answers.
-        assert!(first_failure(&step, &class_points(&[96, 2], &ROWS, &rows(&[2, 16]))).is_none());
+        assert!(first_failure(&step, &ClassPoints::of(&[96, 2], &ROWS, &rows(&[2, 16]))).is_none());
         // A slice set reaching 17 rows does not, nor a model past the width.
-        assert!(first_failure(&step, &class_points(&[64, 1], &ROWS, &rows(&[1, 16, 32]))).is_some());
-        assert!(first_failure(&step, &class_points(&[256, 1], &ROWS, &rows(&[1]))).is_some());
+        assert!(first_failure(&step, &ClassPoints::of(&[64, 1], &ROWS, &rows(&[1, 16, 32]))).is_some());
+        assert!(first_failure(&step, &ClassPoints::of(&[256, 1], &ROWS, &rows(&[1]))).is_some());
         let chunks = chunked(32);
-        assert!(first_failure(&chunks, &class_points(&[64, 32], &ROWS, &rows(&[17, 512]))).is_none());
+        assert!(first_failure(&chunks, &ClassPoints::of(&[64, 32], &ROWS, &rows(&[17, 512]))).is_none());
+    }
+
+    /// A guard varies only the classes it reads: a slice's other classes,
+    /// however many values they take, are never combined with them, and a
+    /// class value listed twice is one class.
+    #[test]
+    fn a_guard_is_checked_over_the_classes_it_reads_alone() {
+        let recording = Rc::new(Recording::default());
+        let width = Dim::fact(0, 64, &recording);
+        let segments = Dim::fact(2, 4, &recording);
+        let slots = Dim::fact(3, 2, &recording);
+        let _ = segments.at_most(width.clone());
+        let _ = (segments.clone() * slots).at_most(width);
+        recording.finished.set(true);
+        let guards = recording.guards.take();
+        assert_eq!([guards[0].reads.as_slice(), guards[1].reads.as_slice()], [&[0, 2][..], &[0, 2, 3][..]]);
+        let classes = [
+            ClassFact { fact: 1, scope: None, dimension: "rows" },
+            ClassFact { fact: 2, scope: None, dimension: "segments" },
+            ClassFact { fact: 3, scope: None, dimension: "slots" },
+        ];
+        let many = (1..=4096).collect::<Vec<_>>();
+        let slice = |segments: &[u64], slots: &[u64]| {
+            NativeGraphClassSlice::new()
+                .dimension("rows", many.clone())
+                .dimension("segments", segments.to_vec())
+                .dimension("slots", slots.to_vec())
+        };
+        // Segments listed once per slot count: each distinct value once.
+        let points = ClassPoints::of(&[64, 1, 4, 2], &classes, &[slice(&[1, 4, 1, 4], &[1, 2, 1, 2])]);
+        assert_eq!(points.slices[0][1..], [(2, vec![1, 4]), (3, vec![1, 2])]);
+        assert!(first_failure(&guards, &points).is_none());
+        // Within a slice, the classes a guard reads are combined: 64
+        // segments with 2 slots exceed the width.
+        let points = ClassPoints::of(&[64, 1, 4, 2], &classes, &[slice(&[1, 64], &[1, 2])]);
+        let (failed, point) = first_failure(&guards, &points).expect("64 segments at 2 slots exceed 64");
+        assert_eq!((failed.reads.as_slice(), &point[2..]), (&[0, 2, 3][..], &[64, 2][..]));
     }
 
     #[test]
     #[should_panic(expected = "branches between")]
     fn a_template_over_classes_its_builder_branches_between_is_refused() {
-        assert_branches_hold(&chunked(1), &class_points(&[64, 1], &ROWS, &rows(&[1, 16, 32])));
+        assert_branches_hold(&chunked(1), &ClassPoints::of(&[64, 1], &ROWS, &rows(&[1, 16, 32])));
     }
 
     #[test]
