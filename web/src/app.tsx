@@ -56,6 +56,8 @@ import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
 import { ModelsScreen } from "./components/models/models-screen"
 import { Explore } from "./components/models/explore"
+import { OnboardingScreen } from "./components/models/onboarding-screen"
+import { useRecommendations } from "./components/models/recommendations"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -79,10 +81,11 @@ function ModelsPage() {
   const query = Option.getOrElse(linkedQuery, () => explore.query)
   const unified = Result.isSuccess(hardware) && hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
   const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
+  const recommendations = useRecommendations(false, unified)
   const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").map(model => String(model.modelId)) : [])
   return <>
     <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
-    <Explore open={open} query={query} unified={unified} machine={machine} recommended={[]} families={[]} owned={owned}
+    <Explore open={open} query={query} unified={unified} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} families={recommendations.families} owned={owned}
       setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
   </>
@@ -378,7 +381,7 @@ export function App() {
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  if (page === "onboarding") return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><div /></>
+  if (page === "onboarding") return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><OnboardingScreen /></>
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {page === "settings" ? <SettingsPage observation={observation} />
       : service?._tag === "Unreachable" ? <CannotReachMagnitude />

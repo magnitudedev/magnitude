@@ -1,8 +1,10 @@
 import { Option } from "effect"
-import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
+import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
 import { labForDeveloper } from "../model-logo"
 import { quantBits } from "./parts"
 import type { DiscoveredModel } from "./onboarding"
+import type { OfferedModel } from "./expanding-model"
+import type { RunnableFamily } from "./explore-modal"
 import type { OwnedModel, UnrunnableFile } from "./your-models"
 import type { PlacementPhrase, PlacementTier, QuantView } from "./view"
 
@@ -20,10 +22,10 @@ const repositoryOf = (model: LocalModel): string | null => {
     const [form, owner, repo] = model.modelId.split(/[:/]/)
     return form === "hf" && owner && repo ? `${owner}/${repo}` : null
   }
-  const url = model.presentation.sourceUrls.find(source => source.startsWith("https://huggingface.co/"))
-  const [owner, repo] = url ? new URL(url).pathname.split("/").filter(Boolean) : []
-  return owner && repo ? `${owner}/${repo}` : null
+  return model.catalogData.quant.repository
 }
+
+const quantNameOf = (model: LocalModel): string => model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel
 
 const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
   model.servingState._tag === "Assessed" ? model.servingState.assessment : null
@@ -69,7 +71,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
 
 /** A model on this computer as a quant this machine runs. */
 export const quantOf = (model: LocalModel, unified: boolean): QuantView =>
-  quantView({ key: model.modelId, name: model.presentation.variantLabel, repository: repositoryOf(model), sizeBytes: model.storageBytes, downloadBytes: model.storageBytes }, assessmentOf(model), unified)
+  quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes: model.storageBytes, downloadBytes: model.storageBytes }, assessmentOf(model), unified)
 
 const directoryOf = (path: string) => path.replace(/[\\/][^\\/]*$/, "")
 
@@ -85,8 +87,8 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
     const recommended = Option.getOrNull(model.recommendedDrafter)
     return recommended ? { method: Option.match(recommended.method, { onNone: () => recommended.label, onSome: method => methodName[method._tag] }), sizeBytes: recommended.sizeBytes, attached: false } : null
   }
-  if (model.servingState._tag !== "Assessed" || model.drafterWithheld) return null
-  return Option.match(model.servingState.speculativeMethod, { onNone: () => null, onSome: method => ({ method: methodName[method._tag], sizeBytes: null, attached: true }) })
+  if (model.drafterWithheld) return null
+  return Option.match(model.catalogData.drafter, { onNone: () => null, onSome: drafter => ({ method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes, attached: true }) })
 }
 
 /** A model on this computer as the Your models list shows it. */
@@ -134,3 +136,31 @@ export const unrunnableFile = (model: UnsupportedLocalModel): UnrunnableFile => 
     reason: architecture && "architecture" in architecture ? `${architecture.architecture} architecture` : model.detail,
   }
 }
+
+/** A recommended tested model as an offered model: its ladder's rungs as this machine would run them, the chosen one marked. */
+export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, unified: boolean): OfferedModel | null => {
+  const rungs = recommendation.rungs.flatMap(id => { const model = models.get(id); return model ? [model] : [] })
+  const first = rungs[0]
+  if (!first || first._tag !== "Catalog") return null
+  const drafter = Option.getOrNull(first.catalogData.drafter)
+  const assessment = rungs.map(assessmentOf).find(entry => entry?._tag === "Fits")
+  return {
+    key: recommendation.base,
+    catalog: true,
+    name: recommendation.name,
+    lab: labForDeveloper(recommendation.developer.lab),
+    country: recommendation.developer.country,
+    fineTuneOf: null,
+    drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
+    contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
+    quants: rungs.map(model => ({ ...quantOf(model, unified), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) })),
+    recommended: Option.getOrNull(recommendation.chosen),
+  }
+}
+
+/** A family Magnitude runs, for the "What runs in Magnitude" list. */
+export const runnableFamily = (family: LocalModelFamily): RunnableFamily => ({
+  lab: labForDeveloper(family.developer.lab),
+  models: family.name,
+  comingSoon: family.status === "ComingSoon",
+})

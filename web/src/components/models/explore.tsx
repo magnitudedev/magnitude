@@ -2,8 +2,8 @@ import { useEffect, useState } from "react"
 import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { DownloadSimpleIcon } from "@phosphor-icons/react"
-import type { HuggingFaceRepositoryId, HuggingFaceSearchResult } from "@magnitudedev/sdk"
-import { formatStorageSize, useAgentClient } from "@magnitudedev/client-common"
+import type { CatalogFormModelId, HuggingFaceRepositoryId, HuggingFaceSearchResult } from "@magnitudedev/sdk"
+import { formatStorageSize, useAgentClient, useLocalModelMutations } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
 import { quantView } from "./data"
@@ -47,6 +47,7 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified:
     const first = members.flatMap(member => Option.toArray(member.recommended))[0]
     return {
       key,
+      catalog: false,
       name: base && base.relation === "Quantized" ? base.repository.split("/").pop() ?? lead.displayName : lead.displayName,
       lab: developer ? labForDeveloper(developer.lab) : undefined,
       country: developer?.country ?? null,
@@ -75,7 +76,10 @@ interface ExploreProps {
 function useDownload() {
   const client = useAgentClient()
   const add = useAtomSet(client.Models.AddHuggingFaceModel)
-  return (quant: QuantView) => quant.repository === null ? null : <Button disabled={!quant.fits} onClick={() => add({
+  const { install } = useLocalModelMutations()
+  return (model: OfferedModel, quant: QuantView) => model.catalog
+    ? <Button disabled={!quant.fits} onClick={() => install(quant.key as CatalogFormModelId)}><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</Button>
+    : quant.repository === null ? null : <Button disabled={!quant.fits} onClick={() => add({
     repository: quant.repository as HuggingFaceRepositoryId,
     revision: Option.none(),
     version: Option.some(quant.name),
@@ -92,7 +96,7 @@ function Searched({ settled, props }: { settled: string; props: ExploreProps }) 
   const results: ExploreResults = props.query.trim() !== settled || Result.isInitial(search) || search.waiting ? { _tag: "Searching" }
     : Result.isFailure(search) ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
     : { _tag: "Results", ...offeredFromSearch(search.value.results, props.unified) }
-  return <ExploreModal {...props} results={results} download={(_, quant) => download(quant)} />
+  return <ExploreModal {...props} results={results} download={download} />
 }
 
 /** The Explore models modal on the service's data: Hugging Face search, and the recommendations it is given. */
@@ -100,6 +104,6 @@ export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
   const download = useDownload()
   return settled === ""
-    ? <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine }} download={(_, quant) => download(quant)} />
+    ? <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine }} download={download} />
     : <Searched settled={settled} props={props} />
 }

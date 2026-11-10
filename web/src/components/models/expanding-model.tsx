@@ -6,6 +6,7 @@ import type { QuantView } from "./view"
 /** A model offered for download: its quant ladder, the rung chosen for this machine, and what it pairs with. */
 export interface OfferedModel {
   readonly key: string
+  readonly catalog: boolean
   readonly name: string
   readonly lab: ModelLab | undefined
   readonly country: string | null
