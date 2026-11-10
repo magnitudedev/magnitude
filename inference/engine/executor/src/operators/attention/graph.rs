@@ -2431,7 +2431,7 @@ mod tests {
     /// head, adjacent trailing pairs turned back) decodes through the decode
     /// entry on Metal (its matrix form, in head groups of 8) and on CPU, as
     /// a Qwen-shaped layer does; CUDA's and Vulkan's decode entries hold
-    /// none of the new forms, so CUDA attends them with its prefill entry.
+    /// none of the new forms, so both attend them with their prefill entries.
     #[test]
     fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
@@ -2507,10 +2507,10 @@ mod tests {
         assert!(decodes(BackendName::Metal, qwen));
         assert!(!decodes(BackendName::Cuda, v41));
         assert!(decodes(BackendName::Cuda, qwen));
-        // Each new form alone (a query norm without a key norm, adjacent
-        // pairs, trailing pairs, the output rotary, V4.1's own): CUDA's
-        // decode entry declares none of them and its prefill entry all of
-        // them; Vulkan's mix entries declare none.
+        // Each new form alone (a key norm without a query norm, adjacent
+        // pairs, trailing pairs, the output rotary, V4.1's own): CUDA's and
+        // Vulkan's decode entries declare none of them and their prefill
+        // entries all of them.
         let holds = |backend, shape: AttentionShape| {
             // The prefill's block and listing axes at one block, unlisted.
             let mut statics = shape.dense_mix_statics();
@@ -2553,8 +2553,9 @@ mod tests {
             assert_eq!(holds(backend, qwen), (true, true), "{backend:?}");
         }
         for form in forms {
-            assert_eq!(holds(BackendName::Cuda, form), (false, true), "{form:?}");
-            assert_eq!(holds(BackendName::Vulkan, form), (false, false), "{form:?}");
+            for backend in [BackendName::Cuda, BackendName::Vulkan] {
+                assert_eq!(holds(backend, form), (false, true), "{backend:?} {form:?}");
+            }
             assert_eq!(holds(BackendName::Cpu, form), (true, true), "{form:?}");
         }
     }
