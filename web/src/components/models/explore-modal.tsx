@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
-import { InfoIcon, MagnifyingGlassIcon, XIcon } from "@phosphor-icons/react"
+import { CircleNotchIcon, InfoIcon, MagnifyingGlassIcon, XIcon } from "@phosphor-icons/react"
+import { cn } from "@/lib/utils"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
@@ -7,7 +8,6 @@ import { LabLogo, type ModelLab } from "../model-logo"
 import { Badge } from "./parts"
 import { MeasuringRecommendations, OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
-import { Unrunnable, type UnrunnableFile } from "./your-models"
 import type { QuantView } from "./view"
 
 /** A family Magnitude runs, as the "What runs in Magnitude" list names it. */
@@ -41,10 +41,17 @@ export function WhatRuns({ families }: { families: readonly RunnableFamily[] }) 
   </div>
 }
 
+/** What search is doing now: a spinner and a status line read out as it changes. */
+function SearchStatus({ children, className }: { children: ReactNode; className?: string }) {
+  return <p role="status" aria-live="polite" className={cn("mb-3 flex items-center gap-1.5 text-xs font-medium text-slate-500", className)}>
+    <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 motion-safe:animate-spin" />{children}
+  </p>
+}
+
 export type ExploreResults =
   | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
   | { readonly _tag: "Searching" }
-  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[]; readonly more: "Loading" | (() => void) | null }
+  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly more: "Loading" | (() => void) | null }
   | { readonly _tag: "Failed"; readonly message: string }
 
 /** The end of a page of results: reaching it asks for the next page. */
@@ -89,21 +96,19 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
           {results.measuring ? <MeasuringRecommendations {...results.measuring} /> : <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>}
         </>}
         {results._tag === "Searching" && <>
-          <p role="status" className="mb-3 text-xs font-medium text-slate-500">Searching Hugging Face and checking how each result runs on your machine…</p>
+          <SearchStatus>Searching Hugging Face and checking how each result runs on your machine…</SearchStatus>
           <OfferedModelsSkeleton />
         </>}
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
-          <p className="mb-3 text-xs font-medium text-slate-500">Results on Hugging Face ({results.models.length})</p>
+          <p className="mb-3 text-xs font-medium text-slate-500">On Hugging Face, running in Magnitude ({results.models.length})</p>
           {results.models.length > 0
             ? <div className="space-y-2">{results.models.map(model => card(model))}</div>
             : results.more === null && <p className="max-w-lg text-[13px] text-slate-500">
-              {results.unrunnable.length > 0 || results.unchecked.length > 0 ? "None of these run in Magnitude." : `No GGUF models on Hugging Face match “${query.trim()}”.`} {runnableSummary(families)}
+              No models on Hugging Face that run in Magnitude match “{query.trim()}”. {runnableSummary(families)}
             </p>}
-          {results.more === "Loading" ? <div className="mt-2"><OfferedModelsSkeleton count={2} /></div>
+          {results.more === "Loading" ? <div className="mt-2"><SearchStatus className="mt-4">Loading more results…</SearchStatus><OfferedModelsSkeleton count={2} /></div>
             : results.more && <NextPage onReach={results.more} />}
-          <Unrunnable files={results.unchecked} title="Couldn’t check in time" />
-          <Unrunnable files={results.unrunnable} />
         </>}
       </div>
     </DialogContent>

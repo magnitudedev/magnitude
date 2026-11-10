@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Option } from "effect"
-import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
 import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
 import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
@@ -10,7 +10,6 @@ import { onThisComputer, quantView, transferOf } from "./data"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
 import { ExploreModal, type ExploreResults, type RunnableFamily } from "./explore-modal"
-import type { UnrunnableFile } from "./your-models"
 
 function useDebounced<A>(value: A, delay: number): A {
   const [settled, setSettled] = useState(value)
@@ -30,20 +29,11 @@ const trustedPublisher = (repository: string, base: string | undefined) => {
 }
 
 /** Search results grouped by the model they quantize: one offered model per base, one rung per repository's recommended quant. */
-const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: ServingMemory): { readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] } => {
+const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: ServingMemory): readonly OfferedModel[] => {
   const groups = new Map<string, HuggingFaceSearchResult[]>()
-  const unrunnable: UnrunnableFile[] = []
-  const unchecked: UnrunnableFile[] = []
   for (const result of results) {
-    if (Option.isSome(result.unsupported)) {
-      const architecture = Option.getOrNull(result.architecture)
-      unrunnable.push({ name: result.repository, reason: architecture ? `${architecture} architecture` : "Not supported" })
-      continue
-    }
-    if (Option.isNone(result.recommended)) {
-      unchecked.push({ name: result.repository, reason: "Its files took too long to read" })
-      continue
-    }
+    // A result that doesn't run here, or that couldn't be checked, is no offer: search shows what runs.
+    if (Option.isSome(result.unsupported) || Option.isNone(result.recommended)) continue
     const base = Option.getOrNull(result.base)
     const key = base && base.relation === "Quantized" ? base.repository : result.repository
     groups.set(key, [...groups.get(key) ?? [], result])
@@ -76,7 +66,7 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: 
       recommended: fastest?.key ?? quants[0]?.key ?? null,
     }
   })
-  return { models, unrunnable, unchecked }
+  return models
 }
 
 interface ExploreProps {
@@ -137,42 +127,46 @@ function useDownload() {
 }
 
 /**
- * Explore while searching: the settled query's Hugging Face results, a page at a time. Pages already shown stay while
- * the next one loads; reaching the end of the list asks for it.
+ * The settled query's Hugging Face results, a page at a time: pages already shown stay while the next one loads, and
+ * reaching the end of the list asks for it. An empty query asks for nothing.
  */
-function Searched({ settled, props }: { settled: string; props: ExploreProps }) {
+function useSearchResults(settled: string, query: string, memory: ServingMemory): ExploreResults {
   const client = useAgentClient()
-  const [cursor, setCursor] = useState<Option.Option<string>>(Option.none())
-  const [shown, setShown] = useState<readonly HuggingFaceSearchResult[]>([])
-  const page = useAtomValue(client.Models.SearchHuggingFaceModels({ query: settled, limit: Option.none(), cursor })).result
-  const download = useDownload()
+  const [pages, setPages] = useState<{ readonly query: string; readonly cursor: Option.Option<string>; readonly shown: readonly HuggingFaceSearchResult[] }>(
+    { query: settled, cursor: Option.none(), shown: [] })
+  const current = pages.query === settled ? pages : { query: settled, cursor: Option.none<string>(), shown: [] }
+  const page = useAtomValue(useMemo(() => Atom.make((get) => settled === ""
+    ? Result.initial()
+    : get(client.Models.SearchHuggingFaceModels({ query: settled, limit: Option.none(), cursor: current.cursor })).result),
+  [client, settled, current.cursor]))
   const loading = Result.isInitial(page) || page.waiting
-  const current = Result.isSuccess(page) && !page.waiting ? page.value : null
-  const next = current ? current.nextCursor : Option.none<string>()
+  const listed = Result.isSuccess(page) && !page.waiting ? page.value : null
+  const next = listed ? listed.nextCursor : Option.none<string>()
   const more = () => {
-    if (!current || Option.isNone(next)) return
-    setShown(previous => [...previous, ...current.results])
-    setCursor(next)
+    if (!listed || Option.isNone(next)) return
+    setPages({ query: settled, cursor: next, shown: [...current.shown, ...listed.results] })
   }
-  const results: ExploreResults = props.query.trim() !== settled || (loading && shown.length === 0) ? { _tag: "Searching" }
-    : Result.isFailure(page) && shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
+  return query !== settled || (loading && current.shown.length === 0) ? { _tag: "Searching" }
+    : Result.isFailure(page) && current.shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
     : {
         _tag: "Results",
-        ...offeredFromSearch([...shown, ...(current?.results ?? [])], props.memory),
+        models: offeredFromSearch([...current.shown, ...(listed?.results ?? [])], memory),
         more: loading ? "Loading" : Option.isSome(next) ? more : null,
       }
-  return <ExploreModal {...props} results={results} download={download} />
 }
 
-/** The Explore models modal on the service's data: Hugging Face search, and the recommendations it is given. */
+/**
+ * The Explore models modal on the service's data: Hugging Face search, and the recommendations it is given. One modal
+ * whatever it shows, so typing a search changes its contents, never the modal itself.
+ */
 export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
+  const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
+  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.memory)
   const download = useDownload()
-  if (settled === "") {
-    return <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }} download={download} />
-  }
-  if (new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES) {
-    return <ExploreModal {...props} results={{ _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }} download={download} />
-  }
-  return <Searched settled={settled} props={props} />
+  const results: ExploreResults = props.query.trim() === ""
+    ? { _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }
+    : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
+    : searched
+  return <ExploreModal {...props} results={results} download={download} />
 }

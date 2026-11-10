@@ -59,7 +59,7 @@ export function OfferedModelsSkeleton({ count = 3, firstOpened = false, footer =
           <SkeletonLine className="mt-0.5 h-4 text-xs" width="60%" />
         </span>
         <span className="flex items-center gap-4">
-          <span className="grid grid-cols-[96px_64px] gap-4">
+          <span className="grid grid-cols-[84px_64px] gap-4">
             {[0, 1].map(cell => <span key={cell} className="flex w-full flex-col items-end">
               <SkeletonLine className="h-[22px] justify-end text-[15px]" width={cell ? "3.5rem" : "4.5rem"} />
               <SkeletonLine className="h-[16px] justify-end text-[11px]" width={cell ? "2.5rem" : "4rem"} />
