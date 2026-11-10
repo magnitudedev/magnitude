@@ -9,15 +9,6 @@ export const cardClass = "rounded-xl border border-slate-200 bg-white dark:borde
 
 export const formatSpeed = (speed: number) => speed < 1 ? "<1 tok/s" : `${Math.round(speed)} tok/s`
 
-/** A quant's nominal bit width from its type name: `UD-Q4_K_XL` is 4-bit, `MXFP4_MOE` is 4-bit, `BF16` is 16-bit. */
-export const quantBits = (name: string): number => {
-  const upper = name.toUpperCase()
-  if (/BF16|F16/.test(upper)) return 16
-  const digit = upper.match(/(?:IQ|TQ|Q)(\d)/)
-  if (digit) return Number(digit[1])
-  return /FP4/.test(upper) ? 4 : 0
-}
-
 export const quantSource = (quant: Pick<QuantView, "publisher" | "name">) => quant.publisher ? `${quant.publisher} ${quant.name}` : quant.name
 
 export function LabMark({ lab, className = "size-8" }: { lab: ModelLab | undefined; className?: string }) {

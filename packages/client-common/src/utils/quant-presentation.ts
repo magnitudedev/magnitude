@@ -13,9 +13,20 @@ export const quantBitWidth = (name: string): Option.Option<number> => {
   return float === null ? Option.none() : Option.some(Number(float[1]))
 }
 
-/** A quant as people compare them: its bit width, publisher and quant name ("4-bit unsloth UD-Q4_K_XL"). */
-export const formatQuantLabel = (name: string, repository: Option.Option<string>): string => [
-  ...Option.toArray(Option.map(quantBitWidth(name), (bits) => `${bits}-bit`)),
+/**
+ * Bit widths for a ladder's rungs, given smallest first: each rung's own width, and half a bit more on a rung that
+ * shares its width with a smaller one, so `UD-IQ3_XXS` and `UD-Q3_K_XL` on one ladder read 3-bit and 3.5-bit.
+ */
+export const ladderBitWidths = (names: readonly string[]): ReadonlyArray<Option.Option<number>> =>
+  names.map((name, index) => Option.map(quantBitWidth(name), (bits) =>
+    names.slice(0, index).some((smaller) => Option.contains(quantBitWidth(smaller), bits)) ? bits + 0.5 : bits))
+
+/**
+ * A quant as people compare them: its bit width, publisher and quant name ("4-bit unsloth UD-Q4_K_XL"). A ladder
+ * passes the width `ladderBitWidths` gave the rung.
+ */
+export const formatQuantLabel = (name: string, repository: Option.Option<string>, bits = quantBitWidth(name)): string => [
+  ...Option.toArray(Option.map(bits, (width) => `${width}-bit`)),
   ...Option.toArray(Option.flatMap(repository, (value) => Option.fromNullable(value.split("/")[0]))),
   name,
 ].join(" ")

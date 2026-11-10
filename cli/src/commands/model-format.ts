@@ -3,6 +3,7 @@ import {
   describeCatalogDeprecation,
   fitPlacementPhrase,
   formatQuantLabel,
+  ladderBitWidths,
   formatMemorySize,
   formatStorageSize,
   formatModelLoadPercentage,
@@ -174,11 +175,12 @@ export const modelRepository = (model: LocalModel): Option.Option<string> => {
   return form === "hf" && owner !== undefined && repo !== undefined ? Option.some(`${owner}/${repo}`) : Option.none()
 }
 
-/** A model's quant: "4-bit unsloth UD-Q4_K_XL". */
-export const modelQuant = (model: LocalModel): string => formatQuantLabel(
-  model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel,
-  modelRepository(model),
-)
+const quantName = (model: LocalModel): string =>
+  model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel
+
+/** A model's quant: "4-bit unsloth UD-Q4_K_XL", with the bit width a ladder gave it when there is one. */
+export const modelQuant = (model: LocalModel, bits?: Option.Option<number>): string =>
+  formatQuantLabel(quantName(model), modelRepository(model), bits)
 
 /** Where a model's files are: Magnitude's own downloads, or the other app or folder Magnitude found them in. */
 export const modelSource = (model: LocalModel): string => {
@@ -265,11 +267,14 @@ export const renderQuantLadder = (
   rungs: readonly LocalModel[],
   chosen: Option.Option<string>,
   unifiedMemory: boolean,
-): string => renderTable(rungs, [
-  { heading: "QUANT", value: (model) => `${modelQuant(model)}${Option.contains(chosen, model.modelId as string) ? " *" : ""}` },
-  { heading: "SIZE", value: (model) => formatStorageSize(model.storageBytes) },
-  { heading: "SPEED", value: (model) => assessmentSpeed(modelAssessment(model)) },
-  { heading: "CONTEXT", value: (model) => assessmentContext(modelAssessment(model)) },
-  { heading: "PLACEMENT", value: (model) => assessmentPlacement(modelAssessment(model), unifiedMemory) },
-  { heading: "MODEL ID", value: ({ modelId }) => modelId },
-])
+): string => {
+  const widths = ladderBitWidths(rungs.map(quantName))
+  return renderTable(rungs, [
+    { heading: "QUANT", value: (model) => `${modelQuant(model, widths[rungs.indexOf(model)])}${Option.contains(chosen, model.modelId as string) ? " *" : ""}` },
+    { heading: "SIZE", value: (model) => formatStorageSize(model.storageBytes) },
+    { heading: "SPEED", value: (model) => assessmentSpeed(modelAssessment(model)) },
+    { heading: "CONTEXT", value: (model) => assessmentContext(modelAssessment(model)) },
+    { heading: "PLACEMENT", value: (model) => assessmentPlacement(modelAssessment(model), unifiedMemory) },
+    { heading: "MODEL ID", value: ({ modelId }) => modelId },
+  ])
+}

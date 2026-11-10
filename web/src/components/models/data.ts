@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
+import { ladderBitWidths, quantBitWidth } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
-import { quantBits } from "./parts"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
 import type { RunnableFamily } from "./explore-modal"
@@ -54,7 +54,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
   const fits = assessment?._tag === "Fits" ? assessment : null
   return {
     key: quant.key,
-    bits: quantBits(quant.name),
+    bits: Option.getOrElse(quantBitWidth(quant.name), () => 0),
     publisher: quant.repository?.split("/")[0] ?? null,
     name: quant.name,
     repository: quant.repository,
@@ -120,7 +120,7 @@ export const discoveredModel = (model: CustomLocalModel): DiscoveredModel | null
     key: model.modelId,
     name: model.presentation.displayName,
     lab: developer ? labForDeveloper(developer.lab) : undefined,
-    bits: quantBits(model.presentation.variantLabel),
+    bits: Option.getOrElse(quantBitWidth(model.presentation.variantLabel), () => 0),
     source: model.origin.source._tag === "Folder" ? directoryOf(model.origin.source.path).split(/[\\/]/).pop() ?? "Folder" : foundSourceName[model.origin.source._tag],
     fromHuggingFaceCache: model.origin.source._tag === "HuggingFaceCache",
     warning: model.modelId.startsWith("local:")
@@ -154,9 +154,16 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: rungs.map(model => ({ ...quantOf(model, unified), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) })),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, unified), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) }))),
     recommended: Option.getOrNull(recommendation.chosen),
   }
+}
+
+/** A ladder's rungs, smallest first, with bit widths that tell two rungs of the same width apart. */
+export const ladderOf = (quants: readonly QuantView[]): readonly QuantView[] => {
+  const sorted = [...quants].sort((left, right) => left.sizeBytes - right.sizeBytes)
+  const widths = ladderBitWidths(sorted.map(quant => quant.name))
+  return sorted.map((quant, index) => ({ ...quant, bits: Option.getOrElse(widths[index] ?? Option.none(), () => quant.bits) }))
 }
 
 /** A family Magnitude runs, for the "What runs in Magnitude" list. */
