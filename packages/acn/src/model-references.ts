@@ -91,9 +91,19 @@ export const drafterInput = (input: string, environment: DiscoveryEnvironment): 
   })
 }
 
-/** A repository's display name: its name without a trailing GGUF marker, words split at separators. */
-export const repositoryDisplayName = (id: string): string => {
+/**
+ * A repository's display name: its name without a trailing GGUF marker and the `i1` before it that marks imatrix
+ * quants, words split at separators. Given the repository it quantizes, an uploader's `Org_` prefix naming that
+ * repository's owner is dropped too (`bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` of `Qwen/Qwen3.6-35B-A3B` is
+ * `Qwen3.6 35B A3B`).
+ */
+export const repositoryDisplayName = (id: string, base?: string): string => {
   const name = id.split("/").at(-1) ?? id
-  const trimmed = name.replace(/[-_.]?gguf$/i, "")
-  return (trimmed.length > 0 ? trimmed : name).replace(/[-_]+/g, " ").trim()
+  const trimmed = name.replace(/(-i1)?[-_.]?gguf$/i, "")
+  const owner = base?.split("/")[0]
+  const unprefixed = owner !== undefined && trimmed.toLowerCase().startsWith(`${owner.toLowerCase()}_`)
+    ? trimmed.slice(owner.length + 1)
+    : trimmed
+  const shown = unprefixed.length > 0 ? unprefixed : trimmed.length > 0 ? trimmed : name
+  return shown.replace(/[-_]+/g, " ").trim()
 }

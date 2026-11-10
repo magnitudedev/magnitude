@@ -756,7 +756,7 @@ export const CustomModelCommandsLive: Layer.Layer<
           if (Option.isNone(repository)) return []
           return Option.toArray(Schema.decodeUnknownOption(HuggingFaceSearchResultSchema)({
             repository: repository.value,
-            displayName: repositoryDisplayName(repository.value),
+            displayName: repositoryDisplayName(repository.value, Option.getOrUndefined(Option.map(result.base, ({ repository }) => repository))),
             uploader: repository.value.split("/")[0],
             ...presentField("variantOf", result.variantOf),
             ...presentField("developer", result.developer),

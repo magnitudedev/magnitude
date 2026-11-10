@@ -542,14 +542,15 @@ fn is_quantization_token(token: &str) -> bool {
 }
 
 /// A display name from a repository or folder name: separators become spaces and a trailing
-/// `GGUF` is dropped.
+/// `GGUF` is dropped, with the `i1` before it that marks a repository of imatrix quants
+/// (`mradermacher/Qwen3.5-4B-i1-GGUF` is `Qwen3.5 4B`).
 #[must_use]
 pub fn display_name(name: &str) -> String {
     let name = name.rsplit('/').next().unwrap_or(name);
     let trimmed = ["-GGUF", "-gguf", "_GGUF", "_gguf", "-Gguf"]
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
-        .unwrap_or(name);
+        .map_or(name, |trimmed| trimmed.strip_suffix("-i1").unwrap_or(trimmed));
     trimmed.replace(['-', '_'], " ")
 }
 
@@ -785,6 +786,8 @@ mod tests {
             display_name("HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-GGUF"),
             "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive"
         );
+        assert_eq!(display_name("mradermacher/Qwen3.5-4B-Heretic-i1-GGUF"), "Qwen3.5 4B Heretic");
+        assert_eq!(display_name("someone/Model-i1"), "Model i1");
     }
 
     #[test]
