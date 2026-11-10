@@ -1330,12 +1330,14 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
         mandatory.disposition,
         seismic::TuningDisposition::CanonicalFallback { .. }
     ));
-    // Discovery measures the defaults one point a piece, each unpriced:
-    // its operations' classes are first observed by it.
-    for discovered in 1..=3 {
+    // Discovery measures the defaults one point a piece. The first point's
+    // build and measurement are unpriced; a later point's are priced from
+    // the unit's earlier ones, and the last's planning stays unpriced.
+    for (discovered, unpriced) in (1..=3).zip([2, 0, 1]) {
         let work = unit.next().unwrap();
         assert_eq!(work.stage, Stage::Discovery);
-        assert_eq!(work.quote.forecast(), None);
+        assert_eq!(work.quote.unpriced, unpriced);
+        assert_eq!(work.quote.priced.is_zero(), discovered == 1);
         let performed = unit.perform(&mut source, None).unwrap();
         assert!(!performed.promoted);
         assert_eq!(timed(&unit.terminal().unwrap()).len(), discovered);

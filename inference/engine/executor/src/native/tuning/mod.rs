@@ -349,7 +349,14 @@ pub const STREAMING_ROWS: u64 = 8;
 /// 44: a case's picks name the rows its index-list source holds at the
 /// position its point stands for, in a plane of those rows (a result of 43
 /// timed every pick as none, of a plane of no rows).
-pub const SEARCH_VERSION: u32 = 44;
+/// 45: a discovery piece is admitted at what it is ranked at, a unit's
+/// later points priced from its own earlier ones and what that leaves
+/// unpriced from the discovery the load has run (a result of 44 held every
+/// pending piece to two or three times the longest operation any unit
+/// completed, and stored the units that then left the objective with their
+/// defaults alone: 18 demanded units of a DeepSeek V4.1 load on Metal,
+/// attention_decode among them, behind routed_gate_up's 11.29 s build).
+pub const SEARCH_VERSION: u32 = 45;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);

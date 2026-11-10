@@ -3434,8 +3434,10 @@ pub struct UnitSearch<'m, 'a> {
     builds: Vec<Observed>,
     /// The whole check of each untimed point, by point: its class.
     checks: Vec<Observed>,
-    /// The longest measurement of the defaults at one point, and the
-    /// longest planning of the search: operations of no repeated class.
+    /// Measuring the defaults at one discovery point: its class.
+    discovering: Observed,
+    /// The longest planning of the search: an operation of no repeated
+    /// class.
     longest: f64,
     /// What making each point's inputs resident added to the bytes held,
     /// by point: its class, observed when the point is discovered and
@@ -3550,6 +3552,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             progress: Progress::Discovering(Vec::new()),
             builds: Vec::new(),
             checks: Vec::new(),
+            discovering: Observed::default(),
             longest: 0.,
             resident_bytes: Vec::new(),
             measure_bytes: Observed::default(),
@@ -4028,6 +4031,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .map(|point| point.prices().longest())
             .chain(self.builds.iter().map(Observed::longest))
             .chain(self.checks.iter().map(Observed::longest))
+            .chain([self.discovering.longest()])
             .chain(match &self.progress {
                 Progress::Searching(searching) => Some(searching.planning.longest()),
                 Progress::Discovering(_) => None,
@@ -4106,20 +4110,27 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         match &self.progress {
             Progress::Discovering(slots) => {
                 let index = self.undiscovered()?;
-                // Building a point's inputs and measuring the defaults
-                // there are operations of classes first observed by this
-                // very work; discovering the last point also plans the
-                // search.
+                // Building a point's inputs is priced at what building them
+                // took at the unit's last point discovered, and measuring
+                // the defaults at what measuring them has taken at its
+                // points, whose samples are sized by time, not by the
+                // point's cost. So the cheapest point prices the longer
+                // ones before they are built, from the unit's own inputs:
+                // what another unit builds says nothing of them. The first
+                // point's are unpriced, and discovering the last point
+                // also plans the search, which the unit has not run.
                 let last = (index + 1..self.specs.len())
                     .all(|later| !discovery_selected(&self.specs, later) || slots[later].is_some());
+                let built = (0..index).rev().find(|earlier| slots[*earlier].is_some());
+                let mut quote = Quote::default();
+                quote.add(built.and_then(|earlier| self.builds[earlier].price()), 1);
+                quote.add(self.discovering.price(), 1);
+                quote.add(None, usize::from(last));
                 let mut footprint = Footprint::default();
                 footprint.add(most_bytes(&self.resident_bytes[index]), 1);
                 Some(Work {
                     stage: Stage::Discovery,
-                    quote: Quote {
-                        priced: Duration::ZERO,
-                        unpriced: 2 + usize::from(last),
-                    },
+                    quote,
                     forming: Quote::default(),
                     opportunity: 0.,
                     footprint,
@@ -4702,7 +4713,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             }
         };
         let measured = measuring.elapsed().as_secs_f64();
-        self.longest = self.longest.max(measured);
+        self.discovering.observe(measured);
         self.time.measuring_seconds += measured;
         let Progress::Discovering(slots) = &mut self.progress else {
             unreachable!("discovery precedes the search");
