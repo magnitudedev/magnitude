@@ -233,7 +233,7 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
     let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(OW) + min(8 * ceil_div(Q * W, 32), 288) * 72
-    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N and IN <= SN
+    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch partials bytes (SPLIT * M * D * 4) when M > 8 and SPLIT > 1
     scratch staged bytes (M * Q * W * 2) when M > 8 and operands(OW) == 1
     launch attention_output_stage when M > 8 and operands(OW) == 1:
@@ -875,9 +875,9 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
-    selected_rows: &tensor[M, KS] i32, selected: &tensor[TS, KV, 2 * P + S] A,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
+    selected_rows: &tensor[M, KS] i32, selected: &slab tensor[TS, KV, 2 * P + S] A,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32, selected_slab_rows: u32,
     key_block: i32, key_element: i32, key_scale: i32, key_amax_floor: f32)
     -> tensor[M, KV * G, 2 * P + S] A
@@ -1045,9 +1045,9 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, SK, RA, RT
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
     selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
-    selected_rows: &tensor[M, KS] i32, selected: &tensor[TS, KV, 2 * P + S] A,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
+    selected_rows: &tensor[M, KS] i32, selected: &slab tensor[TS, KV, 2 * P + S] A,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32, selected_slab_rows: u32,
     key_block: i32, key_element: i32, key_scale: i32, key_amax_floor: f32)
     -> tensor[M, KV * G, 2 * P + S] A
@@ -1149,16 +1149,19 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
 # Vulkan (`vulkan/lib/attention/prefill.glsl`): L1 prepares queries/keys (f16
 # scratch) and appends K/V; L2 streams 32-key K/V tiles per (tile of ROWS / G
 # tokens x G query heads, kv head, key partition), a head wider than 256 in
-# 256-column chunks; L3 merges split tiles.
+# 256-column chunks; L3 merges split tiles. As on CUDA, an index-list source
+# (KS > 0) is the state after the key partitions' (`attention_prefill_picks`,
+# a subgroup over the row's picks), which the merge folds in, and the output
+# rotary (RO = 1) is its own launch over the published rows.
 native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256)
-    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
+    where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
+    scratch partials bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
     scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
@@ -1172,9 +1175,15 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)
         shared_bytes (64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048)
-    launch attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
+    launch attention_prefill_picks when KS > 0:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV or KS > 0:
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+    launch attention_prefill_rotate when RO == 1:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
 
 # CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, and the
 # keys and values of a layer with fresh rows, into F32 scratch; the K/V
@@ -1324,8 +1333,8 @@ fn attention_append_dense[M, T, KV, P, S, F, N, NV, RA, RT, VK, KR](
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, destinations: &tensor[M] i32,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, VK, KR] i32,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, VK, KR] i32,
     epsilon: f32, slab_rows: u32, key_block: i32, key_element: i32, key_scale: i32,
     key_amax_floor: f32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and F >= 0 and N >= 0 and NV >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK <= 1 and (VK == 0 or NV == 0) and KR >= 0 and KR <= 1 and (KR == 0 or VK == 1):
@@ -1366,7 +1375,7 @@ native attention_append_dense for cuda from "cuda/attention_append_dense.cu":
 
 native attention_append_dense for vulkan from "vulkan/attention_append_dense.comp":
     static (KV, P, S, F, N, NV, RA, RT, VK, KR)
-    where KR == 0 and RA == 0 and RT == 0 and VK == 0 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
+    where KR <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and VK <= 1 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
     launch attention_append_dense:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1386,10 +1395,10 @@ fn attention_append_k8v4[M, T, KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK](
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, destinations: &tensor[M] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, VK] i32,
     epsilon: f32, slab_rows: u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK == 0:
     # Publication has no output rotary.
@@ -1468,10 +1477,10 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, KC, KP, VC, V
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:
@@ -1508,10 +1517,10 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
     selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
     history_tiles: &tensor[L, HT] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and BR >= 1 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:

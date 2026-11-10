@@ -12,6 +12,7 @@ sequences.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import math
@@ -27,22 +28,51 @@ from magnitude_references.perturbation import UE8M0 as UE8M0_CODES, Format, Pert
 
 F32 = torch.float32
 QUERY_BLOCK = 1024  # attention query rows per score block
-# F8_E4M3 weights with UE8M0 block exponents (`inference/docs/precision.md`, "UE8M0-scaled FP8 weights")
-SCALE_ENCODING = "magnitude.scale_encoding"
-UE8M0 = "ue8m0"
 MAX_UE8M0 = UE8M0_CODES.largest  # the largest byte whose E4M3 products are exact in float32
 DECODERS = ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix="expert-decode")
 EXPERT_WINDOW = 2 * (os.cpu_count() or 1)  # expert matrices decoded ahead of their reads, at most
 
 
+@dataclass(frozen=True)
+class TileEncoding:
+    """The element code of an F8_E4M3 weight's tile grid `<base>.scale`, named by the grid's GGUF type: the format a
+    perturbation moves its elements in (None: the type's own), the refusal of a file's grid bytes, and the float32
+    factors of stored grid bytes [n, grid cols]."""
+    perturbed: Format | None
+    refuse: Callable[[str, np.ndarray], None]
+    factors: Callable[[np.ndarray], np.ndarray]
+
+
+def _refuse_ue8m0(name: str, data: np.ndarray) -> None:
+    if data.size and (largest := int(data.view(np.uint8).max())) > MAX_UE8M0:
+        raise ValueError(f"{name}: UE8M0 byte {largest} is above {MAX_UE8M0}, where products leave float32")
+
+
+def _refuse_f32(name: str, data: np.ndarray) -> None:
+    if not np.isfinite(data.view(np.float32)).all():
+        raise ValueError(f"{name}: a tile scale is not finite")
+
+
+# `inference/docs/precision.md`, "Block-scaled FP8 weights": a grid's GGUF type names its element code. I8: one
+# UE8M0 byte b per tile, factor 2^(b - 127), every product exact in float32. F32: the checkpoint's F32 scale per
+# tile; a product is correctly rounded once.
+TILE_ENCODINGS = {
+    GGMLQuantizationType.I8: TileEncoding(
+        UE8M0_CODES, _refuse_ue8m0,
+        lambda data: np.ldexp(np.float32(1), data.view(np.uint8).astype(np.int32) - 127).astype(np.float32)),
+    GGMLQuantizationType.F32: TileEncoding(None, _refuse_f32, lambda data: data.view(np.float32)),
+}
+
+
 class Weights:
     """Float32 tensors of a GGUF package by GGUF name, dequantized on demand.
 
-    A stored tensor's value includes its `<base>.scale` companion: the NVFP4 second-level scale, or,
-    for an F8_E4M3 tensor of a file declaring `magnitude.scale_encoding = "ue8m0"`, one UE8M0 byte b
-    (I8) per block, value = code * 2^(b - 127). The block grid is the one the two shapes define (32x32
-    for dense DeepSeek weights, 1x32 for the Engram table). Both products are exact in float32 (UE8M0
-    bytes above 246 are refused).
+    A stored tensor's value includes its `<base>.scale` companion: the NVFP4 second-level scale, or, for an
+    F8_E4M3 tensor, its tile grid in the element code the grid's own GGUF type names (`TILE_ENCODINGS`: I8 UE8M0
+    bytes, F32 scales), value = code * factor as one float32 product, so one file may hold grids of both. The tile
+    is the quotient of the two shapes' last two axes (32x32 for dense DeepSeek weights, 1x32 for the Engram table,
+    128x128 for GLM-5.3-Flash), and a stack of expert matrices [experts, rows, cols] has one grid per expert
+    [experts, grid rows, grid cols].
 
     Expert matrices a layer is about to read (`plan_experts`) decode ahead on a thread pool, at most
     `EXPERT_WINDOW` at a time, so their decoding overlaps each other and the layer's products; a decode is
@@ -92,36 +122,38 @@ class Weights:
         companion scale."""
         if (scale := self.global_scale(name)) is not None:
             return value * (scale if expert is None else scale[expert])
-        if self.package.info(name).type != GGMLQuantizationType.F8_E4M3:
+        info = self.package.info(name)
+        if info.type != GGMLQuantizationType.F8_E4M3:
             return value
-        return value * self.block_scale(name, rows)
+        if rows is not None:
+            index = rows.cpu().numpy()
+        elif expert is not None:
+            index = np.arange(expert * info.shape[1], (expert + 1) * info.shape[1])
+        else:
+            index = np.arange(int(np.prod(info.shape[1:], dtype=np.int64)))
+        return value * self.tile_scale(name, index).view(value.shape)
 
-    def block_scale(self, name: str, rows: torch.Tensor | None) -> torch.Tensor:
-        """The UE8M0 factors of an F8_E4M3 matrix, expanded to its elements ([rows, cols])."""
-        encoding = self.package.metadata.get(SCALE_ENCODING)
-        if encoding is None or encoding.value != UE8M0:
-            raise ValueError(f"{name}: F8_E4M3 needs {SCALE_ENCODING} = {UE8M0}, the file declares {encoding}")
+    def tile_scale(self, name: str, rows: np.ndarray) -> torch.Tensor:
+        """The tile factors of F8_E4M3 `name`'s GGUF `rows` (rows of its matrix, or of a stack's matrices one after
+        another), expanded to their elements: [rows, cols]."""
         scale_name = name.removesuffix(".weight") + ".scale"
         info, scale = self.package.info(name), self.package.info(scale_name)
-        if len(info.shape) != 2 or scale.type != GGMLQuantizationType.I8 or len(scale.shape) != 2:
-            raise ValueError(f"{name}: a block-scaled matrix needs an I8 matrix {scale_name}, got {scale}")
-        (total, cols), (grid_rows, grid_cols) = info.array_shape, scale.array_shape
-        block_rows, block_cols = total // grid_rows, cols // grid_cols
-        if block_rows * grid_rows != total or block_cols * grid_cols != cols:
+        tiles = TILE_ENCODINGS.get(scale.type)
+        if tiles is None or len(scale.shape) != len(info.shape) or len(info.shape) not in (2, 3) \
+                or scale.shape[2:] != info.shape[2:]:
+            raise ValueError(f"{name}: a tile-scaled matrix or stack needs a grid {scale_name} of "
+                             f"{' or '.join(kind.name for kind in TILE_ENCODINGS)} of its rank and stack, got {scale}")
+        (total, cols), (grid_rows, grid_cols) = info.array_shape[-2:], scale.array_shape[-2:]
+        tile_rows, tile_cols = total // grid_rows, cols // grid_cols
+        if tile_rows * grid_rows != total or tile_cols * grid_cols != cols:
             raise ValueError(f"{name}: {scale_name} {scale.array_shape} does not tile {info.array_shape}")
-        file_bytes = self.package.raw(scale_name).view(np.uint8)
-        if file_bytes.size and (largest := int(file_bytes.max())) > MAX_UE8M0:
-            raise ValueError(f"{scale_name}: UE8M0 byte {largest} is above {MAX_UE8M0}, where products leave float32")
-        # The rows used are picked before the codes widen: a table's grid is as large as its codes' rows. A
-        # perturbed byte stays within UE8M0's range, so the file's bytes decide the refusal.
-        if rows is None:
-            codes = self.stored(scale_name, encoding=UE8M0_CODES).view(np.uint8).repeat(block_rows, axis=0)
-        else:
-            codes = self.stored(scale_name, rows.cpu().numpy() // block_rows, UE8M0_CODES).view(np.uint8)
-        exponents = codes.astype(np.int32) - 127
+        # The file's grid decides the refusal: a perturbed element stays within its format's finite range.
+        tiles.refuse(scale_name, self.package.raw(scale_name))
+        # A row of a stack's flattened matrices lies in the grid row of the same flattened position.
+        grid, inverse = np.unique(rows // tile_rows, return_inverse=True)
+        codes = self.stored(scale_name, grid, tiles.perturbed)[inverse]
         self.read.add(scale_name)
-        factors = np.ldexp(np.float32(1), exponents).astype(np.float32)  # exact powers of two
-        return torch.from_numpy(factors.repeat(block_cols, axis=1)).to(self.device)
+        return torch.from_numpy(tiles.factors(codes).repeat(tile_cols, axis=1)).to(self.device)
 
     def global_scale(self, name: str) -> torch.Tensor | None:
         """An NVFP4 tensor's second-level scale (`<base>.scale`: [1], or [experts] for stacked experts).

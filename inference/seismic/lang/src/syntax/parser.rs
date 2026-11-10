@@ -836,11 +836,12 @@ impl Parser {
         let kind = match self.peek().clone() {
             Tok::Op(Op::Amp) => {
                 self.bump();
-                // `host` and `await` are contextual: after `&`, only `mut` or
-                // `tensor` could follow otherwise.
-                let host = self.at_word("host");
-                let awaited = !host && self.at_word("await");
-                if host || awaited {
+                // `host`, `await` and `slab` are contextual: after `&`, only
+                // `mut` or `tensor` could follow otherwise.
+                let qualifier = ["host", "await", "slab"]
+                    .into_iter()
+                    .find(|word| self.at_word(word));
+                if qualifier.is_some() {
                     self.bump();
                 }
                 let mutable = self.eat_kw(Kw::Mut);
@@ -849,14 +850,16 @@ impl Parser {
                     return Err(Diagnostic::with_rule(
                         DiagnosticRule::Syntax,
                         tensor.span,
-                        "a borrow type is `&tensor[...] T`, `&mut tensor[...] T`, `&host tensor[...] T`, `&host mut tensor[...] T`, `&await tensor[...] T` or `&await mut tensor[...] T`",
+                        "a borrow type is `&tensor[...] T` or `&mut tensor[...] T`, optionally qualified `&host`, `&await` or `&slab`",
                     ));
                 }
-                self.shaped(match (host, awaited, mutable) {
-                    (true, _, write) => ShapedHead::HostTensor { write },
-                    (false, true, write) => ShapedHead::AwaitTensor { write },
-                    (false, false, true) => ShapedHead::MutTensor,
-                    (false, false, false) => ShapedHead::SharedTensor,
+                self.shaped(match (qualifier, mutable) {
+                    (Some("host"), write) => ShapedHead::HostTensor { write },
+                    (Some("await"), write) => ShapedHead::AwaitTensor { write },
+                    (Some("slab"), write) => ShapedHead::SlabTensor { write },
+                    (Some(_), _) => unreachable!("a borrow qualifier is one of its words"),
+                    (None, true) => ShapedHead::MutTensor,
+                    (None, false) => ShapedHead::SharedTensor,
                 })?
             }
             Tok::Kw(Kw::Void) => {

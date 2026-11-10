@@ -26,51 +26,6 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "decode routing that also expands the shared expert, the decode form of the backends that stream decode; the other backends run `routed_route`, then `routed_expand`",
     ),
     (
-        "pool_rows",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "pooled history rows (DeepSeek V4.1's compressed history), which no Vulkan model runs yet",
-    ),
-    (
-        "stream_mix_sinkhorn",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the Sinkhorn mix site (DeepSeek V4.1's single-pass hyper-connections), which no Vulkan model runs yet",
-    ),
-    (
-        "stream_collapse",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the exit of Sinkhorn hyper-connection streams, which no Vulkan model runs yet",
-    ),
-    (
-        "stream_join",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the streams' join of a general routed feed-forward's branch, which only Sinkhorn streams read and no Vulkan model runs yet",
-    ),
-    (
-        "indexer_keys",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the general indexer's keys (DeepSeek V4.1's compressed history), which no Vulkan model runs yet",
-    ),
-    (
-        "indexer_score",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the general indexer's scores over a row list, which no Vulkan model runs yet",
-    ),
-    (
-        "rows_topk",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the general indexer's selection of rows, which no Vulkan model runs yet",
-    ),
-    (
-        "candidate_blocks",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the candidate pool's block scores (DeepSeek V4.1's restricted indexers), which no Vulkan model runs yet",
-    ),
-    (
-        "candidate_rows",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "the candidate pool's rows (DeepSeek V4.1's restricted indexers), which no Vulkan model runs yet",
-    ),
-    (
         "gated_delta_project_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's projection, which also convolves and publishes the windows; the other backends run `gated_delta_project`, then `gated_delta_step`, until the form is measured there",
@@ -166,8 +121,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/projection/join",
-        &[BackendName::Cuda],
-        "the residual and stream joins and their row maps are separate from CUDA's projection header, which requires an activation element, so `stream_join` (which binds none) joins through the same epilogues; Metal keeps them in `projection.h`",
+        &[BackendName::Cuda, BackendName::Vulkan],
+        "the residual and stream joins are separate from the projection header (CUDA's requires an activation element; Vulkan's binds weight packets), so `stream_join` (which binds neither) joins through the same code; Metal keeps them in `projection.h`",
     ),
     (
         "lib/attention/decode_merge",
@@ -201,13 +156,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/indexer/indexer",
-        &[BackendName::Metal, BackendName::Cuda],
-        "the general indexer's lane helpers (Metal: the simdgroup head preparation and threadgroup scan; CUDA: the warp head norm, rotating through `rotary` and scanning through `reduce`), shared by `indexer_keys`, `indexer_score` and `rows_topk`; the CPU natives prepare a row in their own work item",
-    ),
-    (
-        "lib/core/rounding",
-        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
-        "trained block roundings of stored rows (the compressed history and its indexer), which no Vulkan model runs yet",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the general indexer's lane helpers (Metal: the simdgroup head preparation and threadgroup scan; CUDA and Vulkan: the span walk, the head norm, rotation and scans in `head`, `rotary` and `reduce`), shared by `indexer_keys`, `indexer_score`, `rows_topk`, `candidate_rows` and `pool_rows`; the CPU's are `lib/core/spans`",
     ),
     (
         "lib/readout/progressive",
@@ -231,18 +181,18 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/core/head",
-        &[BackendName::Metal, BackendName::Cuda],
-        "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item, and Vulkan runs none of the pooled forms",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp, Vulkan's logical subgroup), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item",
     ),
     (
         "lib/core/order",
-        &[BackendName::Metal, BackendName::Cuda],
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
         "the F32 order key (`ordered_key`) shared by the sampling shape, `rows_topk` and the progressive readout's values; the CPU's is `functions::ordered_key`, beside the functions it shares",
     ),
     (
         "lib/core/streams",
-        &[BackendName::Metal, BackendName::Cuda],
-        "the hyper-connection stream collapse shared by `stream_collapse` and `stream_mix_sinkhorn`; the CPU's is `functions::collapse`, and Vulkan runs neither entry",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the hyper-connection stream collapse shared by `stream_collapse` and `stream_mix_sinkhorn`; the CPU's is `functions::collapse`",
     ),
     (
         "lib/core/spans",
@@ -252,7 +202,7 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "lib/core/rotary",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
-        "rotary layouts and the lane rotation shared by attention, vision and (Metal, CUDA) the pooled rows and indexers; the CPU rotates in `attention.rs`",
+        "rotary layouts and the lane rotation shared by attention, vision, the pooled rows and the indexers; the CPU rotates in `attention.rs`",
     ),
     (
         "lib/recurrent/convolution",
@@ -400,7 +350,8 @@ fn main() {
 /// [..]`) expands to `mod gguf` with one module for each storage the
 /// registry converts GGUF formats into in that layout, holding one module
 /// for each such format, in ggml id order, a format under a scale grid
-/// named for it too (`gguf::q2g256::tq2_0`, `gguf::mxfp8g32::f8_e4m3_e8m0`).
+/// named for it too (`gguf::q2g256::tq2_0`, `gguf::mxfp8g32::f8_e4m3_e8m0`,
+/// `gguf::fp8g128::f8_e4m3_f32`).
 /// A format's module has a test for each of the `every` functions, and for
 /// each `partial_block` function when whole blocks of it fill a
 /// `PARTIAL_BLOCK_WIDTHS` width (`partial_block_widths`). A storage's
@@ -417,16 +368,21 @@ fn gguf_format_tests(out: &Path) {
         let mut storages: Vec<(String, String)> = Vec::new();
         for (encoding, scales) in Encoding::ALL
             .into_iter()
-            .flat_map(|encoding| [GgufScales::Own, GgufScales::E8m0Grid].map(|scales| (encoding, scales)))
+            .flat_map(|encoding| GgufScales::ALL.map(|scales| (encoding, scales)))
         {
             let Some(source) = registry::gguf_packet_source(encoding, scales) else {
                 continue;
             };
             let packet = registry::external_packet(source).expect("a GGUF source is external storage");
             let block = u64::from(packet.logical_group);
-            let suffix = match scales {
-                GgufScales::Own => "",
-                GgufScales::E8m0Grid => "_e8m0",
+            // The suffix of its modules' names, and its `GgufScales`
+            // expression.
+            let (suffix, scales) = match scales {
+                GgufScales::Own => (String::new(), "::seismic::GgufScales::Own".to_owned()),
+                GgufScales::Grid(grid) => (
+                    format!("_{}", grid.name()),
+                    format!("::seismic::GgufScales::Grid(::seismic::GridScale::{grid:?})"),
+                ),
             };
             for operands in OperandRecipe::ALL {
                 let Some(element) = registry::conversion_destination(source, layout, operands)
@@ -444,7 +400,7 @@ fn gguf_format_tests(out: &Path) {
                     .unwrap_or_else(|| {
                         let own = if operands == OperandRecipe::Rounded {
                             format!(
-                                " crate::gguf_format_tests!(@tests {encoding:?} {scales:?} {operands:?}: $($own)*);"
+                                " crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: $($own)*);"
                             )
                         } else {
                             String::new()
@@ -457,7 +413,7 @@ fn gguf_format_tests(out: &Path) {
                     tests.push_str(" $($partial)*");
                 }
                 storages[index].1.push_str(&format!(
-                    " pub mod {}{suffix} {{ crate::gguf_format_tests!(@tests {encoding:?} {scales:?} {operands:?}: {tests}); }}",
+                    " pub mod {}{suffix} {{ crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: {tests}); }}",
                     encoding.ggml_name().to_ascii_lowercase()
                 ));
             }
@@ -472,7 +428,7 @@ fn gguf_format_tests(out: &Path) {
         ));
     }
     let text = format!(
-        "/// Generated by `build.rs` (`gguf_format_tests`) from the registry.\nmacro_rules! gguf_format_tests {{\n{arms}    (@tests $encoding:ident $scales:ident $operands:ident: $($test:ident)*) => {{\n        $(\n            #[test]\n            fn $test() {{\n                crate::$test(crate::Format {{\n                    encoding: ::magnitude_ggml::Encoding::$encoding,\n                    scales: ::seismic::GgufScales::$scales,\n                    operands: ::seismic::OperandRecipe::$operands,\n                }});\n            }}\n        )*\n    }};\n}}\n"
+        "/// Generated by `build.rs` (`gguf_format_tests`) from the registry.\nmacro_rules! gguf_format_tests {{\n{arms}    (@tests $encoding:ident [$scales:expr] $operands:ident: $($test:ident)*) => {{\n        $(\n            #[test]\n            fn $test() {{\n                crate::$test(crate::Format {{\n                    encoding: ::magnitude_ggml::Encoding::$encoding,\n                    scales: $scales,\n                    operands: ::seismic::OperandRecipe::$operands,\n                }});\n            }}\n        )*\n    }};\n}}\n"
     );
     std::fs::write(out.join("gguf_format_tests.rs"), text)
         .unwrap_or_else(|error| panic!("writing gguf_format_tests.rs: {error}"));

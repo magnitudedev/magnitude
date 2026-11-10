@@ -68,10 +68,10 @@ impl Target {
             "band": format!("{:?}", reading.band) }))
     }
 
-    pub fn take(&self, bytes: u64, first: usize) -> Result<Held, String> {
+    /// `bytes` of the selected store, host RAM's written from `seed` ([`written`]).
+    pub fn take(&self, bytes: u64, seed: usize) -> Result<Held, String> {
         if self.device.topology().store(self.store).expect("selected store").kind() == &StoreKind::HostRam {
-            let writers = std::thread::available_parallelism().map_err(|error| error.to_string())?.get();
-            Ok(Held::Host { _words: written(bytes, writers, first * writers)? })
+            Ok(Held::Host { _words: written(bytes, seed)? })
         } else {
             // Ordinary backed storage, not a reservation or a virtual allocation.
             // Its entire placement was proved to resolve to this selected store.

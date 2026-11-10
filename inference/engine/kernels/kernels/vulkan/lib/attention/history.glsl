@@ -40,8 +40,9 @@ struct attention_history {
     uint64_t slab_rows;
 };
 
+// A stored-key history's values are its key plane (it has no value plane).
 attention_history attention_dense_history(uint64_t key, uint64_t value) {
-    return attention_history(key, value, 0ul, 0ul, SEISMIC_PARAM_SLAB_ROWS);
+    return attention_history(key, ATTENTION_STORED_KEY ? key : value, 0ul, 0ul, SEISMIC_PARAM_SLAB_ROWS);
 }
 
 #ifdef ATTENTION_AFFINE_HISTORY
@@ -156,9 +157,12 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
 #endif
 // ---------------------------------------------------------------------------
 // Appending one row (the subgroup's E columns per lane) at history row
-// `destination`: the key (prepared, already rounded to A) or the value.
+// `destination`: the key (prepared, already rounded to A) or the value. A
+// stored-key history stores the key alone.
 void history_append(attention_history h, const bool is_key, int destination, uint kv_head, uint lane,
     float x[ATTENTION_E]) {
+    if (!is_key && ATTENTION_STORED_KEY)
+        return;
 #ifndef ATTENTION_AFFINE_HISTORY
         const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_ACT);
         const uint64_t address = history_address(is_key ? h.key : h.value, uint64_t(destination),

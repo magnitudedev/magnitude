@@ -245,16 +245,13 @@ impl GateCase {
 #[test]
 fn gate_natives_match_the_portable_body() {
     let cases = [(1, 4, 64, false, 1), (5, 4, 160, false, 2), (17, 2, 300, false, 3)]
-        // The stored product, at V4.1's streams (every backend but Vulkan).
+        // The stored product, at V4.1's streams.
         .into_iter()
         .chain([(1, 4, 64, true, 4), (9, 4, 160, true, 5)]);
     for (rows, streams, hidden, product, seed) in cases {
         let case = GateCase::new(rows, streams, hidden, product, seed);
         let oracle = case.oracle();
         for device in devices() {
-            if product && device.backend().as_str() == "vulkan" {
-                continue;
-            }
             check_close(
                 &format!(
                     "{} gate {rows}x{streams}x{hidden} (product {product})",

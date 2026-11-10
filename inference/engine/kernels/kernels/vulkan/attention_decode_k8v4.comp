@@ -31,7 +31,10 @@
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
+#define ATTENTION_KEY_ROUNDING rounding_none()
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SOFTPLUS (SEISMIC_PARAM_GATE_FUNCTION != 0)
 #define ATTENTION_QUERY_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
@@ -155,8 +158,9 @@ void attention_decode_k8v4_partial() {
             const uint64_t source = (row * KV + kv_head) * W;
             float x[ATTENTION_E];
             if (plane == 0u) {
-                attention_prepare(key + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), key_norm, row_coordinates,
-                    components, frequencies, amplitudes, epsilon, lane, x);
+                attention_prepare(key + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_NORM,
+                    key_norm, row_coordinates, components, frequencies, amplitudes, epsilon, lane,
+                    ATTENTION_KEY_ROUNDING, x);
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     x[i] = element_round(ELEMENT_ACT, x[i]);
             } else {
@@ -189,8 +193,8 @@ void attention_decode_k8v4_partial() {
         for (uint head = sg; head < G; head += simds) {
             float x[ATTENTION_E];
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + head)
-                * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
-                amplitudes, epsilon, lane, x);
+                * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
+                row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), x);
             float sum = 0.0;
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
                 const float q = element_round(ELEMENT_ACT, x[i]) * query_scale;
@@ -211,12 +215,12 @@ void attention_decode_k8v4_partial() {
             float low[ATTENTION_E];
             float high[ATTENTION_E];
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair)
-                * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
-                amplitudes, epsilon, lane, low);
+                * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
+                row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), low);
             if (2u * pair + 1u < G)
                 attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + 1u)
-                    * ATTENTION_QUERY_STRIDE) * act_bytes, query_norm, row_coordinates, components, frequencies,
-                    amplitudes, epsilon, lane, high);
+                    * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
+                    row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), high);
             else
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     high[i] = 0.0;
@@ -356,8 +360,9 @@ void attention_decode_k8v4_partial() {
                 const uint64_t at = (token * KV + kv_head) * W;
                 float k[4][ATTENTION_E];
                 float v[4][ATTENTION_E];
-                attention_prepare(key + at * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), key_norm, coordinates + token * 16ul,
-                    components, frequencies, amplitudes, epsilon, lane, k[0]);
+                attention_prepare(key + at * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_NORM,
+                    key_norm, coordinates + token * 16ul, components, frequencies, amplitudes, epsilon, lane,
+                    ATTENTION_KEY_ROUNDING, k[0]);
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     k[0][i] = element_round(ELEMENT_ACT, k[0][i]);
                 attention_value(value + at * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_VALUE_NORM_BUFFER,

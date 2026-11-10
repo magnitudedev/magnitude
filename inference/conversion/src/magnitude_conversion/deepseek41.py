@@ -6,7 +6,7 @@ MXFP4 expert repack, DSpark and vision paths, and store what upstream widens as 
 
 - an FP8 weight `X` is written as `X.weight` (F8_E4M3 codes) plus `X.scale` (I8 holding the checkpoint's UE8M0
   bytes, one per block, in the checkpoint's block grid), declared by `magnitude.scale_encoding = "ue8m0"`
-  (the convention is `inference/docs/precision.md`'s "UE8M0-scaled FP8 weights");
+  (the convention is `inference/docs/precision.md`'s "Block-scaled FP8 weights");
 - the Engram tables are `per_layer_token_embd.weight` (F8_E4M3) plus `per_layer_token_embd.scale` (I8, one per 32);
 - BF16 and F32 tensors keep their type, vectors and norms included (upstream's base writes those F32). The Engram
   gate stays upstream's F32 product of two BF16 tensors (exact).

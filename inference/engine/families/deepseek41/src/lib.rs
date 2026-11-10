@@ -1,7 +1,7 @@
 //! DeepSeek V4.1 Flash (`deepseek41`) artifact recognition and numerical
 //! interpretation, from the converter's GGUF (`inference/conversion`
 //! `deepseek41.py`: llama.cpp v0.9.0 names and metadata, FP8 projections as
-//! E4M3 codes beside their UE8M0 grids, `magnitude.scale_encoding`).
+//! E4M3 codes beside their I8 grids of UE8M0 scales).
 //!
 //! The model is defined by DeepSeek's released code for
 //! deepseek-ai/DeepSeek-V4.1-Flash-1017. Every layer is a window-attention

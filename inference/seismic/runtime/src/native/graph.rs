@@ -2011,6 +2011,9 @@ enum SiteRecords {
 struct PortUse {
     /// A launch reads its grid from it, so it binds no slab view.
     grid: bool,
+    /// A node binds it to a slab port (`&slab`), so it binds a slab view
+    /// or no elements.
+    slab: bool,
     /// A node binds it other than as a record port (a host port, never
     /// bound, does not), so it binds no chunked storage.
     direct: bool,
@@ -2160,6 +2163,16 @@ impl Executable {
                 Region::External(port) => {
                     self.external_writes[port as usize] |= write;
                     self.port_uses[port as usize].grid |= kernel.reads_grid(ordinal);
+                    self.port_uses[port as usize].slab |= kernel.addresses_slab(ordinal);
+                }
+                // Graph storage is never a slab view: a slab port takes it
+                // only where it holds no elements.
+                Region::Upload | Region::Workspace | Region::Outputs
+                    if kernel.addresses_slab(ordinal) && descriptor.byte_len > 0 =>
+                {
+                    return Err(WorkflowError::PlainSlabBinding {
+                        parameter: parameter.name.clone(),
+                    });
                 }
                 Region::Upload => self.upload_written |= write,
                 Region::Workspace | Region::Outputs => {}
@@ -4212,6 +4225,11 @@ impl NativeGraphBindings {
         }
         if self.uses[ordinal].grid && tensor.is_slab_view() {
             return Err(WorkflowError::NativePortSlabGrid { port: ordinal });
+        }
+        if self.uses[ordinal].slab && !tensor.binds_slab_port() {
+            return Err(WorkflowError::PlainSlabBinding {
+                parameter: format!("port {ordinal}"),
+            });
         }
         if self.uses[ordinal].direct && !tensor.binds_directly() {
             return Err(WorkflowError::ChunkedBinding {

@@ -70,8 +70,8 @@ fn scale_rows[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:
     return result
 
 # This fixture keeps ordinary tensor semantics in the checked body while the
-# authored CPU implementation resolves a slab address table for x.
-fn slab_scale[M, N](x: &tensor[M, N] f32, slab_rows: u32, factor: f32, delay_ms: u32) -> tensor[M, N] f32:
+# authored implementations resolve a slab address table for x, a slab port.
+fn slab_scale[M, N](x: &slab tensor[M, N] f32, slab_rows: u32, factor: f32, delay_ms: u32) -> tensor[M, N] f32:
     let mut result = zeros_like(x)
     parallel for row in 0..M:
         parallel for column in 0..N:
@@ -100,7 +100,7 @@ native slab_scale for vulkan from "vulkan/slab_scale.comp":
 
 # One fixed read and write, independent of the number of bound slabs. Used
 # to measure Metal submission cost when residency grows from 1 to 100 slabs.
-fn slab_probe[M, N](x: &tensor[M, N] f32) -> tensor[1] f32:
+fn slab_probe[M, N](x: &slab tensor[M, N] f32) -> tensor[1] f32:
     let mut result = tensor[1] f32
     result[0] = x[0, 0]
     return result

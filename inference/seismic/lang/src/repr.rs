@@ -1505,6 +1505,24 @@ pub(crate) const REPRS: &[Repr] = &[
             },
         },
     },
+    // E4M3 codes under one stored F32 scale per 128: a GGUF F8_E4M3
+    // weight imports as it under its companion grid of F32 tile scales (an
+    // FP8 checkpoint's `weight_scale_inv`, 128 columns a tile), each tile's
+    // scale on every 128 values of its rows. A value is the code times its
+    // scale, one F32 product.
+    Repr {
+        name: "fp8g128",
+        packing_axis: PackingAxisRule::Last,
+        group: 128,
+        coding: Coding::Direct {
+            codes: CodeStorage::Float(FloatCodeFormat::E4M3),
+            scales: Scales::Stored {
+                dtype: DType::F32,
+                bias: false,
+                packet_group: 128,
+            },
+        },
+    },
     // GGUF NVFP4: E2M1 codes, one UE4M3 scale per 16, packets of 64 values
     // (the GGUF block).
     Repr {

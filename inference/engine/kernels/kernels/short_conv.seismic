@@ -29,7 +29,7 @@ fn short_conv_rows[M, B, S, CH, C, T](projection: &tensor[M, 2 * CH] f32,
     convolution: &tensor[CH, C] f32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[S, C - 1 + T, CH] f32,
+    window: &slab mut tensor[S, C - 1 + T, CH] f32,
     slab_banks: u32) -> tensor[M, CH] A where T >= 0:
     let mut gated = tensor[M, CH] A
     for row in 0..M:

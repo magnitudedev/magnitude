@@ -1686,7 +1686,7 @@ fn engram_requests_decode_together_as_each_alone() {
 /// most 46), so no selection there hinges on a near-tie of its scores.
 const WIDE_POOL: CompressedForm = CompressedForm::Reindexed { blocks: 32, block_units: 2, top: 64 };
 
-/// Decode equals prefill, on Metal, CUDA and the CPU: slice C's layer forms
+/// Decode equals prefill, on Metal, CUDA, Vulkan and the CPU: slice C's layer forms
 /// (a window, a pooled source of rate 2 with its own indexer, and a layer
 /// reusing that source and its picks) give each of the 8 rows after a
 /// prompt the same distribution whether they run one row a forward after
@@ -1721,7 +1721,12 @@ fn compressed_layers_decode_equals_prefill() {
     let unit = |name: &str| name.ends_with("norm").then_some(1.0);
     let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(32, false, 1, 32) };
     let mut differing = Vec::new();
-    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Cpu];
+    let backends = [
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Vulkan,
+        seismic::BackendName::Cpu,
+    ];
     let forms = [
         ("unrounded", definition.clone(), &manifest),
         ("slice-c", slice_c_numerics(definition), &manifest),

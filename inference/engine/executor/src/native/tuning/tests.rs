@@ -3799,3 +3799,76 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
     }
 }
+
+/// A compressed layer's attention cases read the picks' rows from a plane
+/// bound as its natives address it, a slab view (`selected`, a slab port):
+/// the cases of V4.1's slice C, whose sources hold more rows than a row
+/// picks at the load's context, so their picks name real rows, are measured
+/// on the device the host has, the declared default first (`attention_prefill`,
+/// which every backend serves rows beyond decode with). A plane bound as
+/// a plain tensor is refused at the call; before slab ports were declared,
+/// CUDA took its elements for slab addresses (an illegal address) and Metal
+/// and the CPU read through them. The budget lets every unit's search end,
+/// so each attention unit's default is measured whatever the backend's
+/// compile times.
+#[test]
+fn a_compressed_load_searches_its_attention_cases_on_the_device() {
+    use crate::operators::attention::tests::selected::{CompressedForm, compressed};
+    /// How many configurations each finished `attention_prefill` unit
+    /// measured: every backend serves rows beyond decode with it.
+    struct Finished(RefCell<Vec<usize>>);
+    impl TuningObserver for Finished {
+        fn event(&self, event: &TuningEvent) {
+            if let TuningEvent::Finished(tuned) = event {
+                if tuned.entry == "attention_prefill" {
+                    self.0.borrow_mut().push(tuned.measured);
+                }
+            }
+        }
+    }
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let selected = crate::platform::select_device(
+        &catalog,
+        crate::ExecutionPath::Native,
+        crate::platform::DeviceRequest::Automatic,
+        &crate::platform::MemoryReserves::of_machine(None),
+    )
+    .unwrap();
+    let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    let (definition, manifest) = compressed(CompressedForm::FullAndReuse);
+    let draft = crate::ExecutionPlanner::prepare(
+        &selected,
+        &manifest,
+        &definition,
+        crate::ComponentSelection { head: false, vision: false },
+        crate::ExecutionPath::Native,
+        crate::PlannedMethod::Plain,
+        magnitude_state::KvCodec::Dense,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let observer = Finished(RefCell::new(Vec::new()));
+    crate::AttestedPrograms::search_draft(
+        &draft,
+        &device,
+        crate::TuningContext {
+            definition: &definition,
+            weights: &crate::ZeroTuningWeights,
+            observer: &observer,
+            cache: None,
+            numerical_profile: crate::ResolvedNumericalProfile::standard(),
+            settings: crate::TuningSettings {
+                budget: Duration::from_secs(600),
+                fresh: true,
+            },
+        },
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let measured = observer.0.borrow();
+    assert!(
+        !measured.is_empty() && measured.iter().all(|&measured| measured > 0),
+        "each attention_prefill unit measures its default: {measured:?}"
+    );
+}

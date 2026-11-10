@@ -2,7 +2,7 @@
 //! type; the wording here is the default a family may keep.
 
 use magnitude_artifacts::{gguf::Encoding, UnsupportedReason};
-use magnitude_family_contracts::{DefinitionError, FamilyError};
+use magnitude_family_contracts::{DefinitionError, FamilyError, ScaleCodes};
 use std::{error, fmt};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -139,24 +139,30 @@ const OUTPUT_HEAD: &str = "output.weight";
 pub enum CompanionForm {
     /// One F32 value per matrix (of `matrices`).
     PerMatrix { matrices: u64 },
-    /// An F8_E4M3 `[rows, columns]` matrix's grid of UE8M0 block scales:
-    /// I8 `[rows / r, columns / c]` for the power-of-two tiles `[r, c]` it
-    /// divides the matrix into (`ImportTransform::grid_tile`), the file
-    /// declaring `magnitude.scale_encoding = "ue8m0"`.
-    Ue8m0Grid { rows: u64, columns: u64 },
+    /// An F8_E4M3 `[rows, columns]` matrix's (each matrix's of a stack of
+    /// `stack`) grid of block scales: `[rows / r, columns / c]` (after the
+    /// stack's extent) for the power-of-two tiles `[r, c]` it divides the
+    /// matrix into (`ImportTransform::grid_tile`), stored as the type of
+    /// any grid codes (`ScaleCodes::stored`).
+    Grid {
+        stack: Option<u64>,
+        rows: u64,
+        columns: u64,
+    },
 }
 
 impl fmt::Display for CompanionForm {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PerMatrix { matrices } => write!(formatter, "F32 [{matrices}]"),
-            Self::Ue8m0Grid { rows, columns } => write!(
-                formatter,
-                "an I8 grid dividing [{rows}, {columns}] into power-of-two tiles, \
-                 declared `{}` = {:?}",
-                crate::tensors::SCALE_ENCODING,
-                crate::tensors::UE8M0,
-            ),
+            Self::Grid { stack, rows, columns } => {
+                let matrix = match stack {
+                    Some(stack) => format!("each of {stack} matrices [{rows}, {columns}]"),
+                    None => format!("[{rows}, {columns}]"),
+                };
+                let types = ScaleCodes::ALL.map(|codes| codes.stored().ggml_name()).join(" or ");
+                write!(formatter, "an {types} grid dividing {matrix} into power-of-two tiles")
+            }
         }
     }
 }

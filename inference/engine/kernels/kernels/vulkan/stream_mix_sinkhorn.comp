@@ -1,0 +1,111 @@
+// stream_mix_sinkhorn (contract and portable body in streams.seismic): one
+// workgroup of 256 invocations per row, as CUDA's. Each invocation
+// accumulates, over its strided share of the row's S * H flattened stream
+// values, their squares and every function row's products; the workgroup
+// reduces them in fixed order (`reduce_group_sum`), and the first invocation
+// forms and publishes pre, post and the Sinkhorn comb from the reduced mixes.
+// The invocations mix the streams by the previous site's pre column by column
+// (`streams_collapse`). Group memory: the reductions' subgroup partials.
+#include <seismic/element.glsl>
+#include "lib/core/precise.glsl"
+#include "lib/core/reduce.glsl"
+#include "lib/core/streams.glsl"
+
+#define SINKHORN_STREAMS uint(SEISMIC_DIM_S)
+#define SINKHORN_MIXES ((2u + SINKHORN_STREAMS) * SINKHORN_STREAMS)
+#define SINKHORN_THREADS 256u
+
+float sinkhorn_sigmoid(float x) {
+    return seismic_div_rn(1.0, 1.0 + precise_exp(-x));
+}
+
+void stream_mix_sinkhorn() {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const uint h = uint(SEISMIC_DIM_H);
+    const uint width = SINKHORN_STREAMS * h;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const float norm_epsilon = element_word_f32(SEISMIC_PARAM_NORM_EPSILON);
+    const uint iterations = uint(SEISMIC_PARAM_ITERATIONS);
+    const uint64_t x = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul;
+    const uint64_t function = SEISMIC_PTR(SEISMIC_BUFFER_FUNCTION);
+    const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
+    const uint64_t scale = SEISMIC_PTR(SEISMIC_BUFFER_SCALE);
+    float squares = 0.0;
+    float mixes[SINKHORN_MIXES];
+    [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)
+        mixes[j] = 0.0;
+    for (uint at = thread; at < width; at += SINKHORN_THREADS) {
+        const uint stream = at / h, column = at % h;
+        const float v = element_f32_at(x + (uint64_t(stream) * SEISMIC_HIDDEN_STRIDE_1
+            + uint64_t(column) * SEISMIC_HIDDEN_STRIDE_2) * 4ul);
+        squares = seismic_fma_rn(v, v, squares);
+        [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)
+            mixes[j] = seismic_fma_rn(element_f32_at(function
+                + (uint64_t(j) * SEISMIC_FUNCTION_STRIDE_0 + uint64_t(at) * SEISMIC_FUNCTION_STRIDE_1) * 4ul), v, mixes[j]);
+    }
+    const float inverse = inversesqrt(seismic_div_rn(reduce_group_sum(squares, 0u), float(width)) + norm_epsilon);
+    [[unroll]] for (uint j = 0u; j < SINKHORN_MIXES; ++j)
+        mixes[j] = reduce_group_sum(mixes[j], 0u) * inverse;
+    if (thread == 0u) {
+        const uint64_t scale_stride = SEISMIC_SCALE_STRIDE_0 * 4ul;
+        const uint64_t base_stride = SEISMIC_BASE_STRIDE_0 * 4ul;
+        // The softmax rows of comb, then its Sinkhorn normalizations.
+        float comb[SINKHORN_STREAMS][SINKHORN_STREAMS];
+        for (uint source = 0u; source < SINKHORN_STREAMS; ++source) {
+            float maximum = -uintBitsToFloat(0x7f800000u);
+            for (uint target = 0u; target < SINKHORN_STREAMS; ++target) {
+                const uint at = 2u * SINKHORN_STREAMS + source * SINKHORN_STREAMS + target;
+                comb[source][target] = mixes[at] * element_f32_at(scale + 2ul * scale_stride)
+                    + element_f32_at(base + uint64_t(at) * base_stride);
+                maximum = max(maximum, comb[source][target]);
+            }
+            float total = 0.0;
+            for (uint target = 0u; target < SINKHORN_STREAMS; ++target) {
+                comb[source][target] = precise_exp(comb[source][target] - maximum);
+                total += comb[source][target];
+            }
+            for (uint target = 0u; target < SINKHORN_STREAMS; ++target)
+                comb[source][target] = seismic_div_rn(comb[source][target], total) + epsilon;
+        }
+        for (uint sweep = 0u; sweep < iterations; ++sweep) {
+            if (sweep > 0u) {
+                for (uint source = 0u; source < SINKHORN_STREAMS; ++source) {
+                    float sum = 0.0;
+                    for (uint target = 0u; target < SINKHORN_STREAMS; ++target)
+                        sum += comb[source][target];
+                    for (uint target = 0u; target < SINKHORN_STREAMS; ++target)
+                        comb[source][target] = seismic_div_rn(comb[source][target], sum + epsilon);
+                }
+            }
+            for (uint target = 0u; target < SINKHORN_STREAMS; ++target) {
+                float sum = 0.0;
+                for (uint source = 0u; source < SINKHORN_STREAMS; ++source)
+                    sum += comb[source][target];
+                for (uint source = 0u; source < SINKHORN_STREAMS; ++source)
+                    comb[source][target] = seismic_div_rn(comb[source][target], sum + epsilon);
+            }
+        }
+        const uint64_t own = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul;
+        const uint64_t joined = SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER) + row * SEISMIC_RESULT_2_STRIDE_0 * 4ul;
+        const uint64_t own_stride = SEISMIC_RESULT_1_STRIDE_1 * 4ul;
+        const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1 * 4ul;
+        for (uint stream = 0u; stream < SINKHORN_STREAMS; ++stream) {
+            element_f32_put(own + uint64_t(stream) * own_stride,
+                sinkhorn_sigmoid(mixes[stream] * element_f32_at(scale) + element_f32_at(base + uint64_t(stream) * base_stride))
+                    + epsilon);
+            element_f32_put(joined + uint64_t(stream) * join_stride,
+                2.0 * sinkhorn_sigmoid(mixes[SINKHORN_STREAMS + stream] * element_f32_at(scale + scale_stride)
+                    + element_f32_at(base + uint64_t(SINKHORN_STREAMS + stream) * base_stride)));
+        }
+        for (uint source = 0u; source < SINKHORN_STREAMS; ++source)
+            for (uint target = 0u; target < SINKHORN_STREAMS; ++target)
+                element_f32_put(joined + uint64_t(SINKHORN_STREAMS + source * SINKHORN_STREAMS + target) * join_stride,
+                    comb[source][target]);
+    }
+    // The sublayer's input: the streams mixed by the previous site's pre.
+    streams_collapse(x, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2,
+        SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS) + row * SEISMIC_PREVIOUS_STRIDE_0 * 4ul, SEISMIC_PREVIOUS_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul, SEISMIC_RESULT_0_STRIDE_1,
+        SINKHORN_STREAMS, h, thread, SINKHORN_THREADS);
+}

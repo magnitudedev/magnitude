@@ -453,6 +453,12 @@ pub enum ShapedHead {
     /// kernel; one whose devices do not ends the submission before the
     /// launch and resumes it on the host's signal).
     AwaitTensor { write: bool },
+    /// A slab port (`&slab tensor`, `&slab mut tensor`): a shared or
+    /// (`write`) mutable borrow whose binding is a slab view, its rows held
+    /// by the slabs its address table names. Its natives reach its rows
+    /// through that table, so it binds no other storage
+    /// ([`crate::entry::PortBinding::Slab`]).
+    SlabTensor { write: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]

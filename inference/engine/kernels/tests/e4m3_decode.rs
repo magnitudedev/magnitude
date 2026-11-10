@@ -1,9 +1,15 @@
 //! E4M3 decode on every device against the format's reference decode, bit
-//! for bit
-//! (`mxfp8g32`: E4M3 codes under one E8M0 scale per 32): every byte code
-//! (NaN, ±0, subnormals, ±448) under every E8M0 exponent, as a gather
-//! decodes each value alone (`embedding_rows`) and as the GEMV's products
-//! take the codes (`project_rows`, under BF16 and F16 activations).
+//! for bit (`mxfp8g32`: E4M3 codes under one E8M0 scale per 32; `fp8g128`:
+//! under one F32 scale per 128): every byte code (NaN, ±0, subnormals,
+//! ±448) under every E8M0 exponent, and under F32 scales across the range
+//! the importer admits, as a gather decodes each value alone
+//! (`embedding_rows`) and as the GEMV's products take the codes
+//! (`project_rows`, under BF16 and F16 activations).
+//!
+//! Under an F32 scale the reference value is the code's value times the
+//! scale, one correctly rounded F32 product; a device that folds the codes'
+//! 2^-9 into the scale computes the same product for every scale the
+//! importer admits (zero or `|s| >= 2^-117`, `import_transforms::f32_scale`).
 //!
 //! The reference restores a weight as its E4M3 codes' values
 //! (`e4m3::value`, the `float8_e4m3fn` format) times their UE8M0 scales,
@@ -15,7 +21,7 @@
 
 use magnitude_ggml::Encoding;
 use magnitude_kernels::{embedding_rows, project_rows};
-use seismic::{BackendName, Device, Element, GgufScales, Layout, NativeSpecialization, Tensor};
+use seismic::{BackendName, Device, Element, GgufScales, GridScale, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 
 mod e4m3;
@@ -43,20 +49,62 @@ fn exponents(device: &Device, last: u8) -> Vec<u8> {
     (first..=last).collect()
 }
 
-/// A table of one row per `(exponent, codes)`: each of its eight assembled
-/// blocks (`gguf_f8_e4m3_e8m0`: the scale byte, then 32 codes) under the
-/// row's exponent.
+/// A row's scale: an E8M0 exponent byte (`mxfp8g32`, a scale per 32
+/// codes) or an F32 value (`fp8g128`, a scale per 128).
+#[derive(Clone, Copy, Debug)]
+enum Scale {
+    E8m0(u8),
+    F32(f32),
+}
+
+impl Scale {
+    fn grid(self) -> GridScale {
+        match self {
+            Self::E8m0(_) => GridScale::E8m0,
+            Self::F32(_) => GridScale::F32,
+        }
+    }
+
+    /// The codes it scales in an assembled block.
+    fn group(self) -> usize {
+        match self {
+            Self::E8m0(_) => 32,
+            Self::F32(_) => 128,
+        }
+    }
+
+    /// Its bytes at the head of an assembled block.
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::E8m0(exponent) => vec![exponent],
+            Self::F32(scale) => scale.to_le_bytes().to_vec(),
+        }
+    }
+
+    /// The reference's value of it.
+    fn value(self) -> f32 {
+        match self {
+            Self::E8m0(exponent) => ue8m0(exponent),
+            Self::F32(scale) => scale,
+        }
+    }
+}
+
+/// A table of one row per `(scale, codes)`, every scale of one kind: each
+/// of its assembled blocks (`gguf_f8_e4m3_e8m0`, `gguf_f8_e4m3_f32`: the
+/// scale, then its group of codes) under the row's scale.
 struct Table {
-    rows: Vec<(u8, [u8; K])>,
+    rows: Vec<(Scale, [u8; K])>,
     blocks: Vec<u8>,
 }
 
 impl Table {
-    fn new(rows: Vec<(u8, [u8; K])>) -> Self {
-        let mut blocks = Vec::with_capacity(rows.len() * K / 32 * 33);
-        for (exponent, codes) in &rows {
-            for block in codes.chunks_exact(32) {
-                blocks.push(*exponent);
+    fn new(rows: Vec<(Scale, [u8; K])>) -> Self {
+        let mut blocks = Vec::new();
+        for (scale, codes) in &rows {
+            assert_eq!(scale.grid(), rows[0].0.grid(), "a table's scales are of one kind");
+            for block in codes.chunks_exact(scale.group()) {
+                blocks.extend(scale.bytes());
                 blocks.extend_from_slice(block);
             }
         }
@@ -67,19 +115,21 @@ impl Table {
         [self.rows.len() as u64, K as u64]
     }
 
-    /// The reference values of the table, row-major.
+    /// The reference values of the table, row-major: each code's value
+    /// times its row's scale, one F32 product.
     fn values(&self) -> Vec<f32> {
         self.rows
             .iter()
-            .flat_map(|(exponent, codes)| codes.map(|code| e4m3::value(code) * ue8m0(*exponent)))
+            .flat_map(|(scale, codes)| codes.map(|code| e4m3::value(code) * scale.value()))
             .collect()
     }
 
     /// The table's bytes in `layout`, whose host decode is the reference
     /// values.
     fn resident(&self, layout: Layout) -> (Element, Vec<u8>) {
-        let source = Element::gguf_packet_source(Encoding::F8E4M3, GgufScales::E8m0Grid).unwrap();
-        let element = Element::stored("mxfp8g32", layout).unwrap();
+        let grid = self.rows[0].0.grid();
+        let source = Element::gguf_packet_source(Encoding::F8E4M3, GgufScales::Grid(grid)).unwrap();
+        let element = source.converted(layout, seismic::OperandRecipe::Rounded).unwrap();
         let bytes = element.repack_host(source, &self.shape(), &self.blocks).unwrap();
         let host = element
             .decode_host(&self.shape(), &bytes)
@@ -87,9 +137,35 @@ impl Table {
             .into_iter()
             .map(|value| value as f32)
             .collect::<Vec<_>>();
-        assert_same(&format!("host decode in {layout:?}"), &host, &self.values());
+        assert_same(&format!("host decode of {} in {layout:?}", element.name()), &host, &self.values());
         (element, bytes)
     }
+}
+
+/// F32 scales across the range the importer admits whose products with
+/// every finite code stay finite (`448 |s| < 2^128` for `|s| < 2^119`):
+/// zero, and for each binary exponent from -117 (the least admitted) to 118
+/// a scale of a pseudo-random 23-bit mantissa (all zeros and all ones at
+/// the two least), of alternating sign, so products with most codes round.
+fn f32_scales() -> Vec<Scale> {
+    let mut state = 0x9e37_79b9_u32;
+    let mut mantissa = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state & 0x7f_ffff
+    };
+    let mut scales = vec![Scale::F32(0.0)];
+    for exponent in -117..=118i32 {
+        let bits = match exponent {
+            -117 => 0,
+            -116 => 0x7f_ffff,
+            _ => mantissa(),
+        };
+        let sign = if exponent % 2 == 0 { 0 } else { 1 << 31 };
+        scales.push(Scale::F32(f32::from_bits(sign | (((127 + exponent) as u32) << 23) | bits)));
+    }
+    scales
 }
 
 /// Row `r`'s codes: `codes` rotated by 7 r, so a code meets every column
@@ -166,58 +242,72 @@ fn defaults<E: seismic::Entry>(
 /// too, `rows16`).
 #[test]
 fn e4m3_gathers_match_the_reference_at_every_code_and_exponent() {
-    let codes: [u8; K] = std::array::from_fn(|k| k as u8);
     for device in seismic_native_tests::every_device() {
-        let table = Table::new(
-            exponents(&device, 254)
-                .into_iter()
-                .enumerate()
-                .map(|(r, exponent)| (exponent, rotated(&codes, r)))
-                .collect(),
+        let scales = exponents(&device, 254).into_iter().map(Scale::E8m0).collect();
+        e4m3_gathers_match_the_reference_on(&device, scales);
+    }
+}
+
+/// Every code under F32 scales across the admitted range (`f32_scales`),
+/// gathered, as `e4m3_gathers_match_the_reference_at_every_code_and_exponent`.
+#[test]
+fn e4m3_gathers_match_the_reference_under_f32_scales() {
+    for device in seismic_native_tests::every_device() {
+        e4m3_gathers_match_the_reference_on(&device, f32_scales());
+    }
+}
+
+fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
+    let codes: [u8; K] = std::array::from_fn(|k| k as u8);
+    let table = Table::new(
+        scales
+            .into_iter()
+            .enumerate()
+            .map(|(r, scale)| (scale, rotated(&codes, r)))
+            .collect(),
+    );
+    let expected = table.values().into_iter().map(bf16_round).collect::<Vec<_>>();
+    let rows = table.rows.len();
+    let pairs = (0..rows as i32).flat_map(|row| [row, 0]).collect::<Vec<_>>();
+    let tokens = i32_tensor(device, &[rows as u64, 2], &pairs);
+    let directory = i32_tensor(device, &[0, 1], &[]);
+    let mut layouts = vec![device.backend().resident_layout()];
+    if device.backend() == BackendName::Cuda {
+        layouts.push(Layout::Rows16);
+    }
+    for layout in layouts {
+        let (element, bytes) = table.resident(layout);
+        let elements = || embedding_rows::Elements {
+            EW: element,
+            A: Element::bf16(),
+        };
+        let statics = embedding_rows::native_implementation(device)
+            .unwrap()
+            .unwrap()
+            .statics
+            .clone();
+        let specialization = defaults(
+            device,
+            &embedding_rows::native_entry_with(elements()),
+            &statics,
+            &[("D", K as u64)],
         );
-        let expected = table.values().into_iter().map(bf16_round).collect::<Vec<_>>();
-        let rows = table.rows.len();
-        let pairs = (0..rows as i32).flat_map(|row| [row, 0]).collect::<Vec<_>>();
-        let tokens = i32_tensor(&device, &[rows as u64, 2], &pairs);
-        let directory = i32_tensor(&device, &[0, 1], &[]);
-        let mut layouts = vec![device.backend().resident_layout()];
-        if device.backend() == BackendName::Cuda {
-            layouts.push(Layout::Rows16);
-        }
-        for layout in layouts {
-            let (element, bytes) = table.resident(layout);
-            let elements = || embedding_rows::Elements {
-                EW: element,
-                A: Element::bf16(),
-            };
-            let statics = embedding_rows::native_implementation(&device)
-                .unwrap()
-                .unwrap()
-                .statics
-                .clone();
-            let specialization = defaults(
-                &device,
-                &embedding_rows::native_entry_with(elements()),
-                &statics,
-                &[("D", K as u64)],
-            );
-            let out = embedding_rows::native_for_device_with(&device, elements(), &specialization)
-                .unwrap()
-                .call(embedding_rows::Args {
-                    table: &Tensor::from_host(&device, element, &table.shape(), &bytes).unwrap(),
-                    tokens: &tokens,
-                    directory: &directory,
-                    scale: 1.0,
-                    normalize: 0,
-                    epsilon: 0.0,
-                })
-                .unwrap();
-            assert_same(
-                &format!("{:?} gather from {layout:?}", device.backend()),
-                &read_f32(&out.r1),
-                &expected,
-            );
-        }
+        let out = embedding_rows::native_for_device_with(device, elements(), &specialization)
+            .unwrap()
+            .call(embedding_rows::Args {
+                table: &Tensor::from_host(device, element, &table.shape(), &bytes).unwrap(),
+                tokens: &tokens,
+                directory: &directory,
+                scale: 1.0,
+                normalize: 0,
+                epsilon: 0.0,
+            })
+            .unwrap();
+        assert_same(
+            &format!("{:?} gather of {} from {layout:?}", device.backend(), element.name()),
+            &read_f32(&out.r1),
+            &expected,
+        );
     }
 }
 
@@ -228,84 +318,101 @@ fn e4m3_gathers_match_the_reference_at_every_code_and_exponent() {
 /// its every output NaN.
 #[test]
 fn e4m3_gemv_products_match_the_reference_at_every_code_and_exponent() {
+    for device in seismic_native_tests::every_device() {
+        // 448 2^(e - 127) is finite up to e = 245.
+        let scales = exponents(&device, 245).into_iter().map(Scale::E8m0).collect();
+        e4m3_gemv_products_match_the_reference_on(&device, scales, Scale::E8m0(127));
+    }
+}
+
+/// Every finite code under F32 scales across the admitted range
+/// (`f32_scales`), as the GEMV's products take them, as
+/// `e4m3_gemv_products_match_the_reference_at_every_code_and_exponent`.
+#[test]
+fn e4m3_gemv_products_match_the_reference_under_f32_scales() {
+    for device in seismic_native_tests::every_device() {
+        e4m3_gemv_products_match_the_reference_on(&device, f32_scales(), Scale::F32(1.0));
+    }
+}
+
+/// The GEMV of a table of every finite code under each of `scales`, then a
+/// row of one NaN code of each sign under `one` (a scale of 1).
+fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>, one: Scale) {
     let finite = (0..=u8::MAX)
         .filter(|code| code & 0x7f != 0x7f)
         .chain([0x00, 0x80])
         .collect::<Vec<_>>();
     let finite: [u8; K] = finite.try_into().unwrap();
-    for device in seismic_native_tests::every_device() {
-        // 448 2^(e - 127) is finite up to e = 245.
-        let mut rows = exponents(&device, 245)
-            .into_iter()
-            .enumerate()
-            .map(|(r, exponent)| (exponent, rotated(&finite, r)))
-            .collect::<Vec<_>>();
-        let nan_rows = rows.len();
-        // One NaN code of each sign, among zeros.
-        let mut positive = [0x00; K];
-        positive[5] = 0x7f;
-        let mut negative = [0x80; K];
-        negative[200] = 0xff;
-        rows.extend([(127, positive), (127, negative)]);
-        let table = Table::new(rows);
-        let n = table.rows.len();
-        let values = table.values();
-        let (element, bytes) = table.resident(device.backend().resident_layout());
-        let weight = Tensor::from_host(&device, element, &table.shape(), &bytes).unwrap();
-        for act in [Element::bf16(), Element::f16()] {
-            let elements = || project_rows::Elements {
-                A: act,
-                W: element,
-                Y: Element::f32(),
-            };
-            let statics = project_rows::native_implementation(&device)
-                .unwrap()
-                .unwrap()
-                .statics
-                .clone();
-            let specialization = defaults(
-                &device,
-                &project_rows::native_entry_with(elements()),
-                &statics,
-                &[("G", 1), ("K", K as u64), ("N", n as u64), ("WS", 0), ("WB", 0)],
-            );
-            let kernel =
-                project_rows::native_for_device_with(&device, elements(), &specialization).unwrap();
-            // 1.0 in BF16 and F16.
-            let one = if act == Element::bf16() { 0x3f80u16 } else { 0x3c00u16 };
-            let mut actual = Vec::with_capacity(K * n);
-            for column in 0..K {
-                let source = (0..K)
-                    .flat_map(|k| (if k == column { one } else { 0 }).to_le_bytes())
-                    .collect::<Vec<_>>();
-                let out = kernel
-                    .call(project_rows::Args {
-                        source: &Tensor::from_host(&device, act, &[1, K as u64], &source).unwrap(),
-                        weight: &weight,
-                        weight_scale: &f32_tensor(&device, &[0], &[]),
-                        weight_bound: &f32_tensor(&device, &[0], &[]),
-                    })
-                    .unwrap()
-                    .value;
-                actual.extend(read_f32(&out));
-            }
-            let expected = (0..K)
-                .flat_map(|column| {
-                    let values = &values;
-                    (0..n).map(move |row| {
-                        if row >= nan_rows {
-                            f32::NAN
-                        } else {
-                            values[row * K + column] + 0.0
-                        }
-                    })
-                })
+    let mut rows = scales
+        .into_iter()
+        .enumerate()
+        .map(|(r, scale)| (scale, rotated(&finite, r)))
+        .collect::<Vec<_>>();
+    let nan_rows = rows.len();
+    // One NaN code of each sign, among zeros.
+    let mut positive = [0x00; K];
+    positive[5] = 0x7f;
+    let mut negative = [0x80; K];
+    negative[200] = 0xff;
+    rows.extend([(one, positive), (one, negative)]);
+    let table = Table::new(rows);
+    let n = table.rows.len();
+    let values = table.values();
+    let (element, bytes) = table.resident(device.backend().resident_layout());
+    let weight = Tensor::from_host(device, element, &table.shape(), &bytes).unwrap();
+    for act in [Element::bf16(), Element::f16()] {
+        let elements = || project_rows::Elements {
+            A: act,
+            W: element,
+            Y: Element::f32(),
+        };
+        let statics = project_rows::native_implementation(device)
+            .unwrap()
+            .unwrap()
+            .statics
+            .clone();
+        let specialization = defaults(
+            device,
+            &project_rows::native_entry_with(elements()),
+            &statics,
+            &[("G", 1), ("K", K as u64), ("N", n as u64), ("WS", 0), ("WB", 0)],
+        );
+        let kernel =
+            project_rows::native_for_device_with(device, elements(), &specialization).unwrap();
+        // 1.0 in BF16 and F16.
+        let one = if act == Element::bf16() { 0x3f80u16 } else { 0x3c00u16 };
+        let mut actual = Vec::with_capacity(K * n);
+        for column in 0..K {
+            let source = (0..K)
+                .flat_map(|k| (if k == column { one } else { 0 }).to_le_bytes())
                 .collect::<Vec<_>>();
-            assert_same(
-                &format!("{:?} GEMV under {act:?}", device.backend()),
-                &actual,
-                &expected,
-            );
+            let out = kernel
+                .call(project_rows::Args {
+                    source: &Tensor::from_host(device, act, &[1, K as u64], &source).unwrap(),
+                    weight: &weight,
+                    weight_scale: &f32_tensor(device, &[0], &[]),
+                    weight_bound: &f32_tensor(device, &[0], &[]),
+                })
+                .unwrap()
+                .value;
+            actual.extend(read_f32(&out));
         }
+        let expected = (0..K)
+            .flat_map(|column| {
+                let values = &values;
+                (0..n).map(move |row| {
+                    if row >= nan_rows {
+                        f32::NAN
+                    } else {
+                        values[row * K + column] + 0.0
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_same(
+            &format!("{:?} GEMV under {act:?}", device.backend()),
+            &actual,
+            &expected,
+        );
     }
 }

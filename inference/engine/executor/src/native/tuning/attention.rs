@@ -16,8 +16,8 @@
 
 use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, across_sequences,
-    history_placement, longest_history, row_points, served_row_points, with_contexts,
+    CaseState, EntryTuning, ModelInputs, PointShape, SlabView, TuningInputs, TuningLimits,
+    across_sequences, history_placement, longest_history, row_points, served_row_points, with_contexts,
 };
 use crate::operators;
 use crate::operators::attention::graph::{
@@ -1339,9 +1339,9 @@ pub(crate) struct AttentionMixCase<H> {
     block_slots: Tensor,
     /// The dense entries' index-list source: each row's picks (`[rows,
     /// KS]`) of the rows its source holds, in a plane of the most any row
-    /// holds (`[TS, KV, W]`), and source 0's key rounding.
+    /// holds (`[TS, KV, W]`, a slab port's), and source 0's key rounding.
     selected_rows: Tensor,
-    selected: Tensor,
+    selected: SlabView,
     key_rounding: crate::RoundingArgs,
     /// The rotary layout, output rotary, stored-key values and, for the
     /// dense entries, key rounding (`[0, RA, RT, RO, VK(, KR)]`, no values).
@@ -1881,11 +1881,11 @@ impl AttentionMix {
                     )?,
                     block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
                     selected_rows: inputs.i32s(&[rows, shape.widths.picks], &selected_rows)?,
-                    selected: inputs.activation(
+                    selected: inputs.slab_view(inputs.activation(
                         self.activation,
                         &[plane_rows, shape.widths.kv_heads, shape.widths.width],
                         0x77,
-                    )?,
+                    )?)?,
                     key_rounding: shape.key_rounding,
                     form: inputs.i32s(
                         &[
@@ -2074,8 +2074,8 @@ mix_entry!(
     statics |_mix| [],
     |case| {
         selected_rows: &case.selected_rows,
-        selected: &case.selected,
-        selected_slab_rows: 1,
+        selected: case.selected.tensor(),
+        selected_slab_rows: case.selected.rows_per_slab(),
         key_block: case.key_rounding.block,
         key_element: case.key_rounding.element,
         key_scale: case.key_rounding.scale,
@@ -2095,8 +2095,8 @@ mix_entry!(
         selection: &case.selection,
         block_slots: &case.block_slots,
         selected_rows: &case.selected_rows,
-        selected: &case.selected,
-        selected_slab_rows: 1,
+        selected: case.selected.tensor(),
+        selected_slab_rows: case.selected.rows_per_slab(),
         key_block: case.key_rounding.block,
         key_element: case.key_rounding.element,
         key_scale: case.key_rounding.scale,

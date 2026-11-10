@@ -62,6 +62,13 @@
 #else
 #define PREFILL_SELECTED_PASS PREFILL_SELECTED
 #endif
+// An index-list source (the entry's PREFILL_PICKS: its KS > 0) is one more
+// softmax state per (row, query head) after the key partitions'
+// (`prefill_picks`, a subgroup over the row's picks), which the merge folds
+// in, so every tile publishes partials then.
+#ifndef PREFILL_PICKS
+#define PREFILL_PICKS false
+#endif
 // PREFILL_ROWS, the matrix rows of a workgroup, is the entry's (and with
 // PREFILL_DECODE, PREFILL_PARTS its partitions).
 
@@ -73,6 +80,14 @@ struct prefill_scratch {
     uint64_t keys;
     uint64_t values;
     uint64_t counts;
+};
+
+// The index-list source's state (PREFILL_PICKS), named by the entry:
+// [M][KV * G][W] and [M][KV * G][2] F32 after the key partitions' partials
+// and statistics; zero without picks.
+struct prefill_picked {
+    uint64_t partials;
+    uint64_t statistics;
 };
 #define PREFILL_QT (PREFILL_ROWS / ATTENTION_G)
 #ifdef PREFILL_DECODE
@@ -87,6 +102,24 @@ struct prefill_scratch {
 
 // ---------------------------------------------------------------------------
 // L1.
+
+// The lane's E columns of batch row `row`'s prepared key (rounded by the
+// entry's key rounding and to A, as history stores it) or value for
+// `kv_head`, one subgroup. A stored-key value is the prepared key.
+void prefill_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane, out float x[ATTENTION_E]) {
+    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    if (is_key || ATTENTION_STORED_KEY) {
+        attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source, ATTENTION_NORM,
+            SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
+            SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+            ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, ATTENTION_KEY_ROUNDING, x);
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            x[i] = element_round(ELEMENT_ACT, x[i]);
+    } else {
+        attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
+    }
+}
 
 #ifndef PREFILL_DECODE
 
@@ -107,9 +140,10 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
         float x[ATTENTION_E];
         if (row < rows) {
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + head) * ATTENTION_QUERY_STRIDE) * 2ul,
-                SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
+                ATTENTION_QUERY_NORM, SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM),
+                SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
-                ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, x);
+                ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, rounding_none(), x);
         } else {
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 x[i] = 0.0;
@@ -123,16 +157,17 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint kv_head = head - KV * G;
     const uint64_t source = (row * KV + kv_head) * W;
     float k[ATTENTION_E], v[ATTENTION_E];
-    attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source * 2ul, SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM),
-        SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS),
-        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), ATTENTION_AMPLITUDE_BUFFER,
-        element_word_f32(SEISMIC_PARAM_EPSILON), lane, k);
-    attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source * 2ul, ATTENTION_VALUE_NORM_BUFFER,
-        element_word_f32(SEISMIC_PARAM_EPSILON), lane, v);
+    prefill_fresh_row(true, row, kv_head, lane, k);
+    // A stored-key value is the prepared key.
+    if (ATTENTION_STORED_KEY) {
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            v[i] = k[i];
+    } else {
+        prefill_fresh_row(false, row, kv_head, lane, v);
+    }
     const uint64_t keys = scratch_planes.keys;
     const uint64_t values = scratch_planes.values;
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
-        k[i] = element_round(ELEMENT_ACT, k[i]);
         element_put(ELEMENT_F16, keys, source + lane * E + i, k[i]);
         element_put(ELEMENT_F16, values, source + lane * E + i, v[i]);
     }
@@ -146,22 +181,6 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
 
 // ---------------------------------------------------------------------------
 // L2.
-
-// The lane's E columns of batch row `row`'s prepared key (rounded to A, as
-// history stores it) or value for `kv_head`, one subgroup.
-void prefill_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane, out float x[ATTENTION_E]) {
-    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
-    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
-    if (is_key) {
-        attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source, SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM),
-            SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS),
-            SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, x);
-        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_round(ELEMENT_ACT, x[i]);
-    } else {
-        attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
-    }
-}
 
 // Columns [column, column + w) of the lane's E columns of a row, as f16, into
 // row `row` of the tile at shared half `base` (row pitch `pitch`).
@@ -419,10 +438,10 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         float x[ATTENTION_E];
         if (i < PREFILL_QT * G && token < rows) {
             attention_prepare(ATTENTION_QUERY_BUFFER + ((token * KV * G + kv_head * G + i % G) * ATTENTION_QUERY_STRIDE)
-                    * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)),
+                    * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_QUERY_NORM,
                 SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + token * 16ul,
                 SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
-                ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, x);
+                ATTENTION_AMPLITUDE_BUFFER, element_word_f32(SEISMIC_PARAM_EPSILON), lane, rounding_none(), x);
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
                 x[j] = element_round(ELEMENT_ACT, x[j]);
         } else {
@@ -623,7 +642,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                     element_f32_put(statistics + slot * 8ul + 4ul, row_denominator);
                 }
 #else
-                if (used > 1u) {
+                if (used > 1u || PREFILL_PICKS) {
                     const uint64_t slot = (uint64_t(part) * rows + out_token) * heads + out_head;
                     element_f32_put(partials + (slot * W + column) * 4ul, value);
                     if (column == 0u) {
@@ -642,24 +661,117 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 
 #ifndef PREFILL_DECODE
 // ---------------------------------------------------------------------------
+// The index-list source (PREFILL_PICKS), after L1 put the queries:
+// workgroup (row, query head), one subgroup. Its softmax state over the row's
+// `picks` picks (`selected_rows`, [M][picks] i32, -1 for none; each the kv
+// head's vector of the `selected` plane, [rows][KV][W] A in slabs of
+// `selected_slab_rows` rows, read as key and value) is `picked`'s.
+void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64_t selected_rows, uint picks,
+    uint64_t selected, uint64_t selected_slab_rows) {
+    const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
+    const uint64_t rows = SEISMIC_DIM_M;
+    const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint kv_head = head / G;
+    const uint lane = SEISMIC_LANE;
+    const float scale = element_word_f32(SEISMIC_PARAM_SCALE) * ATTENTION_LOG2E;
+    const uint64_t query = ((uint64_t(kv_head) * padded + row) * G + head % G) * W + lane * E;
+    float q[ATTENTION_E], accumulated[ATTENTION_E];
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
+        q[i] = element_at(ELEMENT_F16, scratch_planes.queries, query + i);
+        accumulated[i] = 0.0;
+    }
+    const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ELEMENT_ACT);
+    float maximum = -ATTENTION_INF;
+    float denominator = 0.0;
+    for (uint pick = 0u; pick < picks; ++pick) {
+        const int index = element_i32_at(selected_rows + (row * picks + pick) * 4ul);
+        if (index < 0)
+            continue;
+        float x[ATTENTION_E];
+        const uint64_t vector = history_address(selected, uint64_t(index), selected_slab_rows,
+            uint64_t(KV) * head_bytes, head_bytes, kv_head);
+        attention_load_row(vector, uint64_t(lane) * E, x);
+        float dot = 0.0;
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            dot = seismic_fma_rn(q[i], x[i], dot);
+        const float score = seismic_subgroup_sum_f32(dot) * scale;
+        const float next = max(maximum, score);
+        const float carry = exp2(maximum - next);
+        const float weight = exp2(score - next);
+        denominator = seismic_fma_rn(denominator, carry, weight);
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            accumulated[i] = seismic_fma_rn(accumulated[i], carry, weight * x[i]);
+        maximum = next;
+    }
+    const uint64_t state = row * KV * G + head;
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+        element_f32_put(picked.partials + (state * W + lane * E + i) * 4ul, accumulated[i]);
+    if (lane == 0u) {
+        element_f32_put(picked.statistics + state * 8ul, maximum);
+        element_f32_put(picked.statistics + state * 8ul + 4ul, denominator);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // L3: workgroup (QT-row tile, query head), one invocation per column. A tile
-// that took several key partitions merges each of its rows' partitions in
-// partition order and applies the gate; other tiles were stored by L2.
-void prefill_merge(prefill_scratch scratch_planes) {
+// that took several key partitions, or any tile with an index-list source,
+// merges each of its rows' partitions in partition order, then the picked
+// state, and applies the gate; other tiles were stored by L2.
+void prefill_merge(prefill_scratch scratch_planes, prefill_picked picked) {
     const uint64_t heads = uint64_t(ATTENTION_KV * ATTENTION_G);
     const uint tile = gl_WorkGroupID.x;
     const uint64_t head = gl_WorkGroupID.y;
     const uint column = gl_LocalInvocationIndex;
     const uint count = element_u32_at(scratch_planes.counts + uint64_t(tile) * 4ul);
-    if (count <= 1u)
+    if (count <= 1u && !PREFILL_PICKS)
         return;
     const uint64_t rows = SEISMIC_DIM_M;
     for (uint64_t row = uint64_t(tile) * PREFILL_QT; row < min(uint64_t(tile + 1u) * PREFILL_QT, rows); ++row) {
-        const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), row * heads + head, rows * heads, count, column, head);
+        const uint64_t slot = row * heads + head;
+        vec3 merged = attention_merge_state(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), slot, rows * heads, count, column);
+        if (PREFILL_PICKS) {
+            const float denominator = element_f32_at(picked.statistics + slot * 8ul + 4ul);
+            if (denominator > 0.0) {
+                const float maximum = element_f32_at(picked.statistics + slot * 8ul);
+                const float next = max(merged.x, maximum);
+                const float carry = exp2(merged.x - next);
+                const float weight = exp2(maximum - next);
+                merged = vec3(next, seismic_fma_rn(denominator, weight, merged.y * carry),
+                    seismic_fma_rn(element_f32_at(picked.partials + (slot * ATTENTION_W + column) * 4ul), weight,
+                        merged.z * carry));
+            }
+        }
         attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
-            head, column, attended);
+            head, column, attention_attended(merged.z, merged.x, merged.y, head));
     }
+}
+
+// The output rotary (RO = 1), after every query head's output is stored:
+// workgroup (row, query head), invocation `pair` turns its pair of the
+// published row back by the row's negated angles (the portable
+// `output_rotary`), in F32, and publishes it again.
+void prefill_rotate() {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t head = gl_WorkGroupID.y;
+    const uint pair = gl_LocalInvocationIndex;
+    if (pair >= ATTENTION_P)
+        return;
+    float cosine, sine;
+    rotary_turn(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul, 1ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), 1ul, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), 1ul,
+        ATTENTION_AMPLITUDE_BUFFER, 1ul, pair, cosine, sine);
+    const rotary_layout pairs = ATTENTION_ROTARY;
+    const uint lo = rotary_leading(pair, pairs);
+    const uint hi = rotary_partner(lo, pairs.p, pairs.first, pairs.adjacent);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t row_at = (row * uint64_t(ATTENTION_KV * ATTENTION_G) + head) * ATTENTION_W;
+    const float low = element_at(ELEMENT_ACT, result, row_at + lo);
+    const float high = element_at(ELEMENT_ACT, result, row_at + hi);
+    element_put(ELEMENT_ACT, result, row_at + lo, low * cosine + high * sine);
+    element_put(ELEMENT_ACT, result, row_at + hi, high * cosine - low * sine);
 }
 #endif
 

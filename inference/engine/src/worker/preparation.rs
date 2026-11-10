@@ -25,7 +25,7 @@ use crate::execution::LoadAttempt;
 use crate::options::ExecutionManifest;
 use magnitude_executor::{UnpreparedUnits, pinned_tuning};
 use std::io::BufReader;
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 /// A worker process a host started for one request.
 pub struct WorkerProcess<T, R> {
@@ -165,16 +165,43 @@ pub type ChildTransport =
 /// standard error): a host executable's own worker entry, which runs
 /// [`super::serve_worker`] over [`super::transport::stdio_worker_transport`].
 pub fn start_worker_process(
-    mut command: Command,
+    command: Command,
 ) -> Result<
     WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>,
+    LoadError,
+> {
+    spawn_worker(command, Stdio::inherit()).map(|(process, _)| process)
+}
+
+/// [`start_worker_process`], its diagnostics on a pipe this process reads
+/// rather than on this process's standard error: for a host that observes
+/// what the worker reports as it runs. The host keeps the pipe drained, or
+/// the worker stops once its buffer fills.
+pub fn observe_worker_process(
+    command: Command,
+) -> Result<
+    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>, ChildStderr),
+    LoadError,
+> {
+    let (process, stderr) = spawn_worker(command, Stdio::piped())?;
+    let stderr = stderr.ok_or_else(|| LoadError::WorkerLost { reason: "the worker process has no diagnostic stream".into() })?;
+    Ok((process, stderr))
+}
+
+/// `command` started with its diagnostics on `stderr`, and their pipe when
+/// piped.
+fn spawn_worker(
+    mut command: Command,
+    stderr: Stdio,
+) -> Result<
+    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>, Option<ChildStderr>),
     LoadError,
 > {
     let lost = |reason: String| LoadError::WorkerLost { reason };
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .spawn()
         .map_err(|error| lost(format!("starting {command:?}: {error}")))?;
     let streams = child.stdin.take().zip(child.stdout.take());
@@ -182,10 +209,14 @@ pub fn start_worker_process(
         let _ = retire(child, WorkerReport::Unreported);
         return Err(lost("the worker process has no standard streams".into()));
     };
-    Ok(WorkerProcess {
-        transport: FramedTransport::new(BufReader::new(stdout), stdin),
-        retire: move |report| retire(child, report),
-    })
+    let diagnostics = child.stderr.take();
+    Ok((
+        WorkerProcess {
+            transport: FramedTransport::new(BufReader::new(stdout), stdin),
+            retire: move |report| retire(child, report),
+        },
+        diagnostics,
+    ))
 }
 
 /// Return once `child` is gone. A worker that reported its outcome is

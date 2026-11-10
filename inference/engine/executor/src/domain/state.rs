@@ -1069,7 +1069,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(|grown| self.resources.hold_class(grown));
             self.release_claim(claim);
             if held.is_ok() {
-                tracing::info!("prompt groups hold {places} places, {bytes} bytes more");
+                tracing::info!(places, bytes, "prompt groups hold more places");
             }
             self.refresh_memory()?;
             return match held.map_err(|error| match error {

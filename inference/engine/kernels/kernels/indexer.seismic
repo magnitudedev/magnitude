@@ -66,8 +66,8 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
     visible: &tensor[M, R, 2] i32,
     block_slots: &tensor[0, SB] i32, segment_slots: &tensor[0, C] i32,
     bitmap_words: &tensor[0, B] u32,
-    window_keys: &mut tensor[TW, 2 * P + S] f32, window_coordinates: &mut tensor[TW, 4] i32,
-    block_keys: &mut tensor[TB, 2 * P + S] f32,
+    window_keys: &slab mut tensor[TW, 2 * P + S] f32, window_coordinates: &slab mut tensor[TW, 4] i32,
+    block_keys: &slab mut tensor[TB, 2 * P + S] f32,
     selected: i32, epsilon: f32, slab_rows: u32, window_slab_rows: u32, block_slab_rows: u32)
     -> (tensor[M, C, 2] i32, tensor[M, B] u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and H >= 1 and SB >= 1 and C >= 0 and B >= 0:
@@ -332,7 +332,7 @@ fn indexer_keys[M, TB, P, S, RA, RT](key: &tensor[M, 2 * P + S] A,
     key_norm: &tensor[1, 2 * P + S] f32, latent_rows: &tensor[M] i32,
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
-    keys: &mut tensor[TB, 2 * P + S] f32, form: &host tensor[0, RA, RT] i32,
+    keys: &slab mut tensor[TB, 2 * P + S] f32, form: &host tensor[0, RA, RT] i32,
     epsilon: f32, block: i32, element: i32, scale: i32, amax_floor: f32, slab_rows: u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
     let layout = tensor[0, RA, RT, 0] i32
@@ -354,7 +354,7 @@ fn indexer_score[M, H, P, S, NQ, HW, TB, R, N, RA, RT](query: &tensor[M, H, 2 * 
     query_norm: &tensor[NQ, 2 * P + S] f32, head_weights: &tensor[M, HW] A,
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
-    keys: &tensor[TB, 2 * P + S] f32, spans: &tensor[M, R, 2] i32,
+    keys: &slab tensor[TB, 2 * P + S] f32, spans: &tensor[M, R, 2] i32,
     score_slots: &tensor[0, N] i32, form: &host tensor[0, RA, RT] i32,
     scale: f32, epsilon: f32, block: i32, element: i32, rounding_scale: i32, amax_floor: f32,
     slab_rows: u32) -> tensor[M, N] f32
@@ -455,6 +455,15 @@ native indexer_keys for cuda from "cuda/indexer_keys.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8 * (2 * P + S) * 4)
 
+# Vulkan: CUDA's form, a logical subgroup per row (8 a workgroup), each
+# rotating by shuffles across its lanes as Metal does (`rotary_lane_rotate`).
+native indexer_keys for vulkan from "vulkan/indexer_keys.comp":
+    static (P, S, RA, RT)
+    where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    launch indexer_keys:
+        threadgroups (ceil_div(M, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row.
 native indexer_keys for cpu from "cpu/indexer_keys.rs":
     static (P, S, RA, RT)
@@ -481,6 +490,16 @@ native indexer_score for metal from "metal/indexer_score.metal":
 native indexer_score for cuda from "cuda/indexer_score.cu":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 98304 and (2 * P + S) % 32 == 0
+    launch indexer_score:
+        threadgroups (ceil_div(N, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+
+# Vulkan: CUDA's form, each head's subgroup rotating by shuffles before it
+# stores the prepared head in group memory.
+native indexer_score for vulkan from "vulkan/indexer_score.comp":
+    static (H, P, S, NQ, HW, RA, RT)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -513,6 +532,14 @@ native rows_topk for metal from "metal/rows_topk.metal":
 
 # CUDA: Metal's form, a block of 256 threads per row.
 native rows_topk for cuda from "cuda/rows_topk.cu":
+    scratch spans bytes (M * (R + 1) * 4)
+    launch rows_topk:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
+
+# Vulkan: CUDA's form, a workgroup of 256 invocations per row.
+native rows_topk for vulkan from "vulkan/rows_topk.comp":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
         threadgroups (M, 1, 1)
@@ -647,6 +674,12 @@ native candidate_blocks for cuda from "cuda/candidate_blocks.cu":
         threadgroups (ceil_div(NB, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# Vulkan: as CUDA.
+native candidate_blocks for vulkan from "vulkan/candidate_blocks.comp":
+    launch candidate_blocks:
+        threadgroups (ceil_div(NB, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row, walking its picked blocks and its spans once.
 native candidate_rows for cpu from "cpu/candidate_rows.rs":
     launch candidate_rows:
@@ -662,6 +695,12 @@ native candidate_rows for metal from "metal/candidate_rows.metal":
 
 # CUDA: as Metal, a thread per row.
 native candidate_rows for cuda from "cuda/candidate_rows.cu":
+    launch candidate_rows:
+        threadgroups (ceil_div(M, 64), 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+# Vulkan: as CUDA, an invocation per row.
+native candidate_rows for vulkan from "vulkan/candidate_rows.comp":
     launch candidate_rows:
         threadgroups (ceil_div(M, 64), 1, 1)
         threads_per_threadgroup (64, 1, 1)

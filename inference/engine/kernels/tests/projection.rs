@@ -5811,18 +5811,41 @@ gguf_format_tests! {
 /// An F8_E4M3 weight under its UE8M0 grid (mxfp8g32) at DeepSeek V4.1
 /// Flash's attention shapes, `wq_b` `[32768, 1280]` and `wo_b` `[5120,
 /// 8192]`, projects a decode row (GEMV) and a verify block (GEMM) within
-/// the reassociation bound of the F32 host reference. The weight's rows
-/// repeat a host-built 509 (prime, so no tile or row block repeats with
-/// them), which the host decodes in seconds rather than the whole matrix's
-/// tens of minutes.
+/// the reassociation bound of the F32 host reference
+/// (`fp8_projections_match_the_host_reference`).
 #[test]
 fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
+    fp8_projections_match_the_host_reference(Format::F8_E4M3, &[(32768, 1280, 81), (5120, 8192, 82)], &[1, 17]);
+}
+
+/// An F8_E4M3 weight under its F32 tile grid (fp8g128) at GLM-5.3-Flash's
+/// shapes, a routed expert's down `[4096, 2048]`, the dense FFN's down
+/// `[4096, 12288]` and MLA's `q_b` `[16384, 1536]`, projects a decode row
+/// (GEMV), a verify block and a prefill block (GEMMs) within the
+/// reassociation bound of the F32 host reference
+/// (`fp8_projections_match_the_host_reference`).
+#[test]
+fn fp8g128_projections_at_glm_shapes_match_the_host_reference() {
+    fp8_projections_match_the_host_reference(
+        Format::F8_E4M3_F32,
+        &[(4096, 2048, 83), (4096, 12288, 84), (16384, 1536, 85)],
+        &[1, 17, 128],
+    );
+}
+
+/// `format`'s `[h, f]` weights of `shapes` (each with its seed) project
+/// blocks of each of `rows` rows on every device within the
+/// reassociation bound of the F32 host reference. The weight's rows repeat
+/// a host-built 509 (prime, so no tile or row block repeats with them),
+/// which the host decodes in seconds rather than the whole matrix's tens of
+/// minutes.
+fn fp8_projections_match_the_host_reference(format: Format, shapes: &[(usize, usize, u64)], rows: &[usize]) {
     let act = Act::Bf16;
-    let repr = Repr::Gguf(Format::F8_E4M3);
+    let repr = Repr::Gguf(format);
     let mapping = gemm_mapping(64, 64, 1);
-    for (h, f, seed) in [(32768, 1280, 81), (5120, 8192, 82)] {
+    for &(h, f, seed) in shapes {
         let down = periodic_weight(repr, h, f, seed);
-        for rows in [1usize, 17] {
+        for &rows in rows {
             let mut rng = Rng::new(seed + rows as u64);
             let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
@@ -5837,7 +5860,7 @@ fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
                     &device, act, &down, &residual, rows, &product, &out_rows, mapping,
                 );
                 assert_within(
-                    &format!("mxfp8g32 [{h}, {f}] M {rows} on {:?}", device.backend()),
+                    &format!("{format:?} [{h}, {f}] M {rows} on {:?}", device.backend()),
                     &native,
                     &expected,
                     &bound,
@@ -5845,6 +5868,93 @@ fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
             }
         }
     }
+}
+
+/// The time of `attention_output`'s decode row on Metal at DeepSeek V4.1
+/// Flash's `wo_b` (`[5120, 8192]` of F8_E4M3 under its UE8M0 grid,
+/// mxfp8g32), at its default configuration: one point, M = 1, so a survey
+/// walks only the launch that row runs, the other launches' parameters at
+/// their defaults. It prints the default's median device seconds a call and
+/// the rate it reads the weight at.
+#[test]
+#[ignore = "times attention_output's decode row on V4.1's wo_b on Metal; run it by name under a timed hold"]
+fn mxfp8_attention_output_decode_row_at_deepseek_v41_wo_b_times() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (d, q, w) = (5120usize, 8usize, 1024usize);
+    let weight = periodic_weight(Repr::Gguf(Format::F8_E4M3), d, q * w, 82);
+    let mut rng = Rng::new(83);
+    let hidden = (0..d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+    let gated = (0..q * w)
+        .map(|_| act.round(rng.symmetric()))
+        .collect::<Vec<_>>();
+    let hidden = f32_tensor(&device, &[1, d], &hidden);
+    let inject = no_inject(&device, 1);
+    let gated = act_tensor(&device, act, &[1, q, w], &gated);
+    let output_weight = weight.tensor(&device);
+    let scale = no_scale(&device);
+    let bound = absent_bound(&device);
+    let point = seismic::TuningPoint {
+        label: "m1".into(),
+        weight: 1.0,
+        class: None,
+        cost: 1.0,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![attention_output::Args {
+            hidden: &hidden,
+            inject: &inject,
+            gated: &gated,
+            output_weight: &output_weight,
+            output_scale: &scale,
+            output_bound: &bound,
+        }],
+        initialize: None,
+        written: Default::default(),
+    };
+    let statics = [("D", d), ("SN", 1), ("IN", 0), ("Q", q), ("W", w), ("OS", 0), ("OB", 0)]
+        .into_iter()
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, value as u64)
+        });
+    let result = attention_output::native_tune_with(
+        &device,
+        attention_output::Elements {
+            OW: weight.repr.resident(&device),
+            A: act.element(),
+        },
+        &statics,
+        vec![point],
+        seismic::NumericalRequirement::RoundingSteps {
+            alpha: 8.,
+            activation: Some(seismic::DType::BF16),
+        },
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 15,
+            min_sample_seconds: 0.001,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    let default = result
+        .configurations
+        .iter()
+        .filter(|record| record.observations.is_empty())
+        .find_map(|record| match &record.outcome {
+            seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
+            seismic::Outcome::Excluded(_) => None,
+        })
+        .expect("the default is measured");
+    println!(
+        "attention_output m1 wo_b mxfp8g32 [{d}, {}]: default {:.1} us a call, the weight at {:.1} GB/s",
+        q * w,
+        default * 1e6,
+        weight.bytes.len() as f64 / default / 1e9
+    );
 }
 
 /// The rows of a periodic real-shape weight repeat every `PERIOD` rows
@@ -5970,18 +6080,18 @@ fn normed_projection_reference(
     (expected, bound)
 }
 
-/// The devices whose `project_rows` natives take more than one group: CUDA
-/// and Vulkan declare G = 1 only.
+/// The devices whose `project_rows` natives take these groups: CUDA's takes
+/// only groups of N % 16 == 0 (its grouped tests are `cuda_projection.rs`'s).
 fn grouped_devices() -> Vec<Device> {
     devices()
         .into_iter()
-        .filter(|device| matches!(device.backend(), BackendName::Cpu | BackendName::Metal))
+        .filter(|device| matches!(device.backend(), BackendName::Cpu | BackendName::Metal | BackendName::Vulkan))
         .collect()
 }
 
 /// `project_rows` over a `groups`-group weight at its default
-/// specialization (activation rows in, F32 rows out, no scale or bound), on
-/// Metal with the GEMM past 64 rows split `split` ways.
+/// specialization (activation rows in, F32 rows out, no scale or bound),
+/// with Metal's GEMM past 64 rows and Vulkan's past 8 split `split` ways.
 fn grouped_project_rows_native(
     device: &Device,
     act: Act,
@@ -6008,7 +6118,7 @@ fn grouped_project_rows_native(
         .filter(|(name, _)| implementation.implementation().statics.iter().any(|declared| declared == name))
         .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, value as u64));
     let statics = match device.backend() {
-        BackendName::Metal => statics.with_param("SPLIT", split),
+        BackendName::Metal | BackendName::Vulkan => statics.with_param("SPLIT", split),
         _ => statics,
     };
     let specialization = implementation
@@ -6125,9 +6235,10 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
 }
 
 /// A grouped `project_rows` (three groups of 40 weight rows over 256
-/// columns each) equals its portable body and the per-group host products
-/// in the GEMV, small GEMM and split GEMM row classes, on the devices whose
-/// natives take groups.
+/// columns each) equals the per-group host products in the GEMV, small GEMM
+/// and split GEMM row classes on the devices whose natives take groups, and
+/// its portable body (which has no row classes, so one multi-row count
+/// decides it) equals them too.
 #[test]
 fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
     let module = module();
@@ -6140,27 +6251,34 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
             let source = (0..rows * groups * k)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let outcome = interpret(
-                &module,
-                "project_rows",
-                &[
-                    ("A", registry::dense(DType::BF16)),
-                    ("W", repr.storage()),
-                    ("Y", registry::dense(DType::F32)),
-                ],
-                vec![
-                    activations(act, &[rows, groups * k], &source),
-                    Input::Data(weight.oracle()),
-                    floats(&[0], &[]),
-                    floats(&[0], &[]),
-                ],
-            );
-            let oracle = result(&outcome, 0);
             let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
-            assert_within(&format!("grouped portable body {repr:?} M {rows}"), &oracle, &expected, &bound);
+            if rows == 3 {
+                let outcome = interpret(
+                    &module,
+                    "project_rows",
+                    &[
+                        ("A", registry::dense(DType::BF16)),
+                        ("W", repr.storage()),
+                        ("Y", registry::dense(DType::F32)),
+                    ],
+                    vec![
+                        activations(act, &[rows, groups * k], &source),
+                        Input::Data(weight.oracle()),
+                        floats(&[0], &[]),
+                        floats(&[0], &[]),
+                    ],
+                );
+                let oracle = result(&outcome, 0);
+                assert_within(&format!("grouped portable body {repr:?} M {rows}"), &oracle, &expected, &bound);
+            }
             for device in grouped_devices() {
-                // Each split of the GEMM past 64 rows (Metal's SPLIT).
-                for split in [1, 2, 4] {
+                // Each split of the GEMM (Metal's and Vulkan's SPLIT; the
+                // CPU native has none).
+                let splits: &[u64] = match device.backend() {
+                    BackendName::Cpu => &[1],
+                    _ => &[1, 2, 4],
+                };
+                for &split in splits {
                     let native = grouped_project_rows_native(&device, act, &weight, groups, &source, split);
                     assert_within(
                         &format!(
@@ -6182,11 +6300,19 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
 /// 17-row prefill within the reassociation bound of the per-group F32 host
 /// products, over F8_E4M3 under its grid (mxfp8g32) and BF16. The weight is
 /// periodic (`periodic_weight`): N = 1024 is no multiple of the period, so
-/// every group's block differs.
+/// every group's block differs. Only the GPU devices run this shape: the
+/// CPU native and the portable body are checked at the small grouped shape.
 #[test]
 fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
     let act = Act::Bf16;
     let (groups, n, k) = (8usize, 1024usize, 4096usize);
+    let devices = grouped_devices()
+        .into_iter()
+        .filter(|device| device.backend() != BackendName::Cpu)
+        .collect::<Vec<_>>();
+    if devices.is_empty() {
+        return;
+    }
     for (repr, seed) in [(Repr::Gguf(Format::F8_E4M3), 93), (Repr::Bf16, 94)] {
         let weight = periodic_weight(repr, groups * n, k, seed);
         for rows in [1usize, 17] {
@@ -6195,8 +6321,8 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
             let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
-            for device in grouped_devices() {
-                let native = grouped_project_rows_native(&device, act, &weight, groups, &source, 1);
+            for device in &devices {
+                let native = grouped_project_rows_native(device, act, &weight, groups, &source, 1);
                 assert_within(
                     &format!("wo_a {repr:?} M {rows} on {:?}", device.backend()),
                     &native,

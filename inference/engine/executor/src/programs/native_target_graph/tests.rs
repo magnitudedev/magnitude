@@ -1159,18 +1159,16 @@ mod sinkhorn_graph_tests {
         }
     }
 
-    /// The Sinkhorn fixture's block graphs check on the CPU, Metal and CUDA,
-    /// whole at decode and prompt rows and as a split block's front and
-    /// back; Vulkan declares no Sinkhorn site, so its plans refuse it by
-    /// declaration.
+    /// The Sinkhorn fixture's block graphs check on every backend, whole at
+    /// decode and prompt rows and as a split block's front and back.
     #[test]
-    fn sinkhorn_block_graphs_check_on_every_backend_but_vulkan() {
+    fn sinkhorn_block_graphs_check_on_every_backend() {
         let definition = sinkhorn_fixture_definition(2);
         let manifest = fixture_manifest(&definition);
         let codec = KvCodec::Dense;
         let selection = ComponentSelection { head: false, vision: false };
         let limits = crate::planning::fixtures::LIMITS;
-        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+        for backend in BackendName::ALL {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
             let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
@@ -1188,15 +1186,7 @@ mod sinkhorn_graph_tests {
                 );
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
-                match backend {
-                    BackendName::Cpu | BackendName::Metal | BackendName::Cuda => {
-                        drop(checked.unwrap_or_else(|error| panic!("{label}: {error}")))
-                    }
-                    _ => {
-                        let error = checked.err().unwrap_or_else(|| panic!("{label} checks")).to_string();
-                        assert!(error.contains("stream_mix_sinkhorn"), "{label}: {error}");
-                    }
-                }
+                drop(checked.unwrap_or_else(|error| panic!("{label}: {error}")));
             }
         }
     }

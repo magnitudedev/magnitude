@@ -241,7 +241,7 @@ fn overlapping_definitions_agree_on_awaited_ports() {
         let ordinary = awaited.replace("&await ", "&");
         for source in [awaited.clone() + &ordinary, ordinary + &awaited] {
             let error = check(&source).unwrap_err();
-            assert!(error.contains("different awaited state"), "{error}");
+            assert!(error.contains("different binding"), "{error}");
         }
         check(&(awaited.clone() + &awaited)).unwrap();
     }

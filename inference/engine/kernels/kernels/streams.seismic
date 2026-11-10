@@ -421,9 +421,9 @@ native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
 
-# Metal and CUDA: one threadgroup per row reduces its squares and every mix
+# Metal, CUDA and Vulkan: one threadgroup per row reduces its squares and every mix
 # in fixed order; its first thread forms the coefficients, and every thread
-# mixes the input columns. Vulkan has no native yet (build.rs).
+# mixes the input columns.
 native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
     static (H, S)
     where S <= 8
@@ -438,6 +438,14 @@ native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+native stream_mix_sinkhorn for vulkan from "vulkan/stream_mix_sinkhorn.comp":
+    static (H, S)
+    where S <= 8
+    launch stream_mix_sinkhorn:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * 4)
+
 # CPU: one work item per row, which forms its coefficients in place (to 8
 # streams) and mixes its input row.
 native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
@@ -447,7 +455,8 @@ native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal and CUDA: one threadgroup per row, its threads over the columns.
+# Metal, CUDA and Vulkan: one threadgroup per row, its threads over the
+# columns.
 native stream_collapse for metal from "metal/stream_collapse.metal":
     static (H, S)
     launch stream_collapse:
@@ -460,16 +469,21 @@ native stream_collapse for cuda from "cuda/stream_collapse.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+native stream_collapse for vulkan from "vulkan/stream_collapse.comp":
+    static (H, S)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row.
 native stream_collapse for cpu from "cpu/stream_collapse.rs":
     launch stream_collapse:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal and CUDA: the projection library's output epilogue
-# (`projection::OutputOf`, the `Scatter` of every output entry's join) over
-# the F32 rows, one thread per column of a row. Vulkan has no native yet
-# (build.rs).
+# Metal, CUDA and Vulkan: the projection library's output join
+# (`projection::OutputOf`, the `Scatter` of every output entry's join;
+# Vulkan's `join_scatter`) over the F32 rows, one thread per column of a row.
 native stream_join for metal from "metal/stream_join.metal":
     static (H, SN, IN)
     launch stream_join:
@@ -477,6 +491,12 @@ native stream_join for metal from "metal/stream_join.metal":
         threads_per_threadgroup (256, 1, 1)
 
 native stream_join for cuda from "cuda/stream_join.cu":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_join for vulkan from "vulkan/stream_join.comp":
     static (H, SN, IN)
     launch stream_join:
         threadgroups (ceil_div(M * H, 256), 1, 1)

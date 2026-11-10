@@ -1985,23 +1985,56 @@ pub fn representation_conversions() -> &'static [RepresentationConversion] {
     internals::representation_conversions()
 }
 /// Where the scales of a GGUF source's values are: in its stored tensor's
-/// own blocks, or in a companion grid of E8M0 block scales.
+/// own blocks, or in a companion grid of block scales.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GgufScales {
     /// In the tensor's blocks (`magnitude_ggml` geometry), or none.
     Own,
-    /// A companion grid of E8M0 codes, one per tile of whole row blocks of
-    /// the source's packet values, over a tensor of single-value blocks.
-    /// The importer assembles each block of a row as its tile's scale code,
-    /// then its values' blocks: the source's packet.
-    E8m0Grid,
+    /// A companion grid of `GridScale` scales, one per tile of whole row
+    /// blocks of the source's packet values, over a tensor of single-value
+    /// blocks. The importer assembles each block of a row as its tile's
+    /// scale, then its values' blocks: the source's packet.
+    Grid(GridScale),
+}
+
+impl GgufScales {
+    /// Every place scales can be: a tensor's own blocks, then each grid.
+    pub const ALL: [Self; 3] = [Self::Own, Self::Grid(GridScale::E8m0), Self::Grid(GridScale::F32)];
+}
+
+/// The scale element of a companion grid (`GgufScales::Grid`), as the
+/// source's assembled packet holds it, before its values' blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GridScale {
+    /// One E8M0 byte, `2^(e - 127)`, 0xff NaN (OCP MX).
+    E8m0,
+    /// One F32 value, little-endian.
+    F32,
+}
+
+impl GridScale {
+    /// The bytes of one scale.
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::E8m0 => 1,
+            Self::F32 => 4,
+        }
+    }
+
+    /// Its short name, as a source's name carries it (`gguf_f8_e4m3_e8m0`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::E8m0 => "e8m0",
+            Self::F32 => "f32",
+        }
+    }
 }
 
 /// A GGUF source the registry converts from: its ggml type, where its
 /// scales are, its storage name, and the resident representation its
 /// conversion writes. A source packet is one block of the type
 /// (`magnitude_ggml` geometry), or one assembled grid block
-/// (`GgufScales::E8m0Grid`).
+/// (`GgufScales::Grid`).
 #[derive(Clone, Copy, Debug)]
 struct GgufSource {
     encoding: Encoding,
@@ -2023,7 +2056,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 26] = [
+const GGUF_SOURCES: [GgufSource; 27] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -2053,13 +2086,21 @@ const GGUF_SOURCES: [GgufSource; 26] = [
     // more to decode than a bit field, and no backend's product is bound by
     // the 18% of bytes they save (spec 26-10-30 §13).
     gguf_source_spec(Encoding::Tq1_0, "gguf_tq1_0", "q2g256"),
-    // E4M3 codes under their companion E8M0 grid (OCP MXFP8's block: the
-    // scale, then a group of codes), moved bit for bit.
+    // E4M3 codes under their companion grid (a block: the scale, then a
+    // group of codes), moved bit for bit: under E8M0 scales OCP MXFP8's
+    // block; under F32 scales (an FP8 checkpoint's `weight_scale_inv`) a
+    // stored F32 scale per 128, every scale of a 128-column tile.
     GgufSource {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::E8m0Grid,
+        scales: GgufScales::Grid(GridScale::E8m0),
         name: "gguf_f8_e4m3_e8m0",
         resident: "mxfp8g32",
+    },
+    GgufSource {
+        encoding: Encoding::F8E4M3,
+        scales: GgufScales::Grid(GridScale::F32),
+        name: "gguf_f8_e4m3_f32",
+        resident: "fp8g128",
     },
 ];
 
@@ -2071,7 +2112,7 @@ impl GgufSource {
     fn packet(&self) -> (u64, u64) {
         match self.scales {
             GgufScales::Own => (self.encoding.block_bytes(), self.encoding.block_elements()),
-            GgufScales::E8m0Grid => {
+            GgufScales::Grid(scale) => {
                 assert_eq!(self.encoding.block_elements(), 1, "a scale grid scales single values");
                 let group = crate::repr::REPRS
                     .iter()
@@ -2079,7 +2120,7 @@ impl GgufSource {
                     .expect("a GGUF source names a registered resident representation")
                     .group;
                 let group = u64::from(group);
-                (1 + group * self.encoding.block_bytes(), group)
+                (scale.bytes() + group * self.encoding.block_bytes(), group)
             }
         }
     }
@@ -3583,6 +3624,12 @@ pub(crate) mod internals {
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
                 ));
             }
+            "gguf_f8_e4m3_f32" => {
+                // The assembled block: s (F32) | qs[128] (E4M3), value p
+                // qs[p]; every byte moves bit for bit.
+                push(plane("words", PlaneRepackRecipe::BitRoutes(direct_bits(4, 128))));
+                push(plane("scale", PlaneRepackRecipe::BitRoutes(direct_bits(0, 4))));
+            }
             "gguf_q5_0" | "gguf_q5_1" => {
                 // block_q5_0: d (f16) | qh[4] | qs[16]; block_q5_1: d | m
                 // (f16) | qh[4] | qs[16]. Value p: the low (p < 16) or high
@@ -4993,29 +5040,37 @@ mod tests {
         );
     }
 
-    /// F8_E4M3 has a source only under its grid of E8M0 block scales: an
-    /// assembled block, the scale byte then 32 codes, converting into
-    /// mxfp8g32, whose decoders read E4M3 bytes 2^9 times their value; no
-    /// other encoding is read under a grid.
+    /// F8_E4M3 has a source only under a grid of block scales: an
+    /// assembled block, the scale then a group of codes, converting under
+    /// E8M0 scales (one byte, 32 codes) into mxfp8g32, under F32 scales
+    /// (four bytes, 128 codes) into fp8g128, whose decoders read E4M3 bytes
+    /// 2^9 times their value under that scale; no other encoding is read
+    /// under a grid.
     #[test]
-    fn f8_e4m3_is_sourced_by_its_scale_grid_as_mxfp8g32() {
+    fn f8_e4m3_is_sourced_by_its_scale_grid() {
         use crate::repr::ValueCodes;
         assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::Own, 256), None);
-        assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 48), None);
-        assert_eq!(gguf_source(Encoding::Q8_0, GgufScales::E8m0Grid, 256), None);
-        let source = gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 256).unwrap();
-        assert_eq!(representation_info(source).name, "gguf_f8_e4m3_e8m0");
-        let packet = external_packet(source).unwrap();
-        assert_eq!((packet.packet_size, packet.logical_group), (33, 32));
-        for layout in Layout::ALL {
-            let resident = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
-            assert_eq!(representation_info(resident).representation, "mxfp8g32");
-            if let Some(axes) = decode_axes(resident) {
-                assert_eq!(axes.code_exponent, -9);
-                let CodingAxes::Direct { codes, .. } = axes.coding else {
-                    panic!("mxfp8g32 is direct");
-                };
-                assert_eq!(codes, ValueCodes::E4m3);
+        for (scale, name, resident, packet_size, group, encoding) in [
+            (GridScale::E8m0, "gguf_f8_e4m3_e8m0", "mxfp8g32", 33, 32, ScaleEncoding::E8M0),
+            (GridScale::F32, "gguf_f8_e4m3_f32", "fp8g128", 132, 128, ScaleEncoding::F32),
+        ] {
+            let scales = GgufScales::Grid(scale);
+            assert_eq!(gguf_source(Encoding::F8E4M3, scales, 48), None);
+            assert_eq!(gguf_source(Encoding::Q8_0, scales, 256), None);
+            let source = gguf_source(Encoding::F8E4M3, scales, 256).unwrap();
+            assert_eq!(representation_info(source).name, name);
+            let packet = external_packet(source).unwrap();
+            assert_eq!((packet.packet_size, packet.logical_group), (packet_size, group));
+            for layout in Layout::ALL {
+                let element = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
+                assert_eq!(representation_info(element).representation, resident);
+                if let Some(axes) = decode_axes(element) {
+                    assert_eq!(axes.code_exponent, -9);
+                    let CodingAxes::Direct { codes, scale, bias, group: coded } = axes.coding else {
+                        panic!("{resident} is direct");
+                    };
+                    assert_eq!((codes, scale, bias, coded), (ValueCodes::E4m3, encoding, false, group as u32));
+                }
             }
         }
     }

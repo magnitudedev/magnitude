@@ -37,7 +37,7 @@ use magnitude_engine::{
     error::{RequestError, UnloadCause},
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits},
     planning::plan_execution,
-    worker::{RequestEvent, RequestOptions, WorkerProcess, WorkerReport, connect_worker, start_worker_process},
+    worker::{RequestEvent, RequestOptions, WorkerProcess, WorkerReport, connect_worker, observe_worker_process},
 };
 use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
@@ -81,13 +81,13 @@ pub struct Load {
     pub hold: bool,
 }
 
-/// Another process pressing the load `deficit` bytes below its planning
-/// line over a window of the decode ([`Window`]): signalled once a quarter
-/// of the decode's tokens are out, or, `from_prompt`, once the request is
-/// admitted, so its prompt's groups run under it.
+/// Another process pressing the load below its planning line, past its
+/// prompt groups' surplus into its bank ([`press_deficit`]), over a window of
+/// the decode ([`Window`]): signalled once a quarter of the decode's tokens
+/// are out, or, `from_prompt`, once the request is admitted, so its prompt's
+/// groups run under it.
 pub struct Pressing {
     pub store: PressureStore,
-    pub deficit: u64,
     pub from_prompt: bool,
 }
 
@@ -113,7 +113,6 @@ pub fn load(load: Load) -> Result<(), String> {
         pressure,
         hold,
     } = load;
-    let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing));
     let Planned { host, manifest, devices, structure, planned } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
     let context = manifest.definition.decoder.context_limit;
     // The charge the load's planning confirmed of its plan.
@@ -199,9 +198,17 @@ pub fn load(load: Load) -> Result<(), String> {
         "host bytes",
     )?;
     let vocabulary = manifest.definition.decoder.vocabulary;
-    // The load, in a worker process as the service loads.
-    let WorkerProcess { transport, retire } =
-        start_worker_process(crate::engine::worker(&[])?).map_err(|error| error.to_string())?;
+    // The load, in a worker process as the service loads, its diagnostics
+    // passed on to this process's standard error as they come, the prompt
+    // groups' surplus read from its events.
+    let (WorkerProcess { transport, retire }, diagnostics) =
+        observe_worker_process(crate::engine::worker(&[])?).map_err(|error| error.to_string())?;
+    let surplus = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let forwarding = {
+        let surplus = Arc::clone(&surplus);
+        std::thread::spawn(move || forward(diagnostics, &surplus))
+    };
+    let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing, surplus));
     let loaded = connect_worker(transport, Some((manifest, UnpreparedUnits::ServeDefaults)), |_| {})
         .map_err(|error| error.to_string())?;
     let LoadAttempt::Loaded(connection) = loaded else {
@@ -266,9 +273,61 @@ pub fn load(load: Load) -> Result<(), String> {
     if hold {
         std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).map_err(|error| error.to_string())?;
     }
-    // The worker ends once its host is gone.
+    // The worker ends once its host is gone, and its last diagnostics are
+    // passed on once its stream closes.
     drop(engine);
-    retire(WorkerReport::Reported)
+    retire(WorkerReport::Reported)?;
+    forwarding.join().map_err(|_| "the worker's diagnostics reader panicked")?
+}
+
+/// Pass each line of the worker's `diagnostics` on to this process's
+/// standard error unchanged, keeping `surplus` at what its events report
+/// ([`surplus_after`]), until the stream closes.
+fn forward(diagnostics: std::process::ChildStderr, surplus: &std::sync::atomic::AtomicU64) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let mut lines = std::io::BufReader::new(diagnostics);
+    let mut line = Vec::new();
+    // The first event refused; the stream is still drained, so the worker
+    // never stops on a full pipe.
+    let mut refused = Ok(());
+    loop {
+        line.clear();
+        if lines.read_until(b'\n', &mut line).map_err(|error| error.to_string())? == 0 {
+            return refused;
+        }
+        std::io::stderr().lock().write_all(&line).map_err(|error| error.to_string())?;
+        if let (Ok(text), Ok(())) = (std::str::from_utf8(&line), &refused) {
+            let held = surplus.load(std::sync::atomic::Ordering::Relaxed);
+            match surplus_after(held, text.trim_end()) {
+                Ok(after) => surplus.store(after, std::sync::atomic::Ordering::Relaxed),
+                Err(error) => refused = Err(error),
+            }
+        }
+    }
+}
+
+/// The bytes the load's prompt-group class holds above its floor of one
+/// place, `surplus` before the worker's diagnostic `line`: what the ladder's
+/// surplus rung releases before any of the bank. A class grown holds its
+/// growth's bytes more (`prompt groups hold more places`, from the places it
+/// held); one back at its floor holds none, and one lowered short of it holds
+/// less by what it released, its group buffers (`prompt groups hold fewer
+/// places`) and its graph slots (`graph slots released`). Any other line
+/// changes nothing; one of these events without its field is refused.
+fn surplus_after(surplus: u64, line: &str) -> Result<u64, String> {
+    let Some(event) = line
+        .strip_prefix("magnitude-harness: event ")
+        .and_then(|event| serde_json::from_str::<Value>(event).ok())
+    else {
+        return Ok(surplus);
+    };
+    let field = |name: &str| event[name].as_u64().ok_or_else(|| format!("the event has no `{name}`: {line}"));
+    Ok(match event["message"].as_str() {
+        Some("prompt groups hold more places") => surplus.saturating_add(field("bytes")?),
+        Some("prompt groups hold fewer places") if field("places")? == 1 => 0,
+        Some("prompt groups hold fewer places" | "graph slots released") => surplus.saturating_sub(field("released")?),
+        _ => surplus,
+    })
 }
 
 /// A target planned as the service plans it on `backend`'s device: the
@@ -413,52 +472,51 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
     .map_err(|error| text(&error))
 }
 
-/// Another process's memory, pressing the loaded process `deficit` bytes
-/// below its planning line in the selected physical store, read through
-/// the engine's observation owner. It takes them in two moves, so the time
-/// the pressure takes to land is the deficit's, whatever the host's size:
-/// first it comes to `deficit` above the line, where the engine still has
-/// room, and prints `approached` with the seconds it took; at the first line
-/// on standard input it takes what the engine could still claim then and
-/// `deficit` more, which leaves it `deficit` below the line whatever it
-/// claimed meanwhile, and prints `occupied`; at the next it gives that press
-/// back, which leaves the engine the room it had before it (`deficit` above
-/// the line), and prints `released`; it holds the approach until standard
-/// input closes, so giving the memory back takes the press's time, not
-/// the host's (freeing 107 GB on a GB10 took 14 s). The press is sized from
-/// the ceiling (`DomainReading::ceiling_bytes`), what the host gives
-/// without displacing another program's data, the one figure the load's
-/// band and growth read alike. The bytes are pseudo-random
-/// words, as an application's data is: zeroed pages the OS compresses to
-/// nothing would press nothing. They are written on every core the host
-/// has, as fast as its memory takes them, by threads that yield any core
-/// other work wants ([`yielding`]): the press takes the host's memory, never
-/// the engine's processors.
-pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Result<(), String> {
+/// Another process's memory, pressing the loaded process below its planning
+/// line in the selected physical store, read through the engine's
+/// observation owner. It takes it in two moves, so the time the pressure
+/// takes to land is the press's, whatever the host's size: first it comes
+/// to its planning reserve above the line, where the engine still has room,
+/// and prints `approached` with the seconds it took; at the first line on
+/// standard input, the bytes the load's prompt groups hold above their floor
+/// then, it takes what the engine could still claim and the deficit
+/// [`press_deficit`] sizes from that surplus and its reserve, which leaves
+/// the load that deficit below the line whatever it claimed meanwhile, and
+/// prints `occupied`; at the next it gives that press back, which leaves the
+/// engine the room it had before it, and prints `released`; it holds the
+/// approach until standard input closes, so giving the memory back takes the
+/// press's time, not the host's (freeing 107 GB on a GB10 took 14 s). The
+/// moves are sized from the ceiling (`DomainReading::ceiling_bytes`), what
+/// the host gives without displacing another program's data, the one figure
+/// the load's band and growth read alike, read here with the machine's
+/// reserves. The load's own line holds at least those: its measured motion
+/// only adds to the machine's page-fill rate (`StoreMotion::with`), and its
+/// release latency to the reading interval, so the press lands the load at
+/// least the deficit below its line, provided the moves take memory no
+/// faster than the load's reserve provisions for. The bytes are
+/// pseudo-random words, as an application's data is, written by one thread
+/// ([`written`]).
+pub fn occupy(backend: BackendName, selected: PressureStore) -> Result<(), String> {
     let target = store::Target::open(backend, selected)?;
     let before = target.snapshot()?;
     let reading = target.reading()?;
-    // Below the line is only the planning reserve: a deeper press would take
-    // more than the store has free, and fail as it allocates.
-    let planning = reading.thresholds.planning_bytes;
-    if deficit > planning {
-        return Err(format!(
-            "a press of {deficit} bytes is deeper than the store's planning reserve of {planning} bytes, all that is free below its line"
-        ));
-    }
-    let ceiling = reading.ceiling_bytes;
-    let approach = ceiling.saturating_sub(deficit);
+    let (ceiling, reserve) = (reading.ceiling_bytes, reading.thresholds.planning_bytes);
+    let approach = ceiling.saturating_sub(reserve);
     let approaching = Instant::now();
     let approached = target.take(approach, 0)?;
-    println!("{}", json!({ "approached": approach, "ceiling": ceiling, "seconds": approaching.elapsed().as_secs_f64(),
-        "at": unix_seconds(), "before": before, "observation": target.snapshot()? }));
+    println!("{}", json!({ "approached": approach, "ceiling": ceiling, "reserve": reserve,
+        "seconds": approaching.elapsed().as_secs_f64(), "at": unix_seconds(), "before": before,
+        "observation": target.snapshot()? }));
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())? == 0 { return Ok(()); }
+    let surplus = line.trim().parse::<u64>().map_err(|error| format!("the press's surplus {line:?}: {error}"))?;
     let reading = target.reading()?;
-    let ceiling = reading.ceiling_bytes;
+    let (ceiling, reserve) = (reading.ceiling_bytes, reading.thresholds.planning_bytes);
+    let deficit = press_deficit(surplus, reserve)?;
     let press = ceiling.checked_add(deficit).ok_or("pressure allocation size overflows")?;
     let pressed = target.take(press, 1)?;
-    println!("{}", json!({ "occupied": approach + press, "ceiling": ceiling, "at": unix_seconds(), "observation": target.snapshot()? }));
+    println!("{}", json!({ "occupied": approach + press, "ceiling": ceiling, "surplus": surplus, "reserve": reserve,
+        "deficit": deficit, "at": unix_seconds(), "observation": target.snapshot()? }));
     let released = std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())?;
     drop(pressed);
     println!("{}", json!({ "released": press, "at": unix_seconds(), "observation": target.snapshot()? }));
@@ -469,20 +527,45 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
     Ok(())
 }
 
-/// `bytes` of pseudo-random words, written by `writers` threads at once,
-/// the first of them seeded as writer `first` of the process.
-fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String> {
+/// How far below its line a press lands a load whose prompt groups hold
+/// `surplus` bytes above their floor, in a store whose planning `reserve` is
+/// all that is free below the line: midway between them, so the surplus
+/// rung's release cannot answer it and the bank's must, and no allocation
+/// reaches past the free memory. A surplus at or beyond the reserve leaves
+/// no press that reaches the bank.
+fn press_deficit(surplus: u64, reserve: u64) -> Result<u64, String> {
+    if surplus >= reserve {
+        return Err(format!(
+            "no press reaches the bank: the prompt groups' surplus of {surplus} bytes is at or beyond the store's planning reserve of {reserve} bytes, all that is free below its line"
+        ));
+    }
+    Ok(surplus + (reserve - surplus) / 2)
+}
+
+/// `bytes` of pseudo-random words seeded by `seed`, written by one thread
+/// that yields any processor other work wants ([`yielding`]), so the
+/// pressure takes the host's memory, never the engine's processors.
+///
+/// One thread takes memory as one program does: no faster than the machine
+/// fills fresh pages, each page faulted in before its words are written,
+/// which is the take a load's planning reserve holds a margin for
+/// (`StoreMotion::of_machine`, the page-fill rate over the reserve's reading
+/// interval and release latency). Pressed below that line, the load sees
+/// the pressure it is built to answer. A writer on every core takes memory
+/// several times faster than any one program, and the load's line rises to
+/// the rate it measures: a GB10 load's went from 0.7 GB to 33 GB under such
+/// an approach and its bank fell to its floor before any press (c2a9ef).
+fn written(bytes: u64, seed: usize) -> Result<Vec<u64>, String> {
     let mut held = vec![0u64; usize::try_from(bytes.div_ceil(8)).map_err(|error| error.to_string())?];
-    // One writer's share of the words, at least one word for a chunk size.
-    let share = held.len().div_ceil(writers).max(1);
     std::thread::scope(|scope| {
-        let written = held.chunks_mut(share).enumerate().map(|(writer, words)| {
-            scope.spawn(move || {
+        let words = &mut held;
+        scope
+            .spawn(move || {
                 yielding()?;
                 // xorshift64 from a seed of its own (an odd multiple, never
                 // zero): every word differs, so no page compresses.
-                let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * (first + writer) as u64 + 1);
-                for slot in words {
+                let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * seed as u64 + 1);
+                for slot in words.iter_mut() {
                     word ^= word << 13;
                     word ^= word >> 7;
                     word ^= word << 17;
@@ -490,8 +573,8 @@ fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String>
                 }
                 Ok::<(), String>(())
             })
-        });
-        written.collect::<Vec<_>>().into_iter().try_for_each(|writer| writer.join().expect("a writer panicked"))
+            .join()
+            .expect("the writer panicked")
     })?;
     Ok(held)
 }
@@ -829,6 +912,9 @@ impl Window {
 struct Pressure {
     backend: BackendName,
     pressing: Pressing,
+    /// The bytes the load's prompt groups hold above their floor, as its
+    /// diagnostics report them ([`forward`]).
+    surplus: Arc<std::sync::atomic::AtomicU64>,
     /// The occupying process, from its approach before the pressured
     /// request until the decode under it ends.
     sibling: Option<Sibling>,
@@ -848,11 +934,12 @@ struct Sibling {
 }
 
 impl Pressure {
-    fn new(backend: BackendName, pressing: Pressing) -> Self {
+    fn new(backend: BackendName, pressing: Pressing, surplus: Arc<std::sync::atomic::AtomicU64>) -> Self {
         Self {
             backend,
-            record: serde_json::Map::from_iter([("deficit".to_owned(), json!(pressing.deficit))]),
+            record: serde_json::Map::new(),
             pressing,
+            surplus,
             sibling: None,
             steps: Vec::new(),
         }
@@ -864,8 +951,8 @@ impl Pressure {
     /// window, its prompt cut to leave the room. Approached, pressing takes
     /// only what the engine could still claim and the deficit, which lands
     /// in a fraction of a second; the approach takes everything else the
-    /// host has (over 100 GB on a GB10, 8 s beside the load), which no
-    /// decode's room need hold. The prompt's tokens decoded from, and the
+    /// host has, at the rate one program takes memory ([`written`]), which
+    /// no decode's room need hold. The prompt's tokens decoded from, and the
     /// tokens.
     fn decode(&mut self, engine: &ReadyEngine, prompt: &[TokenId], tokens: usize) -> Result<(usize, Vec<u32>), Failure> {
         let mut window = Window::of(tokens, self.pressing.from_prompt);
@@ -882,12 +969,12 @@ impl Pressure {
             }
             _ => return Err(Failure::Cell("the step's timing decode gave fewer than two outputs".into())),
         };
-        let rate = self.approach()?;
-        // The press is at most twice the deficit: what the engine could
-        // still claim, at most the deficit the approach left it, and the
-        // deficit. It lands, and is given back, at the rate the approach
-        // took memory beside the load.
-        let landing = 2.0 * self.pressing.deficit as f64 / rate;
+        let (rate, reserve) = self.approach()?;
+        // The press is at most twice the reserve: what the engine could
+        // still claim, at most the reserve the approach left it, and a
+        // deficit within the reserve. It lands, and is given back, at the
+        // rate the approach took memory beside the load.
+        let landing = 2.0 * reserve as f64 / rate;
         let room = window.room(2.0 * landing, step);
         let context = context_limit(engine)?;
         let length = context
@@ -928,11 +1015,12 @@ impl Pressure {
     }
 
     /// Start the occupying process, between requests, and wait while it
-    /// takes everything but `deficit` of what the engine could still claim,
-    /// so pressing later takes only twice the deficit, however much memory
-    /// the host has: the bytes a second it took them at. A thread passes on
-    /// its reports, so the pressured request's outputs are read meanwhile.
-    fn approach(&mut self) -> Result<f64, String> {
+    /// takes everything but its planning reserve of what the engine could
+    /// still claim, so pressing later takes at most twice the reserve,
+    /// however much memory the host has: the bytes a second it took them at,
+    /// and the reserve. A thread passes on its reports, so the pressured
+    /// request's outputs are read meanwhile.
+    fn approach(&mut self) -> Result<(f64, u64), String> {
         let text = |error: std::io::Error| error.to_string();
         let mut child = std::process::Command::new(std::env::current_exe().map_err(text)?)
             .args([
@@ -941,8 +1029,6 @@ impl Pressure {
                 self.backend.as_str(),
                 "--pressure-store",
                 self.pressing.store.name(),
-                "--deficit",
-                &self.pressing.deficit.to_string(),
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -968,18 +1054,20 @@ impl Pressure {
         self.sibling = Some(Sibling { input: child.stdin.take().expect("piped"), child, reports, reader });
         self.recorded(vec![Ok(approached)])?;
         let approach = &self.record["approached"];
-        match (approach["approached"].as_u64(), approach["seconds"].as_f64()) {
-            (Some(bytes), Some(seconds)) if bytes > 0 && seconds > 0.0 => Ok(bytes as f64 / seconds),
+        match (approach["approached"].as_u64(), approach["seconds"].as_f64(), approach["reserve"].as_u64()) {
+            (Some(bytes), Some(seconds), Some(reserve)) if bytes > 0 && seconds > 0.0 => Ok((bytes as f64 / seconds, reserve)),
             _ => Err(format!("the occupying process approached by nothing to time: {approach}")),
         }
     }
 
-    /// Signal pressing, `decoded` tokens out: the occupying process takes the
-    /// rest once it has approached.
+    /// Signal pressing, `decoded` tokens out, with the prompt groups'
+    /// surplus now: the occupying process takes the rest once it has
+    /// approached.
     fn press(&mut self, decoded: usize) -> Result<(), String> {
         let sibling = self.sibling.as_mut().ok_or("pressing starts once approached")?;
-        std::io::Write::write_all(&mut sibling.input, b"\n").map_err(|error| error.to_string())?;
-        self.record.insert("started".into(), json!({ "at": unix_seconds(), "token": decoded }));
+        let surplus = self.surplus.load(std::sync::atomic::Ordering::Relaxed);
+        std::io::Write::write_all(&mut sibling.input, format!("{surplus}\n").as_bytes()).map_err(|error| error.to_string())?;
+        self.record.insert("started".into(), json!({ "at": unix_seconds(), "token": decoded, "surplus": surplus }));
         Ok(())
     }
 
@@ -1272,7 +1360,8 @@ mod tests {
     fn the_pressure_lands_on_its_signal_and_approach_and_is_held_once_occupied() {
         let mut pressure = Pressure {
             backend: BackendName::Cpu,
-            pressing: Pressing { store: PressureStore::Host, deficit: 1, from_prompt: false },
+            pressing: Pressing { store: PressureStore::Host, from_prompt: false },
+            surplus: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sibling: None,
             record: serde_json::Map::new(),
             steps: Vec::new(),
@@ -1293,6 +1382,50 @@ mod tests {
         assert!(!pressure.record.contains_key("freed"));
         pressure.failed("model unloaded: memory pressure".into()).unwrap();
         assert_eq!(pressure.record["ended"]["failure"], "model unloaded: memory pressure");
+    }
+
+    /// The press lands midway between the prompt groups' surplus and the
+    /// reserve, past what the surplus rung releases and within what is free,
+    /// and is refused where the surplus leaves it no room.
+    #[test]
+    fn the_press_lands_between_the_surplus_and_the_reserve() {
+        assert_eq!(press_deficit(236_000_000, 361_000_000).unwrap(), 298_500_000);
+        assert_eq!(press_deficit(0, 361_000_000).unwrap(), 180_500_000);
+        assert_eq!(press_deficit(360, 361).unwrap(), 360);
+        for (surplus, reserve) in [(361, 361), (362, 361), (0, 0)] {
+            assert!(press_deficit(surplus, reserve).unwrap_err().starts_with("no press reaches the bank"));
+        }
+    }
+
+    /// The surplus follows the worker's events: growth adds its bytes, a
+    /// release to the floor empties it, a partial one takes its bytes, and
+    /// any other line, prose or malformed, changes nothing; a named event
+    /// without its field is refused.
+    #[test]
+    fn the_surplus_follows_the_prompt_groups_events() {
+        let event = |fields: &str| format!("magnitude-harness: event {{\"at\":1.0,{fields}}}");
+        let grown = surplus_after(0, &event(r#""message":"prompt groups hold more places","places":3,"bytes":235941928"#)).unwrap();
+        assert_eq!(grown, 235_941_928);
+        assert_eq!(surplus_after(grown, &event(r#""message":"prompt groups hold more places","places":4,"bytes":100"#)), Ok(235_942_028));
+        assert_eq!(surplus_after(grown, &event(r#""message":"prompt groups hold fewer places","places":1,"released":37196312"#)), Ok(0));
+        assert_eq!(surplus_after(grown, &event(r#""message":"prompt groups hold fewer places","places":2,"released":941928"#)), Ok(235_000_000));
+        assert_eq!(surplus_after(grown, &event(r#""message":"graph slots released","slots":5,"released":198745616"#)), Ok(37_196_312));
+        assert_eq!(surplus_after(5, &event(r#""message":"graph slots released","released":9"#)), Ok(0));
+        assert_eq!(surplus_after(grown, &event(r#""message":"memory read","planning":1"#)), Ok(grown));
+        assert_eq!(surplus_after(grown, "magnitude-harness: prompt groups hold more places, 99 bytes"), Ok(grown));
+        assert_eq!(surplus_after(grown, "magnitude-harness: event {not json"), Ok(grown));
+        assert!(surplus_after(grown, &event(r#""message":"prompt groups hold more places","places":4"#)).is_err());
+    }
+
+    /// The pressure's words fill every byte asked, none of them zero or
+    /// repeated, so no page of them compresses.
+    #[test]
+    fn the_pressure_writes_distinct_words_over_every_byte() {
+        let words = written(4096 * 3 + 1, 1).unwrap();
+        assert_eq!(words.len(), (4096 * 3 + 1usize).div_ceil(8));
+        assert!(words.iter().all(|&word| word != 0));
+        assert_eq!(words.iter().collect::<std::collections::HashSet<_>>().len(), words.len());
+        assert_ne!(written(64, 0).unwrap(), written(64, 1).unwrap());
     }
 
     /// Only the engine's unload under memory pressure is the pressure's

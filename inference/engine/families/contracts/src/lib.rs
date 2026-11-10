@@ -187,7 +187,8 @@ impl WeightDescriptor {
                     }
                     if !ImportTransform::tiles(&shape, *tile) {
                         return Err(DefinitionError::new(format!(
-                            "{:?} {shape:?} is no matrix of whole power-of-two {tile:?} tiles",
+                            "{:?} {shape:?} is no matrix, or stack of matrices, of whole \
+                             power-of-two {tile:?} tiles",
                             self.name
                         )));
                     }
@@ -250,12 +251,12 @@ pub enum ImportTransform {
         tensor: String,
         activations: ScaledActivations,
     },
-    /// Read the stored matrix (of single-value blocks) under the stored
-    /// grid `tensor` of block scales: one scale of `codes` per `tile`
-    /// (`[rows, columns]`, [`Self::tiles`]) of the matrix, the grid shaped
-    /// `[rows / tile[0], columns / tile[1]]`. The importer places each
-    /// tile's scale beside each block of its rows' values, which replicates
-    /// it exactly.
+    /// Read the stored matrix, or stack of matrices, (of single-value
+    /// blocks) under the stored grid `tensor` of block scales: one scale of
+    /// `codes` per `tile` (`[rows, columns]`, [`Self::tiles`]) of each
+    /// matrix, the grid shaped `[rows / tile[0], columns / tile[1]]` (with
+    /// the stack's leading extent). The importer places each tile's scale
+    /// beside each block of its rows' values, which replicates it exactly.
     ScaleBlocks {
         tensor: String,
         tile: [u64; 2],
@@ -294,14 +295,19 @@ impl ImportTransform {
         }
     }
 
-    /// The tile a stored grid `grid` of block scales gives a `shape` matrix,
-    /// when the grid tiles it ([`Self::tiles`]): `[rows / g, columns / h]`
-    /// for a `[g, h]` grid dividing it exactly.
+    /// The tile a stored grid `grid` of block scales gives a `shape` matrix
+    /// or stack of matrices, when the grid tiles it ([`Self::tiles`]):
+    /// `[rows / g, columns / h]` for a `[g, h]` grid (`[matrices, g, h]` of a
+    /// `[matrices, rows, columns]` stack, the same tile for every matrix)
+    /// dividing it exactly.
     pub fn grid_tile(shape: &[u64], grid: &[u64]) -> Option<[u64; 2]> {
-        let (&[rows, columns], &[grid_rows, grid_columns]) = (shape, grid) else {
+        let (Some(([rows, columns], stack)), Some(([grid_rows, grid_columns], grid_stack))) =
+            (Self::matrices(shape), Self::matrices(grid))
+        else {
             return None;
         };
-        if grid_rows == 0
+        if stack != grid_stack
+            || grid_rows == 0
             || grid_columns == 0
             || !rows.is_multiple_of(grid_rows)
             || !columns.is_multiple_of(grid_columns)
@@ -312,8 +318,8 @@ impl ImportTransform {
         Self::tiles(shape, tile).then_some(tile)
     }
 
-    /// Whether `tile` tiles a `shape` matrix exactly, each extent a power of
-    /// two dividing the matrix's.
+    /// Whether `tile` tiles every matrix of a `shape` matrix or stack of
+    /// matrices exactly, each extent a power of two dividing the matrix's.
     ///
     /// A file stores no tile, only its grid, so the tile is inferred from
     /// the shapes, and this rule is what makes the inferred tile the true
@@ -326,7 +332,7 @@ impl ImportTransform {
     /// So `t = T` whenever the extent has more than one tile, and a grid
     /// over a partial last tile (`300 = 10 x 30`) is refused, not misread.
     pub fn tiles(shape: &[u64], tile: [u64; 2]) -> bool {
-        let &[rows, columns] = shape else {
+        let Some(([rows, columns], _)) = Self::matrices(shape) else {
             return false;
         };
         tile[0].is_power_of_two()
@@ -334,15 +340,48 @@ impl ImportTransform {
             && rows.is_multiple_of(tile[0])
             && columns.is_multiple_of(tile[1])
     }
+
+    /// The `[rows, columns]` of a matrix (`[rows, columns]`) or of each
+    /// matrix of a stack (`[matrices, rows, columns]`), with the stack's
+    /// matrices (`None` for a matrix); `None` for any other rank.
+    fn matrices(shape: &[u64]) -> Option<([u64; 2], Option<u64>)> {
+        match *shape {
+            [rows, columns] => Some(([rows, columns], None)),
+            [stack, rows, columns] => Some(([rows, columns], Some(stack))),
+            _ => None,
+        }
+    }
 }
 
 /// The codes of a stored block-scale grid (`ImportTransform::ScaleBlocks`),
-/// as its file declares them.
+/// named by the type the grid is stored as ([`Self::of_stored`]): a
+/// block's value is its code times its tile's scale, one F32 product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScaleCodes {
-    /// UE8M0 bytes, `2^(b - 127)`, 0xff NaN (OCP E8M0), stored as I8
-    /// (`magnitude.scale_encoding = "ue8m0"`).
+    /// UE8M0 bytes, `2^(b - 127)`, 0xff NaN (OCP E8M0), stored as I8.
     Ue8m0,
+    /// F32 values, stored as F32: an FP8 checkpoint's `weight_scale_inv`,
+    /// each finite, and zero or of magnitude at least 2^-117, which the
+    /// importer checks.
+    F32,
+}
+
+impl ScaleCodes {
+    pub const ALL: [Self; 2] = [Self::Ue8m0, Self::F32];
+
+    /// The artifact encoding a grid of them is stored as.
+    pub const fn stored(self) -> magnitude_artifacts::gguf::Encoding {
+        match self {
+            Self::Ue8m0 => magnitude_artifacts::gguf::Encoding::I8,
+            Self::F32 => magnitude_artifacts::gguf::Encoding::F32,
+        }
+    }
+
+    /// The codes of a grid stored as `encoding`, if it is any codes' type:
+    /// each codes' stored type is theirs alone, so the type names them.
+    pub fn of_stored(encoding: magnitude_artifacts::gguf::Encoding) -> Option<Self> {
+        Self::ALL.into_iter().find(|codes| codes.stored() == encoding)
+    }
 }
 
 /// The exact symmetric 32-value code representation a progressive placement
@@ -2090,6 +2129,11 @@ mod tests {
             assert_eq!(ImportTransform::grid_tile(&shape, &grid), None, "{shape:?} {grid:?}");
         }
         assert_eq!(ImportTransform::grid_tile(&[64, 256, 1], &[2, 8]), None);
+        // A stack's grid tiles every matrix alike, over the same matrices.
+        assert_eq!(ImportTransform::grid_tile(&[3, 64, 256], &[3, 2, 8]), Some([32, 32]));
+        assert_eq!(ImportTransform::grid_tile(&[3, 64, 256], &[2, 2, 8]), None);
+        assert_eq!(ImportTransform::grid_tile(&[3, 64, 256], &[2, 8]), None);
+        assert_eq!(ImportTransform::grid_tile(&[2, 3, 64, 256], &[2, 3, 2, 8]), None);
         let tiled = |tile| WeightDescriptor {
             name: "w".into(),
             shape: vec![64, 256],
@@ -2102,5 +2146,22 @@ mod tests {
         assert_eq!(tiled([32, 32]).transformed_shape(&[64, 256]).unwrap(), [64, 256]);
         assert!(tiled([16, 48]).transformed_shape(&[64, 256]).is_err());
         assert!(tiled([0, 32]).transformed_shape(&[64, 256]).is_err());
+        assert_eq!(tiled([32, 32]).transformed_shape(&[3, 64, 256]).unwrap(), [3, 64, 256]);
+        assert!(tiled([32, 32]).transformed_shape(&[2, 3, 64, 256]).is_err());
+    }
+
+    /// An I8 grid holds UE8M0 bytes and an F32 grid F32 scales; a grid of
+    /// any other type holds no codes.
+    #[test]
+    fn scale_codes_are_named_by_their_stored_type() {
+        use magnitude_artifacts::gguf::Encoding;
+        for encoding in Encoding::ALL {
+            let codes = match encoding {
+                Encoding::I8 => Some(ScaleCodes::Ue8m0),
+                Encoding::F32 => Some(ScaleCodes::F32),
+                _ => None,
+            };
+            assert_eq!(ScaleCodes::of_stored(encoding), codes, "{encoding:?}");
+        }
     }
 }

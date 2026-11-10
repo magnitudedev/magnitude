@@ -1,7 +1,7 @@
 //! Every served target's family outline equals its load's layouts.
 
 use super::catalog::{
-    LIMITS, SELECTION, bank_reservations, bind_catalog_draft, refused_by_the_device, support_levels, target_manifest,
+    LIMITS, SELECTION, bank_reservations, bind_catalog_draft, refused_by_the_device, serves, target_manifest,
 };
 use crate::{
     ComponentSelection, ExecutionPath, ModelLoadPlan, PlanError, PlannedMethod, ResourceCapacity, ResourcePlanner,
@@ -25,13 +25,13 @@ use std::time::Duration;
 /// outline and of the layouts is printed.
 fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: BackendName) {
     let identity = PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
-    let levels = support_levels();
+    let served = serves();
     let (mut rows, mut failures) = (0u32, Vec::new());
     let (mut time, mut graphs) = ([Duration::ZERO; 2], 0usize);
     let index = headers::index();
     for component in index.iter().filter(|component| component.role == ComponentRole::Target) {
         let name = component.model.as_str();
-        if matches!(levels.get(name).map(String::as_str), Some("disabled" | "deprecated")) {
+        if !served(name) {
             continue;
         }
         let target = headers::component(component);

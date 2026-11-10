@@ -1,10 +1,16 @@
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_prefill: streaming attention for prefill rows over dense history.
-// The body (three launches) is `lib/attention/prefill.glsl`.
+// The body (its launches) is `lib/attention/prefill.glsl`.
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
+#define ATTENTION_KEY_ROUNDING                                                                                 \
+    (SEISMIC_DIM_KR != 0 ? rounding_of(SEISMIC_PARAM_KEY_BLOCK, SEISMIC_PARAM_KEY_ELEMENT, SEISMIC_PARAM_KEY_SCALE, \
+                               SEISMIC_PARAM_KEY_AMAX_FLOOR)                                                    \
+                         : rounding_none())
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SOFTPLUS (SEISMIC_PARAM_GATE_FUNCTION != 0)
 #define ATTENTION_QUERY_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
@@ -29,6 +35,12 @@
 #define PREFILL_LISTS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST)
 #define PREFILL_LISTED_BUFFER (PREFILL_LISTS_BUFFER + PREFILL_LIST_TILES * uint64_t(PREFILL_LIST_CAPACITY) * 8ul)
 #define PREFILL_BASES_BUFFER (PREFILL_LISTED_BUFFER + PREFILL_LIST_TILES * 4ul)
+// The index-list source (KS > 0): its state follows the attend grid's key
+// partitions (its z extent) in the partials and statistics scratch.
+#define PREFILL_PICKS (SEISMIC_DIM_KS != 0)
+#define PREFILL_KEY_PARTS                                                                                   \
+    max(1ul, (uint64_t(SEISMIC_TUNE_SPLIT_GROUPS) + PREFILL_LIST_TILES * SEISMIC_DIM_KV - 1ul)              \
+            / (PREFILL_LIST_TILES * SEISMIC_DIM_KV))
 #include "lib/attention/prefill.glsl"
 
 attention_history prefill_history() {
@@ -40,7 +52,20 @@ prefill_scratch prefill_scratch_planes() {
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS));
 }
 
+prefill_picked prefill_picked_planes() {
+    if (!PREFILL_PICKS)
+        return prefill_picked(0ul, 0ul);
+    const uint64_t states = PREFILL_KEY_PARTS * SEISMIC_DIM_M * uint64_t(ATTENTION_KV * ATTENTION_G);
+    return prefill_picked(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS) + states * uint64_t(ATTENTION_W) * 4ul,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS) + states * 8ul);
+}
+
 void attention_prefill_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }
-void attention_prefill_merge() { prefill_merge(prefill_scratch_planes()); }
+void attention_prefill_picks() {
+    prefill_picks(prefill_scratch_planes(), prefill_picked_planes(), SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS),
+        uint(SEISMIC_DIM_KS), SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS));
+}
+void attention_prefill_merge() { prefill_merge(prefill_scratch_planes(), prefill_picked_planes()); }
+void attention_prefill_rotate() { prefill_rotate(); }
 void attention_prefill_list() { prefill_list(); }

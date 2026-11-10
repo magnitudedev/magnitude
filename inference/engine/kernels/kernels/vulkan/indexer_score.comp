@@ -1,0 +1,111 @@
+// indexer_score on Vulkan (contract and portable body in indexer.seismic), as
+// CUDA's (`cuda/indexer_score.cu`):
+//
+// A workgroup of 256 invocations per (256 scores, row). A tile holding some
+// of the row's listed rows first prepares the row's H query heads into group
+// memory, a logical subgroup per head (8 heads at a time): widened to F32,
+// RMS-normalized with the query norm when NQ = 1, rotated at the row's
+// coordinates (`rotary_lane_rotate`) and rounded with the indexer's trained
+// rounding, as `indexer_keys` prepares a key. Then invocation t scores
+// ordinal j = 256 x + t of the row's list: the j-th key-plane row of its spans
+// (each invocation walks the spans to it), streaming the key's columns once
+// into one accumulator per head, so each head's dot is the ascending FMA
+// chain of the portable body; s = scale * sum_h relu(dot_h) * w_h, heads
+// ascending. Every score past the list is -inf.
+#include <seismic/element.glsl>
+#include <seismic/slab.glsl>
+#include "lib/core/activation.glsl"
+
+#define SCORE_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
+#define SCORE_H uint(SEISMIC_DIM_H)
+#define LANE_E (SCORE_W / 32u)
+
+#include "lib/core/head.glsl"
+#include "lib/core/rotary.glsl"
+#include "lib/core/rounding.glsl"
+#include "lib/indexer/indexer.glsl"
+
+// The rotated pairs: P of them over the leading columns, or the trailing ones
+// (RT = 1, from S); half-split, or adjacent (RA = 1).
+#define SCORE_ROTARY \
+    rotary_layout(uint(SEISMIC_DIM_P), SEISMIC_DIM_RT != 0 ? uint(SEISMIC_DIM_S) : 0u, SEISMIC_DIM_RA != 0)
+
+void indexer_score() {
+    const uint64_t row = gl_WorkGroupID.y;
+    const uint64_t n = SEISMIC_DIM_N;
+    const uint lane = SEISMIC_LANE;
+    const uint simd = SEISMIC_SUBGROUP;
+    const uint64_t spans = SEISMIC_PTR(SEISMIC_BUFFER_SPANS) + row * SEISMIC_SPANS_STRIDE_0 * 4ul;
+    // The row's listed rows: those of its spans, at most N scored.
+    const uint64_t listed =
+        min(uint64_t(indexer_span_rows(spans, SEISMIC_DIM_R, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2)), n);
+    const uint64_t ordinal = uint64_t(gl_WorkGroupID.x) * 256ul + gl_LocalInvocationIndex;
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const float infinity = uintBitsToFloat(0x7f800000u);
+    if (uint64_t(gl_WorkGroupID.x) * 256ul >= listed) {
+        if (ordinal < n)
+            element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, -infinity);
+        return;
+    }
+    // The row's query heads, prepared in F32.
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const rounding_t trained =
+        rounding_of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_ROUNDING_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
+    const rotary_turns turns = rotary_lane_turns(
+        SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * SEISMIC_COORDINATES_STRIDE_0 * 4ul, SEISMIC_COORDINATES_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_ROTARY_COMPONENTS_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+        SEISMIC_ROTARY_FREQUENCIES_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES),
+        SEISMIC_ROTARY_AMPLITUDES_STRIDE_0, SCORE_ROTARY, lane);
+    const uint64_t query = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
+    for (uint head = simd; head < SCORE_H; head += SEISMIC_SUBGROUPS) {
+        float x[LANE_E];
+        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+            x[i] = element_at(ELEMENT_ACT, query, row * SEISMIC_QUERY_STRIDE_0 + uint64_t(head) * SEISMIC_QUERY_STRIDE_1
+                + uint64_t(lane * LANE_E + i) * SEISMIC_QUERY_STRIDE_2);
+        // A rounded query is rounded from its norm and rotation held in A.
+        if (SEISMIC_DIM_NQ != 0) {
+            head_rms_norm(x, SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM), SEISMIC_QUERY_NORM_STRIDE_1, epsilon, lane);
+            rounding_hold_lanes(x, trained);
+        }
+        rotary_lane_rotate(x, turns, SCORE_ROTARY, lane);
+        rounding_hold_lanes(x, trained);
+        rounding_lanes(x, trained);
+        [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+            seismic_shared_f32[head * SCORE_W + lane * LANE_E + i] = x[i];
+    }
+    barrier();
+    if (ordinal >= n)
+        return;
+    if (ordinal >= listed) {
+        element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, -infinity);
+        return;
+    }
+    // The ordinal's key-plane row (a listed ordinal lies within the spans).
+    const int at = indexer_span_row(spans, SEISMIC_DIM_R, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2, ordinal);
+    const uint64_t k = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_KEYS), uint(at), uint(SEISMIC_PARAM_SLAB_ROWS),
+        uint64_t(SCORE_W) * 4ul);
+    float dot[SCORE_H];
+    [[unroll]] for (uint head = 0u; head < SCORE_H; ++head)
+        dot[head] = 0.0;
+    for (uint column = 0u; column < SCORE_W; column += 4u) {
+        const vec4 kx = element_vec4_at(k + uint64_t(column) * 4ul);
+        [[unroll]] for (uint head = 0u; head < SCORE_H; ++head) {
+            const uint q = head * SCORE_W + column;
+            float d = dot[head];
+            d = seismic_fma_rn(seismic_shared_f32[q], kx.x, d);
+            d = seismic_fma_rn(seismic_shared_f32[q + 1u], kx.y, d);
+            d = seismic_fma_rn(seismic_shared_f32[q + 2u], kx.z, d);
+            d = seismic_fma_rn(seismic_shared_f32[q + 3u], kx.w, d);
+            dot[head] = d;
+        }
+    }
+    const uint64_t head_weights = SEISMIC_PTR(SEISMIC_BUFFER_HEAD_WEIGHTS);
+    float total = 0.0;
+    [[unroll]] for (uint head = 0u; head < SCORE_H; ++head) {
+        const float weight = SEISMIC_DIM_HW != 0
+            ? element_at(ELEMENT_ACT, head_weights, row * SEISMIC_HEAD_WEIGHTS_STRIDE_0 + uint64_t(head) * SEISMIC_HEAD_WEIGHTS_STRIDE_1)
+            : 1.0;
+        total = total + max(dot[head], 0.0) * weight;
+    }
+    element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, element_word_f32(SEISMIC_PARAM_SCALE) * total);
+}

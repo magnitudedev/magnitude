@@ -1,7 +1,8 @@
 // ngram_gate (contract and portable body in ngram.seismic): each row's
 // per-stream gate sigmoid(g) and the inverse RMS of the gated value. The
 // Vulkan form of `cuda/ngram_gate.cu`: a workgroup per (stream, row), the y
-// grid visiting the rows with a stride.
+// grid visiting the rows with a stride. Under the stored product (PR = 1)
+// the query weight is one.
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 
@@ -48,10 +49,13 @@ void ngram_gate() {
             const float vv = element_f32_at(v + i * SEISMIC_VALUE_STRIDE_1 * 4ul);
             keys = seismic_fma_rn(kv, kv, keys);
             queries = seismic_fma_rn(xv, xv, queries);
+            // Under the stored product (PR = 1) the query weight is one,
+            // which leaves each term's bits as the body's.
+            const float qn = SEISMIC_DIM_PR == 1 ? 1.0
+                : element_at(QUERY_NORM, query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1);
             dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv,
                        element_at(KEY_NORM, key_norm, stream * SEISMIC_KEY_NORM_STRIDE_0 + i * SEISMIC_KEY_NORM_STRIDE_1)),
-                       xv),
-                   element_at(QUERY_NORM, query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1));
+                       xv), qn);
             values = seismic_fma_rn(vv, vv, values);
         }
         keys = reduce_group_sum(keys, 0u);

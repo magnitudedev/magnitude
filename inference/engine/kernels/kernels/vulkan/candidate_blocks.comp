@@ -1,0 +1,38 @@
+// candidate_blocks on Vulkan (contract and portable body in indexer.seismic),
+// as CUDA's (`cuda/candidate_blocks.cu`):
+//
+// A workgroup of 256 invocations per (256 blocks, row), invocation t scoring
+// block 256 x + t: the largest of its listed scores, the newest block +inf,
+// -inf past the row's blocks. The first invocation of the row's first
+// workgroup writes its block list.
+#include <seismic/element.glsl>
+
+void candidate_blocks() {
+    const uint64_t row = gl_WorkGroupID.y;
+    const uint n = uint(SEISMIC_DIM_N);
+    const uint nb = uint(SEISMIC_DIM_NB);
+    const uint bu = uint(SEISMIC_DIM_BU);
+    const int complete = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_COMPLETE) + row * SEISMIC_COMPLETE_STRIDE_0 * 4ul);
+    const uint units = uint(min(max(complete, 0), int(n)));
+    const uint count = (units + bu - 1u) / bu;
+    const uint block = gl_WorkGroupID.x * 256u + gl_LocalInvocationIndex;
+    if (block == 0u) {
+        const uint64_t lists = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul;
+        element_i32_put(lists, 0);
+        element_i32_put(lists + SEISMIC_RESULT_1_STRIDE_2 * 4ul, int(count));
+    }
+    if (block >= nb)
+        return;
+    const float infinity = uintBitsToFloat(0x7f800000u);
+    float score = -infinity;
+    if (block + 1u == count) {
+        score = infinity;
+    } else if (block < count) {
+        const uint64_t scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES) + row * SEISMIC_SCORES_STRIDE_0 * 4ul;
+        const uint end = min((block + 1u) * bu, units);
+        for (uint unit = block * bu; unit < end; ++unit)
+            score = max(score, element_f32_at(scores + uint64_t(unit) * SEISMIC_SCORES_STRIDE_1 * 4ul));
+    }
+    element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+        + (row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(block) * SEISMIC_RESULT_0_STRIDE_1) * 4ul, score);
+}

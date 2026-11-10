@@ -461,9 +461,9 @@ fn gated_delta_step[M, B, S, NK, NV, W, C, T](
     rate: &tensor[NV] f32, time_bias: &tensor[NV] f32, recurrent_norm: &tensor[W] RN,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
-    delta: &mut tensor[S, NV, W, W] f32,
-    tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
+    window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
+    delta: &slab mut tensor[S, NV, W, W] f32,
+    tape: &slab mut tensor[S, T, NV * W + NK * W + NV] f32,
     norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
     -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_rows(projection, convolution, rate, time_bias, recurrent_norm, segments, stop,
@@ -557,7 +557,7 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
     beta_weight: &tensor[NV, H] BW, convolution: &tensor[(2 * NK + NV) * W, C] f32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A, epsilon: f32, slab_banks: u32)
+    window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A, epsilon: f32, slab_banks: u32)
     -> (tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A, tensor[M, (2 * NK + NV) * W] f32)
     where T >= 0 and NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
     # Decode classes: no packed form, so no packing bounds.
@@ -623,8 +623,8 @@ fn gated_delta_step_convolved[M, B, S, NK, NV, W, T](
     rate: &tensor[NV] f32, time_bias: &tensor[NV] f32, recurrent_norm: &tensor[W] RN,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    delta: &mut tensor[S, NV, W, W] f32,
-    tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
+    delta: &slab mut tensor[S, NV, W, W] f32,
+    tape: &slab mut tensor[S, T, NV * W + NK * W + NV] f32,
     norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
     -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_advance(projection, convolved, rate, time_bias, recurrent_norm, segments, stop,
@@ -666,9 +666,9 @@ fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
     rate: &tensor[NV] f32, time_bias: &tensor[NV] f32, recurrent_norm: &tensor[W] RN,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
-    delta: &mut tensor[S, NV, W, W] f32,
-    tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
+    window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
+    delta: &slab mut tensor[S, NV, W, W] f32,
+    tape: &slab mut tensor[S, T, NV * W + NK * W + NV] f32,
     norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
     -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_rows(projection, convolution, rate, time_bias, recurrent_norm, segments, stop,

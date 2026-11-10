@@ -6,7 +6,7 @@
 #![allow(dead_code, unused_macros)]
 
 use magnitude_ggml::Encoding;
-use seismic::{Element, GgufScales, Layout, OperandRecipe};
+use seismic::{Element, GgufScales, GridScale, Layout, OperandRecipe};
 use seismic_lang::registry::f16_bits;
 
 include!("widths.rs");
@@ -51,7 +51,13 @@ impl Format {
     /// GGUF F8_E4M3 under its grid of E8M0 block scales: mxfp8g32.
     pub const F8_E4M3: Format = Format {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::E8m0Grid,
+        scales: GgufScales::Grid(GridScale::E8m0),
+        operands: OperandRecipe::Rounded,
+    };
+    /// GGUF F8_E4M3 under its grid of F32 tile scales: fp8g128.
+    pub const F8_E4M3_F32: Format = Format {
+        encoding: Encoding::F8E4M3,
+        scales: GgufScales::Grid(GridScale::F32),
         operands: OperandRecipe::Rounded,
     };
 
@@ -193,12 +199,24 @@ impl Format {
                     *field = (exponent << 3) | (rng.next() % 8) as u8;
                 }
             }
-            // An assembled block: E8M0, the power of two nearest
-            // factor / 448 (the E4M3 range), then 32 random finite E4M3
-            // codes (a NaN code, S.1111.111, loses its exponent's top bit).
+            // An assembled block: its scale, of factor / 448 (the E4M3
+            // range), then random finite E4M3 codes (a NaN code,
+            // S.1111.111, loses its exponent's top bit). An E8M0 scale is
+            // the power of two nearest it (32 codes follow), an F32 one it
+            // (128 codes follow).
             Encoding::F8E4M3 => {
-                block[0] = (127.0 + (factor / 448.0).log2().round()) as u8;
-                for code in &mut block[1..] {
+                let codes = match self.scales {
+                    GgufScales::Grid(GridScale::E8m0) => {
+                        block[0] = (127.0 + (factor / 448.0).log2().round()) as u8;
+                        1
+                    }
+                    GgufScales::Grid(GridScale::F32) => {
+                        block[..4].copy_from_slice(&(factor / 448.0).to_le_bytes());
+                        4
+                    }
+                    GgufScales::Own => panic!("F8_E4M3 blocks are scaled by a grid"),
+                };
+                for code in &mut block[codes..] {
                     if *code & 0x7f == 0x7f {
                         *code &= !0x40;
                     }
@@ -212,7 +230,7 @@ impl Format {
     /// recipe, in ggml id order.
     fn pairs() -> impl Iterator<Item = Format> {
         Encoding::ALL.into_iter().flat_map(|encoding| {
-            [GgufScales::Own, GgufScales::E8m0Grid]
+            GgufScales::ALL
                 .into_iter()
                 .flat_map(move |scales| {
                     OperandRecipe::ALL.into_iter().map(move |operands| Format {

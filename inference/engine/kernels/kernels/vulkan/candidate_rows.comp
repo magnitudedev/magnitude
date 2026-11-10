@@ -1,0 +1,106 @@
+// candidate_rows on Vulkan (contract and portable body in indexer.seismic), as
+// CUDA's (`cuda/candidate_rows.cu`):
+//
+// An invocation per row, as the CPU native: its taken units form ascending
+// runs (before each picked block, ascending and clipped to the row's units,
+// the fill takes the gap's lowest units while it lasts, then the block's own;
+// after the last, the rest of the fill). Each run is mapped through the row's
+// spans, split where a span ends, and adjacent runs within one span join. The
+// rest of the row's B + R spans are [-1, -1].
+#include <seismic/element.glsl>
+#include "lib/indexer/indexer.glsl"
+
+// A row's taken units as plane-row spans: the pending run [start, end)
+// (joined with an adjacent next), mapped through the row's list spans on
+// flush; `span` is the list span the next run starts in, `offset` the units
+// before it, `count` the spans emitted.
+struct candidate_pool {
+    uint64_t list;
+    uint64_t result;
+    uint count;
+    uint span;
+    uint offset;
+    uint start;
+    uint end;
+};
+
+void candidate_flush(inout candidate_pool pool) {
+    const uint spans = uint(SEISMIC_DIM_R);
+    const uint capacity = uint(SEISMIC_DIM_B + SEISMIC_DIM_R);
+    uint at = pool.start;
+    while (at < pool.end && pool.span < spans) {
+        const uint64_t entry = pool.list + uint64_t(pool.span) * SEISMIC_SPANS_STRIDE_1 * 4ul;
+        const int lo = element_i32_at(entry);
+        const uint size = indexer_span_length(lo, element_i32_at(entry + SEISMIC_SPANS_STRIDE_2 * 4ul));
+        if (pool.offset + size <= at) {
+            pool.offset += size;
+            ++pool.span;
+            continue;
+        }
+        const uint stop = min(pool.end, pool.offset + size);
+        if (pool.count < capacity) {
+            const uint64_t target = pool.result + uint64_t(pool.count) * SEISMIC_RESULT_0_STRIDE_1 * 4ul;
+            element_i32_put(target, lo + int(at - pool.offset));
+            element_i32_put(target + SEISMIC_RESULT_0_STRIDE_2 * 4ul, lo + int(stop - pool.offset));
+        }
+        ++pool.count;
+        at = stop;
+    }
+    pool.start = 0u;
+    pool.end = 0u;
+}
+
+// Takes the units [first, last), ascending after every earlier run.
+void candidate_take(inout candidate_pool pool, uint first, uint last) {
+    if (first == last)
+        return;
+    if (pool.end > pool.start && pool.end == first) {
+        pool.end = last;
+        return;
+    }
+    candidate_flush(pool);
+    pool.start = first;
+    pool.end = last;
+}
+
+void candidate_rows() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * 64ul + gl_LocalInvocationIndex;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    const uint b = uint(SEISMIC_DIM_B);
+    const uint bu = uint(SEISMIC_DIM_BU);
+    const uint k = uint(SEISMIC_DIM_K);
+    const uint64_t spans = SEISMIC_PTR(SEISMIC_BUFFER_SPANS) + row * SEISMIC_SPANS_STRIDE_0 * 4ul;
+    const uint64_t picks = SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + row * SEISMIC_BLOCKS_STRIDE_0 * 4ul;
+    const uint units = indexer_span_rows(spans, SEISMIC_DIM_R, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2);
+    uint pooled = 0u;
+    for (uint pick = 0u; pick < b; ++pick) {
+        const int block = element_i32_at(picks + uint64_t(pick) * SEISMIC_BLOCKS_STRIDE_1 * 4ul);
+        if (block >= 0)
+            pooled += min(units, (uint(block) + 1u) * bu) - min(units, uint(block) * bu);
+    }
+    const uint wanted = min(k, units);
+    uint fill = wanted > pooled ? wanted - pooled : 0u;
+    candidate_pool pool = candidate_pool(spans,
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul, 0u, 0u, 0u, 0u, 0u);
+    uint cursor = 0u;
+    for (uint pick = 0u; pick <= b; ++pick) {
+        const bool last = pick == b;
+        const int block = last ? 0 : element_i32_at(picks + uint64_t(pick) * SEISMIC_BLOCKS_STRIDE_1 * 4ul);
+        if (!last && block < 0)
+            continue;
+        const uint start = last ? units : min(units, uint(block) * bu);
+        const uint end = last ? units : min(units, (uint(block) + 1u) * bu);
+        const uint take = min(fill, start - cursor);
+        candidate_take(pool, cursor, cursor + take);
+        fill -= take;
+        candidate_take(pool, start, end);
+        cursor = end;
+    }
+    candidate_flush(pool);
+    for (uint entry = pool.count; entry < b + uint(SEISMIC_DIM_R); ++entry) {
+        const uint64_t target = pool.result + uint64_t(entry) * SEISMIC_RESULT_0_STRIDE_1 * 4ul;
+        element_i32_put(target, -1);
+        element_i32_put(target + SEISMIC_RESULT_0_STRIDE_2 * 4ul, -1);
+    }
+}

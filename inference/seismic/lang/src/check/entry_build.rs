@@ -1820,7 +1820,7 @@ fn build_schema_parameters(
             name: semantic.name.clone(),
             kind,
             value: semantic.value,
-            awaited: semantic.awaited,
+            binding: semantic.binding,
         });
     }
     // Tensor pairs are disjoint whenever either side is mutable/owned.
@@ -2083,7 +2083,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     name: dimension.name.clone(),
                     value,
                     access: ParameterAccess::Scalar,
-                    awaited: false,
+                    binding: crate::entry::PortBinding::Ordinary,
                 });
                 let actual = self.runtime_int(value);
                 // A propagated private recipe remains an exact value even
@@ -2109,7 +2109,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 &[],
                 ty,
                 &parameter.ownership,
-                parameter.awaited,
+                parameter.binding,
                 parameter.span,
             )?;
             self.locals[parameter.local.index()] = Some(value);
@@ -2239,7 +2239,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         path: &[u32],
         ty: SemanticType,
         ownership: &ir::Ownership,
-        awaited: bool,
+        binding: crate::entry::PortBinding,
         span: crate::span::Span,
     ) -> Result<SemanticValueId, SourceDiagnostic> {
         if let SemanticType::Tuple(items) = &ty {
@@ -2257,7 +2257,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     &child,
                     item,
                     &parts[ordinal],
-                    awaited,
+                    binding,
                     span,
                 )?);
             }
@@ -2302,7 +2302,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             name: leaf_name,
             value,
             access: leaf_access,
-            awaited,
+            binding,
         });
         Ok(value)
     }
