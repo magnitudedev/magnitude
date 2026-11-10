@@ -5811,18 +5811,41 @@ gguf_format_tests! {
 /// An F8_E4M3 weight under its UE8M0 grid (mxfp8g32) at DeepSeek V4.1
 /// Flash's attention shapes, `wq_b` `[32768, 1280]` and `wo_b` `[5120,
 /// 8192]`, projects a decode row (GEMV) and a verify block (GEMM) within
-/// the reassociation bound of the F32 host reference. The weight's rows
-/// repeat a host-built 509 (prime, so no tile or row block repeats with
-/// them), which the host decodes in seconds rather than the whole matrix's
-/// tens of minutes.
+/// the reassociation bound of the F32 host reference
+/// (`fp8_projections_match_the_host_reference`).
 #[test]
 fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
+    fp8_projections_match_the_host_reference(Format::F8_E4M3, &[(32768, 1280, 81), (5120, 8192, 82)], &[1, 17]);
+}
+
+/// An F8_E4M3 weight under its F32 tile grid (fp8g128) at GLM-5.3-Flash's
+/// shapes, a routed expert's down `[4096, 2048]`, the dense FFN's down
+/// `[4096, 12288]` and MLA's `q_b` `[16384, 1536]`, projects a decode row
+/// (GEMV), a verify block and a prefill block (GEMMs) within the
+/// reassociation bound of the F32 host reference
+/// (`fp8_projections_match_the_host_reference`).
+#[test]
+fn fp8g128_projections_at_glm_shapes_match_the_host_reference() {
+    fp8_projections_match_the_host_reference(
+        Format::F8_E4M3_F32,
+        &[(4096, 2048, 83), (4096, 12288, 84), (16384, 1536, 85)],
+        &[1, 17, 128],
+    );
+}
+
+/// `format`'s `[h, f]` weights of `shapes` (each with its seed) project
+/// blocks of each of `rows` rows on every device within the
+/// reassociation bound of the F32 host reference. The weight's rows repeat
+/// a host-built 509 (prime, so no tile or row block repeats with them),
+/// which the host decodes in seconds rather than the whole matrix's tens of
+/// minutes.
+fn fp8_projections_match_the_host_reference(format: Format, shapes: &[(usize, usize, u64)], rows: &[usize]) {
     let act = Act::Bf16;
-    let repr = Repr::Gguf(Format::F8_E4M3);
+    let repr = Repr::Gguf(format);
     let mapping = gemm_mapping(64, 64, 1);
-    for (h, f, seed) in [(32768, 1280, 81), (5120, 8192, 82)] {
+    for &(h, f, seed) in shapes {
         let down = periodic_weight(repr, h, f, seed);
-        for rows in [1usize, 17] {
+        for &rows in rows {
             let mut rng = Rng::new(seed + rows as u64);
             let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
@@ -5837,7 +5860,7 @@ fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
                     &device, act, &down, &residual, rows, &product, &out_rows, mapping,
                 );
                 assert_within(
-                    &format!("mxfp8g32 [{h}, {f}] M {rows} on {:?}", device.backend()),
+                    &format!("{format:?} [{h}, {f}] M {rows} on {:?}", device.backend()),
                     &native,
                     &expected,
                     &bound,

@@ -16,7 +16,7 @@ use magnitude_family_contracts::{
     ImportTransform, ProgressiveCodeDepth, ProgressivePlane, ScaleCodes, ScaledActivations,
     WeightDescriptor,
 };
-use seismic::{Element, GgufScales};
+use seismic::{Element, GgufScales, GridScale};
 
 /// Whether the importer can apply `descriptor`'s transforms to a tensor
 /// stored as `source` with `stored` shape, making the shape `descriptor`
@@ -183,9 +183,9 @@ pub(crate) fn apply(
     let mut shape = stored.to_vec();
     for transform in &descriptor.transforms {
         match transform {
-            ImportTransform::ScaleBlocks { tile, .. } => {
+            ImportTransform::ScaleBlocks { tile, codes, .. } => {
                 let grid = grid.expect("a weight under a scale grid is stored with it");
-                bytes = assemble_grid(source, &bytes, grid, &shape, *tile)?;
+                bytes = assemble_grid(source, &bytes, grid, &shape, *tile, grid_scale(*codes))?;
             }
             ImportTransform::Rows(range) => {
                 let rows = RowLayout::of(&shape, source)?;
@@ -267,7 +267,7 @@ pub(crate) fn upload_bytes(
 
 /// Where the scales of a weight `descriptor` names are
 /// (`seismic::GgufScales`): in its stored tensor's own blocks, or in its
-/// grid of UE8M0 block scales.
+/// grid of block scales.
 pub(crate) fn stored_scales(descriptor: &WeightDescriptor) -> GgufScales {
     scales_of(grid(descriptor).map(|(_, _, codes)| codes))
 }
@@ -275,9 +275,15 @@ pub(crate) fn stored_scales(descriptor: &WeightDescriptor) -> GgufScales {
 /// Where the scales of stored blocks are, under a grid of `grid` codes when
 /// they have one.
 pub(crate) fn scales_of(grid: Option<ScaleCodes>) -> GgufScales {
-    match grid {
-        Some(ScaleCodes::Ue8m0) => GgufScales::E8m0Grid,
-        None => GgufScales::Own,
+    grid.map_or(GgufScales::Own, |codes| GgufScales::Grid(grid_scale(codes)))
+}
+
+/// The scale element a grid of `codes` places in each of its source's
+/// blocks.
+fn grid_scale(codes: ScaleCodes) -> GridScale {
+    match codes {
+        ScaleCodes::Ue8m0 => GridScale::E8m0,
+        ScaleCodes::F32 => GridScale::F32,
     }
 }
 
@@ -332,38 +338,83 @@ pub(crate) fn assemble_row(
     apply(descriptor, &[1, width], source, own.to_vec(), grid.first().copied())
 }
 
-/// The blocks of `source` (`GgufScales::E8m0Grid`) of a `[rows, columns]`
-/// matrix of one-byte codes `codes` under its `[rows / tile[0], columns /
-/// tile[1]]` grid of one-byte block scales `grid`: per row, per packet of
-/// the source's values, their tile's scale, then their codes. Every byte is
-/// the stored one, so the source holds the stored values exactly, NaN codes
-/// and scales included. The plan admitted the tiling (`admit_transforms`)
-/// and the stored bytes, so any other geometry is an invariant violation.
+/// The blocks of `source` (`GgufScales::Grid`) of a `[rows, columns]`
+/// matrix, or `[matrices, rows, columns]` stack, of one-byte codes `codes`
+/// under its `[rows / tile[0], columns / tile[1]]` grid (per matrix) of
+/// block scales of element `scales`, `grid`: per row, per packet of the source's
+/// values, their tile's scale, then their codes. Every byte is the stored
+/// one, so the source holds the stored values exactly, NaN codes and E8M0
+/// scales included; an F32 scale is first checked ([`f32_scale`]). The plan
+/// admitted the tiling (`admit_transforms`) and the stored bytes, so any
+/// other geometry is an invariant violation.
 fn assemble_grid(
     source: Element,
     codes: &[u8],
     grid: &[u8],
     shape: &[u64],
     tile: [u64; 2],
+    scales: GridScale,
 ) -> Result<Vec<u8>, String> {
-    let &[rows, columns] = shape else {
-        unreachable!("an admitted scale grid scales a matrix, not {shape:?}");
+    let (matrices, rows, columns) = match *shape {
+        [rows, columns] => (1, rows, columns),
+        [matrices, rows, columns] => (matrices, rows, columns),
+        _ => unreachable!("an admitted scale grid scales a matrix or stack, not {shape:?}"),
     };
-    let (rows, columns) = (to_usize(rows)?, to_usize(columns)?);
+    let (rows, columns) = (to_usize(matrices * rows)?, to_usize(columns)?);
     let (tile_rows, tile_columns) = (to_usize(tile[0])?, to_usize(tile[1])?);
     let block = to_usize(source.logical_group().expect("a grid source has packets"))?;
+    let scale = to_usize(scales.bytes())?;
     let grid_columns = columns / tile_columns;
-    assert_eq!(codes.len(), rows * columns, "the admitted codes of a {shape:?} matrix");
-    assert_eq!(grid.len(), rows / tile_rows * grid_columns, "the admitted grid of {tile:?} tiles");
-    let mut blocks = Vec::with_capacity(rows * columns / block * (block + 1));
+    assert_eq!(codes.len(), rows * columns, "the admitted codes of a {shape:?} tensor");
+    assert_eq!(
+        grid.len(),
+        rows / tile_rows * grid_columns * scale,
+        "the admitted grid of {tile:?} tiles"
+    );
+    if scales == GridScale::F32 {
+        for (at, value) in grid.chunks_exact(4).enumerate() {
+            f32_scale(f32::from_le_bytes(value.try_into().expect("four bytes")))
+                .map_err(|reason| format!("scale {at} of the grid: {reason}"))?;
+        }
+    }
+    let mut blocks = Vec::with_capacity(rows * columns / block * (block + scale));
+    // A matrix's rows are whole tiles, so the stack's rows, matrix after
+    // matrix, read their tiles' rows of the grid in order.
     for (row, codes) in codes.chunks_exact(columns).enumerate() {
-        let scales = &grid[row / tile_rows * grid_columns..][..grid_columns];
+        let scales = &grid[row / tile_rows * grid_columns * scale..][..grid_columns * scale];
         for (first, codes) in codes.chunks_exact(block).enumerate() {
-            blocks.push(scales[first * block / tile_columns]);
+            blocks.extend_from_slice(&scales[first * block / tile_columns * scale..][..scale]);
             blocks.extend_from_slice(codes);
         }
     }
     Ok(blocks)
+}
+
+/// Whether `scale`, an F32 block scale (`ScaleCodes::F32`), is one the
+/// engine reads: finite, and zero or of magnitude at least 2^-117. A
+/// value is the code times its scale, one F32 product (`fp8g128`). The
+/// Metal, Vulkan and CPU decoders take an E4M3 code as an integer `q`
+/// times 2^-9 and fold the 2^-9 into the scale, `(s · 2^-9) · q`
+/// (`ScalesTimes`); that is the one product `s · (q · 2^-9)` exactly when
+/// `s · 2^-9` is exact, which for an F32 `s` (24 significant bits) holds
+/// while it stays in F32's normal range, `|s| >= 2^-117`, or is zero. Below
+/// it the folded scale drops low bits: `s = (1 + 2^-23) · 2^-118` under the
+/// code of 1.0 decodes to `2^-118`, not `s`. The same bound keeps every
+/// nonzero product, at least `2^-117 · 2^-9`, an F32 normal, which a device
+/// that flushes subnormals keeps too. A checkpoint's scales are amax / 448,
+/// far above it.
+fn f32_scale(scale: f32) -> Result<(), String> {
+    // 2^-117: biased exponent 127 - 117, no mantissa.
+    const LEAST: f32 = f32::from_bits((127 - 117) << 23);
+    if !scale.is_finite() {
+        return Err(format!("{scale} is not finite"));
+    }
+    if scale != 0.0 && scale.abs() < LEAST {
+        return Err(format!(
+            "{scale:e} is below 2^-117, where a code's value under it is no exact F32 product"
+        ));
+    }
+    Ok(())
 }
 
 /// The stored tensor holding `descriptor`'s second-level scale, when it has

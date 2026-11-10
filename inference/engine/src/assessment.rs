@@ -1491,7 +1491,8 @@ fn unsupported_weights(
     let mut counts = BTreeMap::<&'static str, u32>::new();
     for (tensor, scales) in stored_weights(tensors) {
         let width = tensor.shape.last().copied().unwrap_or(1);
-        let imported = match residency {
+        // A weight whose scales are read nowhere is imported nowhere.
+        let imported = scales.is_some_and(|scales| match residency {
             // Every encoding with a resident element has a W4A16 one.
             Residency::Packed => held_storage(
                 tensor.encoding,
@@ -1505,7 +1506,7 @@ fn unsupported_weights(
             Residency::Dequantized => {
                 scaled_source_element(tensor.encoding, scales, width).is_some()
             }
-        };
+        });
         if !imported {
             *counts.entry(tensor.encoding.ggml_name()).or_default() += 1;
         }

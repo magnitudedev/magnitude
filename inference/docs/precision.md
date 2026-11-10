@@ -265,20 +265,47 @@ checkpoints keep those weights in BF16, refuse W4A4 weights rather than form row
 The stored `input_scale` marks the recipe and is not applied: each row's global scale is the
 row's own power of two.
 
-## UE8M0-scaled FP8 weights
+## Block-scaled FP8 weights
 
-A GGUF declaring `magnitude.scale_encoding = "ue8m0"` stores an FP8 checkpoint's block-scaled
-weights as the checkpoint ships them (`inference/conversion`). A weight `X` is its F8_E4M3 codes
-`X.weight` `[rows, columns]` beside an I8 grid `X.scale` `[rows / r, columns / c]` of UE8M0
-bytes, one per `[r, c]` tile. A reader takes the tile as the quotient of the two shapes, which
-is unambiguous only for whole tiles, so a file holds whole tiles only. A code q in a tile of
-byte b has the value q · 2^(b − 127), one F32 product (OCP MX's E8M0: 255 is NaN). DeepSeek
-V4.1's dense FP8 weights have 32 × 32 tiles and its Engram table 1 × 32.
+A GGUF stores an FP8 checkpoint's block-scaled weights as the checkpoint ships them
+(`inference/conversion`). A weight `X` is its F8_E4M3 codes `X.weight` `[rows, columns]`, or
+`[matrices, rows, columns]` for stacked experts, beside a grid `X.scale` `[rows / r, columns /
+c]` (with the stack's leading extent), one scale per `[r, c]` tile, the same tile for every
+matrix. A reader takes the tile as the quotient of the two shapes. That is unambiguous only for
+whole power-of-two tiles, so a file holds whole tiles only. The grid's stored type names its
+scales' encoding, so each grid is read in its own and one file can hold both. (Published
+files also carry a file-wide `magnitude.scale_encoding`, `"ue8m0"` or `"f32"`; it agrees with
+their grids' type, and no reader reads it.)
 
-The converter and the model references (`inference/evaluation`) refuse bytes above 246, the
-range in which every product is exact in F32: E4M3's largest code, 448 = 1.75 · 2^8, reaches
+- I8: UE8M0 bytes b, the scale 2^(b − 127) (OCP MX's E8M0: 255 is NaN). DeepSeek V4.1's
+  dense FP8 weights have 32 × 32 tiles, and its Engram table 1 × 32. The weight is resident as
+  `mxfp8g32`, with one E8M0 scale per 32 values of a row.
+- F32: F32 values s, the checkpoint's `weight_scale_inv`. GLM-5.3-Flash's weights have
+  128 × 128 tiles of scales amax / 448. The weight is resident as `fp8g128`, with one F32 scale
+  per 128 values of a row, so a tile is whole 128-value groups.
+
+In both, a code's value v times its tile's scale is one F32 product, the value the model
+reference (`inference/evaluation`) holds. Each row repeats its tile's scale on every group, so
+every row is self-contained. The resident scale bytes are 1/32 of the codes' under either
+encoding, 3.1%.
+
+A UE8M0 product is exact in F32. The converter and the references refuse bytes above 246,
+the range in which every product is exact: E4M3's largest code, 448 = 1.75 · 2^8, reaches
 F32's largest binade at b = 246, and its smallest step, 2^−9, stays above F32's smallest at
 every b.
+
+An F32 product is not always exact. An E4M3 value has 4 significant bits and an F32 scale 24,
+so the exact product can have 28. The product is held as its correctly rounded F32 value, a
+relative error of at most 2^−24, far below E4M3's own resolution of 2^−4: rounding is the
+model's operation, not an approximation of it. The products' rounding is the same on every
+device for every admitted scale. Metal, Vulkan and the CPU take a code as an integer q times
+2^−9 and fold the power of two into the scale, computing (s · 2^−9) · q. That equals the one
+product s · (q · 2^−9) only while s · 2^−9 is exact, that is, while it stays in F32's normal
+range. So the importer refuses any scale that is not finite, or is nonzero with |s| < 2^−117,
+far below a checkpoint's amax / 448. The bound also keeps every nonzero product, at
+least 2^−117 · 2^−9 = 2^−126, an F32 normal, which a device that flushes subnormals keeps.
+A kernel that applies a group's scale after summing its products reorders the arithmetic,
+and admission judges it against α like any other reordering.
 
 ## Evidence and boundaries
 

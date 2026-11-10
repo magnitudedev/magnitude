@@ -834,6 +834,9 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         // An assembled block: E8M0 scale 127 (2^0), then E4M3 codes 0x38
         // (value 1).
         "mxfp8g32" => unit_packet(size, &[(0, &[127]), (1, &[0x38; 32])]),
+        // An assembled block: F32 scale 1.0, then E4M3 codes 0x38 (value
+        // 1).
+        "fp8g128" => unit_packet(size, &[(0, &1.0f32.to_le_bytes()), (4, &[0x38; 128])]),
         // E2M1 code 2 (value 1) and four UE4M3 scales 0x38 (1.0).
         "nvfp4g16" => unit_packet(size, &[(0, &[0x38; 4]), (4, &[0x22; 32])]),
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 (odd

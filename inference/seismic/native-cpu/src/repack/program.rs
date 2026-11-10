@@ -2354,7 +2354,10 @@ mod tests {
                     .find(|encoding| registry::gguf_source(*encoding, scales, group) == Some(conversion.source))
             };
             let Some(encoding) = source(GgufScales::Own) else {
-                assert!(source(GgufScales::E8m0Grid).is_some(), "a conversion's source is a GGUF type's");
+                assert!(
+                    GgufScales::ALL.into_iter().any(|scales| source(scales).is_some()),
+                    "a conversion's source is a GGUF type's"
+                );
                 let packets = 64;
                 let blocks = registry::pseudo_random_bytes(
                     conversion.id.position() as u64,

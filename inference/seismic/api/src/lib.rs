@@ -203,7 +203,7 @@ pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
 pub use seismic_lang::registry::{
-    f16_bits, f16_to_f32, record_table_bytes, BackendName, GgufScales, Layout, OperandRecipe,
+    f16_bits, f16_to_f32, record_table_bytes, BackendName, GgufScales, GridScale, Layout, OperandRecipe,
 };
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.

@@ -74,14 +74,33 @@ fn e8m0_grid_vectors() -> (Vec<u8>, Vec<f32>) {
     (bytes, values)
 }
 
+/// Assembled blocks of every E4M3 code under F32 scales (four bytes, then
+/// 128 codes) across the range the importer admits (`f32_scale`: zero, ±0,
+/// 2^-117, amax / 448 values, values whose products round, one whose
+/// largest products overflow), and each value as the F32 reference holds
+/// it: the code's value (`e4m3::value`) times the scale, one F32 product.
+fn f32_grid_vectors() -> (Vec<u8>, Vec<f32>) {
+    let least = f32::from_bits(10 << 23);
+    let (mut bytes, mut values) = (Vec::new(), Vec::new());
+    for scale in [0.0f32, -0.0, least, -least, 2.232_142_9e-3, 0.1, -0.333_333_34, 1.000_000_1, 1234.567, 3.0e38] {
+        for codes in (0..=u8::MAX).collect::<Vec<_>>().chunks_exact(128) {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            bytes.extend_from_slice(codes);
+            values.extend(codes.iter().map(|code| e4m3::value(*code) * scale));
+        }
+    }
+    (bytes, values)
+}
+
 /// Every GGUF source the registry converts from imports, in every layout and
 /// for every operand recipe, to exactly the reference dequantization of its
 /// type's vectors, in rows of 128 values (of one source packet, when
 /// wider): a GGUF type's gguf-py's, and a scale grid's assembled blocks'
-/// as OCP MX defines them (`e8m0_grid_vectors`), NaN where it is NaN.
+/// as OCP MX defines them (`e8m0_grid_vectors`) or the F32 reference does
+/// (`f32_grid_vectors`), NaN where it is NaN.
 #[test]
 fn every_gguf_source_imports_as_the_reference_dequantizes() {
-    use seismic::GgufScales;
+    use seismic::{GgufScales, GridScale};
     for (source, operands) in conversions() {
         let width = source.logical_group().unwrap().max(128);
         let encoding = |scales| {
@@ -89,9 +108,11 @@ fn every_gguf_source_imports_as_the_reference_dequantizes() {
                 .into_iter()
                 .find(|encoding| seismic::Element::gguf_source(*encoding, scales, width) == Some(source))
         };
-        let (bytes, reference) = match (encoding(GgufScales::Own), encoding(GgufScales::E8m0Grid)) {
-            (Some(encoding), None) => reference_vectors(encoding),
-            (None, Some(_)) => e8m0_grid_vectors(),
+        let scales = GgufScales::ALL.into_iter().filter(|scales| encoding(*scales).is_some()).collect::<Vec<_>>();
+        let (bytes, reference) = match scales[..] {
+            [GgufScales::Own] => reference_vectors(encoding(GgufScales::Own).unwrap()),
+            [GgufScales::Grid(GridScale::E8m0)] => e8m0_grid_vectors(),
+            [GgufScales::Grid(GridScale::F32)] => f32_grid_vectors(),
             _ => panic!("{} is no one encoding's source", source.name()),
         };
         let shape = [reference.len() as u64 / width, width];

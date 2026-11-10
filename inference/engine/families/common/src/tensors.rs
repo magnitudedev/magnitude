@@ -9,12 +9,6 @@ use magnitude_family_contracts::{
 };
 use std::collections::HashSet;
 
-/// The metadata key declaring the codes of a file's I8 block-scale grids
-/// (`Tensors::companion_scale`).
-pub const SCALE_ENCODING: &str = "magnitude.scale_encoding";
-/// Its one admitted value: UE8M0 bytes (`ScaleCodes::Ue8m0`).
-pub const UE8M0: &str = "ue8m0";
-
 pub struct Tensors<'a> {
     directory: &'a Directory,
     bound: HashSet<&'a str>,
@@ -116,8 +110,8 @@ impl<'a> Tensors<'a> {
     }
 
     /// Binds the stored companion `<stem>.scale` of `<stem>.weight` as the
-    /// weight's scale: of an F8_E4M3 matrix, which takes one, its grid of
-    /// UE8M0 block scales ([`Self::scale_grid`]); of any other weight,
+    /// weight's scale: of an F8_E4M3 matrix or stack, which takes one, its
+    /// grid of block scales ([`Self::scale_grid`]); of any other weight,
     /// NVFP4's per-tensor or per-matrix second-level scale, one F32 value
     /// per matrix, as its `ScaleByTensor`. `None` when the file stores none
     /// for a weight that takes none.
@@ -167,38 +161,44 @@ impl<'a> Tensors<'a> {
         }))
     }
 
-    /// Binds `scale` as the grid of UE8M0 block scales of the F8_E4M3
-    /// matrix `weight` (`ImportTransform::ScaleBlocks`): I8 `[rows / r,
-    /// columns / c]` for the tiles `[r, c]` it tiles the matrix by
-    /// (`ImportTransform::grid_tile`), in a file declaring
-    /// [`SCALE_ENCODING`] = [`UE8M0`], since an I8 tensor's bytes are codes
-    /// only by that declaration. Any other scale is refused, naming it.
+    /// Binds `scale` as the grid of block scales of the F8_E4M3 matrix, or
+    /// stack of matrices, `weight` (`ImportTransform::ScaleBlocks`): `[rows
+    /// / r, columns / c]` (after the stack's extent) for the tiles `[r, c]`
+    /// it tiles each matrix by (`ImportTransform::grid_tile`), of the codes
+    /// its stored type names (`ScaleCodes::of_stored`: I8 UE8M0 bytes, F32
+    /// scales), so each grid of a file is read in its own codes. Any other
+    /// scale is refused, naming it.
     fn scale_grid(
         &mut self,
         weight: &TensorDescriptor,
         scale: &'a TensorDescriptor,
     ) -> Result<ImportTransform, HeaderError> {
-        let &[rows, columns] = &weight.shape[..] else {
-            return Err(HeaderError::NotMatrix {
-                name: weight.name.clone(),
-                shape: weight.shape.clone(),
-            });
+        let (stack, rows, columns) = match weight.shape[..] {
+            [rows, columns] => (None, rows, columns),
+            [stack, rows, columns] => (Some(stack), rows, columns),
+            _ => {
+                return Err(HeaderError::NotMatrix {
+                    name: weight.name.clone(),
+                    shape: weight.shape.clone(),
+                });
+            }
         };
-        let declared =
-            self.directory.value(SCALE_ENCODING).and_then(|value| value.string()) == Some(UE8M0);
-        let tile = ImportTransform::grid_tile(&weight.shape, &scale.shape)
-            .filter(|_| declared && scale.encoding == Encoding::I8)
-            .ok_or_else(|| HeaderError::CompanionScale {
+        let (Some(codes), Some(tile)) = (
+            ScaleCodes::of_stored(scale.encoding),
+            ImportTransform::grid_tile(&weight.shape, &scale.shape),
+        ) else {
+            return Err(HeaderError::CompanionScale {
                 name: scale.name.clone(),
-                expected: CompanionForm::Ue8m0Grid { rows, columns },
+                expected: CompanionForm::Grid { stack, rows, columns },
                 encoding: scale.encoding,
                 shape: scale.shape.clone(),
-            })?;
+            });
+        };
         self.bound.insert(scale.name.as_str());
         Ok(ImportTransform::ScaleBlocks {
             tensor: scale.name.clone(),
             tile,
-            codes: ScaleCodes::Ue8m0,
+            codes,
         })
     }
 
@@ -225,7 +225,7 @@ impl<'a> Tensors<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar, Value};
+    use magnitude_artifacts::gguf::ByteOrder;
 
     const WEIGHT: &str = "blk.0.attn_q_b.weight";
     const SCALE: &str = "blk.0.attn_q_b.scale";
@@ -233,81 +233,139 @@ mod tests {
     const SHAPE: [u64; 2] = [64, 256];
 
     /// A file of an F8_E4M3 [`SHAPE`] weight and, when `scale` gives it,
-    /// its `.scale`, declaring `declared` as its scale encoding.
-    fn directory(declared: Option<&str>, scale: Option<(Encoding, Vec<u64>)>) -> Directory {
-        shaped(SHAPE, declared, scale)
+    /// its `.scale`.
+    fn directory(scale: Option<(Encoding, Vec<u64>)>) -> Directory {
+        shaped(&SHAPE, scale)
     }
 
-    fn shaped(weight: [u64; 2], declared: Option<&str>, scale: Option<(Encoding, Vec<u64>)>) -> Directory {
-        let tensor = |name: &str, shape: Vec<u64>, encoding| TensorDescriptor {
-            name: name.into(),
-            shape,
-            encoding,
-            offset: 0,
-            nbytes: 0,
-        };
+    fn shaped(weight: &[u64], scale: Option<(Encoding, Vec<u64>)>) -> Directory {
+        stored(
+            std::iter::once((WEIGHT, weight.to_vec(), Encoding::F8E4M3))
+                .chain(scale.map(|(encoding, shape)| (SCALE, shape, encoding)))
+                .collect(),
+        )
+    }
+
+    /// A file of `tensors` (name, shape, encoding), with no metadata.
+    fn stored(tensors: Vec<(&str, Vec<u64>, Encoding)>) -> Directory {
         Directory {
             version: 3,
             byte_order: ByteOrder::Little,
             alignment: 32,
             data_offset: 0,
-            metadata: declared
-                .map(|value| Metadata {
-                    name: SCALE_ENCODING.into(),
-                    value: Value::Scalar(Scalar::String(value.into())),
-                })
+            metadata: Vec::new(),
+            tensors: tensors
                 .into_iter()
-                .collect(),
-            tensors: std::iter::once(tensor(WEIGHT, weight.to_vec(), Encoding::F8E4M3))
-                .chain(scale.map(|(encoding, shape)| tensor(SCALE, shape, encoding)))
+                .map(|(name, shape, encoding)| TensorDescriptor {
+                    name: name.into(),
+                    shape,
+                    encoding,
+                    offset: 0,
+                    nbytes: 0,
+                })
                 .collect(),
         }
     }
 
+    /// A grid binds as block scales of its tile in the codes its stored
+    /// type names: an I8 grid UE8M0 bytes, an F32 grid F32 scales.
     #[test]
-    fn a_declared_ue8m0_grid_binds_as_block_scales_of_its_tile() {
-        for (shape, tile) in [(vec![2, 8], [32, 32]), (vec![64, 8], [1, 32]), (vec![1, 2], [64, 128])] {
-            let directory = directory(Some(UE8M0), Some((Encoding::I8, shape)));
-            let mut tensors = Tensors::new(&directory);
-            let weight = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
-            assert_eq!(
-                weight.transforms,
-                [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile, codes: ScaleCodes::Ue8m0 }]
-            );
-            tensors.finish().unwrap();
+    fn a_grid_binds_as_block_scales_of_its_tile_in_its_types_codes() {
+        for codes in ScaleCodes::ALL {
+            for (shape, tile) in [(vec![2, 8], [32, 32]), (vec![64, 8], [1, 32]), (vec![1, 2], [64, 128])] {
+                let directory = directory(Some((codes.stored(), shape)));
+                let mut tensors = Tensors::new(&directory);
+                let weight = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
+                assert_eq!(weight.transforms, [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile, codes }]);
+                tensors.finish().unwrap();
+            }
         }
     }
 
-    /// An undeclared or otherwise declared I8 grid, a grid that does not
-    /// divide the matrix into power-of-two tiles, an F32 scale, and no scale
-    /// at all are each refused, naming the tensor.
+    /// One file holds an I8-gridded and an F32-gridded weight, and each
+    /// binds in its own grid's codes.
     #[test]
-    fn any_other_scale_of_an_f8_e4m3_weight_is_refused_naming_it() {
-        for (declared, scale) in [
-            (None, Some((Encoding::I8, vec![2, 8]))),
-            (Some("e8m0fnu"), Some((Encoding::I8, vec![2, 8]))),
-            (Some(UE8M0), Some((Encoding::F32, vec![2, 8]))),
-            (Some(UE8M0), Some((Encoding::F32, vec![1]))),
-            (Some(UE8M0), Some((Encoding::I8, vec![3, 8]))),
-            (Some(UE8M0), Some((Encoding::I8, vec![2, 8, 1]))),
-            (Some(UE8M0), Some((Encoding::I8, vec![0, 8]))),
-            (Some(UE8M0), None),
-        ] {
-            let directory = directory(declared, scale);
-            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &SHAPE).unwrap_err();
+    fn one_file_binds_ue8m0_and_f32_grids_together() {
+        let directory = stored(vec![
+            (WEIGHT, SHAPE.to_vec(), Encoding::F8E4M3),
+            (SCALE, vec![2, 8], Encoding::I8),
+            ("blk.0.ffn_down.weight", vec![256, 512], Encoding::F8E4M3),
+            ("blk.0.ffn_down.scale", vec![2, 4], Encoding::F32),
+        ]);
+        let mut tensors = Tensors::new(&directory);
+        let ue8m0 = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
+        let f32 = tensors.bind_scaled("blk.0.ffn_down.weight", &[256, 512]).unwrap();
+        tensors.finish().unwrap();
+        assert_eq!(
+            ue8m0.transforms,
+            [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile: [32, 32], codes: ScaleCodes::Ue8m0 }]
+        );
+        assert_eq!(
+            f32.transforms,
+            [ImportTransform::ScaleBlocks {
+                tensor: "blk.0.ffn_down.scale".into(),
+                tile: [128, 128],
+                codes: ScaleCodes::F32
+            }]
+        );
+    }
+
+    /// A stack of F8_E4M3 matrices binds with a grid of its matrices' grids,
+    /// one tile for all of them; a grid over other matrices is refused.
+    #[test]
+    fn a_stacked_weight_binds_with_its_matrices_grids() {
+        let stack = [3, 64, 256];
+        let directory = shaped(&stack, Some((Encoding::F32, vec![3, 2, 8])));
+        let mut tensors = Tensors::new(&directory);
+        let weight = tensors.bind_scaled(WEIGHT, &stack).unwrap();
+        assert_eq!(weight.shape, stack);
+        assert_eq!(
+            weight.transforms,
+            [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile: [32, 32], codes: ScaleCodes::F32 }]
+        );
+        tensors.finish().unwrap();
+        for grid in [vec![2, 2, 8], vec![2, 8], vec![3, 3, 8]] {
+            let directory = shaped(&stack, Some((Encoding::F32, grid)));
+            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &stack).unwrap_err();
             assert!(error.to_string().contains(SCALE), "{error}");
         }
     }
 
-    /// A grid whose inferred tile could be wrong is refused, naming it:
+    /// A grid of a type that holds no codes, a grid that does not divide
+    /// the matrix into power-of-two tiles, and no scale at all are each
+    /// refused, naming the tensor and the grid types that hold codes.
+    #[test]
+    fn any_other_scale_of_an_f8_e4m3_weight_is_refused_naming_it() {
+        for scale in [
+            Some((Encoding::F16, vec![2, 8])),
+            Some((Encoding::BF16, vec![2, 8])),
+            Some((Encoding::F32, vec![1])),
+            Some((Encoding::I8, vec![3, 8])),
+            Some((Encoding::I8, vec![2, 8, 1])),
+            Some((Encoding::I8, vec![0, 8])),
+            Some((Encoding::F32, vec![3, 8])),
+            None,
+        ] {
+            let error = Tensors::new(&directory(scale.clone())).bind_scaled(WEIGHT, &SHAPE).unwrap_err();
+            assert!(error.to_string().contains(SCALE), "{error}");
+            if scale.is_some() {
+                assert!(error.to_string().contains("an I8 or F32 grid"), "{error}");
+            }
+        }
+    }
+
+    /// A grid whose inferred tile could be wrong is refused, naming it,
+    /// under either codes:
     /// `[300, 4096]` under `[10, 128]` (a partial last 32-row tile, inferred
     /// 30) and `[192, 256]` under `[2, 8]` (128-row tiles, inferred 96).
     #[test]
     fn a_grid_inferring_no_power_of_two_tile_is_refused_naming_it() {
-        for (weight, grid) in [([300, 4096], vec![10, 128]), ([192, 256], vec![2, 8])] {
-            let directory = shaped(weight, Some(UE8M0), Some((Encoding::I8, grid)));
-            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &weight).unwrap_err();
-            assert!(error.to_string().contains(SCALE), "{error}");
+        for codes in ScaleCodes::ALL {
+            for (weight, grid) in [([300, 4096], vec![10, 128]), ([192, 256], vec![2, 8])] {
+                let directory = shaped(&weight, Some((codes.stored(), grid)));
+                let error = Tensors::new(&directory).bind_scaled(WEIGHT, &weight).unwrap_err();
+                assert!(error.to_string().contains(SCALE), "{error}");
+            }
         }
     }
 }
