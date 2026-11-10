@@ -319,7 +319,7 @@ const harness = (options: {
 describe("finding models", () => {
   it("maps search results with uploader, variant, and an unsupported architecture's reason", async () => {
     const { run } = harness()
-    const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none() }))
+    const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none(), cursor: Option.none() }))
     expect(result.results[1]).toMatchObject({
       displayName: "DeepSeek V4 Flash",
       variantOf: Option.none(),

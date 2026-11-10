@@ -179,11 +179,15 @@ const optional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
 
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
 
-/** GGUF repositories on Hugging Face; those of architectures Magnitude doesn't run carry their reasons. */
+/**
+ * One page of GGUF repositories on Hugging Face; those of architectures Magnitude doesn't run carry their reasons.
+ * `cursor` is a previous page's `nextCursor`.
+ */
 const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
   payload: Schema.Struct({
     query: Schema.String,
-    limit: optional(Schema.Int.pipe(Schema.between(1, 100))),
+    limit: optional(Schema.Int.pipe(Schema.between(1, 50))),
+    cursor: optional(NonEmptyString),
   }),
   success: HuggingFaceSearchResponseSchema,
   error: ModelCandidateError,

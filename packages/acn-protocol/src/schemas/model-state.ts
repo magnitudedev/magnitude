@@ -1534,9 +1534,10 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
-/** Repositories of every architecture, unsupported ones last. */
+/** One page of repositories of every architecture, unsupported ones last; `nextCursor` requests the next page. */
 export const HuggingFaceSearchResponseSchema = Schema.Struct({
   results: Schema.Array(HuggingFaceSearchResultSchema),
+  nextCursor: Schema.optionalWith(Schema.String.pipe(Schema.minLength(1)), { as: "Option", exact: true }),
 })
 export type HuggingFaceSearchResponse = typeof HuggingFaceSearchResponseSchema.Type
 

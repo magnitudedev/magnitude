@@ -127,12 +127,13 @@ export const renderSearch = ({ query, response, unifiedMemory }: SearchView): st
     ...supportedSection,
     ...unsupportedSection,
     ...(supported.length > 0 ? ["", "See every quant: magnitude models show <repository>"] : []),
+    ...Option.toArray(Option.map(response.nextCursor, (cursor) => `More results: magnitude models search ${quoted(query)} --more '${cursor}'`)),
   ].join("\n"))
 }
 
 export const searchJson = jsonDocument(HuggingFaceSearchResponseJsonSchema, ({ response }: SearchView) => response)
 
-export const SEARCH_LIMIT_MAXIMUM = 100
+export const SEARCH_LIMIT_MAXIMUM = 50
 
 const parseSearchLimit = (input: string | undefined) => {
   if (input === undefined) return Effect.succeed(Option.none<number>())
@@ -146,8 +147,9 @@ export const readSearch = (
   client: CliModelsClient,
   query: string,
   limit: Option.Option<number>,
+  cursor: Option.Option<string>,
 ) => Effect.all({
-  response: client.models.searchHuggingFaceModels({ query, limit }),
+  response: client.models.searchHuggingFaceModels({ query, limit, cursor }),
   hardware: readHardware(client),
 }).pipe(Effect.map(({ response, hardware }): SearchView => ({
   query,
@@ -157,13 +159,14 @@ export const readSearch = (
 
 export const searchHuggingFace = (
   query: string,
-  options: JsonOption & { readonly limit?: string } = {},
+  options: JsonOption & { readonly limit?: string; readonly more?: string } = {},
 ) => commandEffect({
   effect: Effect.gen(function* () {
     const trimmed = query.trim()
     if (trimmed.length === 0) return yield* new ModelCommandError({ message: "Search query must not be empty" })
     const limit = yield* parseSearchLimit(options.limit)
-    return yield* withClient((client) => readSearch(client, trimmed, limit))
+    const cursor = Option.fromNullable(options.more).pipe(Option.filter((value) => value.length > 0))
+    return yield* withClient((client) => readSearch(client, trimmed, limit, cursor))
   }),
   render: renderSearch,
   json: asJson(options, searchJson),

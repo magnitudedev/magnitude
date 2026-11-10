@@ -94,14 +94,31 @@ function useDownload() {
   })}><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</Button>
 }
 
-/** Explore while searching: the settled query's Hugging Face results. */
+/**
+ * Explore while searching: the settled query's Hugging Face results, a page at a time. Pages already shown stay while
+ * the next one loads; reaching the end of the list asks for it.
+ */
 function Searched({ settled, props }: { settled: string; props: ExploreProps }) {
   const client = useAgentClient()
-  const search = useAtomValue(client.Models.SearchHuggingFaceModels({ query: settled, limit: Option.none() })).result
+  const [cursor, setCursor] = useState<Option.Option<string>>(Option.none())
+  const [shown, setShown] = useState<readonly HuggingFaceSearchResult[]>([])
+  const page = useAtomValue(client.Models.SearchHuggingFaceModels({ query: settled, limit: Option.none(), cursor })).result
   const download = useDownload()
-  const results: ExploreResults = props.query.trim() !== settled || Result.isInitial(search) || search.waiting ? { _tag: "Searching" }
-    : Result.isFailure(search) ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
-    : { _tag: "Results", ...offeredFromSearch(search.value.results, props.unified) }
+  const loading = Result.isInitial(page) || page.waiting
+  const current = Result.isSuccess(page) && !page.waiting ? page.value : null
+  const next = current ? current.nextCursor : Option.none<string>()
+  const more = () => {
+    if (!current || Option.isNone(next)) return
+    setShown(previous => [...previous, ...current.results])
+    setCursor(next)
+  }
+  const results: ExploreResults = props.query.trim() !== settled || (loading && shown.length === 0) ? { _tag: "Searching" }
+    : Result.isFailure(page) && shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
+    : {
+        _tag: "Results",
+        ...offeredFromSearch([...shown, ...(current?.results ?? [])], props.unified),
+        more: loading ? "Loading" : Option.isSome(next) ? more : null,
+      }
   return <ExploreModal {...props} results={results} download={download} />
 }
 

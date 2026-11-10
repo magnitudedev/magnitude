@@ -44,8 +44,21 @@ export function WhatRuns({ families }: { families: readonly RunnableFamily[] }) 
 export type ExploreResults =
   | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
   | { readonly _tag: "Searching" }
-  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] }
+  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[]; readonly more: "Loading" | (() => void) | null }
   | { readonly _tag: "Failed"; readonly message: string }
+
+/** The end of a page of results: reaching it asks for the next page. */
+function NextPage({ onReach }: { onReach: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const target = ref.current
+    if (!target) return
+    const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) onReach() })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [onReach])
+  return <div ref={ref} className="mt-2 flex justify-center"><Button variant="ghost" size="sm" onClick={onReach}>More results</Button></div>
+}
 
 /** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
 export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download }: {
@@ -82,7 +95,9 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
           <p className="mb-3 text-xs font-medium text-slate-500">Results on Hugging Face ({results.models.length})</p>
-          {results.models.length > 0 ? <div className="space-y-2">{results.models.map(model => card(model))}</div> : <p className="max-w-lg text-[13px] text-slate-500">Nothing here runs in Magnitude. {runnableSummary(families)}</p>}
+          {results.models.length > 0 ? <div className="space-y-2">{results.models.map(model => card(model))}</div> : results.more === null && <p className="max-w-lg text-[13px] text-slate-500">Nothing here runs in Magnitude. {runnableSummary(families)}</p>}
+          {results.more === "Loading" ? <div className="mt-2"><OfferedModelsSkeleton count={2} /></div>
+            : results.more && <NextPage onReach={results.more} />}
           <Unrunnable files={results.unchecked} title="Couldn’t check in time" />
           <Unrunnable files={results.unrunnable} />
         </>}

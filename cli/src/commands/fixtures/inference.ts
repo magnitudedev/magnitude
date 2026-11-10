@@ -363,6 +363,7 @@ export const catalogState = (
 })
 
 export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse> = {}): HuggingFaceSearchResponse => ({
+  nextCursor: Option.none(),
   results: [
     {
       repository: TEST_REPOSITORY,

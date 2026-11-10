@@ -140,6 +140,7 @@ export interface CustomModelCommandsApi {
   readonly searchHuggingFace: (request: {
     readonly query: string
     readonly limit: Option.Option<number>
+    readonly cursor: Option.Option<string>
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
   /** A reference inspected without changes, as it goes: its progress in order, then the inspection itself. */
   readonly inspectCandidate: (reference: string) => Stream.Stream<CandidateInspectionUpdate, ModelCandidateError>
@@ -741,13 +742,15 @@ export const CustomModelCommandsLive: Layer.Layer<
   { discard: true })
 
   const commands = CustomModelCommands.of({
-    searchHuggingFace: ({ query, limit }) => icn.search({
+    searchHuggingFace: ({ query, limit, cursor }) => icn.search({
       query,
       limit: Option.getOrElse(limit, () => 20),
+      cursor,
     }).pipe(
       Effect.catchAll(candidateFailed(query)),
       Effect.zip(assessmentsSnapshot),
-      Effect.map(([{ results }, snapshot]) => ({
+      Effect.map(([{ results, nextCursor }, snapshot]) => ({
+        nextCursor,
         results: results.flatMap((result) => {
           const repository = Schema.decodeUnknownOption(HuggingFaceRepositoryIdSchema)(result.repository)
           if (Option.isNone(repository)) return []

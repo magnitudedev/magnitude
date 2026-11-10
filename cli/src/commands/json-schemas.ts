@@ -199,4 +199,5 @@ export const HuggingFaceSearchResponseJsonSchema = Schema.Struct({
       assessment: LocalModelAssessmentJsonSchema,
     })),
   })),
+  nextCursor: optional(Schema.String),
 })
