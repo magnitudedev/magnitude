@@ -3881,14 +3881,15 @@ fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
     let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     const GB: u64 = 1 << 30;
+    // Host RAM's own room, read as 6 GB at each decision.
+    let room = Some(RoomNow { device_bytes: 0, host_bytes: 6 * GB, host_shared: false });
     let mut memory = TuningMemory {
-        host_ceiling_bytes: Some(6 * GB),
         process_began_bytes: seismic::ProcessMemory::footprint_now(),
         // The first compile's price, as this process's footprint saw it.
         compile_host_bytes: 64 << 20,
         ..TuningMemory::default()
     };
-    let before = memory.compile_threads(&device).expect("a host ceiling bounds compiles");
+    let before = memory.compile_threads(&device, room).expect("a host room bounds compiles");
     assert!(before >= 64, "6 GB affords many 64 MB compiles: {before}");
     // Four compiles ran at once; this process's footprint did not move, but
     // the host's room fell 8 GB below its reading as the wave began.
@@ -3897,7 +3898,7 @@ fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
     memory.price_compiles(held);
     assert_eq!(memory.compile_host_bytes, 2 * GB);
     assert_eq!(memory.mispriced.len(), 1, "a price risen past one set is a mispricing");
-    let after = memory.compile_threads(&device).expect("a host ceiling bounds compiles");
+    let after = memory.compile_threads(&device, room).expect("a host room bounds compiles");
     assert!(after <= 3 && after < before, "the next wave narrows to what 6 GB affords at 2 GB a compile: {after}");
     // A room that did not fall, or a missing reading, prices nothing.
     assert_eq!(compile_wave_price(Some(20 * GB), Some(20 * GB), 4), None);

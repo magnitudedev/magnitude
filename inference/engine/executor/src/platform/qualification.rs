@@ -108,21 +108,35 @@ pub fn host_tier(
 pub struct OpenedPlatform {
     selector: ExecutorSelector,
     device: Device,
-    /// What the engine might still claim in each of the device's memory
-    /// domains when it was opened.
-    room: crate::TuningRoom,
+}
+
+/// What the engine may still claim on `device` now, read from `status`:
+/// its stores and paths bounded through `bounds` as a load's
+/// (`refresh_device_ceiling`), and what is left above the planning reserve
+/// of `room`. `bounds` is the one live holder of the right to bound the
+/// device's ledgers: the device's open's own, or its load's heap's
+/// ([`crate::DeviceHeap`]), never a second beside it.
+pub(crate) fn room_now(
+    device: &Device,
+    bounds: &seismic::Bounds,
+    status: &seismic::Status,
+    reserves: &MemoryReserves,
+    room: HostRoom,
+) -> Result<crate::RoomNow, MemoryPolicyError> {
+    refresh_device_ceiling(device, bounds, status, reserves, room, 0)?;
+    let topology = device.topology();
+    let host_ram = topology.host_ram().id();
+    let fit = Fit::new(topology, status, reserves, room);
+    Ok(crate::RoomNow {
+        device_bytes: fit.placement(device.info(), Contract::DeviceOnly)?.ceiling_bytes,
+        host_bytes: fit.store(host_ram)?.ceiling_bytes,
+        host_shared: DomainRole::of(topology, device.info(), host_ram) == DomainRole::Allocation,
+    })
 }
 
 impl OpenedPlatform {
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// What a search on this device is held to: what the platform let the
-    /// engine claim in each memory domain when the device was opened, its
-    /// observed availability above the planning reserve.
-    pub fn tuning_room(&self) -> crate::TuningRoom {
-        self.room
     }
 
     pub fn selector(&self) -> ExecutorSelector {
@@ -273,32 +287,13 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    let status = catalog.device_status(&device);
-    // A load opens the device: its first allocations are a load's, which
-    // may take what the OS can obtain (`DeviceHeap::open` holds the device
-    // to the same room until the load ends, taking the right to bound its
-    // stores as this one is let go).
-    refresh_device_ceiling(&device, &device.bounds(), &status, &config.reserves, HostRoom::Load(LoadStage::Loading), 0)
+    // The device opens bounded to the room read now, a load's (its heap,
+    // `DeviceHeap::open`, takes the right to bound it as this one is let
+    // go); a machine that cannot be read refuses the open.
+    let status = Devices::new(catalog.inventory().clone()).device_status(&device);
+    room_now(&device, &device.bounds(), &status, &config.reserves, HostRoom::Load(LoadStage::Loading))
         .map_err(PlatformError::Memory)?;
-    let topology = device.topology();
-    let host_ram = topology.host_ram().id();
-    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Load(LoadStage::Loading));
-    let room = crate::TuningRoom {
-        device_bytes: fit
-            .placement(device.info(), Contract::DeviceOnly)
-            .map_err(PlatformError::Memory)?
-            .ceiling_bytes,
-        host_bytes: fit
-            .store(host_ram)
-            .map_err(PlatformError::Memory)?
-            .ceiling_bytes,
-        host_shared: DomainRole::of(topology, device.info(), host_ram) == DomainRole::Allocation,
-    };
-    Ok(OpenedPlatform {
-        selector,
-        device,
-        room,
-    })
+    Ok(OpenedPlatform { selector, device })
 }
 
 fn enforce_phase_one(path: ExecutionPath) -> Result<(), PlatformError> {

@@ -287,7 +287,7 @@ pub(crate) fn search(
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<(), LoadError> {
     let PlannedModel {
-        startup: _startup,
+        startup,
         draft,
         opened,
         kernel_cache,
@@ -307,7 +307,9 @@ pub(crate) fn search(
             numerical_profile: &numerical_profile,
             settings: manifest.tuning,
         },
-        Some(opened.tuning_room()),
+        // The search reads its room through the load's heap, which holds
+        // the right to bound the device's ledgers while it lives.
+        Some(&startup.heap),
     )
     .map_err(|error| LoadError::from(classify_catalog(error)))?;
     if let Some(trace) = &report.trace {

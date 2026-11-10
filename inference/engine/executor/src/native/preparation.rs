@@ -110,8 +110,9 @@ pub(super) struct PreparationInputs<'a> {
     pub load: &'a ModelLoadPlan,
     pub limits: TuningLimits,
     pub tuning: TuningContext<'a>,
-    /// What a search is held to; a load, which never searches, has none.
-    pub room: Option<super::tuning::TuningRoom>,
+    /// What a search is held to, read live; a load, which never searches,
+    /// has none.
+    pub room: Option<&'a dyn super::tuning::TuningRoom>,
     pub selection_limits: crate::ResourceLimits,
     pub graph_demand: GraphInvocationDemand,
 }

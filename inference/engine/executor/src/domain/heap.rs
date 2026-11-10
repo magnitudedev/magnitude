@@ -356,6 +356,21 @@ pub struct DeviceHeap {
     observed: Option<(seismic::Status, Vec<DomainReading>, Vec<(seismic::StoreId, u64)>)>,
 }
 
+/// A search on the heap's device reads its room through the heap: the
+/// heap holds the one right to bound the device's ledgers while it lives, so
+/// the search's readings bound them as the heap's own do, never from a
+/// second holder beside it.
+impl crate::TuningRoom for DeviceHeap {
+    /// A reading that fails reads no room: missing observations never
+    /// authorize allocation.
+    fn now(&self, device: &Device) -> crate::RoomNow {
+        assert_eq!(device.info().selector(), self.device.info().selector(), "a search reads the room of its heap's device");
+        let status = self.reading.status(&self.device);
+        crate::platform::room_now(&self.device, &self.bounds, &status, &self.reserves, self.room())
+            .unwrap_or(crate::RoomNow { device_bytes: 0, host_bytes: 0, host_shared: false })
+    }
+}
+
 impl DeviceHeap {
     /// Hold every fit from the next reading on at what the load measures
     /// now: host RAM's motion and a device's own memory's, and its release
@@ -1065,6 +1080,21 @@ mod tests {
         let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
         let _first = DeviceHeap::open(catalog.clone(), MemoryReserves::of_machine(None), device.clone()).unwrap();
         let _second = DeviceHeap::open(catalog, MemoryReserves::of_machine(None), device);
+    }
+
+    /// A search started while the load's heap lives reads the device's
+    /// room through the heap, which holds the one right to bound its
+    /// ledgers: reading it at every decision takes no second holder, so it
+    /// never panics. (A search that bounded the ledgers from a holder of its
+    /// own, `Device::bounds`, beside the heap's panicked at its first
+    /// reading, naming both.)
+    #[test]
+    fn a_search_reads_its_room_through_the_live_heap() {
+        let heap = cpu_heap();
+        let device = heap.device.clone();
+        let room: &dyn crate::TuningRoom = &heap;
+        room.now(&device);
+        room.now(&device);
     }
 
     fn cpu_heap() -> DeviceHeap {

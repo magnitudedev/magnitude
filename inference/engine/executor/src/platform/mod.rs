@@ -11,6 +11,7 @@ mod selection;
 mod volume;
 
 pub(crate) use policy::refresh_device_ceiling;
+pub(crate) use qualification::room_now;
 pub(crate) use policy::ShownBasis;
 pub use policy::{
     DemandFit, DisplacementBaseline, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, HostDistress, HostEmergency,

@@ -101,7 +101,7 @@ pub use native::{
     PinnedChoice, PointShape, QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt,
     ResolvedNumericalProfile, SEARCH_SETTINGS, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
     SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry,
-    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom,
+    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom, RoomNow,
     TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits, UnreportedTuning,
     ZeroTuningWeights, attention_points, row_points,
 };
