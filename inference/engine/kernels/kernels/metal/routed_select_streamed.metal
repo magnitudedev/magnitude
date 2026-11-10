@@ -80,7 +80,7 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
         SYSTEM int *rings [[buffer(SEISMIC_BUFFER_RINGS)]], SYSTEM int *routing [[buffer(SEISMIC_BUFFER_ROUTING)]], \
         SYSTEM const int *map [[buffer(SEISMIC_BUFFER_MAP)]], SYSTEM const int *tier [[buffer(SEISMIC_BUFFER_TIER)]], \
         device int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]], SYSTEM int *file [[buffer(SEISMIC_BUFFER_FILE)]],  \
-        device int *grids [[buffer(SEISMIC_BUFFER_GRIDS)]], SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]], \
+        SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]],                                                \
         device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                              \
         arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],                           \
         device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],                                  \
@@ -131,7 +131,7 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
             SEISMIC_TIER_STRIDE_0, uint(SEISMIC_DIM_TM), uint(SEISMIC_PARAM_SITED),                                \
             sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, routing,         \
             SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1, uint(SEISMIC_DIM_FLIGHT), uint(SEISMIC_DIM_P),       \
-            grids, SEISMIC_GRIDS_STRIDE_0, SEISMIC_GRIDS_STRIDE_1, file, SEISMIC_FILE_STRIDE_0,                     \
+            file, SEISMIC_FILE_STRIDE_0,                                                                           \
             SEISMIC_FILE_STRIDE_1, policy,                                                                         \
             words, tid, launch_threads);                                                                           \
     }

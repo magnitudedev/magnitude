@@ -9,10 +9,18 @@
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
 /// Words of an expert-streaming list of `entries` entries (`routed_copy`,
-/// `routed_convert`, `routed_seed_commit`): the sequence and count,
+/// `routed_move`, `routed_seed_commit`): the sequence and count,
 /// then each entry's from and to words. Entry `entries` begins there.
 pub fn list_extent(entries: u64) -> u64 {
     constants::LIST_ENTRIES + constants::LIST_ENTRY_WORDS * entries
+}
+
+/// Words of a landing list of `entries` entries (`routed_land`,
+/// `routed_round`; streaming_words.seismic's landing list): the head (the
+/// step's low word, the count landed), then each entry's from, to and DONE
+/// words. Entry `entries` begins there.
+pub fn landing_extent(entries: u64) -> u64 {
+    constants::LANDING_ENTRIES + constants::LANDING_ENTRY_WORDS * entries
 }
 
 /// The blocks of a list's whole launch grid, LIST_GROUPS by LIST_ROWS
@@ -47,6 +55,14 @@ const _: () = {
     assert!(constants::FILE_COUNT == constants::SLOT_PAYLOAD, "a file request's count is its payload's first word");
     assert!(constants::SCRATCH_STAGED == constants::SLOT_PAYLOAD, "a scratch answer's count is its payload's first word");
     assert!(constants::SCRATCH_FOLLOWED == constants::SCRATCH_STAGED + 1, "a scratch request's fill order follows its count");
+    assert!(
+        constants::LANDING_HEAD % 2 == 0 && constants::LANDING_ENTRIES == constants::LANDING_HEAD + 2,
+        "a landing list's head is one u64 at an even word, its entries after it"
+    );
+    assert!(
+        constants::LAND_WINDOW_AT == 4 * constants::LAND_GROUP_WORDS && constants::LAND_WINDOW_AT % 16 == 0,
+        "a landing launch's window follows its group words, 16-byte aligned"
+    );
     assert!(
         (constants::SLOT_PAYLOAD + SCRATCH_PAYLOAD).next_multiple_of(2) == constants::SCRATCH_SLOT,
         "a scratch lane is SCRATCH_SLOT words"

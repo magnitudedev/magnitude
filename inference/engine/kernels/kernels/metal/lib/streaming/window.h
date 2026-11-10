@@ -7,8 +7,8 @@
 // (lib/repack/repack.h, the registered conversion), two tiles a simdgroup,
 // reading the copy. The tile placement is `repack_weight`'s, so a slot holds
 // exactly the bytes a resident import places. A dense float record
-// (`B::dense()`: `repack` between dense representations) converts row by
-// row, each element as `import_dense` converts it (decoded to F32, rounded
+// (`B::dense()`: `repack` between dense representations) converts runs of
+// rows, each element as `import_dense` converts it (decoded to F32, rounded
 // into the destination).
 //
 // Templates over a repack binding `B` (`REPACK_BINDING`), so a kernel
@@ -130,16 +130,6 @@ inline void copy_rows(STAGED *source, ulong offset, ulong stride, threadgroup uc
     }
 }
 
-// A packed record's items are its row tiles' windows; a dense record's, its
-// rows.
-template <class B> inline ulong record_items(constant ulong *seismic_words) {
-    if constexpr (B::dense())
-        return B::n(seismic_words);
-    else
-        return repack::tiles_y<B>(seismic_words) * Windows<B>::of(seismic_words).count;
-}
-
-// The element types of a dense binding's source and destination.
 template <class B> struct Dense {
     typedef typename element::Of<B::source_kind()>::type Source;
     typedef typename element::Of<B::destination_kind()>::type Destination;
@@ -150,19 +140,50 @@ inline STAGED *source_record(device const ulong *table, ulong record) {
     return reinterpret_cast<STAGED *>(slab::region<const uchar>(table, record));
 }
 
-// Row `n` of the dense source record at `record` into the destination record
-// at `out`: each element decoded to F32 and rounded into the destination,
-// `import_dense`'s conversion.
+// A packed record's items are its row tiles' windows; a dense record's, spans
+// of its flattened elements (`streaming_dense_span`), each staged through the
+// window as a packed record's windows are, by the threadgroup's coherent
+// loads, and converted from it.
+template <class B> inline ulong record_items(constant ulong *seismic_words, uint threads) {
+    if constexpr (B::dense()) {
+        const uint element = uint(sizeof(typename Dense<B>::Source::storage));
+        return streaming_dense_items(uint(B::n(seismic_words) * B::k(seismic_words)), element,
+            streaming_dense_span(element, threads, uint(SEISMIC_CONST_WINDOW_BYTES)));
+    } else {
+        return repack::tiles_y<B>(seismic_words) * Windows<B>::of(seismic_words).count;
+    }
+}
+
+// Item `item` of the dense source record at `record` into the destination
+// record at `out`: its span staged into `window`, each element then decoded
+// to F32 and rounded into the destination, `import_dense`'s conversion, from
+// the window.
 template <class B>
-inline void convert_row(STAGED *record, device uchar *out, constant ulong *seismic_words, ulong n, uint tid,
-    uint threads) {
+inline void convert_span(STAGED *record, device uchar *out, constant ulong *seismic_words, ulong item,
+    threadgroup uchar *window, uint tid, uint threads) {
     typedef typename Dense<B>::Source Source;
     typedef typename Dense<B>::Destination Destination;
-    volatile coherent(system) device const typename Source::storage *from =
-        reinterpret_cast<volatile coherent(system) device const typename Source::storage *>(record);
-    for (ulong k = tid; k < B::k(seismic_words); k += threads)
-        element::put<Destination>(out, n * B::out_stride_1(seismic_words) + k * B::out_stride_2(seismic_words),
-            Source::load(from[n * B::source_stride_1(seismic_words) + k * B::source_stride_2(seismic_words)]));
+    const uint element = uint(sizeof(typename Source::storage));
+    const uint k = uint(B::k(seismic_words)), elements = uint(B::n(seismic_words)) * k;
+    const uint span = streaming_dense_span(element, threads, uint(SEISMIC_CONST_WINDOW_BYTES));
+    const uint first = uint(item) * (span / element);
+    const uint count = min(span / element, elements - first);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    copy_staged(record, ulong(first) * element, window, count * element, tid, threads);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // A thread's row and column step with its element: two divides an item.
+    uint row = (first + tid) / k, column = (first + tid) % k;
+    const uint row_step = threads / k, column_step = threads % k;
+    for (uint e = tid; e < count; e += threads) {
+        element::put<Destination>(out, ulong(row) * B::out_stride_1(seismic_words) + ulong(column) * B::out_stride_2(seismic_words),
+            Source::load(reinterpret_cast<threadgroup const typename Source::storage *>(window)[e]));
+        row += row_step;
+        column += column_step;
+        if (column >= k) {
+            column -= k;
+            ++row;
+        }
+    }
 }
 
 template <class B>
@@ -178,8 +199,7 @@ template <class B>
 inline void convert_item(STAGED *record, device uchar *out, constant ulong *seismic_words, ulong item,
     threadgroup uchar *window, uint tid, uint threads, uint simd, uint simdgroups, uint lane) {
     if constexpr (B::dense()) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        convert_row<B>(record, out, seismic_words, item, tid, threads);
+        convert_span<B>(record, out, seismic_words, item, window, tid, threads);
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     } else {
         convert_window<B>(record, out, seismic_words, item, window, tid, threads, simd, simdgroups, lane);

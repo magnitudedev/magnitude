@@ -26,11 +26,36 @@
 
 #define STREAMING_PULSE_READ 64
 
+#if SEISMIC_PARKS_IN_KERNELS
+// Spin `spins` of a spinning wait of step `q` on the slot at `slot` (its
+// words `stride` apart), by the wait's one thread: whether its host is
+// gone, the slot's SLOT_PULSE read every STREAMING_PULSE_READ spins (from
+// spin 0, which only reads it) and still for PULSE_SPINS of them, `pulse`
+// and `still` the wait's own record of it. A wait it ends has stored its
+// step as the slot's SLOT_EXPIRED. Every spinning wait's give-up is this
+// one (`streaming_await_slot`, `streaming_land_await`).
+STREAMING_FN bool streaming_host_gone(STREAMING_SYSTEM_WORDS slot, u64 stride, u64 q, u32 spins,
+    STREAMING_THREAD int &pulse, STREAMING_THREAD u32 &still) {
+    if (spins % STREAMING_PULSE_READ != 0)
+        return false;
+    const int now = streaming_load_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_PULSE * stride));
+    if (spins == 0 || now != pulse) {
+        pulse = now;
+        still = 0;
+        return false;
+    }
+    if ((still += STREAMING_PULSE_READ) < u32(SEISMIC_CONST_PULSE_SPINS))
+        return false;
+    streaming_store_u64_release(STREAMING_AT(slot, SEISMIC_CONST_SLOT_EXPIRED * stride), q);
+    return true;
+}
+#endif
+
 // Step `q`'s wait on the slot at `slot` (its first word, its words `stride`
 // apart): until its request is not q or its answer is q or q | SLOT_FAILED,
-// or a spinning wait's host is gone. True when the slot holds q's answer:
-// neither its failure nor no request, nor a wait whose host is gone. One
-// thread calls it.
+// or a spinning wait's host is gone (`streaming_host_gone`). True when the
+// slot holds q's answer: neither its failure nor no request, nor a wait
+// whose host is gone. One thread calls it.
 STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_WORDS slot, u64 stride, u64 q) {
     const u64 failed = q | (u64(u32(SEISMIC_CONST_SLOT_FAILED)) << 32);
 #if SEISMIC_PARKS_IN_KERNELS
@@ -43,16 +68,8 @@ STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_WORDS slot, u64 stride, 
             || streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * stride)) != q)
             return answer == q;
 #if SEISMIC_PARKS_IN_KERNELS
-        if (spins % STREAMING_PULSE_READ == 0) {
-            const int now = streaming_load_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_PULSE * stride));
-            if (spins == 0 || now != pulse) {
-                pulse = now;
-                still = 0;
-            } else if ((still += STREAMING_PULSE_READ) >= u32(SEISMIC_CONST_PULSE_SPINS)) {
-                streaming_store_u64_release(STREAMING_AT(slot, SEISMIC_CONST_SLOT_EXPIRED * stride), q);
-                return false;
-            }
-        }
+        if (streaming_host_gone(slot, stride, q, spins, pulse, still))
+            return false;
 #else
         return false;
 #endif
@@ -60,9 +77,11 @@ STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_WORDS slot, u64 stride, 
 }
 
 // Store step `q` as the request of the slot at `slot` (its words `stride`
-// apart): one 64-bit release store, after every earlier store of the
-// calling thread's.
+// apart): the slot's SLOT_VIOLATED cleared (a violation stored for an earlier
+// step is never read as a later step's), then one 64-bit release store,
+// after every earlier store of the calling thread's.
 STREAMING_FN void streaming_request_slot(STREAMING_SYSTEM_WORDS slot, u64 stride, u64 q) {
+    streaming_store(STREAMING_AT(slot, SEISMIC_CONST_SLOT_VIOLATED * stride), 0);
     streaming_store_u64_release(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * stride), q);
 }
 

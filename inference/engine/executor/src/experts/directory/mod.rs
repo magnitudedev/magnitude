@@ -99,7 +99,7 @@ impl Point {
 }
 
 /// A park read from the steps where it is served (`Steps::park`): the
-/// device parked at `point` (a decode request's tier wait), and per layer
+/// device parked at `point` (a decode request's landing launch), and per layer
 /// what its order says of every step's resolution there. Read once a
 /// serve, at use: a group cut in after it only moves resolutions later,
 /// so what it says stays true.
@@ -1511,7 +1511,7 @@ impl Directory {
         store.into_iter().chain(self.bank.pending_from()).min()
     }
 
-    /// The device is parked at `park`, a decode request (its tier wait),
+    /// The device is parked at `park`, a decode request (its landing launch),
     /// so every resolution before it in the device's order is done: every
     /// graced record ready but those the parked step resolved there
     /// (`read`, (group, record), `decode::parked_reads`) and those a step

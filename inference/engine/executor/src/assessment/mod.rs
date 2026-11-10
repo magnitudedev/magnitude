@@ -64,7 +64,7 @@ pub use launches::{Declarations, Kernel, Launches, Words};
 #[cfg(feature = "machine-line")]
 pub use line::{Line, MachineLine, MachineLineError, Operand, Peak, Rate, Stream, Sweep};
 pub use cost::{
-    BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LineError, Miss, Nanoseconds, Pass,
+    BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LandingLine, LineError, Miss, Nanoseconds, Pass,
     PassLine, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
 };
 pub use priced::Priced;

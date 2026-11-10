@@ -87,6 +87,22 @@ inline void streaming_device_store(device int *word, int value) {
     *word = value;
 }
 
+inline int streaming_device_add(device int *word, int value) {
+    return atomic_fetch_add_explicit((device atomic_int *)word, value, memory_order_relaxed);
+}
+
+// MSL's compare-and-swap is weak only: it retries a spurious failure (the
+// word read as `expected`), so it fails only where the word differs.
+inline int streaming_device_cas(device int *word, int expected, int desired) {
+    int seen = expected;
+    while (!atomic_compare_exchange_weak_explicit((device atomic_int *)word, &seen, desired, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+        if (seen != expected)
+            return seen;
+    }
+    return expected;
+}
+
 // The threadgroup's barrier over its threadgroup memory, and over its device
 // memory too.
 inline void streaming_barrier() {

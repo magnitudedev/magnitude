@@ -1,4 +1,4 @@
-use magnitude_kernels::{constants, import_dense, list_extent, repack_weight, routed_convert, routed_step};
+use magnitude_kernels::{constants, import_dense, landing_extent, repack_weight, routed_round, routed_step, SlotTable};
 
 mod e4m3;
 
@@ -560,9 +560,14 @@ fn unit_columns(element: seismic::Element) -> u32 {
     repack::conversion_unit_columns(registry::ConversionLayout::of(&info.kind).unwrap())
 }
 
-/// `routed_convert`'s scratch slots after converting each record of
-/// `source` (a stored [records, N, K] stack, the conveyor) into the slot of
-/// its index.
+/// The rows of a conversion's row tile: repack's 16-row tile on every
+/// streaming backend.
+const ROW_TILE: u64 = 16;
+
+/// The scratch slots a round lands (`routed_round`) from `source` (a stored
+/// [records, N, K] stack, the conveyor's up-only records, their down dense
+/// BF16 zeros), each record into the slot of its index, the round served
+/// before its call.
 fn streamed_conversion(
     device: &seismic::Device,
     source: &seismic::Tensor,
@@ -574,6 +579,13 @@ fn streamed_conversion(
         let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
         seismic::Tensor::from_host(device, seismic::Element::i32(), &[values.len() as u64], &bytes).unwrap()
     };
+    let shared = |shape: &[u64], values: &[i32]| {
+        let tensor = seismic::Tensor::shared(device, seismic::Element::i32(), shape).unwrap();
+        // SAFETY: no device work uses the tensor yet.
+        unsafe { tensor.write_shared(0, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap() };
+        tensor
+    };
+    let zeros = |element: seismic::Element, shape: &[u64]| seismic::Tensor::zeros(device, element, shape).unwrap();
     let mut step = words(&[0, 0]);
     routed_step::native_for_device(device, &seismic::NativeSpecialization::new())
         .unwrap()
@@ -582,40 +594,54 @@ fn streamed_conversion(
             sequence: &words(&[SEQUENCE, 0]),
         })
         .unwrap();
-    // Every record into its own slot.
-    let entry = |index: u64| list_extent(index) as usize;
-    let mut list = vec![0; entry(shape[0])];
-    list[constants::LIST_SEQUENCE as usize] = SEQUENCE;
-    list[constants::LIST_COUNT as usize] = shape[0] as i32;
-    for record in 0..shape[0] {
-        list[entry(record) + constants::LIST_FROM as usize] = record as i32;
-        list[entry(record) + constants::LIST_TO as usize] = record as i32;
+    // Every record into its own slot, all landed.
+    let records = shape[0];
+    let entry = |index: u64| landing_extent(index) as usize;
+    let mut landing = vec![0; entry(records)];
+    landing[constants::LANDING_HEAD as usize] = SEQUENCE;
+    landing[constants::LANDING_HEAD as usize + 1] = records as i32;
+    for record in 0..records {
+        landing[entry(record) + constants::LANDING_FROM as usize] = record as i32;
+        landing[entry(record) + constants::LANDING_TO as usize] = record as i32;
     }
-    let list_words = list.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    let shared = seismic::Tensor::shared(device, seismic::Element::i32(), &[list.len() as u64]).unwrap();
-    // SAFETY: no device work uses the tensor yet.
-    unsafe { shared.write_shared(0, &list_words).unwrap() };
-    let zeros = |element: seismic::Element, shape: &[u64]| {
-        let length = element.canonical_byte_len(shape).unwrap() as usize;
-        seismic::Tensor::from_host(device, element, shape, &vec![0u8; length]).unwrap()
-    };
+    // The round's lane answered for the step.
+    let table = SlotTable::scratch(1, 1);
+    let mut scratch = vec![0; table.words() as usize];
+    scratch[(table.lane(SEQUENCE as u64, constants::SCRATCH_ROUND) + constants::SLOT_ANSWER) as usize] = SEQUENCE;
+    let bf16 = seismic::Element::bf16();
+    let down = [records, shape[2], shape[1]];
+    let mut gate = zeros(destination, &[0, shape[1], shape[2]]);
     let mut slots = zeros(destination, shape);
-    routed_convert::native_for_device_with(
+    let mut down_slots = zeros(bf16, &down);
+    let list = magnitude_kernels::list_extent(1);
+    routed_round::native_for_device_with(
         device,
-        routed_convert::Elements {
-            ST: source.element(),
-            U: destination,
+        routed_round::Elements {
+            SG: source.element(),
+            SU: source.element(),
+            SD: bf16,
+            UG: destination,
+            UU: destination,
+            UD: bf16,
         },
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(routed_convert::Args {
-        conveyor: source,
-        list: &shared,
+    .call_answered(routed_round::Args {
         step: &step,
-        destination: &mut slots,
-        // One threadgroup striding over every listed record's items.
-        grid: &words(&[1, 1, 1]),
+        scratch: &mut shared(&table.extents(), &scratch),
+        round: 0,
+        landing: &mut shared(&[landing.len() as u64], &landing),
+        tiered: &words(&vec![0; list as usize]),
+        conveyor_gate: &zeros(source.element(), &[0, shape[1], shape[2]]),
+        conveyor_up: source,
+        conveyor_down: &zeros(bf16, &down),
+        gate: &mut gate,
+        up: &mut slots,
+        down: &mut down_slots,
+        seeds: &words(&vec![0; list as usize]),
+        map: &words(&vec![0; constants::MAP_WORDS as usize]).reshape(&[1, constants::MAP_WORDS]).unwrap(),
+        grid: &words(&[constants::LAND_GROUPS as i32, 1, 1]),
     })
     .unwrap();
     slots.read_to_host().unwrap()
@@ -624,7 +650,7 @@ fn streamed_conversion(
 /// K8: the native repack of every (format, layout) conversion equals the
 /// registry's host reference byte for byte, and its storage decodes to the
 /// source's values; where the backend streams, so does its streamed
-/// conversion (`routed_convert`, record by record into scratch slots),
+/// conversion (`routed_round`, record by record into scratch slots),
 /// so a streamed record holds what the resident import places. Shapes cover
 /// a row count off the 16-row tile, several matrices, a packing axis with an
 /// odd number of q8 packets (mma16 pads rows to whole 64-column k-blocks),
@@ -637,7 +663,7 @@ fn repack_matches_the_registered_conversion(
     records: bool,
 ) {
     let device = device.clone();
-    let streams = routed_convert::native_implementation(&device)
+    let streams = routed_round::native_implementation(&device)
         .unwrap()
         .is_some();
     for (source_element, operands) in conversions() {
@@ -716,7 +742,7 @@ fn repack_matches_the_registered_conversion(
         let destination = source_element.converted(resident, operands).filter(|_| streams && layouts.contains(&resident));
         if let Some(destination) = destination.filter(|&destination| records || !has_records(destination)) {
             let mut wide = group;
-            while destination.canonical_byte_len(&[1, constants::CONVERT_TILE_ROWS, wide]).unwrap() <= constants::MIRROR_BYTES {
+            while destination.canonical_byte_len(&[1, ROW_TILE, wide]).unwrap() <= constants::MIRROR_BYTES {
                 wide *= 2;
             }
             let shape = [whole_tiles[0], whole_tiles[1], wide];

@@ -1,34 +1,40 @@
-//! A file miss's landing into the host tier (routed.seismic's
-//! `routed_tier_wait`): the expert's stored record, read into a landing
-//! record (a staging record, `source::Records`), is converted piece by
-//! piece into a ready tier record of its group in the bank's resident form
-//! (`RowConversion::piece`, pieces of whole stored tiles of at most
-//! [`CONVERSION_PIECE`] source bytes), then mapped: the layer's
-//! tier map names it (`tier[e] = t`, a release store, only now that its
-//! bytes are whole). Then each choice that named the expert is answered
-//! (`Answer`): its record word in the request's slot of the layer's file
-//! table, and the slot itself once every absent expert is. A read that
-//! failed maps nothing and answers -1.
+//! A file miss's landing: the expert's stored record, read into a landing
+//! record (a staging record, `source::Records`), becomes a record of its
+//! group in the bank's resident form, then is mapped and each choice that
+//! named it answered (`Answer`): its record word in the request's slot of
+//! the layer's file table, and the slot itself once every absent expert is.
+//! A read that failed lands nothing and answers -1. Who converts it is
+//! fixed by who places the bank's records (`Placer`), never chosen per
+//! request:
 //!
-//! A landing runs on the host compute executor (`compute`), submitted
-//! where the read ends (the read engine's worker that ends it,
-//! `Ticket::on_end`) or by the watcher where the stored record is already
-//! whole in staging: its pieces convert on any of the executor's workers,
-//! then its end maps the record and answers ([`Converting`]), so no host
-//! round trip but the landing itself is on a miss's path. The watcher
-//! learns it afterwards (`Directory::landed`), once its end is recorded
-//! ([`Ended`]).
+//! - **Into a host tier** (`Placer::Tier`, a discrete device), and every
+//!   read ahead's landing (a hint's, the tier fill's, which no launch waits
+//!   on as it lands): the host converts it piece by piece into a ready tier
+//!   record (`RowConversion::piece`, pieces of whole stored tiles of at most
+//!   [`CONVERSION_PIECE`] source bytes, byte-equal to every device's
+//!   repack), then maps it: the layer's tier map names it (`tier[e] = t`, a
+//!   release store, only now that its bytes are whole), then answers. It
+//!   runs on the host compute executor (`compute`), submitted where its
+//!   read ends (the read engine's worker that ends it, `Ticket::on_end`) or
+//!   by the watcher where the stored record is already whole in staging:
+//!   its pieces convert on any of the executor's workers, then its end maps
+//!   the record and answers ([`Converting`]), so no host round trip but the
+//!   landing itself is on a miss's path.
+//! - **Into the bank** (`Placer::Bank`, unified memory), every demand read
+//!   a step's landing launch waits on (`routed_land`): the device converts
+//!   it ([`DeviceLanding`]). Each expert's read ends on its own, and its end
+//!   appends its entry (staging record, bank record) to the layer's landing
+//!   list ([`LandingList`]) and answers its choices, the request's last
+//!   absent expert the slot too; the launch's threadgroups, parked on the
+//!   list's head, convert each entry as it lands, in landing order, while
+//!   the request's later reads run, so past the last read byte only the
+//!   last record's conversion remains on the path. The device stores each
+//!   entry's DONE once its every item is placed, which frees its staging
+//!   record; the device past the launch proves the record's bytes whole,
+//!   which maps it and ends the landing.
 //!
-//! Where the host places (unified memory) a request's misses land at the
-//! site priced sooner (`assessment::ExpertLines::landed`), per request, the
-//! line of each the host's own and the job's: the host's, above, or the
-//! device's ([`DeviceLanding`]): `routed_convert` past the request's
-//! barrier, from staging in place into the bank record. Its read's end
-//! publishes the convert's list and answers; the device past that barrier
-//! proves its bytes whole, which maps the record and ends the landing, the
-//! record and staging held by the directory and the prefetcher as any
-//! landing's until then. A landing no request waits for (a hint's) lands on
-//! the host.
+//! The watcher learns a landing once its end is recorded ([`Ended`],
+//! `Directory::landed`).
 
 use super::compute::Urgency;
 use super::host_records::Grant;
@@ -82,88 +88,190 @@ pub(in crate::experts) fn host_source(placer: crate::planning::Placer, record: u
 /// `mma16_record_rate`), whatever size the record was read in.
 const CONVERSION_PIECE: usize = 128 << 10;
 
-/// The words of a layer's barrier's convert (`routed_convert`,
-/// `BankPart::LandingList`, `BankPart::LandingGrids`): its list of the step
-/// and each routed tensor's grid, which the host writes before it answers
-/// the barrier, and the blocks of a record of each grid.
-pub(in crate::experts) struct DeviceWords {
-    pub list: super::Words,
-    pub grids: super::Words,
-    pub rows_groups: i32,
-    pub columns_groups: i32,
-    /// Its list's entries' bounds: staging records into bank records.
-    pub bounds: super::ListBounds,
+/// A landing launch's landing list (streaming_words.seismic's: a decode
+/// layer's, `routed_land`; a scratch round's of a layer, `routed_round`),
+/// as its one host writer appends to it. Each record whose read landed is
+/// an entry, in landing order: the record it converts from (LANDING_FROM:
+/// a staging or conveyor record, or a scratch slot s as -1 - s), the record
+/// it converts into (LANDING_TO), then the head (LANDING_HEAD: the step's
+/// low word, and the count landed above it) in one 64-bit release store,
+/// so the launch's threadgroups, each parked on the head for the entry it
+/// claimed, convert every entry as it lands. A head whose low word is
+/// another step's counts none: the first entry of a step is its first
+/// head. The device stores an entry's DONE (LANDING_DONE, the step's low
+/// word) once it has placed the entry's every item, so its record
+/// converted from is read; the host never resets it, comparing it with the
+/// step's low word.
+pub(in crate::experts) struct LandingList {
+    words: super::Words,
+    /// What an entry may name: its from record below `from` (or one of
+    /// `lent` scratch slots), its to record below `to`.
+    bounds: super::ListBounds,
+    entries: usize,
+    /// The step the head lists and the entries appended for it, one
+    /// appender at a time.
+    head: std::sync::Mutex<(Step, usize)>,
 }
 
-impl DeviceWords {
-    /// The word of grid `grid`'s axis `axis`.
-    fn grid_word(grid: u64, axis: usize) -> usize {
-        grid as usize * 3 + axis
+impl LandingList {
+    /// `words`, a landing list of every entry its words hold, naming
+    /// records within `bounds`.
+    pub fn new(words: super::Words, bounds: super::ListBounds) -> Self {
+        let entries = (words.len() - constants::LANDING_ENTRIES as usize) / constants::LANDING_ENTRY_WORDS as usize;
+        Self { words, bounds, entries, head: std::sync::Mutex::new((0, 0)) }
     }
 
-    /// The device converts `pairs` (staging record, bank record) at step
-    /// `sequence`'s barrier, past which the grids launch them: its list,
-    /// then its grids, all before the barrier's answer.
-    pub fn publish(&self, sequence: Step, pairs: &[(i32, i32)]) {
-        self.list.publish_list(sequence, pairs, self.bounds);
-        for (grid, groups) in [(constants::ROWS_GRID, self.rows_groups), (constants::COLUMNS_GRID, self.columns_groups)] {
-            self.grids.store(Self::grid_word(grid, 0), groups);
-            self.grids.store(Self::grid_word(grid, 1), pairs.len() as i32);
-            self.grids.store(Self::grid_word(grid, 2), 1);
-        }
+    /// The word `word` of entry `entry`.
+    fn word(entry: usize, word: u64) -> usize {
+        (constants::LANDING_ENTRIES + constants::LANDING_ENTRY_WORDS * entry as u64 + word) as usize
     }
 
-    /// The device is past the barrier the grids launched at: later steps'
-    /// convert launches run nothing.
-    pub fn clear(&self) {
-        for grid in [constants::ROWS_GRID, constants::COLUMNS_GRID] {
-            self.grids.store(Self::grid_word(grid, 1), 0);
+    /// Append `(from, to)` for step `sequence`: its entry, then the head
+    /// counting it. None where the list lists a later step already: the
+    /// device is past this step's launch, which converts nothing more. An
+    /// entry past the list, or a pair outside its bounds, is an invariant
+    /// violation.
+    pub fn append(&self, sequence: Step, from: i32, to: i32) -> Option<usize> {
+        let mut head = self.head.lock().expect("a landing list's head");
+        if sequence < head.0 {
+            return None;
         }
+        if sequence > head.0 {
+            *head = (sequence, 0);
+        }
+        let entry = head.1;
+        assert!(entry < self.entries, "landing entry {entry} of a list of {}", self.entries);
+        assert!(self.bounds.admits(from, to), "landing entry {entry}, ({from}, {to}), outside {:?}", self.bounds);
+        self.words.store(Self::word(entry, constants::LANDING_FROM), from);
+        self.words.store(Self::word(entry, constants::LANDING_TO), to);
+        head.1 += 1;
+        let low = super::watcher::low_word(sequence) as u32;
+        self.words.store_u64(constants::LANDING_HEAD as usize, u64::from(low) | (head.1 as u64) << 32);
+        Some(entry)
+    }
+
+    /// Whether the device stored entry `entry`'s DONE for step `sequence`:
+    /// it placed the entry's every item, so its record converted from is
+    /// read.
+    pub fn done(&self, sequence: Step, entry: usize) -> bool {
+        self.words.load(Self::word(entry, constants::LANDING_DONE)) == super::watcher::low_word(sequence)
+    }
+
+    /// The entries the head counts for step `sequence`, each (from, to), as
+    /// the device reads them.
+    #[cfg(test)]
+    pub fn listed(&self, sequence: Step) -> Vec<(i32, i32)> {
+        let head = self.words.load_u64(constants::LANDING_HEAD as usize);
+        let count = match head as u32 == super::watcher::low_word(sequence) as u32 {
+            true => (head >> 32) as usize,
+            false => 0,
+        };
+        (0..count)
+            .map(|entry| (self.words.load(Self::word(entry, constants::LANDING_FROM)), self.words.load(Self::word(entry, constants::LANDING_TO))))
+            .collect()
+    }
+
+    /// Place entry `entry` as the device does once it converted it: its
+    /// DONE, the step's low word.
+    #[cfg(test)]
+    pub fn place(&self, sequence: Step, entry: usize) {
+        self.words.store(Self::word(entry, constants::LANDING_DONE), super::watcher::low_word(sequence));
     }
 }
 
-/// A landing the device converts at its request's barrier
-/// (`routed_convert`, the priced site `assessment::ExpertLines::landed`):
-/// its read's end publishes its list and answers, and only the device's
-/// passing that barrier proves its bytes whole, so its record stays a
-/// landing's, its staging held, until then ([`Self::end`]). One that drops
+/// Where a [`DeviceLanding`] is: its read running; its entry appended to
+/// its landing list, whose DONE frees its staging record, once seen;
+/// ended.
+enum Device {
+    Reading,
+    Appended { entry: usize, grant: Grant, done: bool },
+    Ended,
+}
+
+/// A miss the device converts (`routed_land`, where the bank places): its
+/// read's end appends its entry to its layer's landing list
+/// ([`Self::append`]) and answers its choices; the launch converts it as
+/// it lands and stores the entry's DONE, which frees its staging record
+/// ([`Self::converted`]); the device past the launch proves its bytes
+/// whole, which maps its record ([`Self::end`]). Until then its record is
+/// a landing's, held by the directory as any landing's. One that drops
 /// without its end never landed, as a [`Converting`].
 pub(in crate::experts) struct DeviceLanding {
-    words: std::sync::Arc<DeviceWords>,
-    file: super::ExchangeTable,
+    list: std::sync::Arc<LandingList>,
     at: super::directory::Point,
-    landing: std::sync::Mutex<Option<Landing>>,
+    state: std::sync::Mutex<Device>,
     ended: Ended,
     account: std::sync::Arc<LandingAccount>,
 }
 
 impl DeviceLanding {
-    /// The device converts a landing of the request of `file` at `at`.
-    pub fn new(words: std::sync::Arc<DeviceWords>, file: super::ExchangeTable, at: super::directory::Point, ended: Ended, account: std::sync::Arc<LandingAccount>) -> Self {
-        Self { words, file, at, landing: std::sync::Mutex::new(None), ended, account }
+    /// The device converts a landing of the request at `at` listed in
+    /// `list`, its layer's.
+    pub fn new(list: std::sync::Arc<LandingList>, at: super::directory::Point, ended: Ended, account: std::sync::Arc<LandingAccount>) -> Self {
+        Self { list, at, state: std::sync::Mutex::new(Device::Reading), ended, account }
     }
 
-    /// Its list is published, `landing` its: it answers next.
-    pub fn converts(&self, landing: Landing) {
-        *self.landing.lock().expect("a device landing") = Some(landing);
+    fn state(&self) -> std::sync::MutexGuard<'_, Device> {
+        self.state.lock().expect("a device landing")
     }
 
-    /// Whether the device is past its convert at `past`: then its record is
-    /// mapped and its end set, or, its step failed, its end set not landed.
+    /// Its read landed whole in staging record `staged`, for the bank
+    /// record `grant` takes: append its entry. Whether it did: not once the
+    /// list lists a later step, the device past this one's launch, when it
+    /// ends not landed.
+    pub fn append(&self, grant: Grant, staged: u32) -> bool {
+        let to = i32::try_from(grant.record()).expect("bank records fit i32");
+        let from = i32::try_from(staged).expect("staging records fit i32");
+        let mut state = self.state();
+        assert!(matches!(*state, Device::Reading), "a device landing appends once");
+        match self.list.append(self.at.sequence, from, to) {
+            Some(entry) => {
+                *state = Device::Appended { entry, grant, done: false };
+                true
+            }
+            None => {
+                *state = Device::Ended;
+                drop(state);
+                self.ended.set(false);
+                false
+            }
+        }
+    }
+
+    /// Whether the device stored its entry's DONE: its staging record is
+    /// read, and frees.
+    pub fn converted(&self) -> bool {
+        match &mut *self.state() {
+            Device::Appended { entry, done, .. } => {
+                *done = *done || self.list.done(self.at.sequence, *entry);
+                *done
+            }
+            Device::Reading | Device::Ended => false,
+        }
+    }
+
+    /// Whether the device is past its launch at `past`: then its record is
+    /// mapped and its end set landed where the device stored its DONE, else
+    /// (the launch stopped before it: its slot failed, or its wait expired)
+    /// its end set not landed. One still reading ends once its read does.
     pub fn end(&self, past: super::directory::Point) {
         if self.at >= past {
             return;
         }
-        let Some(landing) = self.landing.lock().expect("a device landing").take() else {
+        let mut state = self.state();
+        let Device::Appended { entry, done, .. } = &*state else {
             return;
         };
-        self.words.clear();
-        let failed = self.file.answer_of(self.at.sequence, 0) == Some(super::exchange::Answer::Failed);
-        if !failed {
-            landing.grant.map();
+        let landed = *done || self.list.done(self.at.sequence, *entry);
+        let Device::Appended { grant, .. } = std::mem::replace(&mut *state, Device::Ended) else {
+            unreachable!("matched above");
+        };
+        drop(state);
+        if landed {
+            grant.map();
             self.account.device.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.ended.set(!failed);
+        self.ended.set(landed);
     }
 }
 
@@ -287,13 +395,6 @@ pub(in crate::experts) struct Landing {
     pub grant: Grant,
 }
 
-impl Landing {
-    /// The tier record it lands into.
-    pub fn record(&self) -> u32 {
-        self.grant.record()
-    }
-}
-
 /// Whether a landing has ended and how: unset while it converts, then
 /// whether it landed (its record mapped) or not (its read failed, or its
 /// conversion never ended). Set once, before any answer it publishes, so a
@@ -364,22 +465,18 @@ pub(in crate::experts) struct LandingTerms {
     worked: std::sync::atomic::AtomicU64,
 }
 
-/// The landings' account over a load, by their urgency as they ended
-/// (waited: a step waited for it; else a hint's no request named), and the
-/// landings that waited for a record past grace and how long; logged as
-/// the watcher stops.
+/// The host's landings' account over a load, by their urgency as they
+/// ended (waited: a step waited for it; else a hint's no request named),
+/// the landings the device converted, and the landings that waited for a
+/// record past grace and how long; logged as the watcher stops.
 #[derive(Default)]
 pub(in crate::experts) struct LandingAccount {
     demand: LandingTerms,
     hinted: LandingTerms,
     pub waits: std::sync::atomic::AtomicU64,
     pub waited: std::sync::atomic::AtomicU64,
-    /// The landings the device converted past their barriers.
+    /// The landings the device converted (`routed_land`).
     pub device: std::sync::atomic::AtomicU64,
-    /// Milliseconds each request's device landing holds back its list, so a
-    /// test's convert launched behind its wait finds none.
-    #[cfg(test)]
-    pub held_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LandingAccount {
@@ -531,8 +628,8 @@ pub(in crate::experts) struct Answer {
     /// The watcher's steps, whose ownership of the step's slot an answer is
     /// written under (`Steps::while_owned`).
     pub steps: std::sync::Arc<super::watcher::Steps>,
-    /// The load's parks, which an answer settles (a tier wait's park opens
-    /// at the slot's answer where parks are submission boundaries).
+    /// The load's parks, which an answer settles (a landing launch's park
+    /// opens at the slot's answer where parks are submission boundaries).
     pub parks: std::sync::Arc<super::Parks>,
 }
 

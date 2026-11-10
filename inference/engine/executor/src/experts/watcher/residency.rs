@@ -531,7 +531,7 @@ impl Residency {
     /// late, never early. Its resolved word is set while it is whole or its
     /// group's host tier keeps every expert outside the conveyor's lent
     /// records (`HostRecords::settled`): no route of its can find an
-    /// expert absent, so its tier wait is not encoded. The tier gives up a
+    /// expert absent, so its landing launch is not encoded. The tier gives up a
     /// kept expert mid-flight only to land one it lacks, which a complete
     /// tier never does, or to a prompt group's claim of a lent record,
     /// which a settled tier keeps none in; otherwise only in a shrink

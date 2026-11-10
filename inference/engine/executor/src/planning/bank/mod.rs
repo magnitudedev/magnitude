@@ -31,7 +31,7 @@ use std::num::NonZeroU64;
 use table::stored_rows;
 pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
 pub use counts::BankCounts;
-pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, PlacedAllocations, Placer};
+pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, Parking, PlacedAllocations, Placer};
 pub use records::{RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
 pub(crate) use records::layer_homes;
 pub use sizing::growth_target;
@@ -641,9 +641,11 @@ impl ExpertBankPlan {
     }
 
     /// Records of each staging pool (`T`): the demand reserve and the hint
-    /// window. A staging record lives only from its read to its landing, and
-    /// a request past them waits for one (`Decode::resume`), so a pool holds
-    /// what one row reads at once, and no more of a cap's bytes.
+    /// window. A staging record lives only from its read to its landing
+    /// (on unified memory, to the device's DONE of its entry,
+    /// `experts::landing`), and a request past them waits for one
+    /// (`Decode::resume`), so a pool holds what a request must hold at once,
+    /// and no more of a cap's bytes.
     pub fn staging_records(&self) -> u64 {
         self.demand_records() + self.hint_records()
     }
@@ -715,12 +717,25 @@ impl ExpertBankPlan {
         })
     }
 
-    /// Staging records only demand takes: a row's choices (`K`). Every
-    /// earlier request's records are free once the device makes a request,
-    /// so a one-row request always finds these, and a wider request's misses
-    /// past them land as each record frees.
+    /// Staging records only demand takes. Every earlier request's records
+    /// are free once the device makes a request (it is past their
+    /// landings), so a request always finds these, and its misses past them
+    /// are read as each record frees: by its own landings' ends, a host
+    /// landing's or, on unified memory, the device's DONE of each entry its
+    /// landing launch converts (`experts::landing`), which the host sees
+    /// while the launch runs where the device parks in its kernels: a row's
+    /// choices (`K`), the misses a one-row request may name. Where it parks
+    /// at submission boundaries ([`Parking::AtBoundaries`], Vulkan) the
+    /// device's DONE is the host's only once the launch's submission ends,
+    /// past its park, which waits for every entry: a request's misses there
+    /// hold their staging all at once, so the reserve holds the widest
+    /// request's distinct misses (its choices, at most the widest layer's
+    /// experts), and no miss waits on its own request's landings.
     pub fn demand_records(&self) -> u64 {
-        self.selected()
+        match self.host() {
+            HostTier::Unified(Parking::AtBoundaries) => self.choices().min(self.widest().get()),
+            HostTier::Unified(Parking::InKernels) | HostTier::Linked(_) => self.selected(),
+        }
     }
 
     /// Staging records hints may hold beyond the demand reserve: 2K, twice
@@ -764,10 +779,11 @@ impl ExpertBankPlan {
         self.widest().get().div_ceil(self.round_records())
     }
 
-    /// Words of a convert list (`routed_convert`): the sequence and
-    /// count, then a (conveyor record, scratch slot) pair per record.
-    pub fn list_words(&self) -> u64 {
-        list_extent(self.round_records())
+    /// Words of a scratch round's landing list (`routed_round`,
+    /// `magnitude_kernels::landing_extent`): its head, then an entry per record it converts,
+    /// (conveyor record or scratch slot, scratch slot, DONE).
+    pub fn round_list_words(&self) -> u64 {
+        magnitude_kernels::landing_extent(self.round_records())
     }
 
     /// Words of the tier list and the seed list (`routed_copy` from the host

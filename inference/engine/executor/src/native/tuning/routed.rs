@@ -20,7 +20,7 @@ use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_bloc
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
 use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
-    DECODE_GRIDS, MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS,
+    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS,
 };
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
@@ -468,8 +468,8 @@ pub(crate) fn hint_port(
 /// The bank operands of a streamed layer's route or selection
 /// (`routed_route_streamed`, `routed_select_streamed`) at one point of
 /// `rows` rows, in the storage the bank holds each in
-/// (`ExpertBankPlan::layout`: its words host-shared, its grids and the
-/// step's sources the device's): a group map of the layer's experts alone
+/// (`ExpertBankPlan::layout`: its words host-shared, the step's sources
+/// the device's): a group map of the layer's experts alone
 /// (`home` 0) that holds none of them, and where the bank has a host tier a
 /// tier map that holds none either, so every choice is requested and, across
 /// a link, assigned (the resolve's most work); policy words clear (no layer
@@ -488,7 +488,6 @@ pub(crate) struct BankOperands {
     /// The file table (`BankPart::FileTable`), whose step's slot the route
     /// requests.
     pub file: CaseState,
-    pub grids: CaseState,
     pub sources: CaseState,
     pub next_policy: Tensor,
     pub rings: CaseState,
@@ -515,7 +514,6 @@ impl BankOperands {
             sited: i32::from(bank.tier > 0),
             step,
             file: written(inputs, words(inputs, &bank.words.file().extents())?)?,
-            grids: written(inputs, inputs.scratch(Element::i32(), &[DECODE_GRIDS, 3])?)?,
             sources: written(inputs, inputs.scratch(Element::i32(), &[SOURCE_ROWS, rows, bank.selected])?)?,
             next_policy: words(inputs, &[POLICY_WORDS])?,
             rings: written(inputs, words(inputs, &[ahead, ring])?)?,
@@ -523,10 +521,9 @@ impl BankOperands {
         })
     }
 
-    pub fn states(&self) -> [(&'static str, &CaseState); 5] {
+    pub fn states(&self) -> [(&'static str, &CaseState); 4] {
         [
             ("file", &self.file),
-            ("grids", &self.grids),
             ("sources", &self.sources),
             ("rings", &self.rings),
             ("routing", &self.routing),
@@ -680,7 +677,6 @@ impl EntryTuning for RoutedRouteStreamedTuning {
             sited: bank.sited,
             step: &bank.step,
             file: bank.file.tensor_mut(),
-            grids: bank.grids.tensor_mut(),
             sources: bank.sources.tensor_mut(),
             next_norm,
             next_router,

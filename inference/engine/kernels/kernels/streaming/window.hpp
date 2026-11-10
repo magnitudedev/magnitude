@@ -34,6 +34,9 @@
 //
 // An includer asserts that a window holds a packet of each row
 // (`STREAMING_WINDOW_FITS`).
+//
+// A dense record has no windows: its items are runs of whole rows, each a
+// pass of the launch's threads over the run's elements (`streaming_dense_*`).
 
 // Whether `rows` rows of `packet`-byte packets, each share padded to 16 bytes,
 // fit a window of `window` bytes with at least one packet each: an integer
@@ -90,4 +93,25 @@ STREAMING_FN u32 streaming_window_count(u32 row_packets, u32 packets) {
 // The bytes between a window's rows.
 STREAMING_FN u32 streaming_window_pitch(u32 rows, u32 packet, u32 packets, u32 stride, u32 window) {
     return streaming_window_whole(rows, stride, window) ? stride : (packets * packet + 15u) / 16u * 16u;
+}
+
+// The elements each thread of a dense item converts: an item is a pass of the
+// launch's `threads` over `threads * STREAMING_DENSE_PER_THREAD` elements, so
+// that the claim, barriers and count an item costs are paid over work and not
+// over a row a few elements long.
+#define STREAMING_DENSE_PER_THREAD 8u
+
+// The bytes of a dense record's item: a pass of the launch's threads, within
+// the window, whole 16-byte units (an element, a power of two of at most four
+// bytes, never straddles two items). A record's items split its flattened
+// elements, rows and all; the dense source is row-major, one unit-stride run.
+STREAMING_FN u32 streaming_dense_span(u32 element, u32 threads, u32 window) {
+    const u32 bytes = threads * STREAMING_DENSE_PER_THREAD * element;
+    return (bytes < window ? bytes : window) / 16u * 16u;
+}
+
+// A dense record's items: its `elements` elements of `element` bytes in
+// spans of `span` bytes, the last the rest.
+STREAMING_FN u32 streaming_dense_items(u32 elements, u32 element, u32 span) {
+    return (elements * element + span - 1u) / span;
 }

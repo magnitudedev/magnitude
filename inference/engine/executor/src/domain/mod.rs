@@ -997,15 +997,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.measures.as_ref().and_then(|measures| measures.experts.as_ref())
     }
 
-    /// Measure the host's landings slow from now on
-    /// (`Shared::slow_host_landing`).
-    #[cfg(test)]
-    pub(crate) fn slow_host_landing(&self) {
-        if let Some(bank) = self.family.expert_bank() {
-            bank.slow_host_landing();
-        }
-    }
-
     /// The device the domain charges.
     #[cfg(test)]
     pub(crate) fn device(&self) -> &seismic::Device {

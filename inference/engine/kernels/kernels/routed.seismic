@@ -1794,9 +1794,11 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # launch that reads an expert's weights looks up where it lives, in its
 # layer's map, by its step (`held`). A decode class (M <= DECODE_ROWS) is
 # bank-served:
-#   routed_route_streamed -> routed_tier_wait -> routed_site_request ->
+#   routed_route_streamed -> routed_land -> routed_site_request ->
 #   routed_gate_up -> routed_output_project -> routed_output_sited
-# the gate/up and projections the resident entries over the bank stacks
+# the landing launch converting each file miss the device lands as its read
+# lands and then sourcing the absent choices, the gate/up and projections
+# the resident entries over the bank stacks
 # (E = BANK), reading each choice's record where the route's sources name it
 # (XS = SOURCE_ROWS, `decode_source`): a bank record, a record of the
 # group's host tier read in place (TR its records), or none for a choice the
@@ -1805,8 +1807,9 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # `routes` are its slots), as two runs, a front and a back:
 #   routed_route -> routed_scratch_request | rounds -> routed_group ->
 #   routed_experts -> routed_combine
-# where each round is routed_scratch_wait then routed_convert (conveyor
-# records), and routed_experts reads a bank hit in its record through the
+# where each round is one landing launch (`routed_round`: its arrival, then
+# each conveyed record converted into the scratch bank as its read lands),
+# and routed_experts reads a bank hit in its record through the
 # map (X = E), the rest from the scratch bank. A prompt group runs every
 # step's front of a layer before any step's back there, so every request of
 # the layer is published before its experts are read for. A step's
@@ -1836,7 +1839,10 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (host): LIST_SEQUENCE the
 # sequence it was written for, LIST_COUNT the count n, then from
 # LIST_ENTRIES n entries of LIST_ENTRY_WORDS words, (from, to) record pairs
-# at LIST_FROM and LIST_TO.
+# at LIST_FROM and LIST_TO. A landing list
+# `landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS L]` (host, the device's
+# DONE words aside): the step and the count of entries landed in one u64
+# (LANDING_HEAD), then (from, to, done) entries in landing order.
 #
 # A request (`routed_route_streamed`, `routed_site_request`,
 # `routed_scratch_request`) is where the host serves the device. A file
@@ -1844,21 +1850,22 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # running step reads, and answers in the request's slot. A scratch
 # request's host only reads on seeing it: the request runs in its step's
 # front, ahead of the backs of the steps before it, so what the host writes
-# for a scratch step (its lists, staging and conveyor records) its rounds'
-# waits declare as host ports (`&host` what its host reads, `&host mut`
-# what it rewrites), and the host serves the request once its round 0 has
-# arrived, the device past the steps before it there. Each entry the
+# for a scratch step and no launch reads (its tier and seed lists, the map)
+# its rounds declare as host ports (`&host` what its host reads, `&host
+# mut` what it rewrites), and the host serves the request once its round 0
+# has arrived, the device past the steps before it there. Each entry the
 # device runs on that storage binds what it reads, so a launch's bindings
 # are every ordering the protocol has. The host writes the maps, which no
 # binding needs: an entry is read by a step only within its stamped steps
 # (`held`).
 #
-# A wait (the decode tier wait, the CPU's answer at the combine, a scratch
-# round's wait) declares its slots as awaited ports (`&await`), which the
-# host answers while the launch waits, and ends by the exchange's one rule
-# (`slot_answered`). How it waits is the backend's one fact
-# (`SEISMIC_PARKS_IN_KERNELS`, `streaming/park.hpp`): Metal and CUDA spin
-# in the kernel on mapped host-shared words read with acquire; Vulkan,
+# A wait (the decode landing, the CPU's answer at the combine, a scratch
+# round) declares its slots as awaited ports (`&await`), which the host
+# answers while the launch waits, and ends by the exchange's one rule
+# (`slot_answered`); a landing launch also awaits its landing list, whose
+# entries the host appends while it runs. How it waits is the backend's one
+# fact (`SEISMIC_PARKS_IN_KERNELS`, `streaming/park.hpp`): Metal and CUDA
+# spin in the kernel on mapped host-shared words read with acquire; Vulkan,
 # whose running work sees no host write, waits at a park before the call,
 # a submission boundary the host opens once the rule holds, after which the
 # kernel reads the words once. Liveness is the protocol's: every request is
@@ -1919,6 +1926,13 @@ fn slot_succeeded[S, W](slots: &tensor[S, W] i32, slot: i32, q: u64) -> bool:
 fn store_pair[S, W](slots: &mut tensor[S, W] i32, slot: i32, at: i32, q: u64):
     slots[slot, at] = i32(u32(q & u64(4294967295)))
     slots[slot, at + 1] = i32(u32(q >> u64(32)))
+
+# Request lane `lane` of slot `slot` of `slots` for step `q` (its payload
+# stored): the lane's SLOT_VIOLATED cleared first, so a violation stored for
+# an earlier step is never read as a later step's (streaming_request_slot).
+fn request_slot[S, W](slots: &mut tensor[S, W] i32, slot: i32, lane: i32, q: u64):
+    slots[slot, lane + SLOT_VIOLATED] = 0
+    store_pair(slots, slot, lane + SLOT_REQUEST, q)
 
 
 # A layer ahead's hints: layer j's choices for these rows, predicted from
@@ -2002,21 +2016,17 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
 # - else absent: the step's slot of the layer's file table (`file`, the
 #   routing record's slot) is requested (the choices, an absent expert as
 #   itself, any other as -1 - expert; the count; then the step), from whose
-#   answer `routed_tier_wait` sources its choices once the host landed
-#   them. Across a link (TM = E) an absent expert is a miss too, assigned
-#   with the rest, its record pending (SOURCE_SITE -2 where the CPU's; the
-#   tier wait names it). The route does not wait; with no choice absent the
+#   answer `routed_land` sources its choices once the host landed them.
+#   Across a link (TM = E) an absent expert is a miss too, assigned with
+#   the rest, its record pending (SOURCE_SITE -2 where the CPU's; the
+#   landing names it). The route does not wait; with no choice absent the
 #   host is not involved.
 # Every choice of an expert has its expert's source, read once, on its
 # first choice: the host maps and unmaps while a step runs, so two reads of
 # an expert's map or tier words may differ. A layer whose policy's
 # POLICY_WHOLE word is set (its group holds every expert at its home record)
 # sources each choice from `home + expert`: nothing misses, nothing is
-# published, and neither the routing record nor the grids are written.
-#
-# `grids` are the grids the route writes, whole or not: `routed_tier_wait`'s
-# (WAIT_GRID, its `grid`): one threadgroup, or none when no choice is
-# absent, so a wait for none does no work.
+# published, and the routing record is not written.
 #
 # Routing record: `routing[q mod FLIGHT]`, a ring's words over P choices,
 # takes every choice as routed (`routes`, M K of them), then the count, then
@@ -2034,7 +2044,7 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
 # misses to the CPU: any other reads every tier-held miss in place.
 fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tensor[GM, MAP_WORDS] i32,
     tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32, sited: i32,
-    step: &tensor[STEP_WORDS] i32, file: &mut tensor[FLIGHT, FW] i32, grids: &mut tensor[DECODE_GRIDS, 3] i32,
+    step: &tensor[STEP_WORDS] i32, file: &mut tensor[FLIGHT, FW] i32,
     routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32)
     where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let home = policy[POLICY_HOME]
@@ -2078,10 +2088,7 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
                     if routing[record, RING_EXPERTS + P + row * K + choice] == -1:
                         file[record, entry + FILE_CHOICE] = routes[row, choice]
             file[record, FILE_COUNT] = i32(M * K)
-            store_pair(file, record, SLOT_REQUEST, q)
-        grids[WAIT_GRID, 0] = absent
-        grids[WAIT_GRID, 1] = 1
-        grids[WAIT_GRID, 2] = 1
+            request_slot(file, record, 0, q)
 
 # The first choice in choice order (row-major) of choice (row, choice)'s
 # expert, as row * K + choice: the one that stands for the expert.
@@ -2116,7 +2123,7 @@ fn expert_rows[M, K](routes: &tensor[M, K] i32, expert: i32) -> i32:
 # no later than in place (the CPU's first pays the handshake), else to the
 # GPU in place. It runs only once POLICY_PRICED is set; until then every
 # miss is the GPU's in place. Every choice of a CPU expert is the CPU's:
-# SOURCE_SITE its tier record (-2 while absent, its tier wait names it),
+# SOURCE_SITE its tier record (-2 while absent, its landing names it),
 # SOURCE_RECORD -1; a link expert's keeps its source.
 fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
     sources: &mut tensor[SOURCE_ROWS, M, K] i32):
@@ -2177,7 +2184,7 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
 # form (NM, PT): a norm each, or none; each routes over EN experts.
 #
 # Its host answers the step's slot of the layer's `file` table as it lands
-# the absent experts (`routed_tier_wait` awaits it).
+# the absent experts (`routed_land` awaits it).
 fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM](residual: &tensor[M, PT * H] f32,
     norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
@@ -2185,7 +2192,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, 
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32,
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
-    file: &mut tensor[FLIGHT, FW] i32, grids: &mut tensor[DECODE_GRIDS, 3] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
+    file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
     next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
     after_norm: &tensor[NM] NW, after_router: &tensor[EN, H] RW,
     next_policy: &tensor[POLICY_WORDS] i32,
@@ -2197,7 +2204,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, 
     let mut shared_product = tensor[M, S] A
     route_shared(residual, norm, router, shared_router, shared_gate, shared_up, eps,
         normalize, expert_scale, routes, scores, normalized, coefficient, shared_product)
-    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, grids, routing, sources)
+    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
     let mut after = tensor[M, H] A
@@ -2229,7 +2236,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     normalization_epsilon: f32, scale: f32,
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
-    file: &mut tensor[FLIGHT, FW] i32, grids: &mut tensor[DECODE_GRIDS, 3] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
+    file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
     next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
     after_router_norm: &tensor[H] RNW, after_router: &tensor[EN, H] RW, after_bias: &tensor[EN] f32,
     next_policy: &tensor[POLICY_WORDS] i32,
@@ -2238,7 +2245,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
         weights, epsilon, score, normalization, normalization_epsilon, scale)
-    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, grids, routing, sources)
+    resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
     # Initialized as `hint`'s routes are, for the `&mut` argument.
@@ -2263,7 +2270,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
 
 
 # A streamed decode layer's site request (streaming_words.seismic's site
-# kind), after its route (or its tier wait, when one runs), before its
+# kind), after its route (or its landing, when one runs), before its
 # gate/up: when any choice is the CPU's (SOURCE_SITE >= 0), into the step's
 # slot s = q mod FLIGHT, the rows (`site_rows[s]`, the layer's normalized
 # rows widened to F32 exactly), then the request (`site[s]`): each CPU
@@ -2296,7 +2303,7 @@ fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
                     site[slot, entry + SITE_WEIGHT_BITS] = i32(bitcast_u32(weights[row, choice]))
                     count = count + 1
         site[slot, SITE_COUNT] = count
-        store_pair(site, slot, SLOT_REQUEST, q)
+        request_slot(site, slot, 0, q)
 
 # Whether any choice of the step is the CPU's (SOURCE_SITE >= 0).
 fn any_sited[M, K](sources: &tensor[SOURCE_ROWS, M, K] i32) -> bool:
@@ -2369,75 +2376,143 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
 
 
 # The window a converting threadgroup copies staged bytes into before it
-# converts them (`lib/streaming/window.h`, the natives of `routed_convert`):
-# its threadgroup memory, within Metal's 32 KiB, CUDA's 48 KiB of static
-# shared memory a block and the 32 KiB of group memory the engine requires of
-# a Vulkan device (beside a workgroup's list words). 20 KiB, the least whole KiB that holds a 16-row
-# tile of DeepSeek V4.1's MXFP4 down rows (16 x 1224 = 19584 bytes, 72
-# packets of 17 bytes a row) whole, so such a tile is one item, copied as
-# one 16-byte aligned span (a smaller window splits each row's packets
+# converts them (`lib/streaming/window.h`, the landing launches' natives,
+# `routed_land` and `routed_round`): its threadgroup memory, within Metal's
+# 32 KiB, CUDA's 48 KiB of static shared memory a block and the 32 KiB of
+# group memory the engine requires of a Vulkan device (beside a
+# workgroup's landing words). 20 KiB, the least whole KiB that holds a
+# 16-row tile of DeepSeek V4.1's MXFP4 down rows (16 x 1224 = 19584 bytes,
+# 72 packets of 17 bytes a row) whole, so such a tile is one item, copied
+# as one 16-byte aligned span (a smaller window splits each row's packets
 # across two items, every other row's share off 16-byte alignment).
 const WINDOW_BYTES = 20480
 
-# The rows of a record one converting threadgroup's tile covers, which sets
-# `routed_convert`'s grid over a record of N rows, ceil_div(N,
-# CONVERT_TILE_ROWS): repack's 16-row tile on every streaming backend
-# (`lib/repack`'s TILE_ROWS, the rows of a Metal window; asserted in Metal's
-# and CUDA's `routed_convert`). The host writes the grid from it
-# (`routed_scratch_grids`).
-const CONVERT_TILE_ROWS = 16
+# A landing launch's group words (`streaming/land.hpp`): the claim its
+# threadgroup took and the from and to of the claim's entry, four words,
+# so a window after them starts 16-byte aligned.
+const LAND_GROUP_WORDS = 4
 
-# A streamed layer's absent experts, between `routed_route_streamed` and the
-# entries over its sources. Its absent choices are the ones this step's
-# slot of the layer's file table names (an entry c below its count whose
-# FILE_CHOICE word is an expert >= 0, the slot requested for the step); any
-# other choice is read where the route's sources name it. The host reads
-# each absent expert's stored record from the file into a landing record,
-# converts it into a free record in the bank's resident form (on unified
-# memory a bank record r, which it maps; across a link a tier record t,
-# which it names in the tier map), and writes the source the choice reads
-# as its entry's FILE_RECORD: r, or -2 - t, or -1 for a failed read; once
-# every absent choice's is written, it answers the slot. The
-# wait waits on the slot (`slot_answered`), then each absent choice writes
-# its sources: a bank record is read as a hit; a tier record goes where the
-# route assigned the expert, to the CPU (its SOURCE_SITE -2: SOURCE_SITE t)
-# or to the GPU in place (SOURCE_RECORD -2 - t). A failed read or a failed
-# step sources none (SOURCE_RECORD and SOURCE_SITE -1), whose entries then
-# read nothing for it (`decode_source`). Every write of the sources
-# completes before `routed_site_request` and `routed_gate_up` read them
-# (they follow in submission order). `grid` is the route's wait grid (its
-# `grids`' WAIT_GRID), which only the native launches read (their written
-# grid). `landing` is the layer's convert list of the misses the device lands
-# (`routed_convert`), which the host writes before it answers: the park is
-# its writer, so those converts run after the wait on every backend, not only
-# where launches keep submission order.
-fn routed_tier_wait[M, K, FW, FLIGHT, LW](step: &tensor[STEP_WORDS] i32, file: &await mut tensor[FLIGHT, FW] i32,
-    sources: &mut tensor[SOURCE_ROWS, M, K] i32, grid: &tensor[3] i32,
-    policy: &tensor[POLICY_WORDS] i32, landing: &host mut tensor[LW] i32)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0:
+# The byte at which a landing workgroup's window follows its group words
+# (4 * LAND_GROUP_WORDS), on a backend whose window lies in group memory
+# beside them (Vulkan): a literal, since the seismic language holds no
+# constant expressions, which `vulkan/lib/streaming/land.glsl` checks.
+const LAND_WINDOW_AT = 16
+
+# The entries of landing list `landing` (streaming_words.seismic) landed
+# for step `step`: its head's count where its head names the step, else
+# none.
+fn landed_entries[L](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+    step: &tensor[STEP_WORDS] i32) -> i32:
+    let mut entries = i32(0)
+    if landing[LANDING_HEAD] == step[STEP_LOW]:
+        entries = landing[LANDING_HEAD + 1]
+    return entries
+
+# One routed tensor's records of a landing list's `entries` landed entries:
+# each entry's `from` record of `source` converted into its `to` record of
+# `destination` by the registered GGUF -> resident conversion (`repack`, as
+# `repack_weight` imports them). A round's negative `from` (scratch slot -1
+# - from, holding the stored bytes in bytes its view types as the resident
+# form) is the natives' alone: this body states a source record's case.
+fn land_tensor[L, V, S, N, K](landing: &tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32, entries: i32,
+    source: &tensor[V, N, K] ST, destination: &mut tensor[S, N, K] U)
+    where V >= 0 and S >= 0:
+    for entry in 0..L:
+        let from = landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_FROM]
+        let to = landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_TO]
+        if entry < entries and from >= 0:
+            destination[to, :, :] = repack[U = U](source[from, :, :])
+
+# A landing launch's conversions, with no host (streaming_words.seismic's
+# landing list): every entry landed for the step, each routed tensor's
+# `from` record converted into its `to` record (`land_tensor`: gate, where
+# the record has one, GV > 0; up; down), then each entry's DONE the step's
+# low word. The natives convert each entry as it lands (`streaming/land.hpp`).
+fn land[L, V, GV, S, GS, F, H](landing: &mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+    step: &tensor[STEP_WORDS] i32, source_gate: &tensor[GV, F, H] SG, source_up: &tensor[V, F, H] SU,
+    source_down: &tensor[V, H, F] SD, gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU,
+    down: &mut tensor[S, H, F] UD)
+    where V >= 0 and GV >= 0 and S >= 0 and GS >= 0:
+    let entries = landed_entries[L = L](landing, step)
+    if GV > 0:
+        land_tensor[L = L](landing, entries, source_gate, gate)
+    if V > 0:
+        land_tensor[L = L](landing, entries, source_up, up)
+        land_tensor[L = L](landing, entries, source_down, down)
+    for entry in 0..L:
+        if entry < entries:
+            landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS * entry + LANDING_DONE] = step[STEP_LOW]
+
+# The sources of step `q`'s absent choices, from its answer in slot `slot`
+# of the layer's file table: each choice the slot names absent (an entry c
+# below its count whose FILE_CHOICE word is an expert >= 0) is sourced
+# from its FILE_RECORD: a bank record is read as a hit; a tier record goes
+# where the route assigned the expert, to the CPU (its SOURCE_SITE -2:
+# SOURCE_SITE t) or to the GPU in place (SOURCE_RECORD -2 - t). A failed
+# read or a failed step sources none (SOURCE_RECORD and SOURCE_SITE -1),
+# whose entries then read nothing for it (`decode_source`).
+fn source_landed[M, K, FLIGHT, FW](file: &tensor[FLIGHT, FW] i32, slot: i32, q: u64,
+    sources: &mut tensor[SOURCE_ROWS, M, K] i32)
+    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K:
+    let answered = slot_succeeded(file, slot, q)
+    for row in 0..M:
+        for choice in 0..K:
+            let c = row * K + choice
+            let entry = FILE_ENTRIES + FILE_ENTRY_WORDS * c
+            let expert = file[slot, entry + FILE_CHOICE]
+            if i32(c) < file[slot, FILE_COUNT] and expert >= 0:
+                let mut source = -1
+                if answered:
+                    source = file[slot, entry + FILE_RECORD]
+                if source == -1:
+                    sources[SOURCE_RECORD, row, choice] = -1
+                    sources[SOURCE_SITE, row, choice] = -1
+                if source >= 0:
+                    sources[SOURCE_RECORD, row, choice] = source
+                if source < -1:
+                    if sources[SOURCE_SITE, row, choice] == -2:
+                        sources[SOURCE_SITE, row, choice] = -2 - source
+                    else:
+                        sources[SOURCE_RECORD, row, choice] = source
+
+# A streamed decode layer's landing launch, between `routed_route_streamed`
+# and the entries over its sources: it lands the layer's absent experts,
+# each as its read lands, then sources the absent choices. Its absent
+# choices are the ones this step's slot of the layer's file table names
+# (`source_landed`); any other choice is read where the route's sources
+# name it. The host reads each absent expert's stored record from the file.
+# Where the bank places (unified memory), it reads into a free staging
+# record (`staging_*`, the layer's stored-form views, an up-only record's
+# gate empty, GV 0, and with it `gate`, GS 0), and the moment the read
+# lands appends (staging record, bank record) to the layer's landing list
+# (`landing`, streaming_words.seismic) and answers the expert's choices
+# (FILE_RECORD the bank record r); the launch converts every routed tensor
+# of each entry into the bank's records (`gate`, `up`, `down`, the layer's
+# bank stacks) as it lands, in landing order, and stores the entry's DONE,
+# which frees its staging record, while the experts follow the launch in
+# submission order. Where the host tier places (across a link), the host
+# converts into a tier record t and answers -2 - t; nothing lands here (V =
+# S = 0) and the launch only sources. Once every absent expert's choices
+# are answered, the host answers the slot; a failed read appends nothing
+# and answers -1. The launch converts every entry below the count its
+# landing list holds once the slot is answered (`slot_answered`), then
+# writes the sources (`source_landed`). Every write of the sources and the
+# records completes before `routed_site_request` and `routed_gate_up` read
+# them (they follow in submission order). Its host maps each bank record
+# once the device is past the launch. This body states the conversions
+# with no host: the entries landed when it runs.
+fn routed_land[M, K, FW, FLIGHT, L, V, GV, S, GS, F, H](step: &tensor[STEP_WORDS] i32,
+    file: &await mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
+    policy: &tensor[POLICY_WORDS] i32,
+    landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
+    staging_gate: &tensor[GV, F, H] SG, staging_up: &tensor[V, F, H] SU, staging_down: &tensor[V, H, F] SD,
+    gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD)
+    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if policy[POLICY_RESOLVED] == 0 and pair_at(file, slot, SLOT_REQUEST) == q:
-        let answered = slot_succeeded(file, slot, q)
-        for row in 0..M:
-            for choice in 0..K:
-                let c = row * K + choice
-                let entry = FILE_ENTRIES + FILE_ENTRY_WORDS * c
-                let expert = file[slot, entry + FILE_CHOICE]
-                if i32(c) < file[slot, FILE_COUNT] and expert >= 0:
-                    let mut source = -1
-                    if answered:
-                        source = file[slot, entry + FILE_RECORD]
-                    if source == -1:
-                        sources[SOURCE_RECORD, row, choice] = -1
-                        sources[SOURCE_SITE, row, choice] = -1
-                    if source >= 0:
-                        sources[SOURCE_RECORD, row, choice] = source
-                    if source < -1:
-                        if sources[SOURCE_SITE, row, choice] == -2:
-                            sources[SOURCE_SITE, row, choice] = -2 - source
-                        else:
-                            sources[SOURCE_RECORD, row, choice] = source
+        land[L = L](landing, step, staging_gate, staging_up, staging_down, gate, up, down)
+        source_landed(file, slot, q, sources)
 
 
 # Expert streaming, a step's sequence: `sequence[STEP_WORDS]`, the pair the
@@ -2459,7 +2534,7 @@ fn scratch_lane(lane: i32) -> i32:
 # choices routed to expert e (0 when none), in its chain place's flags, then
 # the request in its slot's SCRATCH_ASK lane of the layer's scratch table.
 # It does not wait. What its host writes for the step, the rounds' waits
-# declare (`routed_scratch_wait`). A resident group's step (`resident`, the
+# declare (`routed_round`). A resident group's step (`resident`, the
 # word its host writes before encoding the group) requests nothing: every
 # expert is read where it lives, in the group's one pass at the layer.
 fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
@@ -2474,65 +2549,77 @@ fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
                 let expert = routes[row, choice]
                 flags[expert] = flags[expert] + 1
         let q = step_sequence(step)
-        store_pair(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ASK) + SLOT_REQUEST, q)
+        request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ASK), q)
 
 
-# One scratch round's wait: requests the step's lane SCRATCH_ROUND + `round`
-# of its slot (the device's arrival at the round), then waits on it
-# (`slot_answered`). The reference has no host and only arrives.
+# One scratch round's landing launch: it requests the step's lane
+# SCRATCH_ROUND + `round` of its slot (the device's arrival at the round),
+# then converts each of the round's records as its read lands, until the
+# lane is answered (`slot_answered`) and every entry below the round's
+# landing list's count is converted.
 #
-# The host's answer is host work alone, into host memory: every datum it
-# answers with is read by device work already in the graph after this
-# wait, so no submission to the device stands between the wait and its
-# answer. Before answering it, the host writes the round's convert `list`
-# and reads each expert it lists into its record of the layer's
-# `conveyor_*` views, host memory the round's convert reads in place after
-# this park (the streaming header's requests). Before round 0's answer it
-# writes the `tiered` list, each (host tier record, scratch slot) of an
-# expert the host tier keeps whole, which the tier copy after round 0
-# reads from the tier in place. A prompt group's last step's host writes
-# the `seeds` list, which its seed copy reads after the last round (the
-# host maps the seeds once the copy has completed). The host rewrites the
-# layer's `map`, a row for each of the layer's experts (EL), as it serves
-# round 0, while its lists hold up to the widest layer's (E). An up-only
-# record has no gate: its `conveyor_gate` is empty (GV 0).
-fn routed_scratch_wait[FLIGHT, LANES, LW, V, F, H, E, EL, GV](step: &tensor[STEP_WORDS] i32,
+# Its host serves it in host memory alone: every datum it serves is read by
+# device work already in the graph (this launch, and what follows it), so
+# no submission to the device stands between the launch and the host. For
+# each expert of the round it reads the stored record into its record of
+# the layer's `conveyor_*` views (host memory this launch reads in place),
+# or into scratch slot s at the slot's base (where the host addresses the
+# scratch: on unified memory), and the moment the read lands appends
+# (conveyor record, or -1 - s, scratch slot e) to the round's landing list
+# (`landing`, streaming_words.seismic), in landing order; it answers the
+# round's lane after the round's last entry (at once for a round of none).
+# The launch converts every routed tensor of each entry into the layer's
+# scratch tier (`gate`, `up`, `down`, views of the scratch lender's bank
+# records, slot e holding expert e; an up-only record's gate views empty,
+# GV = GS = 0). Before round 0's answer the host writes the `tiered` list,
+# each (host tier record, scratch slot) of an expert the host tier keeps
+# whole, which the tier copy after round 0 reads from the tier in place. A
+# prompt group's last step's host writes the `seeds` list, which its seed
+# copy reads after the last round (the host maps the seeds once the copy
+# has completed). The host rewrites the layer's `map`, a row for each of
+# the layer's experts (EL), as it serves round 0, while its lists hold up
+# to the widest layer's (E). It launches on its park grid (`grid`,
+# `routed_scratch_grids`'), round 0 on LAND_GROUPS threadgroups always.
+# The arrival of the round after a round, which the scratch table and the
+# scratch tier order after it, is the device's word that its records are
+# read, which frees them. This body states the arrival and the
+# conversions with no host: the entries landed when it runs.
+fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_WORDS] i32,
     scratch: &await mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, round: i32,
-    list: &host mut tensor[LW] i32,
+    landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
     tiered: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
-    conveyor_gate: &host mut tensor[GV, F, H] SG, conveyor_up: &host mut tensor[V, F, H] SU,
-    conveyor_down: &host mut tensor[V, H, F] SD,
+    conveyor_gate: &tensor[GV, F, H] SG, conveyor_up: &tensor[V, F, H] SU,
+    conveyor_down: &tensor[V, H, F] SD,
+    gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD,
     seeds: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
     map: &host mut tensor[EL, MAP_WORDS] i32, grid: &tensor[3] i32)
-    where FLIGHT > 0 and LANES > SCRATCH_ROUND and V > 0 and GV >= 0 and (GV == V or GV == 0):
+    where FLIGHT > 0 and LANES > SCRATCH_ROUND and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
-    store_pair(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + round) + SLOT_REQUEST, q)
+    request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + round), q)
+    land[L = L](landing, step, conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
 
 
-# A scratch request's round grids, after round 0's wait: from the count of
-# records its rounds convert (its SCRATCH_ASK lane's SCRATCH_STAGED, which
-# the host writes and answers before it answers round 0; none where it
-# failed the request), round r converts
+# A scratch request's round grids, after round 0's landing launch: from
+# the count of records its rounds convert (its SCRATCH_ASK lane's
+# SCRATCH_STAGED, which the host writes and answers before it answers
+# round 0; none where it failed the request), round r converts
 # n_r = clamp(count - r L, 0, L) records (L = `round_records`), so its park
-# grid holds one threadgroup while n_r > 0 or, unfollowed, n_{r-1} > 0
-# (round 0's is never read) and its convert grids n_r rows of `rows_groups` and
-# `columns_groups` threadgroups, ceil(N / CONVERT_TILE_ROWS) of the
-# convert's over records of N = F and N = H rows (its threadgroups stride
-# over a record's items, so any grid converts every one). The round after
-# the last with records parks and converts nothing: its arrival, which its
-# wait orders after the last round's converts by the conveyor it binds, is
-# the device's word that they have read their records, which frees them,
-# and its host answers it before the last round; but not where the request
-# is followed (SCRATCH_FOLLOWED: a sibling fill's round 0 arrives next and
-# proves as much). The rounds after it neither park nor convert, and the
-# host serves none of them. A request
-# neither answered nor failed here had round 0's wait end on its still
-# pulse (`streaming_await_slot`), before the count was final: every round
-# parks and none converts, so the device still arrives, in order, at every
-# round the host serves (the step is interrupted, its outputs unused).
+# grid (`routed_round`'s `grid`) holds LAND_GROUPS threadgroups while
+# n_r > 0 or, unfollowed, n_{r-1} > 0 (round 0's is never read), and none
+# otherwise. The round after the last with records lands nothing: its
+# arrival, which the scratch table orders after the last round's launch, is
+# the device's word that the last round's records are read, which frees
+# them, and its host answers it before the last round; but not where the
+# request is followed (SCRATCH_FOLLOWED: a sibling fill's round 0 arrives
+# next and proves as much). The rounds after it launch nothing, and the
+# host serves none of them. A request neither answered nor failed here had
+# round 0's wait end on its still pulse (`streaming_await_slot`), before
+# the count was final: every round launches and none converts (the host
+# appends nothing), so the device still arrives, in order, at every round
+# the host serves (the step is interrupted, its outputs unused).
 fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
     scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
-    grids: &mut tensor[R, ROUND_GRIDS, 3] i32, round_records: i32, rows_groups: i32, columns_groups: i32)
+    grids: &mut tensor[R, 3] i32, round_records: i32)
     where FLIGHT > 0 and LANES == SCRATCH_ROUND + R:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
@@ -2552,14 +2639,9 @@ fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
         let records = min(max(count - i32(round) * round_records, 0), round_records)
         let before = min(max(count - max(i32(round) - 1, 0) * round_records, 0), 1) * after
         let parks = max(max(min(records, 1), before), unanswered)
-        grids[round, PARK_GRID, 0] = parks
-        grids[round, ROWS_GRID, 0] = rows_groups
-        grids[round, COLUMNS_GRID, 0] = columns_groups
-        for grid in 0..ROUND_GRIDS:
-            grids[round, grid, 1] = 1
-            grids[round, grid, 2] = 1
-        grids[round, ROWS_GRID, 1] = records
-        grids[round, COLUMNS_GRID, 1] = records
+        grids[round, 0] = parks * i32(LAND_GROUPS)
+        grids[round, 1] = 1
+        grids[round, 2] = 1
 
 
 # Stage host-written `list` into `staged`: its sequence, its count of step
@@ -2593,15 +2675,6 @@ fn routed_list_grid[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, s
     if entries > 0:
         grid[1] = 1
     grid[2] = 1
-
-
-# A host-written list staged into device memory (streaming/list.hpp): its
-# sequence, its count of the step's entries, and those entries, which every
-# group of the launches after it reads in place of the host's (a round's
-# converts).
-fn routed_list_stage[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &tensor[STEP_WORDS] i32,
-    staged: &mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32):
-    let _ = stage_list[L = L](list, step, staged)
 
 
 # A merge set's pass's view of a streamed layer's map (streaming_words.seismic's
@@ -2655,33 +2728,6 @@ fn routed_move[D, L, N, K](records: &mut tensor[D, N, K] U,
         let to = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
         if entry < list[LIST_COUNT]:
             records[to, :, :] = records[from, :, :]
-
-
-# A scratch round's stored records: each listed (record, scratch slot) pair
-# converted into `destination` by the registered GGUF -> resident conversion
-# (`repack`, as `repack_weight` imports them). `from` names a record of the
-# conveyor, a stored-form view of lent records the host addresses (the one
-# store's on unified memory, the host tier's on a discrete device), which
-# the host read into and the convert reads in place (over the link on a
-# discrete device). `destination` is the layer's scratch tier, a view of the
-# scratch lender's bank records (slot e holds expert e). A negative `from`
-# names scratch slot -1 - from instead, one no pass reads until this round's
-# converts are done, which the host read the stored bytes into at the slot's
-# base (where the host addresses the scratch: on unified memory); the
-# natives read it there as they read a conveyor record. This body states
-# the conveyor's case only: a slot holds the stored form in bytes its view
-# types as the resident one. A list written for another step converts
-# nothing.
-fn routed_convert[V, L, S, N, K](
-    conveyor: &tensor[V, N, K] ST, list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &tensor[STEP_WORDS] i32,
-    destination: &mut tensor[S, N, K] U, grid: &tensor[3] i32)
-    where V > 0:
-    if list[LIST_SEQUENCE] == step[STEP_LOW]:
-        for entry in 0..L:
-            let from = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_FROM]
-            let to = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
-            if entry < list[LIST_COUNT] and from >= 0:
-                destination[to, :, :] = repack[U = U](conveyor[from, :, :])
 
 
 # A prompt group's seeding commit, after the scratch tier's last round and

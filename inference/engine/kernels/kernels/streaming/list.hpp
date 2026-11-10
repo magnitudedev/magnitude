@@ -2,8 +2,8 @@
 // count words, then each entry's from and to words, LIST_* in
 // streaming_words.seismic), over the backend's shim (streaming/contract.hpp):
 // their count, their entries' items and the grid a copy of them launches on,
-// shared by `routed_copy`, `routed_move` (streaming/list_copy.hpp),
-// `routed_convert` and `routed_list_grid`.
+// shared by `routed_copy`, `routed_move` (streaming/list_copy.hpp) and
+// `routed_list_grid`.
 //
 // A list lies in host-shared memory, where each read is a round trip over
 // the link and small reads hardly overlap, so a group reads a list in as few

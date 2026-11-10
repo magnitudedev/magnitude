@@ -40,7 +40,7 @@ pub enum BankPart {
     Tier { kind: RoutedTensor },
     /// The layer's tables of the exchange (streaming_words.seismic): its
     /// file kind's (`file`, the decode route's requests of the experts
-    /// neither the bank nor the tier holds, `routed_tier_wait`'s wait) and
+    /// neither the bank nor the tier holds, `routed_land`'s slot) and
     /// its scratch kind's (`scratch`, a scratch-served step's request and
     /// rounds), each a slot for each step in flight (`RegionWords::file`,
     /// `RegionWords::scratch`).
@@ -54,7 +54,7 @@ pub enum BankPart {
     /// The layer's policy words (`POLICY_WORDS`), the host's between
     /// flights (the watcher's `publish_policy`): its POLICY_WHOLE word,
     /// nonzero while the layer's group is whole (nothing misses there, so
-    /// its tier wait and the hints of it are not encoded, and its route is
+    /// its landing launch and the hints of it are not encoded, and its route is
     /// the whole form: the resident route and its routing record,
     /// `routed_route_whole`, `routed_select_whole`); its home; and the
     /// lines the route's assignment reads (`streaming_words.seismic`'s
@@ -75,36 +75,34 @@ pub enum BankPart {
     /// device committed in it (`routed_seed_commit`).
     Commits,
     /// The conveyor of routed tensor `kind` in the layer's stored form: its
-    /// records, a view of the lender's (`ConveyorCarrier`), which
-    /// `routed_convert` names.
+    /// records, a view of the lender's (`ConveyorCarrier`), which a scratch
+    /// round's landing launch (`routed_round`) converts from.
     Conveyor { kind: RoutedTensor },
     /// The staging pool of routed tensor `kind`, the layer's stored form's,
-    /// which a decode barrier's convert reads where the device lands a miss
-    /// (`experts::landing`); and that convert's list of the layer (each
-    /// (staging record, bank record)) and grids (`[1, ROUND_GRIDS, 3]`), both
-    /// the host's, written before it answers the barrier. Only where the
-    /// host places, a landing's record then the device's own bank, but for
-    /// the list, which every tier wait declares.
+    /// which the layer's decode landing launch (`routed_land`) converts
+    /// from where the host places, a miss's record then the bank's own
+    /// (`experts::landing`); and that launch's landing list
+    /// (`streaming_words.seismic`'s, its entries each (staging record, bank
+    /// record, DONE)), which the host appends to as each record's read
+    /// lands, while the launch runs. Staging only where the host places;
+    /// the list for every layer, which every landing launch declares.
     Staging { kind: RoutedTensor },
     LandingList,
-    LandingGrids,
     /// The scratch tier's view of routed tensor `kind` in the layer's form:
     /// slot `e` holding expert `e`, a view of the scratch the lender lends
     /// every prompt group ([`ScratchPlan`]), which the rounds convert cold
     /// experts into and the pass reads them from.
     Scratch { kind: RoutedTensor },
-    /// A chain place's scratch flags, scratch round `round`'s convert list,
-    /// the tier list (a step's experts the host tier keeps whole, each
+    /// A chain place's scratch flags, scratch round `round`'s landing list
+    /// (its landing launch's, `routed_round`: each conveyed expert's
+    /// (conveyor record or scratch slot, scratch slot), appended as its read
+    /// lands), the tier list (a step's experts the host tier keeps whole, each
     /// (tier record, scratch slot): its tier copy after round 0) and the
     /// seed list (a prompt group's last step beside a host tier: its seeds'
     /// copy from their scratch slots into their bank records, then commit),
     /// the last two each layer's own.
     ScratchFlags,
-    ConvertList { round: u8 },
-    /// A round's convert list staged into device memory
-    /// (`routed_list_stage`), which its converts read; one for every round
-    /// in turn.
-    ConvertStaged,
+    RoundList { round: u8 },
     TierList,
     SeedList,
     /// The launch grid a scratch request's round 0 writes of the tier list
@@ -118,8 +116,8 @@ pub enum BankPart {
     SeedGrid,
     SeedStaged,
     /// The round grids a scratch request's round 0 writes
-    /// (`routed_scratch_grids`), which its later rounds' parks and every
-    /// round's converts dispatch on.
+    /// (`routed_scratch_grids`), each round's park grid, which its later
+    /// rounds' landing launches dispatch on.
     ScratchGrids,
     /// The layer's group reads: of each record of a group in flight
     /// (`FlightDepth::groups`) and each chain place, the choices of
@@ -173,11 +171,9 @@ impl BankPart {
             | Self::Conveyor { .. }
             | Self::Staging { .. }
             | Self::LandingList
-            | Self::LandingGrids
             | Self::Scratch { .. }
             | Self::ScratchFlags
-            | Self::ConvertList { .. }
-            | Self::ConvertStaged
+            | Self::RoundList { .. }
             | Self::TierList
             | Self::SeedList
             | Self::TierGrid
@@ -190,7 +186,7 @@ impl BankPart {
         let records = RoutedTensor::ALL.into_iter().flat_map(|kind| {
             [Self::Tier { kind }, Self::Conveyor { kind }, Self::Staging { kind }, Self::Scratch { kind }]
         });
-        let rounds = (0..=u8::MAX).take_while(move |&round| u64::from(round) < rounds).map(|round| Self::ConvertList { round });
+        let rounds = (0..=u8::MAX).take_while(move |&round| u64::from(round) < rounds).map(|round| Self::RoundList { round });
         [
             Self::Step,
             Self::Resident,
@@ -207,9 +203,7 @@ impl BankPart {
             Self::SiteOutput,
             Self::Commits,
             Self::LandingList,
-            Self::LandingGrids,
             Self::ScratchFlags,
-            Self::ConvertStaged,
             Self::TierList,
             Self::SeedList,
             Self::TierGrid,
@@ -357,10 +351,35 @@ pub enum HostTier {
     Linked(seismic::Reservation),
     /// Unified memory (Metal's, an integrated CUDA device's such as
     /// GB10's): device storage is host RAM, so the bank is the one store.
-    /// The host lands every file miss straight into a bank record, which
-    /// the device reads at the bank's own bandwidth, and places it by the
-    /// map write alone; there is no tier, and the device places nothing.
-    Unified,
+    /// Every file miss lands straight into a bank record, which the device
+    /// reads at the bank's own bandwidth, placed by the map write alone:
+    /// the host reads it into staging and the device's landing launch
+    /// converts it in place (`experts::landing`); there is no tier. Where
+    /// the device parks ([`Parking`]) sets how soon the host learns a
+    /// converted record's staging is free.
+    Unified(Parking),
+}
+
+/// Where the device waits for the host (`seismic::BackendName::parks_in_kernels`),
+/// and so when the host sees what a running submission stored: inside its
+/// kernels (Metal, CUDA), where host and device see each other's stores as
+/// they land; or at submission boundaries (Vulkan), where the device's
+/// stores are the host's only once its submission ends, past the park that
+/// waits on every entry of a landing (`ExpertBankPlan::demand_records`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parking {
+    InKernels,
+    AtBoundaries,
+}
+
+impl Parking {
+    /// Where `backend`'s device parks.
+    pub fn of(backend: seismic::BackendName) -> Self {
+        match backend.parks_in_kernels() {
+            true => Self::InKernels,
+            false => Self::AtBoundaries,
+        }
+    }
 }
 
 impl HostTier {
@@ -368,7 +387,7 @@ impl HostTier {
     pub const fn placer(self) -> Placer {
         match self {
             Self::Linked(_) => Placer::Tier,
-            Self::Unified => Placer::Bank,
+            Self::Unified(_) => Placer::Bank,
         }
     }
 
@@ -377,13 +396,13 @@ impl HostTier {
     pub const fn tier(self) -> Option<seismic::Reservation> {
         match self {
             Self::Linked(reservation) => Some(reservation),
-            Self::Unified => None,
+            Self::Unified(_) => None,
         }
     }
 
     /// The contract of `tier`'s records.
     pub const fn contract(self, tier: BankTier) -> seismic::ReservedContract {
-        tier.contract_where(matches!(self, Self::Unified))
+        tier.contract_where(matches!(self, Self::Unified(_)))
     }
 }
 
@@ -444,14 +463,11 @@ pub struct BankLayout<T> {
     pub host: Option<Vec<RecordTensors<T>>>,
 }
 
-/// The load's words: whether the group being encoded is resident, every
-/// scratch round's convert list, the tier and seed lists' grids and staged
-/// copies, and its scratch rounds' grids.
+/// The load's words: whether the group being encoded is resident, the tier
+/// and seed lists' grids and staged copies, and its scratch rounds' grids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadAllocations<T> {
     pub resident: T,
-    pub lists: Vec<T>,
-    pub convert_staged: T,
     pub tier_grid: T,
     pub tier_staged: T,
     pub seed_grid: T,
@@ -535,23 +551,17 @@ pub struct LayerAllocations<T> {
     /// The CPU site's words and buffers, where the layer has a CPU site
     /// (`ExpertBankPlan::sited`).
     pub sited: Option<SiteAllocations<T>>,
-    /// A decode barrier's convert's list, the wait's declaration where the
-    /// device places, and grids, where the host places
-    /// (`BankPart::LandingList`, `BankPart::LandingGrids`).
-    pub landing: LandingAllocations<T>,
+    /// Its decode landing launch's landing list (`BankPart::LandingList`),
+    /// and each scratch round's (`BankPart::RoundList`): the layer's own, so
+    /// a step's round at the next layer, which launches before the host
+    /// appends for it there, finds no entry of this layer's under its head.
+    pub landing: T,
+    pub rounds: Vec<T>,
     /// Its scratch request's tier and seed lists (`BankPart::TierList`,
     /// `SeedList`): each layer's own, so a list a step's copy at the layer
     /// launches on was written for the layer.
     pub tiered: T,
     pub seeds: T,
-}
-
-/// A layer's CPU site table, rows and outputs (`BankPart::SiteTable`,
-/// `SiteRows`, `SiteOutput`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LandingAllocations<T> {
-    pub list: T,
-    pub grids: Option<T>,
 }
 
 /// A streamed layer's CPU site's words and buffers.
@@ -588,8 +598,6 @@ impl<T> BankLayout<T> {
             load:
                 LoadAllocations {
                     resident,
-                    lists,
-                    convert_staged,
                     tier_grid,
                     tier_staged,
                     seed_grid,
@@ -602,9 +610,7 @@ impl<T> BankLayout<T> {
             host,
         } = self;
         let mut owned = vec![("load: resident words", resident)];
-        owned.extend(lists.iter().map(|list| ("load: copy lists", list)));
         owned.extend([
-            ("load: convert staged list", convert_staged),
             ("load: tier grid", tier_grid),
             ("load: tier staged list", tier_staged),
             ("load: seed grid", seed_grid),
@@ -615,7 +621,7 @@ impl<T> BankLayout<T> {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
             owned.extend([("group: map", map), ("group: commits", commits), ("group: moves", moves)]);
         }
-        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, tiered, seeds } in layers {
+        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, rounds, tiered, seeds } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
             owned.extend(tier.iter().map(|tier| ("layer: tier words", tier)));
             owned.extend([
@@ -626,7 +632,8 @@ impl<T> BankLayout<T> {
                 ("layer: policy", policy),
             ]);
             owned.extend(sited.iter().flat_map(SiteAllocations::iter).map(|site| ("layer: CPU site", site)));
-            owned.extend(std::iter::once(&landing.list).chain(&landing.grids).map(|words| ("layer: landing convert", words)));
+            owned.push(("layer: landing list", landing));
+            owned.extend(rounds.iter().map(|list| ("layer: round landing lists", list)));
             owned.extend([("layer: tier list", tiered), ("layer: seeds", seeds)]);
         }
         owned.extend(staging.iter().map(|pool| ("staging", pool)));
@@ -648,8 +655,6 @@ impl<T> BankLayout<T> {
         let load = &self.load;
         let load = LoadAllocations {
             resident: make(&load.resident)?,
-            lists: load.lists.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
-            convert_staged: make(&load.convert_staged)?,
             tier_grid: make(&load.tier_grid)?,
             tier_staged: make(&load.tier_staged)?,
             seed_grid: make(&load.seed_grid)?,
@@ -676,7 +681,8 @@ impl<T> BankLayout<T> {
                 routing: make(&layer.routing)?,
                 policy: make(&layer.policy)?,
                 sited: layer.sited.as_ref().map(|sited| sited.try_map(&mut make)).transpose()?,
-                landing: LandingAllocations { list: make(&layer.landing.list)?, grids: layer.landing.grids.as_ref().map(&mut make).transpose()? },
+                landing: make(&layer.landing)?,
+                rounds: layer.rounds.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
                 tiered: make(&layer.tiered)?,
                 seeds: make(&layer.seeds)?,
             });
@@ -737,7 +743,7 @@ impl ExpertBankPlan {
 
     /// [`Self::shape_of`], none of a part the layer does not hold: a host
     /// tier's of a bank without one, a CPU site's of a layer without one,
-    /// a landing's where the device places, a convert list past its rounds,
+    /// staging where the device places, a round's landing list past its rounds,
     /// a record part of a kind its record lacks.
     fn held_shape(
         &self,
@@ -777,34 +783,31 @@ impl ExpertBankPlan {
                 let record = binding()?.record;
                 Ok(record
                     .get(kind)
-                    .map(|tensor| (tensor.resident, vec![self.host_extent(self.layers()[layer].group), tensor.matrix[0], tensor.matrix[1]])))
+                    .map(|tensor| tensor.resident_tensor(self.host_extent(self.layers()[layer].group)))
+                    .map(|(element, extents)| (element, extents.to_vec())))
             }
             BankPart::Resident => words(1),
             BankPart::Policy => words(constants::POLICY_WORDS),
             BankPart::Commits => words(binding()?.records),
             BankPart::Conveyor { kind } => {
                 let binding = binding()?;
-                Ok(binding.record.get(kind).map(|tensor| (tensor.source, vec![binding.conveyor, tensor.matrix[0], tensor.matrix[1]])))
+                Ok(binding.record.get(kind).map(|tensor| tensor.stored_tensor(binding.conveyor)).map(|(element, extents)| (element, extents.to_vec())))
             }
             BankPart::Scratch { kind } => {
                 let binding = binding()?;
-                Ok(binding.record.get(kind).map(|tensor| (tensor.resident, vec![binding.experts, tensor.matrix[0], tensor.matrix[1]])))
+                Ok(binding.record.get(kind).map(|tensor| tensor.resident_tensor(binding.experts)).map(|(element, extents)| (element, extents.to_vec())))
             }
-            BankPart::Staging { .. } | BankPart::LandingGrids if self.placer() != Placer::Bank => Ok(None),
+            BankPart::Staging { .. } if self.placer() != Placer::Bank => Ok(None),
             BankPart::Staging { kind } => {
                 let binding = binding()?;
-                Ok(binding.record.get(kind).map(|tensor| (tensor.source, vec![binding.staging, tensor.matrix[0], tensor.matrix[1]])))
+                Ok(binding.record.get(kind).map(|tensor| tensor.stored_tensor(binding.staging)).map(|(element, extents)| (element, extents.to_vec())))
             }
-            BankPart::LandingList => words(list_extent(self.choices())),
-            BankPart::LandingGrids => Ok(Some((Element::i32(), vec![1, constants::ROUND_GRIDS, 3]))),
-            BankPart::ConvertList { round } if u64::from(round) < self.rounds() => {
-                words(self.list_words())
-            }
-            BankPart::ConvertList { .. } => Ok(None),
-            BankPart::ConvertStaged => words(self.list_words()),
+            BankPart::LandingList => words(magnitude_kernels::landing_extent(self.choices())),
+            BankPart::RoundList { round } if u64::from(round) < self.rounds() => words(self.round_list_words()),
+            BankPart::RoundList { .. } => Ok(None),
             BankPart::TierList | BankPart::SeedList | BankPart::TierStaged | BankPart::SeedStaged => words(self.expert_list_words()),
             BankPart::TierGrid | BankPart::SeedGrid => words(3),
-            BankPart::ScratchGrids => Ok(Some((Element::i32(), vec![self.rounds(), constants::ROUND_GRIDS, 3]))),
+            BankPart::ScratchGrids => Ok(Some((Element::i32(), vec![self.rounds(), 3]))),
         }
     }
 
@@ -896,10 +899,13 @@ impl ExpertBankPlan {
                             })
                         })
                         .transpose()?,
-                    landing: LandingAllocations {
-                        list: words(index, BankPart::LandingList)?,
-                        grids: (self.placer() == Placer::Bank).then(|| words(index, BankPart::LandingGrids)).transpose()?,
-                    },
+                    landing: words(index, BankPart::LandingList)?,
+                    rounds: (0..self.rounds())
+                        .map(|round| {
+                            let round = u8::try_from(round).map_err(|_| "scratch rounds exceed u8")?;
+                            words(index, BankPart::RoundList { round })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
                     tiered: words(index, BankPart::TierList)?,
                     seeds: words(index, BankPart::SeedList)?,
                 })
@@ -907,13 +913,6 @@ impl ExpertBankPlan {
             .collect::<Result<Vec<_>, String>>()?;
         let load = LoadAllocations {
             resident: words(0, BankPart::Resident)?,
-            lists: (0..self.rounds())
-                .map(|round| {
-                    let round = u8::try_from(round).map_err(|_| "scratch rounds exceed u8")?;
-                    words(0, BankPart::ConvertList { round })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-            convert_staged: device(0, BankPart::ConvertStaged)?,
             tier_grid: device(0, BankPart::TierGrid)?,
             tier_staged: device(0, BankPart::TierStaged)?,
             seed_grid: device(0, BankPart::SeedGrid)?,

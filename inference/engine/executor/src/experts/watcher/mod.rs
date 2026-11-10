@@ -18,9 +18,9 @@
 //!   record of the layer's group (`experts::landing`): revived from
 //!   staging, by its hint's read, or read now into staging, the landing
 //!   converting it as its read ends, mapping it, and answering each choice
-//!   that named it, all without waiting for a read. The tier wait waits for
-//!   each choice's answer (`parks`) and sources it from the tier
-//!   (`routed_tier_wait`). The tier keeps a reserve of ready records,
+//!   that named it, all without waiting for a read. The landing launch
+//!   waits for each choice's answer (`parks`) and sources it from the tier
+//!   (`routed_land`). The tier keeps a reserve of ready records,
 //!   unmapping its least valuable kept ones ahead of need, each reused only
 //!   once every step that could have resolved it has retired.
 //! - A scratch request (`routed_scratch_request`) flags the experts a
@@ -131,7 +131,7 @@ use promotions::Promotions;
 use requests::Requests;
 use residency::Residency;
 use resize::{Joins, ResizeHandoff};
-use scratch::{Scratch, ScratchWords, conveyor_forms};
+use scratch::{Scratch, conveyor_forms};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -402,23 +402,9 @@ impl Shared {
         self.telemetry.group_size(self.priced().as_deref(), self.notice(), capacity)
     }
 
-    /// Each bank group's convert in a decode barrier takes its `lines` from
-    /// now on.
+    /// Each bank group's device convert takes its `lines` from now on.
     pub(in crate::experts) fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
         self.telemetry.device_convert(lines);
-    }
-
-    /// Measure the host's landings at a line of two counts each, each read
-    /// held back 2 ms: beside a device convert line far under it
-    /// (`ExpertMeasures::convert`), every miss is priced to land on the
-    /// device.
-    #[cfg(test)]
-    pub(in crate::experts) fn slow_host_landing(&self) {
-        for layer in 0..self.telemetry.landing_lines().len() {
-            self.telemetry.landings_ended(layer, 1, 1.);
-            self.telemetry.landings_ended(layer, 2, 2.);
-        }
-        self.landings.held_ms.store(2, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The landings the device has converted.
@@ -586,7 +572,7 @@ impl Watcher {
         let homes = (0..layers.len())
             .map(|layer| i32::try_from(directory.home(layer)).map_err(|_| "a layer's map words exceed i32".to_owned()))
             .collect::<Result<Vec<_>, _>>()?;
-        let LoadWords { flags, lists } = load;
+        let LoadWords { flags } = load;
         let count = layers.len();
         let core = Core {
             table: Arc::new(ReadTable::new(source, pools, &layers)),
@@ -681,7 +667,7 @@ impl Watcher {
             prefetch: Prefetch::new(staging, count),
             scratch: Scratch::new(
                 count,
-                ScratchWords { flags, lists },
+                flags,
                 Conveyor::new(form_of, &experts, carrier),
             ),
             promotions: Promotions::new(),

@@ -17,6 +17,24 @@ fn a_scratch_request_reads_hits_in_place_and_converts_the_rest_round_by_round() 
     step.complete().unwrap();
 }
 
+/// Each layer's rounds append to landing lists of their own, each entry
+/// as its expert is held whole: a step's rounds at the next layer, which
+/// it reaches before the host appends for it there, find none of this
+/// layer's entries under the step's head, and every entry names the
+/// conveyor record holding its expert whole.
+#[test]
+fn each_layers_rounds_list_their_own_entries() {
+    let harness = lending("round-lists", EXPERTS, 4, 2, STAGING, Conveying::of(EXPERTS as u64), TIER, Placer::Tier, false);
+    let step = harness.prompt_step();
+    let first = harness.scratch(&step, 0, &[0, 1, 2]);
+    assert_eq!(harness.from_conveyor(&first.concat()), [0, 1, 2]);
+    assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1], "rounds of two records");
+    assert_eq!(harness.round_listed(&step, 1, 0), [], "layer 1's list holds none of layer 0's entries");
+    let second = harness.scratch(&step, 1, &[3, 4]);
+    assert_eq!(harness.from_conveyor(&second.concat()), [3, 4]);
+    step.complete().unwrap();
+}
+
 /// A request's cold experts are read into conveyor records as it is
 /// published: every round lists conveyor records holding its experts
 /// whole, staging is never written, and a conveyor of a round's records
@@ -28,9 +46,7 @@ fn a_conveyors_records_cycle_as_rounds_convert() {
         let step = harness.prompt_step();
         let cold = [0, 1, 2, 3, 4, 5, 6];
         harness.publish(&step, 0, &cold);
-        let sequence = low_word(step.sequence());
         let scratch = &harness.layer.2;
-        let (_, lists) = &harness.load;
         let (mut converted, mut rounds, mut index) = (Vec::new(), 1, 0);
         while index < rounds {
             scratch.request(step.sequence(), round(index));
@@ -40,10 +56,8 @@ fn a_conveyors_records_cycle_as_rounds_convert() {
                     .div_ceil(ROUND_RECORDS);
             }
             // Until the device arrives at the next round, this round's
-            // records hold what its convert reads.
-            let list = &lists[index as usize];
-            assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
-            converted.extend(harness.from_conveyor(&listed(list)));
+            // records hold what its landing launch converts.
+            converted.extend(harness.from_conveyor(&harness.round_listed(&step, 0, index)));
             index += 1;
         }
         assert_eq!(rounds, (cold.len() as u64).div_ceil(ROUND_RECORDS));
@@ -246,7 +260,7 @@ fn a_groups_requests_of_a_layer_are_served_in_order_once_their_rounds_arrive() {
     let steps = harness.group(&[StepRoute::Grouped; 2]);
     let scratch = &harness.layer.2;
     for expert in 0..EXPERTS {
-        harness.load.0.store(expert, i32::from(expert < 2));
+        harness.flags.store(expert, i32::from(expert < 2));
         harness.second.store(expert, i32::from((1..3).contains(&expert)));
     }
     for step in &steps {

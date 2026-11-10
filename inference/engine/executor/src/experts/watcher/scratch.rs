@@ -10,7 +10,9 @@
 //! expert `e`, which the pass reads it from (`routed_experts`' `expert_*`).
 //! Each request is served once its first round arrives: once the group holds
 //! every record the scratch lies in, then converted round by round, each
-//! round once the experts it lists are held whole in the conveyor. A group runs as a wavefront: a step's front at a layer follows
+//! expert of a round appended to the round's landing list as it is held
+//! whole in the conveyor, which the round's launch (`routed_round`)
+//! converts while the rest are read. A group runs as a wavefront: a step's front at a layer follows
 //! its back at the layer before, so a layer's requests are taken while the
 //! layer before is served, and every one before the layer's first round.
 //!
@@ -198,14 +200,6 @@ fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: us
     composed
 }
 
-/// The load's scratch words: each chain place's flags and each scratch
-/// round's convert list. A layer's tier and seed lists are its own
-/// (`Layer::tiered`, `Layer::seeds`).
-pub(super) struct ScratchWords {
-    pub(super) flags: Vec<Words>,
-    pub(super) lists: Vec<Words>,
-}
-
 /// Each layer's conveyor form, of layers whose routed tensors read the
 /// pools `layers` names (of `pools`): the class of layers sharing a pool
 /// with it, directly or through others. Record `e` of a pool holds one
@@ -263,7 +257,10 @@ pub(super) fn round_lane(round: u64) -> u64 {
 pub(super) struct Scratch {
     /// Per layer, the last request taken.
     published: Vec<Step>,
-    words: ScratchWords,
+    /// Each chain place's scratch flags. A layer's round landing lists and
+    /// its tier and seed lists are its own (`Layer::rounds`,
+    /// `Layer::tiered`, `Layer::seeds`).
+    flags: Vec<Words>,
     /// The tiers of the layers a group's requests were taken at and the
     /// device is not yet past: the layer served and the next, at most.
     tiers: Vec<Tier>,
@@ -346,6 +343,9 @@ struct Rounds {
     tiered: Vec<usize>,
     rounds: u64,
     round: u64,
+    /// The experts of round `round` appended to its landing list so far,
+    /// in landing order.
+    appended: Vec<usize>,
     waited: Instant,
     served: RequestCost,
     took: GroupLayer,
@@ -354,10 +354,10 @@ struct Rounds {
 }
 
 impl Scratch {
-    pub(super) fn new(layers: usize, words: ScratchWords, conveyor: Conveyor) -> Self {
+    pub(super) fn new(layers: usize, flags: Vec<Words>, conveyor: Conveyor) -> Self {
         Self {
             published: vec![0; layers],
-            words,
+            flags,
             tiers: Vec::new(),
             held: Vec::new(),
             conveyor,
@@ -367,7 +367,7 @@ impl Scratch {
     /// The bank holds `flags`, each place's, from now: between flights,
     /// every step retired, so no tier holds a request.
     pub(super) fn place(&mut self, flags: Vec<Words>) {
-        self.words.flags = flags;
+        self.flags = flags;
     }
 
     /// Layer `layer`'s earliest request published and not yet taken, at its
@@ -588,7 +588,7 @@ impl Scratch {
                     routed: vec![0; experts],
                     last: vec![0; experts],
                     taken: 0,
-                    requests: (0..self.words.flags.len()).map(|_| None).collect(),
+                    requests: (0..self.flags.len()).map(|_| None).collect(),
                     scratch: vec![false; experts],
                     deferred: Vec::new(),
                     reader: vec![None; experts],
@@ -600,7 +600,7 @@ impl Scratch {
         };
         let tier = &mut self.tiers[index];
         let flags = (0..experts)
-            .map(|expert| u32::try_from(self.words.flags[place].load(expert)).expect("a routed count"))
+            .map(|expert| u32::try_from(self.flags[place].load(expert)).expect("a routed count"))
             .collect::<Vec<_>>();
         let routed = (0..experts).filter(|&expert| flags[expert] > 0).collect::<Vec<_>>();
         let first = routed
@@ -1279,6 +1279,7 @@ impl Scratch {
             tiered,
             rounds,
             round: 0,
+            appended: Vec::new(),
             waited: Instant::now(),
             served: RequestCost::default(),
             took: GroupLayer::default(),
@@ -1287,15 +1288,16 @@ impl Scratch {
         }
     }
 
-    /// Serve `rounds` as far as their experts allow: each round, once every
-    /// expert it lists is held whole in its conveyor record, is listed and,
-    /// but for the last, answered (the last is answered once the request is
-    /// counted: its answer releases the device to complete the step). A
-    /// round's records free once the device arrives at the round after it,
-    /// past its convert. Whether the rounds
-    /// are over: every one served, or the request failed (an expert's read
-    /// failed, or its step ended without the device arriving, a device
-    /// error).
+    /// Serve `rounds` as far as their experts allow: each expert of a
+    /// round, once held whole in its conveyor record, is appended to the
+    /// round's landing list, in landing order, which its round's launch
+    /// (`routed_round`) converts as the head counts it, and the round, but
+    /// for the last, is answered after its last entry (the last is answered
+    /// once the request is counted: its answer releases the device to
+    /// complete the step). A round's records free once the device arrives
+    /// at the round after it, past its launch. Whether the rounds are over:
+    /// every one served, or the request failed (an expert's read failed, or
+    /// its step ended without the device arriving, a device error).
     fn round(&mut self, at: At, rounds: &mut Rounds, core: &mut Core, prefetch: &mut Prefetch, shared: &Shared) -> bool {
         let Point { group, layer, sequence, .. } = at.point;
         let round_records = core.extents.round_records;
@@ -1314,44 +1316,40 @@ impl Scratch {
             prefetch.settle(&mut core.directory);
             self.convey(core, shared);
             let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
-            let failed = tier.failed.iter().find(|(expert, _)| chunk.contains(expert)).map(|(_, reason)| reason.clone());
-            if let Some(reason) = failed {
-                rounds.failure = Some(reason);
-            } else if !self.reclaim_slots(&chunk) || !chunk.iter().all(|&expert| self.conveyor.whole(layer, expert)) {
-                // A step that ended without the device arriving (a device
-                // error) leaves nothing to arrive.
-                if !shared.steps.ended(sequence) {
-                    return false;
-                }
-                rounds.failure = Some(format!(
-                    "step {sequence} ended before scratch round {round} of layer {layer}: the step ended, the round waiting for experts {chunk:?}"
-                ));
-            }
-            rounds.served.read += rounds.waited.elapsed();
-            if rounds.failure.is_some() {
+            if let Some((_, reason)) = tier.failed.iter().find(|(expert, _)| chunk.contains(expert)) {
+                rounds.failure = Some(reason.clone());
                 break;
             }
-            let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
             assert!(chunk.iter().all(|&expert| tier.scratch[expert]), "a listed expert holds its scratch slot");
-            let pairs = chunk
-                .iter()
-                .map(|&expert| {
-                    let record = self.conveyor.list(layer, expert);
-                    (self.conveyor.listed_from(record), expert as i32)
-                })
-                .collect::<Vec<_>>();
-            // Its records free as the device arrives at the round after
-            // (parked there by `routed_scratch_grids`), whose lane its
-            // slot has unless this is the slot's last.
-            core.taken.push(Taken {
-                records: chunk.iter().map(|&expert| Listed { layer, expert }).collect(),
-                until: at.point,
-                after: (round + 1 < core.extents.words.rounds).then(|| round_lane(round + 1)),
-            });
-            let experts = core.layers[layer].experts as u64;
-            let lent = if core.layers[layer].slots.is_some() { experts } else { 0 };
-            let conveyed = ListBounds { from: core.layers[layer].lists.conveyor, to: experts, lent };
-            self.words.lists[round as usize].publish_list(sequence, &pairs, conveyed);
+            // A slot carrying a borrower's stored bytes is reclaimed before
+            // the round's first entry, which may convert into it; once one
+            // is appended, its borrowers are listed, at an earlier round.
+            if rounds.appended.is_empty() && !self.reclaim_slots(&chunk) {
+                return self.unfinished(at, rounds, &chunk, shared);
+            }
+            for &expert in &chunk {
+                if rounds.appended.contains(&expert) || !self.conveyor.whole(layer, expert) {
+                    continue;
+                }
+                let record = self.conveyor.list(layer, expert);
+                let from = self.conveyor.listed_from(record);
+                core.layers[layer].rounds[round as usize]
+                    .append(sequence, from, expert as i32)
+                    .expect("a round's landing list lists no later step while the step's rounds are served");
+                rounds.appended.push(expert);
+                // Its record frees as the device arrives at the round after
+                // (parked there by `routed_scratch_grids`), whose lane its
+                // slot has unless this is the slot's last.
+                core.taken.push(Taken {
+                    records: vec![Listed { layer, expert }],
+                    until: at.point,
+                    after: (round + 1 < core.extents.words.rounds).then(|| round_lane(round + 1)),
+                });
+            }
+            if rounds.appended.len() < chunk.len() {
+                return self.unfinished(at, rounds, &chunk, shared);
+            }
+            rounds.served.read += rounds.waited.elapsed();
             rounds.served.misses += chunk.len() as u64;
             // A prompt group's experts are its own reads, none a hint's.
             rounds.served.anticipated[Anticipation::Demand as usize] += chunk.len() as u64;
@@ -1362,8 +1360,26 @@ impl Scratch {
                 shared.parks.settle();
             }
             rounds.round += 1;
+            rounds.appended.clear();
             rounds.waited = Instant::now();
         }
+        true
+    }
+
+    /// Round `rounds.round` waits for experts of `chunk` still reading (or
+    /// for the slots they convert into): not over, unless its step ended
+    /// without the device arriving (a device error), which leaves nothing
+    /// to arrive and fails the request.
+    fn unfinished(&self, at: At, rounds: &mut Rounds, chunk: &[usize], shared: &Shared) -> bool {
+        let Point { layer, sequence, .. } = at.point;
+        if !shared.steps.ended(sequence) {
+            return false;
+        }
+        rounds.served.read += rounds.waited.elapsed();
+        rounds.failure = Some(format!(
+            "step {sequence} ended before scratch round {} of layer {layer}: the step ended, the round waiting for experts {chunk:?}",
+            rounds.round
+        ));
         true
     }
 

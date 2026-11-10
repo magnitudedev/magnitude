@@ -17,7 +17,10 @@ fn the_next_layers_experts_borrow_no_slot_the_served_layer_converts() {
     harness.publish(&steps[1], 0, &[2]);
     // Slot 2 converts only at step 1, after step 0's experts.
     let first = harness.rounds_checked(&steps[0], 0).concat();
-    assert_eq!(Harness::from_slots(&first), [(0, 2), (1, 3)]);
+    // Each expert's round follows its read's landing, in no set order.
+    let mut lent = Harness::from_slots(&first);
+    lent.sort_unstable();
+    assert_eq!(lent, [(0, 2), (1, 3)]);
     harness.publish(&steps[0], 1, &[4, 5]);
     assert_eq!(Harness::experts(&harness.rounds_checked(&steps[1], 0).concat()), [2]);
     harness.publish(&steps[1], 1, &[]);

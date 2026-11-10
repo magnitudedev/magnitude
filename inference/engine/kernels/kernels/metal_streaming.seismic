@@ -146,18 +146,25 @@ native routed_output_sited for metal from "metal/routed_output_sited.metal":
         threadgroups (ceil_div(H, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Metal: one threadgroup, its first thread waiting on the step's slot, then
-# its threads writing each absent choice's sources
-# (`streaming/tier_wait.hpp`). It dispatches the route's grid: none when
-# every choice is held, so the slot is this step's request whenever it
-# runs.
-native routed_tier_wait for metal from "metal/routed_tier_wait.metal":
+# Metal: the landing launch (`streaming/land.hpp` over the window library,
+# `lib/streaming/window.h`, `metal/lib/streaming/land.h`): where the bank
+# places (V > 0), LAND_GROUPS threadgroups claiming (entry, item) work in
+# landing order, each item one window of a row tile of one routed tensor
+# (or a dense record's row), thread 0 awaiting the entry it claimed, one
+# threadgroup at a time polling the host's count (`streaming_land_poll`);
+# threadgroup 0 then writes each absent choice's sources
+# (`streaming/tier_wait.hpp`). Where the tier places, one threadgroup only
+# sources. Every threadgroup that sees no request returns at its first
+# look.
+native routed_land for metal from "metal/routed_land.metal":
     static (K)
-    launch routed_tier_wait:
-        threadgroups (1, 1, 1)
-        grid (grid)
+    records (staging_gate, staging_up, staging_down, gate, up, down)
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_land:
+        threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
         unless (policy[POLICY_RESOLVED])
-        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (WINDOW_BYTES)
 
 native routed_step for metal from "metal/routed_step.metal":
     launch routed_step:
@@ -172,16 +179,18 @@ native routed_scratch_request for metal from "metal/routed_scratch_request.metal
         unless (resident)
         threads_per_threadgroup (REQUEST_THREADS, 1, 1)
 
-# A round parks only while it, or unfollowed the round before, has records
-# to convert:
-# round 0 always (hit against cold is final only as the request is served),
-# a later round on its park grid (`routed_scratch_grids`), as its converts
-# convert only on theirs.
-native routed_scratch_wait for metal from "metal/routed_scratch_wait.metal":
-    launch routed_scratch_wait:
-        threadgroups (1, 1, 1)
+# Metal: a round's landing launch on its park grid (`routed_scratch_grids`:
+# LAND_GROUPS threadgroups while it, or unfollowed the round before, has
+# records; round 0's always), each threadgroup's thread 0 storing the
+# round's arrival, then claiming as `routed_land`'s.
+native routed_round for metal from "metal/routed_round.metal":
+    records (conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_round:
+        threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
-        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (WINDOW_BYTES)
 
 native routed_scratch_grids for metal from "metal/routed_scratch_grids.metal":
     launch routed_scratch_grids:
@@ -190,11 +199,6 @@ native routed_scratch_grids for metal from "metal/routed_scratch_grids.metal":
 
 native routed_list_grid for metal from "metal/routed_list_grid.metal":
     launch routed_list_grid:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (LIST_THREADS, 1, 1)
-
-native routed_list_stage for metal from "metal/routed_list_stage.metal":
-    launch routed_list_stage:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
@@ -220,18 +224,6 @@ native routed_move for metal from "metal/routed_move.metal":
     launch routed_move:
         threadgroups (LIST_GROUPS, LIST_ROWS, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
-
-# Metal: a threadgroup per row tile of each listed record (one window where
-# the tile's 16 rows fit WINDOW_BYTES, as the 35B's and V4.1's down rows
-# do), striding over the items of longer rows, on its round's grid
-# (`routed_scratch_grids`), converting through `lib/streaming/window.h`.
-native routed_convert for metal from "metal/routed_convert.metal":
-    records (conveyor, destination)
-    launch routed_convert:
-        threadgroups (ceil_div(N, CONVERT_TILE_ROWS), L, 1)
-        grid (grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (WINDOW_BYTES)
 
 # Metal: one threadgroup reads the list's count, then commits each listed
 # record after a system-scope fence (`streaming/seed.hpp`).

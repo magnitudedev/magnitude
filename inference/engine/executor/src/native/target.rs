@@ -76,25 +76,22 @@ pub(crate) enum BankRouteForm {
 }
 
 /// A streamed routed layer's bank entries (`operators::routed::streamed`):
-/// decode rows route, resolve and assign, then wait for the experts the
-/// host lands; larger rows set the step,
-/// request, and wait and convert a round at a time. `convert` and `seed`
-/// are per routed tensor of the record.
+/// decode rows route, resolve and assign, then land the experts the host
+/// reads (`land`, converting each into the bank as its read lands where the
+/// bank places); larger rows set the step, request, and land a round at a
+/// time (`round`, converting each conveyed record into the scratch as its
+/// read lands). `seed` is per routed tensor of the record.
 #[derive(Clone, Debug)]
 pub struct ExpertBankKernels {
     pub route: BankRouteKernels,
-    pub tier_wait: NativeKernel<magnitude_kernels::routed_tier_wait::Entry>,
+    pub land: NativeKernel<magnitude_kernels::routed_land::Entry>,
     pub step: NativeKernel<magnitude_kernels::routed_step::Entry>,
     pub scratch_request: NativeKernel<magnitude_kernels::routed_scratch_request::Entry>,
-    pub scratch_wait: NativeKernel<magnitude_kernels::routed_scratch_wait::Entry>,
+    pub round: NativeKernel<magnitude_kernels::routed_round::Entry>,
     pub scratch_grids: NativeKernel<magnitude_kernels::routed_scratch_grids::Entry>,
-    /// A round's convert list staged into device memory, which its converts
-    /// read.
-    pub list_stage: NativeKernel<magnitude_kernels::routed_list_stage::Entry>,
     /// A merge set's pass's map and step resolved into device memory,
     /// which its expert entries read.
     pub pass_map: NativeKernel<magnitude_kernels::routed_pass_map::Entry>,
-    pub convert: RecordTensors<NativeKernel<magnitude_kernels::routed_convert::Entry>>,
     /// The device's placements into the bank's records, whoever places
     /// (`BankBinding::placer`): a prompt group's seeds, copied from its
     /// scratch slots.
@@ -111,7 +108,7 @@ pub struct ExpertBankKernels {
 
 /// A streamed layer's CPU site entries (streaming_words.seismic's request
 /// and answer): its request (`routed_site_request`), after the route or its
-/// tier wait and before gate/up, and its combine in its routed form (the
+/// landing launch and before gate/up, and its combine in its routed form (the
 /// GPU's projections, then the sum waiting for the CPU's answer); and the
 /// form the site's pool computes in.
 #[derive(Clone, Debug)]
@@ -242,9 +239,8 @@ impl ExpertBankKernels {
         form: BankRouteForm,
     ) -> Result<bool, seismic::CheckedBundleError> {
         use magnitude_kernels::{
-            routed_convert, routed_copy, routed_list_grid, routed_list_stage, routed_move, routed_pass_map, routed_route_streamed,
-            routed_scratch_grids, routed_scratch_request, routed_scratch_wait, routed_seed_commit,
-            routed_select_streamed, routed_step, routed_tier_wait,
+            routed_copy, routed_land, routed_list_grid, routed_move, routed_pass_map, routed_round, routed_route_streamed,
+            routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_step,
         };
         type Declares = fn(seismic::BackendName) -> Result<bool, seismic::CheckedBundleError>;
         fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, seismic::CheckedBundleError> {
@@ -254,19 +250,17 @@ impl ExpertBankKernels {
             BankRouteForm::Fused => declares::<routed_route_streamed::Entry>,
             BankRouteForm::General => declares::<routed_select_streamed::Entry>,
         };
-        let bank: [Declares; 13] = [
+        let bank: [Declares; 11] = [
             route,
-            declares::<routed_tier_wait::Entry>,
+            declares::<routed_land::Entry>,
             declares::<routed_step::Entry>,
             declares::<routed_scratch_request::Entry>,
-            declares::<routed_scratch_wait::Entry>,
+            declares::<routed_round::Entry>,
             declares::<routed_scratch_grids::Entry>,
-            declares::<routed_convert::Entry>,
             declares::<routed_copy::Entry>,
             declares::<routed_seed_commit::Entry>,
             declares::<routed_move::Entry>,
             declares::<routed_list_grid::Entry>,
-            declares::<routed_list_stage::Entry>,
             declares::<routed_pass_map::Entry>,
         ];
         for declares in bank.iter() {

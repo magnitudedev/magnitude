@@ -11,7 +11,13 @@
 //   `STREAMING_DEVICE_READ` for device words; `STREAMING_AT(handle, index)`, the handle of word `index`
 //   past `handle`; `streaming_load(handle)` and `streaming_store(handle, v)`
 //   of a host-shared word, `streaming_device_load` and
-//   `streaming_device_store` of a device word.
+//   `streaming_device_store` of a device word, and
+//   `streaming_device_add(word, v)`, a relaxed device-scope atomic add of
+//   `v` to a device word, returning the word before it (a landing launch's
+//   counters, streaming/land.hpp), and `streaming_device_cas(word,
+//   expected, desired)`, a relaxed device-scope compare-and-swap, storing
+//   `desired` only where the word holds `expected` and returning the word
+//   before it (a landing launch's poll).
 // - Record tables: `STREAMING_RECORDS_READ` and `STREAMING_RECORDS`, the
 //   handles a record copy's source and destination records are addressed
 //   from (below).

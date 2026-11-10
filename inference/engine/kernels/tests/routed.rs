@@ -4,11 +4,10 @@
 mod common;
 
 use magnitude_kernels::{
-    SlotTable, constants, list_extent, routed_combine, routed_convert, routed_copy, routed_down, routed_expand,
-    routed_experts, routed_gate_up, routed_group, routed_list_grid, routed_move, routed_output, routed_pass_map, routed_route,
-    routed_route_shared, routed_scratch_grids, routed_scratch_request, routed_scratch_wait, routed_select,
-    routed_select_streamed, routed_step,
-    routed_tier_wait, routed_up,
+    SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
+    routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_move, routed_output,
+    routed_pass_map, routed_round, routed_route, routed_route_shared, routed_scratch_grids, routed_scratch_request,
+    routed_select, routed_select_streamed, routed_step, routed_up,
 };
 use seismic_lang::{
     checked::{CheckedModule, SourceFile},
@@ -4576,19 +4575,6 @@ fn shared_bytes(device: &seismic::Device, element: seismic::Element, shape: &[u6
     tensor
 }
 
-/// Storage a request's host serves from, bound as its host ports
-/// (routed.seismic's streaming requests): one f32 record of each routed
-/// tensor, `[1, 1, hidden]` (gate and up) or `[1, hidden, 1]` (down), or
-/// zero words of `shape`. No host runs here, so it stays as it was.
-fn host_records(device: &seismic::Device, hidden: u64) -> [seismic::Tensor; 3] {
-    let values = vec![0.0; hidden as usize];
-    [
-        f32_tensor(device, &[1, 1, hidden], &values),
-        f32_tensor(device, &[1, 1, hidden], &values),
-        f32_tensor(device, &[1, hidden, 1], &values),
-    ]
-}
-
 fn host_words(device: &seismic::Device, shape: &[u64]) -> seismic::Tensor {
     i32_tensor(device, shape, &vec![0; shape.iter().product::<u64>() as usize])
 }
@@ -4689,11 +4675,13 @@ impl StreamedKind {
     }
 
     /// DeepSeek V4.1's MXFP4 gate (and up, the same form) and down, at its
-    /// row bytes (160 packets of 17 bytes, 2720, and 72, 1224) over 133 and
-    /// 139 rows: nine row tiles each, the last partial.
+    /// shape: gate [F 2304, H 5120], rows of 160 packets of 17 bytes (2720),
+    /// and down [H 5120, F 2304], rows of 72 (1224). A landing converts an
+    /// entry's three tensors together, so their F and H are one record's.
     fn v41_mxfp4(device: &seismic::Device) -> [Self; 2] {
         let layout = resident_layout(device);
-        [[133, 160 * 32], [139, 72 * 32]].map(|matrix| Self {
+        let (h, f) = (160 * 32, 72 * 32);
+        [[f, h], [h, f]].map(|matrix| Self {
             source: seismic::Element::named("gguf_mxfp4").unwrap(),
             resident: element_in("mxfp4g32", layout),
             matrix,
@@ -4707,8 +4695,17 @@ impl StreamedKind {
     /// Expert `expert`'s stored matrix: pseudo-random whole packets brought
     /// into the conversion's domain, every byte below 0x78 so that no
     /// 16-bit float scale is infinite or NaN (a NaN row would make a ReLU²
-    /// product zero whatever its source).
+    /// product zero whatever its source); a dense BF16 matrix's values
+    /// finite, of both signs.
     fn stored(&self, expert: usize, kind: usize) -> Vec<u8> {
+        if self.source == seismic::Element::bf16() {
+            return (0..(self.matrix[0] * self.matrix[1]) as u32)
+                .flat_map(|index| {
+                    let x = index.wrapping_add(expert as u32 * 7919 + kind as u32 * 104_729).wrapping_mul(2_654_435_761);
+                    ((0x3c00 + (x >> 20) % 0x0700) as u16 | (((x >> 9) & 1) as u16) << 15).to_le_bytes()
+                })
+                .collect();
+        }
         let bytes = self.source.canonical_byte_len(&self.shape(1)).unwrap() as usize;
         let raw = (0..bytes as u32)
             .map(|index| {
@@ -4721,8 +4718,15 @@ impl StreamedKind {
         self.resident.repack_source(self.source, raw).unwrap()
     }
 
-    /// The resident import of a stored matrix.
+    /// The resident import of a stored matrix: a dense BF16 matrix's
+    /// bytes themselves, or each element widened to F32 (`import_dense`).
     fn import(&self, stored: &[u8]) -> Vec<u8> {
+        if self.source == seismic::Element::bf16() {
+            return match self.resident == self.source {
+                true => stored.to_vec(),
+                false => stored.chunks_exact(2).flat_map(|bits| (u32::from(u16::from_le_bytes([bits[0], bits[1]])) << 16).to_le_bytes()).collect(),
+            };
+        }
         self.resident
             .repack_host(self.source, &self.shape(1), stored)
             .unwrap()
@@ -5076,20 +5080,20 @@ fn a_scratch_request_counts_every_choice_of_every_row() {
 
 /// A scratch-served layer's step as serving encodes it: `routed_step` sets
 /// the step's sequence; `routed_scratch_request` publishes each expert's
-/// choice count and the sequence; round 0 parks until the host acknowledges
-/// it, having written the count of records the rounds convert and round 0's
-/// list; `routed_scratch_grids` then writes every round's grids, on which
-/// each round converts its listed conveyor records (`routed_convert`: gate
-/// records of F rows on the rows grid, down records of H
-/// rows on the columns grid) and each later round parks while it or the
-/// round before has records. Four records in rounds of two: round 1 parks
-/// and converts two, round 2 parks (its arrival, answered before the last
-/// round's, proves round 1's converts done) and converts none. Of round 1's,
+/// choice count and the sequence; round 0's landing launch arrives, and its
+/// host, having written the count of records the rounds convert, appends
+/// round 0's records to its landing list and answers it; `routed_scratch_grids`
+/// then writes every round's park grid, on which each later round launches
+/// while it or the round before has records, converting its records as the
+/// host appends them (`routed_round`, every routed tensor of the 35B's
+/// gated records). Four records in rounds of two: round 1 launches and
+/// converts two, round 2 launches (its arrival, answered before the last
+/// round's, proves round 1's records read) and converts none. Of round 1's,
 /// expert 3 converts from scratch slot 12, a slot no pass reads, which the
 /// host read its stored bytes into at the slot's base (its `from` -1 - 12).
 /// Every listed slot then holds its expert's import, byte for byte, slot 12
 /// the stored bytes read there, and every other none; a failed step's grids
-/// convert nothing.
+/// launch nothing.
 #[test]
 fn streaming_scratch_rounds_fill_the_scratch_bank() {
     let Some(device) = streaming_device() else {
@@ -5097,27 +5101,21 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     };
     let sequence = STREAMING_SEQUENCE;
     let (experts, rounds, round_records) = (16u64, 3u64, 2usize);
-    let [gate, _, down] = StreamedKind::qwen35b(&device);
-    let kinds = [gate, down];
+    let form = ServedForm::qwen35b(&device);
     // Conveyor records 0, 1 and 2 hold experts 9, 7 and 5, scratch slot 12
-    // expert 3's stored bytes; the rounds' (record, scratch slot) lists.
+    // expert 3's stored bytes; the rounds' (record, scratch slot) entries.
     let conveyed = [9usize, 7, 5];
     let (lent_slot, lent_expert) = (12usize, 3usize);
     let lists = [vec![(1, 7), (2, 5)], vec![(0, 9), (-1 - lent_slot as i32, lent_expert as i32)]];
     let records = lists.iter().map(Vec::len).sum::<usize>();
-    // Each kind's imports, conveyor, scratch bank and lent slot's bytes.
-    let mut tensors = [0, 1].map(|index| {
-        let kind = kinds[index];
-        let stored = (0..experts as usize).map(|expert| kind.stored(expert, index)).collect::<Vec<_>>();
-        let imports = stored.iter().map(|bytes| kind.import(bytes)).collect::<Vec<_>>();
-        let conveyor = kind.tensor(&device, kind.source, conveyed.len() as u64, |record| {
-            Some(stored[conveyed[record]].as_slice())
-        });
-        let mut lent = vec![0u8; kind.slot_bytes()];
-        lent[..stored[lent_expert].len()].copy_from_slice(&stored[lent_expert]);
-        let scratch = kind.tensor(&device, kind.resident, experts, |slot| (slot == lent_slot).then_some(lent.as_slice()));
-        (imports, conveyor, scratch, lent)
-    });
+    let conveyor = form.records(&device, false, conveyed.len() as u64, |tensor, record| Some(form.stored(conveyed[record], tensor)));
+    let lent = |tensor: usize| {
+        let mut bytes = vec![0u8; form.kind(tensor).slot_bytes()];
+        let stored = form.stored(lent_expert, tensor);
+        bytes[..stored.len()].copy_from_slice(&stored);
+        bytes
+    };
+    let mut scratch = form.records(&device, true, experts, |tensor, slot| (slot == lent_slot).then(|| lent(tensor)));
 
     // The step's sequence.
     let mut step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
@@ -5140,7 +5138,6 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     let mut scratch_table = shared_i32(&device, &table.extents(), &vec![0; table.words() as usize]);
     let _pulse = pulse(&scratch_table, table);
     let k = 4u64;
-    let [conveyor_gate, conveyor_up, conveyor_down] = host_records(&device, 1);
     routed_scratch_request::native_for_device(
         &device,
         &specialize(&[("K", k), ("E", experts)], &[]),
@@ -5163,149 +5160,99 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     set_pair(&mut expected, ask + constants::SLOT_REQUEST, q);
     assert_eq!(unpulsed(read_i32(&scratch_table), table), expected, "the request in its lane");
 
-    let wait = routed_scratch_wait::native_for_device_with(
-        &device,
-        routed_scratch_wait::Elements {
-            SG: seismic::Element::f32(),
-            SU: seismic::Element::f32(),
-            SD: seismic::Element::f32(),
-        },
-        &seismic::NativeSpecialization::new(),
-    )
-    .unwrap();
-    let list_size = list_extent(round_records as u64);
-    let list = shared_i32(&device, &[list_size], &vec![0; list_size as usize]);
-    // Round `round`'s park on `grid`: a round with a list parks, and the host
-    // serves it by writing the list (and before round 0's answer the count
-    // of records the rounds convert, answering the request's lane), then
-    // answering its lane. Where kernels park themselves, the launch spins
-    // and the host serves once the device arrives (its lane's request).
-    // Where a park is a submission boundary (Vulkan), the host serves before
-    // the call, as the boundary opens only once its rule holds, and the call
-    // is made answered; the launch then records its arrival itself. The
-    // round after the last with records is answered with no list, before
-    // the device arrives, as its host answers it; a round after it launches
-    // nothing, so nothing is awaited. The step's
-    // high word is zero, so each u64 is whole at its low word.
+    let kernel = form.round_kernel(&device);
+    let extent = landing_extent(round_records as u64);
+    let landings = (0..rounds).map(|_| shared_i32(&device, &[extent], &vec![0; extent as usize])).collect::<Vec<_>>();
+    // Round `round`'s launch on `grid`. Where kernels park themselves, the
+    // launch arrives and spins, and the host serves once the device arrives
+    // (its lane's request): before round 0's answer the count of records
+    // the rounds convert (answering the request's lane), then each of the
+    // round's records appended, then the lane's answer. Where a park is a
+    // submission boundary (Vulkan), the host serves before the call, as the
+    // boundary opens only once its rule holds, and the call is made
+    // answered; the launch then records its arrival itself. The round after
+    // the last with records is answered with no entry, before the device
+    // arrives, as its host answers it. The step's high word is zero, so each
+    // u64 is whole at its low word.
     let in_kernels = device.backend().parks_in_kernels();
-    let park = |scratch: &mut seismic::Tensor, round: u64, grid: &seismic::Tensor| {
+    let park = |table: &mut seismic::Tensor, scratch: &mut [seismic::Tensor; 3], round: u64, grid: &seismic::Tensor| {
         let at = lane(constants::SCRATCH_ROUND + round);
-        let serve = |served: &seismic::Tensor| {
+        let mut landing = landings[round as usize].clone();
+        let serve = |served: &seismic::Tensor, landing: &seismic::Tensor| {
             if let Some(pairs) = lists.get(round as usize) {
                 if in_kernels {
                     await_shared_word(served, at + constants::SLOT_REQUEST, sequence);
                 }
-                let values = list_words(sequence, pairs.len(), pairs, round_records);
-                let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-                // SAFETY: the parked launch reads the list only once answered.
-                unsafe { list.write_shared(0, &bytes).unwrap() };
                 if round == 0 {
                     served.store_release(4 * (ask + constants::SCRATCH_STAGED), records as u32).unwrap();
                     served.store_release(4 * (ask + constants::SLOT_ANSWER), sequence as u32).unwrap();
+                }
+                for (index, &(from, to)) in pairs.iter().enumerate() {
+                    append_landing(landing, sequence, index, from, to);
                 }
                 served.store_release(4 * (at + constants::SLOT_ANSWER), sequence as u32).unwrap();
             } else if round as usize == lists.len() {
                 served.store_release(4 * (at + constants::SLOT_ANSWER), sequence as u32).unwrap();
             }
         };
+        let (served, appended) = (table.clone(), landing.clone());
         let tiered = host_words(&device, &[list_extent(experts)]);
         let seeds = host_words(&device, &[list_extent(experts)]);
         let map = host_words(&device, &[experts, constants::MAP_WORDS]);
-        let served = scratch.clone();
-        let args = routed_scratch_wait::Args {
+        let [gate, up, down] = scratch.each_mut();
+        let args = routed_round::Args {
             step: &step,
-            scratch,
+            scratch: table,
             round: round as i32,
-            list: &list,
+            landing: &mut landing,
             tiered: &tiered,
-            conveyor_gate: &conveyor_gate,
-            conveyor_up: &conveyor_up,
-            conveyor_down: &conveyor_down,
+            conveyor_gate: &conveyor[0],
+            conveyor_up: &conveyor[1],
+            conveyor_down: &conveyor[2],
+            gate,
+            up,
+            down,
             seeds: &seeds,
             map: &map,
             grid,
         };
         if in_kernels {
             std::thread::scope(|scope| {
-                scope.spawn(|| serve(&served));
-                wait.call(args).unwrap();
+                scope.spawn(|| serve(&served, &appended));
+                kernel.call(args).unwrap();
             });
         } else {
-            serve(&served);
-            wait.call_answered(args).unwrap();
+            serve(&served, &appended);
+            kernel.call_answered(args).unwrap();
         }
     };
-    // The grids as serving writes them: a convert's threadgroups a row of
-    // records of N rows, ceil(N / 16).
-    let (rows_groups, columns_groups) = (gate.matrix[0].div_ceil(16) as i32, down.matrix[0].div_ceil(16) as i32);
     let scratch_grids = routed_scratch_grids::native_for_device(&device, &seismic::NativeSpecialization::new()).unwrap();
     let grids_of = |scratch: &seismic::Tensor| {
-        let mut grids =
-            i32_tensor(&device, &[rounds, constants::ROUND_GRIDS, 3], &vec![-7; (rounds * constants::ROUND_GRIDS * 3) as usize]);
+        let mut grids = i32_tensor(&device, &[rounds, 3], &vec![-7; (rounds * 3) as usize]);
         scratch_grids
-            .call(routed_scratch_grids::Args {
-                step: &step,
-                scratch,
-                grids: &mut grids,
-                round_records: round_records as i32,
-                rows_groups,
-                columns_groups,
-            })
+            .call(routed_scratch_grids::Args { step: &step, scratch, grids: &mut grids, round_records: round_records as i32 })
             .unwrap();
         grids
     };
-    // Every round's grids for `count` records: n_r = clamp(count - r L, 0,
-    // L) records; a park while n_r > 0 or n_{r-1} > 0 (unfollowed), and its
-    // converts' n_r rows.
+    // Every round's park grid for `count` records: LAND_GROUPS threadgroups
+    // while n_r = clamp(count - r L, 0, L) > 0 or n_{r-1} > 0 (unfollowed).
+    let land_groups = constants::LAND_GROUPS as i32;
     let expected_grids = |count: usize| {
         (0..rounds as usize)
-            .flat_map(|round| {
-                let n = count.saturating_sub(round * round_records).min(round_records) as i32;
-                let parks = i32::from(count > round.saturating_sub(1) * round_records);
-                [parks, 1, 1, rows_groups, n, 1, columns_groups, n, 1]
-            })
+            .flat_map(|round| [land_groups * i32::from(count > round.saturating_sub(1) * round_records), 1, 1])
             .collect::<Vec<_>>()
     };
-    let grid = |grids: &seismic::Tensor, round: u64, grid: u64| {
-        grids
-            .slice_leading(round, round + 1)
-            .unwrap()
-            .reshape(&[constants::ROUND_GRIDS, 3])
-            .unwrap()
-            .slice_leading(grid, grid + 1)
-            .unwrap()
-            .reshape(&[3])
-            .unwrap()
-    };
-    let converts = kinds.map(|kind| {
-        routed_convert::native_for_device_with(
-            &device,
-            routed_convert::Elements { ST: kind.source, U: kind.resident },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap()
-    });
-    let always = i32_tensor(&device, &[3], &[1, 1, 1]);
+    let grid = |grids: &seismic::Tensor, round: u64| grids.slice_leading(round, round + 1).unwrap().reshape(&[3]).unwrap();
+    let always = i32_tensor(&device, &[3], &[land_groups, 1, 1]);
     let mut grids = None;
     for round in 0..rounds {
-        // Round 0 always parks, every later round on its park grid.
+        // Round 0 always launches, every later round on its park grid.
         match &grids {
-            None => park(&mut scratch_table, round, &always),
-            Some(grids) => park(&mut scratch_table, round, &grid(grids, round, constants::PARK_GRID)),
+            None => park(&mut scratch_table, &mut scratch, round, &always),
+            Some(grids) => park(&mut scratch_table, &mut scratch, round, &grid(grids, round)),
         }
         let written = grids.get_or_insert_with(|| grids_of(&scratch_table));
         assert_eq!(read_i32(written), expected_grids(records), "the rounds' grids");
-        for (index, (convert, (_, conveyor, scratch, _))) in converts.iter().zip(tensors.iter_mut()).enumerate() {
-            convert
-                .call(routed_convert::Args {
-                    conveyor,
-                    list: &list,
-                    step: &step,
-                    destination: scratch,
-                    grid: &grid(written, round, [constants::ROWS_GRID, constants::COLUMNS_GRID][index]),
-                })
-                .unwrap();
-        }
     }
     // Active rounds and the round after them arrived and were answered; a
     // round after that ran nothing.
@@ -5317,21 +5264,28 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
         set_pair(&mut expected, at + constants::SLOT_ANSWER, q);
     }
     assert_eq!(unpulsed(read_i32(&scratch_table), table), expected, "the rounds' arrivals and answers");
-    for (index, (imports, _, scratch, lent)) in tensors.iter().enumerate() {
-        let bytes = scratch.read_to_host().unwrap();
-        let width = kinds[index].slot_bytes();
+    for (tensor, slots) in scratch.iter().enumerate() {
+        let bytes = slots.read_to_host().unwrap();
+        let width = form.kind(tensor).slot_bytes();
         for expert in 0..experts as usize {
             let slot = &bytes[expert * width..(expert + 1) * width];
             if conveyed.contains(&expert) || expert == lent_expert {
-                assert!(slot == imports[expert], "kind {index} scratch slot {expert}");
+                assert!(slot == form.import(expert, tensor), "tensor {tensor} scratch slot {expert}");
             } else if expert == lent_slot {
-                assert!(slot == lent.as_slice(), "kind {index} lent scratch slot {expert}");
+                assert!(slot == lent(tensor).as_slice(), "tensor {tensor} lent scratch slot {expert}");
             } else {
-                assert!(slot.iter().all(|&byte| byte == 0), "kind {index} unlisted scratch slot {expert}");
+                assert!(slot.iter().all(|&byte| byte == 0), "tensor {tensor} unlisted scratch slot {expert}");
             }
         }
     }
-    // A failed request's rounds convert nothing and later ones never park.
+    // Every round's entries' DONE words hold the step's low word.
+    for (round, pairs) in lists.iter().enumerate() {
+        let words = read_i32(&landings[round]);
+        for entry in 0..pairs.len() {
+            assert_eq!(words[landing_done(entry)], sequence, "round {round} entry {entry}'s DONE");
+        }
+    }
+    // A failed request's rounds launch nothing.
     let mut failed = read_i32(&scratch_table);
     set_pair(&mut failed, ask + constants::SLOT_ANSWER, q | (u64::from(constants::SLOT_FAILED as u32) << 32));
     assert_eq!(
@@ -5340,14 +5294,12 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
         "a failed step's grids"
     );
     // A followed request (a sibling fill's round 0 is the next launch on its
-    // queue): the round after its last with records parks no more, the
-    // sibling's arrival proving its converts done.
+    // queue): the round after its last with records launches no more, the
+    // sibling's arrival proving its records read.
     let mut followed = read_i32(&scratch_table);
     followed[(ask + constants::SCRATCH_FOLLOWED) as usize] = 1;
-    let unparked = expected_grids(records)
-        .chunks(3 * constants::ROUND_GRIDS as usize)
-        .enumerate()
-        .flat_map(|(round, grids)| [&[i32::from(records > round * round_records)][..], &grids[1..]].concat())
+    let unparked = (0..rounds as usize)
+        .flat_map(|round| [land_groups * i32::from(records > round * round_records), 1, 1])
         .collect::<Vec<_>>();
     assert_eq!(
         read_i32(&grids_of(&shared_i32(&device, &table.extents(), &followed))),
@@ -5355,11 +5307,11 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
         "a followed request's grids"
     );
     // A request unanswered past round 0's wait (it ended on its still
-    // pulse): every round parks, so the device arrives at each round the
+    // pulse): every round launches, so the device arrives at each round the
     // host serves, and none converts.
     let mut unanswered = read_i32(&scratch_table);
     set_pair(&mut unanswered, ask + constants::SLOT_ANSWER, q - 1);
-    let parked = expected_grids(0).chunks(3 * constants::ROUND_GRIDS as usize).flat_map(|round| [&[1][..], &round[1..]].concat()).collect::<Vec<_>>();
+    let parked = (0..rounds).flat_map(|_| [land_groups, 1, 1]).collect::<Vec<_>>();
     assert_eq!(
         read_i32(&grids_of(&shared_i32(&device, &table.extents(), &unanswered))),
         parked,
@@ -5368,8 +5320,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt groups: `routed_convert`'s conveyor source, `routed_copy` and
-// `routed_move`.
+// Prompt groups: a round's landing launch, `routed_copy` and `routed_move`.
 
 /// The resident layouts a bank record takes: Metal's, CUDA's, the others'.
 const RESIDENT_LAYOUTS: [registry::Layout; 3] = [
@@ -5377,9 +5328,6 @@ const RESIDENT_LAYOUTS: [registry::Layout; 3] = [
     registry::Layout::Mma16,
     registry::Layout::Rows16,
 ];
-
-/// The 35B's two record forms: gate (and up, the same form) and down.
-const RECORD_FORMS: [usize; 2] = [0, 2];
 
 /// A list's words (`list[list_extent(capacity)]`): the step it was written
 /// for, the count, then the pairs, zero past them.
@@ -5395,55 +5343,228 @@ fn list_words(sequence: i32, count: usize, pairs: &[(i32, i32)], capacity: usize
     words
 }
 
-/// The conveyor case: V conveyor records and S scratch slots. Conveyor
-/// record v holds pattern v.
-const CONVEYOR_RECORDS: (u64, u64) = (3, 4);
+/// The 35B's two record forms: gate (and up, the same form) and down.
+const RECORD_FORMS: [usize; 2] = [0, 2];
 
-/// The conveyor case's list, (from, to) pairs, and its count: conveyor
-/// record 1 into slot 0, record 2 into slot 2, and one past the count.
-fn conveyor_list() -> (Vec<(i32, i32)>, usize) {
-    (vec![(1, 0), (2, 2), (0, 3)], 2)
+/// A landing list's words (`landing[landing_extent(capacity)]`): its head,
+/// the step's low word `low` and the count `count` landed, then each (from,
+/// to) pair, its DONE word zero, zero past them.
+fn landing_words(low: i32, count: usize, pairs: &[(i32, i32)], capacity: usize) -> Vec<i32> {
+    let mut words = vec![0; landing_extent(capacity as u64) as usize];
+    words[constants::LANDING_HEAD as usize] = low;
+    words[constants::LANDING_HEAD as usize + 1] = count as i32;
+    for (index, &(from, to)) in pairs.iter().enumerate() {
+        let entry = landing_extent(index as u64) as usize;
+        words[entry + constants::LANDING_FROM as usize] = from;
+        words[entry + constants::LANDING_TO as usize] = to;
+    }
+    words
 }
 
-/// A scratch bank after the conveyor case's list: slot 0 holds conveyor
-/// record 1's resident import and slot 2 record 2's, byte for byte, and
-/// every other slot is untouched (zero); after a list for another step
-/// every slot is.
-fn assert_conveyor_scratch(kind: &StreamedKind, form: usize, scratch: &[u8], converted: bool, label: &str) {
-    let width = kind.slot_bytes();
-    assert_eq!(scratch.len(), width * CONVEYOR_RECORDS.1 as usize, "{label}: scratch bytes");
-    for slot in 0..CONVEYOR_RECORDS.1 as usize {
-        let bytes = &scratch[slot * width..(slot + 1) * width];
-        let pattern = match (converted, slot) {
-            (true, 0) => Some(1),
-            (true, 2) => Some(2),
-            _ => None,
+/// The word of entry `entry`'s DONE in a landing list.
+fn landing_done(entry: usize) -> usize {
+    landing_extent(entry as u64) as usize + constants::LANDING_DONE as usize
+}
+
+/// A host appending entry `index` (from, to) to a running launch's landing
+/// list of step low word `low`, as its read lands: the entry's words, then
+/// the head (the step's low word, the count) by one 64-bit release store.
+fn append_landing(landing: &seismic::Tensor, low: i32, index: usize, from: i32, to: i32) {
+    let entry = landing_extent(index as u64);
+    landing.store_release(4 * (entry + constants::LANDING_FROM), from as u32).unwrap();
+    landing.store_release(4 * (entry + constants::LANDING_TO), to as u32).unwrap();
+    landing
+        .store_release_u64(4 * constants::LANDING_HEAD, u64::from(low as u32) | (index as u64 + 1) << 32)
+        .unwrap();
+}
+
+impl ServedForm {
+    /// Qwen3.6 35B's gated records: Q4_K gate and up, Q5_K down.
+    fn qwen35b(device: &seismic::Device) -> Self {
+        let [gate, up, down] = StreamedKind::qwen35b(device);
+        Self { gate: Some(gate), up, down }
+    }
+
+    /// Up-only or gated dense BF16 records, resident in `resident` (BF16
+    /// or F32), at F `f` and H `h`.
+    fn dense(gated: bool, resident: seismic::Element, f: u64, h: u64) -> Self {
+        let kind = |matrix| StreamedKind { source: seismic::Element::bf16(), resident, matrix };
+        Self { gate: gated.then(|| kind([f, h])), up: kind([f, h]), down: kind([h, f]) }
+    }
+
+    /// DeepSeek V4.1's gated MXFP4 records (`StreamedKind::v41_mxfp4`).
+    fn v41_mxfp4(device: &seismic::Device) -> Self {
+        let [gate, down] = StreamedKind::v41_mxfp4(device);
+        Self { gate: Some(gate), up: gate, down }
+    }
+
+    /// DeepSeek V4.1's MXFP4 tensors at row counts no multiple of 16, which a
+    /// landing's tied F and H cannot give two MXFP4 tensors (a row count is
+    /// the other's columns, a multiple of 32): each is MXFP4 in one form
+    /// with its F or H the odd one, and the others dense BF16. Gate and up
+    /// of [133, 5120], rows of 2720 bytes, 9 row tiles of a partial last
+    /// (down [5120, 133]); down of [139, 2304], rows of 1224 bytes whose
+    /// row tile a window holds whole, the last 11 rows, each record of
+    /// 170,136 bytes, so every other starts 8 bytes off 16-byte alignment
+    /// (gate and up [2304, 139]).
+    fn v41_mxfp4_partial(device: &seismic::Device) -> [Self; 2] {
+        let layout = resident_layout(device);
+        let mxfp4 = |matrix| StreamedKind {
+            source: seismic::Element::named("gguf_mxfp4").unwrap(),
+            resident: element_in("mxfp4g32", layout),
+            matrix,
         };
-        match pattern {
-            Some(pattern) => assert!(
-                bytes == kind.import(&kind.stored(pattern, form)),
-                "{label}: slot {slot} differs from its record's resident import"
-            ),
-            None => assert!(bytes.iter().all(|&byte| byte == 0), "{label}: slot {slot} written"),
+        let dense = |matrix| StreamedKind { source: seismic::Element::bf16(), resident: seismic::Element::bf16(), matrix };
+        let (h, f) = (160 * 32, 72 * 32);
+        [
+            Self { gate: Some(mxfp4([133, h])), up: mxfp4([133, h]), down: dense([h, 133]) },
+            Self { gate: Some(dense([f, 139])), up: dense([f, 139]), down: mxfp4([139, f]) },
+        ]
+    }
+
+    /// Routed tensor `tensor`'s kind (0 gate, 1 up, 2 down): an up-only
+    /// record's gate is the up's, its views empty.
+    fn kind(&self, tensor: usize) -> StreamedKind {
+        match tensor {
+            0 => self.gate.unwrap_or(self.up),
+            1 => self.up,
+            _ => self.down,
         }
+    }
+
+    /// Expert `expert`'s stored matrix of routed tensor `tensor`, and its
+    /// resident import.
+    fn stored(&self, expert: usize, tensor: usize) -> Vec<u8> {
+        self.kind(tensor).stored(expert, tensor)
+    }
+
+    fn import(&self, expert: usize, tensor: usize) -> Vec<u8> {
+        self.kind(tensor).import(&self.stored(expert, tensor))
+    }
+
+    /// Each routed tensor's `count` records, stored or resident: record r of
+    /// tensor t holding `matrix(t, r)`, zero where none; an up-only
+    /// record's gate empty.
+    fn records(
+        &self,
+        device: &seismic::Device,
+        resident: bool,
+        count: u64,
+        matrix: impl Fn(usize, usize) -> Option<Vec<u8>>,
+    ) -> [seismic::Tensor; 3] {
+        std::array::from_fn(|tensor| {
+            let kind = self.kind(tensor);
+            let element = if resident { kind.resident } else { kind.source };
+            let count = if tensor == 0 && self.gate.is_none() { 0 } else { count };
+            let per = element.canonical_byte_len(&kind.shape(1)).unwrap() as usize;
+            let mut bytes = vec![0u8; per * count as usize];
+            for record in 0..count as usize {
+                if let Some(held) = matrix(tensor, record) {
+                    bytes[record * per..record * per + held.len()].copy_from_slice(&held);
+                }
+            }
+            match count {
+                0 => seismic::Tensor::zeros(device, element, &kind.shape(0)).unwrap(),
+                _ => seismic::Tensor::from_host(device, element, &kind.shape(count), &bytes).unwrap(),
+            }
+        })
+    }
+
+    /// `routed_land` over these records at K choices.
+    fn land_kernel(&self, device: &seismic::Device, k: u64) -> seismic::NativeKernel<routed_land::Entry> {
+        let [gate, up, down] = [0, 1, 2].map(|tensor| self.kind(tensor));
+        routed_land::native_for_device_with(
+            device,
+            routed_land::Elements {
+                SG: gate.source,
+                SU: up.source,
+                SD: down.source,
+                UG: gate.resident,
+                UU: up.resident,
+                UD: down.resident,
+            },
+            &specialize(&[("K", k)], &[]),
+        )
+        .unwrap()
+    }
+
+    /// `routed_round` over these records.
+    fn round_kernel(&self, device: &seismic::Device) -> seismic::NativeKernel<routed_round::Entry> {
+        let [gate, up, down] = [0, 1, 2].map(|tensor| self.kind(tensor));
+        routed_round::native_for_device_with(
+            device,
+            routed_round::Elements {
+                SG: gate.source,
+                SU: up.source,
+                SD: down.source,
+                UG: gate.resident,
+                UU: up.resident,
+                UD: down.resident,
+            },
+            &seismic::NativeSpecialization::new(),
+        )
+        .unwrap()
     }
 }
 
-/// `routed_convert` builds at the 35B's record forms: Q4_K and Q5_K
+/// Round 0 of step STREAMING_SEQUENCE (`step`) whose host served it before
+/// the call: every entry of `landing` appended and its lane answered, so
+/// every backend runs it at once (`call_answered`), from `conveyor` into
+/// `scratch`.
+fn served_round(
+    device: &seismic::Device,
+    kernel: &seismic::NativeKernel<routed_round::Entry>,
+    step: &seismic::Tensor,
+    landing: &mut seismic::Tensor,
+    conveyor: &[seismic::Tensor; 3],
+    scratch: &mut [seismic::Tensor; 3],
+) {
+    let q = STREAMING_SEQUENCE as u64;
+    let table = SlotTable::scratch(FLIGHT, 1);
+    let mut words = vec![0; table.words() as usize];
+    set_pair(&mut words, table.lane(q, constants::SCRATCH_ROUND) + constants::SLOT_ANSWER, q);
+    let [gate, up, down] = scratch.each_mut();
+    kernel
+        .call_answered(routed_round::Args {
+            step,
+            scratch: &mut shared_i32(device, &table.extents(), &words),
+            round: 0,
+            landing,
+            tiered: &host_words(device, &[list_extent(1)]),
+            conveyor_gate: &conveyor[0],
+            conveyor_up: &conveyor[1],
+            conveyor_down: &conveyor[2],
+            gate,
+            up,
+            down,
+            seeds: &host_words(device, &[list_extent(1)]),
+            map: &host_words(device, &[1, constants::MAP_WORDS]),
+            grid: &i32_tensor(device, &[3], &[constants::LAND_GROUPS as i32, 1, 1]),
+        })
+        .unwrap();
+}
+
+/// The landing launches build at the 35B's record forms: Q4_K and Q5_K
 /// stored, their resident forms in every resident layout.
 #[test]
-fn streaming_conveyor_entry_builds_at_35b_record_forms() {
+fn streaming_landing_entries_build_at_35b_record_forms() {
     let module = module();
-    let entry = module.entry_named("routed_convert").unwrap();
-    for form in RECORD_FORMS {
+    for name in ["routed_land", "routed_round"] {
+        let entry = module.entry_named(name).unwrap();
         for layout in RESIDENT_LAYOUTS {
-            let kind = StreamedKind::qwen35b_in(layout)[form];
-            let bindings = ElementBindings::new()
-                .bind("ST", registry::representation(kind.source.name()).unwrap())
-                .bind("U", registry::representation(kind.resident.name()).unwrap());
-            module.entry(entry, &bindings).unwrap_or_else(|error| {
-                panic!("{} -> {}: {error}", kind.source.name(), kind.resident.name())
-            });
+            let [gate, up, down] = StreamedKind::qwen35b_in(layout);
+            let bind = |name: &str, element: seismic::Element| (name.to_string(), registry::representation(element.name()).unwrap());
+            let bindings = [
+                bind("SG", gate.source),
+                bind("SU", up.source),
+                bind("SD", down.source),
+                bind("UG", gate.resident),
+                bind("UU", up.resident),
+                bind("UD", down.resident),
+            ]
+            .into_iter()
+            .fold(ElementBindings::new(), |bindings, (name, representation)| bindings.bind(&name, representation));
+            module.entry(entry, &bindings).unwrap_or_else(|error| panic!("{name} at {layout:?}: {error}"));
         }
     }
 }
@@ -5764,48 +5885,50 @@ fn streaming_copy_copies_the_listed_records_byte_for_byte() {
 
 /// On every backend that streams, a conveyor in reserved device records (as
 /// lent bank records are, the host writing them as a transfer does)
-/// converts bit for bit as one in host-shared records: at the 35B's record
-/// forms, four experts converted from each give one scratch tier, every
+/// lands bit for bit as one in host-shared records: the 35B's gated
+/// records of four experts landed from each give one scratch tier, every
 /// slot its expert's resident import.
 #[test]
-fn streaming_a_reserved_conveyor_converts_as_a_host_shared_one() {
+fn streaming_a_reserved_conveyor_lands_as_a_host_shared_one() {
     let Some(device) = streaming_device() else {
         return;
     };
     let experts = 4u64;
     let step = streaming_step(&device);
-    for form in RECORD_FORMS {
-        let kind = StreamedKind::qwen35b(&device)[form];
-        let label = format!("{} -> {}", kind.source.name(), kind.resident.name());
-        let stored = (0..experts as usize).map(|expert| kind.stored(expert, form)).collect::<Vec<_>>();
-        let shared = shared_bytes(&device, kind.source, &kind.shape(experts), &stored.concat());
-        let (mut reserved, _resizer) =
+    let form = ServedForm::qwen35b(&device);
+    let kernel = form.round_kernel(&device);
+    let shared: [seismic::Tensor; 3] = std::array::from_fn(|tensor| {
+        let kind = form.kind(tensor);
+        let stored = (0..experts as usize).map(|expert| form.stored(expert, tensor)).collect::<Vec<_>>();
+        shared_bytes(&device, kind.source, &kind.shape(experts), &stored.concat())
+    });
+    let reserved = [0, 1, 2].map(|tensor| {
+        let kind = form.kind(tensor);
+        let stored = (0..experts as usize).map(|expert| form.stored(expert, tensor)).collect::<Vec<_>>();
+        let (mut reserved, resizer) =
             seismic::Tensor::reserved(&device, kind.source, &kind.shape(experts), experts).unwrap();
         reserved.write_from_host(&stored.concat()).unwrap();
-        let convert = routed_convert::native_for_device_with(
-            &device,
-            routed_convert::Elements { ST: kind.source, U: kind.resident },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap();
-        let converted = |conveyor: &seismic::Tensor| {
-            let pairs = [(0, 0), (1, 1), (2, 2), (3, 3)];
-            let list = list_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len());
-            let mut scratch = kind.tensor(&device, kind.resident, experts, |_| None);
-            convert
-                .call(routed_convert::Args {
-                    conveyor,
-                    list: &shared_i32(&device, &[list.len() as u64], &list),
-                    step: &step,
-                    destination: &mut scratch,
-                    grid: &i32_tensor(&device, &[3], &[1, 1, 1]),
-                })
-                .unwrap();
-            scratch.read_to_host().unwrap()
-        };
-        let from_shared = converted(&shared);
-        assert!(converted(&reserved) == from_shared, "{label}: the reserved conveyor converts as the shared one");
-        assert!(from_shared.chunks(kind.slot_bytes()).zip(&stored).all(|(slot, stored)| slot == kind.import(stored)));
+        (reserved, resizer)
+    });
+    let landed = |conveyor: &[seismic::Tensor; 3]| {
+        let pairs = [(0, 0), (1, 1), (2, 2), (3, 3)];
+        let mut landing = shared_i32(&device, &[landing_extent(4)], &landing_words(STREAMING_SEQUENCE, 4, &pairs, 4));
+        let mut scratch = form.records(&device, true, experts, |_, _| None);
+        served_round(&device, &kernel, &step, &mut landing, conveyor, &mut scratch);
+        scratch.map(|slots| slots.read_to_host().unwrap())
+    };
+    let from_shared = landed(&shared);
+    let [gate, up, down] = &reserved;
+    assert!(
+        landed(&[gate.0.clone(), up.0.clone(), down.0.clone()]) == from_shared,
+        "the reserved conveyor lands as the shared one"
+    );
+    for (tensor, slots) in from_shared.iter().enumerate() {
+        let width = form.kind(tensor).slot_bytes();
+        assert!(
+            slots.chunks(width).enumerate().all(|(expert, slot)| slot == form.import(expert, tensor)),
+            "tensor {tensor}: every slot its expert's import"
+        );
     }
 }
 
@@ -5813,7 +5936,7 @@ fn streaming_a_reserved_conveyor_converts_as_a_host_shared_one() {
 /// its bank record and each cold expert from the layer's scratch tier, a
 /// view at an offset into the scratch lender's records of another form (on
 /// chunked storage packed whole in chunks, across several), which a round's
-/// convert filled from the conveyor: at the 35B's record forms, gated, the
+/// landing filled from the conveyor: at the 35B's record forms, gated, the
 /// pass's rows equal the resident pass's over the same experts bit for bit.
 #[test]
 fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
@@ -5848,6 +5971,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
 
     let mut reference = Vec::new();
     let mut streamed = Vec::new();
+    let mut conveyors = Vec::new();
     for (index, kind) in kinds.iter().enumerate() {
         let label = format!("{} -> {}", kind.source.name(), kind.resident.name());
         let stored = (0..experts as usize).map(|expert| kind.stored(expert, index)).collect::<Vec<_>>();
@@ -5875,32 +5999,24 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
         )
         .unwrap();
         lender_records.write_from_host(&vec![0u8; (lent * record(&lender).get()) as usize]).unwrap();
-        let mut scratch = lender_records.region(kind.resident, &kind.shape(experts), offset).unwrap();
+        let scratch = lender_records.region(kind.resident, &kind.shape(experts), offset).unwrap();
         let placement = scratch.record_placement().expect("the scratch tier's records lie whole in chunks");
         if reserved.chunked() {
             let last = offset + placement.offset(experts - 1);
             assert!(last / reserved.granule > offset / reserved.granule, "{label}: the scratch tier spans chunks");
         }
 
-        let conveyor = kind.tensor(&device, kind.source, cold.len() as u64, |v| Some(stored[cold[v] as usize].as_slice()));
-        let pairs = cold.iter().enumerate().map(|(v, &expert)| (v as i32, expert as i32)).collect::<Vec<_>>();
-        let list = list_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len());
-        routed_convert::native_for_device_with(
-            &device,
-            routed_convert::Elements { ST: kind.source, U: kind.resident },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap()
-        .call(routed_convert::Args {
-            conveyor: &conveyor,
-            list: &shared_i32(&device, &[list.len() as u64], &list),
-            step: &step,
-            destination: &mut scratch,
-            grid: &i32_tensor(&device, &[3], &[1, 1, 1]),
-        })
-        .unwrap();
+        conveyors.push(kind.tensor(&device, kind.source, cold.len() as u64, |v| Some(stored[cold[v] as usize].as_slice())));
         streamed.push((bank, scratch, (bank_resizer, lender_records, lender_resizer)));
     }
+    // One round lands every cold expert's record, conveyor record v into its
+    // scratch slot.
+    let pairs = cold.iter().enumerate().map(|(v, &expert)| (v as i32, expert as i32)).collect::<Vec<_>>();
+    let mut landing =
+        shared_i32(&device, &[landing_extent(pairs.len() as u64)], &landing_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len()));
+    let conveyor: [seismic::Tensor; 3] = std::array::from_fn(|tensor| conveyors[tensor].clone());
+    let mut scratch: [seismic::Tensor; 3] = std::array::from_fn(|tensor| streamed[tensor].1.clone());
+    served_round(&device, &ServedForm::qwen35b(&device).round_kernel(&device), &step, &mut landing, &conveyor, &mut scratch);
 
     // The layer's map: each hit held in its bank record since step 1, each
     // cold expert mapped from the step after.
@@ -6104,174 +6220,406 @@ fn streaming_move_moves_the_listed_records_byte_for_byte() {
     assert_eq!(moved, (0..records).map(|record| scales[moved_from(record)]).collect::<Vec<_>>(), "scales");
 }
 
-/// On every backend that streams, `routed_convert` converts the listed
-/// conveyor records byte-equal to a resident import, at the 35B's record
-/// forms (`assert_conveyor_converts`).
+/// On every backend that streams, a round lands its records byte-equal to a
+/// resident import (`assert_round_lands`), at the 35B's gated records (Q4_K
+/// and Q5_K), DeepSeek V4.1's MXFP4 records (17-byte packets: gate/up rows
+/// of 2720 bytes, wider than a window holds a row tile of, and down rows of
+/// 1224 bytes, whose row tile a window holds whole), each also at a row
+/// count no multiple of 16 (`ServedForm::v41_mxfp4_partial`: a partial last
+/// row tile, whole at a 1224-byte row pitch, no multiple of 16, and records
+/// of 8 bytes off 16-byte alignment), and Nemotron 3.5
+/// Lightning's up-only records (Q5_0 and Q8_0, whose windows load in
+/// narrower units), and the 35B q8's dense BF16 records ([H 2048, F 512]),
+/// into BF16 (the bytes themselves) and F32 (each element widened); and
+/// dense BF16 records of 139 by 133, whose row counts are no multiple of
+/// 16 (a partial last row tile) and whose records are no multiple of 16
+/// bytes (each after the first starts off 16-byte alignment), as no
+/// quantized record of whole packets on both axes can be.
 #[test]
-fn streaming_conveyor_records_convert_like_a_resident_import() {
+fn streaming_rounds_land_records_like_a_resident_import() {
     let Some(device) = streaming_device() else {
         return;
     };
-    let kinds = StreamedKind::qwen35b(&device);
-    assert_conveyor_converts(&device, RECORD_FORMS.map(|form| (kinds[form], form)));
+    let (bf16, f32) = (seismic::Element::bf16(), seismic::Element::f32());
+    let [partial_gate, partial_down] = ServedForm::v41_mxfp4_partial(&device);
+    for (name, form) in [
+        ("35B", ServedForm::qwen35b(&device)),
+        ("V4.1 MXFP4", ServedForm::v41_mxfp4(&device)),
+        ("V4.1 MXFP4 gate and up of 133 rows", partial_gate),
+        ("V4.1 MXFP4 down of 139 rows", partial_down),
+        ("Lightning", ServedForm::lightning(&device)),
+        ("dense BF16", ServedForm::dense(false, bf16, 512, 2048)),
+        ("dense F32", ServedForm::dense(false, f32, 512, 2048)),
+        ("odd dense BF16", ServedForm::dense(false, bf16, 139, 133)),
+    ] {
+        assert_round_lands(&device, &form, name);
+    }
 }
 
-/// On every backend that streams, `routed_convert` converts DeepSeek V4.1's
-/// MXFP4 records (17-byte packets) byte-equal to a resident import
-/// (`assert_conveyor_converts`): gate/up rows of 2720 bytes and down rows of
-/// 1224 bytes (8 off 16), each record of nine row tiles, the last partial (a
-/// row count no multiple of 16), so every other down record starts 8 bytes
-/// off 16-byte alignment, and a down record's last row tile ends so.
-#[test]
-fn streaming_mxfp4_records_convert_like_a_resident_import() {
-    let Some(device) = streaming_device() else {
-        return;
-    };
-    let kinds = StreamedKind::v41_mxfp4(&device);
-    assert_conveyor_converts(&device, [(kinds[0], 0), (kinds[1], 2)]);
-}
-
-/// `routed_convert` converts the listed conveyor records of each (kind,
-/// form) byte-equal to a resident import: the conveyor a view at an offset
-/// into a larger stored tensor (as lent bank records are); an entry past
-/// the count is skipped; a list for another step converts nothing.
-fn assert_conveyor_converts<const KINDS: usize>(device: &seismic::Device, kinds: [(StreamedKind, usize); KINDS]) {
-    let (v, s) = CONVEYOR_RECORDS;
-    let (pairs, count) = conveyor_list();
+/// A round's landing of `form`'s records byte-equal to a resident import:
+/// the conveyor a view at an offset into a larger stored tensor (as lent
+/// bank records are), conveyor record v holding expert v; its entries out
+/// of record order, record 2 into slot 2, then (where every stored record
+/// fits a slot) scratch slot 3's stored bytes of expert 0 into slot 1, then
+/// record 1 into slot 0; an entry past the count lands nothing; each landed
+/// entry's DONE holds the step's low word; a list another step's head names
+/// lands nothing.
+fn assert_round_lands(device: &seismic::Device, form: &ServedForm, name: &str) {
+    let (v, s) = (3u64, 4u64);
     let step = streaming_step(device);
-    for (kind, form) in kinds {
-        let stored = (0..v).map(|pattern| kind.stored(pattern as usize, form)).collect::<Vec<_>>();
-        // The conveyor's records sit at [1, 1 + V) of a larger stored tensor.
-        let lent = kind.tensor(device, kind.source, v + 2, |record| {
-            (1..=v as usize).contains(&record).then(|| stored[record - 1].as_slice())
-        });
-        let conveyor = lent.slice_leading(1, 1 + v).unwrap();
-        let convert = routed_convert::native_for_device_with(
-            device,
-            routed_convert::Elements {
-                ST: kind.source,
-                U: kind.resident,
-            },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap();
-        for (sequence, converted) in [(STREAMING_SEQUENCE, true), (STREAMING_SEQUENCE - 1, false)] {
-            let label = format!("{} -> {}, converted {converted}", kind.source.name(), kind.resident.name());
-            let list = list_words(sequence, count, &pairs, pairs.len());
-            let mut scratch = kind.tensor(device, kind.resident, s, |_| None);
-            convert
-                .call(routed_convert::Args {
-                    conveyor: &conveyor,
-                    list: &shared_i32(device, &[list.len() as u64], &list),
-                    step: &step,
-                    destination: &mut scratch,
-                    // One threadgroup striding over every listed record's items.
-                    grid: &i32_tensor(device, &[3], &[1, 1, 1]),
-                })
-                .unwrap();
-            assert_conveyor_scratch(&kind, form, &scratch.read_to_host().unwrap(), converted, &label);
+    let kernel = form.round_kernel(device);
+    let held = form.records(device, false, v + 2, |tensor, record| {
+        (1..=v as usize).contains(&record).then(|| form.stored(record - 1, tensor))
+    });
+    let conveyor: [seismic::Tensor; 3] = std::array::from_fn(|tensor| match form.gate.is_none() && tensor == 0 {
+        true => held[tensor].clone(),
+        false => held[tensor].slice_leading(1, 1 + v).unwrap(),
+    });
+    let lends = (0..3).all(|tensor| form.stored(0, tensor).len() <= form.kind(tensor).slot_bytes());
+    let lent = |tensor: usize| {
+        let mut bytes = vec![0u8; form.kind(tensor).slot_bytes()];
+        let stored = form.stored(0, tensor);
+        bytes[..stored.len()].copy_from_slice(&stored);
+        bytes
+    };
+    let mut pairs = vec![(2, 2)];
+    if lends {
+        pairs.push((-1 - 3, 1));
+    }
+    pairs.extend([(1, 0), (0, 3)]);
+    let count = pairs.len() - 1;
+    for (low, landed) in [(STREAMING_SEQUENCE, true), (STREAMING_SEQUENCE - 1, false)] {
+        let label = format!("{name}, landed {landed}");
+        let mut landing =
+            shared_i32(device, &[landing_extent(pairs.len() as u64)], &landing_words(low, count, &pairs, pairs.len()));
+        let mut scratch = form.records(device, true, s, |tensor, slot| (lends && slot == 3).then(|| lent(tensor)));
+        served_round(device, &kernel, &step, &mut landing, &conveyor, &mut scratch);
+        for (tensor, slots) in scratch.iter().enumerate() {
+            if form.gate.is_none() && tensor == 0 {
+                continue;
+            }
+            let bytes = slots.read_to_host().unwrap();
+            let width = form.kind(tensor).slot_bytes();
+            for slot in 0..s as usize {
+                let held = &bytes[slot * width..(slot + 1) * width];
+                let expected = match (landed, slot) {
+                    (true, 2) => Some(form.import(2, tensor)),
+                    (true, 0) => Some(form.import(1, tensor)),
+                    (true, 1) if lends => Some(form.import(0, tensor)),
+                    (_, 3) if lends => Some(lent(tensor)),
+                    _ => None,
+                };
+                match expected {
+                    Some(expected) => assert!(held == expected.as_slice(), "{label}: tensor {tensor} slot {slot}"),
+                    None => assert!(held.iter().all(|&byte| byte == 0), "{label}: tensor {tensor} slot {slot} written"),
+                }
+            }
+        }
+        let words = read_i32(&landing);
+        for entry in 0..pairs.len() {
+            let done = if landed && entry < count { low } else { 0 };
+            assert_eq!(words[landing_done(entry)], done, "{label}: entry {entry}'s DONE");
         }
     }
 }
 
-/// On every backend that streams, `routed_convert` converts dense BF16
-/// records (Qwen3.6 35B q8's BF16 down stacks, [H 2048, F 512]) as
-/// `import_dense` imports them, into BF16 (the bytes themselves) and into
-/// F32 (each element widened), from a conveyor view, under the conveyor
-/// case's list; a list for another step converts nothing.
+/// A decode layer's landing as its host serves it: choice 0's expert 3 held
+/// in bank record 0, choices 1-3's experts 9, 5 and 12 absent and read into
+/// staging records 0, 1 and 2, whose reads land in the order of `LANDED`
+/// (staging record, bank record, choice): not the record order.
+const LANDED_EXPERTS: [usize; 4] = [3, 9, 5, 12];
+const LANDED: [(i32, i32, u64); 3] = [(2, 5, 3), (0, 1, 1), (1, 4, 2)];
+
+/// `form`'s staging records of `LANDED_EXPERTS`' absent experts.
+fn landed_staging(device: &seismic::Device, form: &ServedForm) -> [seismic::Tensor; 3] {
+    form.records(device, false, 3, |tensor, record| Some(form.stored(LANDED_EXPERTS[record + 1], tensor)))
+}
+
+/// On every backend that streams, a decode layer's landing converts each
+/// absent expert's records as its read lands: a host thread appends the
+/// entries out of record order and late (20 ms apart, while the launch
+/// runs, where kernels park; Vulkan's host appends them before the park
+/// opens), the landing list's head first naming an earlier step, then
+/// answers each expert's choices and the slot. Every landed bank record
+/// then holds its expert's resident import, byte for byte, every other
+/// none; every entry's DONE holds the step's low word; and each absent
+/// choice is sourced from its bank record. At
+/// the 35B's, V4.1's MXFP4 and Lightning's up-only records.
 #[test]
-fn streaming_dense_records_convert_as_import_dense() {
+fn streaming_a_landing_converts_records_appended_late_out_of_order() {
     let Some(device) = streaming_device() else {
         return;
     };
-    let (v, s) = CONVEYOR_RECORDS;
-    let (pairs, count) = conveyor_list();
+    let (q, low, k) = (STREAMING_SEQUENCE as u64, STREAMING_SEQUENCE, 4u64);
     let step = streaming_step(&device);
-    let (n, k) = (2048u64, 512u64);
-    let per = (n * k) as usize;
-    let bf16 = seismic::Element::bf16();
-    // Record `pattern`'s BF16 bits: finite values of both signs.
-    let record = |pattern: usize| {
-        (0..per)
-            .map(|index| {
-                let x = (index as u32).wrapping_add(pattern as u32 * 7919).wrapping_mul(2_654_435_761);
-                (0x3c00 + (x >> 20) % 0x0700) as u16 | (((x >> 9) & 1) as u16) << 15
-            })
-            .collect::<Vec<_>>()
-    };
-    let records = (0..v as usize).map(record).collect::<Vec<_>>();
-    let bytes = |values: &[u16]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    let tensor = |count: u64, matrix: &dyn Fn(usize) -> Option<usize>| {
-        let mut data = vec![0u8; 2 * per * count as usize];
-        for index in 0..count as usize {
-            if let Some(pattern) = matrix(index) {
-                data[2 * per * index..2 * per * (index + 1)].copy_from_slice(&bytes(&records[pattern]));
+    let requested = [-1 - LANDED_EXPERTS[0] as i32, LANDED_EXPERTS[1] as i32, LANDED_EXPERTS[2] as i32, LANDED_EXPERTS[3] as i32];
+    let in_kernels = device.backend().parks_in_kernels();
+    for (name, form) in [
+        ("35B", ServedForm::qwen35b(&device)),
+        ("V4.1 MXFP4", ServedForm::v41_mxfp4(&device)),
+        ("Lightning", ServedForm::lightning(&device)),
+    ] {
+        let kernel = form.land_kernel(&device, k);
+        let staging = landed_staging(&device, &form);
+        let mut bank = form.records(&device, true, 6, |_, _| None);
+        let (table, words) = file_words(k, q, &requested, &[], None);
+        let mut file = shared_i32(&device, &table.extents(), &words);
+        let _pulse = pulse(&file, table);
+        let mut landing = shared_i32(&device, &[landing_extent(3)], &landing_words(low - FLIGHT as i32, 3, &[], 3));
+        let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+        let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+        let slot = table.lane(q, 0);
+        let serve = |file: &seismic::Tensor, landing: &seismic::Tensor| {
+            for (index, &(staged, record, choice)) in LANDED.iter().enumerate() {
+                if in_kernels {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                append_landing(landing, low, index, staged, record);
+                file.store_release(4 * (slot + SlotTable::file_entry(choice) + constants::FILE_RECORD), record as u32).unwrap();
             }
-        }
-        seismic::Tensor::from_host(&device, bf16, &[count, n, k], &data).unwrap()
-    };
-    // The conveyor's records sit at [1, 1 + V) of a larger stored tensor.
-    let lent = tensor(v + 2, &|record| (1..=v as usize).contains(&record).then(|| record - 1));
-    let conveyor = lent.slice_leading(1, 1 + v).unwrap();
-    for resident in [bf16, seismic::Element::f32()] {
-        let width = if resident == bf16 { 2 } else { 4 };
-        let import = |pattern: usize| -> Vec<u8> {
-            records[pattern]
-                .iter()
-                .flat_map(|&bits| match width {
-                    2 => bits.to_le_bytes().to_vec(),
-                    _ => (u32::from(bits) << 16).to_le_bytes().to_vec(),
-                })
-                .collect()
+            file.store_release_u64(4 * (slot + constants::SLOT_ANSWER), q).unwrap();
         };
-        let convert = routed_convert::native_for_device_with(
-            &device,
-            routed_convert::Elements { ST: bf16, U: resident },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap();
-        for (sequence, converted) in [(STREAMING_SEQUENCE, true), (STREAMING_SEQUENCE - 1, false)] {
-            let label = format!("bf16 -> {}, converted {converted}", resident.name());
-            let list = list_words(sequence, count, &pairs, pairs.len());
-            let mut scratch =
-                seismic::Tensor::from_host(&device, resident, &[s, n, k], &vec![0u8; width * per * s as usize])
-                    .unwrap();
-            convert
-                .call(routed_convert::Args {
-                    conveyor: &conveyor,
-                    list: &shared_i32(&device, &[list.len() as u64], &list),
-                    step: &step,
-                    destination: &mut scratch,
-                    // One threadgroup striding over every listed record's items.
-                    grid: &i32_tensor(&device, &[3], &[1, 1, 1]),
-                })
-                .unwrap();
-            let scratch = scratch.read_to_host().unwrap();
-            for slot in 0..s as usize {
-                let held = &scratch[slot * width * per..(slot + 1) * width * per];
-                match (converted, slot) {
-                    (true, 0) => assert!(held == import(1), "{label}: slot 0"),
-                    (true, 2) => assert!(held == import(2), "{label}: slot 2"),
-                    _ => assert!(held.iter().all(|&byte| byte == 0), "{label}: slot {slot} written"),
+        let (served, appended) = (file.clone(), landing.clone());
+        let [gate, up, down] = bank.each_mut();
+        let args = routed_land::Args {
+            step: &step,
+            file: &mut file,
+            sources: &mut sources,
+            policy: &policy,
+            landing: &mut landing,
+            staging_gate: &staging[0],
+            staging_up: &staging[1],
+            staging_down: &staging[2],
+            gate,
+            up,
+            down,
+        };
+        if in_kernels {
+            std::thread::scope(|scope| {
+                scope.spawn(|| serve(&served, &appended));
+                kernel.call(args).unwrap();
+            });
+        } else {
+            serve(&served, &appended);
+            kernel.call_answered(args).unwrap();
+        }
+        for (tensor, records) in bank.iter().enumerate() {
+            if form.gate.is_none() && tensor == 0 {
+                continue;
+            }
+            let bytes = records.read_to_host().unwrap();
+            let width = form.kind(tensor).slot_bytes();
+            for record in 0..6 {
+                let held = &bytes[record * width..(record + 1) * width];
+                match LANDED.iter().find(|landed| landed.1 == record as i32) {
+                    Some(&(staged, _, _)) => assert!(
+                        held == form.import(LANDED_EXPERTS[staged as usize + 1], tensor).as_slice(),
+                        "{name}: tensor {tensor} bank record {record}"
+                    ),
+                    None => assert!(held.iter().all(|&byte| byte == 0), "{name}: tensor {tensor} bank record {record} written"),
                 }
             }
         }
+        let words = read_i32(&landing);
+        for entry in 0..LANDED.len() {
+            assert_eq!(words[landing_done(entry)], low, "{name}: entry {entry}'s DONE");
+        }
+        assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&[0, 1, 4, 5], &[-1; 4]), "{name}: sources");
+    }
+}
+
+/// On every backend that streams, a landing stops once its slot is answered
+/// with fewer entries than its threadgroups claim (one expert landed, two
+/// reads failed: their choices sourced none), and once its slot is failed
+/// (the entry landed before the failure converted, every absent choice
+/// sourced none); each case twice, the second landing as the first, so
+/// every launch restores its counters.
+#[test]
+fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let (q, low, k) = (STREAMING_SEQUENCE as u64, STREAMING_SEQUENCE, 4u64);
+    let step = streaming_step(&device);
+    let form = ServedForm::qwen35b(&device);
+    let kernel = form.land_kernel(&device, k);
+    let staging = landed_staging(&device, &form);
+    let requested = [-1 - LANDED_EXPERTS[0] as i32, LANDED_EXPERTS[1] as i32, LANDED_EXPERTS[2] as i32, LANDED_EXPERTS[3] as i32];
+    let failed = q | (u64::from(constants::SLOT_FAILED as u32) << 32);
+    // Staging record 0 (choice 1's expert) lands into bank record 1.
+    for (case, answer, records) in [("answered", q, [0, 1, -1, -1]), ("failed", failed, [0, -1, -1, -1])] {
+        for run in 0..2 {
+            let label = format!("{case}, run {run}");
+            let (table, words) = file_words(k, q, &requested, &[(1, 1), (2, -1), (3, -1)], Some(answer));
+            let mut file = shared_i32(&device, &table.extents(), &words);
+            let mut landing = shared_i32(&device, &[landing_extent(3)], &landing_words(low, 1, &[(0, 1)], 3));
+            let mut sources = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+            let mut bank = form.records(&device, true, 6, |_, _| None);
+            let [gate, up, down] = bank.each_mut();
+            kernel
+                .call_answered(routed_land::Args {
+                    step: &step,
+                    file: &mut file,
+                    sources: &mut sources,
+                    policy: &shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]),
+                    landing: &mut landing,
+                    staging_gate: &staging[0],
+                    staging_up: &staging[1],
+                    staging_down: &staging[2],
+                    gate,
+                    up,
+                    down,
+                })
+                .unwrap();
+            for (tensor, stack) in bank.iter().enumerate() {
+                let bytes = stack.read_to_host().unwrap();
+                let width = form.kind(tensor).slot_bytes();
+                for record in 0..6 {
+                    let held = &bytes[record * width..(record + 1) * width];
+                    match record {
+                        1 => assert!(held == form.import(LANDED_EXPERTS[1], tensor).as_slice(), "{label}: tensor {tensor} record 1"),
+                        _ => assert!(held.iter().all(|&byte| byte == 0), "{label}: tensor {tensor} record {record} written"),
+                    }
+                }
+            }
+            assert_eq!(read_i32(&landing)[landing_done(0)], low, "{label}: the landed entry's DONE");
+            assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&records, &[-1; 4]), "{label}: sources");
+        }
+    }
+}
+
+/// On every backend that streams, each landing launch matches its portable
+/// body on the same words: dense BF16 records landed into F32 ones (the
+/// interpreter binds dense elements alone), at the smallest shapes reaching
+/// every path of the launch: a gated record (gate, up and down), an
+/// up-only record (its gate views empty, GV = GS = 0) and, for a decode
+/// layer, the host tier's placing (V = S = 0: nothing lands, the launch
+/// only sources, a CPU choice's site named by its tier record). Each
+/// landing's entries land out of record order, an entry past the count; a
+/// decode layer's one read failed.
+#[test]
+fn native_landings_match_the_portable_body() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let module = module();
+    let (k, q, low) = (4usize, STREAMING_SEQUENCE as u64, STREAMING_SEQUENCE);
+    let pairs = [(2, 4), (0, 1), (1, 0)];
+    // A tensor's interpreter input: its values, of `dtype`.
+    let dense = |tensor: &seismic::Tensor, dtype: DType| {
+        let shape = tensor.extents().iter().map(|&extent| extent as usize).collect();
+        Input::Tensor(dtype, shape, read_activation(tensor, dtype).into_iter().map(f64::from).collect())
+    };
+    let form = |gated: bool| ServedForm::dense(gated, seismic::Element::f32(), 4, 40);
+    let check = |label: &str, outcome: &OracleOutcome, first: usize, landed: &[seismic::Tensor; 3]| {
+        for (tensor, records) in landed.iter().enumerate() {
+            let expected = input(outcome, first + tensor).into_iter().map(|value| value as f32).collect::<Vec<_>>();
+            assert_eq!(read_f32(records), expected, "{label}: tensor {tensor}");
+        }
+    };
+
+    // A decode layer: choice 0 held, 1 and 3 landed (staging 2 into bank 4,
+    // staging 0 into bank 1), 2's read failed; where the host tier places,
+    // 1 and 3 read in place from tier records 6 and 2, 2 the CPU's (its
+    // site pending) from tier record 3.
+    for (case, form, staged) in [
+        ("gated", form(true), 3),
+        ("up-only", form(false), 3),
+        ("tier-placed", form(false), 0),
+    ] {
+        let label = format!("decode, {case}");
+        let placed = staged > 0;
+        let staging = form.records(&device, false, staged, |tensor, record| Some(form.stored(record, tensor)));
+        let mut bank = form.records(&device, true, 5 * u64::from(placed), |_, _| None);
+        let landed: &[(u64, i32)] = if placed { &[(1, 1), (2, -1), (3, 4)] } else { &[(1, -2 - 6), (2, -2 - 3), (3, -2 - 2)] };
+        let (table, file) = file_words(k as u64, q, &[-1 - 3, 9, 5, 12], landed, Some(q));
+        let site = if placed { -1 } else { -2 };
+        let source_words = magnitude_kernels::source_words(&[0, -1, -1, -1], &[-1, -1, site, -1]);
+        let landing = if placed { landing_words(low, 2, &pairs, 3) } else { landing_words(low, 0, &[], 3) };
+        let [slots, width] = table.extents().map(|extent| extent as usize);
+        let mut inputs = vec![
+            ints(&[constants::STEP_WORDS as usize], &step_words(q)),
+            ints(&[slots, width], &file),
+            ints(&[constants::SOURCE_ROWS as usize, 1, k], &source_words),
+            ints(&[constants::POLICY_WORDS as usize], &[0; constants::POLICY_WORDS as usize]),
+            ints(&[landing.len()], &landing),
+        ];
+        inputs.extend(staging.iter().map(|tensor| dense(tensor, DType::BF16)));
+        inputs.extend(bank.iter().map(|tensor| dense(tensor, DType::F32)));
+        let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
+
+        let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, k as u64], &source_words);
+        let mut landing_tensor = shared_i32(&device, &[landing.len() as u64], &landing);
+        let [gate, up, down] = bank.each_mut();
+        form.land_kernel(&device, k as u64)
+            .call_answered(routed_land::Args {
+                step: &streaming_step(&device),
+                file: &mut shared_i32(&device, &table.extents(), &file),
+                sources: &mut sources,
+                policy: &shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]),
+                landing: &mut landing_tensor,
+                staging_gate: &staging[0],
+                staging_up: &staging[1],
+                staging_down: &staging[2],
+                gate,
+                up,
+                down,
+            })
+            .unwrap();
+        assert_eq!(read_i32(&sources), as_i32(input(&outcome, 2)), "{label}: sources");
+        assert_eq!(read_i32(&landing_tensor), as_i32(input(&outcome, 4)), "{label}: landing list");
+        check(&label, &outcome, 8, &bank);
+    }
+
+    // A round: conveyor record 2 into scratch slot 4, 0 into 1, then one
+    // past the count.
+    for (case, form) in [("gated", form(true)), ("up-only", form(false))] {
+        let label = format!("round, {case}");
+        let conveyor = form.records(&device, false, 3, |tensor, record| Some(form.stored(record, tensor)));
+        let mut scratch = form.records(&device, true, 5, |_, _| None);
+        let table = SlotTable::scratch(FLIGHT, 1);
+        let mut words = vec![0; table.words() as usize];
+        set_pair(&mut words, table.lane(q, constants::SCRATCH_ROUND) + constants::SLOT_ANSWER, q);
+        let landing = landing_words(low, 2, &pairs, 3);
+        let list = list_extent(1) as usize;
+        let [slots, width] = table.extents().map(|extent| extent as usize);
+        let mut inputs = vec![
+            ints(&[constants::STEP_WORDS as usize], &step_words(q)),
+            ints(&[slots, width], &words),
+            Input::I32(0),
+            ints(&[landing.len()], &landing),
+            ints(&[list], &vec![0; list]),
+        ];
+        inputs.extend(conveyor.iter().map(|tensor| dense(tensor, DType::BF16)));
+        inputs.extend(scratch.iter().map(|tensor| dense(tensor, DType::F32)));
+        inputs.extend([
+            ints(&[list], &vec![0; list]),
+            ints(&[1, constants::MAP_WORDS as usize], &vec![0; constants::MAP_WORDS as usize]),
+            ints(&[3], &[constants::LAND_GROUPS as i32, 1, 1]),
+        ]);
+        let outcome = interpret(&module, "routed_round", &DENSE_LANDING, inputs);
+
+        let mut landing_tensor = shared_i32(&device, &[landing.len() as u64], &landing);
+        served_round(&device, &form.round_kernel(&device), &streaming_step(&device), &mut landing_tensor, &conveyor, &mut scratch);
+        assert_eq!(read_i32(&landing_tensor), as_i32(input(&outcome, 3)), "{label}: landing list");
+        check(&label, &outcome, 8, &scratch);
     }
 }
 
 // ---------------------------------------------------------------------------
 // The decode protocol (streaming_words.seismic's contract), by the
-// portable bodies: the step-stamped map, the assignment, the tier wait, the
-// site request and the combine's answer.
+// portable bodies: the step-stamped map, the assignment, the landing's
+// sources, the site request and the combine's answer.
 
-/// Every backend encodes a streamed layer's tier wait only while an expert
-/// of it can be absent (`unless (policy[POLICY_RESOLVED])`): where its
-/// group is whole or its host tier keeps every expert, the wait is left
-/// out, and with it the park before it, which takes a value only where its
-/// call's launch is encoded (seismic's `the_host_answers_a_parked_call`).
-/// A 40-layer decode step's 40 tier-wait parks are then none.
+/// Every backend encodes a streamed decode layer's landing only while an
+/// expert of it can be absent (`unless (policy[POLICY_RESOLVED])`): where
+/// its group is whole or its host tier keeps every expert, the landing is
+/// left out, and with it any park before it, which takes a value only
+/// where its call's launch is encoded (seismic's
+/// `the_host_answers_a_parked_call`). A 40-layer decode step's 40 landing
+/// parks are then none.
 #[test]
-fn the_tier_wait_is_encoded_only_while_an_expert_can_be_absent() {
+fn the_landing_is_encoded_only_while_an_expert_can_be_absent() {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("routed.seismic", include_str!("../kernels/routed.seismic")),
@@ -6284,7 +6632,7 @@ fn the_tier_wait_is_encoded_only_while_an_expert_can_be_absent() {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }
     let module = crate::common::check(sources);
-    let entry = module.entry_named("routed_tier_wait").unwrap();
+    let entry = module.entry_named("routed_land").unwrap();
     let resolved = seismic_lang::checked::LaunchCondition {
         word: "policy".into(),
         index: constants::POLICY_RESOLVED as u64,
@@ -6473,7 +6821,6 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
                 sited: 1,
                 step: &i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64)),
                 file: &mut words(&table.extents()),
-                grids: &mut zeros(seismic::Element::i32(), &[constants::DECODE_GRIDS, 3]),
                 sources: &mut sources,
                 next_router_norm: &zeros(f32, &[h]),
                 next_router: &zeros(f32, &[e, h]),
@@ -6499,7 +6846,7 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
 /// router), and a host thread flips each expert's tier word between none
 /// and record e with release stores for as long as the launches run. A
 /// route that read the tier word once per choice could source two rows of
-/// one expert differently, one absent and one tier-held, whose tier wait
+/// one expert differently, one absent and one tier-held, whose landing
 /// and assignment then drop the one or serve it twice.
 #[test]
 fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
@@ -6574,8 +6921,7 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
                     sited: 1,
                     step: &step,
                     file: &mut words(&table.extents()),
-                    grids: &mut zeros(seismic::Element::i32(), &[constants::DECODE_GRIDS, 3]),
-                    sources: &mut sources,
+                        sources: &mut sources,
                     next_router_norm: &zeros(f32, &[h]),
                     next_router: &zeros(f32, &[e, h]),
                     next_bias: &zeros(f32, &[e]),
@@ -6607,11 +6953,12 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
     });
 }
 
-/// The tier wait sources each landed choice where the route assigned its
+/// A landing sources each landed choice where the route assigned its
 /// expert: the CPU's pending site names its tier record, the link's record
-/// reads it in place; a failed read, or a failed step, sources none.
+/// reads it in place; a failed read, or a failed step, sources none. A
+/// layer the host tier places (V = S = 0), its step's high word set.
 #[test]
-fn portable_tier_wait_routes_a_landed_record_to_its_side() {
+fn portable_landing_routes_a_landed_record_to_its_side() {
     let module = module();
     let (k, step) = (4usize, (1u64 << 32) + 7);
     // Choice 0 held, 1-3 absent: 1 the CPU's (site -2), 2 the link's, 3 the
@@ -6627,15 +6974,16 @@ fn portable_tier_wait_routes_a_landed_record_to_its_side() {
     ] {
         let (table, file) = file_words(k as u64, step, &choices, &landed, Some(answer));
         let [slots, width] = table.extents().map(|extent| extent as usize);
-        let inputs = vec![
+        let landing = landing_words(step as i32, 0, &[], 1);
+        let mut inputs = vec![
             ints(&[constants::STEP_WORDS as usize], &step_words(step)),
             ints(&[slots, width], &file),
             ints(&[constants::SOURCE_ROWS as usize, 1, k], &magnitude_kernels::source_words(&records, &sites)),
-            ints(&[3], &[1, 1, 1]),
             ints(&[constants::POLICY_WORDS as usize], &policy_words(0, 0, [0; 3])),
-            ints(&[1], &[0]),
+            ints(&[landing.len()], &landing),
         ];
-        let outcome = interpret(&module, "routed_tier_wait", &[], inputs);
+        inputs.extend(DENSE_LANDING.map(|(_, dtype)| Input::Tensor(dtype, vec![0, 1, 1], vec![])));
+        let outcome = interpret(&module, "routed_land", &DENSE_LANDING, inputs);
         assert_eq!(
             as_i32(input(&outcome, 2)),
             magnitude_kernels::source_words(&expected_records, &expected_sites),
@@ -6676,6 +7024,7 @@ fn portable_site_request_writes_its_slot() {
             let at = table.lane(q, 0);
             set_pair(&mut request, at + constants::SLOT_REQUEST, q);
             let at = at as usize;
+            request[at + constants::SLOT_VIOLATED as usize] = 0;
             request[at + constants::SITE_COUNT as usize] = 2;
             for (entry, (row, record, expert, weight)) in [(0, 4, 10, 0.5f32), (1, 9, 13, 0.75)].into_iter().enumerate() {
                 let entry = at + constants::SITE_ENTRIES as usize + constants::SITE_ENTRY_WORDS as usize * entry;
@@ -6762,8 +7111,8 @@ const EXPIRED: &str = "dead host: its wait stored its expiry";
 /// ([`patience`]), then the milliseconds.
 const PATIENCE: &str = "dead host: patience ms";
 
-/// This device's patience, as its own wait records it: a tier wait on a
-/// requested slot never answered nor pulsed, from its call until it ends on
+/// This device's patience, as its own wait records it: a landing's wait on
+/// a requested slot never answered nor pulsed, from its call until it ends on
 /// its still pulse, having stored its expiry (PULSE_SPINS spins at the
 /// device's own cost of a spin, which is longer across a discrete device's
 /// bus than on unified memory). What a test of a wait outlasting its
@@ -6771,14 +7120,11 @@ const PATIENCE: &str = "dead host: patience ms";
 fn patience(device: &seismic::Device) -> std::time::Duration {
     let q = STREAMING_SEQUENCE as u64;
     let (table, words) = file_words(1, q, &[0], &[], None);
-    let wait = routed_tier_wait::native_for_device(device, &one_choice_tier_wait(device)).unwrap();
-    let step = i32_tensor(device, &[constants::STEP_WORDS], &step_words(q));
+    let mut wait = TierLanding::new(device);
     let mut file = shared_i32(device, &table.extents(), &words);
     let mut sources = i32_tensor(device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
-    let grid = i32_tensor(device, &[3], &[1, 1, 1]);
-    let policy = shared_i32(device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
     let began = std::time::Instant::now();
-    wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(device, &[1], &[0]) }).unwrap();
+    wait.call(&mut file, &mut sources).unwrap();
     let patience = began.elapsed();
     assert_eq!(
         file.load_acquire_u64(4 * (table.lane(q, 0) + constants::SLOT_EXPIRED)).unwrap(),
@@ -6790,7 +7136,7 @@ fn patience(device: &seismic::Device) -> std::time::Duration {
 
 /// A live host's long wait is answered, not given up: its pulse beats
 /// throughout (the acquire load the wait reads it by sees each beat), so a
-/// tier wait the host answers at twice the device's patience, as a still
+/// landing's wait the host answers at twice the device's patience, as a still
 /// pulse's wait on this device recorded it ([`patience`]), returns the
 /// answer, its choice sourced from the record the answer names, and stores
 /// no expiry.
@@ -6804,12 +7150,9 @@ fn a_live_hosts_long_wait_is_answered() {
     }
     let q = STREAMING_SEQUENCE as u64;
     let (table, words) = file_words(1, q, &[0], &[], None);
-    let wait = routed_tier_wait::native_for_device(&device, &one_choice_tier_wait(&device)).unwrap();
-    let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q));
+    let mut wait = TierLanding::new(&device);
     let mut file = shared_i32(&device, &table.extents(), &words);
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
-    let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
-    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
     let late = 2 * patience(&device);
     let _pulse = pulse(&file, table);
     let slot = table.lane(q, 0);
@@ -6822,7 +7165,7 @@ fn a_live_hosts_long_wait_is_answered() {
             answerer.store_release(4 * (slot + SlotTable::file_entry(0) + constants::FILE_RECORD), 5).unwrap();
             answerer.store_release(4 * (slot + constants::SLOT_ANSWER), q as u32).unwrap();
         });
-        wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) }).unwrap();
+        wait.call(&mut file, &mut sources).unwrap();
     });
     assert!(answered.elapsed() >= late, "the wait returned before its answer");
     assert_ne!(file.load_acquire_u64(4 * (slot + constants::SLOT_EXPIRED)).unwrap(), q, "a pulsed wait stored an expiry");
@@ -6861,7 +7204,7 @@ fn an_aborted_hosts_wait_ends() {
 /// PULSE_MS, has stood still for its patience, PULSE_SPINS spins at the
 /// device's own cost of a spin, which the host measures first
 /// ([`patience`]) and the test times itself by. The test runs itself as
-/// that host (one tier wait on a requested slot, pulsed), ends it by
+/// that host (one landing's wait on a requested slot, pulsed), ends it by
 /// `death` at twice that patience, and requires its GPU idle again within
 /// twice its patience and the five seconds its settling is read over; it
 /// needs the GPU to itself.
@@ -6992,17 +7335,57 @@ fn gpu_busy() -> Option<bool> {
     Some(percent > 0)
 }
 
-/// The tier wait's specialization for one choice: K 1 where it is static.
-fn one_choice_tier_wait(device: &seismic::Device) -> seismic::NativeSpecialization {
-    let implementation = seismic::generated::native_implementation::<routed_tier_wait::Entry>(device).unwrap().unwrap();
-    let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |statics, name| {
-        assert_eq!(name, "K", "the tier wait's statics");
-        statics.with_static(name.clone(), 1)
-    });
-    implementation.default_specialization(&statics).unwrap()
+/// The element bindings a dense landing's portable body runs under
+/// (`ServedForm::dense` into F32): BF16 stored, F32 resident.
+const DENSE_LANDING: [(&str, DType); 6] =
+    [("SG", DType::BF16), ("SU", DType::BF16), ("SD", DType::BF16), ("UG", DType::F32), ("UU", DType::F32), ("UD", DType::F32)];
+
+/// A decode layer's landing of one choice where the host tier places
+/// (V = S = 0): nothing lands, the launch waits on its slot and sources,
+/// one threadgroup; what the pulse's tests wait on.
+struct TierLanding {
+    kernel: seismic::NativeKernel<routed_land::Entry>,
+    step: seismic::Tensor,
+    policy: seismic::Tensor,
+    landing: seismic::Tensor,
+    staging: [seismic::Tensor; 3],
+    bank: [seismic::Tensor; 3],
 }
 
-/// The host a dead-host test ends: one tier wait on step q's
+impl TierLanding {
+    fn new(device: &seismic::Device) -> Self {
+        let form = ServedForm::dense(false, seismic::Element::f32(), 1, 1);
+        Self {
+            kernel: form.land_kernel(device, 1),
+            step: streaming_step(device),
+            policy: shared_i32(device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]),
+            landing: shared_i32(device, &[landing_extent(1)], &landing_words(STREAMING_SEQUENCE, 0, &[], 1)),
+            staging: form.records(device, false, 0, |_, _| None),
+            bank: form.records(device, true, 0, |_, _| None),
+        }
+    }
+
+    fn call(&mut self, file: &mut seismic::Tensor, sources: &mut seismic::Tensor) -> Result<(), seismic::CallError> {
+        let [gate, up, down] = self.bank.each_mut();
+        self.kernel
+            .call(routed_land::Args {
+                step: &self.step,
+                file,
+                sources,
+                policy: &self.policy,
+                landing: &mut self.landing,
+                staging_gate: &self.staging[0],
+                staging_up: &self.staging[1],
+                staging_down: &self.staging[2],
+                gate,
+                up,
+                down,
+            })
+            .map(|_| ())
+    }
+}
+
+/// The host a dead-host test ends: one landing's wait on step q's
 /// requested, unanswered slot of a one-choice file table, its pulse
 /// advanced every PULSE_MS as a live host's watchdog does, then nothing but
 /// its `death`: the kill, its own abort at twice its device's patience
@@ -7015,12 +7398,9 @@ fn dead_host(death: &str) -> ! {
     let late = 2 * measured;
     let q = STREAMING_SEQUENCE as u64;
     let (table, words) = file_words(1, q, &[0], &[], None);
-    let wait = routed_tier_wait::native_for_device(&device, &one_choice_tier_wait(&device)).unwrap();
-    let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q));
+    let mut wait = TierLanding::new(&device);
     let mut file = shared_i32(&device, &table.extents(), &words);
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
-    let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
-    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
     // A stalling host stops its pulse at twice its patience after its call;
     // any other beats until it dies.
     let beating = pulse(&file, table);
@@ -7040,7 +7420,7 @@ fn dead_host(death: &str) -> ! {
         });
     }
     println!("{WAITING}");
-    let returned = wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) });
+    let returned = wait.call(&mut file, &mut sources);
     println!("{RETURNED} {:?}", returned.map(|_| ()));
     // A wait that ended on its still pulse stores its step as its slot's
     // SLOT_EXPIRED, by which the live host interrupts exactly that step.
@@ -7107,7 +7487,6 @@ fn routed_select_streamed_at_deepseek_v41_decode_shape_times() {
         let mut routes = zeros(seismic::Element::i32(), &[m, k]);
         let mut weights = zeros(f32, &[m, k]);
         let mut file = words(&table.extents());
-        let mut grids = zeros(seismic::Element::i32(), &[constants::DECODE_GRIDS, 3]);
         let mut sources = zeros(seismic::Element::i32(), &[constants::SOURCE_ROWS, m, k]);
         let mut rings = zeros(seismic::Element::i32(), &[ahead, constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * choices]);
         let mut routing = words(&[FLIGHT, constants::RING_EXPERTS + 2 * choices]);
@@ -7139,7 +7518,6 @@ fn routed_select_streamed_at_deepseek_v41_decode_shape_times() {
                 sited: 0,
                 step: &step,
                 file: &mut file,
-                grids: &mut grids,
                 sources: &mut sources,
                 next_router_norm: &ones,
                 next_router: &routers[1],

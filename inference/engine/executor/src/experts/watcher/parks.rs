@@ -6,8 +6,8 @@
 //!
 //! A graph places a park node (`seismic::timeline::Park`) before each
 //! call that waits on a slot of the exchange (`experts::exchange`): a
-//! decode layer's tier wait (`routed_tier_wait`, its file slot), a scratch
-//! round's wait (`routed_scratch_wait`, its round's lane) and a sited
+//! decode layer's landing launch (`routed_land`, its file slot), a scratch
+//! round's launch (`routed_round`, its round's lane) and a sited
 //! combine's sum (`routed_down_sited`, `routed_output_sited`, its site
 //! slot); and a publication (`seismic::timeline::Publish`) right after a site
 //! request (`routed_site_request`), so the CPU pool reads the request while
@@ -50,7 +50,7 @@
 //! which the hardware forces here too. A blocking wait on the timeline
 //! (`vkWaitSemaphores`) returns 25 to 97 µs after the device reached the
 //! value on GB10 (`seismic_vulkan`'s `the_keepers_wait_is_measured`), and a
-//! tier wait's or a round's request is the host's only from then.
+//! landing launch's or a round's request is the host's only from then.
 //! Otherwise the keeper waits on the parks' changes.
 //!
 //! While the device runs between parks its writes are not visible to the
@@ -79,9 +79,9 @@ use std::thread::JoinHandle;
 /// waits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkKind {
-    /// The decode tier wait (`routed_tier_wait`): the file slot.
-    TierWait,
-    /// A scratch round's wait (`routed_scratch_wait`), by its round: its
+    /// The decode landing launch (`routed_land`): the file slot.
+    Land,
+    /// A scratch round's launch (`routed_round`), by its round: its
     /// lane of the scratch slot, which its arrival requests.
     Round(u64),
     /// A sited combine's wait for the CPU's answer (`routed_down_sited`,
@@ -94,7 +94,7 @@ impl ParkKind {
     /// (`seismic::ParkAnswer::park`).
     fn label(self) -> &'static str {
         match self {
-            Self::TierWait => "tier wait",
+            Self::Land => "landing launch",
             Self::Round(_) => "scratch round",
             Self::Site => "sited combine",
         }
@@ -122,18 +122,37 @@ impl ParkLayer {
     /// nothing.
     fn lane(&self, kind: ParkKind) -> Option<(&ExchangeTable, u64, bool)> {
         match kind {
-            ParkKind::TierWait => Some((&self.file, 0, false)),
+            ParkKind::Land => Some((&self.file, 0, false)),
             ParkKind::Round(round) => Some((&self.scratch, round_lane(round), true)),
             ParkKind::Site => self.site.as_ref().map(|site| (site, 0, false)),
         }
     }
 
     /// Whether a wait of `step`'s at this layer ended on its still pulse,
-    /// before its answer ([`ExchangeTable::expired`]): its tier wait's,
+    /// before its answer ([`ExchangeTable::expired`]): its landing launch's,
     /// any round's, or its sited combine's.
+    ///
+    /// # Panics
+    /// When a kernel found a state the protocol never reaches at this layer
+    /// ([`ExchangeTable::violated`]).
     fn expired(&self, step: u64) -> bool {
-        let lanes = |table: &ExchangeTable| (0..table.table().lanes()).any(|lane| table.expired(step, lane));
-        lanes(&self.file) || lanes(&self.scratch) || self.site.as_ref().is_some_and(lanes)
+        let any = |lane_is: &dyn Fn(&ExchangeTable, u64) -> bool| {
+            [&self.file, &self.scratch]
+                .into_iter()
+                .chain(self.site.as_ref())
+                .any(|table| (0..table.table().lanes()).any(|lane| lane_is(table, lane)))
+        };
+        // A step that unwinds from this panic reads it again as it drops:
+        // reported, not asserted twice.
+        let violated = any(&|table, lane| table.violated(step, lane));
+        if std::thread::panicking() {
+            if violated {
+                eprintln!("a kernel found a state the exchange protocol never reaches at step {step}");
+            }
+        } else {
+            assert!(!violated, "a kernel found a state the exchange protocol never reaches at step {step}");
+        }
+        any(&|table, lane| table.expired(step, lane))
     }
 }
 
@@ -396,7 +415,7 @@ impl Parks {
                     false => head.value,
                 }
             }
-            ParkKind::TierWait | ParkKind::Round(_) => head.value,
+            ParkKind::Land | ParkKind::Round(_) => head.value,
         };
         !self.device_reached(held, value)
     }
@@ -608,7 +627,7 @@ mod tests {
     }
 
     /// Each registered park is answered once the device is parked at it and
-    /// its slot's rule holds, in order: a tier wait without a request at
+    /// its slot's rule holds, in order: a landing launch without a request at
     /// once, one with a request once its slot is answered, a round once its
     /// lane is answered, its arrival requested as the device reaches it.
     #[test]
@@ -618,7 +637,7 @@ mod tests {
         let parks = parks(&device);
         assert!(parks.kept);
         assert!(!parks.parked(), "with no park registered, a request may be in flight");
-        let wait = ParkSite { layer: 0, kind: ParkKind::TierWait };
+        let wait = ParkSite { layer: 0, kind: ParkKind::Land };
         let round = ParkSite { layer: 0, kind: ParkKind::Round(1) };
         // The values runs take when queued, each park two.
         let values = [1, 3, 5];
@@ -696,7 +715,7 @@ mod tests {
     /// once the device reached its request's publication: at once where
     /// the step requested nothing of the CPU, else once the pool answers.
     /// Neither answer reads as the device having reached the park, and a
-    /// tier wait, whose request the host reads only at the park, waits for
+    /// landing launch, whose request the host reads only at the park, waits for
     /// the device. The keeper answers the first as the device reaches the
     /// publication.
     #[test]
@@ -717,9 +736,9 @@ mod tests {
         site.answer(7, 0, false);
         assert!(parks.settle());
         assert!(parks.timeline.answered(3).unwrap() && !parks.timeline.reached(3).unwrap(), "the pool's answer opens the park first");
-        // Step 8's tier wait reads a request the device has not made
+        // Step 8's landing launch reads a request the device has not made
         // visible: it waits for the device to park.
-        parks.register(5, 8, ParkSite { layer: 0, kind: ParkKind::TierWait });
+        parks.register(5, 8, ParkSite { layer: 0, kind: ParkKind::Land });
         assert!(!parks.settle());
         parks.timeline.reach(5).unwrap();
         assert!(parks.settle());
@@ -748,7 +767,7 @@ mod tests {
         let device = boundary_device();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
-        parks.register(1, 7, ParkSite { layer: 0, kind: ParkKind::TierWait });
+        parks.register(1, 7, ParkSite { layer: 0, kind: ParkKind::Land });
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(!parks.timeline.answered(1).unwrap(), "a park answered before the device reached it");
         parks.timeline.reach(1).unwrap();
@@ -771,7 +790,7 @@ mod tests {
             let parks = parks.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(5));
-                parks.register(1, 7, ParkSite { layer: 0, kind: ParkKind::TierWait });
+                parks.register(1, 7, ParkSite { layer: 0, kind: ParkKind::Land });
             })
         };
         assert!(parks.look(), "a registration ends the wait");
@@ -791,7 +810,7 @@ mod tests {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
-        let wait = ParkSite { layer: 0, kind: ParkKind::TierWait };
+        let wait = ParkSite { layer: 0, kind: ParkKind::Land };
         for (index, value) in (1..4000u64).step_by(2).enumerate() {
             parks.register(value, 7, wait);
             // The device arrives after a varying delay, which sweeps the
@@ -851,7 +870,7 @@ mod tests {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
-        let wait = ParkSite { layer: 0, kind: ParkKind::TierWait };
+        let wait = ParkSite { layer: 0, kind: ParkKind::Land };
         let quiet = parks.events.seen();
         // A decode's parks that wait for nothing: none requested its slot.
         for value in (1..400u64).step_by(2) {
@@ -890,7 +909,7 @@ mod tests {
     fn retiring_a_step_removes_its_parks() {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = parks(&device);
-        let site = ParkSite { layer: 0, kind: ParkKind::TierWait };
+        let site = ParkSite { layer: 0, kind: ParkKind::Land };
         for (value, sequence) in [(1, 3), (3, 4), (5, 3), (7, 5)] {
             parks.register(value, sequence, site);
         }

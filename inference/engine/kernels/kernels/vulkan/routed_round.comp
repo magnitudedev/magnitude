@@ -1,0 +1,32 @@
+// Expert streaming, one round of a scratch fill (`routed_round` in
+// routed.seismic); the Vulkan form of `metal/routed_round.metal`, after its
+// park, which the host opened once the round's lane was answered (every
+// entry appended), having stored the round's arrival as the device reached
+// the park: every workgroup's invocation 0 stores it too, then the
+// workgroups read the landing list's head once and convert the entries
+// they claim into the scratch tier (streaming/land.hpp over
+// `lib/streaming/land.glsl`). A negative `from` names scratch slot -1 -
+// from, the stored bytes the host read there.
+#include <seismic/slab.glsl>
+#include "lib/streaming/control.glsl"
+#include "lib/streaming/window.glsl"
+
+#define LAND_SOURCE_GATE SEISMIC_CONVEYOR_GATE
+#define LAND_SOURCE_UP SEISMIC_CONVEYOR_UP
+#define LAND_SOURCE_DOWN SEISMIC_CONVEYOR_DOWN
+#define LAND_SOURCE_GATE_BUFFER SEISMIC_BUFFER_CONVEYOR_GATE
+#define LAND_SOURCE_UP_BUFFER SEISMIC_BUFFER_CONVEYOR_UP
+#define LAND_SOURCE_DOWN_BUFFER SEISMIC_BUFFER_CONVEYOR_DOWN
+#include "lib/streaming/land.glsl"
+#include "../streaming/round.hpp"
+
+void routed_round() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+    const uint64_t slot = streaming_round_lane(q, uint64_t(SEISMIC_PARAM_ROUND), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH));
+    if (tid == 0u)
+        streaming_round_arrive(slot, SEISMIC_SCRATCH_STRIDE_1, q);
+    streaming_land(STREAMING_LAND_WINDOW, SEISMIC_PTR(SEISMIC_BUFFER_LANDING), SEISMIC_LANDING_STRIDE_0, slot,
+        SEISMIC_SCRATCH_STRIDE_1, q, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTERS), uint(SEISMIC_DIM_L),
+        gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z, 0u, tid);
+}

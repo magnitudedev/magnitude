@@ -220,9 +220,9 @@ impl ExpertBank {
         write_blocks(&self.layout.load.tier_grid, blocks)
     }
 
-    /// Each bank group's convert in a decode barrier takes its `lines` from
-    /// now on (`assessment::ConvertCosts`, which the job measured): a miss
-    /// lands wherever its line is sooner.
+    /// Each bank group's device convert takes its `lines` from now on
+    /// (`assessment::ConvertCosts`, which the job measured): where the bank
+    /// places, what a request's landing adds past its last read.
     pub fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
         self.watcher.shared().device_convert(lines);
     }
@@ -563,17 +563,11 @@ impl ExpertBank {
                 let pool = self.pool_of[index].get(kind).ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
                 &self.layout.staging[*pool]
             }
-            BankPart::LandingList | BankPart::LandingGrids => {
-                match part {
-                    BankPart::LandingList => &layer.landing.list,
-                    _ => layer.landing.grids.as_ref().ok_or_else(|| format!("bank part {part:?} of a bank the device places"))?,
-                }
-            }
-            BankPart::ConvertList { round } => load
-                .lists
+            BankPart::LandingList => &layer.landing,
+            BankPart::RoundList { round } => layer
+                .rounds
                 .get(usize::from(round))
-                .ok_or_else(|| format!("bank part {part:?} names no convert round"))?,
-            BankPart::ConvertStaged => &load.convert_staged,
+                .ok_or_else(|| format!("bank part {part:?} names no scratch round"))?,
             BankPart::TierList => &layer.tiered,
             BankPart::TierGrid => &load.tier_grid,
             BankPart::TierStaged => &load.tier_staged,

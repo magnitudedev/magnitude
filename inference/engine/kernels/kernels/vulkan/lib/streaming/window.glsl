@@ -30,7 +30,7 @@
 // D, N, K)` (dense `S` into dense `U`) defines, over source tensor `SRC`'s
 // and destination `D`'s strides and the record's [N, K] matrix:
 // - `NAME_items()`, a record's items: a packed record's row tiles by its
-//   windows, a dense record's rows;
+//   windows, a dense record's spans of elements;
 // - `NAME_convert(record, destination, item, window)`, item `item` of the
 //   source record at `record` into the destination record at `destination`,
 //   by the whole workgroup, a packed record's through the window at byte
@@ -147,14 +147,39 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
     }
 
 #define STREAMING_DENSE(NAME, S, U, SRC, D, N, K) \
-    uint64_t NAME##_items() { \
-        return uint64_t(N); \
+    /* The source's element bytes, and a span of a record's flattened elements */ \
+    /* an item holds (`streaming_dense_span`): each item is staged through the */ \
+    /* window and converted from it. */ \
+    uint NAME##_element() { \
+        return ELEMENT_BYTES(STREAMING_DENSE_KIND(S)); \
     } \
-    void NAME##_convert(uint64_t record, uint64_t destination, uint64_t n, uint window) { \
+    uint NAME##_span() { \
+        return streaming_dense_span(NAME##_element(), gl_WorkGroupSize.x, uint(SEISMIC_CONST_WINDOW_BYTES)); \
+    } \
+    uint64_t NAME##_items() { \
+        return uint64_t(streaming_dense_items(uint(N) * uint(K), NAME##_element(), NAME##_span())); \
+    } \
+    void NAME##_convert(uint64_t record, uint64_t destination, uint64_t item, uint window) { \
+        /* Vulkan's running work sees no host write (its parks are submission */ \
+        /* boundaries), so the span is read in place: no window. */ \
         barrier(); \
-        for (uint64_t k = gl_LocalInvocationIndex; k < uint64_t(K); k += gl_WorkGroupSize.x) \
+        const uint in_span = NAME##_span() / NAME##_element(); \
+        const uint first = uint(item) * in_span; \
+        const uint count = min(in_span, uint(N) * uint(K) - first); \
+        /* A thread's row and column step with its element: two divides an item. */ \
+        uint row = (first + gl_LocalInvocationIndex) / uint(K), column = (first + gl_LocalInvocationIndex) % uint(K); \
+        const uint row_step = gl_WorkGroupSize.x / uint(K), column_step = gl_WorkGroupSize.x % uint(K); \
+        for (uint e = gl_LocalInvocationIndex; e < count; e += gl_WorkGroupSize.x) { \
+            const uint64_t n = uint64_t(row), k = uint64_t(column); \
             element_put(STREAMING_DENSE_KIND(U), destination, n * D##_STRIDE_1 + k * D##_STRIDE_2, \
                 element_at(STREAMING_DENSE_KIND(S), record, n * SRC##_STRIDE_1 + k * SRC##_STRIDE_2)); \
+            row += row_step; \
+            column += column_step; \
+            if (column >= uint(K)) { \
+                column -= uint(K); \
+                ++row; \
+            } \
+        } \
         memoryBarrierBuffer(); \
         barrier(); \
     }

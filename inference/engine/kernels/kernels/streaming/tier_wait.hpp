@@ -1,8 +1,9 @@
-// Expert streaming: a streamed layer's tier wait (`routed_tier_wait` in
-// routed.seismic), over the backend's shim (streaming/contract.hpp): the
-// body of the route's wait grid (WAIT_GRID), one group. The grid is empty
-// unless the route requested the step's slot of the layer's file table, so
-// the slot is this step's request whenever it runs.
+// Expert streaming: a streamed layer's absent choices' sources
+// (`source_landed` in routed.seismic, the end of `routed_land`), over the
+// backend's shim (streaming/contract.hpp): the body of the landing
+// launch's threadgroup 0, once it has converted what it claimed. A step
+// whose route requested nothing finds its slot not this step's request and
+// writes nothing.
 //
 // Each thread waits on the slot (`streaming_await_slot`, which the host
 // answers once it landed every absent choice's expert and wrote where each
@@ -16,7 +17,8 @@
 // SOURCE_SITE -1. Every thread reads the same words, so no thread waits for
 // another.
 
-// Thread `tid` of `threads`' wait and its choices' sources: `file` the
+// Thread `tid` of `threads`' wait and its choices' sources, where the slot
+// is this step's request: `file` the
 // layer's file table (strides `file0`, `file1`), `sources0`..`sources2` the
 // route's sources' strides; `step` the step pair.
 STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STREAMING_SYSTEM_WORDS file, u64 file0,
@@ -24,6 +26,8 @@ STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STR
     u32 threads STREAMING_WORDS_PARAM) {
     const u64 q = streaming_step(step, step0);
     STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, (q % u64(SEISMIC_DIM_FLIGHT)) * file0);
+    if (streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * file1)) != q)
+        return;
     const bool answered = streaming_await_slot(slot, file1, q);
     const u32 K = u32(SEISMIC_DIM_K);
     const u32 count = u32(streaming_load(STREAMING_AT(slot, SEISMIC_CONST_FILE_COUNT * file1)));

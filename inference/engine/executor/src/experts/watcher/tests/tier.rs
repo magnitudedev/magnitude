@@ -35,7 +35,7 @@ fn a_refill_past_the_last_step_leaves_no_grace() {
 /// absent, every choice the bank lacks served from the tier, and the tier
 /// keeps them all, with no reserve unmapped. No expert can then be absent:
 /// the next gap sets the layer's resolved word, its group not whole, so its
-/// tier wait and the wait's park are left out of every step.
+/// landing launch and the wait's park are left out of every step.
 #[test]
 fn a_tier_of_every_expert_keeps_every_expert_its_misses_land() {
     // No staging beyond a request's own, so the cover reads nothing and

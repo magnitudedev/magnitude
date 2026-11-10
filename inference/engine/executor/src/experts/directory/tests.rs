@@ -86,7 +86,7 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let backend = seismic::BackendName::Metal;
     let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-    let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified };
+    let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified(crate::planning::Parking::InKernels) };
     let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let plan = load.expert_bank().unwrap();

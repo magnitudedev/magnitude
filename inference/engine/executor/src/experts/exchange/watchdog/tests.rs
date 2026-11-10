@@ -149,6 +149,22 @@ fn an_unanswered_lane_of_each_kind_trips_with_its_report() {
     }
 }
 
+/// A kernel that found a state the protocol never reaches stores the step
+/// violated and stops: the watchdog reports it at once, whatever the lane's
+/// bound, instead of an unrelated unanswered wait.
+#[test]
+fn a_violation_stored_by_a_kernel_trips_at_once_with_its_message() {
+    let (limit, began) = (Duration::from_secs(10), Instant::now());
+    let bounds = bounds(limit, volumes(1e-3));
+    let slots = slots(SlotTable::file(4, 2));
+    slots.request(6, 0);
+    let mut watch = watch(vec![Watched { kind: Kind::File, layer: 3, slots }], Box::new(|| Park::Clear), Box::new(|_| false), Box::new(idle), began);
+    assert!(watch.look(began + limit / 10, &bounds).is_none(), "tripped with nothing wrong");
+    watch.tables[0].slots.violate(6, 0);
+    let report = watch.look(began + limit / 5, &bounds).expect("a violation never tripped");
+    assert!(report.contains("never reaches at step 6"), "{report}");
+}
+
 /// A lane whose read has pieces in flight is being answered and never trips
 /// while their volume ends one within its bound: neither while it is within
 /// the bound ending none (the load's only reads on a saturated volume, far

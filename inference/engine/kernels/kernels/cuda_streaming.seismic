@@ -4,15 +4,14 @@
 # (`SEISMIC_PARKS_IN_KERNELS` 1, `streaming/park.hpp`), over the protocol
 # every backend shares (`cuda/lib/streaming/control.cuh`). The protocol
 # entries' unmeasured geometry is every backend's (SERIAL_THREADS,
-# LIST_THREADS, REQUEST_THREADS, LIST_GROUPS by LIST_ROWS:
-# streaming_words.seismic); `routed_convert` takes a block per
-# CONVERT_TILE_ROWS-row tile.
+# LIST_THREADS, REQUEST_THREADS, LIST_GROUPS by LIST_ROWS, LAND_GROUPS:
+# streaming_words.seismic).
 
-# The threads of a block that converts by windows (`routed_convert`): eight
+# The threads of a block that converts by windows (a landing launch's): eight
 # warps, each placing two tiles at once, a half warp each from its own stage
 # words (`cuda/lib/streaming/window.cuh`, `Shared`, which asserts that a
 # warp's stages fit CUDA's 48 KB of static shared memory beside the
-# WINDOW_BYTES window and the block's words).
+# WINDOW_BYTES window, 20 KiB, and the block's words).
 const WINDOW_THREADS = 256
 
 # A converting block's mirror of the row tile it converts, written to the
@@ -45,28 +44,11 @@ native routed_pass_map for cuda from "cuda/routed_pass_map.cu":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
-# The block stages a list into device memory.
-native routed_list_stage for cuda from "cuda/routed_list_stage.cu":
-    launch routed_list_stage:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (LIST_THREADS, 1, 1)
-
 # `routed_copy`'s geometry, on every entry (a shrink lists its moves).
 native routed_move for cuda from "cuda/routed_move.cu":
     launch routed_move:
         threadgroups (LIST_GROUPS, LIST_ROWS, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
-
-# A block per CONVERT_TILE_ROWS-row tile of each listed record, converting
-# its windows in turn, on its round's grid (`routed_scratch_grids`), through
-# `cuda/lib/streaming/window.cuh`, the tile mirrored in its dynamic shared
-# memory; a dense record, converted row by row, reserves none.
-native routed_convert for cuda from "cuda/routed_convert.cu":
-    launch routed_convert:
-        threadgroups (ceil_div(N, CONVERT_TILE_ROWS), L, 1)
-        grid (grid)
-        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
-        shared_bytes (packed(U) * MIRROR_BYTES)
 
 # One block counts every choice in shared memory; a resident group's step
 # requests nothing.
@@ -77,13 +59,16 @@ native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
         unless (resident)
         threads_per_threadgroup (REQUEST_THREADS, 1, 1)
 
-# A round parks on its written grid (`routed_scratch_grids`): one block while
-# it, or unfollowed the round before, has records to convert.
-native routed_scratch_wait for cuda from "cuda/routed_scratch_wait.cu":
-    launch routed_scratch_wait:
-        threadgroups (1, 1, 1)
+# A round's landing launch on its park grid (`routed_scratch_grids`), each
+# block's thread 0 storing the round's arrival, then claiming as
+# `routed_land`'s.
+native routed_round for cuda from "cuda/routed_round.cu":
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_round:
+        threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
-        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
+        shared_bytes (max(packed(UG), max(packed(UU), packed(UD))) * MIRROR_BYTES)
 
 # Thread 0 writes every round's grids.
 native routed_scratch_grids for cuda from "cuda/routed_scratch_grids.cu":
@@ -91,17 +76,26 @@ native routed_scratch_grids for cuda from "cuda/routed_scratch_grids.cu":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (SERIAL_THREADS, 1, 1)
 
-# The launch on the route's wait grid over the shared tier wait
-# (`streaming/tier_wait.hpp`): one block, its first thread spinning on the
-# step's slot, its threads then writing the absent choices' sources, while
-# a choice is absent.
-native routed_tier_wait for cuda from "cuda/routed_tier_wait.cu":
+# The landing launch (`streaming/land.hpp` over the window library,
+# `cuda/lib/streaming/window.cuh`, `cuda/lib/streaming/land.cuh`): where the
+# bank places (V > 0), LAND_GROUPS blocks claiming (entry, item) work in
+# landing order, each item a whole row tile of one routed tensor (or a
+# dense record's row), its windows converted in turn, each loaded while the
+# one before converts, and the next claim's first window loaded while the
+# tile's last converts where that claim's entry has landed; the tile
+# mirrored in the dynamic shared memory and written whole. Thread 0 awaits
+# the entry it claimed, one block at a time polling the host's count
+# (`streaming_land_poll`); block 0 then writes each
+# absent choice's sources (`streaming/tier_wait.hpp`). Where the tier
+# places, one block only sources.
+native routed_land for cuda from "cuda/routed_land.cu":
     static (K)
-    launch routed_tier_wait:
-        threadgroups (1, 1, 1)
-        grid (grid)
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_land:
+        threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
         unless (policy[POLICY_RESOLVED])
-        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
+        shared_bytes (min(V, 1) * max(packed(UG), max(packed(UU), packed(UD))) * MIRROR_BYTES)
 
 # Metal's launches over `routed_select`'s CUDA decode launches and
 # parameters (so its bits, `cuda/lib/routed/selection.cuh`): the GEMV adds

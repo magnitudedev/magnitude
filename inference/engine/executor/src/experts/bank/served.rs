@@ -305,11 +305,6 @@ impl ElasticBank for ServedBank {
     }
 
     #[cfg(test)]
-    fn slow_host_landing(&self) {
-        self.bank.watcher.shared().slow_host_landing();
-    }
-
-    #[cfg(test)]
     fn device_landed(&self) -> u64 {
         self.bank.watcher.shared().device_landed()
     }

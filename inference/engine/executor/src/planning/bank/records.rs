@@ -262,6 +262,19 @@ impl RecordTensor {
     pub fn record_bytes(&self) -> Result<u64, String> {
         record_bytes(self.resident, self.matrix)
     }
+
+    /// `records` records as stored: the element and extents of the staging
+    /// and conveyor tensors that hold them, wherever one is laid.
+    pub fn stored_tensor(&self, records: u64) -> (Element, [u64; 3]) {
+        (self.source, [records, self.matrix[0], self.matrix[1]])
+    }
+
+    /// `records` records as resident: the element and extents of the
+    /// tensors of a bank group's records, its scratch and host tier, wherever
+    /// one is laid.
+    pub fn resident_tensor(&self, records: u64) -> (Element, [u64; 3]) {
+        (self.resident, [records, self.matrix[0], self.matrix[1]])
+    }
 }
 
 /// One expert's `[N, K]` `matrix` in `element`: a record's bytes.

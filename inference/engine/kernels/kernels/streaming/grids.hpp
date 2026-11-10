@@ -1,25 +1,15 @@
 // Expert streaming, a scratch request's round grids (`routed_scratch_grids`
 // in routed.seismic), over the backend's shim (streaming/contract.hpp):
-// after round 0's wait, one thread reads the count of records the request's
-// rounds convert from its answer (none where the host failed it) and writes
-// each round's park grid (a round parks while it has records, or the
-// round before has and the request is not followed, SCRATCH_FOLLOWED) and
-// its converts' grids over records of F and of H rows
-// (`rows_groups`, `columns_groups` groups a row of records). A request
+// after round 0's landing launch, one thread reads the count of records the
+// request's rounds convert from its answer (none where the host failed it)
+// and writes each round's park grid, `routed_round`'s: LAND_GROUPS
+// threadgroups while the round has records, or the round before has and
+// the request is not followed (SCRATCH_FOLLOWED), else none. A request
 // still unanswered here had round 0's wait end on its still pulse
-// (`streaming_await_slot`), its count unknown: every round parks and none
+// (`streaming_await_slot`), its count unknown: every round launches and none
 // converts, so the device arrives at every round the host serves, in
 // order, as it does once the count is known. The step's later launches
 // read them in order. The includer includes streaming/round.hpp first.
-
-// Round `round`'s grid `grid` of `grids`: (x, y, 1).
-STREAMING_FN void streaming_write_grid(STREAMING_DEVICE_WORDS grids, u32 round, int grid, int x, int y
-    STREAMING_WORDS_PARAM) {
-    const u64 at = u64(round) * SEISMIC_GRIDS_STRIDE_0 + u64(grid) * SEISMIC_GRIDS_STRIDE_1;
-    streaming_device_store(STREAMING_AT(grids, at), x);
-    streaming_device_store(STREAMING_AT(grids, at + SEISMIC_GRIDS_STRIDE_2), y);
-    streaming_device_store(STREAMING_AT(grids, at + 2 * SEISMIC_GRIDS_STRIDE_2), 1);
-}
 
 // One thread calls it, for step `q`, its request the SCRATCH_ASK lane of
 // its slot of the layer's scratch table `scratch`.
@@ -35,14 +25,11 @@ STREAMING_FN void streaming_scratch_grids(u64 q, STREAMING_SYSTEM_READ scratch, 
     const int per_round = int(SEISMIC_PARAM_ROUND_RECORDS);
     for (u32 round = 0u; round < u32(SEISMIC_DIM_R); ++round) {
         const int left = count - int(round) * per_round;
-        const int records = left < 0 ? 0 : left < per_round ? left : per_round;
         const int before = round > 0u ? int(round) - 1 : 0;
-        const bool parks = unanswered || records > 0 || (after && count > before * per_round);
-        streaming_write_grid(grids, round, int(SEISMIC_CONST_PARK_GRID), parks ? 1 : 0, 1
-            STREAMING_WORDS_ARG);
-        streaming_write_grid(grids, round, int(SEISMIC_CONST_ROWS_GRID), int(SEISMIC_PARAM_ROWS_GROUPS), records
-            STREAMING_WORDS_ARG);
-        streaming_write_grid(grids, round, int(SEISMIC_CONST_COLUMNS_GRID), int(SEISMIC_PARAM_COLUMNS_GROUPS), records
-            STREAMING_WORDS_ARG);
+        const bool parks = unanswered || left > 0 || (after && count > before * per_round);
+        const u64 at = u64(round) * SEISMIC_GRIDS_STRIDE_0;
+        streaming_device_store(STREAMING_AT(grids, at), parks ? int(SEISMIC_CONST_LAND_GROUPS) : 0);
+        streaming_device_store(STREAMING_AT(grids, at + SEISMIC_GRIDS_STRIDE_1), 1);
+        streaming_device_store(STREAMING_AT(grids, at + 2 * SEISMIC_GRIDS_STRIDE_1), 1);
     }
 }

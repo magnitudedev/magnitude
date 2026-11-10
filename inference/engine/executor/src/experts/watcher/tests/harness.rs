@@ -5,7 +5,8 @@ pub(super) use super::super::telemetry::GroupFacts;
 pub(super) use crate::experts::exchange::Answer;
 pub(super) use crate::experts::{ExchangeTable, Words};
 pub(super) use crate::experts::conveyor::{Carrier, LentPool, Lending};
-pub(super) use crate::experts::landing::TierTensor;
+pub(super) use crate::experts::landing::{LandingList, TierTensor};
+pub(super) use crate::experts::ListBounds;
 pub(super) use crate::experts::map::{LandingMap, MapView, StampedMap};
 pub(super) use crate::experts::source::{ExpertSource, Outcome, Read, Records, Ticket};
 pub(super) use crate::operation::LaunchWork;
@@ -82,8 +83,12 @@ pub(super) fn until_answered(slots: &ExchangeTable, step: Step, lane: u64) -> An
 /// routed tensor; with the words a test plays the device through.
 pub(super) struct Harness {
     pub(super) watcher: Watcher,
-    /// Each layer's barrier's convert words, where the host places.
-    pub(super) device_words: Vec<Option<Arc<crate::experts::landing::DeviceWords>>>,
+    /// Each layer's decode landing list, where the bank places (the
+    /// watcher's own, which the harness plays the device's landing launch
+    /// over).
+    pub(super) landing: Vec<Option<Arc<LandingList>>>,
+    /// Each layer's round landing lists, read over the watcher's words.
+    round_lists: Vec<Vec<LandingList>>,
     /// The first layer's words, and every layer's: map, file and scratch
     /// tables, rings, routing records and policy words.
     pub(super) layer: LayerWords,
@@ -92,8 +97,8 @@ pub(super) struct Harness {
     pub(super) reads: Vec<Words>,
     /// The group's commits.
     commits: Words,
-    /// Scratch flags and convert lists.
-    pub(super) load: (Words, Vec<Words>),
+    /// The first chain place's scratch flags.
+    pub(super) flags: Words,
     /// Each layer's tier list: a request's experts the host tier keeps
     /// whole, which the device's tier copy reads (the harness plays it at
     /// round 0).
@@ -425,10 +430,13 @@ pub(super) fn lending_bank(
         .into_iter()
         .map(|records| TierTensor::new(records, Element::i32(), Element::i32(), [1, RECORD / 4], RECORD).unwrap())
         .collect::<Vec<_>>();
-    let load = (
-        words(EXPERTS as u64, 0),
-        (0..WORDS.rounds).map(|_| words(magnitude_kernels::list_extent(2), 0)).collect::<Vec<_>>(),
-    );
+    let flags = words(EXPERTS as u64, 0);
+    // Each layer's round landing lists, whose entries name conveyor records
+    // or, where the host addresses the scratch, its slots, into slots.
+    let round_bounds = ListBounds { from: conveyor_records, to: EXPERTS as u64, lent: if addressed { EXPERTS as u64 } else { 0 } };
+    let round_words = (0..layers)
+        .map(|_| (0..WORDS.rounds).map(|_| words(magnitude_kernels::landing_extent(ROUND_RECORDS), 0)).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
     let lists = || (0..layers).map(|_| words(magnitude_kernels::list_extent(EXPERTS as u64), 0)).collect::<Vec<_>>();
     let (tiered, seeds) = (lists(), lists());
     // Each tensor's conveyor: the bytes of the lent records it lies on,
@@ -481,18 +489,14 @@ pub(super) fn lending_bank(
                 .collect(),
         },
     };
-    // Each layer's barrier's convert words, where the host places.
-    let device_words = all
+    // Each layer's decode landing list, where the bank places: staging
+    // records into bank records.
+    let landing = all
         .iter()
         .map(|_| {
             (placer == Placer::Bank).then(|| {
-                Arc::new(crate::experts::landing::DeviceWords {
-                    list: words(magnitude_kernels::list_extent(EXPERTS as u64), 0),
-                    grids: words(constants::ROUND_GRIDS * 3, 0),
-                    rows_groups: 3,
-                    columns_groups: 4,
-                    bounds: crate::experts::ListBounds { from: u64::from(staging_records), to: bank_records, lent: 0 },
-                })
+                let bounds = ListBounds { from: u64::from(staging_records), to: bank_records, lent: 0 };
+                Arc::new(LandingList::new(words(magnitude_kernels::landing_extent(WORDS.choices), 0), bounds))
             })
         })
         .collect::<Vec<_>>();
@@ -517,7 +521,8 @@ pub(super) fn lending_bank(
                 stored: (0..3).map(stored_tensor).collect(),
                 slots: addressed.then(|| scratch.iter().map(|slots| Records::new(slots.clone(), RECORD, EXPERTS as u64).unwrap()).collect()),
                 scratch_form: vec![0; 3],
-                landing: device_words[index].clone(),
+                landing: landing[index].clone(),
+                rounds: round_words[index].iter().map(|words| LandingList::new(words.clone(), round_bounds)).collect(),
                 lists: ListRecords {
                     bank: bank_records,
                     // `BankBinding::tier`: the one store has no tier to copy from.
@@ -525,7 +530,6 @@ pub(super) fn lending_bank(
                         Placer::Tier => reserved,
                         Placer::Bank => 0,
                     },
-                    conveyor: conveyor_records,
                 },
                 tiered: tiered[index].clone(),
                 seeds: seeds[index].clone(),
@@ -540,10 +544,7 @@ pub(super) fn lending_bank(
                 Placer::Bank => 0,
             },
         }],
-        load: LoadWords {
-            flags: vec![load.0.clone(), second.clone()],
-            lists: load.1.clone(),
-        },
+        load: LoadWords { flags: vec![flags.clone(), second.clone()] },
         pools,
         extents: Extents {
             widest: EXPERTS,
@@ -577,12 +578,13 @@ pub(super) fn lending_bank(
     Harness {
         _pool: (!ALONE.get()).then(|| POOL.read().unwrap_or_else(std::sync::PoisonError::into_inner)),
         watcher,
-        device_words,
+        landing,
+        round_lists: round_words.into_iter().map(|lists| lists.into_iter().map(|words| LandingList::new(words, round_bounds)).collect()).collect(),
+        flags,
         layer,
         layers: all,
         reads,
         commits,
-        load,
         tiered,
         seeds,
         second,
@@ -693,6 +695,33 @@ struct AheadLine {
     bytes: u64,
     /// How long a read's end waits before it submits the read again.
     late: Duration,
+    /// What a read's end waits at, on the worker that ended it, before it
+    /// submits the read again: open unless the test holds the line.
+    gate: Gate,
+}
+
+/// A line's gate: closed, every read's end holds its worker until the test
+/// opens it, so no read the test issues behind the line is taken by a
+/// worker before then, whatever the host's speed.
+struct Gate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Gate {
+    fn new(open: bool) -> Self {
+        Self { open: Mutex::new(open), opened: std::sync::Condvar::new() }
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.opened.notify_all();
+    }
+
+    fn wait(&self) {
+        let open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(self.opened.wait_while(open, |open| !*open).unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
 }
 
 impl AheadLine {
@@ -718,6 +747,7 @@ impl AheadLine {
             ticket.on_end(move |_, _| {
                 // Ended while its hook was registered: the loop reads again.
                 if ending.compare_exchange(REGISTERING, ENDED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    line.gate.wait();
                     std::thread::sleep(line.late);
                     line.stand();
                 }
@@ -739,6 +769,20 @@ impl Ahead {
 
     /// [`Self::queue`], each read submitted again `late` after it ended.
     pub(super) fn resubmitting_after(name: &str, late: Duration) -> Self {
+        Self::standing(name, late, true)
+    }
+
+    /// [`Self::queue`] held: every read's end of the line stops its worker
+    /// until the line's end, so a read the test issues
+    /// at demand behind it is not taken until then: the pool is grown to
+    /// all it will have before the line stands, and the line's reads are
+    /// queued ahead of the test's, so each worker that ends one holds, and
+    /// none takes another.
+    pub(super) fn held(name: &str) -> Self {
+        Self::standing(name, Duration::ZERO, false)
+    }
+
+    fn standing(name: &str, late: Duration, open: bool) -> Self {
         assert!(ALONE.get(), "a test queuing reads ahead holds the pool alone (`alone`)");
         let path = std::env::temp_dir().join(format!("expert-watcher-{name}-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; Self::FILE as usize]).unwrap();
@@ -763,7 +807,7 @@ impl Ahead {
         drop(growing);
         let shape = seismic_io::link_shape(&seismic_io::OpenFile::open(&path).unwrap(), Some(&urgent())).unwrap();
         let bytes = shape.due_read.min(Self::FILE);
-        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), bytes, late });
+        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), bytes, late, gate: Gate::new(open) });
         let mut standing = 0;
         while standing < seismic_io::read_workers() + 2 {
             line.stand();
@@ -782,6 +826,7 @@ impl Ahead {
     /// End the line: every read in it lands, and none follows it.
     pub(super) fn finish(self) {
         self.line.done.store(true, std::sync::atomic::Ordering::Release);
+        self.line.gate.open();
         let tickets = std::mem::take(&mut *self.line.tickets());
         assert!(tickets.iter().all(|ticket| matches!(ticket.wait(), Outcome::Read)));
         std::fs::remove_file(&self.path).unwrap();
@@ -792,6 +837,7 @@ impl Drop for Ahead {
     /// A test that failed before it finished the line leaves no read behind.
     fn drop(&mut self) {
         self.line.done.store(true, std::sync::atomic::Ordering::Release);
+        self.line.gate.open();
         drop(std::mem::take(&mut *self.line.tickets()));
     }
 }
@@ -854,7 +900,7 @@ impl Harness {
     }
 
     /// Play a begun decode step's route of `experts` at its one layer, and
-    /// the tier wait of its request ([`Self::request_at`]).
+    /// the landing launch of its request ([`Self::request_at`]).
     pub(super) fn request(&self, experts: &[usize]) -> ExpertStep {
         let step = self.step();
         self.request_at(&step, 0, experts);
@@ -927,14 +973,45 @@ impl Harness {
     }
 
     /// Play the route of `experts` at layer `layer` in `step` and, where it
-    /// requests any, its tier wait: parked until the slot is answered, by
-    /// the step or its failure (the exchange's rule).
+    /// requests any, its landing launch: parked until the slot is answered, by
+    /// the step or its failure (the exchange's rule), landing each entry the
+    /// host appends meanwhile ([`Self::land_listed`]), and then the rest.
     pub(super) fn request_at(&self, step: &ExpertStep, layer: usize, experts: &[usize]) {
         if self.ask_at(step, layer, experts) {
             let file = &self.layers[layer].1;
             eventually(&format!("step {}'s request at layer {layer} was never answered", step.sequence()), || {
+                self.land_listed(step.sequence(), layer);
                 file.answered(step.sequence(), 0)
             });
+            self.land_listed(step.sequence(), layer);
+        }
+    }
+
+    /// Play the decode landing launch at layer `layer` of step `sequence`
+    /// where the bank places: each entry its landing list counts for the
+    /// step and not yet placed, in landing order, its staging record's
+    /// bytes of every tensor converted (the harness's identity form) into
+    /// its store record, then its DONE.
+    pub(super) fn land_listed(&self, sequence: Step, layer: usize) {
+        let Some(list) = &self.landing[layer] else {
+            return;
+        };
+        for (entry, (from, to)) in list.listed(sequence).into_iter().enumerate() {
+            if list.done(sequence, entry) {
+                continue;
+            }
+            for kind in 0..3 {
+                let mut bytes = vec![0u8; RECORD as usize];
+                let at = kind * u64::from(self.staging_records) * RECORD + from as u64 * RECORD;
+                // SAFETY: the harness plays the device; the host writes
+                // neither the staging record, read whole before its entry,
+                // nor the store record, granted, meanwhile.
+                unsafe {
+                    self.staging.read_shared(at, &mut bytes).unwrap();
+                    self.host.tier[kind as usize].write_shared(to as u64 * RECORD, &bytes).unwrap();
+                }
+            }
+            list.place(sequence, entry);
         }
     }
 
@@ -1086,7 +1163,7 @@ impl Harness {
     fn flags(&self, step: &ExpertStep) -> &Words {
         let (first, _) = self.watcher.shared().steps.group_of(step.sequence());
         match step.sequence() - first {
-            0 => &self.load.0,
+            0 => &self.flags,
             1 => &self.second,
             place => panic!("the harness has two chain places, not {}", place + 1),
         }
@@ -1117,13 +1194,9 @@ impl Harness {
     /// before the device arrives at the next, whose arrival frees them for
     /// other reads: where records or slots cycle within a request.
     pub(super) fn rounds_checked(&self, step: &ExpertStep, layer: usize) -> Vec<Vec<(i32, i32)>> {
-        let sequence = low_word(step.sequence());
-        let (_, lists) = &self.load;
         let mut rounds = Vec::new();
         self.park_answering(step, layer, true, |index| {
-            let list = &lists[index as usize];
-            assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
-            let pairs = listed(list);
+            let pairs = self.round_listed(step, layer, index);
             self.from_conveyor(&pairs);
             rounds.push(pairs);
         });
@@ -1134,14 +1207,14 @@ impl Harness {
     /// with records only where `after` says; else it arrives there later
     /// ([`Self::arrive_after`]).
     pub(super) fn rounds_arriving(&self, step: &ExpertStep, layer: usize, after: bool) -> Vec<Vec<(i32, i32)>> {
-        let sequence = low_word(step.sequence());
-        let (_, lists) = &self.load;
         let converting = self.park_arriving(step, layer, after);
-        let pairs = |list: &Words| {
-            assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
-            listed(list)
-        };
-        lists[..converting].iter().map(pairs).collect()
+        (0..converting as u64).map(|index| self.round_listed(step, layer, index)).collect()
+    }
+
+    /// The (from, expert) entries round `index` of `step`'s request at
+    /// `layer` lists, in landing order; none for a list of another step.
+    pub(super) fn round_listed(&self, step: &ExpertStep, layer: usize, index: u64) -> Vec<(i32, i32)> {
+        self.round_lists[layer][index as usize].listed(step.sequence())
     }
 
     /// Play the device arriving at every round of `step`'s request at layer
@@ -1319,11 +1392,17 @@ impl Harness {
         self.hint_at(step, layer, 0, experts);
     }
 
-    /// Play `step`'s tier wait at layer `layer` ending on its still pulse,
+    /// Play `step`'s landing launch at layer `layer` ending on its still pulse,
     /// as its kernel does when the host's pulse stood still past its
     /// patience.
     pub(super) fn expire(&self, step: &ExpertStep, layer: usize) {
         self.layers[layer].1.expire(step.sequence(), 0);
+    }
+
+    /// Play `step`'s landing launch at layer `layer` finding a state the
+    /// protocol never reaches, as its kernel records it.
+    pub(super) fn violate(&self, step: &ExpertStep, layer: usize) {
+        self.layers[layer].1.violate(step.sequence(), 0);
     }
 
     /// Play layer `layer`'s ring row of lead `lead` hinting `experts` of

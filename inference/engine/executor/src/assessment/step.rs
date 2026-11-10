@@ -176,7 +176,7 @@ impl StepInputs<'_> {
             free
         };
         // What `count` misses of `layer` add past their reads' end.
-        let landing = |layer: usize, count: u64| self.lines[layer].landed(count);
+        let landing = |layer: usize, count: u64| self.lines[layer].landed(count, reads[layer].0 * byte);
         let mut ready = vec![0f64; layers];
         // Under a token's lead every read is issued at the step's start, in
         // layer order, wrong hints after each layer's own.
@@ -270,7 +270,7 @@ impl StepInputs<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assessment::cost::{GpuLines, HostLines, Nanoseconds, PassLine};
+    use crate::assessment::cost::{GpuLines, HostLines, LandingLine, Nanoseconds, PassLine};
     use crate::assessment::streaming_costs::{FileLine, RecordLine};
 
     /// A record alone in 1 ms at 2 GB/s: 2 MB records, `λ` 0.
@@ -283,16 +283,16 @@ mod tests {
     /// of nothing.
     fn unified() -> ExpertLines {
         let none = PassLine { weights: Nanoseconds::try_from(0).unwrap(), row: Nanoseconds::try_from(0).unwrap() };
-        ExpertLines { host: HostLines { cpu: None, memory: None, file: None, convert: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none } }
+        ExpertLines { host: HostLines { cpu: None, memory: None, landing: None, record_bytes: 2_000_000 }, gpu: GpuLines { link: none, resident: none } }
     }
 
     fn landed_host() -> FileLine {
         FileLine { landing: RecordLine::new(0.2e-3, 0.1e-3).unwrap() }
     }
 
-    fn landed_line(file: FileLine) -> ExpertLines {
+    fn landed_line(landing: LandingLine) -> ExpertLines {
         let mut landed = unified();
-        landed.host.file = Some(file);
+        landed.host.landing = Some(landing);
         landed
     }
 
@@ -357,21 +357,26 @@ mod tests {
     }
 
     /// A miss's records are whole only once they land, which its layer's
-    /// barrier waits for too.
+    /// computes wait for too: on the host, a request's every landing past
+    /// its reads' end; on the device, whose landing launch converts each
+    /// record as its read lands, the last record's convert alone, however
+    /// many the request reads.
     #[test]
-    fn a_barrier_waits_for_its_landing() {
-        let lines = [landed_line(landed_host()); 4];
+    fn a_layer_waits_for_its_landing() {
+        let lines = [landed_line(LandingLine::Host(landed_host())); 4];
         let demand = inputs(&lines, Lead::Layers(0.), 1.);
         close(one(&demand, &[load(0, 0.), load(2, 0.), load(0, 0.), load(0, 0.)]).0, 1e-3 + 2e-3 + 0.4e-3 + 3e-3);
-        // A device convert of 0.05 + 0.03 a record lands them sooner; one of
-        // 1 ms a record does not.
-        for (convert, landed) in [((0.05e-3, 0.03e-3), 0.11e-3), ((0., 1e-3), 0.4e-3)] {
-            let mut priced = landed_line(landed_host());
-            priced.host.convert = Some(RecordLine::new(convert.0, convert.1).unwrap());
-            let lines = [priced; 4];
-            let demand = inputs(&lines, Lead::Layers(0.), 1.);
-            close(one(&demand, &[load(0, 0.), load(2, 0.), load(0, 0.), load(0, 0.)]).0, 1e-3 + 2e-3 + landed + 3e-3);
+        let device = [landed_line(LandingLine::Device(RecordLine::new(0.05e-3, 0.03e-3).unwrap())); 4];
+        let demand = inputs(&device, Lead::Layers(0.), 1.);
+        for misses in [1, 2, 6] {
+            close(one(&demand, &[load(0, 0.), load(misses, 0.), load(0, 0.), load(0, 0.)]).0, 1e-3 + misses as f64 * 1e-3 + 0.08e-3 + 3e-3);
         }
+        // Conversion slower than the reads (2 ms a record against their 1 ms)
+        // is what holds the layer: six records convert 12 ms from the first
+        // landing, 7 ms past the last read (at 6 ms, 5 ms after the first).
+        let slow = [landed_line(LandingLine::Device(RecordLine::new(0., 2e-3).unwrap())); 4];
+        let demand = inputs(&slow, Lead::Layers(0.), 1.);
+        close(one(&demand, &[load(0, 0.), load(6, 0.), load(0, 0.), load(0, 0.)]).0, 1e-3 + 6e-3 + 7e-3 + 3e-3);
     }
 
     /// A hint `ℓ` layers ahead is issued at the route `ℓ` before and hides
@@ -440,7 +445,7 @@ mod tests {
         for cell in cells {
             let mut line = unified();
             line.host.record_bytes = 1_900_544;
-            line.host.file = Some(FileLine { landing: RecordLine::new(cell.landing.0, cell.landing.1).unwrap() });
+            line.host.landing = Some(LandingLine::Host(FileLine { landing: RecordLine::new(cell.landing.0, cell.landing.1).unwrap() }));
             let lines = [line; 40];
             let step = StepInputs {
                 compute: cell.compute,

@@ -3,7 +3,7 @@
 // and `routed_select_streamed` share: the group's step-stamped map
 // ([GM, MAP_WORDS], the layer's expert e at row `home + e`), the layer's
 // tier map (TM words, none without a host tier), the step pair, the step's
-// sources, routing record, grids and file table. Every thread of the
+// sources, routing record and file table. Every thread of the
 // selecting block calls it (`routed_resolve`), `words` its group words
 // (`STREAMING_RESOLVE_WORDS`).
 
@@ -11,7 +11,7 @@
 // (`ROUTED_RESOLVE_PORTS`, in the kernel's own scope).
 struct ResolvePorts {
     const int *routes, *step;
-    int *sources, *routing, *grids, *file;
+    int *sources, *routing, *file;
     const int *map, *tier, *policy;
 };
 
@@ -21,7 +21,6 @@ struct ResolvePorts {
             reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)),                                \
             reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES)),                                   \
             reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTING)),                                   \
-            reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_GRIDS)),                                     \
             reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_FILE)),                                      \
             reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_MAP)),                                 \
             reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TIER)),                                \
@@ -37,8 +36,8 @@ __device__ __forceinline__ void routed_resolve(const ResolvePorts &bank, bool wh
         SEISMIC_TIER_STRIDE_0, static_cast<unsigned>(SEISMIC_DIM_TM), static_cast<unsigned>(SEISMIC_PARAM_SITED),
         bank.sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
         SEISMIC_SOURCES_STRIDE_2, bank.routing, SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1,
-        static_cast<unsigned>(SEISMIC_DIM_FLIGHT), static_cast<unsigned>(SEISMIC_DIM_P), bank.grids,
-        SEISMIC_GRIDS_STRIDE_0, SEISMIC_GRIDS_STRIDE_1, bank.file, SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1,
+        static_cast<unsigned>(SEISMIC_DIM_FLIGHT), static_cast<unsigned>(SEISMIC_DIM_P), bank.file,
+        SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1,
         bank.policy, words,
         threadIdx.x, blockDim.x);
 }

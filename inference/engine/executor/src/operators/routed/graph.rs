@@ -15,7 +15,7 @@ use super::grouped::{ExpertsPass, Grouped};
 use super::split::{Crossing, PassPorts, Split};
 use super::streamed::{
     BankCombineEntry, BankForm, BankNumbers, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals,
-    StreamedLayer, WaitPorts,
+    StreamedLayer, LandPorts,
 };
 use super::{GeneralRoutedForm, GeneralRoutedNumbers, SharedExpertNumbers};
 use crate::operators::scalar;
@@ -801,8 +801,8 @@ fn combine<'a, G: GraphDraft + 'a>(
 /// after its merge set's pass, which grouped the set's rows (`split`);
 /// a front's output is the residual it read. A layer the load streams takes
 /// its `bank` entries: a bank-served launch selects, resolves and assigns
-/// (`routed_select_streamed`), waits for the experts its host lands
-/// (`routed_tier_wait`) and requests the CPU's choices
+/// (`routed_select_streamed`), lands the experts its host reads
+/// (`routed_land`) and requests the CPU's choices
 /// (`routed_site_request`), then the decode entries read each choice where
 /// its source names, a bank record or a tier record in place (`X` = the
 /// experts, `E` = `BANK`), and the sum adds the CPU's answer. Its resident
@@ -925,7 +925,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         Some(selection.norm.clone()),
     )?;
     // A bank-served launch selects, resolves and assigns each choice's
-    // source, its tier wait sources the absent choices, and its decode reads
+    // source, its landing launch sources the absent choices, and its decode reads
     // where the sources name (`E` = `BANK`); a resident one reads the expert
     // stacks by expert.
     let (normalized, reads, experts_read, sequence, mut sited) = match &mut streamed {
@@ -959,12 +959,9 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 ],
             ]
             .concat();
-            // The step's sources and the tier wait's grid, which the
-            // selection writes and its later entries read.
-            let mut locals = RouteLocals {
-                sources: graph.local_for(route, "sources", &select_dims)?,
-                grids: graph.local_for(route, "grids", &select_dims)?,
-            };
+            // The step's sources, which the selection writes and its later
+            // entries read.
+            let mut locals = RouteLocals { sources: graph.local_for(route, "sources", &select_dims)? };
             let selected = graph.enqueue(
                 route,
                 &select_dims,
@@ -988,7 +985,6 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     sited: (ports.sited()).into(),
                     step: ports.step.tensor().into(),
                     file: ports.file.tensor_mut().into(),
-                    grids: locals.grids.tensor_mut().into(),
                     sources: locals.sources.tensor_mut().into(),
                     next_router_norm: (&hints.weights[0][0]).into(),
                     next_router: (&hints.weights[0][1]).into(),
@@ -1002,13 +998,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 },
             )?;
             let decode_shape = DecodeShape { rows };
-            let wait_grid = locals.grid(magnitude_kernels::constants::WAIT_GRID);
             let mut sources = locals.sources.tensor().clone();
-            layer.tier_wait(
-                graph,
-                WaitPorts { decode: &mut ports, sources: &mut sources, grid: &wait_grid, records: stacks.records() },
-                &decode_shape,
-            )?;
+            layer.land(graph, LandPorts { decode: &mut ports, sources: &mut sources, records: stacks.records() }, &decode_shape, constants)?;
             let reads = layer.reads(graph, &ports, &locals, constants)?;
             let sequence = ports.sequence.take();
             let sited = ports.site.is_some().then_some(ports);

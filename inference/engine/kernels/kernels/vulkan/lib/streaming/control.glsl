@@ -69,6 +69,14 @@ void streaming_device_store(uint64_t word, int value) {
     streaming_word_t(word).v = value;
 }
 
+int streaming_device_add(uint64_t word, int value) {
+    return atomicAdd(streaming_word_t(word).v, value);
+}
+
+int streaming_device_cas(uint64_t word, int expected, int desired) {
+    return atomicCompSwap(streaming_word_t(word).v, expected, desired);
+}
+
 // Orders this invocation's accesses of host-shared words.
 void streaming_system_fence() {
     memoryBarrierBuffer();

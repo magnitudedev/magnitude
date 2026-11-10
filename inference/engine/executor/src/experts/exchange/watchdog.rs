@@ -13,7 +13,7 @@
 //! each owner's state as it reports it ([`Witness`]).
 //!
 //! A lane the device waits on ([`Kind::waited`]) is a file slot's (a
-//! decode layer's tier wait), a site slot's (a sited combine's sum) and a
+//! decode layer's landing launch), a site slot's (a sited combine's sum) and a
 //! scratch slot's round lanes (each round's wait, requested as the device
 //! arrives there). A scratch request's own lane is answered only once its
 //! round 0 arrives, after every earlier place's back at its layer, and the
@@ -210,6 +210,21 @@ fn unanswered(tables: &[Watched], ended: &dyn Fn(u64) -> bool) -> Vec<Lane> {
     open
 }
 
+/// The first waited lane of `tables` a kernel stored violated for the step
+/// it is requested for (`ExchangeTable::violated`), of a step not ended: its
+/// table and step.
+fn violated(tables: &[Watched], ended: &dyn Fn(u64) -> bool) -> Option<(usize, u64)> {
+    tables.iter().enumerate().find_map(|(table, watched)| {
+        let shape = watched.slots.table();
+        (0..shape.slots()).find_map(|slot| {
+            watched.kind.waited(shape.lanes()).find_map(|lane| {
+                let (request, _) = watched.slots.held(slot, lane);
+                (request != 0 && !ended(request) && watched.slots.violated(request, lane)).then_some((table, request))
+            })
+        })
+    })
+}
+
 /// The watchdog's thread: a look every tenth of the bound, until stopped
 /// or a lane or the park is overdue.
 fn run(mut watch: Watch, bounds: &dyn Fn() -> Bounds, trip: Trip, stop: &(Mutex<bool>, Condvar)) {
@@ -281,6 +296,16 @@ impl Watch {
             if !self.open.iter().any(|open| open.lane == lane) {
                 self.open.push(Open { lane, since: now, events: seen });
             }
+        }
+        // A kernel that found a state the protocol never reaches abandoned
+        // its claim, so the host's wait for it may never end: the violation
+        // is the report, at once, not the wait's.
+        if let Some((table, request)) = violated(tables, ended) {
+            let header = format!(
+                "magnitude-engine: a kernel found a state the exchange protocol never reaches at step {request} \
+                 (table {table})."
+            );
+            return Some(report(header, tables, &self.open, seen, now, seen, ended, &engine(), witnesses));
         }
         if let Some(oldest) = self.open.iter().filter(|open| now - open.since >= limit).min_by_key(|open| open.since) {
             let header = format!(

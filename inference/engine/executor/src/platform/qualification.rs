@@ -89,14 +89,16 @@ pub struct FitReading {
 /// where `Shared` reserves nothing.
 /// Every backend's decode entries read tier records in place; only a
 /// linked tier's are promoted ([`HostTier::Linked`]). The host lands and
-/// converts file misses into the tier's records in place.
+/// converts file misses into a linked tier's records in place; on unified
+/// memory the device converts them into the bank's, its parking the
+/// executor's backend's ([`crate::planning::Parking::of`]).
 pub fn host_tier(
     topology: &seismic::DeviceTopology,
     executor: &Executor,
 ) -> Result<Option<HostTier>, String> {
     let reservation = executor.reserving(seismic::ReservedContract::Shared).map_err(ToString::to_string)?;
     Ok(reservation.map(|reservation| match topology.shared_ranges_lie_in_device_memory(executor) {
-        true => HostTier::Unified,
+        true => HostTier::Unified(crate::planning::Parking::of(executor.backend())),
         false => HostTier::Linked(reservation),
     }))
 }

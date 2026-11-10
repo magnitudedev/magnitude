@@ -11,13 +11,13 @@
 //! streamed form (`operators::routed::streamed`) while its bank lacks any
 //! expert, which its demand is: each such layer's route resolves and hints
 //! (`routed_route_streamed`, `routed_select_streamed`), the first sets the
-//! run's step word (`routed_step`), each waits on its route's grid for its
-//! absent choices (`routed_tier_wait`), and a layer with a CPU site requests
+//! run's step word (`routed_step`), each lands its absent choices
+//! (`routed_land`), and a layer with a CPU site requests
 //! the CPU's choices (`routed_site_request`) and combines with its answer
 //! (`routed_output_project` and `routed_output_sited`, or the general
 //! form's down), all at any misses, none included. Where the backend's
 //! parks are submission boundaries (`BackendName::parks_in_kernels`), each
-//! tier wait's park, site request's publication and sited combine's park
+//! landing launch's park, site request's publication and sited combine's park
 //! ends one ([`DecodeDemand::boundaries`]). A plan that holds its experts
 //! whole decodes its resident forms alone.
 //!
@@ -406,7 +406,22 @@ impl Step<'_> {
         dimensions: &[(&'static str, u64)],
         work: Work,
     ) -> Result<(), AssessmentError> {
-        let key = (kernel.name(), work_recipe(&work), statics.to_vec(), dimensions.to_vec());
+        let recipe = work_recipe(&work);
+        self.call_as(kernel, recipe, statics, dimensions, work)
+    }
+
+    /// [`Self::call_specialized`] at operand recipe `recipe`, for a call
+    /// whose operands are not its work's weights (a landing launch's are the
+    /// bank's records).
+    fn call_as(
+        &mut self,
+        kernel: Kernel,
+        recipe: OperandRecipe,
+        statics: &[(&'static str, u64)],
+        dimensions: &[(&'static str, u64)],
+        work: Work,
+    ) -> Result<(), AssessmentError> {
+        let key = (kernel.name(), recipe, statics.to_vec(), dimensions.to_vec());
         let launches = match self.resolved.get(&key) {
             Some(launches) => launches.clone(),
             None => {
@@ -776,8 +791,8 @@ fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1]
 /// (`operators::routed::streamed`): the run's step word where the layer
 /// sets it (`routed_step`), its route `streamed` at its `AHEAD`, reading
 /// beside `work` the hinted weights of each layer it predicts
-/// (`ExpertBankPlan::predicted`), its tier wait on the route's grid
-/// (`routed_tier_wait`), after its park, and where the layer has a CPU site
+/// (`ExpertBankPlan::predicted`), its landing launch
+/// (`routed_land`), after its park, and where the layer has a CPU site
 /// its request (`routed_site_request`), before its publication.
 fn route(
     step: &mut Step<'_>,
@@ -804,7 +819,12 @@ fn route(
         .collect::<Result<Vec<_>, _>>()?;
     step.call_with(streamed, &[("AHEAD", bank.ahead(index))], join([work, projection(&hinted)?])?)?;
     step.park();
-    step.call(Kernel::of::<kernels::routed_tier_wait::Entry>(), Work::default())?;
+    // The landing launch converts the bank's records, from their stored
+    // element into their resident one: its operands are the records', not a
+    // weight the step reads.
+    let record = bank.binding(index).map_err(demand_error)?.record;
+    let recipe = operand_recipe(record.iter().flat_map(|(_, tensor)| [tensor.source, tensor.resident]));
+    step.call_as(Kernel::of::<kernels::routed_land::Entry>(), recipe, &[], &[], Work::default())?;
     if bank.sited(index) {
         step.call(Kernel::of::<kernels::routed_site_request::Entry>(), Work::default())?;
         step.park();

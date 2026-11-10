@@ -296,7 +296,7 @@ enum Host {
     Ready,
     /// Taken for a landing of the expert in flight, mapped for no step
     /// before `from` once landed ([`Whole`]); where a request's demand took
-    /// it, the request at `answer` (its tier wait), which the landing
+    /// it, the request at `answer` (its landing launch), which the landing
     /// answers with it; the reserve's while it lands where `taking` is a
     /// read ahead's.
     Landing { staged: Staged, answer: Option<Point>, from: Step, taking: Taking },
@@ -882,7 +882,7 @@ impl HostRecords {
     }
 
     /// Kept or graced record `record` is the answer of the request at
-    /// `past` (its tier wait), published now: an outstanding answer until
+    /// `past` (its landing launch), published now: an outstanding answer until
     /// the device is past there ([`Self::retire`]), the latest of its
     /// requests'. A graced one is taken back as it was: its entry mapped
     /// again from its `from`, so every step that named it still does and

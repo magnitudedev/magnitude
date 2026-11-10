@@ -69,9 +69,15 @@ pub(in crate::experts) struct Layer {
     /// (`ExpertBankPlan::layer_scratch_forms`): layers of one form lay each
     /// slot in the same bytes.
     pub scratch_form: Vec<usize>,
-    /// Its barrier's convert's words, where the host places and so the
-    /// device may land its misses.
-    pub landing: Option<std::sync::Arc<crate::experts::landing::DeviceWords>>,
+    /// Its decode landing launch's landing list (`routed_land`), where the
+    /// bank places and so the device converts its misses
+    /// (`landing::DeviceLanding`).
+    pub landing: Option<std::sync::Arc<crate::experts::landing::LandingList>>,
+    /// Each scratch round's landing list (`routed_round`): the layer's own,
+    /// so a round's launch at the next layer, which a step reaches before
+    /// the host appends for it there, finds no entry of this layer's under
+    /// the step's head.
+    pub rounds: Vec<crate::experts::landing::LandingList>,
     /// The records its scratch lists name.
     pub lists: ListRecords,
     /// Its scratch request's tier list (the request's experts the host tier
@@ -88,14 +94,12 @@ pub(in crate::experts) struct Layer {
 }
 
 /// The records a layer's scratch lists name, its device readers' extents
-/// ([`crate::experts::ListBounds`]): its group's bank records (`BANK`), its
-/// group's host tier records (`TR`, none without a tier) and the
-/// conveyor's (`V`).
+/// ([`crate::experts::ListBounds`]): its group's bank records (`BANK`) and
+/// its group's host tier records (`TR`, none without a tier).
 #[derive(Clone, Copy, Debug)]
 pub(in crate::experts) struct ListRecords {
     pub bank: u64,
     pub tier: u64,
-    pub conveyor: u64,
 }
 
 impl Layer {
@@ -213,8 +217,6 @@ pub(in crate::experts) struct PlacedLayerWords {
 pub(in crate::experts) struct LoadWords {
     /// Each chain place's scratch flags.
     pub flags: Vec<Words>,
-    /// Each scratch round's convert list.
-    pub lists: Vec<Words>,
 }
 
 /// The bank's extents the watcher serves by.

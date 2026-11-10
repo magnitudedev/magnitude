@@ -89,13 +89,8 @@ pub trait ElasticBank {
     /// Wait until its traffic, held, is quiet; why serving ended, if it
     /// ends first, or that the load stops.
     fn wait_traffic_quiet(&self) -> Result<(), super::DomainError>;
-    /// Each bank group's convert in a decode barrier takes its `lines` from
-    /// now on.
+    /// Each bank group's device convert takes its `lines` from now on.
     fn device_convert(&self, lines: &[crate::assessment::RecordLine]);
-    /// Measure the host's landings slow from now on
-    /// (`Shared::slow_host_landing`).
-    #[cfg(test)]
-    fn slow_host_landing(&self);
     /// The landings the device has converted.
     #[cfg(test)]
     fn device_landed(&self) -> u64;

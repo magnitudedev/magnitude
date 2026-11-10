@@ -3,7 +3,7 @@ use crate::experts::conveyor::{Carrier, LentPool, Lending};
 use crate::experts::source::{ExpertSource, Records};
 use crate::experts::watcher::{Copier, CopyTensor, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredTensor, Watcher, WatcherParts};
 use crate::experts::directory::{HostTier as TierStart, Placement};
-use crate::experts::landing::TierTensor;
+use crate::experts::landing::{LandingList, TierTensor};
 use crate::experts::map::{LandingMap, StampedMap};
 use crate::experts::{ExchangeTable, Words};
 use crate::planning::{BankAllocation, BankLayout, ConveyorCarrier, ExpertBankPlan, Lender, PlacedAllocations, Placer, RecordTensors, StagingPool};
@@ -354,6 +354,12 @@ fn watch(
             Placer::Bank => LandingMap::Bank { map: Arc::new(map), steps: steps.clone() },
         };
         landing_maps.push(landing);
+        // A round converts conveyor records, or the scratch slots the
+        // layer's experts were read into where the host addresses the
+        // scratch, into the scratch slot of each expert.
+        let lent = if slots.is_some() { experts } else { 0 };
+        let bounds = crate::experts::ListBounds { from: plan.binding(index)?.conveyor, to: experts, lent };
+        let rounds = layer.rounds.iter().map(|list| Ok(LandingList::new(words(list, 0)?, bounds))).collect::<Result<Vec<_>, String>>()?;
         watched.push(Layer {
             group,
             experts: usize::try_from(plan.layers()[index].experts).map_err(|_| "experts exceed the host")?,
@@ -368,25 +374,18 @@ fn watch(
             stored: stored.into(),
             slots,
             scratch_form,
-            landing: layer
-                .landing
-                .grids
-                .as_ref()
-                .map(|grids| {
+            landing: match plan.placer() {
+                Placer::Tier => None,
+                Placer::Bank => {
                     let binding = plan.binding(index)?;
-                    let groups = |rows: u64| crate::operators::routed::streamed::convert_groups(rows).map_err(str::to_owned);
-                    Ok::<_, String>(Arc::new(crate::experts::landing::DeviceWords {
-                        list: words(&layer.landing.list, 0)?,
-                        grids: words(grids, 0)?,
-                        rows_groups: groups(binding.record.up.matrix[0])?,
-                        columns_groups: groups(binding.record.down.matrix[0])?,
-                        bounds: crate::experts::ListBounds { from: binding.staging, to: binding.records, lent: 0 },
-                    }))
-                })
-                .transpose()?,
+                    let bounds = crate::experts::ListBounds { from: binding.staging, to: binding.records, lent: 0 };
+                    Some(Arc::new(LandingList::new(words(&layer.landing, 0)?, bounds)))
+                }
+            },
+            rounds,
             lists: {
                 let binding = plan.binding(index)?;
-                ListRecords { bank: binding.records, tier: binding.tier, conveyor: binding.conveyor }
+                ListRecords { bank: binding.records, tier: binding.tier }
             },
             tiered: words(&layer.tiered, 0)?,
             seeds: words(&layer.seeds, 0)?,
@@ -540,15 +539,7 @@ fn watch(
         layers: watched,
         group_reads,
         groups,
-        load: LoadWords {
-            flags,
-            lists: layout
-                .load
-                .lists
-                .iter()
-                .map(|list| words(list, 0))
-                .collect::<Result<Vec<_>, String>>()?,
-        },
+        load: LoadWords { flags },
         pools,
         extents: Extents {
             widest: usize::try_from(plan.widest().get()).map_err(|_| "experts exceed the host")?,

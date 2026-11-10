@@ -492,6 +492,15 @@ impl JobDeadlines {
         Self { started, standing: started + time.min(budget), loads: started + time }
     }
 
+    /// The deadlines of a test's job, whose standing points have all of
+    /// `time`: a machine whose kernels take long to form (CUDA's) would
+    /// otherwise leave them unmeasured ([`MEASUREMENT_SECONDS`]).
+    #[cfg(test)]
+    pub(crate) fn within(time: std::time::Duration) -> Self {
+        let started = std::time::Instant::now();
+        Self { started, standing: started + time, loads: started + time }
+    }
+
     /// When assessment's points end: what the job measures of the machine
     /// before them (its device's probes) ends by then too.
     pub fn standing(&self) -> std::time::Instant {

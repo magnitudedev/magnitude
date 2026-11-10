@@ -2,7 +2,7 @@
 //! of a layer, read as each step's scratch request publishes them (every
 //! step's request of a layer comes before any of its rounds there), each
 //! once per group, and converted by the step's rounds from its records
-//! (`routed_convert`'s source). The conveyor works only for a group:
+//! (`routed_round`'s source), each as its read lands. The conveyor works only for a group:
 //! decode never takes a record from it.
 //!
 //! One rule carries every expert: it is read into a conveyor record, which
@@ -29,7 +29,7 @@
 //! claims them as its first request is taken, before any hit is
 //! (`Scratch::claim_lent`), so no hit lies in one, and they return empty once
 //! the group is past: the conveyor holds the stored form, which
-//! `routed_convert` repacks, so a claimed record holds no bank-form expert.
+//! `routed_round` repacks, so a claimed record holds no bank-form expert.
 //!
 //! Beside a host tier, a cold expert the tier keeps whole is not read and
 //! takes no record: the fill's tier copy reads its tier record, already in
@@ -42,7 +42,7 @@
 //! experts too, at no memory: an expert may be read into the base of a
 //! scratch slot no step reads or converts into until the expert's round
 //! has converted it ([`Self::take`], `Scratch::lendable_slot`), and
-//! its round converts it from there (`routed_convert`'s negative `from`).
+//! its round converts it from there (`routed_round`'s negative `from`).
 //! A slot's record is `records + slot`, past the conveyor's own; it frees
 //! as a conveyor record does, and holds no bytes kept past the group.
 
@@ -224,8 +224,8 @@ impl Conveyor {
         (record as usize >= self.carrier.records).then(|| record - self.carrier.records as u32)
     }
 
-    /// The `from` a round's list names record `record` by
-    /// (`routed_convert`): a conveyor record, or -1 - slot.
+    /// The `from` a round's landing list names record `record` by
+    /// (`routed_round`): a conveyor record, or -1 - slot.
     pub fn listed_from(&self, record: u32) -> i32 {
         match self.slot_of(record) {
             Some(slot) => -1 - slot as i32,

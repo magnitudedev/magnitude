@@ -331,7 +331,7 @@ impl BankStructure<'_> {
             .expect("a bank holds a group")
     }
 
-    /// Records of each stored form's conveyor (`V` of `routed_convert`,
+    /// Records of each stored form's conveyor (`V` of `routed_round`,
     /// [`ExpertBankPlan::conveyor`]): beside a host tier, a whole layer's
     /// experts, record `e` holding expert `e` of a layer, so every cold
     /// expert of a layer is read at once (the tier's records are plentiful
@@ -345,7 +345,7 @@ impl BankStructure<'_> {
         let widest = self.widest();
         match self.host {
             HostTier::Linked(_) => widest,
-            HostTier::Unified => (2 * self.round_records()).min(widest),
+            HostTier::Unified(_) => (2 * self.round_records()).min(widest),
         }
     }
 
@@ -355,7 +355,7 @@ impl BankStructure<'_> {
         let conveyor = self.conveyor_alone()?;
         let scratch = self.scratch(&conveyor)?;
         let carrier = match self.host {
-            HostTier::Unified => ConveyorCarrier::Bank(scratch.lender),
+            HostTier::Unified(_) => ConveyorCarrier::Bank(scratch.lender),
             HostTier::Linked(_) => {
                 let group = self.lender_group();
                 let records = lent_records(self.groups[group].record, &conveyor.bytes)?;
@@ -377,7 +377,7 @@ impl BankStructure<'_> {
             return Ok(held);
         }
         let conveyor_store = match self.host {
-            HostTier::Unified => crate::planning::BankTier::Bank,
+            HostTier::Unified(_) => crate::planning::BankTier::Bank,
             HostTier::Linked(_) => crate::planning::BankTier::Host,
         };
         let form = self.form();
@@ -402,7 +402,7 @@ impl BankStructure<'_> {
         let pools = self.staging_pools().0;
         let group = self.lender_group();
         let (store, reservation) = match self.host {
-            HostTier::Unified => (crate::planning::BankTier::Bank, self.reservation),
+            HostTier::Unified(_) => (crate::planning::BankTier::Bank, self.reservation),
             HostTier::Linked(tier) => (crate::planning::BankTier::Host, tier),
         };
         let carriers = self.groups[group].record.try_map(|kind, tensor| {
@@ -428,7 +428,7 @@ impl BankStructure<'_> {
         let group = self.lender_group();
         let (forms, experts) = self.scratch_forms();
         let start = match self.host {
-            HostTier::Unified => conveyor.bytes,
+            HostTier::Unified(_) => conveyor.bytes,
             HostTier::Linked(_) => self.form().each(|_| Ok::<_, String>(0))?,
         };
         let carriers = self.groups[group].record.try_map(|kind, tensor| {

@@ -37,8 +37,7 @@
 //
 // A whole group's route (`whole`) sources each choice from its home record,
 // `policy[POLICY_HOME]` + expert: every expert is at home, nothing misses,
-// and it writes neither the routing record nor the grids, which nothing
-// reads of a whole layer.
+// and it writes no routing record, which nothing reads of a whole layer.
 
 // The group words a resolve of `choices` choices takes: the missing flag;
 // then each choice's expert, its source as resolved, its CPU site (-1: the
@@ -139,7 +138,7 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     STREAMING_SYSTEM_READ tier, u64 tier0, u32 tiered, u32 sited,
     STREAMING_DEVICE_WORDS sources, u64 sources0, u64 sources1, u64 sources2,
     STREAMING_SYSTEM_WORDS routing, u64 routing0, u64 routing1, u32 flight, u32 width,
-    STREAMING_DEVICE_WORDS grids, u64 grids0, u64 grids1, STREAMING_SYSTEM_WORDS file, u64 file0, u64 file1,
+    STREAMING_SYSTEM_WORDS file, u64 file0, u64 file1,
     STREAMING_SYSTEM_READ policy, STREAMING_GROUP_PARAM, u32 tid, u32 threads) {
     const u32 K = u32(SEISMIC_DIM_K);
     if (whole) {
@@ -219,12 +218,7 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     streaming_publish_barrier();
     if (tid != 0)
         return;
-    const bool missing = STREAMING_GROUP(0) != 0;
-    STREAMING_DEVICE_WORDS wait = STREAMING_AT(grids, SEISMIC_CONST_WAIT_GRID * grids0);
-    streaming_device_store(wait, missing ? 1 : 0);
-    streaming_device_store(STREAMING_AT(wait, grids1), 1);
-    streaming_device_store(STREAMING_AT(wait, 2 * grids1), 1);
-    if (!missing)
+    if (STREAMING_GROUP(0) == 0)
         return;
     STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, (q % u64(flight)) * file0);
     for (u32 c = 0; c < choices; ++c)

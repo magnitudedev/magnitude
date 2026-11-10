@@ -47,6 +47,18 @@ fn a_watcher_panic_fails_every_request_and_step() {
     assert!(matches!(next.complete(), Err(StepFailure::Watcher(_))));
 }
 
+/// A kernel that found a state the protocol never reaches (SLOT_VIOLATED)
+/// is no wait that outlasted a pulse: the host panics where the step ends,
+/// and does not re-run it.
+#[test]
+#[should_panic(expected = "never reaches")]
+fn a_state_the_protocol_never_reaches_panics_the_host() {
+    let harness = prompted("violated", EXPERTS, 4);
+    let step = harness.request(&[1]);
+    harness.violate(&step, 0);
+    let _ = step.complete();
+}
+
 /// A beat of the load's pulse that comes later than any wait's patience
 /// (its host starved) lets a live host's spinning wait end before its
 /// answer, which its kernel records (SLOT_EXPIRED): the step of a wait that
@@ -204,7 +216,9 @@ fn a_failed_steps_record_frees_only_once_its_read_ends() {
     let _alone = alone();
     let harness = layered("stale-read", EXPERTS, 4, 1, 1);
     // Reads queued ahead of the request's, as in
-    // `a_read_slower_than_the_patience_is_a_slow_step`.
+    // `a_read_slower_than_the_patience_is_a_slow_step`. Not held
+    // (`Ahead::held`): a held line leaves the request's read untaken, which
+    // giving up cancels, so it would never be the read that still runs.
     let ahead = Ahead::queue("stale-ahead");
     let failed = harness.step();
     assert!(harness.ask_at(&failed, 0, &[3]));

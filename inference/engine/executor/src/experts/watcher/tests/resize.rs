@@ -115,7 +115,7 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
     shared.place(placed()).unwrap();
     // The harness plays the device through the handed-over words.
     let [first, second] = flags;
-    (harness.load.0, harness.second) = (first, second);
+    (harness.flags, harness.second) = (first, second);
     harness.reads = reads;
     let steps = harness.group(&[StepRoute::Grouped; 2]);
     assert_eq!(harness.converted(&steps[0], 0, &[0, 1]).concat().len(), 2);
@@ -184,10 +184,10 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     }
     harness.tier_ready();
     // The landing ends past its request, so it leaves flight the moment it
-    // ends, kept (`HostRecords::answering`): the reads ahead must outlast the
-    // shrink and its checks, which the line holds them back for until the
-    // test finishes it (`Ahead`).
-    let ahead = Ahead::queue("shrink-landing-ahead");
+    // ends, kept (`HostRecords::answering`): it must stay queued behind the
+    // line until the shrink is served, so the line is held, its workers
+    // released only by `finish` below (`Ahead::held`).
+    let ahead = Ahead::held("shrink-landing-ahead");
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
     let step = harness.step();
@@ -231,9 +231,9 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     shared.join(super::Join::Landed { records: vec![8], views: vec![harness.host.views(8)] });
     shared.joins.wait_taken();
     drop(step);
-    // Enough reads ahead to outlast the shrink, as in
+    // The landing held in flight until the shrink is served, as in
     // `a_host_shrink_asked_with_a_landing_in_flight_answers_at_once`.
-    let ahead = Ahead::queue("shrink-grown-ahead");
+    let ahead = Ahead::held("shrink-grown-ahead");
     let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
@@ -289,7 +289,9 @@ fn a_host_shrink_on_an_idle_load_answers_beside_a_landing_its_step_passed() {
         harness.request(&[expert]).complete().unwrap();
     }
     harness.tier_ready();
-    let ahead = Ahead::queue("shrink-idle-ahead");
+    // The demand read, as urgent as the line's, is taken only once `finish`
+    // below ends the hold, after the step is given up.
+    let ahead = Ahead::held("shrink-idle-ahead");
     let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();

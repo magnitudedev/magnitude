@@ -1,6 +1,6 @@
 //! Staging, the landing pool, and the reads into it: each request's demand
-//! reads, and reads ahead of demand, each landing into the host tier as it
-//! ends (`experts::landing`). A read ahead is one of two kinds: a hint's,
+//! reads, and reads ahead of demand, each landing as it ends
+//! (`experts::landing`). A read ahead is one of two kinds: a hint's,
 //! the next layer's hinted expert whose file is on the path (nothing holds,
 //! keeps or lands it), or a covering tier's, an expert the tier lacks read
 //! at the load's priority below every step's ([`Prefetch::cover`]) where
@@ -9,31 +9,38 @@
 //! its miss waits for a read no prediction made. A tier that cannot hold
 //! every expert keeps what the steps' misses and the hints land.
 //!
-//! A read's end submits its landing to the host compute executor on the
-//! read engine's worker that ends it, once the read's end is set and its
-//! tier records are claimed ([`Join`]: a request's read is submitted before
-//! residency claims them, and where the claim comes last the request
-//! service submits the landing; each landing is tracked by its own `Ended`
-//! from its claim): the executor converts the stored record into
-//! the tier record taken for it, maps it, and answers the choices of the
-//! request that named it; a read that failed fails exactly the rows of that
-//! request whose choices named its expert (`Steps::fail_request_rows`),
+//! Every read lands one expert, its own read engine request, so each
+//! landing begins as its own read ends, however many its request reads.
+//! A read's end lands it once the read's end is set and its record is
+//! claimed ([`Join`]: a request's read is submitted before residency
+//! claims it, and where the claim comes last the request service lands
+//! it; each landing is tracked by its own `Ended` from its claim). Where the
+//! host places into a tier, and for every read ahead, the host compute
+//! executor converts the stored record into the tier record taken for it,
+//! maps it, and answers the choices of the request that named it; where
+//! the bank places, a request's read appends its entry to its layer's
+//! landing list and answers, and the device's landing launch converts it
+//! (`landing::DeviceLanding`), its DONE freeing the staging record as the
+//! watcher reads it ([`Prefetch::settle`]), so a request of more misses than
+//! free staging reads its later misses into the records its earlier ones
+//! free while its launch runs. A read that failed fails exactly the rows of
+//! the request whose choices named its expert (`Steps::fail_request_rows`),
 //! before it answers them with no record, so before its step can complete.
 //! A read ahead names no request and fails nothing: a request whose expert
 //! it reads waits for its landing, hastened to demand, and reads it again
 //! should it fail (`Decode::resume`). The watcher learns each landing once
-//! it ended
-//! ([`Prefetch::settle`]): the tier record keeps its expert, or is ready
-//! again, and the staging record frees.
+//! it ended ([`Prefetch::settle`]): the tier record keeps its expert, or is
+//! ready again, and the staging record frees, where the device's DONE has
+//! not freed it already.
 
 use super::Shared;
 use super::telemetry::Admitted;
 use super::core::{At, Core, ReadTable};
 use crate::experts::directory::{Directory, HostRecord, Point};
-use crate::experts::host_records::{Claim, Taking};
+use crate::experts::host_records::{Claim, Grant, Taking};
 use crate::experts::compute::Urgency;
 use super::Step;
-use crate::experts::landing::{Answer, Converting, DeviceLanding, DeviceWords, Ended, Landing};
+use crate::experts::landing::{Answer, Converting, DeviceLanding, Ended};
 use crate::experts::source::{Outcome, Read, Ticket};
 use crate::experts::staging::{Staged, StagingPool};
 use seismic_io::Want;
@@ -121,25 +128,49 @@ pub(super) fn post(table: &ReadTable, reads: Vec<Read>, want: Want) -> Result<Po
     Ok(Posting { ticket, join })
 }
 
-/// Account request `naming`'s demand read `ticket` (joined by `join`) as
-/// it ends, once: a point of the read line over `timed` bytes where it
-/// reads all the request's misses; and a read worker's panic, which ends
-/// serving.
-pub(super) fn account(ticket: &Ticket, join: &Join, naming: Naming, timed: Option<(u64, Instant)>, shared: &Arc<Shared>) {
-    // When the volume began reading the job: from its submission, which
-    // the request times where it reads all its misses, else now, just
+/// Request `naming`'s demand reads, accounted once the last of them ends
+/// ([`account`]): those left, and whether every one so far read whole.
+struct Accounted {
+    left: Mutex<(usize, bool)>,
+    started: Vec<Arc<std::sync::OnceLock<Instant>>>,
+    submitted: Instant,
+    timed: Option<(u64, Instant)>,
+    naming: Naming,
+}
+
+/// Account request `naming`'s demand reads `postings` as the last of them
+/// ends, once: a point of the read line over `timed` bytes where they read
+/// all the request's misses, submitted together at its instant; and a read
+/// worker's panic, which ends serving.
+pub(super) fn account(postings: &[&Posting], naming: Naming, timed: Option<(u64, Instant)>, shared: &Arc<Shared>) {
+    // When the volume began reading the jobs: from their submission, which
+    // the request times where they read all its misses, else now, just
     // after.
-    let (started, submitted) = (ticket.started(), timed.map_or_else(Instant::now, |(_, submitted)| submitted));
-    let shared = shared.clone();
-    join.claimed(move |outcome, _, _| {
-        panicked(&shared, &outcome);
-        if let Outcome::Read = outcome {
+    let accounted = Arc::new(Accounted {
+        left: Mutex::new((postings.len(), true)),
+        started: postings.iter().flat_map(|posting| posting.ticket.started()).collect(),
+        submitted: timed.map_or_else(Instant::now, |(_, submitted)| submitted),
+        timed,
+        naming,
+    });
+    for posting in postings {
+        let (shared, accounted) = (shared.clone(), accounted.clone());
+        posting.join.claimed(move |outcome, _, _| {
+            panicked(&shared, &outcome);
+            let mut left = accounted.left.lock().expect("a request's reads' account");
+            left.0 -= 1;
+            left.1 &= matches!(outcome, Outcome::Read);
+            if left.0 > 0 || !left.1 {
+                return;
+            }
+            drop(left);
+            let Accounted { started, submitted, timed, naming, .. } = &*accounted;
             let timed = timed.map(|(bytes, submitted)| (bytes, submitted.elapsed()));
             let first = started.iter().filter_map(|started| started.get().copied()).min();
-            let queued = first.map_or(std::time::Duration::ZERO, |first| first.saturating_duration_since(submitted));
+            let queued = first.map_or(std::time::Duration::ZERO, |first| first.saturating_duration_since(*submitted));
             shared.landed(naming.layer, naming.sequence, naming.named.elapsed(), timed, queued);
-        }
-    });
+        });
+    }
 }
 
 /// A request that names reads: its step's layer and sequence, and when it
@@ -151,119 +182,64 @@ pub(super) struct Naming {
     pub(super) named: Instant,
 }
 
-/// A read a request named that lands one expert: its landing, the staging
-/// record it reads into, the reads of the ticket it takes, the rows of the
-/// request whose choices named it, and the choices it answers.
+/// A read a request named that lands one expert, its record claimed: the
+/// expert, its posting, the staging record it reads into, the record its
+/// claim took, the rows of the request whose choices named it, and the
+/// choices it answers.
 pub(super) struct Named {
-    pub(super) landing: Landing,
+    pub(super) expert: usize,
+    pub(super) posting: Posting,
     pub(super) staged: u32,
-    pub(super) reads: std::ops::Range<usize>,
+    pub(super) grant: Grant,
     pub(super) rows: BTreeSet<usize>,
     pub(super) answer: Answer,
 }
 
-/// The landings of one request's demand read: from the read's end to the
-/// last one's, a point of its group's landing line (`FileLine`).
+/// The host's landings of one request's demand reads (`FileLine`): from
+/// the last read's end to the last landing's, a point of its group's
+/// landing line, once every one landed.
 pub(super) struct Landings {
     layer: usize,
     count: usize,
-    left: std::sync::atomic::AtomicUsize,
-    read: Instant,
+    /// The landings not yet ended, and the last read's end so far.
+    left: Mutex<(usize, Option<Instant>)>,
 }
 
 impl Landings {
-    fn new(layer: usize, count: usize) -> Arc<Self> {
-        Arc::new(Self { layer, count, left: std::sync::atomic::AtomicUsize::new(count), read: Instant::now() })
+    pub(super) fn new(layer: usize, count: usize) -> Arc<Self> {
+        Arc::new(Self { layer, count, left: Mutex::new((count, None)) })
+    }
+
+    /// One of its reads ended whole.
+    fn read(&self) {
+        let mut left = self.left.lock().expect("a request's landings");
+        left.1 = Some(Instant::now());
     }
 
     /// One of them ended.
     fn ended(&self, shared: &Shared) {
-        if self.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-            shared.telemetry.landings_ended(self.layer, self.count, self.read.elapsed().as_secs_f64());
+        let mut left = self.left.lock().expect("a request's landings");
+        left.0 -= 1;
+        if let (0, Some(read)) = *left {
+            shared.telemetry.landings_ended(self.layer, self.count, read.elapsed().as_secs_f64());
         }
     }
 }
 
-/// Whether named read `named` of request `naming` landed, as its ticket's
-/// `failed` reads say; failed, its end is recorded, its rows fail, then it
-/// answers none.
-fn read_named(shared: &Shared, naming: Naming, named: &Named, outcome: &Outcome, failed: &[usize], ended: &Ended) -> bool {
-    if !failed.iter().any(|read| named.reads.contains(read)) {
+/// Whether request `naming`'s read of one expert landed whole, its
+/// ticket's `failed` reads none; failed, its end is recorded, the `rows`
+/// that named it fail, then `answer` answers none.
+fn read_named(shared: &Shared, naming: Naming, (rows, answer): (&BTreeSet<usize>, &Answer), outcome: &Outcome, failed: &[usize], ended: &Ended) -> bool {
+    if failed.is_empty() {
         shared.landings.read(naming.named.elapsed());
         return true;
     }
     if let Outcome::Failed(reason) = outcome {
-        shared.steps.fail_request_rows(naming.sequence, naming.layer, &named.rows, reason.clone());
+        shared.steps.fail_request_rows(naming.sequence, naming.layer, rows, reason.clone());
     }
     ended.set(false);
-    named.answer.publish(None);
+    answer.publish(None);
     false
-}
-
-/// End named read `named` of request `naming`, its landing on the host:
-/// submitted to the executor, which converts and maps its record, records
-/// its end in `ended`, then answers it. Where the read's end ran it
-/// (`party`), its read worker works its pieces beside the executor's, so no
-/// wake stands between the read and its landing.
-fn end_named(
-    shared: &Arc<Shared>,
-    naming: Naming,
-    named: Named,
-    landings: &Arc<Landings>,
-    outcome: &Outcome,
-    failed: &[usize],
-    (ended, urgency): (Ended, Arc<Urgency>),
-    party: Party,
-) {
-    if !read_named(shared, naming, &named, outcome, failed, &ended) {
-        return;
-    }
-    let (record, answer) = (named.landing.record(), named.answer);
-    let (landings, serving) = (landings.clone(), shared.clone());
-    // SAFETY: the read landed whole and nothing reads into its staging
-    // record until the watcher frees it (once its end is recorded), and its
-    // tier record was ready (no step reads it) when taken.
-    let converting = unsafe {
-        Converting::new(named.landing, urgency, shared.landings.clone(), ended, move || {
-            answer.publish(Some(record));
-            landings.ended(&serving);
-        })
-    };
-    match party {
-        Party::Read => shared.compute.run(Arc::new(converting)),
-        Party::Claim => shared.compute.submit(Arc::new(converting)),
-    }
-}
-
-/// End a request's named reads on the thread that ends them, their landings
-/// on the device: the list of those that landed published while the step
-/// owns its slot, each held as converting, then answered, so the device
-/// finds its list past the barrier the answer opens. A step that ended
-/// first converts nothing, and lands none.
-fn end_converted(
-    shared: &Arc<Shared>,
-    naming: Naming,
-    named: Vec<(Named, Arc<DeviceLanding>, Ended)>,
-    words: &DeviceWords,
-    outcome: &Outcome,
-    failed: &[usize],
-) {
-    let landed = named
-        .into_iter()
-        .filter(|(named, _, ended)| read_named(shared, naming, named, outcome, failed, ended))
-        .collect::<Vec<_>>();
-    let pairs = landed.iter().map(|(named, ..)| (named.staged as i32, named.landing.record() as i32)).collect::<Vec<_>>();
-    #[cfg(test)]
-    std::thread::sleep(std::time::Duration::from_millis(shared.landings.held_ms.load(std::sync::atomic::Ordering::Relaxed)));
-    let published = shared.steps.while_owned(naming.sequence, |_| words.publish(naming.sequence, &pairs)).is_some();
-    for (named, device, ended) in landed {
-        let (record, answer) = (named.landing.record(), named.answer);
-        match published {
-            true => device.converts(named.landing),
-            false => ended.set(false),
-        }
-        answer.publish(Some(record));
-    }
 }
 
 /// A panic that ended the reads `outcome` reports: a defect of the read
@@ -275,13 +251,14 @@ fn panicked(shared: &Shared, outcome: &Outcome) {
     }
 }
 
-/// An expert on its way into the host tier: read into staging record
-/// `record`, landing into tier record `tier`, for what [`Need`] says; its
-/// landing's end, once it landed (or its read failed), and its urgency on
-/// the executor, the read's own. Directory places one landing of an expert
-/// at a time (`Located::Landing`), so an expert has one at most.
+/// An expert on its way into its record: read into staging record
+/// `record` (none once the device's DONE freed it), landing into tier
+/// record `tier`, for what [`Need`] says; its landing's end, once it
+/// landed (or its read failed), and its urgency on the executor, the
+/// read's own. Directory places one landing of an expert at a time
+/// (`Located::Landing`), so an expert has one at most.
 struct Inbound {
-    record: u32,
+    record: Option<u32>,
     tier: u32,
     need: Need,
     ended: Ended,
@@ -290,10 +267,9 @@ struct Inbound {
 
 /// Why an expert is inbound, with the read that brings it.
 enum Need {
-    /// A request named it at step `read`: its read is the request's
-    /// ticket, shared with the request's other landings, which ends before
-    /// any of them; `device` where the device converts it.
-    Due { ticket: Arc<Ticket>, read: Step, device: Option<Arc<DeviceLanding>> },
+    /// A request named it at step `read`, read by its own ticket;
+    /// `device` where the device converts it (the bank places).
+    Due { ticket: Ticket, read: Step, device: Option<Arc<DeviceLanding>> },
     /// Read ahead of demand, by its own ticket (cancelled once it can only
     /// be wrong): what it reads ahead for is `ahead`.
     Ahead { ticket: Ticket, ahead: Ahead },
@@ -421,48 +397,70 @@ impl Prefetch {
         }
     }
 
-    /// Track the demand job `ticket` (joined by `join`), landing `named`
-    /// for the request `naming` names, its tier records claimed: its end
-    /// lands or fails each, on the host ([`end_named`]) or, where `device`
-    /// names the words of the request's barrier at its point, on the device
-    /// ([`end_converted`]). `landings` are each named landing's staging
-    /// record, expert, tier record and read step, in order. A request's
-    /// read is accounted apart, once ([`account`]).
-    pub(super) fn demand(
-        &mut self,
-        (ticket, join): (&Arc<Ticket>, &Join),
-        named: Vec<Named>,
-        landings: Vec<(u32, Staged, u32, Step)>,
-        naming: Naming,
-        device: Option<(Arc<DeviceWords>, crate::experts::ExchangeTable, Point)>,
-        shared: &Arc<Shared>,
-    ) {
-        let ends = landings.iter().map(|_| (Ended::new(shared.events()), Urgency::waited())).collect::<Vec<_>>();
-        let converted = ends
-            .iter()
-            .map(|(ended, _)| device.as_ref().map(|(words, file, at)| Arc::new(DeviceLanding::new(words.clone(), file.clone(), *at, ended.clone(), shared.landings.clone()))))
-            .collect::<Vec<_>>();
-        let (shared, ended, held) = (shared.clone(), ends.clone(), converted.clone());
-        let words = device.map(|(words, ..)| words);
-        join.claimed(move |outcome, failed, party| {
-            match &words {
-                Some(words) => {
-                    let named = named.into_iter().zip(held).zip(ended).map(|((named, held), (ended, _))| (named, held.expect("a device landing's"), ended)).collect();
-                    end_converted(&shared, naming, named, words, &outcome, failed);
-                }
-                None => {
-                    let landings = Landings::new(naming.layer, named.len());
-                    for (named, ended) in named.into_iter().zip(ended) {
-                        end_named(&shared, naming, named, &landings, &outcome, failed, ended, party);
+    /// Track request `naming`'s demand read `named` at `at`, its record
+    /// claimed: its read's end lands it where its layer's bank places, on
+    /// the device ([`DeviceLanding`]: appended to the layer's landing list,
+    /// under the step's ownership, then answered) or else on the host
+    /// (submitted to the executor, which converts and maps its record,
+    /// records its end, then answers; one of the request's host `landings`,
+    /// whose line it measures), or fails it. Where the read's end ran the
+    /// host's landing (`party`), its read worker works its pieces beside the
+    /// executor's, so no wake stands between the read and its landing. A
+    /// request's reads are accounted apart, once ([`account`]).
+    pub(super) fn demand(&mut self, core: &Core, named: Named, naming: Naming, at: Point, landings: &Arc<Landings>, shared: &Arc<Shared>) {
+        let Named { expert, posting: Posting { ticket, join }, staged, grant, rows, answer } = named;
+        let (ended, urgency, tier) = (Ended::new(shared.events()), Urgency::waited(), grant.record());
+        let device = core.layers[naming.layer]
+            .landing
+            .as_ref()
+            .map(|list| Arc::new(DeviceLanding::new(list.clone(), at, ended.clone(), shared.landings.clone())));
+        let (serving, end) = (shared.clone(), ended.clone());
+        match &device {
+            Some(device) => {
+                let device = device.clone();
+                join.claimed(move |outcome, failed, _| {
+                    if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
+                        return;
                     }
-                }
+                    // Appended while the step owns its slot: a read ending
+                    // after its step did appends nothing, its end not
+                    // landed; one the list has moved past (the device past
+                    // this step's launch) ends not landed and answers none.
+                    match serving.steps.while_owned(naming.sequence, |_| device.append(grant, staged)) {
+                        Some(true) => answer.publish(Some(tier)),
+                        Some(false) => answer.publish(None),
+                        None => end.set(false),
+                    }
+                });
             }
-        });
-        assert!(!landings.is_empty(), "a demand read lands an expert");
-        for (((record, staged, tier, read), (ended, urgency)), device) in landings.into_iter().zip(ends).zip(converted) {
-            let need = Need::Due { ticket: ticket.clone(), read, device };
-            self.arrive(staged, Inbound { record, tier, need, ended, urgency });
+            None => {
+                let landing = core.landing(grant, staged);
+                let (landings, urgent) = (landings.clone(), urgency.clone());
+                join.claimed(move |outcome, failed, party| {
+                    if !read_named(&serving, naming, (&rows, &answer), &outcome, failed, &end) {
+                        return;
+                    }
+                    landings.read();
+                    let completed = serving.clone();
+                    // SAFETY: the read landed whole and nothing reads into
+                    // its staging record until the watcher frees it (once
+                    // its end is recorded), and its tier record was ready
+                    // (no step reads it) when taken.
+                    let converting = unsafe {
+                        Converting::new(landing, urgent, serving.landings.clone(), end, move || {
+                            answer.publish(Some(tier));
+                            landings.ended(&completed);
+                        })
+                    };
+                    match party {
+                        Party::Read => serving.compute.run(Arc::new(converting)),
+                        Party::Claim => serving.compute.submit(Arc::new(converting)),
+                    }
+                });
+            }
         }
+        let need = Need::Due { ticket, read: naming.sequence, device };
+        self.arrive((naming.layer, expert), Inbound { record: Some(staged), tier, need, ended, urgency });
     }
 
     /// The landing of `staged` in flight a step waits for (a decode
@@ -593,10 +591,21 @@ impl Prefetch {
 
     /// Settle the landings that ended (their ends mapped or failed their
     /// experts): each tier record keeps its expert in `directory`, or is
-    /// ready again, and each staging record frees. True when any ended.
+    /// ready again, and each staging record frees; and each device landing's
+    /// staging record whose entry the device stored DONE for, its landing
+    /// ending only once the device is past its launch
+    /// (`DeviceLanding::end`). Where the device parks in its kernels the
+    /// request service's pass reads those words while a step runs, so a
+    /// request's later misses read into the records its earlier ones free.
+    /// True when any ended or freed.
     pub(super) fn settle(&mut self, directory: &mut Directory) -> bool {
-        for inbound in self.inbound.values() {
+        let mut freed = false;
+        for inbound in self.inbound.values_mut() {
             if let Need::Due { device: Some(device), .. } = &inbound.need {
+                if inbound.record.is_some() && device.converted() {
+                    self.staging.release(inbound.record.take().expect("checked above"));
+                    freed = true;
+                }
                 device.end(self.past);
             }
         }
@@ -608,23 +617,25 @@ impl Prefetch {
             }
             None => true,
         });
-        let settled = !ended.is_empty();
+        let settled = freed || !ended.is_empty();
         for (record, staged, tier, read, landed) in ended {
             self.ended(directory, record, staged, tier, read, landed);
         }
         settled
     }
 
-    /// A landing of `staged` from staging record `record` into tier record
-    /// `tier`, read at step `read` (none for the cover's), ended: landed or
-    /// not.
-    fn ended(&mut self, directory: &mut Directory, record: u32, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
+    /// A landing of `staged` from staging record `record` (none, freed
+    /// already) into tier record `tier`, read at step `read` (none for the
+    /// cover's), ended: landed or not.
+    fn ended(&mut self, directory: &mut Directory, record: Option<u32>, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
         let (layer, expert) = staged;
         match landed {
             true => directory.landed(layer, HostRecord(tier), expert, read),
             false => directory.unlanded(layer, HostRecord(tier)),
         }
-        self.staging.release(record);
+        if let Some(record) = record {
+            self.staging.release(record);
+        }
     }
 
     /// Read each layer's ring if it changed, of a step whose request at the
@@ -895,7 +906,8 @@ impl Prefetch {
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
                     if read {
-                        // SAFETY: as `end_named`'s.
+                        // SAFETY: as a demand landing's on the host
+                        // (`Self::demand`).
                         let converting = unsafe {
                             Converting::new(landing, urgent, serving.landings.clone(), end, move || {
                                 seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_landed"), 0, (target as i64, expert as i64, 0));
@@ -906,7 +918,7 @@ impl Prefetch {
                     }
                     end.set(false);
                 });
-                self.arrive(staged, Inbound { record, tier, need: Need::Ahead { ticket, ahead }, ended, urgency });
+                self.arrive(staged, Inbound { record: Some(record), tier, need: Need::Ahead { ticket, ahead }, ended, urgency });
                 Ok(bytes)
             }
             // The engine took no request: the read stages and lands nothing and

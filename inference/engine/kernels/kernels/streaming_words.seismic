@@ -6,8 +6,10 @@
 # Placement: the host is the one writer of every map entry, on every
 # backend. Across a link it copies a record's bytes into the bank on the
 # copy engine, off every step's path, then maps it (MAP_* below); a file
-# miss lands into its tier (`tier[e]`). On unified memory it lands a file
-# miss straight into a bank record and maps it; there is no tier.
+# miss lands into its tier (`tier[e]`). On unified memory it reads a file
+# miss into a staging record, which the layer's landing launch converts
+# into a bank record (the landing list, below), and maps it once the device
+# is past that launch; there is no tier.
 
 # ---------------------------------------------------------------------------
 # The streaming contract: the one statement of the
@@ -81,8 +83,8 @@ const MAP_WORDS = 6
 # reads the CPU's. Last, whether no expert of the layer can be absent
 # (POLICY_RESOLVED, nonzero: its group is whole, or its group's host tier
 # keeps every expert), so no step's route can request the file and the
-# tier wait is not encoded, nor its park where parks are submission
-# boundaries.
+# landing launch (`routed_land`) is not encoded, nor its park where parks
+# are submission boundaries.
 #
 # The assignment (`assign` in routed.seismic), per step on the device, is
 # the cost function's (`ExpertLines::serve` at one step's choices, nothing
@@ -124,6 +126,10 @@ const POLICY_WORDS = 11
 #   leaves it), so a late answer never overwrites a later step's;
 # - SLOT_PULSE, an i32 the host's pulse advances every PULSE_MS while the
 #   host lives (below), in every slot of every table;
+# - SLOT_VIOLATED, an i32: the low word of the step in which a kernel found
+#   a state the protocol never reaches, with VIOLATED_STAMP set (so a zeroed
+#   word never matches a step), stored by that kernel alone, which the host
+#   panics on;
 # - SLOT_EXPIRED, a u64: the step whose wait on the slot ended on its still
 #   pulse before its answer, stored by that waiting kernel alone (below);
 # - from SLOT_PAYLOAD, the kind's payload (each kind below).
@@ -148,7 +154,12 @@ const POLICY_WORDS = 11
 # at least 100 ms at the fastest spin measured (70 ns, an idle M4 Pro),
 # under a second on a Mac (535 ns, its slowest), and longer across a
 # discrete device's bus, whose spins read host memory over it (a 3090's and
-# a 4070's waits outlasted 1.2 s of still pulse).
+# a 4070's waits outlasted 1.2 s of still pulse). The patience is counted
+# per single poller: those costs are of one reader of the host's words, so
+# a launch of many threadgroups polls through one of them at a time
+# (`streaming_land_poll`, streaming/land.hpp); many readers contending for
+# a discrete device's bus would each spin many times slower, past any
+# bound the pulse is stated in.
 # A live host meets that end only if its pulse starves for that long (a
 # loaded machine): the wait then stores its step as the slot's SLOT_EXPIRED,
 # and the host interrupts that step, its outputs unused and its seeds never
@@ -168,6 +179,8 @@ const POLICY_WORDS = 11
 const SLOT_REQUEST = 0
 const SLOT_ANSWER = 2
 const SLOT_PULSE = 4
+const SLOT_VIOLATED = 5
+const VIOLATED_STAMP = 2147483648
 const SLOT_EXPIRED = 6
 const SLOT_PAYLOAD = 8
 # The failure bit of an answer, bit 63: bit 31 of its high word.
@@ -220,23 +233,78 @@ const SOURCE_ROWS = 2
 # each choice's entry from FILE_ENTRIES, FILE_ENTRY_WORDS words: the
 # request's word (FILE_CHOICE, `routed_route_streamed`'s), an absent
 # expert as itself, any other as -1 - expert; and for an absent choice the
-# answer's (FILE_RECORD, the host's, which `routed_tier_wait` reads), the
-# record its expert landed in and was mapped at (a bank record r on unified
-# memory, where the host lands into the bank; a tier record t as -2 - t
-# across a link; -1 for a failed read). A step with no absent choice
-# requests nothing.
+# answer's (FILE_RECORD, the host's, which `routed_land` reads), the record
+# its expert lands in (a bank record r on unified memory, which the landing
+# launch converts it into from staging; a tier record t as -2 - t across a
+# link, which the host converted it into; -1 for a failed read). The host
+# answers each expert's choices as its read lands, and the slot once every
+# absent expert's are. A step with no absent choice requests nothing.
 const FILE_COUNT = 8
 const FILE_ENTRIES = 9
 const FILE_CHOICE = 0
 const FILE_RECORD = 1
 const FILE_ENTRY_WORDS = 2
 
-# A streamed decode route's written grids `grids[DECODE_GRIDS, 3]`, written
-# by every route, whole or not: the tier wait's (WAIT_GRID,
-# `routed_tier_wait`'s `grid`): one threadgroup, or none when no choice is
-# absent.
-const WAIT_GRID = 0
-const DECODE_GRIDS = 1
+# A landing list `landing[LANDING_ENTRIES + LANDING_ENTRY_WORDS L]`
+# (host-shared, the host's `landing_extent`): the records one landing
+# launch converts as their reads land, a decode layer's (`routed_land`, its
+# file misses) or a scratch round's (`routed_round`, its conveyed records),
+# L its most entries.
+# - LANDING_HEAD, one u64 at an even word: its low word the step's low word
+#   (STEP_LOW), its high word the count of entries landed. The host stores
+#   it with one 64-bit release store after each entry it appends, in
+#   landing order (the order its reads land, not the record order); the
+#   device reads it with one 64-bit acquire load. A head whose low word is
+#   another step's counts none, so a step's first entry needs no head
+#   before it, and within a step the count only grows.
+# - From LANDING_ENTRIES, LANDING_ENTRY_WORDS words an entry: the record it
+#   converts from (LANDING_FROM: a staging or conveyor record >= 0, or in a
+#   round a negative from naming scratch slot -1 - from, which the host
+#   read the stored bytes into), the record it converts into (LANDING_TO),
+#   and the device's word (LANDING_DONE): the step's low word, stored with
+#   release by the threadgroup that places the entry's last item, after a
+#   system-scope fence following every item's stores, so the host knows the
+#   entry's source record read and frees it. The host never resets DONE: it
+#   compares it with the step's low word. A failed read is never appended:
+#   the host answers its choices -1 and appends nothing.
+# The launch's threadgroups claim (entry, item) work through a device
+# counter in landing order, each parking only on the host's count for the
+# entry it claimed (`streaming/land.hpp`), and stop once the launch's slot
+# is answered with the count below their claim: past the last read byte,
+# only the last record's conversion remains.
+const LANDING_HEAD = 0
+const LANDING_ENTRIES = 2
+const LANDING_ENTRY_WORDS = 3
+const LANDING_FROM = 0
+const LANDING_TO = 1
+const LANDING_DONE = 2
+
+# A landing launch's counters (device words, `scratch counters`): the claims
+# taken, the groups arrived, the polling lead, the count heard, then a word
+# per entry counting its items placed, so a launch of L entries holds
+# 4 * (LAND_ITEMS + L) bytes.
+const LAND_CLAIMS = 0
+const LAND_ARRIVALS = 1
+const LAND_LEAD = 2
+const LAND_HEARD = 3
+const LAND_ITEMS = 4
+
+# The landing launch's threadgroups where the device converts (a decode
+# layer whose bank places, every scratch round), every backend's: a ceiling
+# on the groups claiming (entry, item) work, which a record offers in the
+# hundreds of items, so the work never limits it. It is not fitted to a
+# device: how many groups are co-resident changes only how fast a convert
+# runs, never what it lands (a claim is taken only by a running threadgroup
+# and a parked one waits only on the host), and the assessment prices a
+# convert by running this launch as built (`routed_land`'s convert point),
+# so no other number is owed to the model. It is not derived from the
+# device's compute units because the kernels' launches declare
+# `threadgroups (LAND_GROUPS, ...)` from this module constant, before any
+# device's count is known; a device with more units than this (an 80-core Apple
+# Ultra, a large discrete GPU) leaves the rest idle during a convert.
+# Where the host tier places, a decode landing converts nothing and is one
+# threadgroup.
+const LAND_GROUPS = 64
 
 # The scratch kind: a scratch-served step's request at a layer and its
 # rounds, the layer's table `scratch[FLIGHT, SCRATCH_SLOT LANES]` (LANES =
@@ -248,14 +316,14 @@ const DECODE_GRIDS = 1
 #   0; its answer is the step once that count is final. SCRATCH_FOLLOWED,
 #   which the host stores before it queues the step's fill, is nonzero
 #   where the next launch on the fill's queue is a sibling fill, whose
-#   arrival proves this fill's converts done as an arrival after its last
+#   arrival proves this fill's rounds done as an arrival after its last
 #   round would (`routed_scratch_grids`).
-# - lane SCRATCH_ROUND + r, round r's (`routed_scratch_wait`): its request
-#   is the device's arrival at the round, which its wait stores as it
-#   begins; its answer, the round's records ready to convert. The host
-#   answers every round of a request, the rounds without records too, and
-#   a failure fails every round not yet answered, the last always among
-#   them. The device arrives at every round the host awaits its arrival
+# - lane SCRATCH_ROUND + r, round r's (`routed_round`): its request is the
+#   device's arrival at the round, which its launch stores as it begins;
+#   its answer, every record of the round appended to the round's landing
+#   list. The host answers every round of a request, the rounds without
+#   records too, and a failure fails every round not yet answered, the
+#   last always among them. The device arrives at every round the host awaits its arrival
 #   at: each with records, and every round where round 0's wait ended on
 #   its still pulse before the request's answer (`routed_scratch_grids`),
 #   so a host serving a step's rounds in order never waits on an arrival
@@ -268,14 +336,6 @@ const SCRATCH_SLOT = 10
 
 # ---------------------------------------------------------------------------
 # The rest of expert streaming's words.
-
-# A scratch request's round grids `grids[R, ROUND_GRIDS, 3]`
-# (`routed_scratch_grids`): each round's park's, and its converts' over
-# records of F rows and of H rows.
-const ROUND_GRIDS = 3
-const PARK_GRID = 0
-const ROWS_GRID = 1
-const COLUMNS_GRID = 2
 
 # A ring `ring[RING]`, a hint ring's or a routing record's: the sequence
 # (the step's low word) and the count, then its entries from RING_EXPERTS. A
@@ -300,8 +360,8 @@ const HINT_RANK = 1
 # consecutive, so no step's record is rewritten before the host has read it.
 
 # A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (`routed_copy`,
-# `routed_convert`, `routed_seed_commit`): the sequence it was written
-# for and the count, then each entry's from and to words.
+# `routed_move`, `routed_seed_commit`): the sequence it was written for and
+# the count, then each entry's from and to words.
 const LIST_SEQUENCE = 0
 const LIST_COUNT = 1
 const LIST_ENTRIES = 2
@@ -338,7 +398,7 @@ const LIST_PART = 16384
 
 # The threads of the protocol entries' one-group launches, every backend's
 # (unmeasured: each launch moves a few words, so no backend's choice is a
-# measured one): a launch whose work is one thread's (a step word, a wait,
+# measured one): a launch whose work is one thread's (a step word,
 # a round's grids; SERIAL_THREADS), a group reading or staging a list or a
 # map, or copying listed records (LIST_THREADS, also `routed_copy`'s and
 # `routed_move`'s groups), and the scratch request's group, a thread a

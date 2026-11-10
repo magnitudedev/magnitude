@@ -1047,9 +1047,6 @@ impl ElasticBank for FakeBank {
     fn device_convert(&self, _lines: &[crate::assessment::RecordLine]) {}
 
     #[cfg(test)]
-    fn slow_host_landing(&self) {}
-
-    #[cfg(test)]
     fn device_landed(&self) -> u64 {
         0
     }

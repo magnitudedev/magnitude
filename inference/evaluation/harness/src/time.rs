@@ -503,13 +503,13 @@ fn with_records<T>(cache: Option<&std::path::Path>, then: impl FnOnce(&dyn seism
     }
 }
 
-/// A prefill attributed by entry (`--prefill-attribution`): its device
-/// convert's and tier copy's seconds, and the records its prompt groups
-/// pulled. What the run achieved, reported beside the bar, which it does
-/// not price.
+/// A prefill attributed by entry (`--prefill-attribution`): its tier
+/// copy's seconds and the records its prompt groups pulled. What the run
+/// achieved, reported beside the bar, which it does not price. Its device
+/// convert has no seconds of its own: each round's landing launch
+/// (`routed_round`) parks on the reads it converts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AttributedPrefill {
-    convert_seconds: f64,
     copy_seconds: f64,
     copied: u64,
 }
@@ -654,13 +654,12 @@ fn graph_budget(engine: &Engine) -> Value {
     })
 }
 
-/// The tier copy and device convert of a prefill attributed by entry
+/// The tier copy of a prefill attributed by entry
 /// (`attribution`, its one sample), and the records its prompt groups
 /// (`groups`, the whole prompt) pulled from the host tier.
 fn attributed_prefill(attribution: &Value, groups: &[magnitude_executor::PromptGroupCost]) -> Result<AttributedPrefill, String> {
     let seconds = |entry: &str| entry_launches(attribution, &[entry]).map(|launches| launches.ms / MS);
     Ok(AttributedPrefill {
-        convert_seconds: seconds(<magnitude_kernels::routed_convert::Entry as seismic::Entry>::NAME)?,
         copy_seconds: seconds(<magnitude_kernels::routed_copy::Entry as seismic::Entry>::NAME)?,
         copied: groups.iter().flat_map(|group| &group.layers).map(|layer| layer.pulled).sum(),
     })
@@ -674,7 +673,7 @@ fn attributed_prefill(attribution: &Value, groups: &[magnitude_executor::PromptG
 /// context and concurrency) plus their conveyed records' convert at its
 /// ceiling, and the bytes they move over a host tier's link at its ceiling
 /// (`ceilings`), the slowest; and beside it, what the attributed prefill's
-/// convert and copy achieved. The bar is unavailable, with why, without an
+/// copy achieved. The bar is unavailable, with why, without an
 /// input one of its terms needs. The layers' counts are summed over the
 /// groups.
 fn prompt_groups(sample: &GroupSample, read_rate: Result<crate::bar::ReadRate, String>, resident_seconds: Result<f64, String>, ceilings: &Ceilings) -> Value {
@@ -731,7 +730,6 @@ fn prompt_groups(sample: &GroupSample, read_rate: Result<crate::bar::ReadRate, S
         },
         "achieved": match &sample.attributed {
             Ok(attributed) => json!({
-                "convert_ms": attributed.convert_seconds * MS,
                 "copy_ms": attributed.copy_seconds * MS,
                 "copy_us_per_record": (attributed.copied > 0).then(|| attributed.copy_seconds / attributed.copied as f64 * 1e6),
             }),
@@ -1550,7 +1548,7 @@ fn expert_lines(engine: &Engine) -> Result<std::sync::Arc<[magnitude_executor::a
     match engine.domain.expert_lines() {
         Some(magnitude_executor::assessment::Priced::Measured(lines)) => {
             let costs = engine.domain.expert_costs().ok_or("a streamed cell's load streams no experts")?;
-            Ok(lines.iter().zip(costs.landings).zip(costs.converts).map(|((lines, file), convert)| lines.landing(file, convert)).collect())
+            Ok(lines.iter().zip(costs.landings).map(|(lines, landing)| lines.landed_by(landing)).collect())
         }
         Some(magnitude_executor::assessment::Priced::Pending(why) | magnitude_executor::assessment::Priced::Unavailable(why)) => {
             Err(unavailable(format!("no expert lines: {why}")))
@@ -1698,7 +1696,7 @@ impl BarInputs {
         let mut peak = Vec::with_capacity(self.lines.len());
         for (layer, lines) in self.lines.iter().enumerate() {
             if lines.host.memory.is_none() {
-                peak.push(lines.landing(None, None));
+                peak.push(magnitude_executor::assessment::ExpertLines { host: magnitude_executor::assessment::HostLines { landing: None, ..lines.host }, ..*lines });
                 continue;
             }
             let of = |reason: &str| format!("streamed layer {layer}: {reason}");
@@ -2324,12 +2322,12 @@ mod tests {
 
     /// The groups' bar ([`crate::bar::PrefillBar`]) over each layer's
     /// totals across the groups at the ceilings, its terms, and the
-    /// attributed prefill's achieved convert and copy beside it; without an
+    /// attributed prefill's achieved copy beside it; without an
     /// input a term needs, there is none.
     #[test]
     fn prompt_groups_are_barred_at_the_ceilings() {
         let group = |first, steps, layers| PromptGroupCost { first, steps, layers };
-        let attributed = AttributedPrefill { convert_seconds: 1e-3, copy_seconds: 4e-3, copied: 4 };
+        let attributed = AttributedPrefill { copy_seconds: 4e-3, copied: 4 };
         let sample = GroupSample {
             groups: vec![group(1, 2, vec![layer(1, 1_000, 3), layer(0, 0, 4)]), group(3, 1, vec![layer(5, 5_000, 0), layer(0, 0, 1)])],
             measured_ms: 20.0,

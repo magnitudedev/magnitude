@@ -12,7 +12,8 @@
 //!   over its busy time and `λ` what its demand reads took beyond that: a
 //!   run is judged by it.
 //! - **The landing line** ([`FileLine`]): what a request's file misses add
-//!   past their read as they land into the host tier.
+//!   past their reads as the host lands them into a host tier (on unified
+//!   memory the device's convert prices it, `cost::LandingLine`).
 //! - **The shrink's move line** ([`MoveCosts`]), per bank group: moving `n`
 //!   records of the group's own record form takes `μ₀ + n · μ₁`, its
 //!   `routed_move` launches (one per routed tensor) timed moving none and
@@ -22,11 +23,11 @@
 //!   moving group's line at the records it moves until a resize was timed
 //!   ([`MoveCosts::of_bank`], [`MoveLines`]).
 //! - **The convert's ceiling** ([`ConvertCosts`]), per bank group: a stored
-//!   record's conversion into its resident form by a scratch round's
-//!   `routed_convert` launches (one per routed tensor), from a conveyor and
-//!   into a scratch both in the device's own memory, wherever a load lays
-//!   them: the slope through rounds of one record and of
-//!   [`CONVERTED_RECORDS`].
+//!   record's conversion into its resident form by a landing launch
+//!   (`routed_land`, every routed tensor of each entry), from staging and
+//!   into records both in the device's own memory, wherever a load lays
+//!   them, every entry landed and its slot answered before the launch: the
+//!   slope through launches of one record and of [`CONVERTED_RECORDS`].
 //! - **The host memory's read line** ([`MemoryCosts`]), where a bank has a
 //!   host tier (a record's read from it,
 //!   [`super::cost::HostLines::memory`]): reading `b` bytes of host
@@ -46,8 +47,9 @@
 //! refused as it is read.
 
 use super::executor_costs::{executor_identity, failed, named, ExecutorCostsError, Formation, Walks};
+use crate::operators::routed::streamed::land_launch;
 use crate::planning::{BankBinding, ExpertBankPlan, RecordTensor, RecordTensors};
-use magnitude_kernels::{constants, routed_convert, routed_copy, routed_move};
+use magnitude_kernels::{constants, routed_copy, routed_land, routed_move};
 use seismic::measure::{
     Gauge, InvalidLine, Pending, Reason, Record, RecordStore, StoreError, Sums, Terms, Timing, Unformed, Work,
 };
@@ -262,16 +264,15 @@ impl RecordLine {
 }
 
 /// What a layer's file misses cost beside their read (`λ + b/D`, the read
-/// line's) as they land into the host tier: a
-/// request's reads are one job, which ends once its last piece is read;
-/// each landing is then submitted to the host compute executor, whose
-/// workers convert its pieces (`RowConversion`) beside the other landings',
-/// then map and answer it. `n` landings at once end `fixed + n · record`
-/// after the read: observed from a load's requests' own landings
-/// (`Telemetry::landings_ended`) on the one generic line. Not in it: the
-/// park's notice of the answer, an in-kernel poll of a host word where the
-/// park spins (one link read), unmeasured where a park is a submission
-/// boundary.
+/// line's) as the host lands them into a host tier: each miss is a read of
+/// its own, whose end submits its landing to the host compute executor,
+/// whose workers convert its pieces (`RowConversion`) beside the other
+/// landings', then map and answer it. A request's `n` landings end `fixed +
+/// n · record` after its last read's end: observed from a load's requests'
+/// own landings (`Telemetry::landings_ended`) on the one generic line. Not
+/// in it: the park's notice of the answer, an in-kernel poll of a host word
+/// where the park spins (one link read), unmeasured where a park is a
+/// submission boundary.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileLine {
     pub landing: RecordLine,
@@ -286,12 +287,6 @@ impl FileLine {
     /// What `misses` file misses of a layer add past their reads' end.
     pub fn seconds(&self, misses: u64) -> f64 {
         self.landing.seconds(misses)
-    }
-
-    /// Whether `misses` land sooner by `device`, the device's convert in
-    /// their barrier, than on the host.
-    pub fn device_lands(&self, device: &RecordLine, misses: u64) -> bool {
-        device.seconds(misses) < self.seconds(misses)
     }
 }
 
@@ -576,7 +571,7 @@ impl MoveForm {
     }
 }
 
-/// The records a convert ceiling's larger round converts
+/// The records a convert ceiling's larger landing launch converts
 /// ([`ConvertCosts`]): enough of a record's row tiles that the device is
 /// full however few rows a record holds.
 pub const CONVERTED_RECORDS: u64 = 64;
@@ -635,7 +630,7 @@ fn rising(points: [(u64, f64); 2]) -> Option<Terms<2>> {
     sums.fit().and_then(Result::ok).filter(|terms| terms.slope() > 0.)
 }
 
-/// A bank group's record as a scratch round converts it: each routed
+/// A bank group's record as a landing launch converts it: each routed
 /// tensor's stored form into its resident one. What a convert ceiling's
 /// points are requested by (`PointRequest::Convert`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -644,17 +639,24 @@ pub struct ConvertForm {
 }
 
 impl ConvertForm {
-    /// Each routed tensor's `routed_convert` over [`CONVERTED_RECORDS`]
-    /// conveyor records into as many scratch records, its list as long.
-    fn converts(&self) -> RecordTensors<Formation<routed_convert::Entry>> {
-        let records = CONVERTED_RECORDS;
-        self.record.map(|_, tensor| {
-            let [n, k] = tensor.matrix;
-            Formation::new(
-                routed_convert::native_entry_with(routed_convert::Elements { ST: tensor.source, U: tensor.resident }),
-                &[("V", records), ("L", records), ("S", records), ("N", n), ("K", k)],
-            )
-        })
+    /// The landing launch converting every routed tensor of
+    /// [`CONVERTED_RECORDS`] staging records into as many records, of one
+    /// row's one choice (`K` 1), an up-only record's gate views empty in its
+    /// up's elements.
+    fn land(&self) -> Formation<routed_land::Entry> {
+        let RecordTensors { gate, up, down } = self.record;
+        let gate = gate.unwrap_or(up);
+        Formation::new(
+            routed_land::native_entry_with(routed_land::Elements {
+                SG: gate.source,
+                SU: up.source,
+                SD: down.source,
+                UG: gate.resident,
+                UU: up.resident,
+                UD: down.resident,
+            }),
+            &[("K", 1)],
+        )
     }
 
     fn key(&self, executor: &seismic::Identity, backend: seismic::BackendName, converted: u64) -> Result<PointKey, ExecutorCostsError> {
@@ -666,7 +668,7 @@ impl ConvertForm {
         }
         Ok(PointKey {
             executor: executor.clone(),
-            kernels: self.converts().iter().map(|(_, formation)| formation.identity(backend)).collect::<Result<_, _>>()?,
+            kernels: vec![self.land().identity(backend)?],
             configuration,
             point: named(&[("converted", converted)]),
         })
@@ -681,8 +683,8 @@ impl ConvertForm {
     /// landing by its bytes at this form's rate
     /// ([`Self::stored_byte_seconds`]).
     pub(crate) fn reference(backend: seismic::BackendName) -> Result<Option<Self>, ExecutorCostsError> {
-        let convert = seismic::generated::native_implementation_for_backend::<routed_convert::Entry>(backend)
-            .map_err(|cause| failed("routed_convert")(&cause))?;
+        let convert = seismic::generated::native_implementation_for_backend::<routed_land::Entry>(backend)
+            .map_err(|cause| failed("routed_land")(&cause))?;
         if convert.is_none() {
             return Ok(None);
         }
@@ -690,7 +692,10 @@ impl ConvertForm {
         let resident = super::executor_costs::chain_element(backend)
             .ok_or_else(|| ExecutorCostsError(format!("{backend:?} keeps no Q4_K weights resident")))?;
         let tensor = RecordTensor { source, resident, matrix: [512, 2048] };
-        Ok(Some(Self { record: RecordTensors { gate: Some(tensor), up: tensor, down: tensor } }))
+        // Down as its layer holds it, `[hidden, features]`: the launch's
+        // staging and records of down are `[hidden, features]`.
+        let down = RecordTensor { matrix: [tensor.matrix[1], tensor.matrix[0]], ..tensor };
+        Ok(Some(Self { record: RecordTensors { gate: Some(tensor), up: tensor, down } }))
     }
 
     /// `record_seconds`, this form's convert of a record, over its stored
@@ -706,72 +711,105 @@ impl ConvertForm {
     }
 }
 
-/// One round's graph: each routed tensor's `routed_convert` of the first
-/// `converted` list entries, conveyor record `i` into scratch record `i`,
-/// both zero and in the device's own memory, on the grid
-/// `routed_scratch_grids` writes a round of `converted` records.
+/// One landing launch's graph (`routed_land`): the first `converted`
+/// entries of its landing list, staging record `i` into record `i`, both
+/// zero and in the device's own memory, every entry landed and the step's
+/// file slot answered before it, so it waits for no host.
 fn convert_point(
     device: &Device,
-    kernels: &RecordTensors<NativeKernel<routed_convert::Entry>>,
+    kernel: &NativeKernel<routed_land::Entry>,
     form: &ConvertForm,
     converted: u64,
 ) -> Result<Point, ExecutorCostsError> {
     let error = failed("convert point");
     let records = CONVERTED_RECORDS;
-    let words = magnitude_kernels::list_extent(records);
-    // The step and its list: the list written for the step's sequence.
     let sequence = 1;
-    let mut step = vec![0i32; constants::STEP_WORDS as usize];
-    step[constants::STEP_LOW as usize] = sequence;
-    let mut list = vec![0i32; words as usize];
-    list[constants::LIST_SEQUENCE as usize] = sequence;
-    list[constants::LIST_COUNT as usize] = converted as i32;
-    for entry in 0..records {
-        let at = magnitude_kernels::list_extent(entry) as usize;
-        list[at + constants::LIST_FROM as usize] = entry as i32;
-        list[at + constants::LIST_TO as usize] = entry as i32;
-    }
-    let bytes = |words: &[i32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let shared = |extents: &[u64], set: &[(u64, i32)]| {
+        let tensor = Tensor::shared(device, Element::i32(), extents).map_err(|cause| error(&cause))?;
+        for &(index, value) in set {
+            tensor.store_release(4 * index, u32::from_ne_bytes(value.to_ne_bytes())).map_err(|cause| error(&cause))?;
+        }
+        Ok::<_, ExecutorCostsError>(tensor)
+    };
+    // The step, its file slot of one choice requested and answered, and its
+    // landing list of `converted` entries.
+    let table = magnitude_kernels::SlotTable::file(1, 1);
+    let slot = table.lane(sequence as u64, 0);
+    let file = [(slot + constants::SLOT_REQUEST, sequence), (slot + constants::SLOT_ANSWER, sequence)];
+    let landing = [(constants::LANDING_HEAD, sequence), (constants::LANDING_HEAD + 1, converted as i32)]
+        .into_iter()
+        .chain((0..records).flat_map(|entry| {
+            let at = magnitude_kernels::landing_extent(entry);
+            [(at + constants::LANDING_FROM, entry as i32), (at + constants::LANDING_TO, entry as i32)]
+        }))
+        .collect::<Vec<_>>();
     let mut graph = device.native_graph();
-    let port = |graph: &mut seismic::NativeGraph, element, extents: &[u64]| graph.port(element, extents).map_err(|cause| error(&cause));
-    let step_port = port(&mut graph, Element::i32(), &[constants::STEP_WORDS])?;
-    let list_port = port(&mut graph, Element::i32(), &[words])?;
-    let step_tensor = Tensor::from_host(device, Element::i32(), &[constants::STEP_WORDS], &bytes(&step)).map_err(|cause| error(&cause))?;
-    let list_tensor = Tensor::from_host(device, Element::i32(), &[words], &bytes(&list)).map_err(|cause| error(&cause))?;
-    let mut bound = Vec::new();
-    for ((_, kernel), (_, tensor)) in kernels.iter().zip(form.record.iter()) {
-        let [n, k] = tensor.matrix;
-        let conveyor = port(&mut graph, tensor.source, &[records, n, k])?;
-        let mut destination = port(&mut graph, tensor.resident, &[records, n, k])?;
-        let grid = port(&mut graph, Element::i32(), &[3])?;
-        graph
-            .enqueue(
-                kernel,
-                routed_convert::WorkflowArgs {
-                    conveyor: conveyor.tensor().into(),
-                    list: list_port.tensor().into(),
-                    step: step_port.tensor().into(),
-                    destination: destination.tensor_mut().into(),
-                    grid: grid.tensor().into(),
-                },
-            )
-            .map_err(|cause| error(&cause))?;
-        let groups = crate::operators::routed::streamed::convert_groups(n).map_err(|cause| error(&cause))?;
-        bound.push((conveyor, Tensor::zeros(device, tensor.source, &[records, n, k]).map_err(|cause| error(&cause))?));
-        bound.push((destination, Tensor::zeros(device, tensor.resident, &[records, n, k]).map_err(|cause| error(&cause))?));
-        bound.push((grid, Tensor::from_host(device, Element::i32(), &[3], &bytes(&[groups, converted as i32, 1])).map_err(|cause| error(&cause))?));
+    let mut port = |element, extents: &[u64]| graph.port(element, extents).map_err(|cause| error(&cause));
+    let step = port(Element::i32(), &[constants::STEP_WORDS])?;
+    let mut file_port = port(Element::i32(), &table.extents())?;
+    let mut sources = port(Element::i32(), &[constants::SOURCE_ROWS, 1, 1])?;
+    let policy = port(Element::i32(), &[constants::POLICY_WORDS])?;
+    let mut list = port(Element::i32(), &[magnitude_kernels::landing_extent(records)])?;
+    // An up-only record's gate views hold no record, in its up's form.
+    let RecordTensors { gate, up, down } = form.record;
+    let tensors = [(gate.unwrap_or(up), if gate.is_some() { records } else { 0 }), (up, records), (down, records)];
+    // The staging and the records of each tensor, in the tensors' own forms
+    // and extents the bank lays them out in (`RecordTensor`).
+    let [staging_gate, staging_up, staging_down] = tensors.map(|(tensor, held)| {
+        let (element, extents) = tensor.stored_tensor(held);
+        port(element, &extents)
+    });
+    let [gate_records, up_records, down_records] = tensors.map(|(tensor, held)| {
+        let (element, extents) = tensor.resident_tensor(held);
+        port(element, &extents)
+    });
+    let staging = [staging_gate?, staging_up?, staging_down?];
+    let [mut gate_records, mut up_records, mut down_records] = [gate_records?, up_records?, down_records?];
+    // The launch parks, as the load's does: its park node is bound answered
+    // below, as every word it awaits already holds its answer.
+    let park = land_launch(
+        &mut graph,
+        kernel,
+        &[] as &[(&str, u64)],
+        routed_land::WorkflowArgs {
+            step: step.tensor().into(),
+            file: file_port.tensor_mut().into(),
+            sources: sources.tensor_mut().into(),
+            policy: policy.tensor().into(),
+            landing: list.tensor_mut().into(),
+            staging_gate: staging[0].tensor().into(),
+            staging_up: staging[1].tensor().into(),
+            staging_down: staging[2].tensor().into(),
+            gate: gate_records.tensor_mut().into(),
+            up: up_records.tensor_mut().into(),
+            down: down_records.tensor_mut().into(),
+        },
+    )
+    .map_err(|cause| error(&cause))?;
+    let mut bound = vec![
+        (step, shared(&[constants::STEP_WORDS], &[(constants::STEP_LOW, sequence)])?),
+        (file_port, shared(&table.extents(), &file)?),
+        (sources, shared(&[constants::SOURCE_ROWS, 1, 1], &[])?),
+        (policy, shared(&[constants::POLICY_WORDS], &[])?),
+        (list, shared(&[magnitude_kernels::landing_extent(records)], &landing)?),
+    ];
+    let zeros = |(element, extents): (Element, [u64; 3])| Tensor::zeros(device, element, &extents).map_err(|cause| error(&cause));
+    for ((staging, records), (tensor, held)) in staging.into_iter().zip([gate_records, up_records, down_records]).zip(tensors) {
+        bound.push((staging, zeros(tensor.stored_tensor(held))?));
+        bound.push((records, zeros(tensor.resident_tensor(held))?));
     }
     let plan = graph.seal().map_err(|cause| error(&cause))?;
     let mut bindings = plan.bindings();
-    for (port, tensor) in [(&step_port, &step_tensor), (&list_port, &list_tensor)].into_iter().chain(bound.iter().map(|(port, tensor)| (port, tensor))) {
+    for (port, tensor) in &bound {
         bindings.set(port, tensor).map_err(|cause| error(&cause))?;
     }
+    bindings.set_answered(park).map_err(|cause| error(&cause))?;
     plan.point(bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
 /// The convert's ceiling on an executor, per bank group: a record of the
 /// group's form converted from the device's own memory into it, the
-/// slope's seconds through rounds of one record and of
+/// slope's seconds through landing launches of one record and of
 /// [`CONVERTED_RECORDS`], each timed by the measurement job on the device
 /// at its sustained clock and kept in the record store, so a form is
 /// measured once per executor. It holds wherever
@@ -840,22 +878,22 @@ impl ConvertCosts {
 }
 
 impl ConvertForm {
-    /// Measure the form's points in the measurement job (`walks`): rounds of
-    /// one record and of [`CONVERTED_RECORDS`], the kernels formed with the
-    /// first attempted.
+    /// Measure the form's points in the measurement job (`walks`): landing
+    /// launches of one record and of [`CONVERTED_RECORDS`], the kernel
+    /// formed with the first attempted.
     pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         let device = walks.device();
-        type Formed = Result<RecordTensors<NativeKernel<routed_convert::Entry>>, ExecutorCostsError>;
+        type Formed = Result<NativeKernel<routed_land::Entry>, ExecutorCostsError>;
         let formed = OnceCell::<Formed>::new();
         for converted in [1, CONVERTED_RECORDS] {
             let key = self.key(&walks.identity(), device.backend(), converted)?;
             let formed = &formed;
             walks.time(key, false, move || {
-                let kernels = formed
-                    .get_or_init(|| self.converts().try_map(|_, formation| formation.form(device, None)))
+                let kernel = formed
+                    .get_or_init(|| self.land().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                convert_point(device, kernels, self, converted).map_err(Unformed::Now)
+                convert_point(device, kernel, self, converted).map_err(Unformed::Now)
             });
         }
         Ok(())
@@ -1640,8 +1678,7 @@ pub struct CpuCosts {
 
 impl CpuForm {
     /// The site the measurement job reads a machine's CPU lines on, of no
-    /// model: the reference convert's record (`ConvertForm::reference`), its
-    /// down turned to a layer's `[hidden, features]`, a
+    /// model: the reference convert's record (`ConvertForm::reference`), a
     /// decode row's 8 choices of a layer's 256 experts, expanding by the
     /// fused routed activation, a served load's steps in flight; none on a
     /// backend that streams nothing. A streamed estimate prices a sited
@@ -1649,11 +1686,8 @@ impl CpuForm {
     /// ([`Self::lines_of`]).
     pub(crate) fn reference(backend: seismic::BackendName) -> Result<Option<Self>, ExecutorCostsError> {
         const CHOICES: u64 = 8;
-        // A site reads down as its layer computes it, `[hidden, features]`:
-        // the reference convert's `[features, hidden]` turned.
-        let turned = |tensor: RecordTensor| RecordTensor { matrix: [tensor.matrix[1], tensor.matrix[0]], ..tensor };
         Ok(ConvertForm::reference(backend)?.map(|convert| Self {
-            record: RecordTensors { down: turned(convert.record.down), ..convert.record },
+            record: convert.record,
             choices: CHOICES,
             experts: 256,
             function: crate::operators::routed::FUSED_ACTIVATION,
@@ -2345,6 +2379,42 @@ mod tests {
         let whole = measured(whole);
         assert!(whole.line.0.slope() > 0., "{:?}", whole.line);
         std::fs::remove_dir_all(records).unwrap();
+    }
+
+    /// The landing launch is measured as the measurement job builds it, on
+    /// every native backend the run selects with an available executor: its
+    /// graph is valid (the launch parks, its park bound answered) and its
+    /// convert rises with the records landed.
+    #[test]
+    fn the_reference_convert_is_measured_on_every_native_backend() {
+        let devices = seismic::Devices::discover(&[]).unwrap();
+        let available = [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan]
+            .into_iter()
+            .filter(|&backend| crate::test_support::available(&devices, backend))
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            return;
+        }
+        for &backend in &available {
+            let device = crate::test_support::open_backend(&devices, backend)
+                .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
+            let form = ConvertForm::reference(backend).unwrap().expect("a native backend lands");
+            let records = std::env::temp_dir().join(format!("convert-line-{}-{backend:?}", std::process::id()));
+            let store = seismic::measure::JsonFileStore::new(&records);
+            let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+            let deadline = super::super::requests::JobDeadlines::within(std::time::Duration::from_secs(120));
+            let requests = super::super::Outstanding { standing: vec![super::super::PointRequest::Convert(form)], loads: Vec::new() };
+            let mut visited = Vec::new();
+            let ended = super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |key, outcome| {
+                visited.push(format!("{}: {outcome:?}", key.point["converted"]));
+            })
+            .unwrap();
+            assert!(ended.ended.is_empty() && ended.failures.is_empty(), "{backend:?}: {ended:?}");
+            let costs = ConvertCosts::stored(device.topology(), device.info(), form, &store)
+                .unwrap_or_else(|error| panic!("{backend:?}: {error:?}: {visited:?}"));
+            assert!(costs.line.0.slope() > 0. && costs.record_seconds > 0., "{backend:?}: {:?}", costs.line);
+            std::fs::remove_dir_all(records).unwrap();
+        }
     }
 
     }

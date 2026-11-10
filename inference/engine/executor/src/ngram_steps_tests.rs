@@ -350,12 +350,11 @@ fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// On every unified device, a partial bank whose misses are priced to land on
-/// the device: each is converted past its barrier, ordered after the wait
-/// whose answer writes its list on a backend that runs independent launches
-/// concurrently too, so its steps score as the resident load does. Each read
-/// is held back long enough that a convert run beside the wait finds no list,
-/// and its step reads a record nothing converted.
+/// On every unified device, a partial bank's misses land on the device,
+/// unpriced: each record converted by its layer's landing launch as its read
+/// lands, the experts after it reading it in submission order, so its steps
+/// score as the resident load does ([`scores`] asserts the device landed
+/// some).
 #[test]
 fn misses_the_device_lands_score_as_resident() {
     let _placement = crate::test_support::process_placement();
@@ -363,20 +362,18 @@ fn misses_the_device_lands_score_as_resident() {
     let definition = qwen4exp_fixture_definition_of(4, 128);
     let (directory, definition, package) = fixture_with("device-landed", definition, streamed_experts_manifest);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        scores(&catalog, &definition, &package, backend, Banked::Half, Start::DeviceLanded)
+        scores(&catalog, &definition, &package, backend, Banked::Half, Start::AtOnce)
             .assert_as_resident(backend, "the misses the device landed score as the resident load's");
     }
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// Whether [`scores`] steps a banked load at once, once its host tier has
-/// grown to its planned size within its weight cap, or with its misses
-/// priced to land on the device, where the host places.
+/// Whether [`scores`] steps a banked load at once, or once its host tier
+/// has grown to its planned size within its weight cap.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Start {
     AtOnce,
     TierGrown,
-    DeviceLanded,
 }
 
 /// The decode steps [`scores`] runs: at 2 choices a step of 128 experts,
@@ -604,15 +601,10 @@ fn scores(
             }
         }
         // A site serves only once its load is priced: until then every miss
-        // is served on the GPU's path. A miss lands on the device once its
-        // convert is priced under the host's landing.
-        let device_landed = start == Start::DeviceLanded && !matches!(banked, Banked::Resident);
-        if device_landed {
-            domain.slow_host_landing();
-        }
-        if site || device_landed {
+        // is served on the GPU's path.
+        if site {
             domain
-                .measure_load(test_measures(&domain, &pricing, site, device_landed), &mut bindings)
+                .measure_load(test_measures(&domain, &pricing), &mut bindings)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         }
         let request = RequestId(1);
@@ -639,7 +631,8 @@ fn scores(
             _ => 0,
         };
         assert_eq!(domain.resident_decodes(), resident, "{backend:?}: the decode steps the resident forms ran");
-        if start == Start::DeviceLanded && domain.expert_bank_plan().is_some_and(|plan| plan.placer() == crate::planning::Placer::Bank) {
+        // Where the bank places, a half bank's misses all land on the device.
+        if matches!(banked, Banked::Half) && domain.expert_bank_plan().is_some_and(|plan| plan.placer() == crate::planning::Placer::Bank) {
             assert!(domain.device_landed() > 0, "{backend:?}: the device landed no miss, so its path never ran");
         }
         if waited {
@@ -660,34 +653,19 @@ fn scores(
 /// layer's record bytes, where a one-row miss ends on the CPU (40 µs and a
 /// 4 µs handshake) before the link's 86 µs, so the route assigns misses to
 /// the site, as a real model's on that host; the fixture's experts are too
-/// small for a link at their own bytes to lose to a handshake. A
-/// `device_landed` load's bank groups each convert at a line far under the
-/// host's landing (`Shared::slow_host_landing`).
-fn test_measures(domain: &ExecutorDomain, pricing: &Pricing, sited: bool, device_landed: bool) -> crate::LoadMeasures {
-    use crate::assessment::{ExpertLines, HostLines, Priced, RecordLine};
-    let pending = || "not measured by the test".to_owned();
-    let lines = match sited {
-        true => {
-            let reference = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
-            Priced::Measured(
-                domain
-                    .expert_bank_lines()
-                    .expect("a sited load has a bank")
-                    .iter()
-                    .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
-                    .collect(),
-            )
-        }
-        false => Priced::Pending(pending()),
-    };
-    let convert = match device_landed {
-        true => {
-            let groups = domain.expert_bank_plan().expect("a device-landed load has a bank").groups().len();
-            Priced::Measured(Some(vec![RecordLine::new(1e-9, 1e-9).expect("a line"); groups].into()))
-        }
-        false => Priced::Pending(pending()),
-    };
-    pricing.measures(lines, convert)
+/// small for a link at their own bytes to lose to a handshake.
+fn test_measures(domain: &ExecutorDomain, pricing: &Pricing) -> crate::LoadMeasures {
+    use crate::assessment::{ExpertLines, HostLines, Priced};
+    let reference = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
+    let lines = Priced::Measured(
+        domain
+            .expert_bank_lines()
+            .expect("a sited load has a bank")
+            .iter()
+            .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
+            .collect(),
+    );
+    pricing.measures(lines, Priced::Pending("not measured by the test".to_owned()))
 }
 
 /// What a test load is priced on, as a load's worker prices it once its

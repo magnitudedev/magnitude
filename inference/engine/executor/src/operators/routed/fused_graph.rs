@@ -18,7 +18,7 @@ use super::grouped::{ExpertsPass, Grouped};
 use super::split::{BackCrossing, Crossing, PassPorts, SharedInput, Split};
 use super::streamed::{
     BankCombineEntry, BankForm, BankNumbers, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals,
-    StreamedLayer, WaitPorts,
+    StreamedLayer, LandPorts,
 };
 use crate::planning::RecordTensors;
 use crate::programs::graph::facts::Numbers;
@@ -697,12 +697,9 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 return Err("a fused layer's bank holds another form's route".into());
                             };
                             let route = route[hints.ahead as usize].ok_or("a streamed layer's lead was not prepared with its binding")?;
-                            // The step's sources and the tier wait's grid, which
-                            // the route writes and its later entries read.
-                            let mut locals = RouteLocals {
-                                sources: graph.local_for(route, "sources", &route_dims)?,
-                                grids: graph.local_for(route, "grids", &route_dims)?,
-                            };
+                            // The step's sources, which the route writes and its
+                            // later entries read.
+                            let mut locals = RouteLocals { sources: graph.local_for(route, "sources", &route_dims)? };
                             let routed = graph.enqueue(
                                 route,
                                 &route_dims,
@@ -724,7 +721,6 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     sited: (ports.sited()).into(),
                                     step: ports.step.tensor().into(),
                                     file: ports.file.tensor_mut().into(),
-                                    grids: locals.grids.tensor_mut().into(),
                                     sources: locals.sources.tensor_mut().into(),
                                     next_norm: (&hints.weights[0][0]).into(),
                                     next_router: (&hints.weights[0][1]).into(),
@@ -736,17 +732,16 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 },
                             )?;
                             let decode_shape = DecodeShape { rows };
-                            let wait_grid = locals.grid(magnitude_kernels::constants::WAIT_GRID);
                             let mut sources = locals.sources.tensor().clone();
-                            layer.tier_wait(
+                            layer.land(
                                 graph,
-                                WaitPorts {
+                                LandPorts {
                                     decode: &mut ports,
                                     sources: &mut sources,
-                                    grid: &wait_grid,
                                     records: RecordTensors { gate: Some(&mut gate_records), up: &mut up_records, down: &mut down_records },
                                 },
                                 &decode_shape,
+                                constants,
                             )?;
                             // The site request, before the gate/up: the step's
                             // CPU choices of the snapshot, weighed by their scores.

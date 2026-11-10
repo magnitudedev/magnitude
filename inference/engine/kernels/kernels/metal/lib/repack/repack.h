@@ -2,8 +2,8 @@
 // `repack`), as templates over a binding `B` (`REPACK_BINDING`, below): the
 // conversion of one source element into one resident element (representation,
 // layout), and the geometry of the two tensors it converts between, so one
-// kernel holds any number of conversions (`repack_weight` and
-// `routed_convert`: one each). Every view is [B, N, K].
+// kernel holds any number of conversions (`repack_weight`: one;
+// `routed_land` and `routed_round`: one a routed tensor). Every view is [B, N, K].
 //
 // The conversion is data: its word form (`seismic_lang::repack::WordTable`,
 // whose docs give the table's format) gives every 32-bit word of a source

@@ -76,6 +76,14 @@ __device__ __forceinline__ void streaming_device_store(int *word, int value) {
     *word = value;
 }
 
+__device__ __forceinline__ int streaming_device_add(int *word, int value) {
+    return atomicAdd(word, value);
+}
+
+__device__ __forceinline__ int streaming_device_cas(int *word, int expected, int desired) {
+    return atomicCAS(word, expected, desired);
+}
+
 __device__ __forceinline__ void streaming_system_fence() {
     __threadfence_system();
 }

@@ -64,31 +64,37 @@ fn a_decode_request_lands_its_absent_experts_into_the_tier_and_answers_each_choi
     assert_eq!((step.layers[0].misses, step.layers[0].hosted), (1, 1));
 }
 
-/// On unified memory's one store, a file miss lands straight into a store
-/// record, which the host maps for every step not yet begun and answers as
-/// itself (a bank record, not -2 - t); the next step's route finds it held
-/// in the store.
+/// On unified memory's one store, a file miss is read into staging and its
+/// entry appended to the layer's landing list, which the device's landing
+/// launch converts into a store record, answered as itself (a bank record,
+/// not -2 - t); once the device is past the launch, having stored the
+/// entry's DONE, the host maps the record for every step not yet begun,
+/// and the next step's route finds it held in the store.
 #[test]
-fn a_host_placed_miss_lands_into_the_store_and_is_mapped_in_the_map() {
+fn a_device_landed_miss_lands_into_the_store_and_is_mapped_past_its_launch() {
     let harness = lending("one-store", EXPERTS, u64::from(TIER), 1, STAGING, DECODE, TIER, Placer::Bank, false);
     let step = harness.request(&[1]);
     eventually("the choice was never answered", || harness.verdict(0, step.sequence()) == Some(Answer::Answered));
     let record = harness.layers[0].1.load(step.sequence(), 0, record_word(0));
     assert!(record >= 0, "answered as the store record {record}");
-    assert_eq!(harness.layers[0].0.held(1), Some(record as usize), "placed by the map");
-    assert_eq!(harness.layers[0].0.resolve(1, step.sequence()), None, "from the first step not yet begun");
+    let list = harness.landing[0].as_ref().expect("the one store's landing list");
+    assert_eq!(list.listed(step.sequence()).iter().map(|&(_, to)| to).collect::<Vec<_>>(), [record]);
     assert_eq!([0, 1, 2].map(|kind| harness.tiered(kind, record)), [1, 101, 201]);
+    assert_eq!(harness.layers[0].0.resolve(1, step.sequence()), None, "the step resolved it absent");
     step.complete().unwrap();
+    let map = &harness.layers[0].0;
+    eventually("the landing never mapped its record", || map.held(1) == Some(record as usize));
     let next = harness.step();
     assert_eq!(harness.route_at(&next, 0, &[1]), vec![-1 - 1], "held in the store");
     next.complete().unwrap();
 }
 
-/// Where the host places into the one store, a parked step's landing is
-/// mapped from the first step that has not resolved its layer: a step begun
-/// behind it (lookahead) that has yet to route the layer hits it, by the map
-/// the host decides its hits by as the device's route does, so the two
-/// agree; the parked step itself, which resolved it absent, does not.
+/// Where the bank places, a parked step's landing is mapped, once the
+/// device is past its launch, from the first step that had not resolved its
+/// layer when the read took its record: a step begun behind it (lookahead)
+/// that has yet to route the layer hits it, by the map the host decides its
+/// hits by as the device's route does, so the two agree; the parked step
+/// itself, which resolved it absent, does not.
 #[test]
 fn a_miss_landed_for_a_parked_step_is_a_hit_for_the_step_begun_behind_it() {
     let harness = lending("lookahead-hit", EXPERTS, u64::from(TIER), 1, STAGING, DECODE, TIER, Placer::Bank, false);
@@ -98,67 +104,89 @@ fn a_miss_landed_for_a_parked_step_is_a_hit_for_the_step_begun_behind_it() {
     eventually("the choice was never answered", || harness.verdict(0, parked.sequence()) == Some(Answer::Answered));
     let record = harness.layers[0].1.load(parked.sequence(), 0, record_word(0));
     assert!(record >= 0, "answered as the store record {record}");
-    let map = &harness.layers[0].0;
-    assert_eq!(map.resolve(1, parked.sequence()), None, "the parked step resolved it absent");
-    assert_eq!(map.resolve(1, behind.sequence()), Some(record as usize), "the step begun behind it hits it");
+    // Mapped once the device is past the parked step's landing launch.
+    let sequence = parked.sequence();
     parked.complete().unwrap();
+    let map = &harness.layers[0].0;
+    eventually("the landing never mapped its record", || map.resolve(1, behind.sequence()) == Some(record as usize));
+    assert_eq!(map.resolve(1, sequence), None, "the parked step resolved it absent");
     assert_eq!(harness.route_at(&behind, 0, &[1]), vec![-1 - 1], "its route finds it held");
     behind.complete().unwrap();
 }
 
-/// Where the device's convert is priced sooner than the host's landing, a
-/// request's read end publishes the convert's list and grids before its
-/// answer, and only the device's passing the barrier maps the record and
-/// clears the grids: a step behind it has no record before the bytes are
-/// whole. A step that failed maps nothing.
+/// Where the bank places, each miss's read appends its entry to the layer's
+/// landing list as it lands, in landing order, before the slot is answered
+/// at its last absent expert: every entry converts a staging record into the
+/// record its choices are answered with, and the device's DONE of each
+/// lets the host map it once past the launch. A repeated expert lands once.
 #[test]
-fn the_device_lands_a_miss_past_its_barrier() {
-    use crate::assessment::RecordLine;
+fn the_device_lands_each_miss_as_its_read_lands() {
     let harness = lending("device-landing", EXPERTS, u64::from(TIER), 2, STAGING, DECODE, TIER, Placer::Bank, false);
-    let shared = harness.watcher.shared();
-    // The host's line, of two counts, then the device's far under it.
-    shared.telemetry.landings_ended(0, 1, 1e-3);
-    shared.telemetry.landings_ended(0, 2, 1.5e-3);
-    shared.device_convert(&[RecordLine::new(1e-6, 1e-6).unwrap()]);
-    let words = harness.device_words[0].as_ref().expect("the one store's words");
-    let grid = |grid: u64, axis: u64| words.grids.load((grid * 3 + axis) as usize);
     let step = harness.step();
-    harness.request_at(&step, 0, &[1]);
-    let record = harness.layers[0].1.load(step.sequence(), 0, record_word(0));
-    assert!(record >= 0, "answered as the store record {record}");
-    assert_eq!(words.list.load(constants::LIST_SEQUENCE as usize), super::low_word(step.sequence()));
-    assert_eq!(words.list.load(constants::LIST_COUNT as usize), 1);
-    assert_eq!(words.list.load(magnitude_kernels::list_extent(0) as usize + constants::LIST_TO as usize), record);
-    assert_eq!((grid(constants::ROWS_GRID, 0), grid(constants::ROWS_GRID, 1)), (3, 1));
-    assert_eq!((grid(constants::COLUMNS_GRID, 0), grid(constants::COLUMNS_GRID, 1)), (4, 1));
+    harness.request_at(&step, 0, &[1, 2, 1]);
+    let records = (0..3).map(|choice| harness.layers[0].1.load(step.sequence(), 0, record_word(choice))).collect::<Vec<_>>();
+    assert_eq!(records[0], records[2], "a repeated expert answers both choices with one record");
+    let list = harness.landing[0].as_ref().expect("the one store's landing list");
+    let listed = list.listed(step.sequence());
+    let mut landed = listed.iter().map(|&(_, to)| to).collect::<Vec<_>>();
+    landed.sort_unstable();
+    let mut answered = vec![records[0], records[1]];
+    answered.sort_unstable();
+    assert_eq!(landed, answered, "an entry for each distinct miss, into its answered record");
+    for (entry, &(from, _)) in listed.iter().enumerate() {
+        assert!((0..STAGING as i32).contains(&from), "entry {entry} converts staging record {from}");
+        assert!(list.done(step.sequence(), entry), "entry {entry} placed");
+    }
+    for (expert, record) in [(1, records[0]), (2, records[1])] {
+        assert_eq!([0, 1, 2].map(|kind| harness.tiered(kind, record)), [expert, 100 + expert, 200 + expert]);
+    }
     let (map, sequence) = (&harness.layers[0].0, step.sequence());
-    assert_eq!(map.resolve(1, sequence + 1), None, "not mapped before the device passes its convert");
     harness.route_at(&step, 1, &[]);
     step.complete().unwrap();
-    eventually("the landing never mapped its record", || map.resolve(1, sequence + 1) == Some(record as usize));
-    assert_eq!(grid(constants::ROWS_GRID, 1), 0, "past its barrier no grid launches");
+    eventually("the landings never mapped their records", || {
+        map.resolve(1, sequence + 1) == Some(records[0] as usize) && map.resolve(2, sequence + 1) == Some(records[1] as usize)
+    });
+    assert_eq!(harness.watcher.shared().device_landed(), 2);
 }
 
-/// A request of more misses than staging holds lands them all, each as a
-/// record frees: the device's convert, priced sooner, would hold its staging
-/// until the barrier the waiting misses keep shut, so the host lands them.
+/// A request of more misses than staging holds lands them all on the
+/// device: each entry's DONE frees its staging record for the next miss's
+/// read while the launch converts, so the slot is answered whole without
+/// waiting for the launch to end.
 #[test]
-fn a_request_past_its_staging_lands_on_the_host() {
-    use crate::assessment::RecordLine;
+fn a_request_past_its_staging_lands_whole_as_done_frees_staging() {
     let harness = lending("short-staging", EXPERTS, u64::from(TIER), 2, 2, DECODE, TIER, Placer::Bank, false);
-    let shared = harness.watcher.shared();
-    shared.telemetry.landings_ended(0, 1, 1e-3);
-    shared.telemetry.landings_ended(0, 2, 1.5e-3);
-    shared.device_convert(&[RecordLine::new(1e-6, 1e-6).unwrap()]);
-    let words = harness.device_words[0].as_ref().expect("the one store's words");
     let step = harness.step();
     harness.request_at(&step, 0, &[1, 2, 3, 4]);
-    for choice in 0..4 {
-        assert!(harness.layers[0].1.load(step.sequence(), 0, record_word(choice)) >= 0, "choice {choice} landed");
+    let list = harness.landing[0].as_ref().expect("the one store's landing list");
+    let listed = list.listed(step.sequence());
+    assert_eq!(listed.len(), 4, "every miss lands on the device");
+    for (choice, expert) in (0..4).zip(1..) {
+        let record = harness.layers[0].1.load(step.sequence(), 0, record_word(choice));
+        assert!(record >= 0, "choice {choice} landed");
+        assert!(listed.iter().any(|&(_, to)| to == record), "choice {choice}'s record is an entry's");
+        assert_eq!([0, 1, 2].map(|kind| harness.tiered(kind, record)), [expert, 100 + expert, 200 + expert]);
     }
-    assert_ne!(words.list.load(constants::LIST_SEQUENCE as usize), super::low_word(step.sequence()), "no convert of a request that waited");
     harness.route_at(&step, 1, &[]);
     step.complete().unwrap();
+}
+
+/// A read that fails appends nothing: its choices are answered -1 and the
+/// launch converts only the entries of the reads that landed.
+#[test]
+fn a_failed_read_appends_nothing_and_answers_no_record() {
+    // The file holds 6 experts of each tensor: expert 7's reads of the
+    // last tensor lie past its end.
+    let harness = lending("device-failure", 6, u64::from(TIER), 1, STAGING, DECODE, TIER, Placer::Bank, false);
+    let step = harness.request(&[1, 7]);
+    let sequence = step.sequence();
+    assert_eq!(harness.verdict(0, sequence), Some(Answer::Answered));
+    let landed = harness.layers[0].1.load(sequence, 0, record_word(0));
+    assert_eq!(harness.layers[0].1.load(sequence, 0, record_word(1)), -1, "the read that failed answers no record");
+    let list = harness.landing[0].as_ref().expect("the one store's landing list");
+    assert_eq!(list.listed(sequence).iter().map(|&(_, to)| to).collect::<Vec<_>>(), [landed], "only the landed read's entry");
+    assert!(matches!(step.complete(), Err(StepFailure::Read { .. })));
+    assert_eq!(harness.layers[0].0.held(7), None, "nothing is mapped for it");
 }
 
 /// An expert the tier has unmapped for its reserve lives only in the file:
@@ -290,14 +318,14 @@ fn a_parked_step_never_lands_over_a_store_record_its_route_resolved() {
     graced.complete().unwrap();
 }
 
-/// Where the host places into the one store, the reserve's records the
-/// refill unmapped from the first step not yet begun are ready at the next
-/// park, however many steps have begun behind it: their entries are
-/// restamped from the first step that has not resolved their layer, so a
-/// step begun behind the park no longer resolves them, and a hint, which
-/// takes only ready records beyond one request's, is read. A step's misses
-/// take the ready records; the refill unmaps as many again while a second
-/// step is begun; the first step's next park frees them.
+/// Where the bank places, a parked step's device landings are mapped only
+/// once the device is past their launch, at the step's next park, from the
+/// first step that had not resolved their layer; the refill unmaps them
+/// into the reserve in that same advance, and the park restamps them from
+/// that step, so they are ready however many steps have begun behind it,
+/// and a hint, which takes only ready records beyond one request's, is
+/// read. A step's misses take the ready records; a second step is begun
+/// while they land.
 #[test]
 fn a_park_readies_the_reserve_for_the_hints_behind_it() {
     // Eight store records, all the reserve (one per staging record), for
@@ -306,11 +334,9 @@ fn a_park_readies_the_reserve_for_the_hints_behind_it() {
     let map = &harness.layers[0].0;
     let (parked, behind) = (harness.step(), harness.step());
     harness.request_at(&parked, 0, &[4, 5, 6, 7]);
-    // The refill unmaps the four landed while `behind` is begun: it may
-    // still resolve them.
-    eventually("the reserve never unmapped the landed experts", || (4..8).all(|expert| map.held(expert).is_none()));
-    assert!((4..8).all(|expert| map.resolve(expert, behind.sequence()).is_some()), "unmapped from the step after `behind`");
+    assert!((4..8).all(|expert| map.resolve(expert, behind.sequence()).is_none()), "mapped before the device is past the launch");
     harness.request_at(&parked, 1, &[7]);
+    assert!((4..8).all(|expert| map.held(expert).is_none()), "the refill unmapped the landed experts");
     assert!((4..8).all(|expert| map.resolve(expert, behind.sequence()).is_none()), "restamped at the park");
     harness.hint(&behind, 0, &[5]);
     eventually("the hint was never read", || harness.watcher.shared().costs().hints.reads == 1);

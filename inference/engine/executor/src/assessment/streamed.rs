@@ -17,8 +17,10 @@
 //!   a host tier's record read at the host memory's line, a CPU site's
 //!   misses where the plan has one at the site's lines of a reference form
 //!   scaled by the record's bytes, the file's reads at the
-//!   model store's read line and, with no host tier, a read's landing at the
-//!   device's convert, all measured by the measurement job
+//!   model store's read line and, with no host tier, a request's landing
+//!   past its last read at one record's device convert (its landing launch
+//!   converts each record as its read lands), all measured by the
+//!   measurement job
 //!   ([`StreamedFigures`]).
 //! - **The step** is the one step model's ([`super::step`]) on `C`, the
 //!   step's compute in the form its holding decodes in ([`FormSeconds`]),
@@ -26,7 +28,7 @@
 //!   which no stored figure prices. A bank holding every streamed layer's
 //!   experts decodes the resident forms and misses nothing
 //!   ([`StreamedLayers::whole`]); any smaller one the streamed forms, whose
-//!   route, tier wait and CPU site entries cost at any misses, none
+//!   route, landing launch and CPU site entries cost at any misses, none
 //!   included, so the last slot that makes the bank whole saves them too.
 //!
 //! A load prices its experts' decisions on the same step ([`DecodePrice`]):
@@ -34,14 +36,14 @@
 //! read this session ([`LiveDecode`]), at its decode's rows and context.
 //! Nothing it counts is stored.
 //!
-use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError};
+use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError, LandingLine};
 use super::estimate::ExpertPass;
 use super::executor_costs::ExecutorCosts;
 use super::miss_model::MissModel;
 use super::misses::{HeldSlots, StreamedStep};
 use super::priced::Priced;
 use super::step::{LayerLoad, ReadAhead, StepInputs};
-use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, CpuCosts, CpuForm, FileLine, MemoryCosts, MemoryError, ReadLine, RecordLine, StorageCosts, StorageError};
+use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, CpuCosts, CpuForm, MemoryCosts, MemoryError, ReadLine, RecordLine, StorageCosts, StorageError};
 use crate::planning::ExpertBankPlan;
 use seismic::measure::{InvalidLine, Record, RecordStore, StoreError};
 use seismic::{DeviceTopology, Executor, PointKey};
@@ -281,8 +283,8 @@ impl StreamedLayers {
                         Some((form, lines)) => Some(form.lines_of(lines, host.record_bytes).map_err(|error| StreamedError::Costs(error.to_string()))?),
                         None => None,
                     };
-                    let file = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
-                    Ok(HostLines { cpu, file, ..host })
+                    let landing = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
+                    Ok(HostLines { cpu, landing, ..host })
                 })
                 .collect::<Result<Vec<_>, StreamedError>>()?;
             Ok((pass, host))
@@ -379,14 +381,15 @@ impl StreamedLayers {
     }
 }
 
-/// What a file miss of a layer of `host`'s lines takes past its read: with no
-/// host tier it lands through the device's convert into its bank record before
-/// its layer computes, its stored bytes at `byte_seconds`; beside a tier the
-/// CPU or the link serves it where it landed.
-fn landing(host: &HostLines, byte_seconds: f64) -> Result<Option<FileLine>, InvalidLine> {
+/// What a request's file misses of a layer of `host`'s lines take past
+/// their reads' end: with no host tier the device's landing launch converts
+/// each into its bank record as its read lands, so past the last read only
+/// the last record's convert remains, its stored bytes at `byte_seconds`;
+/// beside a tier the host lands them, at a line only a load observes.
+fn landing(host: &HostLines, byte_seconds: f64) -> Result<Option<LandingLine>, InvalidLine> {
     match host.memory {
         Some(_) => Ok(None),
-        None => RecordLine::new(0., host.record_bytes as f64 * byte_seconds).map(|landing| Some(FileLine { landing })),
+        None => RecordLine::new(0., host.record_bytes as f64 * byte_seconds).map(|convert| Some(LandingLine::Device(convert))),
     }
 }
 
@@ -530,12 +533,17 @@ mod tests {
         );
     }
 
-    /// A file miss lands at the convert's rate only with no host tier.
+    /// With no host tier a request's file misses land through the device's
+    /// convert, past their last read one record's, however many they are
+    /// while each read takes longer than a convert (here 1 s against
+    /// 0.2 ms); beside a tier the host lands them, unpriced before a load observes it.
     #[test]
-    fn a_file_miss_lands_through_the_convert_with_no_host_tier() {
-        let host = HostLines { cpu: None, memory: None, file: None, convert: None, record_bytes: 2_000_000 };
+    fn a_file_miss_lands_through_one_records_convert_with_no_host_tier() {
+        let host = HostLines { cpu: None, memory: None, landing: None, record_bytes: 2_000_000 };
         let line = landing(&host, 1e-10).unwrap().expect("no tier: the device lands it");
-        assert!((line.seconds(3) - 3. * 2e-4).abs() < 1e-12);
+        for count in [1, 3] {
+            assert!((line.seconds(count, 1.) - 2e-4).abs() < 1e-12, "{count} misses");
+        }
         let tier = HostLines { memory: Some(Nanoseconds::saturating(1.)), ..host };
         assert_eq!(landing(&tier, 1e-10).unwrap(), None);
     }

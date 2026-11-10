@@ -1,0 +1,35 @@
+// Expert streaming: a streamed decode layer's landing launch (`routed_land`
+// in routed.seismic); the Vulkan form of `metal/routed_land.metal`, after
+// its park, which the host opened once the step's slot of the layer's file
+// table was answered (every entry appended): where the bank places, every
+// workgroup reads the landing list's head once and converts the entries it
+// claims (streaming/land.hpp over `lib/streaming/land.glsl`); then
+// workgroup 0 writes the absent choices' sources (streaming/tier_wait.hpp).
+// Where the tier places, the one workgroup only sources.
+#include <seismic/slab.glsl>
+#include "lib/streaming/control.glsl"
+#include "lib/streaming/window.glsl"
+
+#define LAND_SOURCE_GATE SEISMIC_STAGING_GATE
+#define LAND_SOURCE_UP SEISMIC_STAGING_UP
+#define LAND_SOURCE_DOWN SEISMIC_STAGING_DOWN
+#define LAND_SOURCE_GATE_BUFFER SEISMIC_BUFFER_STAGING_GATE
+#define LAND_SOURCE_UP_BUFFER SEISMIC_BUFFER_STAGING_UP
+#define LAND_SOURCE_DOWN_BUFFER SEISMIC_BUFFER_STAGING_DOWN
+#include "lib/streaming/land.glsl"
+#include "../streaming/tier_wait.hpp"
+
+void routed_land() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+    const uint64_t file = SEISMIC_PTR(SEISMIC_BUFFER_FILE);
+    if (SEISMIC_DIM_V > 0)
+        streaming_land(STREAMING_LAND_WINDOW, SEISMIC_PTR(SEISMIC_BUFFER_LANDING), SEISMIC_LANDING_STRIDE_0,
+            STREAMING_AT(file, (q % uint64_t(SEISMIC_DIM_FLIGHT)) * SEISMIC_FILE_STRIDE_0), SEISMIC_FILE_STRIDE_1, q,
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTERS), uint(SEISMIC_DIM_L),
+            gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z, 0u, tid);
+    if (gl_WorkGroupID.x == 0u)
+        streaming_tier_wait(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0, file, SEISMIC_FILE_STRIDE_0,
+            SEISMIC_FILE_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0,
+            SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, tid, gl_WorkGroupSize.x);
+}

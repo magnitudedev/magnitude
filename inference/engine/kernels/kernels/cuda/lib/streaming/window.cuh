@@ -1,6 +1,6 @@
 // Expert streaming's conversion of staged records, by windows; the CUDA form
 // of `metal/lib/streaming/window.h`. A block converts whole row tiles of a
-// record (its conversion's tile rows, `record_items`),
+// record (its conversion's tile rows; a landing launch's item, `record_items`),
 // one window of packets along them at a time (`Window`): each thread loads
 // its share of the window's stored bytes from staging into registers, 16
 // bytes a load wherever the records keep whole 16-byte units (`Held`),
@@ -20,7 +20,7 @@
 // A row tile larger than the mirror is placed in the record directly. The tile
 // conversion is `repack_weight`'s, so a slot holds exactly the bytes a
 // resident import places. A dense float record (`B::dense()`: `repack`
-// between dense representations) converts row by row, each element as
+// between dense representations) converts runs of rows, each element as
 // `import_dense` converts it (decoded to F32, rounded into the destination).
 //
 // Templates over a repack binding `B` (`REPACK_BINDING`), so a kernel
@@ -152,21 +152,28 @@ template <class Words, class... Bs> struct Shared {
     u32 stages[STAGES][WORDS];
 };
 
-// A packed record's items are its row tiles, each converted window by
-// window and written whole from the mirror (`convert_window`); a dense
-// record's, its rows.
-template <class B> __device__ __forceinline__ u64 record_items(const seismic_words_t &seismic_words_value) {
-    if constexpr (B::dense())
-        return B::n(seismic_words_value);
-    else
-        return repack::tiles_y<B>(seismic_words_value);
-}
-
 // The element types of a dense binding's source and destination.
 template <class B> struct Dense {
     typedef typename element::Of<B::source_kind()>::type Source;
     typedef typename element::Of<B::destination_kind()>::type Destination;
 };
+
+// A packed record's items are its row tiles, each converted window by
+// window and written whole from the mirror (`convert_window`); a dense
+// record's, spans of its flattened elements (`streaming_dense_span`) for a
+// block of `threads` threads, each staged through the window and converted
+// from it.
+template <class B> __device__ __forceinline__ u32 dense_element() {
+    return u32(sizeof(typename Dense<B>::Source::storage));
+}
+template <class B>
+__device__ __forceinline__ u64 record_items(const seismic_words_t &seismic_words_value, u32 threads) {
+    if constexpr (B::dense())
+        return streaming_dense_items(u32(B::n(seismic_words_value) * B::k(seismic_words_value)), dense_element<B>(),
+                                     streaming_dense_span(dense_element<B>(), threads, SEISMIC_CONST_WINDOW_BYTES));
+    else
+        return repack::tiles_y<B>(seismic_words_value);
+}
 
 // A row tile's destination bytes: its rows are whole and consecutive in each
 // layout (a row's packets or planes before the next row's, an mma16 tile's
@@ -175,25 +182,47 @@ template <class B> __device__ __forceinline__ u64 tile_bytes(const seismic_words
     return repack::Shape<B>::TILE_ROWS * B::out_stride_1(seismic_words_value) * B::out_stride_bytes(seismic_words_value);
 }
 
-// Row `n` of dense staged record `record` of `source` into slot `slot` of
-// `destination`, by the whole block: each element decoded to F32 and rounded
-// into the destination, `import_dense`'s conversion. Staged elements are read
-// with streaming loads, as a window's are.
+// The elements of dense item `item` of a record: the first and how many.
+struct DenseItem {
+    u32 first, count;
+};
 template <class B>
-__device__ __forceinline__ void convert_row(const u8 *source, u8 *destination,
-                                            const seismic_words_t &seismic_words_value, u64 record, u64 slot, u64 n) {
-    typedef typename Dense<B>::Source Source;
-    typedef typename Dense<B>::Destination Destination;
-    const typename Source::storage *from =
-        reinterpret_cast<const typename Source::storage *>(source + record * B::source_matrix_bytes(seismic_words_value)) +
-        n * B::source_stride_1(seismic_words_value);
-    u8 *out = destination + slot * B::out_matrix_bytes(seismic_words_value);
-    for (u64 k = threadIdx.x; k < B::k(seismic_words_value); k += blockDim.x)
-        element::put<Destination>(out, n * B::out_stride_1(seismic_words_value) + k * B::out_stride_2(seismic_words_value),
-                                  Source::load(__ldcs(from + k * B::source_stride_2(seismic_words_value))));
+__device__ __forceinline__ DenseItem dense_item_of(const seismic_words_t &seismic_words_value, u32 item) {
+    const u32 element = dense_element<B>();
+    const u32 span = streaming_dense_span(element, blockDim.x, SEISMIC_CONST_WINDOW_BYTES) / element;
+    const u32 elements = u32(B::n(seismic_words_value) * B::k(seismic_words_value));
+    return DenseItem{item * span, min(span, elements - item * span)};
 }
 
-// The stored record a list entry's `from` names: source record `from` of
+// Dense item `item` of the staged record at `record` into slot `slot` of
+// `destination`, by the whole block: each element decoded to F32 and rounded
+// into the destination, `import_dense`'s conversion, from the window the
+// item's bytes were stored into.
+template <class B>
+__device__ __forceinline__ void convert_span(const u8 *window, u8 *destination,
+                                             const seismic_words_t &seismic_words_value, u64 slot, u32 item) {
+    typedef typename Dense<B>::Source Source;
+    typedef typename Dense<B>::Destination Destination;
+    u8 *out = destination + slot * B::out_matrix_bytes(seismic_words_value);
+    const DenseItem span = dense_item_of<B>(seismic_words_value, item);
+    const u32 columns = u32(B::k(seismic_words_value));
+    // A thread's row and column step with its element: two divides an item.
+    u32 row = (span.first + threadIdx.x) / columns, column = (span.first + threadIdx.x) % columns;
+    const u32 row_step = blockDim.x / columns, column_step = blockDim.x % columns;
+    for (u32 e = threadIdx.x; e < span.count; e += blockDim.x) {
+        element::put<Destination>(out, (u64)row * B::out_stride_1(seismic_words_value) +
+                                           (u64)column * B::out_stride_2(seismic_words_value),
+                                  Source::load(reinterpret_cast<const typename Source::storage *>(window)[e]));
+        row += row_step;
+        column += column_step;
+        if (column >= columns) {
+            column -= columns;
+            ++row;
+        }
+    }
+}
+
+// The stored record a landing entry's `from` names: source record `from` of
 // `conveyor`, or, negative, scratch slot -1 - from of `destination`, a slot
 // no pass reads, which the host read the stored bytes into at its base
 // (`routed_round` in routed.seismic). Either is at record 0 of the base
@@ -491,59 +520,6 @@ __device__ __forceinline__ void convert_window(const Window<B> &window, const u8
             write_tile<B>(placed, seismic_words_value);
         }
     }
-}
-
-// Convert the row tiles `first`, `first + step`, ... of a list's packed
-// records, whose items (`per_record` a record, `end` in all) are its row
-// tiles: each window loaded into registers (`Held`) while the one before it
-// converts, each row tile placed in the mirror and written whole
-// (`write_tile`), or, larger than the mirror, placed in the record. `pair(at)`,
-// called by every thread, gives item `at`'s (from, to), `from` as
-// `listed_source` reads it.
-template <class B, class Sh, class Pair>
-__device__ __forceinline__ void convert_records(const u8 *source, u8 *destination,
-                                                const seismic_words_t &seismic_words_value, u64 end, u64 first,
-                                                u64 step, u64 per_record, Pair pair, Sh &shared) {
-    static_assert(!B::dense(), "a dense record converts row by row");
-    const Window<B> window(seismic_words_value);
-    const bool through_mirror = mirrored<B>(seismic_words_value);
-    const u64 windows = window.windows, last = end * windows;
-    // The window after `at`: its row tile's next, else the first of the
-    // block's next row tile.
-    const auto next = [&](u64 at) { return (at + 1) % windows != 0 ? at + 1 : at + 1 - windows + step * windows; };
-    const auto place = [&](u64 at) {
-        const int2 fromto = pair(at / windows);
-        return place_of<B>(window, source, destination, seismic_words_value, fromto.x, fromto.y,
-                           at / windows % per_record, at % windows);
-    };
-    Held held;
-    u64 at = first * windows;
-    Placed<B> placed = at < last ? place(at) : Placed<B>(window, source, destination, seismic_words_value, 0, 0, 0);
-    Span span = span_of(window, placed);
-    if (at < last)
-        held.load(span);
-    while (at < last) {
-        __syncthreads();
-        held.store(span, window.pitch, shared.window);
-        __syncthreads();
-        const Placed<B> current = placed;
-        at = next(at);
-        if (at < last) {
-            placed = place(at);
-            span = span_of(window, placed);
-            held.load(span);
-        }
-        if (!through_mirror) {
-            convert_tiles<B, repack::Rows<B>>(window, current, current.out, seismic_words_value, shared);
-        } else {
-            convert_tiles<B, Mirror<B>>(window, current, mirror(), seismic_words_value, shared);
-            if (current.window_index + 1 == windows) {
-                __syncthreads();
-                write_tile<B>(current, seismic_words_value);
-            }
-        }
-    }
-    __syncthreads();
 }
 
 } // namespace streaming

@@ -31,11 +31,10 @@ fn vulkan_streaming_forms() {
         request("routed_copy", &[("U", b)], &[]),
         request("routed_list_grid", &[], &[]),
         request("routed_step", &[], &[]),
-        request("routed_scratch_wait", &[("SG", g), ("SU", g), ("SD", g)], &[]),
         request("routed_scratch_grids", &[], &[]),
-        request("routed_convert", &[("ST", g), ("U", w)], &[]),
-        request("routed_convert", &[("ST", b), ("U", h)], &[]),
-        request("routed_tier_wait", &[], &[("K", 8)]),
+        request("routed_round", &[("SG", g), ("SU", g), ("SD", g), ("UG", w), ("UU", w), ("UD", w)], &[]),
+        request("routed_round", &[("SG", b), ("SU", b), ("SD", b), ("UG", h), ("UU", h), ("UD", h)], &[]),
+        request("routed_land", &[("SG", g), ("SU", g), ("SD", g), ("UG", w), ("UU", w), ("UD", w)], &[("K", 8)]),
     ];
     // The decode entries over bank and host tier records.
     for weight in [w, b] {

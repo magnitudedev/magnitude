@@ -2726,17 +2726,28 @@ impl<'a> Preparation<'a> {
         layers: &[WeightScope],
     ) -> Result<Option<super::ExpertBankKernels>, CatalogFailure> {
         use magnitude_kernels::{
-            routed_convert, routed_copy, routed_list_grid, routed_list_stage, routed_move, routed_pass_map, routed_scratch_grids, routed_scratch_request,
-            routed_scratch_wait, routed_seed_commit, routed_step, routed_tier_wait,
+            routed_copy, routed_land, routed_list_grid, routed_move, routed_pass_map, routed_round, routed_scratch_grids,
+            routed_scratch_request, routed_seed_commit, routed_step,
         };
         let bindings = format!("{slot:?} {bank:?}");
         let ([experts, selected], route) = self.bank_route(slot, bank, layers, &bindings)?;
         let spec = &mut self.spec;
         let crate::planning::RecordTensors { gate, up, down } = bank.record;
-        let tier_wait = spec.fixed(
+        // A landing launch converts each record from its stored element
+        // into its resident one; an up-only record's gate views are empty,
+        // in its up's elements.
+        let gate = gate.unwrap_or(up);
+        let land = spec.fixed(
             &bindings,
             &[("K", selected)],
-            routed_tier_wait::native_entry(),
+            routed_land::native_entry_with(routed_land::Elements {
+                SG: gate.source,
+                SU: up.source,
+                SD: down.source,
+                UG: gate.resident,
+                UU: up.resident,
+                UD: down.resident,
+            }),
         )?;
         let step = spec.fixed(&bindings, &[], routed_step::native_entry())?;
         let table = bank.words.scratch();
@@ -2747,15 +2758,16 @@ impl<'a> Preparation<'a> {
             &[&[("K", selected), ("E", bank.widest)], scratch.as_slice()].concat(),
             routed_scratch_request::native_entry(),
         )?;
-        // An up-only record's gate conveyor is empty, in its up's stored
-        // element.
-        let scratch_wait = spec.fixed(
+        let round = spec.fixed(
             &bindings,
             &scratch,
-            routed_scratch_wait::native_entry_with(routed_scratch_wait::Elements {
-                SG: gate.map_or(up.source, |gate| gate.source),
+            routed_round::native_entry_with(routed_round::Elements {
+                SG: gate.source,
                 SU: up.source,
                 SD: down.source,
+                UG: gate.resident,
+                UU: up.resident,
+                UD: down.resident,
             }),
         )?;
         let scratch_grids = spec.fixed(
@@ -2763,7 +2775,6 @@ impl<'a> Preparation<'a> {
             &[scratch.as_slice(), &[("R", bank.words.rounds)]].concat(),
             routed_scratch_grids::native_entry(),
         )?;
-        let list_stage = spec.fixed(&bindings, &[], routed_list_stage::native_entry())?;
         let pass_map = spec.fixed(&bindings, &[], routed_pass_map::native_entry())?;
         // The device's placements, a prompt group's seeds, whoever places.
         let seed = bank.record.try_map(|_, tensor| {
@@ -2772,23 +2783,6 @@ impl<'a> Preparation<'a> {
                 &bindings,
                 &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
                 routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
-            )
-        })?;
-        let convert = bank.record.try_map(|_, tensor| {
-            let [n, k] = tensor.matrix;
-            spec.fixed(
-                &bindings,
-                &[
-                    ("V", bank.conveyor),
-                    ("L", bank.round_records),
-                    ("S", experts),
-                    ("N", n),
-                    ("K", k),
-                ],
-                routed_convert::native_entry_with(routed_convert::Elements {
-                    ST: tensor.source,
-                    U: tensor.resident,
-                }),
             )
         })?;
         let seed_commit = spec.fixed(
@@ -2815,20 +2809,19 @@ impl<'a> Preparation<'a> {
         // `None` anywhere: a count or a listing, which forms nothing.
         let (
             Some(route),
-            Some(tier_wait),
+            Some(land),
             Some(step),
             Some(scratch_request),
-            Some(scratch_wait),
+            Some(round),
             Some(scratch_grids),
-            Some(list_stage),
             Some(pass_map),
             Some(seed_commit),
             Some(list_grid),
-        ) = (route, tier_wait, step, scratch_request, scratch_wait, scratch_grids, list_stage, pass_map, seed_commit, list_grid)
+        ) = (route, land, step, scratch_request, round, scratch_grids, pass_map, seed_commit, list_grid)
         else {
             return Ok(None);
         };
-        let (Some(convert), Some(moves), Some(seed)) = (formed(convert), formed(moves), formed(seed)) else {
+        let (Some(moves), Some(seed)) = (formed(moves), formed(seed)) else {
             return Ok(None);
         };
         let placement = super::DevicePlacement { seed, seed_commit, list_grid };
@@ -2838,14 +2831,12 @@ impl<'a> Preparation<'a> {
         };
         Ok(Some(super::ExpertBankKernels {
             route,
-            tier_wait,
+            land,
             step,
             scratch_request,
-            scratch_wait,
+            round,
             scratch_grids,
-            list_stage,
             pass_map,
-            convert,
             placement,
             moves: super::BankMoves { records: moves },
             site,

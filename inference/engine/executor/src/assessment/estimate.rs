@@ -32,7 +32,7 @@
 //! are boundaries, `DecodeDemand::boundaries`) at the executor's round trip
 //! beyond device time (`ExecutorCosts::step_round_trip_seconds`): one
 //! submit and wait. What a streamed layer's waits add beside it has no
-//! figure yet: a spinning wait's device time (a tier wait's or sited
+//! figure yet: a spinning wait's device time (a landing launch's or sited
 //! combine's kernel past its launch), the parks' keeper's latency in
 //! answering a park, and the submitting thread's work beginning each
 //! submission.

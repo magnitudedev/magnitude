@@ -354,12 +354,45 @@ impl BankLines {
 pub struct HostLines {
     pub cpu: Option<CpuLines>,
     pub memory: Option<Nanoseconds>,
-    pub file: Option<FileLine>,
-    /// The device's convert of a request's records in their barrier, beside
-    /// `file`, the host's: where the host places (unified memory) and the
-    /// job measured it.
-    pub convert: Option<RecordLine>,
+    /// What a request's file misses add past their reads' end as they land,
+    /// at the one site its bank lands them ([`LandingLine`]); none before
+    /// any line of that site is had.
+    pub landing: Option<LandingLine>,
     pub record_bytes: u64,
+}
+
+/// Where a layer's file misses land, by who places its bank's records, and
+/// the line of what that adds past their reads' end:
+/// - `Host`: into a host tier beside a discrete device, the host's landing
+///   line ([`FileLine`]): `n` landings `fixed + n · record` past the last
+///   read.
+/// - `Device`: into the bank on unified memory, by the step's landing
+///   launch (`routed_land`), which converts each record as its read lands:
+///   past the last read byte the last record's conversion remains, one
+///   record of the device's convert line ([`RecordLine::seconds`] of 1),
+///   unless conversion is the slower of the two, when it also holds what
+///   `count` records' conversions run past the reads' (the first record
+///   lands, and conversion begins, one record's read in).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LandingLine {
+    Host(FileLine),
+    Device(RecordLine),
+}
+
+impl LandingLine {
+    /// What `count` file misses requested together (one or more) add past
+    /// their reads' end, each read taking `record_read_seconds` after the
+    /// one before. `count` is at least one: nothing missed lands nothing.
+    pub fn seconds(&self, count: u64, record_read_seconds: f64) -> f64 {
+        assert!(count > 0, "a landing prices at least one miss");
+        match self {
+            Self::Host(file) => file.seconds(count),
+            Self::Device(convert) => {
+                let behind = convert.seconds(count) - (count - 1) as f64 * record_read_seconds;
+                behind.max(convert.seconds(1))
+            }
+        }
+    }
 }
 
 /// Why a bank group's host lines could not be had.
@@ -415,7 +448,7 @@ impl HostLines {
             .layers()
             .iter()
             .zip(bank)
-            .map(|(layer, bank)| Self { cpu: bank.cpu, memory: memory[layer.group], file: None, convert: None, record_bytes: bank.record_bytes })
+            .map(|(layer, bank)| Self { cpu: bank.cpu, memory: memory[layer.group], landing: None, record_bytes: bank.record_bytes })
             .collect())
     }
 }
@@ -572,10 +605,12 @@ impl ExpertLines {
         link + copy.stall(link) + memory
     }
 
-    /// The lines with `file`, the landing line the load observes beside
-    /// the lines it was priced on, and `convert`, the device's beside it.
-    pub fn landing(self, file: Option<FileLine>, convert: Option<RecordLine>) -> Self {
-        Self { host: HostLines { file, convert, ..self.host }, ..self }
+    /// The lines with `observed`, the landing line the load observes of
+    /// its landings' site beside the lines it was priced on, where it has
+    /// one.
+    pub fn landed_by(self, observed: Option<LandingLine>) -> Self {
+        let landing = observed.or(self.host.landing);
+        Self { host: HostLines { landing, ..self.host }, ..self }
     }
 
     /// The lines with the CPU site's line as the load observes its
@@ -617,21 +652,22 @@ impl ExpertLines {
         (line.nanoseconds(rows) - line.nanoseconds(1.)) * 1e-9
     }
 
-    /// What `count` file misses of the layer add past their reads' end, at
-    /// the site that lands them sooner: the host's, or the device's convert
-    /// in their barrier (none measured yet: nothing to price).
-    pub fn landed(&self, count: u64) -> f64 {
-        self.host.file.map_or(0., |file| match self.host.convert {
-            Some(device) if file.device_lands(&device, count) => device.seconds(count),
-            _ => file.seconds(count),
-        })
+    /// What `count` file misses of the layer requested together add past
+    /// their reads' end, at the one site its bank lands them
+    /// ([`LandingLine`]; none had yet: nothing to price).
+    pub fn landed(&self, count: u64, record_read_seconds: f64) -> f64 {
+        match (count, self.host.landing) {
+            (0, _) | (_, None) => 0.,
+            (count, Some(landing)) => landing.seconds(count, record_read_seconds),
+        }
     }
 
     /// When `count` file misses of the layer requested together are whole
     /// in the tier: their one read along `line` and their landing (along
     /// the landing line where it was measured; their read alone before).
     pub fn filed(&self, line: &ReadLine, count: u64) -> f64 {
-        line.seconds(count * self.host.record_bytes) + self.landed(count)
+        let record_read = line.transfer_seconds(self.host.record_bytes as f64);
+        line.seconds(count * self.host.record_bytes) + self.landed(count, record_read)
     }
 
     /// The layer's distinct missed experts served in `pass` beside its GPU
@@ -766,8 +802,7 @@ impl ExpertLines {
                     handshake: ns(4_000),
                 }),
                 memory: Some(rate(38_000)),
-                file: None,
-                convert: None,
+                landing: None,
                 record_bytes,
             },
             gpu: GpuLines {
@@ -1126,8 +1161,7 @@ mod tests {
                             handshake: ns(0, 10_000),
                         }),
                         memory: None,
-                        file: None,
-                        convert: None,
+                        landing: None,
                         record_bytes: 1,
                     },
                     gpu: GpuLines {

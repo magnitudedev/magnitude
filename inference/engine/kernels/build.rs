@@ -68,7 +68,7 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
 const STREAMING_ENTRIES: &[&str] = &[
     "routed_route_streamed",
     "routed_select_streamed",
-    "routed_tier_wait",
+    "routed_land",
     "routed_site_request",
     "routed_down_project",
     "routed_down_sited",
@@ -76,14 +76,12 @@ const STREAMING_ENTRIES: &[&str] = &[
     "routed_output_sited",
     "routed_step",
     "routed_scratch_request",
-    "routed_scratch_wait",
+    "routed_round",
     "routed_scratch_grids",
     "routed_copy",
     "routed_list_grid",
     "routed_pass_map",
-    "routed_list_stage",
     "routed_move",
-    "routed_convert",
     "routed_seed_commit",
 ];
 
@@ -299,7 +297,11 @@ const STREAMING_LIBRARIES: &[(&str, &str)] = &[
     ),
     (
         "lib/streaming/window",
-        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by `routed_convert`",
+        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by the landing launches",
+    ),
+    (
+        "lib/streaming/land",
+        "expert streaming's landing launch (`routed_land`, `routed_round`): the shared protocol `streaming/land.hpp` over the backend's window conversion",
     ),
 ];
 

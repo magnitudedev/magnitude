@@ -293,7 +293,6 @@ impl EntryTuning for RoutedSelectStreamedTuning {
             sited: bank.sited,
             step: &bank.step,
             file: bank.file.tensor_mut(),
-            grids: bank.grids.tensor_mut(),
             sources: bank.sources.tensor_mut(),
             next_router_norm,
             next_router,

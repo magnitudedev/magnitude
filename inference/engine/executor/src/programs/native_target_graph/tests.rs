@@ -292,7 +292,7 @@ mod shared_graph_tests {
             .with_expert_bank_at_floor(&definition, crate::planning::BankSubstrate {
                 backend,
                 reservation: seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None },
-                host: crate::planning::HostTier::Unified,
+                host: crate::planning::HostTier::Unified(crate::planning::Parking::InKernels),
             })
             .unwrap();
         (definition, load)
@@ -1142,7 +1142,7 @@ mod resource_template_tests {
         let manifest = streamed_experts_manifest(&definition);
         let selection = ComponentSelection { head: false, vision: false };
         let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-        let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified };
+        let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified(crate::planning::Parking::of(backend)) };
         let derived = ModelLoadPlan::derive(&manifest, &definition, selection, resident_layout(ExecutionPath::Native, backend), PlannedMethod::Plain, limits).unwrap();
         let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();

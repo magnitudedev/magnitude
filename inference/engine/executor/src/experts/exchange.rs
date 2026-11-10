@@ -87,8 +87,10 @@ impl ExchangeTable {
     /// Request lane `lane` for `step`, after its payload: as the device does,
     /// for a request the host makes (a measurement's, a qualification's, a
     /// test's), or for a wait whose request is its arrival where the device
-    /// cannot store it before its park (`watcher::parks`).
+    /// cannot store it before its park (`watcher::parks`). The lane's
+    /// SLOT_VIOLATED is cleared first, as the device's request does.
     pub(crate) fn request(&self, step: u64, lane: u64) {
+        self.store(step, lane, constants::SLOT_VIOLATED, 0);
         self.words.store_u64(self.at(step, lane, constants::SLOT_REQUEST), step);
     }
 
@@ -127,6 +129,27 @@ impl ExchangeTable {
     /// else writes. Read once the device is past the step.
     pub(crate) fn expired(&self, step: u64, lane: u64) -> bool {
         self.words.load_u64(self.at(step, lane, constants::SLOT_EXPIRED)) == step
+    }
+
+    /// What a kernel stores in SLOT_VIOLATED for `step`: its low word with
+    /// VIOLATED_STAMP set, which no zeroed word equals.
+    fn violation(step: u64) -> i32 {
+        (step as u32 | constants::VIOLATED_STAMP as u32) as i32
+    }
+
+    /// Whether a kernel found a state the protocol never reaches while
+    /// `step` waited on lane `lane`: it stored the step's low word as the
+    /// lane's SLOT_VIOLATED (`streaming_land_await`), which nothing else
+    /// writes. Read once the device is past the step, where it panics.
+    pub(crate) fn violated(&self, step: u64, lane: u64) -> bool {
+        self.load(step, lane, constants::SLOT_VIOLATED) == Self::violation(step)
+    }
+
+    /// Store `step` violated on lane `lane`, as a kernel does: for a test
+    /// that plays the device.
+    #[cfg(test)]
+    pub(crate) fn violate(&self, step: u64, lane: u64) {
+        self.store(step, lane, constants::SLOT_VIOLATED, Self::violation(step));
     }
 
     /// End `step`'s wait on lane `lane` on its still pulse, as its kernel

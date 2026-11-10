@@ -18,7 +18,8 @@
 //!   record, or the file), and the ranking's choice of what the bank keeps.
 //! - `host_records`: one bank group's host tier, every miss's first store,
 //!   inclusive of the bank, in its resident form.
-//! - `landing`: a file miss's landing from staging into the tier.
+//! - `landing`: a file miss's landing from staging: into a host tier by
+//!   the host, into the bank by the device's landing launch.
 //! - `map`: each layer's step-stamped map of its bank records, the host its
 //!   one writer.
 //! - `records`: the bank's records, the one owner of what each holds and
@@ -85,10 +86,11 @@ use magnitude_kernels::{constants, list_extent};
 
 /// The records a list's entries may name: each entry's from record below
 /// `from` and its to record below `to`, the leading extents of the tensors
-/// its device reader binds (`routed_copy`'s S and D, `routed_convert`'s V
-/// and S, `routed_move`'s D, `routed_seed_commit`'s BANK); or, negative,
-/// one of `lent` slots of the to tensor, -1 - from (`routed_convert`'s
-/// scratch slots the host read stored bytes into; none for another list).
+/// its device reader binds (`routed_copy`'s S and D, a landing launch's
+/// staging or conveyor records and destination, `routed_move`'s D,
+/// `routed_seed_commit`'s BANK); or, negative, one of `lent` slots of the to
+/// tensor, -1 - from (a scratch round's slots the host read stored bytes
+/// into, `routed_round`; none for another list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ListBounds {
     pub from: u64,
@@ -188,7 +190,7 @@ impl Words {
     }
 
     /// Publish a list for step `sequence` (`routed_copy`,
-    /// `routed_convert`): its pairs, then its count ([`Self::write_list`]),
+    /// `routed_seed_commit`): its pairs, then its count ([`Self::write_list`]),
     /// then the step's low word, which the device checks before it reads
     /// the rest.
     pub(crate) fn publish_list(&self, sequence: watcher::Step, pairs: &[(i32, i32)], bounds: ListBounds) {

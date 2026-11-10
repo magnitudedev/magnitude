@@ -26,9 +26,8 @@
 // The selecting threadgroup then resolves (`streaming/resolve.hpp`): a
 // layer of a group that is not whole (`routed_route_streamed`) its sources
 // by the step-stamped map, its misses' assignment between the GPU and the
-// CPU, routing record, grids and, on a miss, the request; a layer of a
-// whole group (`routed_route_whole`) its hits, routing record and grids
-// alone.
+// CPU, routing record and, on a miss, the request; a layer of a whole
+// group (`routed_route_whole`) its hits and routing record alone.
 
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_GATE
@@ -117,7 +116,6 @@ struct ResolvePorts {
     SYSTEM const int *tier;
     device int *sources;
     SYSTEM int *file;
-    device int *grids;
     SYSTEM const int *policy;
 };
 
@@ -147,8 +145,8 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         step, SEISMIC_STEP_STRIDE_0, WHOLE, bank.map, SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1, bank.tier,
         SEISMIC_TIER_STRIDE_0, uint(SEISMIC_DIM_TM), uint(SEISMIC_PARAM_SITED),
         bank.sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, routing,
-        SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1, uint(SEISMIC_DIM_FLIGHT), uint(SEISMIC_DIM_P), bank.grids,
-        SEISMIC_GRIDS_STRIDE_0, SEISMIC_GRIDS_STRIDE_1, bank.file, SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1,
+        SEISMIC_ROUTING_STRIDE_0, SEISMIC_ROUTING_STRIDE_1, uint(SEISMIC_DIM_FLIGHT), uint(SEISMIC_DIM_P), bank.file,
+        SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1,
         bank.policy, words,
         tid, 32 * SEISMIC_TUNE_SIMDGROUPS);
 }
@@ -185,13 +183,13 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         SYSTEM const int *tier [[buffer(SEISMIC_BUFFER_TIER)]],                                                     \
         device int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],                                                     \
         SYSTEM int *file [[buffer(SEISMIC_BUFFER_FILE)]],                                                           \
-        device int *grids [[buffer(SEISMIC_BUFFER_GRIDS)]], SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]]) { \
+        SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]]) {                                                \
         threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];                                     \
         threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];                                                     \
         threadgroup uint last;                                                                                     \
         threadgroup int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)];              \
         PROJECTION_OPERANDS_SHARED(globals, shared_nvfp4);                                                         \
-        const ResolvePorts bank{map, tier, sources, file, grids, policy};                                       \
+        const ResolvePorts bank{map, tier, sources, file, policy};                                              \
         const Lead leads[2] = {{next_norm, SEISMIC_NEXT_NORM_STRIDE_0, next_router},                               \
             {after_norm, SEISMIC_AFTER_NORM_STRIDE_0, after_router}};                                              \
         route_streamed<HINTS, WHOLE>(residual, norm, router, shared_router, shared_gate, shared_up, routes,        \

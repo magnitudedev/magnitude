@@ -120,10 +120,11 @@ impl StepCost {
 pub struct ExpertCosts {
     pub layers: Vec<LayerCost>,
     pub reads: RequestReads,
-    /// Each streamed layer's landing line, none until observed.
-    pub landings: Vec<Option<FileLine>>,
-    /// Each streamed layer's convert line in a decode barrier, once measured.
-    pub converts: Vec<Option<crate::assessment::RecordLine>>,
+    /// Each streamed layer's landing line at the one site its bank lands
+    /// at: the host's landings observed beside a host tier, none until
+    /// observed; the device's convert (its landing launch's) where the bank
+    /// places, once measured.
+    pub landings: Vec<Option<crate::assessment::LandingLine>>,
     pub hints: HintCost,
     pub completed: Option<(u64, StepCost)>,
     /// The latest prompt group served.
@@ -637,7 +638,7 @@ struct Costs {
     /// time its rows past each one's first take at the step's lines taken
     /// from it, as a site's requests are (`SiteRequests`).
     blocks: Vec<seismic::measure::Line<4>>,
-    /// Each bank group's convert in a decode barrier, once the job measured
+    /// Each bank group's device convert (its landing launches'), once the job measured
     /// it ([`Telemetry::device_convert`]).
     convert: Vec<Option<crate::assessment::RecordLine>>,
     hints: HintCost,
@@ -1094,19 +1095,9 @@ impl Telemetry {
         self.lock().costs.landings[group].observe([1., count as f64], seconds);
     }
 
-    /// Each bank group's convert in a decode barrier takes its `lines` from
-    /// now on.
+    /// Each bank group's device convert takes its `lines` from now on.
     pub(super) fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
         self.lock().costs.convert = lines.iter().copied().map(Some).collect();
-    }
-
-    /// Whether `count` file misses of `layer`'s request land sooner on the
-    /// device, by the two lines ([`FileLine::device_lands`]): on the host
-    /// until the load has its own, which needs no cost.
-    pub(super) fn device_lands(&self, layer: usize, count: u64) -> bool {
-        let group = self.routing.maps[layer].0;
-        let costs = &self.lock().costs;
-        matches!((costs.landing(group), costs.convert.get(group).copied().flatten()), (Some(file), Some(device)) if file.device_lands(&device, count))
     }
 
     /// Each streamed layer's landing line now, none until landings of two
@@ -1184,7 +1175,8 @@ impl Telemetry {
     }
 
     /// `lines` with each layer's landing line, CPU site line and GPU lines
-    /// now, which the load observes beside the lines it was priced on.
+    /// now, which the load observes beside the lines it was priced on: the
+    /// landing line of the one site its bank lands at ([`Self::landing`]).
     fn with_observed(&self, costs: &Costs, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
         lines
             .iter()
@@ -1192,9 +1184,20 @@ impl Telemetry {
             .enumerate()
             .map(|(layer, (lines, &(group, _)))| {
                 let site = costs.site(layer);
-                lines.landing(costs.landing(group), costs.convert.get(group).copied().flatten()).sited(site).passed(costs.block(layer, lines))
+                lines.landed_by(self.landing(costs, group)).sited(site).passed(costs.block(layer, lines))
             })
             .collect()
+    }
+
+    /// Group `group`'s landing line at the one site its bank lands at: the
+    /// host's landings observed beside a host tier, the device's convert as
+    /// the job measured it where the bank places.
+    fn landing(&self, costs: &Costs, group: usize) -> Option<crate::assessment::LandingLine> {
+        use crate::assessment::LandingLine;
+        match self.routing.placer {
+            crate::planning::Placer::Tier => costs.landing(group).map(LandingLine::Host),
+            crate::planning::Placer::Bank => costs.convert.get(group).copied().flatten().map(LandingLine::Device),
+        }
     }
 
     /// The slots the bank commits.
@@ -1238,8 +1241,7 @@ impl Telemetry {
         ExpertCosts {
             layers: costs.layers.clone(),
             reads: costs.reads,
-            landings: self.routing.maps.iter().map(|&(group, _)| costs.landing(group)).collect(),
-            converts: self.routing.maps.iter().map(|&(group, _)| costs.convert.get(group).copied().flatten()).collect(),
+            landings: self.routing.maps.iter().map(|&(group, _)| self.landing(costs, group)).collect(),
             hints: costs.hints,
             completed: costs.completed.clone(),
             group: costs.group.as_ref().map(|counted| counted.cost.clone()),

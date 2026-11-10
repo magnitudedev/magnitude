@@ -223,7 +223,7 @@ impl ExpertShares {
                     ColdSource::HostTier { slots: bank.host_slots, cache_bytes }
                 }
                 crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
-                crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),
+                crate::planning::HostTier::Unified(_) => ColdSource::File(FileOnly::Unified),
             },
         )
     }
