@@ -171,6 +171,18 @@ native pool_rows for cuda from "cuda/pool_rows.cu":
 
 # CPU: `append` per row, then `complete` per row (the portable math in F32,
 # its rotation `attention::prepare_rounded_head`'s).
+# Vulkan: CUDA's launches, a logical subgroup each; the rotation exchanges
+# partners by shuffles across the lanes, as Metal's (`rotary_lane_rotate`).
+native pool_rows for vulkan from "vulkan/pool_rows.comp":
+    static (P, S, GT, RA, RT, RATE)
+    where RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and RATE <= 16
+    launch pool_rows_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch pool_rows_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
 native pool_rows for cpu from "cpu/pool_rows.rs":
     static (P, S, GT, RA, RT, RATE)
     where RATE <= 64

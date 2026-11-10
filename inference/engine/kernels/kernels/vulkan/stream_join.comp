@@ -1,0 +1,28 @@
+// stream_join (contract and portable body in streams.seismic): one invocation
+// per column of a row, joining the F32 output into the streams through the
+// output entries' join (`join_scatter`: the inject values and, when the
+// inject row carries one, their comb), or adding it to the one stream
+// (IN = 0). As CUDA's.
+#include <seismic/element.glsl>
+#include "lib/projection/join.glsl"
+
+void stream_join() {
+    const uint64_t index = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
+    const uint64_t h = SEISMIC_DIM_H;
+    if (index >= SEISMIC_DIM_M * h)
+        return;
+    const uint64_t row = index / h;
+    const uint64_t column = index % h;
+    const float y = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_Y)
+        + (row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1) * 4ul);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
+    if (SEISMIC_DIM_IN == 0) {
+        element_f32_put(result + column * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+            element_f32_at(residual + column * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + y);
+        return;
+    }
+    join_scatter(result, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_INJECT) + row * SEISMIC_INJECT_STRIDE_0 * 4ul, uint(SEISMIC_DIM_SN), uint(h),
+        SEISMIC_DIM_IN > SEISMIC_DIM_SN, column, y);
+}

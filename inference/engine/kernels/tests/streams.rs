@@ -961,14 +961,6 @@ fn native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas() {
     }
 }
 
-/// The backends the Sinkhorn streams' entries run on: this host's CUDA or
-/// Metal device and its CPU. Vulkan declares no native of them
-/// ([`sinkhorn_entries_are_declared_on_every_backend_but_vulkan`]).
-fn sinkhorn_devices() -> Vec<seismic::Device> {
-    use seismic::BackendName::{Cpu, Cuda, Metal};
-    seismic_native_tests::first_and_cpu(&[Cuda, Metal], &[Cuda, Metal, Cpu])
-}
-
 /// Each value of `actual` against the F64 `expected`: a NaN where it is a
 /// NaN, the same infinity where it is one, else within `bound[i]`.
 fn assert_ieee_close(name: &str, actual: &[f32], expected: &[f64], bound: &[f64]) {
@@ -1026,7 +1018,7 @@ fn join_reference(
     (joined, magnitude)
 }
 
-/// `stream_join` on CPU, Metal and CUDA against its F64 formula, in every join
+/// `stream_join` on the host's GPU backend and the CPU against its F64 formula, in every join
 /// form (`IN` = 0 of one stream, `IN = SN` and the comb's `IN = SN + SN²`, at
 /// one and four streams) and at decode and prefill rows, over adversarial
 /// values: sums that cancel to near zero (each row's last column is set so
@@ -1075,7 +1067,7 @@ fn native_stream_join_matches_its_formula_on_adversarial_values() {
             }
             let (expected, magnitude) = join_reference(&residual, &y, &inject, (h, sn, width));
             let bound = magnitude.iter().map(|m| gamma(sn + 1) * m).collect::<Vec<_>>();
-            for device in sinkhorn_devices() {
+            for device in devices() {
                 let statics = [("H", h as u64), ("SN", sn as u64), ("IN", width as u64)];
                 let joined = at_defaults(
                     &device,
@@ -1100,8 +1092,8 @@ fn native_stream_join_matches_its_formula_on_adversarial_values() {
     }
 }
 
-/// `stream_collapse` (the exit over Sinkhorn streams) on CPU, Metal and
-/// CUDA against `sum_s pre[s] X[s]` in F64 at V4.1's width, within the F32 sum's
+/// `stream_collapse` (the exit over Sinkhorn streams) on the host's GPU
+/// backend and the CPU against `sum_s pre[s] X[s]` in F64 at V4.1's width, within the F32 sum's
 /// bound, at decode and prefill rows.
 #[test]
 fn native_stream_collapse_matches_its_formula() {
@@ -1119,7 +1111,7 @@ fn native_stream_collapse_matches_its_formula() {
                 bound.push(gamma(s) * terms.iter().map(|term| term.abs()).sum::<f64>());
             }
         }
-        for device in sinkhorn_devices() {
+        for device in devices() {
             let collapsed = at_defaults(
                 &device,
                 magnitude_kernels::stream_collapse::native_entry(),
@@ -1137,28 +1129,6 @@ fn native_stream_collapse_matches_its_formula() {
                 &expected,
                 &bound,
             );
-        }
-    }
-}
-
-/// The Sinkhorn streams' entries declare natives on CPU, Metal and CUDA:
-/// Vulkan plans refuse them by their declarations.
-#[test]
-fn sinkhorn_entries_are_declared_on_every_backend_but_vulkan() {
-    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
-    fn declared<E: seismic::Entry>(backend: seismic::BackendName) -> bool {
-        seismic::generated::native_implementation_for_backend::<E>(backend)
-            .unwrap()
-            .is_some()
-    }
-    for backend in [Cpu, Metal, Cuda, Vulkan] {
-        let expected = matches!(backend, Cpu | Metal | Cuda);
-        for (name, actual) in [
-            ("stream_mix_sinkhorn", declared::<stream_mix_sinkhorn::Entry>(backend)),
-            ("stream_collapse", declared::<magnitude_kernels::stream_collapse::Entry>(backend)),
-            ("stream_join", declared::<magnitude_kernels::stream_join::Entry>(backend)),
-        ] {
-            assert_eq!(actual, expected, "{name} on {backend:?}");
         }
     }
 }

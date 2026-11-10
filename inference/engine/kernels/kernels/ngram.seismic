@@ -249,10 +249,9 @@ native ngram_gate for cuda from "cuda/ngram_gate.cu":
         threadgroups (S, min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: CUDA's items over the two norms only (PR = 0).
+# Vulkan: CUDA's items.
 native ngram_gate for vulkan from "vulkan/ngram_gate.comp":
     static (H, S, PR)
-    where PR == 0
     launch ngram_gate:
         threadgroups (S, min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)

@@ -12,13 +12,21 @@
 // the entry's element A (ELEMENT_ACT); the head width W = 2P + S is a
 // multiple of 32 and each of a subgroup's 32 lanes owns E = W / 32
 // contiguous columns.
-#include "../core/activation.glsl"
-#include "../core/reduce.glsl"
-#include "../core/rotary.glsl"
-
 #define ATTENTION_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
 #define ATTENTION_E (ATTENTION_W / 32u)
 #define ATTENTION_P uint(SEISMIC_DIM_P)
+// A head row held by a subgroup is the lane row of the core head, rotary and
+// rounding libraries.
+#define LANE_E ATTENTION_E
+#include "../core/activation.glsl"
+#include "../core/reduce.glsl"
+#include "../core/head.glsl"
+#include "../core/rotary.glsl"
+#include "../core/rounding.glsl"
+
+// The rotated pairs: P of them over the leading columns, or the trailing ones
+// (RT = 1, from S); half-split, or adjacent (RA = 1).
+#define ATTENTION_ROTARY rotary_layout(ATTENTION_P, SEISMIC_DIM_RT != 0 ? uint(SEISMIC_DIM_S) : 0u, SEISMIC_DIM_RA != 0)
 #define ATTENTION_KV uint(SEISMIC_DIM_KV)
 #define ATTENTION_G uint(ATTENTION_QUERY_GROUP)
 // Query heads one decode subgroup holds in registers. The decode entries split
@@ -37,7 +45,11 @@
 // before including this file: ATTENTION_I interleaved gate columns after each
 // query head's W columns (0 or W), ATTENTION_U separate gate values per query
 // head (0, 1 or W), ATTENTION_FRESH (the layer has fresh rows),
-// ATTENTION_NORM (q/k RMS norm), ATTENTION_VALUE_NORM (value RMS norm) and
+// ATTENTION_QUERY_NORM (query RMS norm, NQ), ATTENTION_NORM (key RMS norm,
+// N), ATTENTION_VALUE_NORM (value RMS norm), ATTENTION_STORED_KEY (VK: a
+// row's value is its prepared key, and history holds the key plane alone),
+// ATTENTION_KEY_ROUNDING (the trained rounding of a prepared key, a
+// `rounding_t`: the entry's KR scalars, or `rounding_none()`) and
 // ATTENTION_SOFTPLUS (the gate function is softplus rather than sigmoid).
 #define ATTENTION_QUERY_STRIDE (ATTENTION_W + ATTENTION_I)
 
@@ -66,62 +78,35 @@ void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E])
     }
 }
 
-// Lane `lane`'s E columns of `x` RMS-normalized with `norm` (F32 weights). The
-// whole subgroup calls it: the square sum is a subgroup reduction.
-void attention_normalize(uint64_t norm, float epsilon, uint lane, inout float x[ATTENTION_E]) {
-    float squares = 0.0;
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-        squares = seismic_fma_rn(x[i], x[i], squares);
-    squares = seismic_subgroup_sum_f32(squares);
-    const float inverse = inversesqrt(seismic_div_rn(squares, float(ATTENTION_W)) + epsilon);
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-        x[i] = x[i] * inverse * element_f32_at(norm + uint64_t(lane * ATTENTION_E + i) * 4ul);
-}
-
 // One value head row at `raw` (A elements) into lane `lane`'s E columns,
 // RMS-normalized with `norm` and rounded to A when ATTENTION_VALUE_NORM.
 void attention_value(uint64_t raw, uint64_t norm, float epsilon, uint lane, out float x[ATTENTION_E]) {
     attention_load_row(raw, uint64_t(lane) * ATTENTION_E, x);
     if (ATTENTION_VALUE_NORM) {
-        attention_normalize(norm, epsilon, lane, x);
+        head_rms_norm(x, norm, 1ul, epsilon, lane);
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             x[i] = element_round(ELEMENT_ACT, x[i]);
     }
 }
 
-// One head row at `raw` (A elements), RMS-normalized with `norm` (F32) when
-// ATTENTION_NORM and rotated on its first 2P columns (pair p by coordinate
-// axis components[p] at frequencies[p], cosine and sine scaled by
-// amplitudes[p]), into lane `lane`'s E columns. The
-// whole subgroup calls it: each rotated column's pair partner lives P / E
-// lanes away.
-void attention_prepare(uint64_t raw, uint64_t norm, uint64_t coordinates, uint64_t components, uint64_t frequencies,
-    uint64_t amplitudes, float epsilon, uint lane, out float x[ATTENTION_E]) {
+// One head row at `raw` (A elements) prepared as the portable
+// `rounded_head_rotary` does, into lane `lane`'s E columns: RMS-normalized
+// with `norm` (F32) when `normed`, its pairs rotated (`ATTENTION_ROTARY`;
+// pair p by coordinate axis components[p] at frequencies[p], cosine and sine
+// scaled by amplitudes[p]), held in A after each where `trained` rounds the
+// row, then rounded by it. The caller rounds the result to A. The whole
+// subgroup calls it.
+void attention_prepare(uint64_t raw, const bool normed, uint64_t norm, uint64_t coordinates, uint64_t components,
+    uint64_t frequencies, uint64_t amplitudes, float epsilon, uint lane, rounding_t trained, out float x[ATTENTION_E]) {
     attention_load_row(raw, uint64_t(lane) * ATTENTION_E, x);
-    if (ATTENTION_NORM)
-        attention_normalize(norm, epsilon, lane, x);
-    if (ATTENTION_P == 0u)
-        return;
-    const uint half_lanes = ATTENTION_P / ATTENTION_E;
-    const uint partner_lane = lane < half_lanes ? lane + half_lanes : (lane < 2u * half_lanes ? lane - half_lanes : lane);
-    float partner[ATTENTION_E];
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-        partner[i] = seismic_shuffle(x[i], partner_lane);
-    if (lane >= 2u * half_lanes)
-        return;
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
-        const uint column = lane * ATTENTION_E + i;
-        const uint pair = column % max(ATTENTION_P, 1u);
-        float c;
-        const int axis = element_i32_at(components + uint64_t(pair) * 4ul);
-        const float angle = float(element_i32_at(coordinates + uint64_t(axis) * 4ul))
-            * element_f32_at(frequencies + uint64_t(pair) * 4ul);
-        float s = rotary_sincos(angle, c);
-        const float amplitude = element_f32_at(amplitudes + uint64_t(pair) * 4ul);
-        c *= amplitude;
-        s *= amplitude;
-        x[i] = column < ATTENTION_P ? x[i] * c - partner[i] * s : x[i] * c + partner[i] * s;
-    }
+    if (normed)
+        head_rms_norm(x, norm, 1ul, epsilon, lane);
+    rounding_hold_lanes(x, trained);
+    const rotary_turns turns =
+        rotary_lane_turns(coordinates, 1ul, components, 1ul, frequencies, 1ul, amplitudes, 1ul, ATTENTION_ROTARY, lane);
+    rotary_lane_rotate(x, turns, ATTENTION_ROTARY, lane);
+    rounding_hold_lanes(x, trained);
+    rounding_lanes(x, trained);
 }
 
 // Appends lane `lane`'s columns of one kv head row at history row
@@ -324,10 +309,10 @@ float attention_attended(float accumulated, float maximum, float denominator, ui
 // state p is slot first + p * stride, with its unnormalized output at
 // partials[slot * W + column] (relative to its maximum) and (maximum,
 // denominator) at statistics[slot * 2]. Empty states (denominator 0) are
-// skipped; a column with no state attends to zero. With sinks, query head
-// `head`'s sink joins the denominator (`attention_sink_denominator`).
-float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count, uint column,
-    uint64_t head) {
+// skipped. Returns (maximum, denominator, accumulated), the sums relative to
+// the maximum (0 with no non-empty state).
+vec3 attention_merge_state(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count,
+    uint column) {
     float maximum = -ATTENTION_INF;
     for (uint p = 0u; p < count; ++p) {
         const uint64_t slot = first + p * stride;
@@ -345,7 +330,16 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
             accumulated = seismic_fma_rn(element_f32_at(partials + (slot * ATTENTION_W + column) * 4ul), weight, accumulated);
         }
     }
-    return attention_attended(accumulated, maximum, denominator, head);
+    return vec3(maximum, denominator, accumulated);
+}
+
+// `attention_merge_state` attended: a column with no state attends to zero;
+// with sinks, query head `head`'s sink joins the denominator
+// (`attention_attended`).
+float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count, uint column,
+    uint64_t head) {
+    const vec3 merged = attention_merge_state(partials, statistics, first, stride, count, column);
+    return attention_attended(merged.z, merged.x, merged.y, head);
 }
 
 // Decode subgroups: subgroup sg holds the ATTENTION_HEADS query heads of

@@ -2198,20 +2198,17 @@ fn prefill_natives_match_portable_body() {
 
 // ---------------------------------------------------------------------------
 // Rotary layouts, the output rotary and a query norm apart from the key norm
-// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal and by CUDA's prefill
-// entry, refused by CUDA's decode declaration and by Vulkan's.
+// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal and by the CUDA and
+// Vulkan prefill entries, refused by their decode declarations.
 
 /// The backends whose decode entry refuses these forms: CUDA's and
 /// Vulkan's.
 const DECODE_REFUSALS: &[BackendName] = &[BackendName::Cuda, BackendName::Vulkan];
 
-/// The backends whose prefill entry and dense append refuse these forms:
-/// Vulkan's.
-const PREFILL_REFUSALS: &[BackendName] = &[BackendName::Vulkan];
-
-/// The backends whose `decode` (else prefill) entry refuses these forms.
+/// The backends whose `decode` entry refuses these forms; every prefill
+/// entry and dense append holds them.
 fn new_form_refusals(decode: bool) -> &'static [BackendName] {
-    if decode { DECODE_REFUSALS } else { PREFILL_REFUSALS }
+    if decode { DECODE_REFUSALS } else { &[] }
 }
 
 /// A small DeepSeek V4.1-style layer: ungated, a key norm without a query
@@ -2513,8 +2510,8 @@ fn v41_host_model_matches_reference() {
 
 /// At V4.1's shapes the CPU and Metal natives equal the F32 reference: the
 /// decode entry on both (Metal's matrix form in head groups of 8), prefill
-/// rows on both, and on CUDA, whose decode declaration refuses the forms as
-/// Vulkan's do.
+/// rows on both, and on CUDA and Vulkan, whose decode declarations refuse
+/// the forms.
 #[test]
 fn v41_natives_match_reference() {
     for (name, decode, case) in v41_cases() {
@@ -2523,7 +2520,7 @@ fn v41_natives_match_reference() {
         if decode {
             check_natives_against(name, true, &case, DECODE_REFUSALS, true, &expected);
         }
-        check_natives_against(name, false, &case, PREFILL_REFUSALS, true, &expected);
+        check_natives_against(name, false, &case, &[], true, &expected);
     }
 }
 
@@ -2598,8 +2595,8 @@ impl Case {
 }
 
 /// Stored-key layers at V4.1's shapes and a small one of its form (decode
-/// rows on Metal's decode entry), and a half-split leading one, a form CUDA
-/// and Vulkan hold but for its stored-key values.
+/// rows on Metal's decode entry), and a half-split leading one, a form the
+/// CUDA and Vulkan decode entries hold but for its stored-key values.
 fn stored_key_cases() -> Vec<(&'static str, bool, Case)> {
     let scale = 1.0 / (512f32).sqrt();
     let qwen = Form {
@@ -2646,10 +2643,10 @@ fn bits(values: &[f32]) -> Vec<u32> {
 
 /// Attention over the one key plane equals the same inputs over two planes
 /// whose values are the prepared keys, bit for bit, on every configuration
-/// of the CPU and Metal entries and CUDA's prefill entry: the result, and
-/// the key plane the row's keys are appended to. The two-plane run's value
-/// plane ends equal to its key plane. Vulkan and CUDA's decode entry refuse
-/// every stored-key form.
+/// of the CPU and Metal entries and the CUDA and Vulkan prefill entries: the
+/// result, and the key plane the row's keys are appended to. The two-plane
+/// run's value plane ends equal to its key plane. The CUDA and Vulkan decode
+/// entries refuse every stored-key form.
 #[test]
 fn stored_key_attention_equals_key_valued_planes() {
     let mut failures = Vec::new();
@@ -2751,7 +2748,7 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
 
 /// The dense append of a stored-key layer writes the key plane alone, and
 /// it equals the two-plane append of the same rows with the prepared keys
-/// as values, bit for bit; Vulkan refuses it.
+/// as values, bit for bit.
 #[test]
 fn stored_key_append_writes_the_key_plane_alone() {
     let mut failures = Vec::new();
@@ -2760,17 +2757,7 @@ fn stored_key_append_writes_the_key_plane_alone() {
             let backend = device.backend();
             let label = format!("{name} append {backend:?}");
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let stored = match run_append(&device, &case) {
-                    Err(error) if error.contains("violates the native `where` condition") => {
-                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
-                        return;
-                    }
-                    Err(error) => panic!("{label}: {error}"),
-                    Ok(_) if PREFILL_REFUSALS.contains(&backend) => {
-                        panic!("{label}: admitted stored-key values")
-                    }
-                    Ok(stored) => stored,
-                };
+                let stored = run_append(&device, &case).unwrap_or_else(|error| panic!("{label}: {error}"));
                 assert!(stored.1.is_empty(), "{label}: a value plane");
                 // The appended keys are the host model's, within a bf16 step.
                 let expected = case.expected().1;
@@ -2878,7 +2865,7 @@ fn two_source_host_model_matches_reference() {
 /// The CPU and Metal natives of the two-source form equal the host model at
 /// the small shapes and the F32 reference at V4.1's: the decode entry on
 /// CPU and Metal (its matrix form), the prefill entry (decode rows too) on
-/// both; the other declarations refuse it.
+/// every backend; the other decode declarations refuse it.
 #[test]
 fn two_source_natives_match_reference() {
     for (name, decode, case) in small_two_source_cases() {
@@ -2994,10 +2981,10 @@ fn small_key_rounding_cases() -> Vec<(&'static str, bool, Case)> {
 /// The rounded portable bodies equal the host model, which holds each
 /// prepared key in BF16 after its norm and after its rotation and rounds it
 /// with the independent rounding model, and their appended keys lie on the
-/// rounding's grid; the holds move some rounded key. The CPU and Metal
-/// natives, and the CPU, Metal and CUDA dense appends, store the host
-/// model's rounded keys, and the natives' results are the host model's over
-/// the keys they stored; the other declarations refuse the form.
+/// rounding's grid; the holds move some rounded key. The natives and the
+/// dense appends store the host model's rounded keys, and the natives'
+/// results are the host model's over the keys they stored; the CUDA and
+/// Vulkan decode declarations refuse the form.
 #[test]
 fn key_rounding_matches_portable_body() {
     let (mut failures, mut moved) = (Vec::new(), 0);
@@ -3036,9 +3023,6 @@ fn key_rounding_matches_portable_body() {
             let label = format!("{name} append {backend:?}");
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match run_append(&device, &case) {
-                    Err(error) if error.contains("violates the native `where` condition") => {
-                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
-                    }
                     Err(error) => panic!("{label}: {error}"),
                     Ok(appended) => rounded_keys_agree(&label, &case.prepared_keys(&appended.0), &keys),
                 }
@@ -3078,7 +3062,7 @@ fn v41_compressed_cases() -> Vec<(&'static str, bool, Case)> {
     ]
 }
 
-/// At V4.1's shapes each CPU, Metal and CUDA native its declaration admits
+/// At V4.1's shapes each native its declaration admits
 /// stores the host model's rounded keys (on the rounding's grid), and its
 /// result is the host model's over the keys it stored and its picks; so does
 /// each dense append its declaration admits (a window run of 32 spans two
@@ -3120,9 +3104,6 @@ fn v41_compressed_natives_round_and_attend() {
             let label = format!("{name} append {backend:?}");
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match run_append(&device, &case) {
-                    Err(error) if error.contains("violates the native `where` condition") => {
-                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
-                    }
                     Err(error) => panic!("{label}: {error}"),
                     Ok(appended) => rounded_keys_agree(&label, &case.prepared_keys(&appended.0), &rounded),
                 }

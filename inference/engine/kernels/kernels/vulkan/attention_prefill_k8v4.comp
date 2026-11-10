@@ -11,7 +11,10 @@
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
+#define ATTENTION_KEY_ROUNDING rounding_none()
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SOFTPLUS (SEISMIC_PARAM_GATE_FUNCTION != 0)
 #define ATTENTION_QUERY_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
@@ -51,5 +54,5 @@ prefill_scratch prefill_scratch_planes() {
 
 void attention_prefill_k8v4_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_k8v4_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }
-void attention_prefill_k8v4_merge() { prefill_merge(prefill_scratch_planes()); }
+void attention_prefill_k8v4_merge() { prefill_merge(prefill_scratch_planes(), prefill_picked(0ul, 0ul)); }
 void attention_prefill_k8v4_list() { prefill_list(); }

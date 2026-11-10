@@ -1,0 +1,13 @@
+// stream_collapse (contract and portable body in streams.seismic): one
+// workgroup per row, each invocation summing its columns' streams by the
+// row's pre in stream order (`streams_collapse`). As CUDA's.
+#include <seismic/element.glsl>
+#include "lib/core/streams.glsl"
+
+void stream_collapse() {
+    const uint64_t row = gl_WorkGroupID.x;
+    streams_collapse(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul, SEISMIC_HIDDEN_STRIDE_1,
+        SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PRE) + row * SEISMIC_PRE_STRIDE_0 * 4ul,
+        SEISMIC_PRE_STRIDE_1, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul,
+        SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

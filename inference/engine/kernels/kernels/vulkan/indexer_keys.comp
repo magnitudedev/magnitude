@@ -1,0 +1,58 @@
+// indexer_keys on Vulkan (contract and portable body in indexer.seismic), as
+// CUDA's (`cuda/indexer_keys.cu`):
+//
+// A logical subgroup per row (8 a workgroup), lane l holding columns
+// [l E, (l + 1) E) of the row's projected key (E = W / 32): a row that
+// completes a unit (latent_rows[row] >= 0) widens its key to F32,
+// RMS-normalizes it with the key norm, rotates its pairs at the row's
+// coordinates (the unit's first token's; `rotary_lane_rotate`), rounds it
+// with the indexer's trained rounding (`rounding_lanes`) and stores it in the
+// F32 key plane at latent_rows[row].
+#include <seismic/element.glsl>
+#include <seismic/slab.glsl>
+#include "lib/core/activation.glsl"
+
+#define KEYS_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
+#define LANE_E (KEYS_W / 32u)
+
+#include "lib/core/head.glsl"
+#include "lib/core/rotary.glsl"
+#include "lib/core/rounding.glsl"
+
+// The rotated pairs: P of them over the leading columns, or the trailing ones
+// (RT = 1, from S); half-split, or adjacent (RA = 1).
+#define KEYS_ROTARY \
+    rotary_layout(uint(SEISMIC_DIM_P), SEISMIC_DIM_RT != 0 ? uint(SEISMIC_DIM_S) : 0u, SEISMIC_DIM_RA != 0)
+
+void indexer_keys() {
+    const uint lane = SEISMIC_LANE;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * 8ul + SEISMIC_SUBGROUP;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    const int destination =
+        element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_LATENT_ROWS) + row * SEISMIC_LATENT_ROWS_STRIDE_0 * 4ul);
+    if (destination < 0)
+        return;
+    const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
+    float x[LANE_E];
+    [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+        x[i] = element_at(ELEMENT_ACT, key, row * SEISMIC_KEY_STRIDE_0 + uint64_t(lane * LANE_E + i) * SEISMIC_KEY_STRIDE_1);
+    // A rounded key is rounded from its norm and rotation held in A.
+    const rounding_t trained =
+        rounding_of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
+    head_rms_norm(x, SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_KEY_NORM_STRIDE_1,
+        element_word_f32(SEISMIC_PARAM_EPSILON), lane);
+    rounding_hold_lanes(x, trained);
+    const rotary_turns turns = rotary_lane_turns(
+        SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * SEISMIC_COORDINATES_STRIDE_0 * 4ul, SEISMIC_COORDINATES_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_ROTARY_COMPONENTS_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+        SEISMIC_ROTARY_FREQUENCIES_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES),
+        SEISMIC_ROTARY_AMPLITUDES_STRIDE_0, KEYS_ROTARY, lane);
+    rotary_lane_rotate(x, turns, KEYS_ROTARY, lane);
+    rounding_hold_lanes(x, trained);
+    rounding_lanes(x, trained);
+    const uint64_t target = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_KEYS), uint(destination),
+        uint(SEISMIC_PARAM_SLAB_ROWS), uint64_t(KEYS_W) * 4ul);
+    [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
+        element_f32_put(target + uint64_t(lane * LANE_E + i) * 4ul, x[i]);
+}

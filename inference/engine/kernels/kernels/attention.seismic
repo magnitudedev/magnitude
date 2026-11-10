@@ -233,7 +233,7 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
     let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(OW) + min(8 * ceil_div(Q * W, 32), 288) * 72
-    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N and IN <= SN
+    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch partials bytes (SPLIT * M * D * 4) when M > 8 and SPLIT > 1
     scratch staged bytes (M * Q * W * 2) when M > 8 and operands(OW) == 1
     launch attention_output_stage when M > 8 and operands(OW) == 1:
@@ -1149,16 +1149,19 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
 # Vulkan (`vulkan/lib/attention/prefill.glsl`): L1 prepares queries/keys (f16
 # scratch) and appends K/V; L2 streams 32-key K/V tiles per (tile of ROWS / G
 # tokens x G query heads, kv head, key partition), a head wider than 256 in
-# 256-column chunks; L3 merges split tiles.
+# 256-column chunks; L3 merges split tiles. As on CUDA, an index-list source
+# (KS > 0) is the state after the key partitions' (`attention_prefill_picks`,
+# a subgroup over the row's picks), which the merge folds in, and the output
+# rotary (RO = 1) is its own launch over the published rows.
 native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256)
-    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
+    where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
+    scratch partials bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) + min(1, KS)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
     scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
@@ -1172,9 +1175,15 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)
         shared_bytes (64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048)
-    launch attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV:
+    launch attention_prefill_picks when KS > 0:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_prefill_merge when SPLIT_GROUPS > ceil_div(M, ROWS / G) * KV or KS > 0:
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+    launch attention_prefill_rotate when RO == 1:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
 
 # CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, and the
 # keys and values of a layer with fresh rows, into F32 scratch; the K/V
@@ -1366,7 +1375,7 @@ native attention_append_dense for cuda from "cuda/attention_append_dense.cu":
 
 native attention_append_dense for vulkan from "vulkan/attention_append_dense.comp":
     static (KV, P, S, F, N, NV, RA, RT, VK, KR)
-    where KR == 0 and RA == 0 and RT == 0 and VK == 0 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
+    where KR <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and VK <= 1 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
     launch attention_append_dense:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -455,6 +455,15 @@ native indexer_keys for cuda from "cuda/indexer_keys.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8 * (2 * P + S) * 4)
 
+# Vulkan: CUDA's form, a logical subgroup per row (8 a workgroup), each
+# rotating by shuffles across its lanes as Metal does (`rotary_lane_rotate`).
+native indexer_keys for vulkan from "vulkan/indexer_keys.comp":
+    static (P, S, RA, RT)
+    where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    launch indexer_keys:
+        threadgroups (ceil_div(M, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row.
 native indexer_keys for cpu from "cpu/indexer_keys.rs":
     static (P, S, RA, RT)
@@ -481,6 +490,16 @@ native indexer_score for metal from "metal/indexer_score.metal":
 native indexer_score for cuda from "cuda/indexer_score.cu":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 98304 and (2 * P + S) % 32 == 0
+    launch indexer_score:
+        threadgroups (ceil_div(N, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+
+# Vulkan: CUDA's form, each head's subgroup rotating by shuffles before it
+# stores the prepared head in group memory.
+native indexer_score for vulkan from "vulkan/indexer_score.comp":
+    static (H, P, S, NQ, HW, RA, RT)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 32768 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -513,6 +532,14 @@ native rows_topk for metal from "metal/rows_topk.metal":
 
 # CUDA: Metal's form, a block of 256 threads per row.
 native rows_topk for cuda from "cuda/rows_topk.cu":
+    scratch spans bytes (M * (R + 1) * 4)
+    launch rows_topk:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
+
+# Vulkan: CUDA's form, a workgroup of 256 invocations per row.
+native rows_topk for vulkan from "vulkan/rows_topk.comp":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
         threadgroups (M, 1, 1)
@@ -647,6 +674,12 @@ native candidate_blocks for cuda from "cuda/candidate_blocks.cu":
         threadgroups (ceil_div(NB, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# Vulkan: as CUDA.
+native candidate_blocks for vulkan from "vulkan/candidate_blocks.comp":
+    launch candidate_blocks:
+        threadgroups (ceil_div(NB, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row, walking its picked blocks and its spans once.
 native candidate_rows for cpu from "cpu/candidate_rows.rs":
     launch candidate_rows:
@@ -662,6 +695,12 @@ native candidate_rows for metal from "metal/candidate_rows.metal":
 
 # CUDA: as Metal, a thread per row.
 native candidate_rows for cuda from "cuda/candidate_rows.cu":
+    launch candidate_rows:
+        threadgroups (ceil_div(M, 64), 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+# Vulkan: as CUDA, an invocation per row.
+native candidate_rows for vulkan from "vulkan/candidate_rows.comp":
     launch candidate_rows:
         threadgroups (ceil_div(M, 64), 1, 1)
         threads_per_threadgroup (64, 1, 1)

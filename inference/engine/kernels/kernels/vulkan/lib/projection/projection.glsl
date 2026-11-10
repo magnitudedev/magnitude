@@ -70,6 +70,7 @@
 #include "../core/matrix.glsl"
 
 #include "stage.glsl"
+#include "join.glsl"
 
 
 #define PROJECTION_STORE 0
@@ -84,6 +85,7 @@
 #define PROJECTION_MIX_LOW 9
 #define PROJECTION_MIX_INJECT 10
 #define PROJECTION_MIX 11
+#define PROJECTION_SCATTER_COMBED 12
 
 // Further epilogues (the Metal and CUDA vocabulary):
 //   Glu           y = round_A(round_A(act(round_A(gate))) * round_A(up))  (paired;
@@ -148,22 +150,25 @@ projection_epilogue projection_residual(const int act, uint64_t y, uint64_t stri
 
 // `scatter`: `streams` hyper-connection streams of `width` columns, each the
 // residual plus the output times the stream's inject value (`inject` rows of
-// stride `inject0`).
+// stride `inject0`); `combed`, each target stream d the residual streams
+// mixed by the comb after the inject values (sum_s comb[s, d] residual[s],
+// sources ascending) plus the output times inject[d].
 projection_epilogue projection_scatter(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows, uint64_t inject, uint64_t inject0,
-    uint streams, uint width) {
-    return projection_epilogue(PROJECTION_SCATTER, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
-        0, 0.0, 1.0, 1.0, inject, inject0, streams, width, 0ul);
+    uint streams, uint width, const bool combed) {
+    return projection_epilogue(combed ? PROJECTION_SCATTER_COMBED : PROJECTION_SCATTER, act, y, stride0, stride1, 0ul,
+        residual, residual0, residual1, rows, 0, 0.0, 1.0, 1.0, inject, inject0, streams, width, 0ul);
 }
 
 // An output entry's epilogue by its inject extent `inject_extent`: the
-// residual, or the scatter into `streams` streams of `width` columns.
+// residual, or the scatter into `streams` streams of `width` columns (combed
+// when the inject row carries a comb after its `streams` values).
 projection_epilogue projection_output(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows, uint64_t inject, uint64_t inject0,
     const uint inject_extent, const uint streams, uint width) {
     return inject_extent != 0u
         ? projection_scatter(act, y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0,
-            streams, width)
+            streams, width, inject_extent > streams)
         : projection_residual(act, y, stride0, stride1, residual, residual0, residual1, rows);
 }
 
@@ -271,15 +276,11 @@ void projection_put(projection_epilogue out_, uint m, uint n, float value) {
         element_put(out_.act, out_.y, at, activated * element_f32_at(out_.residual + source * 4ul));
     } else if (out_.kind == PROJECTION_LOGITS) {
         element_f32_put(out_.y + at * 4ul, out_.cap > 0.0 ? functions_softcap(out_.cap, value) : value);
-    } else if (out_.kind == PROJECTION_SCATTER) {
-        const float rounded = element_round(out_.act, value);
-        const uint64_t row = uint64_t(projection_row(out_.rows, m)) * out_.r0;
-        for (uint s = 0u; s < out_.streams; ++s) {
-            const uint64_t column = uint64_t(s * out_.width + n);
-            element_f32_put(out_.y + (projection_out_row(out_, m) + column * out_.y1) * 4ul,
-                element_f32_at(out_.residual + (row + column * out_.r1) * 4ul)
-                    + rounded * element_f32_at(out_.inject + (uint64_t(m) * out_.inject0 + s) * 4ul));
-        }
+    } else if (out_.kind == PROJECTION_SCATTER || out_.kind == PROJECTION_SCATTER_COMBED) {
+        join_scatter(out_.y + projection_out_row(out_, m) * 4ul, out_.y1,
+            out_.residual + uint64_t(projection_row(out_.rows, m)) * out_.r0 * 4ul, out_.r1,
+            out_.inject + uint64_t(m) * out_.inject0 * 4ul, out_.streams, out_.width,
+            out_.kind == PROJECTION_SCATTER_COMBED, uint64_t(n), element_round(out_.act, value));
     } else if (out_.kind == PROJECTION_MIX_LOW) {
         const float v = seismic_div_rn(value, float(out_.streams));
         element_put(out_.act, out_.y, at, seismic_div_rn(v, 1.0 + exp(-v)));

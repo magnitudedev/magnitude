@@ -1,0 +1,179 @@
+// rows_topk on Vulkan (contract and portable body in indexer.seismic), as
+// CUDA's (`cuda/rows_topk.cu`):
+//
+// A workgroup of 256 invocations per row. The row's span offsets (the listed
+// rows before each span, then their count) are scanned into scratch; its
+// scored ordinals are the first min(N, listed). A row that reads a prefix
+// (dense, complete <= K, or with at most K scored ordinals) picks the first
+// min(K, scored). A selecting row finds its K-th best score T by a radix
+// select over the scores' order keys (`order_key`: a < b exactly when their
+// keys are, -0.0 and 0.0 one key), a byte a pass from the top: each pass's
+// histogram takes one atomic per distinct digit of a subgroup, and the digit
+// is found by a scan of the bins. It picks every ordinal above T and the
+// first equal ones in ordinal order (ranked by a scan of each invocation's
+// count of equal ones): the K best, ties to the lower ordinal. Invocation t
+// owns a contiguous share of the ordinals; a scan of the shares' pick counts
+// places its picks, which it emits in ordinal order as their key-plane rows
+// (its first span found by bisection of the offsets, then advanced span by
+// span). The rest of the row's K picks are -1.
+//
+// The workgroup scans are `reduce_group_exclusive_add`. Group memory (u32):
+// the bins [256], the scans' 8 subgroup sums and the select state [4].
+#include <seismic/element.glsl>
+#include "lib/core/order.glsl"
+#include "lib/core/reduce.glsl"
+#include "lib/indexer/indexer.glsl"
+
+#define TOPK_THREADS 256u
+#define TOPK_BINS 0u
+#define TOPK_SCAN 256u
+#define TOPK_STATE 264u
+
+uint64_t topk_scores;
+
+uint topk_key(uint ordinal) {
+    return order_key(element_f32_at(topk_scores + uint64_t(ordinal) * SEISMIC_SCORES_STRIDE_1 * 4ul));
+}
+
+// Whether `ordinal` is picked, its equal ones ranked from `rank`.
+bool topk_picked(bool prefix, uint limit, uint threshold, uint take, uint ordinal, inout uint rank) {
+    if (prefix)
+        return ordinal < limit;
+    const uint u = topk_key(ordinal);
+    if (u > threshold)
+        return true;
+    if (u != threshold)
+        return false;
+    return rank++ < take;
+}
+
+void rows_topk() {
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint thread = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE;
+    const uint n = uint(SEISMIC_DIM_N);
+    const uint k = uint(SEISMIC_DIM_K);
+    const uint r = uint(SEISMIC_DIM_R);
+    if (k == 0u)
+        return;
+    const uint64_t spans = SEISMIC_PTR(SEISMIC_BUFFER_SPANS) + row * SEISMIC_SPANS_STRIDE_0 * 4ul;
+    const uint64_t span_stride = SEISMIC_SPANS_STRIDE_1;
+    const uint64_t bound_stride = SEISMIC_SPANS_STRIDE_2;
+    topk_scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES) + row * SEISMIC_SCORES_STRIDE_0 * 4ul;
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const uint64_t result_stride = SEISMIC_RESULT_0_STRIDE_1 * 4ul;
+    uint total = 0u;
+
+    // The span offsets [R + 1]: the listed rows before each span, then the
+    // row's.
+    const uint64_t span_first = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SPANS) + row * (uint64_t(r) + 1ul) * 4ul;
+    uint listed = 0u;
+    for (uint base = 0u; base < r; base += TOPK_THREADS) {
+        const uint span = base + thread;
+        const uint length = span < r ? indexer_span_length_at(spans, span_stride, bound_stride, span) : 0u;
+        uint chunk;
+        const uint before = reduce_group_exclusive_add(length, TOPK_SCAN, chunk);
+        if (span < r)
+            element_u32_put(span_first + uint64_t(span) * 4ul, listed + before);
+        listed += chunk;
+    }
+    if (thread == 0u)
+        element_u32_put(span_first + uint64_t(r) * 4ul, listed);
+    memoryBarrierBuffer();
+    barrier();
+    const uint scored = min(listed, n);
+
+    // A prefix row picks its first `limit` ordinals; a selecting row those
+    // above `threshold` and the first `take` equal to it.
+    const int complete = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_COMPLETE) + row * SEISMIC_COMPLETE_STRIDE_0 * 4ul);
+    const bool prefix = complete <= int(k) || scored <= k;
+    const uint limit = min(scored, k);
+    uint threshold = 0u;
+    uint take = 0u;
+    if (!prefix) {
+        if (thread == 0u) {
+            seismic_shared_u32[TOPK_STATE] = 0u;
+            seismic_shared_u32[TOPK_STATE + 1u] = k;
+        }
+        uint mask = 0u;
+        for (int digit = 3; digit >= 0; --digit) {
+            seismic_shared_u32[TOPK_BINS + thread] = 0u;
+            barrier();
+            const uint prefix_bits = seismic_shared_u32[TOPK_STATE];
+            const uint remaining = seismic_shared_u32[TOPK_STATE + 1u];
+            const uint shift = uint(digit) * 8u;
+            for (uint base = 0u; base < scored; base += TOPK_THREADS) {
+                const uint ordinal = base + thread;
+                const uint u = ordinal < scored ? topk_key(ordinal) : 0u;
+                bool pending = ordinal < scored && (u & mask) == prefix_bits;
+                const uint value = (u >> shift) & 255u;
+                // One atomic per distinct digit of the subgroup: the first
+                // pending lane's digit, counted over the lanes holding it.
+                for (uint lanes = reduce_lanes_ballot(pending); lanes != 0u; lanes = reduce_lanes_ballot(pending)) {
+                    const uint leader = uint(findLSB(lanes));
+                    const uint chosen = seismic_shuffle(value, leader);
+                    const uint holding = reduce_lanes_ballot(pending && value == chosen);
+                    if (SEISMIC_LANE == leader)
+                        atomicAdd(seismic_shared_u32[TOPK_BINS + chosen], uint(bitCount(holding)));
+                    pending = pending && value != chosen;
+                }
+            }
+            barrier();
+            // Invocation t holds bin 255 - t: the candidates above it are the
+            // scan of the bins before it. The bin holding the `remaining`-th
+            // best takes the digit.
+            const uint bin = 255u - thread;
+            const uint count = seismic_shared_u32[TOPK_BINS + bin];
+            const uint above = reduce_group_exclusive_add(count, TOPK_SCAN, total);
+            const bool pick = above < remaining && remaining <= above + count;
+            barrier();
+            if (pick) {
+                seismic_shared_u32[TOPK_STATE] = prefix_bits | (bin << shift);
+                seismic_shared_u32[TOPK_STATE + 1u] = remaining - above;
+            }
+            mask |= 255u << shift;
+            barrier();
+        }
+        threshold = seismic_shared_u32[TOPK_STATE];
+        take = seismic_shared_u32[TOPK_STATE + 1u];
+    }
+
+    // Invocation t's share of the scored ordinals [lo, hi).
+    const uint share = (scored + TOPK_THREADS - 1u) / TOPK_THREADS;
+    const uint lo = min(thread * share, scored);
+    const uint hi = min(lo + share, scored);
+    // The rank among the ordinals equal to T of the share's first.
+    uint equal = 0u;
+    if (!prefix)
+        for (uint ordinal = lo; ordinal < hi; ++ordinal)
+            equal += topk_key(ordinal) == threshold ? 1u : 0u;
+    const uint first_rank = reduce_group_exclusive_add(equal, TOPK_SCAN, total);
+    uint picks = 0u;
+    uint rank = first_rank;
+    for (uint ordinal = lo; ordinal < hi; ++ordinal)
+        picks += topk_picked(prefix, limit, threshold, take, ordinal, rank) ? 1u : 0u;
+    uint placed;
+    uint position = reduce_group_exclusive_add(picks, TOPK_SCAN, placed);
+    if (lo < hi) {
+        // The span holding `lo`: the last whose offset is at most it.
+        uint span = 0u;
+        for (uint high = r - 1u; span < high;) {
+            const uint middle = (span + high + 1u) / 2u;
+            if (element_u32_at(span_first + uint64_t(middle) * 4ul) <= lo)
+                span = middle;
+            else
+                high = middle - 1u;
+        }
+        rank = first_rank;
+        for (uint ordinal = lo; ordinal < hi; ++ordinal) {
+            while (ordinal >= element_u32_at(span_first + uint64_t(span + 1u) * 4ul))
+                ++span;
+            if (topk_picked(prefix, limit, threshold, take, ordinal, rank) && position < k) {
+                const uint offset = element_u32_at(span_first + uint64_t(span) * 4ul);
+                element_i32_put(result + uint64_t(position++) * result_stride,
+                    element_i32_at(spans + uint64_t(span) * span_stride * 4ul) + int(ordinal - offset));
+            }
+        }
+    }
+    for (uint pick = placed + thread; pick < k; pick += TOPK_THREADS)
+        element_i32_put(result + uint64_t(pick) * result_stride, -1);
+}
