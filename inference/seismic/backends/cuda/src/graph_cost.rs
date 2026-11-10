@@ -195,12 +195,21 @@ fn prepared(device: &Device, graph: driver::Graph) -> Result<driver::GraphExec, 
 
 /// What the device holds that a slope reads: this process's memory on it as
 /// NVML counts it, or, where NVML counts no process, everything it holds.
+/// Windows reads no NVML: under WDDM the device's reading is this process's
+/// own budget.
 enum Holdings {
+    #[cfg(not(target_os = "windows"))]
     Process(crate::nvml::NvmlDevice, u32),
     Device,
 }
 
 impl Holdings {
+    #[cfg(target_os = "windows")]
+    fn of(_device: &Device) -> Result<Self, ExecutionError> {
+        Ok(Self::Device)
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn of(device: &Device) -> Result<Self, ExecutionError> {
         let uuid = crate::profile::describe(device.ordinal()).map_err(failure)?.uuid;
         let pid = std::process::id();
@@ -212,6 +221,7 @@ impl Holdings {
 
     fn read(&self, device: &Device) -> Result<u64, ExecutionError> {
         match self {
+            #[cfg(not(target_os = "windows"))]
             Self::Process(nvml, pid) => nvml.process_bytes(*pid).map_err(failure),
             Self::Device => device.memory_info().map(|info| info.total_bytes - info.free_bytes),
         }

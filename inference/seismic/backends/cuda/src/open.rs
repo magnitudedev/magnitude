@@ -35,7 +35,8 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
     #[cfg(target_os = "windows")]
     {
         let _ = uuid;
-        Ok(crate::executor::memory_info(&context(ordinal)?)?.free_bytes)
+        let context = context(ordinal)?;
+        Ok(crate::executor::memory_info(&context)?.free_bytes)
     }
     #[cfg(not(target_os = "windows"))]
     {
