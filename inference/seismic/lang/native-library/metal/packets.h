@@ -542,18 +542,22 @@ struct Table {
 };
 
 // E4M3 bytes (`registry::ValueCodes::E4m3`) in a plane of bytes
-// (`Planes<8, 0>`): each code 2^9 times its value, an exact float built
-// from its bits (a normal code's (1 + m/8) 2^(e + 2), a subnormal one's m),
-// its sign kept on a zero, a NaN code (S.1111.111) NaN.
+// (`Planes<8, 0>`): each code 2^9 times its value, an exact float, its sign
+// kept on a zero, a NaN code (S.1111.111) NaN.
 struct E4M3Codes {
     static constant constexpr int zero = 0;
-    // The two codes of `two` (bits 0.. and 16.., `Planes<8, 0>::pair`).
+    // The two codes of `two` (bits 0.. and 16.., `Planes<8, 0>::pair`), as
+    // CUDA's `E4M3::operands` forms them: a code's magnitude bits
+    // (e e e e m m m) at an F16's low exponent bits and top mantissa bits
+    // read 2^-8 times its value, for e = 0 the F16's subnormal, so one exact
+    // scaling by 2^17 forms 2^9 times it; its sign bit is the F16's, and a
+    // NaN code's magnitude, which alone carries into bit 7 when incremented,
+    // takes an F16 NaN's exponent.
     static float2 pair_of(uint two) {
-        const uint2 raw = uint2(two & 0xffu, (two >> 16) & 0xffu);
-        const uint2 e = (raw >> 3) & 15u, m = raw & 7u;
-        float2 magnitude = metal::select(as_type<float2>(((e + 129u) << 23) | (m << 20)), float2(m), e == 0u);
-        magnitude = metal::select(magnitude, float2(as_type<float>(0x7fc00000u)), (raw & 0x7fu) == 0x7fu);
-        return as_type<float2>(as_type<uint2>(magnitude) | ((raw & 0x80u) << 24));
+        const uint magnitude = two & 0x007f007fu;
+        const uint nan = ((magnitude + 0x00010001u) >> 7) & 0x00010001u;
+        const uint halves = (magnitude << 7) | ((two & 0x00800080u) << 8) | nan * 0x7e00u;
+        return float2(as_type<half2>(halves)) * 131072.0f;
     }
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
