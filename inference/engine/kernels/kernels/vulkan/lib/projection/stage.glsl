@@ -134,7 +134,7 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
             return;
         }
         projection_load8_strided(in_.act, in_.x, uint64_t(row) * in_.x0 + uint64_t(k) * in_.x1, in_.x1, valid,
-            in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul, even, odd);
+            in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul && (in_.x & 15ul) == 0ul, even, odd);
     } else if (in_.kind == PROJECTION_SUMMED) {
         float v[8];
         [[unroll]] for (uint i = 0u; i < 8u; ++i)

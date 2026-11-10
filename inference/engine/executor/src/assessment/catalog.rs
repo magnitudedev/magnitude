@@ -35,8 +35,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Catalog models whose target's load must derive whatever their catalog
-/// support level.
-const REQUIRED: [&str; 1] = ["qwen3.8-flash-next:gguf:q4"];
+/// support level: DeepSeek V4.1 Flash is disabled for users until it passes
+/// on real text, but its loads plan on every backend, so a call outside a
+/// declaration's domain at its shapes fails here, not at a device's load.
+const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "deepseek-v4.1-flash:gguf:mxfp4"];
 
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
@@ -108,125 +110,162 @@ pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::Model
     targets
 }
 
+/// The catalog's targets on `backend`, each derived on its own thread: a
+/// backend's test names it (`…_on_vulkan`), so a run selects its backend,
+/// and its targets cost the slowest target's derivation, not their sum.
+fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName) {
+    let levels = support_levels();
+    let targets = headers::index()
+        .iter()
+        .filter(|component| component.role == ComponentRole::Target)
+        .collect::<Vec<_>>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let derived = std::thread::scope(|scope| {
+        let workers = (0..threads.min(targets.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut derived = Vec::new();
+                    while let Some(component) = targets.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        derived.push((component.model.as_str(), derive_target(component, backend, &levels)));
+                    }
+                    derived
+                })
+            })
+            .collect::<Vec<_>>();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<BTreeMap<_, _>>()
+    });
+    let lines = |pick: fn(&Derived) -> &Vec<String>| derived.values().flat_map(pick).cloned().collect::<Vec<_>>();
+    let (admitted, refused, failures) = (lines(|d| &d.admitted), lines(|d| &d.refused), lines(|d| &d.failures));
+    println!("refused:\n  {}", refused.join("\n  "));
+    assert!(failures.is_empty(), "failing targets:\n  {}", failures.join("\n  "));
+    assert!(!admitted.is_empty());
+    // Every required target is in the catalog's headers and admitted on the
+    // backend.
+    for name in REQUIRED {
+        assert!(derived.contains_key(name), "required target {name} has no catalog header");
+        let prefix = format!("{name} {} resident:", backend.as_str());
+        assert!(
+            admitted.iter().any(|line| line.starts_with(&prefix)),
+            "required target {name} is not admitted on {}",
+            backend.as_str()
+        );
+    }
+}
+
 #[test]
-fn every_admitted_catalog_target_derives_complete_terms() {
+fn every_admitted_catalog_target_derives_complete_terms_on_cpu() {
+    every_admitted_catalog_target_derives_complete_terms_on(BackendName::Cpu);
+}
+
+#[test]
+fn every_admitted_catalog_target_derives_complete_terms_on_metal() {
+    every_admitted_catalog_target_derives_complete_terms_on(BackendName::Metal);
+}
+
+#[test]
+fn every_admitted_catalog_target_derives_complete_terms_on_cuda() {
+    every_admitted_catalog_target_derives_complete_terms_on(BackendName::Cuda);
+}
+
+#[test]
+fn every_admitted_catalog_target_derives_complete_terms_on_vulkan() {
+    every_admitted_catalog_target_derives_complete_terms_on(BackendName::Vulkan);
+}
+
+/// What one target's loads on one backend came to: lines admitted, refused
+/// and failing.
+#[derive(Default)]
+struct Derived {
+    admitted: Vec<String>,
+    refused: Vec<String>,
+    failures: Vec<String>,
+}
+
+/// Catalog target `component`'s resident load on `backend`, and its banked
+/// load where its experts stream there, derived to complete terms.
+fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BTreeMap<String, String>) -> Derived {
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,
     };
-    let mut admitted = Vec::new();
-    let mut refused = Vec::new();
-    let mut failures = Vec::new();
-    let levels = support_levels();
-    let mut required_seen = Vec::new();
-    for component in headers::index() {
-        if component.role != ComponentRole::Target {
-            continue;
-        }
-        let name = component.model.as_str();
-        let target = headers::component(component);
-        // A target that must serve: its catalog model is neither disabled
-        // nor deprecated, or it is named in `REQUIRED`.
-        let required = REQUIRED.contains(&name);
-        if required {
-            required_seen.push(name);
-        }
-        let served = required
-            || !matches!(
-                levels.get(name).map(String::as_str),
-                Some("disabled" | "deprecated")
-            );
-        let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
-            if served {
-                failures.push(format!("{name}: no family recognizes the target"));
-            }
-            continue;
-        };
-        let definition = match family.inspect(&target, None, identity) {
-            Ok(definition) => definition,
-            Err(error) => {
-                sort(format!("{name}: its family fails to inspect it: {error}"), served, &mut failures, &mut refused);
-                continue;
-            }
-        };
-        if let Err(error) = crate::operators::admit(&definition, false) {
-            refused.push(format!("{name}: {error}"));
-            continue;
-        }
-        let manifest = target_manifest(component, &target, identity);
-        for backend in BackendName::ALL {
-            let load = match plain_load(&manifest, &definition, backend) {
-                Ok(load) => load,
-                // A target that must serve derives its load on every
-                // backend; another may lack a resident form.
-                Err(error) => {
-                    sort(format!("{name} {}: {error}", backend.as_str()), served, &mut failures, &mut refused);
-                    continue;
-                }
-            };
-            // Experts that stream on the backend are planned in its bank too,
-            // at its floor: what the most constrained streamed load holds.
-            // Experts that do not stream are refused with their reason.
-            let banked = match bank_reservations(&definition, backend) {
-                Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
-                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
-                })),
-                // A served target that routes experts streams them on every
-                // backend whose recorded device streams experts at all: only
-                // a fact of the device or its backend refuses it.
-                Err(PlanError::Unstreamed(reason)) => {
-                    let line = format!("{name} {} banked: {reason}", backend.as_str());
-                    match served && !matches!(reason, UnstreamedExperts::Unrouted) && !refused_by_the_device(&reason) {
-                        true => failures.push(line),
-                        false => refused.push(line),
-                    }
-                    None
-                }
-                Err(error) => {
-                    sort(format!("{name} {} banked: {error}", backend.as_str()), served, &mut failures, &mut refused);
-                    None
-                }
-            };
-            // Every routed form streams: a bank that refuses one fails.
-            let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));
-            for (form, load) in loads {
-                let line = |error: &dyn std::fmt::Display| format!("{name} {} {form}: {error}", backend.as_str());
-                match load.map(|load| derive_terms(&definition, &load, SELECTION, backend)) {
-                    Err(error) => sort(line(&error), served, &mut failures, &mut refused),
-                    Ok(Ok(terms)) => admitted.push(line(&terms)),
-                    // Only a missing native refuses a target that need not
-                    // serve; any other failure of its terms fails.
-                    Ok(Err(underived)) => match !served && underived.unoffered {
-                        true => refused.push(line(&underived.line)),
-                        false => failures.push(line(&underived.line)),
-                    },
-                }
-            }
-        }
-    }
-    println!("refused:\n  {}", refused.join("\n  "));
-    assert!(
-        failures.is_empty(),
-        "failing targets:\n  {}",
-        failures.join("\n  ")
-    );
-    assert!(!admitted.is_empty());
-    // Every required target is in the catalog's headers and admitted on
-    // every backend.
-    for name in REQUIRED {
-        assert!(
-            required_seen.contains(&name),
-            "required target {name} has no catalog header"
+    let mut derived = Derived::default();
+    let Derived { admitted, refused, failures } = &mut derived;
+    let name = component.model.as_str();
+    let target = headers::component(component);
+    // A target that must serve: its catalog model is neither disabled nor
+    // deprecated, or it is named in `REQUIRED`.
+    let served = REQUIRED.contains(&name)
+        || !matches!(
+            levels.get(name).map(String::as_str),
+            Some("disabled" | "deprecated")
         );
-        for backend in BackendName::ALL {
-            let prefix = format!("{name} {} resident:", backend.as_str());
-            assert!(
-                admitted.iter().any(|line| line.starts_with(&prefix)),
-                "required target {name} is not admitted on {}",
-                backend.as_str()
-            );
+    let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
+        if served {
+            failures.push(format!("{name}: no family recognizes the target"));
+        }
+        return derived;
+    };
+    let definition = match family.inspect(&target, None, identity) {
+        Ok(definition) => definition,
+        Err(error) => {
+            sort(format!("{name}: its family fails to inspect it: {error}"), served, failures, refused);
+            return derived;
+        }
+    };
+    if let Err(error) = crate::operators::admit(&definition, false) {
+        refused.push(format!("{name}: {error}"));
+        return derived;
+    }
+    let manifest = target_manifest(component, &target, identity);
+    let load = match plain_load(&manifest, &definition, backend) {
+        Ok(load) => load,
+        // A target that must serve derives its load on every backend;
+        // another may lack a resident form.
+        Err(error) => {
+            sort(format!("{name} {}: {error}", backend.as_str()), served, failures, refused);
+            return derived;
+        }
+    };
+    // Experts that stream on the backend are planned in its bank too, at its
+    // floor: what the most constrained streamed load holds. Experts that do
+    // not stream are refused with their reason.
+    let banked = match bank_reservations(&definition, backend) {
+        Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
+            load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+        })),
+        // A served target that routes experts streams them on every backend
+        // whose recorded device streams experts at all: only a fact of the
+        // device or its backend refuses it.
+        Err(PlanError::Unstreamed(reason)) => {
+            let line = format!("{name} {} banked: {reason}", backend.as_str());
+            match served && !matches!(reason, UnstreamedExperts::Unrouted) && !refused_by_the_device(&reason) {
+                true => failures.push(line),
+                false => refused.push(line),
+            }
+            None
+        }
+        Err(error) => {
+            sort(format!("{name} {} banked: {error}", backend.as_str()), served, failures, refused);
+            None
+        }
+    };
+    // Every routed form streams: a bank that refuses one fails.
+    let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));
+    for (form, load) in loads {
+        let line = |error: &dyn std::fmt::Display| format!("{name} {} {form}: {error}", backend.as_str());
+        match load.map(|load| derive_terms(&definition, &load, SELECTION, backend)) {
+            Err(error) => sort(line(&error), served, failures, refused),
+            Ok(Ok(terms)) => admitted.push(line(&terms)),
+            // Only a missing native refuses a target that need not serve;
+            // any other failure of its terms fails.
+            Ok(Err(underived)) => match !served && underived.unoffered {
+                true => refused.push(line(&underived.line)),
+                false => failures.push(line(&underived.line)),
+            },
         }
     }
+    derived
 }
 
 /// Lists what a target fails: a failure where it must serve, a refusal

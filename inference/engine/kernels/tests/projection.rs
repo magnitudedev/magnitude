@@ -6080,18 +6080,18 @@ fn normed_projection_reference(
     (expected, bound)
 }
 
-/// The devices whose `project_rows` natives take more than one group: CUDA
-/// and Vulkan declare G = 1 only.
+/// The devices whose `project_rows` natives take these groups: CUDA's takes
+/// only groups of N % 16 == 0 (its grouped tests are `cuda_projection.rs`'s).
 fn grouped_devices() -> Vec<Device> {
     devices()
         .into_iter()
-        .filter(|device| matches!(device.backend(), BackendName::Cpu | BackendName::Metal))
+        .filter(|device| matches!(device.backend(), BackendName::Cpu | BackendName::Metal | BackendName::Vulkan))
         .collect()
 }
 
 /// `project_rows` over a `groups`-group weight at its default
-/// specialization (activation rows in, F32 rows out, no scale or bound), on
-/// Metal with the GEMM past 64 rows split `split` ways.
+/// specialization (activation rows in, F32 rows out, no scale or bound),
+/// with Metal's GEMM past 64 rows and Vulkan's past 8 split `split` ways.
 fn grouped_project_rows_native(
     device: &Device,
     act: Act,
@@ -6118,7 +6118,7 @@ fn grouped_project_rows_native(
         .filter(|(name, _)| implementation.implementation().statics.iter().any(|declared| declared == name))
         .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, value as u64));
     let statics = match device.backend() {
-        BackendName::Metal => statics.with_param("SPLIT", split),
+        BackendName::Metal | BackendName::Vulkan => statics.with_param("SPLIT", split),
         _ => statics,
     };
     let specialization = implementation
@@ -6235,9 +6235,10 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
 }
 
 /// A grouped `project_rows` (three groups of 40 weight rows over 256
-/// columns each) equals its portable body and the per-group host products
-/// in the GEMV, small GEMM and split GEMM row classes, on the devices whose
-/// natives take groups.
+/// columns each) equals the per-group host products in the GEMV, small GEMM
+/// and split GEMM row classes on the devices whose natives take groups, and
+/// its portable body (which has no row classes, so one multi-row count
+/// decides it) equals them too.
 #[test]
 fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
     let module = module();
@@ -6250,27 +6251,34 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
             let source = (0..rows * groups * k)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let outcome = interpret(
-                &module,
-                "project_rows",
-                &[
-                    ("A", registry::dense(DType::BF16)),
-                    ("W", repr.storage()),
-                    ("Y", registry::dense(DType::F32)),
-                ],
-                vec![
-                    activations(act, &[rows, groups * k], &source),
-                    Input::Data(weight.oracle()),
-                    floats(&[0], &[]),
-                    floats(&[0], &[]),
-                ],
-            );
-            let oracle = result(&outcome, 0);
             let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
-            assert_within(&format!("grouped portable body {repr:?} M {rows}"), &oracle, &expected, &bound);
+            if rows == 3 {
+                let outcome = interpret(
+                    &module,
+                    "project_rows",
+                    &[
+                        ("A", registry::dense(DType::BF16)),
+                        ("W", repr.storage()),
+                        ("Y", registry::dense(DType::F32)),
+                    ],
+                    vec![
+                        activations(act, &[rows, groups * k], &source),
+                        Input::Data(weight.oracle()),
+                        floats(&[0], &[]),
+                        floats(&[0], &[]),
+                    ],
+                );
+                let oracle = result(&outcome, 0);
+                assert_within(&format!("grouped portable body {repr:?} M {rows}"), &oracle, &expected, &bound);
+            }
             for device in grouped_devices() {
-                // Each split of the GEMM past 64 rows (Metal's SPLIT).
-                for split in [1, 2, 4] {
+                // Each split of the GEMM (Metal's and Vulkan's SPLIT; the
+                // CPU native has none).
+                let splits: &[u64] = match device.backend() {
+                    BackendName::Cpu => &[1],
+                    _ => &[1, 2, 4],
+                };
+                for &split in splits {
                     let native = grouped_project_rows_native(&device, act, &weight, groups, &source, split);
                     assert_within(
                         &format!(
@@ -6292,11 +6300,19 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
 /// 17-row prefill within the reassociation bound of the per-group F32 host
 /// products, over F8_E4M3 under its grid (mxfp8g32) and BF16. The weight is
 /// periodic (`periodic_weight`): N = 1024 is no multiple of the period, so
-/// every group's block differs.
+/// every group's block differs. Only the GPU devices run this shape: the
+/// CPU native and the portable body are checked at the small grouped shape.
 #[test]
 fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
     let act = Act::Bf16;
     let (groups, n, k) = (8usize, 1024usize, 4096usize);
+    let devices = grouped_devices()
+        .into_iter()
+        .filter(|device| device.backend() != BackendName::Cpu)
+        .collect::<Vec<_>>();
+    if devices.is_empty() {
+        return;
+    }
     for (repr, seed) in [(Repr::Gguf(Format::F8_E4M3), 93), (Repr::Bf16, 94)] {
         let weight = periodic_weight(repr, groups * n, k, seed);
         for rows in [1usize, 17] {
@@ -6305,8 +6321,8 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
             let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
-            for device in grouped_devices() {
-                let native = grouped_project_rows_native(&device, act, &weight, groups, &source, 1);
+            for device in &devices {
+                let native = grouped_project_rows_native(device, act, &weight, groups, &source, 1);
                 assert_within(
                     &format!("wo_a {repr:?} M {rows} on {:?}", device.backend()),
                     &native,
