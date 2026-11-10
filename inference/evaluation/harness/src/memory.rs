@@ -428,12 +428,14 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
 /// the host's (freeing 107 GB on a GB10 took 14 s). The press is sized from
 /// the ceiling (`DomainReading::ceiling_bytes`), what the host gives
 /// without displacing another program's data, the one figure the load's
-/// band and growth read alike. The bytes are pseudo-random
-/// words, as an application's data is: zeroed pages the OS compresses to
-/// nothing would press nothing. They are written on every core the host
-/// has, as fast as its memory takes them, by threads that yield any core
-/// other work wants ([`yielding`]): the press takes the host's memory, never
-/// the engine's processors.
+/// band and growth read alike, read here with the machine's reserves. The
+/// load's own line holds at least those: its measured motion only adds to
+/// the machine's page-fill rate (`StoreMotion::with`), and its release
+/// latency to the reading interval, so the press lands the load at least
+/// `deficit` below its line,
+/// provided the moves take memory no faster than the load's reserve
+/// provisions for. The bytes are pseudo-random words, as an application's
+/// data is, written by one thread ([`written`]).
 pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Result<(), String> {
     let target = store::Target::open(backend, selected)?;
     let before = target.snapshot()?;
@@ -447,7 +449,7 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
         ));
     }
     let ceiling = reading.ceiling_bytes;
-    let approach = ceiling.saturating_sub(deficit);
+    let approach = approach_bytes(ceiling, deficit);
     let approaching = Instant::now();
     let approached = target.take(approach, 0)?;
     println!("{}", json!({ "approached": approach, "ceiling": ceiling, "seconds": approaching.elapsed().as_secs_f64(),
@@ -456,7 +458,7 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
     if std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())? == 0 { return Ok(()); }
     let reading = target.reading()?;
     let ceiling = reading.ceiling_bytes;
-    let press = ceiling.checked_add(deficit).ok_or("pressure allocation size overflows")?;
+    let press = press_bytes(ceiling, deficit)?;
     let pressed = target.take(press, 1)?;
     println!("{}", json!({ "occupied": approach + press, "ceiling": ceiling, "at": unix_seconds(), "observation": target.snapshot()? }));
     let released = std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())?;
@@ -469,20 +471,42 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
     Ok(())
 }
 
-/// `bytes` of pseudo-random words, written by `writers` threads at once,
-/// the first of them seeded as writer `first` of the process.
-fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String> {
+/// What the approach takes of a store `ceiling` bytes above its line: all
+/// but `deficit` of it.
+fn approach_bytes(ceiling: u64, deficit: u64) -> u64 {
+    ceiling.saturating_sub(deficit)
+}
+
+/// What the press takes of a store `ceiling` bytes above its line: all of it
+/// and `deficit` more, which leaves the store `deficit` below that line.
+fn press_bytes(ceiling: u64, deficit: u64) -> Result<u64, String> {
+    ceiling.checked_add(deficit).ok_or_else(|| "pressure allocation size overflows".to_owned())
+}
+
+/// `bytes` of pseudo-random words seeded by `seed`, written by one thread
+/// that yields any processor other work wants ([`yielding`]), so the
+/// pressure takes the host's memory, never the engine's processors.
+///
+/// One thread takes memory as one program does: no faster than the machine
+/// fills fresh pages, each page faulted in before its words are written,
+/// which is the take a load's planning reserve holds a margin for
+/// (`StoreMotion::of_machine`, the page-fill rate over the reserve's reading
+/// interval and release latency). Pressed below that line, the load sees
+/// the pressure it is built to answer. A writer on every core takes memory
+/// several times faster than any one program, and the load's line rises to
+/// the rate it measures: a GB10 load's went from 0.7 GB to 33 GB under such
+/// an approach and its bank fell to its floor before any press (c2a9ef).
+fn written(bytes: u64, seed: usize) -> Result<Vec<u64>, String> {
     let mut held = vec![0u64; usize::try_from(bytes.div_ceil(8)).map_err(|error| error.to_string())?];
-    // One writer's share of the words, at least one word for a chunk size.
-    let share = held.len().div_ceil(writers).max(1);
     std::thread::scope(|scope| {
-        let written = held.chunks_mut(share).enumerate().map(|(writer, words)| {
-            scope.spawn(move || {
+        let words = &mut held;
+        scope
+            .spawn(move || {
                 yielding()?;
                 // xorshift64 from a seed of its own (an odd multiple, never
                 // zero): every word differs, so no page compresses.
-                let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * (first + writer) as u64 + 1);
-                for slot in words {
+                let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * seed as u64 + 1);
+                for slot in words.iter_mut() {
                     word ^= word << 13;
                     word ^= word >> 7;
                     word ^= word << 17;
@@ -490,8 +514,8 @@ fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String>
                 }
                 Ok::<(), String>(())
             })
-        });
-        written.collect::<Vec<_>>().into_iter().try_for_each(|writer| writer.join().expect("a writer panicked"))
+            .join()
+            .expect("the writer panicked")
     })?;
     Ok(held)
 }
@@ -864,8 +888,8 @@ impl Pressure {
     /// window, its prompt cut to leave the room. Approached, pressing takes
     /// only what the engine could still claim and the deficit, which lands
     /// in a fraction of a second; the approach takes everything else the
-    /// host has (over 100 GB on a GB10, 8 s beside the load), which no
-    /// decode's room need hold. The prompt's tokens decoded from, and the
+    /// host has, at the rate one program takes memory ([`written`]), which
+    /// no decode's room need hold. The prompt's tokens decoded from, and the
     /// tokens.
     fn decode(&mut self, engine: &ReadyEngine, prompt: &[TokenId], tokens: usize) -> Result<(usize, Vec<u32>), Failure> {
         let mut window = Window::of(tokens, self.pressing.from_prompt);
@@ -1293,6 +1317,32 @@ mod tests {
         assert!(!pressure.record.contains_key("freed"));
         pressure.failed("model unloaded: memory pressure".into()).unwrap();
         assert_eq!(pressure.record["ended"]["failure"], "model unloaded: memory pressure");
+    }
+
+    /// The approach leaves the deficit above the line, the press all of what
+    /// is left and the deficit, so the store ends the deficit below the line
+    /// whatever the load claimed between the two moves.
+    #[test]
+    fn the_press_lands_the_deficit_below_the_line_whatever_was_claimed_after_the_approach() {
+        let (ceiling, deficit) = (100_000, 200);
+        assert_eq!(ceiling - approach_bytes(ceiling, deficit), deficit);
+        assert_eq!(approach_bytes(deficit - 1, deficit), 0);
+        for claimed in [0, 150, deficit] {
+            let left = deficit - claimed;
+            assert_eq!(press_bytes(left, deficit).unwrap() - left, deficit);
+        }
+        assert!(press_bytes(u64::MAX, deficit).is_err());
+    }
+
+    /// The pressure's words fill every byte asked, none of them zero or
+    /// repeated, so no page of them compresses.
+    #[test]
+    fn the_pressure_writes_distinct_words_over_every_byte() {
+        let words = written(4096 * 3 + 1, 1).unwrap();
+        assert_eq!(words.len(), (4096 * 3 + 1usize).div_ceil(8));
+        assert!(words.iter().all(|&word| word != 0));
+        assert_eq!(words.iter().collect::<std::collections::HashSet<_>>().len(), words.len());
+        assert_ne!(written(64, 0).unwrap(), written(64, 1).unwrap());
     }
 
     /// Only the engine's unload under memory pressure is the pressure's
