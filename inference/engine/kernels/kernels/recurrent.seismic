@@ -249,7 +249,7 @@ native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
 native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * H * 4)
     launch gated_delta_project_normalize:
         threadgroups (M, 1, 1)

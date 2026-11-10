@@ -272,7 +272,7 @@ native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W, OS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where Q * W > 0 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * Q * W * 4)
     launch attention_output_stage:
         threadgroups (M, 1, 1)
@@ -576,7 +576,7 @@ native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where D > 0 and (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1 or form(KW, INT8) == 1 or form(VW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * D * 4)
     launch attention_project_normalize:
         threadgroups (M, 1, 1)

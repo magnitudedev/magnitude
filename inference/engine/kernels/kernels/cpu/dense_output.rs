@@ -20,16 +20,8 @@ fn dense_output_stage<L: Isa, E: Elements>(
     let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * f, f) };
     projection::stage::<E::A>(cx.arg_product().row([row, 0]), staged);
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(f);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(staged, row, projection::tiled(cx.dim_o() as usize, &[&cx.arg_down_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(&[&cx.arg_down_weight()], staged);
 }
@@ -56,10 +48,8 @@ fn dense_output_rows<L: Isa, E: Elements>(
     let down_scale = if cx.dim_ds() == 0 { 1.0 } else { cx.arg_down_scale().get([0]) };
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, o * f) };
-    let blocks = seismic::cpu::quant::blocks(f);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
+        projection::quantized(cx.scratch_quantized(), 0, o, f, projection::tiled(o, &[&cx.arg_down_weight()]))
     });
     projection::project_staged_arithmetic(
         &down_weight,

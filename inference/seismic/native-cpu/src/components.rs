@@ -11,9 +11,9 @@
 //! amortized.
 
 use crate::isa::Tier;
-use crate::quant::Q8Block;
+use crate::quant::{Q8Block, Q8Tile};
 use crate::weights::{
-    self, codes, scales, Carried, Delta, DenseRows, Direct, E4m3, FloatRows, Format, Grid, Hier,
+    self, Placement, codes, scales, Carried, Delta, DenseRows, Direct, E4m3, FloatRows, Format, Grid, Hier,
     Minimum, NoDelta, PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
 };
 use seismic_lang::ids::RepresentationId;
@@ -36,6 +36,8 @@ type DecodeFn = unsafe fn(*const u8, &RowGeometry, usize, *mut f32);
 type DotFn = unsafe fn(*const u8, &RowGeometry, *const f32, usize, *mut f32);
 type DotQ8Fn = unsafe fn(*const u8, &RowGeometry, *const Q8Block, usize, *mut f32);
 type DotQ8TilesFn = unsafe fn(*const u8, &RowGeometry, *const Q8Block, usize, *mut f32, usize) -> bool;
+type TileFn = unsafe fn(*const u8, &RowGeometry, usize, *const Q8Tile, usize, usize, *mut f32);
+type SpanFn = unsafe fn(*const u8, &RowGeometry, usize, *const Q8Block, usize, usize, *mut f32);
 
 /// The instances of one component on one tier.
 #[derive(Clone, Copy)]
@@ -50,6 +52,17 @@ pub struct WeightKernels {
     /// Whole 16-row tiles against quantized activations, where the element
     /// has a whole-tile form (`Format::dot_q8_tiles`).
     dot_q8_tiles: DotQ8TilesFn,
+    /// Rows against several quantized activation rows, where the element
+    /// has the tile form (`Format::tile_q8`, `tiled`).
+    tile_q8: Option<TileFn>,
+    /// Any number of `rows8` rows against any number of quantized activation
+    /// rows in one call (`weights::dot_q8_tile`), where the element has the
+    /// tile form: the loop over row blocks is inside the call, not around
+    /// it.
+    dot_q8_span: Option<SpanFn>,
+    /// The plain quantized dot of one row (`Format::reference_q8`).
+    #[cfg(test)]
+    reference_q8: unsafe fn(*const u8, &RowGeometry, &[Q8Block], usize) -> f32,
 }
 
 impl std::fmt::Debug for WeightKernels {
@@ -93,8 +106,9 @@ impl WeightKernels {
     /// As [`WeightKernels::dot`] of a block of `R = out.len() / m` rows,
     /// against each of the `m` activation rows of `k` values quantized into
     /// `x` (`quant::blocks(k)` blocks each, row after row), activation-major:
-    /// `out[a R + r] = row r · activation a`. The activation rows go in the
-    /// largest groups that fit ([`ACTIVATION_GROUPS`]), each one pass over
+    /// `out[a R + r] = row r · activation a`. Where it [`Self::spans`], `R`
+    /// is any row count and the activation rows go in one call; the others
+    /// go in the largest groups that fit ([`ACTIVATION_GROUPS`]), each one pass over
     /// the weight rows decoding every block once for the group
     /// (`weights::dot_q8_rows`); every activation row's sums are the ones it
     /// has alone.
@@ -119,6 +133,9 @@ impl WeightKernels {
             out.len()
         );
         let width = out.len() / activations;
+        if let Some(span) = self.span(geometry) {
+            return unsafe { span(rows, geometry, width, x.as_ptr(), activations, k, out.as_mut_ptr()) };
+        }
         let block = row_block(width);
         let mut done = 0;
         while done < activations {
@@ -143,6 +160,45 @@ impl WeightKernels {
     pub unsafe fn dot_q8_tiles(&self, rows: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
         assert_eq!(x.len(), crate::quant::blocks(k), "quantized activation blocks of a {k}-value row");
         unsafe { (self.dot_q8_tiles)(rows, geometry, x.as_ptr(), k, out.as_mut_ptr(), out.len()) }
+    }
+
+    /// The call that takes any number of rows and activation rows at once
+    /// ([`Self::dot_q8`]'s whole span), for rows laid out `rows8` of an
+    /// element with the tile form.
+    fn span(&self, geometry: &RowGeometry) -> Option<SpanFn> {
+        self.dot_q8_span.filter(|_| geometry.placement == Placement::Rows8)
+    }
+
+    /// Whether [`Self::dot_q8`] takes any row count in one call, not row
+    /// blocks ([`ROW_BLOCKS`]) a call.
+    pub fn spans(&self, geometry: &RowGeometry) -> bool {
+        self.span(geometry).is_some()
+    }
+
+    /// Whether the element has the tile form ([`Self::tile_q8`]).
+    pub fn tiled(&self) -> bool {
+        self.tile_q8.is_some()
+    }
+
+    /// `out[a n + r] = row r · activation a` for the `n` rows from `rows`
+    /// and the `m` activation rows of `x` (`quant::tiles(m, blocks(k))`
+    /// tiles), `out.len() = m n`: each weight block decoded once for all
+    /// `m`, every output the sums [`Self::dot_q8`] gives its row alone, bit
+    /// for bit.
+    ///
+    /// # Safety
+    /// `rows` addresses `n` rows with `geometry` and `k` values; the element
+    /// is [`Self::tiled`].
+    #[inline(always)]
+    pub unsafe fn tile_q8(&self, rows: *const u8, geometry: &RowGeometry, n: usize, x: &[Q8Tile], m: usize, k: usize, out: &mut [f32]) {
+        let tile = self.tile_q8.expect("an element with the tile form");
+        assert!(
+            x.len() == crate::quant::tiles(m, crate::quant::blocks(k)) && out.len() == m * n,
+            "{} tiles of {m} activation rows of {k} values for {} products of {n} rows",
+            x.len(),
+            out.len()
+        );
+        unsafe { tile(rows, geometry, n, x.as_ptr(), m, k, out.as_mut_ptr()) }
     }
 }
 
@@ -249,6 +305,24 @@ macro_rules! tier_components {
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr().cast::<f32>(), out, M * R) };
             }
 
+            /// The tile form of the quantized dot of `n` `rows8` rows against
+            /// `m` activation rows: one instance a format, called once for
+            /// all the rows of a span, not once a row block.
+            #[target_feature($(enable = $feature),*)]
+            unsafe fn dot_q8_span<W: Format>(
+                rows: *const u8,
+                geometry: &RowGeometry,
+                n: usize,
+                x: *const Q8Block,
+                m: usize,
+                k: usize,
+                out: *mut f32,
+            ) {
+                let x = unsafe { std::slice::from_raw_parts(x, m * crate::quant::blocks(k)) };
+                let out = unsafe { std::slice::from_raw_parts_mut(out, m * n) };
+                unsafe { weights::dot_q8_tile::<W, crate::isa::$tier>(rows, geometry, n, x, m, k, out) }
+            }
+
             #[target_feature($(enable = $feature),*)]
             unsafe fn dot_q8_tiles<W: Format>(
                 rows: *const u8,
@@ -261,6 +335,26 @@ macro_rules! tier_components {
                 let x = unsafe { std::slice::from_raw_parts(x, crate::quant::blocks(k)) };
                 let out = unsafe { std::slice::from_raw_parts_mut(out, len) };
                 unsafe { W::dot_q8_tiles::<crate::isa::$tier>(rows, geometry, x, k, out) }
+            }
+
+            #[target_feature($(enable = $feature),*)]
+            unsafe fn tile_q8<W: Format>(
+                rows: *const u8,
+                geometry: &RowGeometry,
+                n: usize,
+                x: *const Q8Tile,
+                m: usize,
+                k: usize,
+                out: *mut f32,
+            ) {
+                let x = unsafe { std::slice::from_raw_parts(x, crate::quant::tiles(m, crate::quant::blocks(k))) };
+                let out = unsafe { std::slice::from_raw_parts_mut(out, m * n) };
+                unsafe { W::tile_q8::<crate::isa::$tier, { crate::quant::TILE_ROWS }>(rows, geometry, n, x, m, k, out) }
+            }
+
+            #[cfg(test)]
+            unsafe fn reference_q8<W: Format>(row: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize) -> f32 {
+                unsafe { W::reference_q8(&geometry.row(row), k, x) }
             }
 
             const fn kernels<W: Format>() -> WeightKernels {
@@ -276,6 +370,10 @@ macro_rules! tier_components {
                         [dot_q8::<W, 16, 1>, dot_q8::<W, 16, 2>, dot_q8::<W, 16, 4>],
                     ],
                     dot_q8_tiles: dot_q8_tiles::<W>,
+                    tile_q8: if W::TILED { Some(tile_q8::<W> as TileFn) } else { None },
+                    dot_q8_span: if W::TILED { Some(dot_q8_span::<W> as SpanFn) } else { None },
+                    #[cfg(test)]
+                    reference_q8: reference_q8::<W>,
                 }
             }
 
@@ -283,7 +381,8 @@ macro_rules! tier_components {
         }
     )*
 
-        /// Every tier's component table of this architecture.
+        /// Every tier's component table of this architecture, in
+        /// `Tier::all` order.
         static TABLES: &[&[WeightKernels; COMPONENTS]] =
             &[$(#[cfg(target_arch = $arch)] &$module::KERNELS),*];
 
@@ -785,6 +884,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Blocks whose largest magnitude makes their scale subnormal give
+    /// every output of every tier's tile the quantized dot's contract of its
+    /// row and activation row (`Format::reference_q8`, written plainly), bit
+    /// for bit: their codes keep the magnitude bound of 127 the byte
+    /// products rest on.
+    #[test]
+    fn tiny_blocks_give_every_tier_the_single_row_dots() {
+        let (k, n, m) = (2 * 256, 8, 3);
+        let blocks = crate::quant::blocks(k);
+        let activations = (0..m * k).map(|i| ((i * 37 % 251) as f32 - 125.0) * 1e-39).collect::<Vec<_>>();
+        let mut quantized = vec![Q8Block::ZERO; m * blocks];
+        for (row, out) in activations.chunks_exact(k).zip(quantized.chunks_exact_mut(blocks)) {
+            crate::quant::quantize(row, out);
+        }
+        assert!(quantized.iter().all(|block| block.d < f32::MIN_POSITIVE && block.codes.iter().all(|code| *code >= -127)));
+        let mut tiles = vec![Q8Tile::ZERO; crate::quant::tiles(m, blocks)];
+        crate::quant::interleave(&quantized, m, blocks, &mut tiles);
+        let mut tested = 0;
+        for representation in int8_elements() {
+            let (data, geometry) = rows(representation, n, k, 31);
+            for tier in Tier::detected().unwrap().at_or_below() {
+                let kernels = kernels_of(tier, representation);
+                if !kernels.tiled() {
+                    continue;
+                }
+                let mut out = vec![f32::NAN; m * n];
+                unsafe { kernels.tile_q8(data.as_ptr(), &geometry, n, &tiles, m, k, &mut out) };
+                for a in 0..m {
+                    for r in 0..n {
+                        let reference = unsafe {
+                            (kernels.reference_q8)(data.as_ptr().add(r * geometry.stride), &geometry, &quantized[a * blocks..(a + 1) * blocks], k)
+                        };
+                        assert_eq!(out[a * n + r].to_bits(), reference.to_bits(), "{representation} {tier:?}: a {a} r {r}");
+                    }
+                }
+                tested += 1;
+            }
+        }
+        assert!(tested >= 20, "{tested} element tiers tested");
+    }
+
+    /// The tile form gives every output the quantized dot's contract of its
+    /// row and activation row (`Format::reference_q8`, written plainly),
+    /// bit for bit: every int8 element in every row layout, every tier,
+    /// one-row strips (the quantized dot's own path for rows8) and strips
+    /// of every width and a partial one, a partial row group, rows from
+    /// within a tile and a partial last block.
+    #[test]
+    fn tiles_match_the_single_row_dots() {
+        let (k, n) = (2 * 256 + 32 * 3, 13);
+        let blocks = crate::quant::blocks(k);
+        const MOST: usize = 17;
+        let activations = (0..MOST * k).map(|i| ((i * 37 % 251) as f32 - 125.0) / 113.0).collect::<Vec<_>>();
+        let mut quantized = vec![Q8Block::ZERO; MOST * blocks];
+        for (row, out) in activations.chunks_exact(k).zip(quantized.chunks_exact_mut(blocks)) {
+            crate::quant::quantize(row, out);
+        }
+        let mut tested = 0;
+        for representation in int8_elements() {
+            let (data, geometry) = rows(representation, n, k, 23);
+            for tier in Tier::detected().unwrap().at_or_below() {
+                let kernels = kernels_of(tier, representation);
+                if !kernels.tiled() {
+                    continue;
+                }
+                let reference = |a: usize, r: usize| unsafe {
+                    (kernels.reference_q8)(data.as_ptr().add(r * geometry.stride), &geometry, &quantized[a * blocks..(a + 1) * blocks], k)
+                };
+                for m in [1, 2, 3, 5, 8, 9, MOST] {
+                    let mut tiles = vec![Q8Tile::ZERO; crate::quant::tiles(m, blocks)];
+                    crate::quant::interleave(&quantized[..m * blocks], m, blocks, &mut tiles);
+                    let mut out = vec![f32::NAN; m * n];
+                    unsafe { kernels.tile_q8(data.as_ptr(), &geometry, n, &tiles, m, k, &mut out) };
+                    for a in 0..m {
+                        for r in 0..n {
+                            assert_eq!(out[a * n + r].to_bits(), reference(a, r).to_bits(), "{representation} {tier:?} {m} rows: a {a} r {r}");
+                        }
+                    }
+                }
+                // Blocks of one row a strip: whole tiles, and rows from
+                // within one; a span of several row blocks in one call
+                // (`spans`), with more activation rows than a group.
+                for (first, rows) in [(0, 8), (8, 4), (3, 4), (6, 2), (12, 1), (0, 13), (2, 11)] {
+                    if !ROW_BLOCKS.contains(&rows) && !kernels.spans(&geometry) {
+                        continue;
+                    }
+                    for m in [1, 2, 4, 8] {
+                        let mut out = vec![f32::NAN; m * rows];
+                        unsafe { kernels.dot_q8(data.as_ptr().add(first * geometry.stride), &geometry, &quantized[..m * blocks], k, &mut out) };
+                        for a in 0..m {
+                            for r in 0..rows {
+                                assert_eq!(out[a * rows + r].to_bits(), reference(a, first + r).to_bits(), "{representation} {tier:?} one-row strips: a {a} r {}", first + r);
+                            }
+                        }
+                    }
+                }
+                tested += 1;
+            }
+        }
+        assert!(tested >= 20, "{tested} elements tested");
     }
 
     /// The component throughput rule: a component call per row block across

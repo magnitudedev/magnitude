@@ -1122,7 +1122,6 @@ pub fn on_device(
                     detected
                         .at_or_below()
                         .filter(|tier| *tier != detected)
-                        .map(|tier| tier.name())
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -1257,11 +1256,8 @@ fn cpu_route(
             NativeParameterRole::Workers { launch } => workers[launch as usize] = value as usize,
             NativeParameterRole::Tier if value == 0 => {}
             NativeParameterRole::Tier => {
-                let named = NativeParameterRole::TIERS[value as usize - 1];
-                tier = Tier::all()
-                    .iter()
-                    .copied()
-                    .find(|tier| tier.name() == named)
+                tier = Tier::with_id(value)
+                    .filter(|tier| Tier::all().contains(tier))
                     .expect("the device offers only its own tiers");
             }
         }

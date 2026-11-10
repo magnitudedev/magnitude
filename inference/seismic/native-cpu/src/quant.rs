@@ -15,7 +15,7 @@
 //! Quantizing activations changes a projection's arithmetic: an entry offers
 //! it as an `arithmetic` tuning parameter, validated like any other.
 
-use seismic_lang::forms::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_VALUES};
+use seismic_lang::forms::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
 
 /// Values per quantized activation block (the k-quant super block).
 pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;
@@ -54,6 +54,91 @@ impl Q8Block {
         sums: [0; Q8_BLOCK / 16],
         d: 0.0,
     };
+
+    /// Blocks as the one-row tiles they are: a block's codes, sums and
+    /// scale are a one-row [`Q8Tile`]'s, byte for byte.
+    pub fn as_tiles(blocks: &[Q8Block]) -> &[Q8Tile<1>] {
+        const {
+            assert!(
+                std::mem::size_of::<Q8Block>() == std::mem::size_of::<Q8Tile<1>>()
+                    && std::mem::align_of::<Q8Block>() == std::mem::align_of::<Q8Tile<1>>()
+                    && std::mem::offset_of!(Q8Block, sums) == std::mem::offset_of!(Q8Tile<1>, sums)
+                    && std::mem::offset_of!(Q8Block, d) == std::mem::offset_of!(Q8Tile<1>, d),
+                "a block is a one-row tile"
+            )
+        };
+        // SAFETY: the two are `repr(C)` of the same fields at the same
+        // offsets (asserted), every bit pattern valid for both.
+        unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast(), blocks.len()) }
+    }
+}
+
+/// Activation rows of one [`Q8Tile`]: the tile kernel's strip.
+pub const TILE_ROWS: usize = CPU_Q8_ROWS as usize;
+
+/// One block of `R` activation rows ([`TILE_ROWS`], or one: a
+/// [`Q8Block`], `Q8Block::as_tiles`), interleaved for the tile kernel
+/// (`weights::tile`): each row's codes, sums and scale exactly as its
+/// [`Q8Block`], placed so that every ISA loads a strip's operands whole
+/// (AVX2 broadcasts a row's four codes, AVX-512 its eight, NEON `ld2` yields
+/// four rows' four codes a vector, SMMLA a row pair's eight; x86 broadcasts
+/// a row's adjacent sums). Rows past an activation matrix's end are zero.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug)]
+pub struct Q8Tile<const R: usize = TILE_ROWS> {
+    /// `codes[s][r]`: row `r`'s codes `8 s .. 8 s + 8`.
+    pub(crate) codes: [[[i8; 8]; R]; Q8_BLOCK / 8],
+    /// `sums[r]`: row `r`'s `Q8Block::sums`.
+    pub(crate) sums: [[i16; Q8_BLOCK / 16]; R],
+    pub(crate) d: [f32; R],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<Q8Tile>() <= TILE_ROWS * Q8_BYTES && std::mem::align_of::<Q8Tile>() == CPU_Q8_ALIGNMENT as usize,
+    "a tile fits its rows' blocks' bytes (`forms::CPU_Q8_ROWS`)"
+);
+
+impl Q8Tile {
+    pub const ZERO: Q8Tile = Q8Tile {
+        codes: [[[0; 8]; TILE_ROWS]; Q8_BLOCK / 8],
+        sums: [[0; Q8_BLOCK / 16]; TILE_ROWS],
+        d: [0.0; TILE_ROWS],
+    };
+
+    /// Places `block` as row `row` of the tile at `tile`, writing that row's
+    /// bytes alone: the tile's other rows may be written at the same time.
+    ///
+    /// # Safety
+    /// `tile` is valid for writes, and nothing else writes row `row` of it.
+    #[inline(always)]
+    pub unsafe fn place(tile: *mut Q8Tile, row: usize, block: &Q8Block) {
+        unsafe {
+            for (step, codes) in block.codes.chunks_exact(8).enumerate() {
+                std::ptr::addr_of_mut!((*tile).codes[step][row]).cast::<i8>().copy_from_nonoverlapping(codes.as_ptr(), 8);
+            }
+            std::ptr::addr_of_mut!((*tile).sums[row]).write(block.sums);
+            std::ptr::addr_of_mut!((*tile).d[row]).write(block.d);
+        }
+    }
+}
+
+/// Tiles of `m` activation rows of `blocks` blocks each: `[row group][block]`.
+pub const fn tiles(m: usize, blocks: usize) -> usize {
+    m.div_ceil(TILE_ROWS) * blocks
+}
+
+/// The `m` quantized rows `rows` (`blocks` blocks each, row after row) as
+/// tiles (`[row group][block]`, [`tiles`] of them), rows past `m` zero.
+pub fn interleave(rows: &[Q8Block], m: usize, blocks: usize, out: &mut [Q8Tile]) {
+    assert!(rows.len() == m * blocks && out.len() == tiles(m, blocks), "{m} rows of {blocks} blocks");
+    out.fill(Q8Tile::ZERO);
+    for (row, blocks_of) in rows.chunks_exact(blocks).enumerate() {
+        let group = &mut out[row / TILE_ROWS * blocks..][..blocks];
+        for (tile, block) in group.iter_mut().zip(blocks_of) {
+            // SAFETY: `tile` is this call's alone.
+            unsafe { Q8Tile::place(tile, row % TILE_ROWS, block) };
+        }
+    }
 }
 
 /// Blocks needed for a row of `k` values.

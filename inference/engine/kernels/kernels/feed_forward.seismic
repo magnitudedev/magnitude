@@ -152,7 +152,7 @@ native dense_expand for cpu from "cpu/dense_expand.rs":
     static (GS, US)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where GS <= 1 and US <= 1 and (INT8 == 0 or form(GW, INT8) == 1 or form(UW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(H, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * H * 4)
     launch dense_expand_normalize:
         threadgroups (O, 1, 1)
@@ -269,7 +269,7 @@ native dense_output for cpu from "cpu/dense_output.rs":
     static (DS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where DS <= 1 and (INT8 == 0 or form(DW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(F, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(F, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (O * F * 4)
     launch dense_output_stage:
         threadgroups (O, 1, 1)
@@ -398,7 +398,7 @@ native dense_up for cpu from "cpu/dense_up.rs":
     static (US)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where US <= 1 and (INT8 == 0 or form(UW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(H, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * H * 4)
     launch dense_up_normalize:
         threadgroups (O, 1, 1)

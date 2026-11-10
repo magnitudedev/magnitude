@@ -72,12 +72,18 @@ pub const CPU_Q8_ALIGNMENT: u64 = 64;
 pub const CPU_Q8_BYTES: u64 =
     (CPU_Q8_VALUES + CPU_Q8_VALUES / 16 * 2 + 4).next_multiple_of(CPU_Q8_ALIGNMENT);
 
+/// Activation rows of one CPU INT8 tile (`quant::Q8Tile`), the tile
+/// kernel's strip: several rows quantized for one projection lie as tiles
+/// of this many, each tile at most this many blocks' bytes, so `ceil_div(M,
+/// Q8_ROWS) * Q8_ROWS` blocks a row hold either form.
+pub const CPU_Q8_ROWS: u64 = 8;
+
 /// The named constants `backend`'s native declarations may use in their
 /// expressions (`scratch quantized bytes (M * ceil_div(H, Q8_VALUES) *
 /// Q8_BYTES)`), the facts of its forms they size buffers by.
 pub fn constants(backend: BackendName) -> &'static [(&'static str, u64)] {
     match backend {
-        BackendName::Cpu => &[("Q8_VALUES", CPU_Q8_VALUES), ("Q8_BYTES", CPU_Q8_BYTES)],
+        BackendName::Cpu => &[("Q8_VALUES", CPU_Q8_VALUES), ("Q8_BYTES", CPU_Q8_BYTES), ("Q8_ROWS", CPU_Q8_ROWS)],
         BackendName::Cuda | BackendName::Metal | BackendName::Vulkan => &[],
     }
 }

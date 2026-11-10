@@ -4327,6 +4327,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "postcard",
+ "seismic-cpu-tiers",
  "serde",
  "sha2 0.11.0",
 ]

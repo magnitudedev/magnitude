@@ -122,7 +122,7 @@ native per_layer_gate for cpu from "cpu/per_layer_gate.rs":
     static (GS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where GS <= 1 and (INT8 == 0 or form(GW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * D * 4)
     launch per_layer_gate_stage:
         threadgroups (M, 1, 1)

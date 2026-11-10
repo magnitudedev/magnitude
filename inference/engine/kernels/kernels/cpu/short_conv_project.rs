@@ -22,16 +22,8 @@ fn short_conv_project_normalize<L: Isa, E: Elements>(
     let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * h, h) };
     projection::rms_row::<E::A>(cx.arg_residual().row([row, 0]), weight, cx.arg_eps(), normalized);
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(h);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(normalized, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_m() as usize, &[&cx.arg_b_weight(), &cx.arg_x_weight(), &cx.arg_c_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(
         &[&cx.arg_b_weight(), &cx.arg_x_weight(), &cx.arg_c_weight()],
@@ -54,9 +46,9 @@ fn short_conv_project_rows<L: Isa, E: Elements>(
     let x_scale = if cx.dim_xs() == 0 { 1.0 } else { cx.arg_x_scale().get([0]) };
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * h) };
-    let blocks = seismic::cpu::quant::blocks(h);
-    let quantized = (cx.param_int8() == 1)
-        .then(|| unsafe { cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * blocks) });
+    let quantized = (cx.param_int8() == 1).then(|| unsafe {
+        projection::quantized(cx.scratch_quantized(), 0, m, h, projection::tiled(m, &[&cx.arg_b_weight(), &cx.arg_x_weight(), &cx.arg_c_weight()]))
+    });
     if group[0] < segment {
         let rows = projection::item_rows(group[0], cx.param_rows(), ch);
         projection::project_pair_staged_arithmetic(

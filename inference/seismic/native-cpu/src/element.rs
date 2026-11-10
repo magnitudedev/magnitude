@@ -152,9 +152,14 @@ impl Dense for F16 {
     #[inline(always)]
     unsafe fn widen_x86(values: *const u16) -> std::arch::x86_64::__m256 {
         use std::arch::x86_64::*;
+        // A function, not a closure: a closure would not take the caller's
+        // features, and its intrinsic would compile as a call.
+        #[inline(always)]
+        unsafe fn word(bits: u32) -> __m256i {
+            unsafe { _mm256_set1_epi32(bits as i32) }
+        }
         unsafe {
             let value = _mm256_cvtepu16_epi32(_mm_loadu_si128(values.cast()));
-            let word = |bits: u32| _mm256_set1_epi32(bits as i32);
             let magnitude = _mm256_slli_epi32::<13>(_mm256_and_si256(value, word(0x7fff)));
             let exponent = _mm256_and_si256(magnitude, word(0x0f80_0000));
             let normal = _mm256_add_epi32(magnitude, word(0x3800_0000));
@@ -383,12 +388,12 @@ mod tests {
                     if !std::arch::is_x86_feature_detected!("avx2") {
                         return;
                     }
-                    unsafe {
-                        std::arch::x86_64::_mm256_storeu_ps(
-                            widened.as_mut_ptr(),
-                            E::widen_x86(chunk.as_ptr()),
-                        )
-                    };
+                    // Inside a tier boundary, as the kernels take it.
+                    #[target_feature(enable = "avx2")]
+                    unsafe fn widen8<E: Dense<Storage = u16>>(values: *const u16, out: *mut f32) {
+                        unsafe { std::arch::x86_64::_mm256_storeu_ps(out, E::widen_x86(values)) }
+                    }
+                    unsafe { widen8::<E>(chunk.as_ptr(), widened.as_mut_ptr()) };
                 }
                 #[cfg(target_arch = "aarch64")]
                 unsafe {

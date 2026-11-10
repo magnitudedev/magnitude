@@ -16,16 +16,9 @@ fn project_rows_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * staged_row * k, k) };
     projection::stage::<E::A>(&cx.arg_source().row([row, 0])[g * k..][..k], staged);
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(k);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    staged_row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes of
+        // group `g`'s rows.
+        unsafe { projection::quantize_row(staged, row, projection::tiled(m, &[&cx.arg_weight()]), cx.scratch_quantized(), g * projection::quantized_bytes(m, k)) };
     }
     projection::operand_row(&[&cx.arg_weight()], staged);
 }
@@ -40,12 +33,8 @@ fn project_rows_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
     let scale = if cx.dim_ws() == 0 { 1.0 } else { cx.arg_weight_scale().get([0]) };
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(4 * g * m * k, m * k) };
-    let blocks = seismic::cpu::quant::blocks(k);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(
-            g * m * blocks * seismic::cpu::quant::Q8_BYTES,
-            m * blocks,
-        )
+        projection::quantized(cx.scratch_quantized(), g * projection::quantized_bytes(m, k), m, k, projection::tiled(m, &[&cx.arg_weight()]))
     });
     projection::project_staged_arithmetic(&cx.arg_weight(), first..first + columns, staged, quantized, |row, projected| {
         // SAFETY: each work item writes its own columns of every row.

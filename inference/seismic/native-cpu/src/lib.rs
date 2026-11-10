@@ -340,4 +340,31 @@ impl<'a> Weights<'a> {
             )
         }
     }
+
+    /// Whether [`Weights::dot_q8`] takes any row count in one call, not
+    /// blocks of [`Weights::row_block`] rows a call.
+    pub fn spans(&self) -> bool {
+        self.kernels.spans(&self.geometry)
+    }
+
+    /// Whether products over these weights take the tile form
+    /// ([`Weights::tile_q8`]): packed integer codes.
+    pub fn tiled(&self) -> bool {
+        self.kernels.tiled()
+    }
+
+    /// `out[a n + r] = (row first + r) · activation a` for `n = out.len() /
+    /// m` rows from `first` and the `m` activation rows quantized into the
+    /// tiles `x` ([`quant::interleave`]): each weight block decoded once for
+    /// every activation row, each output the sums [`Weights::dot_q8`] gives
+    /// its row alone, bit for bit.
+    #[inline(always)]
+    pub fn tile_q8(&self, first: usize, x: &[quant::Q8Tile], m: usize, out: &mut [f32]) {
+        let n = out.len() / m;
+        assert!(m > 0 && n * m == out.len() && first + n <= self.rows, "rows {first}..{} of {} against {m} activation rows", first + n, self.rows);
+        // SAFETY: the rows lie inside the operand (`from_raw`).
+        unsafe {
+            self.kernels.tile_q8(self.base.add(first * self.geometry.stride), &self.geometry, n, x, m, self.k, out)
+        }
+    }
 }

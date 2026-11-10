@@ -167,16 +167,17 @@ Apple GPUs are served by Metal. MoltenVK is not a target.
   | Tier | Adds | Typical hardware |
   | --- | --- | --- |
   | x86v2 | SSE3–4.2, POPCNT | Atom-class Gemini Lake / Jasper Lake; 2017–2020 Pentium and Celeron; x86 under Rosetta |
-  | x86v3 | AVX2, FMA, F16C, BMI1/2 | Intel Haswell and newer (including all 12th gen and newer Core, and N100); AMD Zen 1–3 |
-  | x86v4 | AVX-512 F/CD/BW/DQ/VL | Intel Skylake-SP/X server and workstation parts |
-  | x86v4vnni | AVX-512 VNNI | Intel Ice Lake, Tiger Lake, Rocket Lake, Sapphire Rapids and newer Xeon; AMD Zen 4/5 |
+  | x86v3 | AVX2, FMA, F16C, BMI1/2 | Intel Haswell through Comet Lake Core; AMD Zen 1–3 |
+  | x86v3vnni | AVX-VNNI (VEX, 256-bit) | Intel 12th gen and newer Core, N100 and other Alder Lake-N parts |
+  | x86v4 | AVX-512 F/CD/BW/DQ/VL | Intel Skylake-SP/X server and workstation parts (before Cascade Lake) |
+  | x86v4vnni | AVX-512 VNNI | Intel Cascade Lake, Ice Lake, Tiger Lake, Rocket Lake, Sapphire Rapids and newer Xeon; AMD Zen 4 and Zen 5 |
   | neon | NEON | Every AArch64 CPU |
   | neondot | `dotprod` (`sdot`) | Nearly every ARM CPU since 2018: Apple M1 and newer, Snapdragon X, Graviton 2+, Ampere Altra, Raspberry Pi 5 |
 
 - **v2 machines are supported but slow.** Hosts should prefer native builds: arm64 on Apple
   silicon and Windows on Arm.
 - **Planned tiers** (performance on hardware that is already supported):
-  - x86: AVX-VNNI, on Intel 12th gen and newer Core, N100, and Zen 5
+  - x86: AMX, on Sapphire Rapids and newer Xeon (x86v4vnni until then)
   - AArch64: `i8mm` and FP16 arithmetic
 - **Operating systems:**
   - Linux: glibc 2.35 (Ubuntu 22.04-compatible userspace)

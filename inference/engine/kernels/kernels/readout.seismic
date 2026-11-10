@@ -202,7 +202,7 @@ native readout_head_rows for cpu from "cpu/readout_head_rows.rs":
     static (WS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where WS <= 1 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * D * 4)
     launch readout_head_rows_normalize:
         threadgroups (O, 1, 1)
@@ -317,11 +317,11 @@ native readout_selected_rows for vulkan from "vulkan/readout_selected_rows.comp"
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 # CPU: as `readout_head_rows`, each work item owning ROWS selected vocabulary
-# rows (not adjacent: one single-row component call per row).
+# rows (not adjacent: each row against every output row in its own call).
 native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * D * 4)
     launch readout_selected_rows_normalize:
         threadgroups (O, 1, 1)

@@ -460,7 +460,7 @@ native project_rows for cpu from "cpu/project_rows.rs":
     static (WS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where WS <= 1 and (INT8 == 0 or form(W, INT8) == 1)
-    scratch quantized bytes (G * M * ceil_div(K, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (G * ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(K, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (G * M * K * 4)
     launch project_rows_stage:
         threadgroups (M, G, 1)

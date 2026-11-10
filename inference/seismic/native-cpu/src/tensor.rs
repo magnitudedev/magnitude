@@ -297,6 +297,12 @@ impl<'a> Scratch<'a> {
         unsafe { std::slice::from_raw_parts_mut(self.base.add(offset).cast(), length) }
     }
 
+    /// The element of `T` at byte `offset`, for writes that share it with
+    /// other work items (each its own bytes, `quant::Q8Tile::place`).
+    pub fn pointer<T>(&self, offset: usize) -> *mut T {
+        self.base.wrapping_add(offset).cast()
+    }
+
     /// # Safety
     /// As [`Scratch::slice_mut`], for reading.
     pub unsafe fn slice<T: Copy>(&self, offset: usize, length: usize) -> &'a [T] {

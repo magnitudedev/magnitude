@@ -223,7 +223,7 @@ native short_conv_project for cpu from "cpu/short_conv_project.rs":
     static (H, BS, CS, XS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where H > 0 and BS <= 1 and CS <= 1 and XS <= 1 and (INT8 == 0 or form(BW, INT8) == 1 or form(CW, INT8) == 1 or form(XW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * H * 4)
     launch short_conv_project_normalize:
         threadgroups (M, 1, 1)

@@ -29,16 +29,8 @@ fn attention_project_normalize<L: Isa, E: Elements>(
         normalized,
     );
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(d);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(normalized, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_m() as usize, &[&cx.arg_query_weight(), &cx.arg_gate_weight(), &cx.arg_key_weight(), &cx.arg_value_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(
         &[
@@ -88,10 +80,8 @@ fn attention_project_rows<L: Isa, E: Elements>(
     }
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * d) };
-    let blocks = seismic::cpu::quant::blocks(d);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
+        projection::quantized(cx.scratch_quantized(), 0, m, d, projection::tiled(m, &[&cx.arg_query_weight(), &cx.arg_gate_weight(), &cx.arg_key_weight(), &cx.arg_value_weight()]))
     });
     projection::project_staged_arithmetic(
         &weights,
