@@ -5870,6 +5870,93 @@ fn fp8_projections_match_the_host_reference(format: Format, shapes: &[(usize, us
     }
 }
 
+/// The time of `attention_output`'s decode row on Metal at DeepSeek V4.1
+/// Flash's `wo_b` (`[5120, 8192]` of F8_E4M3 under its UE8M0 grid,
+/// mxfp8g32), at its default configuration: one point, M = 1, so a survey
+/// walks only the launch that row runs, the other launches' parameters at
+/// their defaults. It prints the default's median device seconds a call and
+/// the rate it reads the weight at.
+#[test]
+#[ignore = "times attention_output's decode row on V4.1's wo_b on Metal; run it by name under a timed hold"]
+fn mxfp8_attention_output_decode_row_at_deepseek_v41_wo_b_times() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (d, q, w) = (5120usize, 8usize, 1024usize);
+    let weight = periodic_weight(Repr::Gguf(Format::F8_E4M3), d, q * w, 82);
+    let mut rng = Rng::new(83);
+    let hidden = (0..d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+    let gated = (0..q * w)
+        .map(|_| act.round(rng.symmetric()))
+        .collect::<Vec<_>>();
+    let hidden = f32_tensor(&device, &[1, d], &hidden);
+    let inject = no_inject(&device, 1);
+    let gated = act_tensor(&device, act, &[1, q, w], &gated);
+    let output_weight = weight.tensor(&device);
+    let scale = no_scale(&device);
+    let bound = absent_bound(&device);
+    let point = seismic::TuningPoint {
+        label: "m1".into(),
+        weight: 1.0,
+        class: None,
+        cost: 1.0,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![attention_output::Args {
+            hidden: &hidden,
+            inject: &inject,
+            gated: &gated,
+            output_weight: &output_weight,
+            output_scale: &scale,
+            output_bound: &bound,
+        }],
+        initialize: None,
+        written: Default::default(),
+    };
+    let statics = [("D", d), ("SN", 1), ("IN", 0), ("Q", q), ("W", w), ("OS", 0), ("OB", 0)]
+        .into_iter()
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, value as u64)
+        });
+    let result = attention_output::native_tune_with(
+        &device,
+        attention_output::Elements {
+            OW: weight.repr.resident(&device),
+            A: act.element(),
+        },
+        &statics,
+        vec![point],
+        seismic::NumericalRequirement::RoundingSteps {
+            alpha: 8.,
+            activation: Some(seismic::DType::BF16),
+        },
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 15,
+            min_sample_seconds: 0.001,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    let default = result
+        .configurations
+        .iter()
+        .filter(|record| record.observations.is_empty())
+        .find_map(|record| match &record.outcome {
+            seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
+            seismic::Outcome::Excluded(_) => None,
+        })
+        .expect("the default is measured");
+    println!(
+        "attention_output m1 wo_b mxfp8g32 [{d}, {}]: default {:.1} us a call, the weight at {:.1} GB/s",
+        q * w,
+        default * 1e6,
+        weight.bytes.len() as f64 / default / 1e9
+    );
+}
+
 /// The rows of a periodic real-shape weight repeat every `PERIOD` rows
 /// (prime, so no tile or row block repeats with them): the host builds and
 /// decodes `PERIOD` rows in seconds, not the whole matrix's minutes.
