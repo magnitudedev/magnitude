@@ -106,9 +106,16 @@ impl Drop for ModelCacheWorkspace {
 impl ModelCache {
     #[must_use]
     pub fn new(cache_root: &Path) -> Self {
+        Self::with_header_capacity(cache_root, HEADER_CAPACITY_BYTES)
+    }
+
+    /// A cache whose GGUF headers are bounded by `capacity` bytes: a build that must hold every header
+    /// it reads until it ends (the release catalog's bundle) bounds them by none.
+    #[must_use]
+    pub fn with_header_capacity(cache_root: &Path, capacity: u64) -> Self {
         Self {
             root: cache_root.to_path_buf(),
-            headers: HeaderCache::new(cache_root, HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE),
+            headers: HeaderCache::new(cache_root, capacity, HEADER_EVICTION_GRACE),
         }
     }
 

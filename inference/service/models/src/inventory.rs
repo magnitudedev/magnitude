@@ -242,6 +242,7 @@ pub struct InventoryConfig {
     pub catalog_header_digests: BTreeMap<String, String>,
     pub hub_endpoint: Option<String>,
     pub architectures: RecognizedArchitectures,
+    pub header_cache_capacity: u64,
 }
 
 pub(crate) fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
@@ -367,6 +368,7 @@ impl InventoryConfig {
             catalog_header_digests: BTreeMap::new(),
             architectures: RecognizedArchitectures::default(),
             hub_endpoint: None,
+            header_cache_capacity: crate::header_cache::HEADER_CAPACITY_BYTES,
         })
     }
 }
@@ -673,7 +675,7 @@ impl ManagedModelStore {
     ) -> Result<Self, InventoryError> {
         config.prepare_roots().await?;
         let client = hub_client(&config, None)?;
-        let cache = ModelCache::new(&config.cache_root);
+        let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity);
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let local_models = Arc::new(RwLock::new(config.local_models.clone()));
         let manager = Self {

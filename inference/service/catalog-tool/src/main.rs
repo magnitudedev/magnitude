@@ -343,6 +343,9 @@ async fn open_catalog_models(
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
     config.add_hugging_face_caches(hf_caches);
+    // A catalog build reads every header back once it has read them all, so none may be evicted to
+    // make room while it runs: on a slow machine the build outlasts the eviction grace.
+    config.header_cache_capacity = u64::MAX;
     let kernels = magnitude_service_models::ModelCache::new(&config.cache_root).kernel_directory();
     let volumes = Arc::new(magnitude_executor::platform::VolumeReserves::new(Some(kernels)));
     let space = Arc::new(volumes.space(config.root.clone()));
