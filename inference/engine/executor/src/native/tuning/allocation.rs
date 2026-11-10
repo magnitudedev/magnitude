@@ -1601,22 +1601,22 @@ pub(crate) struct Threads<U: Unit> {
     /// The burst of compiles in flight, from the first started with none
     /// running to the last to end.
     burst: Option<Burst>,
-    /// The most a burst raised the peak of the process's footprint, for
-    /// each thread it compiled on at once ([`Workers::compile_host`]), and
-    /// no less than what the load had seen a thread's compile hold before
-    /// these workers began.
+    /// The most the host's room fell in a burst, for each thread it
+    /// compiled on at once ([`super::compile_wave_price`],
+    /// [`Workers::compile_host`]), and no less than what the load had seen
+    /// a thread's compile hold before these workers began.
     compile_host: u64,
     /// Each burst that showed a thread's compile to hold more than it was
     /// priced at: the price it was admitted on and what it held.
     mispriced: Vec<(u64, u64)>,
 }
 
-/// A burst of compiles: the process's footprint when it began, the peak of
-/// the footprint until then ([`seismic::ProcessMemory::footprint_peak`]),
+/// A burst of compiles: the host's room when it began
+/// ([`super::host_room`]), its least as any of the burst's compiles ended,
 /// and the most threads the burst compiled on at once.
 struct Burst {
-    footprint: u64,
-    peak: u64,
+    room: Option<u64>,
+    lowest: Option<u64>,
     threads: usize,
 }
 
@@ -1658,20 +1658,22 @@ impl<U: Unit> Threads<U> {
         (unit, formed, took): (usize, std::thread::Result<U::Formed>, Duration),
     ) -> (usize, U::Formed, Duration) {
         self.taken.retain(|(compiling, _)| *compiling != unit);
-        // The burst is over when its last compile ends. If the peak of the
-        // process's footprint rose in it, the peak was reached while its
-        // compiles ran, and what it rose by over the burst's start is what
-        // that many threads of compiles held at their most (with whatever
-        // else the load took meanwhile, which only prices a compile
-        // higher). A burst below the peak already kept says nothing: there
-        // is one mark for the life of the process. A burst that held more
-        // than its compiles were priced at raises the price to what it
+        // Each compile's end reads the host's room: the burst's least is
+        // what that many threads of compiles held at their most, in this
+        // process or a compiler's own (with whatever else took room
+        // meanwhile, which only prices a compile higher).
+        if let Some(burst) = &mut self.burst {
+            burst.lowest = match (burst.lowest, super::host_room()) {
+                (Some(lowest), Some(room)) => Some(lowest.min(room)),
+                (lowest, room) => lowest.or(room),
+            };
+        }
+        // The burst is over when its last compile ends. A burst that held
+        // more than its compiles were priced at raises the price to what it
         // held, and is kept as a mispricing.
         if self.taken.is_empty() {
             if let Some(burst) = self.burst.take() {
-                let peak = seismic::ProcessMemory::footprint_peak();
-                if let Some(peak) = peak.filter(|peak| *peak > burst.peak && burst.threads > 0) {
-                    let held = peak.saturating_sub(burst.footprint) / burst.threads as u64;
+                if let Some(held) = super::compile_wave_price(burst.room, burst.lowest, burst.threads) {
                     if held > self.compile_host {
                         if self.compile_host > 0 {
                             self.mispriced.push((self.compile_host, held));
@@ -1709,13 +1711,11 @@ where
 
     fn start(&mut self, unit: usize, forming: U::Forming) {
         if self.taken.is_empty() {
-            self.burst = seismic::ProcessMemory::footprint_now()
-                .zip(seismic::ProcessMemory::footprint_peak())
-                .map(|(footprint, peak)| Burst {
-                    footprint,
-                    peak,
-                    threads: 0,
-                });
+            self.burst = Some(Burst {
+                room: super::host_room(),
+                lowest: None,
+                threads: 0,
+            });
         }
         self.taken.push((unit, (self.needs)(&forming)));
         if let Some(burst) = &mut self.burst {

@@ -1421,10 +1421,10 @@ pub struct TuningMemory {
     /// ([`allocation::Unit::host_footprint`]).
     pub host_added_by_unit: Vec<(String, u64)>,
     /// The host bytes one thread of a compile holds while it runs: the
-    /// most the peak of the process's footprint rose over compiles that
-    /// ran at once, for each thread that compiled. What a compile started
-    /// ahead of its piece is admitted on
-    /// ([`allocation::Unit::compile_host`]).
+    /// most the host's room fell over compiles that ran at once
+    /// ([`compile_wave_price`]), for each thread that compiled, wherever
+    /// the compiles' memory lies. What a compile started ahead of its piece
+    /// is admitted on ([`allocation::Unit::compile_host`]).
     pub compile_host_bytes: u64,
     /// Device charges when the mandatory phase began and when it ended.
     pub began_bytes: u64,
@@ -1757,6 +1757,23 @@ impl TuningMemory {
             _ if price == 0 => Some(1),
             allocation::HostRoom::Free(free) => Some((free / price) as usize),
             allocation::HostRoom::Exceeded => Some(0),
+        }
+    }
+
+    /// A compile wave held `held` bytes on each of its threads: the price
+    /// the next is admitted on rises to it, a rise past a price already
+    /// set kept as a mispricing.
+    fn price_compiles(&mut self, held: u64) {
+        let priced = self.compile_host_bytes;
+        if held > priced {
+            if priced > 0 {
+                self.mispriced.push(Mispricing {
+                    kind: "compile".into(),
+                    priced_bytes: priced,
+                    added_bytes: held,
+                });
+            }
+            self.compile_host_bytes = held;
         }
     }
 
@@ -3960,17 +3977,6 @@ impl<'a> Tuner<'a> {
                 MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
             }
         };
-        // What the peak of the process's footprint rose by over compiles
-        // that ran on `threads` threads with nothing else running, for
-        // each thread: what one thread's compile holds. A span that stayed
-        // under the peak already kept says nothing.
-        let rose = |before: Option<u64>, peak: Option<u64>, threads: usize| {
-            before
-                .zip(peak)
-                .zip(seismic::ProcessMemory::footprint_peak())
-                .filter(|((_, peak), now)| now > peak)
-                .map(|((before, _), now)| now.saturating_sub(before) / threads as u64)
-        };
         // Without a host ceiling the canonical compiles all run at once.
         // Where the host has a ceiling of its own they run in waves. A
         // compile's memory is not known before one has run, and one unit's
@@ -3997,24 +4003,24 @@ impl<'a> Tuner<'a> {
                 .min(observed.max(1))
                 .min(groundings.len() - observed);
             let narrowed = workers.narrowed(threads);
-            let (before, peak) = (
-                seismic::ProcessMemory::footprint_now(),
-                seismic::ProcessMemory::footprint_peak(),
-            );
+            // The host's room as the wave began, and its lowest as each of
+            // the wave's compiles ended: what the compiles held wherever it
+            // lies, a toolchain's compiler service apart from this process
+            // among it.
+            let before = host_room();
+            let lowest = std::sync::atomic::AtomicU64::new(u64::MAX);
+            let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
+                let formed = ground(compile);
+                if let Some(room) = host_room() {
+                    lowest.fetch_min(room, std::sync::atomic::Ordering::Relaxed);
+                }
+                formed
+            };
             grounded.extend(workers.each(&groundings[observed..observed + threads], ground));
             drop(narrowed);
-            if let Some(held) = rose(before, peak, threads) {
-                let priced = self.memory.compile_host_bytes;
-                if held > priced {
-                    if priced > 0 {
-                        self.memory.mispriced.push(Mispricing {
-                            kind: "compile".into(),
-                            priced_bytes: priced,
-                            added_bytes: held,
-                        });
-                    }
-                    self.memory.compile_host_bytes = held;
-                }
+            let lowest = Some(lowest.into_inner()).filter(|lowest| *lowest != u64::MAX);
+            if let Some(held) = compile_wave_price(before, lowest, threads) {
+                self.memory.price_compiles(held);
             }
             self.memory.return_freed_pages();
         }
@@ -5131,6 +5137,23 @@ fn tuned_entry(
         time,
         receipt,
     }
+}
+
+/// Host RAM this process may take now above the kernel's own line
+/// ([`seismic::host_room`]); none where the host cannot be read.
+pub(super) fn host_room() -> Option<u64> {
+    seismic::host_room().ok()
+}
+
+/// What one thread of a wave of `threads` compiles held: how far the host's
+/// room fell from `before`, its reading as the wave began, to `lowest`, its
+/// least as any of the wave's compiles ended, for each thread. The fall
+/// counts the compiles' memory in any process, a toolchain's compiler
+/// service as well as this one, which the process's footprint does not.
+/// None where either reading is missing or the room did not fall.
+pub(super) fn compile_wave_price(before: Option<u64>, lowest: Option<u64>, threads: usize) -> Option<u64> {
+    let fell = before?.checked_sub(lowest?).filter(|fell| *fell > 0)?;
+    Some(fell / threads.max(1) as u64)
 }
 
 #[cfg(test)]
