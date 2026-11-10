@@ -172,7 +172,7 @@ export function Explore(props: ExploreProps) {
     return <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }} download={download} />
   }
   if (new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES) {
-    return <ExploreModal {...props} results={{ _tag: "Failed", message: `Hugging Face searches are at most ${HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES} characters. Shorten the search.` }} download={download} />
+    return <ExploreModal {...props} results={{ _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }} download={download} />
   }
   return <Searched settled={settled} props={props} />
 }
