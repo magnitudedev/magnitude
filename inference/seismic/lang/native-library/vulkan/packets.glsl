@@ -303,7 +303,7 @@ vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
 // complement codes (bytes) the signed bytes, odd codes `2 (c - k) + 1`
 // (`CODES_OFFSET` k), and a codebook's codes (nibbles) the codebook's values
 // (`CODEBOOKS_TABLE_<ID>`, `PACKETS_CODEBOOK`), and E4M3 bytes
-// (`registry::ValueCodes::E4m3`) the registry's integers 2^9 v. A product
+// (`registry::ValueCodes::E4m3`) their values. A product
 // operand takes an offset off as the exact bias -(offset scale)
 // (`packets_values`): the offset is a power of two, without a stored bias.
 
@@ -353,15 +353,17 @@ float packets_codebook(const int kind, uint code) {
 #endif
 
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
-// Four E4M3 bytes as 2^9 times their values, exact floats built from their
-// bits: a normal code's (1 + m/8) 2^(e + 2), a subnormal one's m, its sign
-// kept on a zero, a NaN code (S.1111.111) NaN.
+// Four E4M3 bytes as their exact values (`registry::ValueCodes::E4m3`): a
+// normal code's (1 + m/8) 2^(e - 7) built from its bits, a subnormal one's
+// m 2^-9 (an exact product, zero or normal), its sign kept on a zero, and
+// both NaN codes (S.1111.111) the registry's one NaN, 0x7fc00000.
 vec4 packets_e4m3(uint bytes) {
     const uvec4 raw = uvec4(bytes, bytes >> 8, bytes >> 16, bytes >> 24) & 0xffu;
     const uvec4 e = (raw >> 3) & 15u, m = raw & 7u;
-    uvec4 magnitude = mix(((e + 129u) << 23) | (m << 20), floatBitsToUint(vec4(m)), equal(e, uvec4(0u)));
-    magnitude = mix(magnitude, uvec4(0x7fc00000u), equal(raw & 0x7fu, uvec4(0x7fu)));
-    return uintBitsToFloat(magnitude | ((raw & 0x80u) << 24));
+    const uvec4 magnitude =
+        mix(((e + 120u) << 23) | (m << 20), floatBitsToUint(vec4(m) * 0.001953125), equal(e, uvec4(0u)));
+    return uintBitsToFloat(
+        mix(magnitude | ((raw & 0x80u) << 24), uvec4(0x7fc00000u), equal(raw & 0x7fu, uvec4(0x7fu))));
 }
 #endif
 
@@ -541,7 +543,8 @@ void packets_grid_codes(uvec2 point, uint signs,
 // interpreted by LOCAL, under a factor (and a minimum factor) per
 // FACTOR_GROUP values: scale = factor 2^EXPONENT L(scale code) and bias =
 // BIAS_SIGN minimum factor 2^EXPONENT L(minimum code). Scales carry the
-// codes' exponent (`CODES_EXPONENT`).
+// codes' exponent (`CODES_EXPONENT`), an exact fold
+// (`registry::ScaleEncoding::scales_exactly`).
 
 // Bytes of one scale of encoding `scale` (`SEISMIC_SCALE_*`).
 uint packets_scale_bytes(const int scale) {

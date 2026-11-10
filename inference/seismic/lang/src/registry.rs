@@ -5044,8 +5044,8 @@ mod tests {
     /// assembled block, the scale then a group of codes, converting under
     /// E8M0 scales (one byte, 32 codes) into mxfp8g32, under F32 scales
     /// (four bytes, 128 codes) into fp8g128, whose decoders read E4M3 bytes
-    /// 2^9 times their value under that scale; no other encoding is read
-    /// under a grid.
+    /// as their values (the profile's integers under exponent -9) under that
+    /// scale; no other encoding is read under a grid.
     #[test]
     fn f8_e4m3_is_sourced_by_its_scale_grid() {
         use crate::repr::ValueCodes;
@@ -5065,7 +5065,7 @@ mod tests {
                 let element = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
                 assert_eq!(representation_info(element).representation, resident);
                 if let Some(axes) = decode_axes(element) {
-                    assert_eq!(axes.code_exponent, -9);
+                    assert_eq!((axes.code_exponent, axes.profile().code_exponent), (0, -9));
                     let CodingAxes::Direct { codes, scale, bias, group: coded } = axes.coding else {
                         panic!("{resident} is direct");
                     };

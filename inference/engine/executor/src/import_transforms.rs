@@ -392,17 +392,11 @@ fn assemble_grid(
 
 /// Whether `scale`, an F32 block scale (`ScaleCodes::F32`), is one the
 /// engine reads: finite, and zero or of magnitude at least 2^-117. A
-/// value is the code times its scale, one F32 product (`fp8g128`). The
-/// Metal, Vulkan and CPU decoders take an E4M3 code as an integer `q`
-/// times 2^-9 and fold the 2^-9 into the scale, `(s · 2^-9) · q`
-/// (`ScalesTimes`); that is the one product `s · (q · 2^-9)` exactly when
-/// `s · 2^-9` is exact, which for an F32 `s` (24 significant bits) holds
-/// while it stays in F32's normal range, `|s| >= 2^-117`, or is zero. Below
-/// it the folded scale drops low bits: `s = (1 + 2^-23) · 2^-118` under the
-/// code of 1.0 decodes to `2^-118`, not `s`. The same bound keeps every
-/// nonzero product, at least `2^-117 · 2^-9`, an F32 normal, which a device
-/// that flushes subnormals keeps too. A checkpoint's scales are amax / 448,
-/// far above it.
+/// value is the code times its scale, one F32 product (`fp8g128`), which
+/// every decoder forms exactly; the bound keeps every nonzero product, at
+/// least `2^-117 · 2^-9` (E4M3's least value), an F32 normal, which a
+/// device that flushes subnormals keeps too. A checkpoint's scales are
+/// amax / 448, far above it.
 fn f32_scale(scale: f32) -> Result<(), String> {
     // 2^-117: biased exponent 127 - 117, no mantissa.
     const LEAST: f32 = f32::from_bits((127 - 117) << 23);
@@ -411,7 +405,7 @@ fn f32_scale(scale: f32) -> Result<(), String> {
     }
     if scale != 0.0 && scale.abs() < LEAST {
         return Err(format!(
-            "{scale:e} is below 2^-117, where a code's value under it is no exact F32 product"
+            "{scale:e} is below 2^-117, where a code's value under it can be an F32 subnormal"
         ));
     }
     Ok(())

@@ -2059,6 +2059,9 @@ pub mod scales {
 /// A stored scale's encoding.
 pub trait Scale: Copy + Send + Sync + 'static {
     const BYTES: usize;
+    /// The exponent of the least bit a finite value of the encoding can
+    /// have: its least subnormal's.
+    const LEAST: i32;
 
     /// The scale stored at `at`.
     ///
@@ -2126,6 +2129,7 @@ impl scales::F16 {
 /// plane where they are adjacent.
 impl Scale for scales::F16 {
     const BYTES: usize = 2;
+    const LEAST: i32 = -24;
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         f16_to_f32(unsafe { read(at) })
@@ -2159,6 +2163,7 @@ impl Scale for scales::F16 {
 
 impl Scale for scales::Bf16 {
     const BYTES: usize = 2;
+    const LEAST: i32 = -133;
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         bf16_to_f32(unsafe { read(at) })
@@ -2167,6 +2172,7 @@ impl Scale for scales::Bf16 {
 
 impl Scale for scales::F32 {
     const BYTES: usize = 4;
+    const LEAST: i32 = -149;
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         f32::from_bits(unsafe { read(at) })
@@ -2175,6 +2181,7 @@ impl Scale for scales::F32 {
 
 impl Scale for scales::E8m0 {
     const BYTES: usize = 1;
+    const LEAST: i32 = -127;
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         match unsafe { *at } {
@@ -2187,6 +2194,7 @@ impl Scale for scales::E8m0 {
 
 impl Scale for scales::Ue4m3 {
     const BYTES: usize = 1;
+    const LEAST: i32 = -9;
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         let raw = unsafe { *at } & 0x7f;
@@ -2208,15 +2216,17 @@ const fn power2(exponent: i32) -> f32 {
     f32::from_bits(((127 + exponent) as u32) << 23)
 }
 
-/// `value * 2^EXPONENT`, exact for every value that stays normal; the value
-/// itself at exponent 0.
-#[inline(always)]
-fn scaled<const EXPONENT: i32>(value: f32) -> f32 {
-    if EXPONENT == 0 {
-        value
-    } else {
-        value * const { power2(EXPONENT) }
-    }
+/// `2^exponent` to fold into every value of scale encoding `S`, which it
+/// scales exactly: none of their bits falls below `f32`'s least, `2^-149`.
+/// A folded scale times a code is then one rounding of the scale times the
+/// code's value, as the registry decodes it; a fold that could round fails
+/// to compile.
+const fn fold<S: Scale>(exponent: i32) -> f32 {
+    assert!(
+        exponent <= 0 && S::LEAST + exponent >= -149,
+        "a power of two folds into a scale only where it scales every value exactly"
+    );
+    power2(exponent)
 }
 
 /// A packet's coefficients: a coefficient component.
@@ -2648,7 +2658,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                     scales
                 } else {
                     unsafe {
-                        _mm256_mul_ps(scales, _mm256_set1_ps(const { power2(CODE_EXPONENT) }))
+                        _mm256_mul_ps(scales, _mm256_set1_ps(const { fold::<S>(CODE_EXPONENT) }))
                     }
                 };
                 sums = unsafe { _mm256_fmadd_ps(scales, _mm256_cvtepi32_ps(exact), sums) };
@@ -2808,7 +2818,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                 let mut scales = unsafe { S::read8_neon(fields.add(S::BYTES * group), stride) };
                 if CODE_EXPONENT != 0 {
                     for scales in &mut scales {
-                        *scales = unsafe { vmulq_n_f32(*scales, const { power2(CODE_EXPONENT) }) };
+                        *scales = unsafe { vmulq_n_f32(*scales, const { fold::<S>(CODE_EXPONENT) }) };
                     }
                 }
                 let biases = BIAS.then(|| unsafe {
@@ -2954,7 +2964,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                 let mut scales = unsafe { S::read8_neon(fields.add(S::BYTES * group), stride) };
                 if CODE_EXPONENT != 0 {
                     for scales in &mut scales {
-                        *scales = unsafe { vmulq_n_f32(*scales, const { power2(CODE_EXPONENT) }) };
+                        *scales = unsafe { vmulq_n_f32(*scales, const { fold::<S>(CODE_EXPONENT) }) };
                     }
                 }
                 let biased = BIAS.then(|| unsafe {
@@ -3018,7 +3028,8 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
     /// whose supers fields are at `fields`.
     #[inline(always)]
     unsafe fn group<const STORAGE: usize>(fields: *const u8, local: usize) -> (f32, f32) {
-        let scale = scaled::<CODE_EXPONENT>(unsafe { S::read(fields.add(S::BYTES * local)) });
+        let scale = unsafe { S::read(fields.add(S::BYTES * local)) };
+        let scale = if CODE_EXPONENT == 0 { scale } else { scale * const { fold::<S>(CODE_EXPONENT) } };
         let bias = if BIAS {
             unsafe { S::read(fields.add(S::BYTES * (STORAGE / GROUP + local))) }
         } else {
@@ -3419,6 +3430,15 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     const MINIMUM: bool = matches!(L::BIAS, Some(LocalBias::Minimum(_)));
     /// Whether the bias term is subtracted.
     const SUBTRACT: bool = matches!(L::BIAS, Some(LocalBias::Minimum(MinimumSign::Subtract)));
+    /// `2^(EXPONENT + CODE_EXPONENT)`, folded into the factor.
+    const SCALE_POWER: f32 = fold::<F>(EXPONENT + CODE_EXPONENT);
+    /// The bias factor's power of two, folded into the minimum factor
+    /// (`2^EXPONENT`) or the factor (`2^(EXPONENT + exponent)`).
+    const BIAS_POWER: f32 = match L::BIAS {
+        Some(LocalBias::Minimum(_)) => fold::<F>(EXPONENT),
+        Some(LocalBias::Signed { exponent }) => fold::<F>(EXPONENT + exponent),
+        None => 1.0,
+    };
 
     /// The scale factor (`factor * 2^(EXPONENT + CODE_EXPONENT)`) and the
     /// bias factor (the stored minimum factor times `2^EXPONENT`, or the
@@ -3439,11 +3459,14 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     #[inline(always)]
     fn factors_of(factor: f32, minimum: f32) -> (f32, f32) {
         let bias = match L::BIAS {
-            Some(LocalBias::Minimum(_)) => scaled::<EXPONENT>(minimum),
-            Some(LocalBias::Signed { exponent }) => factor * power2(EXPONENT + exponent),
+            Some(LocalBias::Minimum(_)) => {
+                if EXPONENT == 0 { minimum } else { minimum * Self::BIAS_POWER }
+            }
+            Some(LocalBias::Signed { .. }) => factor * Self::BIAS_POWER,
             None => 0.0,
         };
-        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), bias)
+        let scale = if EXPONENT + CODE_EXPONENT == 0 { factor } else { factor * Self::SCALE_POWER };
+        (scale, bias)
     }
 
     /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
@@ -3945,8 +3968,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 let scale = if CODE_EXPONENT == 0 && EXPONENT == 0 {
                     factor
                 } else {
-                    let factor = if EXPONENT == 0 { factor } else { _mm256_mul_ps(factor, _mm256_set1_ps(const { power2(EXPONENT) })) };
-                    if CODE_EXPONENT == 0 { factor } else { _mm256_mul_ps(factor, _mm256_set1_ps(const { power2(CODE_EXPONENT) })) }
+                    _mm256_mul_ps(factor, _mm256_set1_ps(Self::SCALE_POWER))
                 };
                 let at = |values: &[i32; 16]| _mm256_cvtepi32_ps(_mm256_loadu_si256(values.as_ptr().add(8 * eight).cast()));
                 let mut value = _mm256_mul_ps(scale, at(&scaled));
@@ -3954,9 +3976,9 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                     let bias = match L::BIAS {
                         Some(LocalBias::Minimum(_)) => {
                             let minimum = F::read8(supers.add(F::BYTES), stride);
-                            if EXPONENT == 0 { minimum } else { _mm256_mul_ps(minimum, _mm256_set1_ps(const { power2(EXPONENT) })) }
+                            if EXPONENT == 0 { minimum } else { _mm256_mul_ps(minimum, _mm256_set1_ps(Self::BIAS_POWER)) }
                         }
-                        Some(LocalBias::Signed { exponent }) => _mm256_mul_ps(factor, _mm256_set1_ps(power2(EXPONENT + exponent))),
+                        Some(LocalBias::Signed { .. }) => _mm256_mul_ps(factor, _mm256_set1_ps(Self::BIAS_POWER)),
                         None => _mm256_setzero_ps(),
                     };
                     let term = _mm256_mul_ps(bias, at(&minimums));
@@ -4281,9 +4303,12 @@ pub trait FloatCodes: Copy + Send + Sync + 'static {
     unsafe fn values(at: At) -> [f32; PACKET];
 }
 
-/// E4M3 bytes: code `c` is `2^9` times its value (an integer, under the
-/// coefficients' code exponent -9), its sign kept on a zero, a NaN code
-/// (`S.1111.111`) NaN.
+/// E4M3 bytes: each code its exact value, its sign kept on a zero, both NaN
+/// codes (`S.1111.111`) the registry's one NaN (`f32::NAN`, the canonical
+/// NaN its arithmetic gives), which every product with a scale propagates.
+/// They are the registry's decoded values (its decode axes' code exponent
+/// 0), so a value is one product of the code's value and its scale, as the
+/// registry decodes it, under every scale.
 #[derive(Clone, Copy, Debug)]
 pub struct E4m3;
 
@@ -4293,13 +4318,14 @@ impl E4m3 {
         let mut raw = 0;
         while raw < 256 {
             let (exponent, mantissa) = ((raw >> 3) & 15, raw & 7);
-            // (8 + m) 2^(e - 1) for a normal code, m for a subnormal one.
+            // (8 + m) 2^(e - 10) for a normal code, m 2^-9 for a subnormal
+            // one.
             let magnitude = match (exponent, mantissa) {
                 (15, 7) => f32::NAN,
-                (0, _) => mantissa as f32,
-                _ => ((8 + mantissa) << (exponent - 1)) as f32,
+                (0, _) => mantissa as f32 * power2(-9),
+                _ => ((8 + mantissa) << (exponent - 1)) as f32 * power2(-9),
             };
-            values[raw] = if raw >= 128 { -magnitude } else { magnitude };
+            values[raw] = if raw >= 128 && !magnitude.is_nan() { -magnitude } else { magnitude };
             raw += 1;
         }
         values
@@ -5502,7 +5528,9 @@ mod tests {
     fn packed_decode_matches_the_registry() {
         use seismic_lang::interp::TensorData;
         let tier = Tier::detected().unwrap();
-        for name in elements() {
+        // Each element's first mismatch.
+        let mut mismatches = Vec::new();
+        'element: for name in elements() {
             let id = registry::representation(name).unwrap();
             let info = registry::representation_info(id);
             let RepresentationKind::PackedRows(layout) = &info.kind else {
@@ -5560,17 +5588,31 @@ mod tests {
                             &mut out,
                         )
                     };
-                    // A NaN code (E4M3's) decodes to NaN.
-                    for (i, value) in out.iter().enumerate() {
-                        let expected = reference[row * k + i];
-                        assert!(
-                            f64::from(*value) == expected || value.is_nan() && expected.is_nan(),
-                            "{name} k {k} row {row} value {i}: {value} is not {expected}"
-                        );
+                    // Equal values, a NaN bit for bit the registry's (its
+                    // one canonical NaN).
+                    let mismatch = out.iter().enumerate().find_map(|(i, value)| {
+                        let expected = reference[row * k + i] as f32;
+                        let same = if expected.is_nan() {
+                            value.to_bits() == expected.to_bits()
+                        } else {
+                            *value == expected
+                        };
+                        (!same).then(|| {
+                            format!(
+                                "{name} k {k} row {row} value {i}: {:#010x} is not {:#010x}",
+                                value.to_bits(),
+                                expected.to_bits()
+                            )
+                        })
+                    });
+                    if let Some(mismatch) = mismatch {
+                        mismatches.push(mismatch);
+                        continue 'element;
                     }
                 }
             }
         }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
     /// Every element a row conversion writes, in its own layout (the CPU's

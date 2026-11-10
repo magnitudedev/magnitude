@@ -2,14 +2,16 @@
 //! for bit (`mxfp8g32`: E4M3 codes under one E8M0 scale per 32; `fp8g128`:
 //! under one F32 scale per 128): every byte code (NaN, ±0, subnormals,
 //! ±448) under every E8M0 exponent, and under F32 scales across the range
-//! the importer admits, as a gather decodes each value alone
+//! the importer admits and below it (subnormal scales, and normal ones
+//! whose 2^-9 multiple is subnormal), as a gather decodes each value alone
 //! (`embedding_rows`) and as the GEMV's products take the codes
 //! (`project_rows`, under BF16 and F16 activations).
 //!
 //! Under an F32 scale the reference value is the code's value times the
-//! scale, one correctly rounded F32 product; a device that folds the codes'
-//! 2^-9 into the scale computes the same product for every scale the
-//! importer admits (zero or `|s| >= 2^-117`, `import_transforms::f32_scale`).
+//! scale, one correctly rounded F32 product, as every device decodes it
+//! (an E4M3 code is its exact value, `registry::ValueCodes::E4m3`, so no
+//! scale carries a code exponent). Both NaN codes are the registry's one
+//! NaN, of positive sign.
 //!
 //! The reference restores a weight as its E4M3 codes' values
 //! (`e4m3::value`, the `float8_e4m3fn` format) times their UE8M0 scales,
@@ -36,16 +38,21 @@ fn ue8m0(bits: u8) -> f32 {
     (2f64.powi(exponent)) as f32
 }
 
+/// Whether `device` keeps F32 subnormals, as operands and results. CUDA's
+/// natives compile with `--ftz=false`; Metal's F32 arithmetic flushes them,
+/// and NVIDIA's Vulkan without `DenormPreserve` does.
+fn keeps_subnormals(device: &Device) -> bool {
+    device.backend() == BackendName::Cuda
+}
+
 /// The E8M0 exponents up to `last` (at most 254, where the reference and the
 /// registry agree) a device decodes every code under exactly. From 10
 /// every finite code's value, at least 2^-9 2^(e - 127), is an F32 normal;
-/// below it some are subnormal, which devices that flush F32 subnormals
-/// (NVIDIA's Vulkan without `DenormPreserve`) lose. CUDA keeps them (its
-/// natives compile with `--ftz=false`, and its scales carry no code
-/// exponent, `packets::CodeExponentOf`), so it takes every exponent.
+/// below it some are subnormal, which only a device that keeps subnormals
+/// takes.
 fn exponents(device: &Device, last: u8) -> Vec<u8> {
     assert!(last <= 254, "scale byte 255 is inf to the reference and NaN to the registry");
-    let first = if device.backend() == BackendName::Cuda { 0 } else { 10 };
+    let first = if keeps_subnormals(device) { 0 } else { 10 };
     (first..=last).collect()
 }
 
@@ -124,6 +131,25 @@ impl Table {
             .collect()
     }
 
+    /// Which of `values` `device` decodes exactly, row-major: every value
+    /// on a device that keeps subnormals; elsewhere a value whose scale is
+    /// not subnormal and whose exact product is not tiny (nonzero and below
+    /// 2^-126 before rounding, which a flushing device's declared arithmetic
+    /// takes to zero even where it rounds up to 2^-126).
+    fn kept(&self, device: &Device) -> Vec<bool> {
+        let keeps = keeps_subnormals(device);
+        self.rows
+            .iter()
+            .flat_map(|(scale, codes)| {
+                codes.map(|code| {
+                    let exact = (f64::from(e4m3::value(code)) * f64::from(scale.value())).abs();
+                    let tiny = exact != 0.0 && exact < f64::from(f32::MIN_POSITIVE);
+                    keeps || !(scale.value().is_subnormal() || tiny)
+                })
+            })
+            .collect()
+    }
+
     /// The table's bytes in `layout`, whose host decode is the reference
     /// values.
     fn resident(&self, layout: Layout) -> (Element, Vec<u8>) {
@@ -137,16 +163,20 @@ impl Table {
             .into_iter()
             .map(|value| value as f32)
             .collect::<Vec<_>>();
-        assert_same(&format!("host decode of {} in {layout:?}", element.name()), &host, &self.values());
+        let every = vec![true; host.len()];
+        assert_same(&format!("host decode of {} in {layout:?}", element.name()), &host, &self.values(), &every);
         (element, bytes)
     }
 }
 
-/// F32 scales across the range the importer admits whose products with
-/// every finite code stay finite (`448 |s| < 2^128` for `|s| < 2^119`):
-/// zero, and for each binary exponent from -117 (the least admitted) to 118
-/// a scale of a pseudo-random 23-bit mantissa (all zeros and all ones at
-/// the two least), of alternating sign, so products with most codes round.
+/// F32 scales whose products with every finite code stay finite
+/// (`448 |s| < 2^128` for `|s| < 2^119`): zero; the least and greatest
+/// subnormal, the least normal exponent under a full mantissa and
+/// `(1 + 2^-23) 2^-118`, below the range the importer admits, where a
+/// scale's 2^-9 multiple is no longer exact; and for each binary exponent
+/// from -117 (the least admitted) to 118 a scale of a pseudo-random 23-bit
+/// mantissa (all zeros and all ones at the two least), of alternating sign,
+/// so products with most codes round.
 fn f32_scales() -> Vec<Scale> {
     let mut state = 0x9e37_79b9_u32;
     let mut mantissa = move || {
@@ -156,6 +186,9 @@ fn f32_scales() -> Vec<Scale> {
         state & 0x7f_ffff
     };
     let mut scales = vec![Scale::F32(0.0)];
+    for bits in [0x0000_0001, 0x807f_ffff, 0x00ff_ffff, 0x8480_0001_u32] {
+        scales.push(Scale::F32(f32::from_bits(bits)));
+    }
     for exponent in -117..=118i32 {
         let bits = match exponent {
             -117 => 0,
@@ -174,15 +207,20 @@ fn rotated(codes: &[u8; K], r: usize) -> [u8; K] {
     std::array::from_fn(|k| codes[(k + 7 * r) % K])
 }
 
-/// Bit equality, NaN as NaN.
+/// Bit equality, a NaN as a NaN of the same sign: a decoded NaN is the
+/// registry's, and a device's arithmetic keeps its sign while choosing its
+/// own payload (NVIDIA's canonical NaN is 0x7fffffff).
 fn same(actual: f32, expected: f32) -> bool {
-    actual.to_bits() == expected.to_bits() || (actual.is_nan() && expected.is_nan())
+    actual.to_bits() == expected.to_bits()
+        || (actual.is_nan() && expected.is_nan() && actual.is_sign_negative() == expected.is_sign_negative())
 }
 
-fn assert_same(label: &str, actual: &[f32], expected: &[f32]) {
+/// `actual` is `expected` at each index `kept` marks.
+fn assert_same(label: &str, actual: &[f32], expected: &[f32], kept: &[bool]) {
     assert_eq!(actual.len(), expected.len(), "{label}: length");
+    assert_eq!(kept.len(), expected.len(), "{label}: kept length");
     let failures = (0..expected.len())
-        .filter(|i| !same(actual[*i], expected[*i]))
+        .filter(|i| kept[*i] && !same(actual[*i], expected[*i]))
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty(),
@@ -192,7 +230,7 @@ fn assert_same(label: &str, actual: &[f32], expected: &[f32]) {
         failures
             .iter()
             .take(4)
-            .map(|i| (*i, actual[*i], expected[*i]))
+            .map(|i| (*i, format!("{:#010x}", actual[*i].to_bits()), format!("{:#010x}", expected[*i].to_bits())))
             .collect::<Vec<_>>()
     );
 }
@@ -267,6 +305,7 @@ fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
             .collect(),
     );
     let expected = table.values().into_iter().map(bf16_round).collect::<Vec<_>>();
+    let kept = table.kept(device);
     let rows = table.rows.len();
     let pairs = (0..rows as i32).flat_map(|row| [row, 0]).collect::<Vec<_>>();
     let tokens = i32_tensor(device, &[rows as u64, 2], &pairs);
@@ -307,6 +346,7 @@ fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
             &format!("{:?} gather of {} from {layout:?}", device.backend(), element.name()),
             &read_f32(&out.r1),
             &expected,
+            &kept,
         );
     }
 }
@@ -358,6 +398,7 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
     let table = Table::new(rows);
     let n = table.rows.len();
     let values = table.values();
+    let kept = table.kept(device);
     let (element, bytes) = table.resident(device.backend().resident_layout());
     let weight = Tensor::from_host(device, element, &table.shape(), &bytes).unwrap();
     for act in [Element::bf16(), Element::f16()] {
@@ -409,10 +450,16 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
                 })
             })
             .collect::<Vec<_>>();
+        // Column-major, as `actual`.
+        let kept = (0..K)
+            .flat_map(|column| (0..n).map(move |row| (row, column)))
+            .map(|(row, column)| row >= nan_rows || kept[row * K + column])
+            .collect::<Vec<_>>();
         assert_same(
             &format!("{:?} GEMV under {act:?}", device.backend()),
             &actual,
             &expected,
+            &kept,
         );
     }
 }

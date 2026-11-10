@@ -300,24 +300,34 @@ pub fn f32_to_f16(value: f32) -> u16 {
 /// `encoding` filled with finite values, small floats and scale codes, a few
 /// moderate codes or, with `every_code`, every finite code (E8M0's
 /// subnormal scales included, UE4M3's with and without its ignored sign
-/// bit).
+/// bit) and among the floats their extremes of least magnitude: the least
+/// and the greatest subnormal and the least normal exponent under a full
+/// mantissa, every fourth field.
 #[cfg(test)]
 pub(crate) fn finite_scales(plane: &mut [u8], encoding: seismic_lang::registry::ScaleEncoding, every_code: bool) {
     use seismic_lang::registry::ScaleEncoding;
+    let extreme = |i: usize| every_code && i % 4 == 3;
     match encoding {
         ScaleEncoding::F16 | ScaleEncoding::BF16 => {
             for (i, field) in plane.chunks_exact_mut(2).enumerate() {
                 let value = 0.002 * (i % 5 + 1) as f32;
-                field.copy_from_slice(&if encoding == ScaleEncoding::F16 {
-                    f32_to_f16(value).to_le_bytes()
-                } else {
-                    f32_to_bf16(value).to_le_bytes()
-                });
+                let bits = match (extreme(i), encoding == ScaleEncoding::F16) {
+                    (true, true) => [0x0001, 0x03ff, 0x07ff][i / 4 % 3],
+                    (true, false) => [0x0001, 0x007f, 0x00ff][i / 4 % 3],
+                    (false, true) => f32_to_f16(value),
+                    (false, false) => f32_to_bf16(value),
+                };
+                field.copy_from_slice(&bits.to_le_bytes());
             }
         }
         ScaleEncoding::F32 => {
             for (i, field) in plane.chunks_exact_mut(4).enumerate() {
-                field.copy_from_slice(&(0.0004 * (i % 3 + 1) as f32).to_le_bytes());
+                let value = if extreme(i) {
+                    f32::from_bits([0x0000_0001, 0x007f_ffff, 0x00ff_ffff][i / 4 % 3])
+                } else {
+                    0.0004 * (i % 3 + 1) as f32
+                };
+                field.copy_from_slice(&value.to_le_bytes());
             }
         }
         // Every exponent but the NaN code 0xff, or 2^(e - 127) for e in
