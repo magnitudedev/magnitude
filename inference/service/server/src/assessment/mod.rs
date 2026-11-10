@@ -89,11 +89,15 @@ enum AssessmentDomain {
 }
 
 /// The catalog models to assess and the profile each is assessed at. A disabled or deprecated
-/// model is never installed or loaded, so no verdict on it answers anything.
+/// model can't be installed, so one not on this computer is left out: no verdict on it answers
+/// anything. A deprecated copy already installed is still shown with its verdict.
 fn catalog_candidates(models: Vec<CatalogModel>) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
     models
         .into_iter()
-        .filter(|model| matches!(model.support, CatalogSupport::Supported { .. }))
+        .filter(|model| {
+            matches!(model.support, CatalogSupport::Supported { .. })
+                || matches!(model.local_state, CatalogModelState::Installed { .. })
+        })
         .filter_map(|model| {
             let (selection, profile) = match model.local_state {
                 CatalogModelState::NotInstalled => {
