@@ -76,7 +76,7 @@ impl Target {
             // Ordinary backed storage, not a reservation or a virtual allocation.
             // Its entire placement was proved to resolve to this selected store.
             // No allocation exceeds the device's largest single allocation.
-            let largest = self.device.info().limits().max_allocation.value;
+            let largest = self.device.info().limits().max_allocation.bytes();
             if largest == 0 {
                 return Err("the device admits no allocation".into());
             }

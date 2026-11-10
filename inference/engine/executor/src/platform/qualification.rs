@@ -273,11 +273,12 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    let status = catalog.status(device.topology(), device.info().id());
+    let status = catalog.device_status(&device);
     // A load opens the device: its first allocations are a load's, which
     // may take what the OS can obtain (`DeviceHeap::open` holds the device
-    // to the same room until the load ends).
-    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Load(LoadStage::Loading), 0)
+    // to the same room until the load ends, taking the right to bound its
+    // stores as this one is let go).
+    refresh_device_ceiling(&device, &device.bounds(), &status, &config.reserves, HostRoom::Load(LoadStage::Loading), 0)
         .map_err(PlatformError::Memory)?;
     let topology = device.topology();
     let host_ram = topology.host_ram().id();

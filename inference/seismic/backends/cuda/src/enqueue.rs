@@ -1,13 +1,11 @@
 //! The one way device work is enqueued: the driver's enqueue calls are
-//! reachable only through an [`Issuing`], which holds its device's issue
-//! lock shared, so no enqueue runs while the device's quiet is drained, and
-//! a missed enqueue site does not compile. The lock is made, taken and
-//! drained only by the device's quiet (`super::Quiet`), which refuses an
-//! [`Issuing`] once the device has a fault.
+//! private to [`Enqueue`], so every enqueue site goes through its methods
+//! (reached as `Context::enqueue`). Each method is the driver's call
+//! (`unsafe` as it is), returning its result code; an optional call returns
+//! none where the driver lacks it.
 
 use libloading::Library;
 use std::ffi::{c_int, c_uchar, c_uint, c_void};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 type Handle = *mut c_void;
 type ResultCode = c_int;
@@ -90,37 +88,6 @@ impl Enqueue {
         self.stream_wait_value_32.is_some() && self.stream_write_value_32.is_some()
     }
 
-}
-
-/// A device's issue lock: held shared by every [`Issuing`], exclusively by
-/// a drain of its quiet.
-pub(super) struct IssueLock(RwLock<()>);
-
-impl IssueLock {
-    pub(super) fn new() -> Self {
-        Self(RwLock::new(()))
-    }
-
-    /// The right to enqueue on this lock's device, through `enqueue`.
-    pub(super) fn issuing<'a>(&'a self, enqueue: &'a Enqueue) -> Issuing<'a> {
-        Issuing { enqueue, _shared: self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner) }
-    }
-
-    /// The lock alone, where no enqueue holds it now.
-    pub(super) fn exclusive(&self) -> Option<RwLockWriteGuard<'_, ()>> {
-        self.0.try_write().ok()
-    }
-}
-
-/// Enqueues on one device, while no drain of its quiet runs. Each call is
-/// the driver's (`unsafe` as it is), returning its result code; an optional
-/// call returns none where the driver lacks it.
-pub(crate) struct Issuing<'a> {
-    enqueue: &'a Enqueue,
-    _shared: RwLockReadGuard<'a, ()>,
-}
-
-impl Issuing<'_> {
     /// `cuLaunchKernel`, or `cuLaunchCooperativeKernel` where `cooperative`.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
@@ -134,26 +101,26 @@ impl Issuing<'_> {
         parameters: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> ResultCode {
-        let launch = if cooperative { self.enqueue.launch_cooperative } else { self.enqueue.launch };
+        let launch = if cooperative { self.launch_cooperative } else { self.launch };
         unsafe { launch(function, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, stream, parameters, extra) }
     }
     pub unsafe fn upload_async(&self, destination: u64, source: *const c_void, bytes: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.upload_async)(destination, source, bytes, stream) }
+        unsafe { (self.upload_async)(destination, source, bytes, stream) }
     }
     pub unsafe fn download_async(&self, destination: *mut c_void, source: u64, bytes: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.download_async)(destination, source, bytes, stream) }
+        unsafe { (self.download_async)(destination, source, bytes, stream) }
     }
     pub unsafe fn memcpy_device_async(&self, destination: u64, source: u64, bytes: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.memcpy_device_async)(destination, source, bytes, stream) }
+        unsafe { (self.memcpy_device_async)(destination, source, bytes, stream) }
     }
     pub unsafe fn memset_d8_async(&self, destination: u64, value: c_uchar, count: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.memset_d8_async)(destination, value, count, stream) }
+        unsafe { (self.memset_d8_async)(destination, value, count, stream) }
     }
     pub unsafe fn memset_d16_async(&self, destination: u64, value: u16, count: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.memset_d16_async)(destination, value, count, stream) }
+        unsafe { (self.memset_d16_async)(destination, value, count, stream) }
     }
     pub unsafe fn memset_d32_async(&self, destination: u64, value: c_uint, count: usize, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.memset_d32_async)(destination, value, count, stream) }
+        unsafe { (self.memset_d32_async)(destination, value, count, stream) }
     }
     pub unsafe fn memset_d2d32_async(
         &self,
@@ -164,27 +131,27 @@ impl Issuing<'_> {
         height: usize,
         stream: Handle,
     ) -> ResultCode {
-        unsafe { (self.enqueue.memset_d2d32_async)(destination, pitch, value, width, height, stream) }
+        unsafe { (self.memset_d2d32_async)(destination, pitch, value, width, height, stream) }
     }
     pub unsafe fn event_record(&self, event: Handle, stream: Handle) -> ResultCode {
-        unsafe { (self.enqueue.event_record)(event, stream) }
+        unsafe { (self.event_record)(event, stream) }
     }
     /// `cuStreamWaitEvent`: `stream`'s later work waits for `event`.
     pub unsafe fn stream_wait_event(&self, stream: Handle, event: Handle) -> ResultCode {
-        unsafe { (self.enqueue.stream_wait_event)(stream, event, 0) }
+        unsafe { (self.stream_wait_event)(stream, event, 0) }
     }
     /// `cuLaunchHostFunc`: `stream` runs `function(data)` once its preceding
     /// work completes.
     pub unsafe fn launch_host_function(&self, stream: Handle, function: HostFunction, data: *mut c_void) -> ResultCode {
-        unsafe { (self.enqueue.launch_host_function)(stream, function, data) }
+        unsafe { (self.launch_host_function)(stream, function, data) }
     }
     pub unsafe fn wait_value_32(&self, stream: Handle, address: u64, value: u32, flags: c_uint) -> Option<ResultCode> {
-        self.enqueue.stream_wait_value_32.map(|wait| unsafe { wait(stream, address, value, flags) })
+        self.stream_wait_value_32.map(|wait| unsafe { wait(stream, address, value, flags) })
     }
     pub unsafe fn write_value_32(&self, stream: Handle, address: u64, value: u32, flags: c_uint) -> Option<ResultCode> {
-        self.enqueue.stream_write_value_32.map(|write| unsafe { write(stream, address, value, flags) })
+        self.stream_write_value_32.map(|write| unsafe { write(stream, address, value, flags) })
     }
     pub unsafe fn graph_launch(&self, graph: Handle, stream: Handle) -> Option<ResultCode> {
-        self.enqueue.graph_launch.map(|launch| unsafe { launch(graph, stream) })
+        self.graph_launch.map(|launch| unsafe { launch(graph, stream) })
     }
 }

@@ -1640,6 +1640,16 @@ impl ModelLoadPlan {
         super::ImportPlan::new(self.target.iter()).peak_bytes()
     }
 
+    /// The target import's claim: each target weight allocation in the
+    /// storage it lies in, and the upload window, device storage staged
+    /// through host RAM.
+    pub fn target_import_demand(&self) -> Result<ClaimDemand, String> {
+        let upload = self.target_upload_peak_bytes()?;
+        self.weight_demands()?[0]
+            .checked_plus(ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() })
+            .ok_or_else(|| "target import demand overflows".to_owned())
+    }
+
     /// Peak upload allocation while importing a lazy optional component.
     pub fn head_upload_peak_bytes(&self) -> Result<u64, String> {
         super::ImportPlan::new(self.head.iter().flatten()).peak_bytes()

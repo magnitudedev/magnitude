@@ -73,7 +73,19 @@ pub fn plan_execution<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
-    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, selected, resident))
+    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, selected, resident, Holding::Placed))
+}
+
+/// How a plan holds its experts ([`plan_banked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holding {
+    /// As placement decides from the stable room: whole where it holds
+    /// them, else streamed.
+    Placed,
+    /// Streamed, whatever whole form the stable room holds: a load whose
+    /// target import claim refused its whole plan, its bank then fitted by
+    /// that claim.
+    Streamed,
 }
 
 /// [`plan_execution`]'s plan before its expert bank: every expert resident.
@@ -112,6 +124,7 @@ pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
     resident: ExecutionPlanDraft,
+    holding: Holding,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     let measurements = match manifest.kernel_cache.as_deref() {
         None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
@@ -128,9 +141,14 @@ pub fn plan_banked<C: HeldCharge>(
             reason: "the executor's costs are not measured yet".into(),
         }));
     }
-    let short = match resident.placed(&manifest.definition, manifest.model.weight_bound).map_err(ExecutionPlanningError::Plan)? {
-        Placed::Whole(whole) => return Ok(whole),
-        Placed::Short(short) => short,
+    let short = match holding {
+        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound).map_err(ExecutionPlanningError::Plan)? {
+            Placed::Whole(whole) => return Ok(whole),
+            Placed::Short(short) => short,
+        },
+        Holding::Streamed => resident
+            .streaming(&manifest.definition, manifest.model.weight_bound)
+            .map_err(ExecutionPlanningError::Plan)?,
     };
     let prices = plan_prices(&measurements, short.draft());
     short.streamed(&manifest.definition, &prices).map_err(ExecutionPlanningError::Plan)

@@ -69,12 +69,24 @@ pub trait Backing: Send + Sync + 'static {
     /// The granules the reservation spans.
     fn granules(&self) -> usize;
     /// Back granules `[from, to)`, zero, every byte present: a backed
-    /// granule is charged, so it is held. On failure nothing new stays
-    /// backed.
+    /// granule is charged, so it is held. On failure nothing new is
+    /// committed: a backing whose release waits for the device (CUDA's
+    /// registered host pages) keeps what it backed, charged, for its next
+    /// growth ([`Self::retract`]); any other frees it.
     fn back(&self, from: usize, to: usize) -> Result<(), Self::Error>;
     /// Return granules `[from, to)` (none where `from >= to`) to unbacked,
-    /// freeing what backed them at once. No device work uses them.
+    /// freeing what backed them at once: a shrink's release, or the
+    /// reservation's end. No device work uses them, and none of the
+    /// holder's runs beside it.
     fn unback(&self, from: usize, to: usize);
+    /// Return granules `[from, to)` a growth backed and no installed
+    /// commitment holds (no device work ever used them), beside device work
+    /// that uses the rest of the reservation: unbacked, except by a backing
+    /// whose release waits for the device, which keeps them, charged, for
+    /// its next growth or release.
+    fn retract(&self, from: usize, to: usize) {
+        self.unback(from, to);
+    }
     /// Write zero over `bytes` of backed granules, beside device work that
     /// uses the reservation but not those bytes.
     fn zero(&self, bytes: Range<u64>) -> Result<(), Self::Error>;
@@ -235,15 +247,17 @@ pub fn large_page_backing() -> LargePageBacking {
 /// ([`time_backing`]), each a wall time on the thread that backed it:
 /// faulting host pages in, collapsing them into large pages, making them
 /// the device's (CUDA's registration, Vulkan's import and binding with its
-/// records' table entries), and zeroing bytes the backing did not give
-/// zeroed. What a span of backing cost is the difference of two readings
-/// ([`Self::since`]).
+/// records' table entries), zeroing bytes the backing did not give zeroed,
+/// and making released pages the device's no more (CUDA's unregistration,
+/// which waits for the device's work). What a span of backing cost is the
+/// difference of two readings ([`Self::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackingTimes {
     pub fault: Duration,
     pub collapse: Duration,
     pub pin: Duration,
     pub zero: Duration,
+    pub unpin: Duration,
 }
 
 impl BackingTimes {
@@ -254,6 +268,7 @@ impl BackingTimes {
             collapse: self.collapse.saturating_sub(earlier.collapse),
             pin: self.pin.saturating_sub(earlier.pin),
             zero: self.zero.saturating_sub(earlier.zero),
+            unpin: self.unpin.saturating_sub(earlier.unpin),
         }
     }
 }
@@ -264,6 +279,7 @@ impl std::ops::AddAssign for BackingTimes {
         self.collapse += more.collapse;
         self.pin += more.pin;
         self.zero += more.zero;
+        self.unpin += more.unpin;
     }
 }
 
@@ -274,9 +290,10 @@ pub enum BackingPhase {
     Collapse,
     Pin,
     Zero,
+    Unpin,
 }
 
-static BACKING_NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static BACKING_NANOS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Do `work`, a phase of backing reserved storage, counting its wall time
 /// into the process's [`BackingTimes`].
@@ -296,6 +313,7 @@ pub fn backing_times() -> BackingTimes {
         collapse: read(BackingPhase::Collapse),
         pin: read(BackingPhase::Pin),
         zero: read(BackingPhase::Zero),
+        unpin: read(BackingPhase::Unpin),
     }
 }
 
@@ -481,7 +499,7 @@ impl<B: Backing> Reserved<B> {
         let view = match backing.view(backed, form) {
             Ok(view) => view,
             Err(error) => {
-                backing.unback(0, backed);
+                backing.retract(0, backed);
                 return Err(error);
             }
         };
@@ -571,7 +589,7 @@ impl<B: Backing> Resizer<B> {
         let change = match change {
             Ok(change) => change,
             Err(error) => {
-                backing.unback(installed, granules);
+                backing.retract(installed, granules);
                 return Err((self, error));
             }
         };
@@ -637,14 +655,15 @@ impl<B: Backing> Prepared<B> {
     }
 
     /// Abandon the commitment: its change is dropped and the granules a
-    /// growth backed are released. It returns the resizer.
+    /// growth backed are retracted ([`Backing::retract`]). It returns the
+    /// resizer.
     pub fn abandon(mut self) -> Resizer<B> {
         Self::unprepare(self.next.take().expect("a prepared commitment is abandoned once"))
     }
 
     fn unprepare(next: Next<B>) -> Resizer<B> {
         drop(next.change);
-        next.reserved.backing.unback(next.installed, next.granules);
+        next.reserved.backing.retract(next.installed, next.granules);
         Resizer {
             reserved: next.reserved,
         }

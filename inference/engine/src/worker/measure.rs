@@ -21,7 +21,7 @@
 //! kernel that cannot be formed is recorded unobtainable at once, as
 //! formation is deterministic for its key.
 
-use super::client::{handshake, receive};
+use super::client::{handshake, receive, Lost};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
@@ -749,9 +749,10 @@ pub fn measure_worker(
     let (mut receiver, mut sender) = transport.split();
     let ended = "it reported its outcome";
     let measure = HostMessage::Measure { request };
-    handshake(&mut sender, &mut receiver, Some(measure), ended, JobLost)?;
+    let lost = |lost: Lost| JobLost(lost.reason);
+    handshake(&mut sender, &mut receiver, Some(measure), ended, lost)?;
     loop {
-        match receive(&mut receiver, ended, JobLost)? {
+        match receive(&mut receiver, ended, lost)? {
             WorkerMessage::Attempting { key } => report(MeasureEvent::Attempting(key)),
             WorkerMessage::Recorded { key, record } => report(MeasureEvent::Recorded(key, record)),
             WorkerMessage::MeasureFinished { failures } => return Ok(failures),

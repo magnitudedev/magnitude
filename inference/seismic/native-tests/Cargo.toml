@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-seismic.workspace = true
+seismic = { workspace = true, features = ["fixtures"] }
 
 [dev-dependencies]
 seismic-lang.workspace = true

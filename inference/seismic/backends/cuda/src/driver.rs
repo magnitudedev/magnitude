@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use crate::registered::{host_pages, Quiet, Registered};
+use crate::registered::{host_pages, Registered};
 use seismic_reservation::HostRange;
 
 pub type Handle = *mut c_void;
@@ -36,9 +36,8 @@ macro_rules! driver {
         pub(crate) struct Driver {
             $(pub $field:$ty,)*
             $(pub $optional: Option<$optional_ty>,)*
-            /// The enqueue calls, reachable only while issuing
-            /// ([`crate::registered::issue::Issuing`]).
-            pub enqueue: crate::registered::issue::Enqueue,
+            /// The enqueue calls ([`crate::enqueue`]).
+            pub enqueue: crate::enqueue::Enqueue,
             _library: Library,
         }
         impl Driver {
@@ -66,7 +65,7 @@ macro_rules! driver {
                             .get::<$optional_ty>(concat!($optional_symbol, "\0").as_bytes())
                             .ok()
                             .map(|symbol| *symbol);)*
-                        let enqueue = crate::registered::issue::Enqueue::load(&library)?;
+                        let enqueue = crate::enqueue::Enqueue::load(&library)?;
                         let driver = Self { $($field,)* $($optional,)* enqueue, _library: library };
                         driver.check((driver.init)(0), "initialization").map_err(|e| e.to_string())?;
                         return Ok(driver);
@@ -281,13 +280,20 @@ pub(crate) struct Context {
     /// `cuMemHostAlloc` memory is resident shared memory, in the footprint
     /// already). Set once, at the device's opening.
     pub(crate) driver_memory: OnceLock<Arc<seismic_native_target::process::DriverMemory>>,
-    /// The device's quiet: its streams, and its registered host granules
-    /// awaiting unregistration ([`Quiet`]).
-    pub(crate) quiet: Arc<Quiet>,
     /// The device account the stack the driver grew beyond
     /// `RESERVED_STACK_BYTES` is charged to (`Context::charge_stack_to`),
     /// and the charges made to it, held while this context lives.
     stack_account: OnceLock<Arc<dyn seismic_compiler::executable::MemoryAccount>>,
+    /// The device's stack growth, shared by every context on it.
+    stack: Arc<StackGrowth>,
+    /// The per-thread stack this context's retain of the primary context is
+    /// known to reserve: it only grows while the retain holds, as the
+    /// driver's limit does (a primary context reset on its last release
+    /// takes the default again, for a later retain to raise).
+    stack_limit: std::sync::atomic::AtomicUsize,
+    /// The driver's stack limit calls (queries and raises) this context made.
+    #[cfg(test)]
+    limit_calls: std::sync::atomic::AtomicUsize,
     stack_charges: std::sync::Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
 }
 
@@ -312,15 +318,17 @@ impl Context {
             ordinal,
             transfer: std::ptr::null_mut(),
             driver_memory: OnceLock::new(),
-            quiet: Quiet::of(ordinal),
             stack_account: OnceLock::new(),
+            stack: stack_growth(ordinal),
+            stack_limit: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            limit_calls: std::sync::atomic::AtomicUsize::new(0),
             stack_charges: std::sync::Mutex::new(Vec::new()),
         };
         context.transfer = {
             let _current = context.enter()?;
             let mut stream = std::ptr::null_mut();
             unsafe { context.driver.check((context.driver.stream_create)(&mut stream, CU_STREAM_NON_BLOCKING), "transfer stream creation")? };
-            context.quiet.add_stream(stream);
             stream
         };
         context.raise_stack(RESERVED_STACK_BYTES)?;
@@ -335,19 +343,17 @@ impl Context {
         let mut event = std::ptr::null_mut();
         unsafe { self.driver.check((self.driver.event_create)(&mut event, EVENT_BLOCKING_SYNC), what)? };
         let waited = self
-            .issuing()
-            .and_then(|issuing| self.driver.check(unsafe { issuing.event_record(event, stream) }, what))
+            .driver
+            .check(unsafe { self.enqueue().event_record(event, stream) }, what)
             .and_then(|()| self.driver.check(unsafe { (self.driver.event_synchronize)(event) }, what));
         unsafe { (self.driver.event_destroy)(event) };
         waited
     }
 
-    /// The right to enqueue device work ([`crate::registered::issue::Issuing`]); refused
-    /// with the device's fault once it has one (a registered granule its
-    /// quiet failed to unregister: `registered::Quiet`), which ends its
-    /// serving with that reason.
-    pub(crate) fn issuing(&self) -> Result<crate::registered::issue::Issuing<'_>, DriverError> {
-        self.quiet.issuing(&self.driver.enqueue)
+    /// The driver's enqueue calls ([`crate::enqueue::Enqueue`]), the one way
+    /// device work is enqueued.
+    pub(crate) fn enqueue(&self) -> &crate::enqueue::Enqueue {
+        &self.driver.enqueue
     }
 
     /// Raises the per-thread stack the driver reserves for this device in
@@ -356,19 +362,30 @@ impl Context {
     /// can hold at once and grows it, never shrinks it, at the first launch
     /// of a function that needs more; raising it here makes that growth
     /// happen at a known moment instead.
+    ///
+    /// A function the stack already covers costs no driver call and takes
+    /// no lock: this context's known limit is read first
+    /// ([`Context::stack_limit`]). A growth, which synchronizes the device,
+    /// is serialized only with the device's other growths, so its free
+    /// memory before and after is the raise's own, and never with loads
+    /// on any device.
     fn raise_stack(&self, bytes: usize) -> Result<u64, DriverError> {
-        let _serial = STACK_RESERVATION
-            .lock()
-            .expect("the stack reservation lock is never poisoned");
+        if self.stack_limit.load(std::sync::atomic::Ordering::Acquire) >= bytes {
+            return Ok(0);
+        }
+        let _raising = self.stack.raising.lock().expect("a device's stack raise lock is never poisoned");
         let _current = self.enter()?;
         let driver = &self.driver;
         let mut limit = 0usize;
+        #[cfg(test)]
+        self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             driver.check(
                 (driver.context_get_limit)(&mut limit, CU_LIMIT_STACK_SIZE),
                 "stack limit query",
             )?;
         }
+        self.stack_limit.fetch_max(limit, std::sync::atomic::Ordering::AcqRel);
         if limit >= bytes {
             return Ok(0);
         }
@@ -381,12 +398,15 @@ impl Context {
             }
         };
         let before = free()?;
+        #[cfg(test)]
+        self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             driver.check(
                 (driver.context_set_limit)(CU_LIMIT_STACK_SIZE, bytes),
                 "stack limit raise",
             )?;
         }
+        self.stack_limit.fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
         Ok(before.saturating_sub(free()?))
     }
 
@@ -396,7 +416,7 @@ impl Context {
     /// function loaded here takes it. Called once, at the device's opening.
     pub(crate) fn charge_stack_to(&self, account: Arc<dyn seismic_compiler::executable::MemoryAccount>) {
         let mut charges = self.stack_charges();
-        charges.push(account.record(stack_growth(self.ordinal).bytes()));
+        charges.push(account.record(self.stack.bytes()));
         assert!(
             self.stack_account.set(account).is_ok(),
             "a context's stack is charged to one account, at its device's opening"
@@ -427,7 +447,7 @@ impl Context {
         }
         let taken = self.raise_stack(usize::try_from(local).unwrap_or(0))?;
         if taken > 0 {
-            stack_growth(self.ordinal).grew(taken);
+            self.stack.grew(taken);
             self.driver_allocated(taken);
             if let Some(account) = self.stack_account.get() {
                 self.stack_charges().push(account.record(taken));
@@ -478,10 +498,6 @@ impl Drop for Context {
     fn drop(&mut self) {
         if !self.transfer.is_null() {
             if let Ok(_current) = self.enter() {
-                // Its work complete before the quiet stops looking at it
-                // (with the device faulted, the quiet no longer drains).
-                let _ = self.synchronize(self.transfer, "stream drain");
-                self.quiet.remove_stream(self.transfer);
                 unsafe {
                     (self.driver.stream_destroy)(self.transfer);
                 }
@@ -505,14 +521,14 @@ const LOCAL_SIZE_BYTES: c_int = 3;
 /// bytes on Ada and Ampere, never grow it.
 pub(crate) const RESERVED_STACK_BYTES: usize = 2048;
 
-static STACK_RESERVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Device memory the process's stack reservation took beyond
 /// `RESERVED_STACK_BYTES`, per device ordinal: the driver keeps it for the
 /// life of the process, whichever context grew it.
 #[derive(Default)]
 pub(crate) struct StackGrowth {
     bytes: std::sync::atomic::AtomicU64,
+    /// Held by a raise of the device's limit, which alone calls the driver.
+    raising: std::sync::Mutex<()>,
 }
 
 impl StackGrowth {
@@ -578,7 +594,6 @@ impl Stream {
                 "stream creation",
             )?;
         }
-        context.quiet.add_stream(raw);
         Ok(Arc::new(Self {
             raw,
             context: context.clone(),
@@ -623,10 +638,6 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
-            // Its work complete before the quiet stops looking at it
-            // (with the device faulted, the quiet no longer drains).
-            let _ = self.synchronize();
-            self.context.quiet.remove_stream(self.raw);
             unsafe {
                 (self.context.driver.stream_destroy)(self.raw);
             }
@@ -691,7 +702,7 @@ impl Event {
             "Event::record precondition: event and stream belong to one opened CUDA context"
         );
         let _current = self.context.enter()?;
-        let status = unsafe { self.context.issuing()?.event_record(self.raw, stream.raw()) };
+        let status = unsafe { self.context.enqueue().event_record(self.raw, stream.raw()) };
         self.context.driver.check(status, "event record")
     }
 
@@ -1077,8 +1088,8 @@ enum Granules {
         handles: std::sync::Mutex<Vec<u64>>,
     },
     /// Host memory a device reads over its link ([`Registered`]: granules
-    /// registered at their host addresses, unregistered only once the
-    /// device is quiet), no driver copy or fill crossing a granule
+    /// registered at their host addresses, unregistered by a shrink's
+    /// release or the reservation's end), no driver copy or fill crossing a granule
     /// ([`ReservedMemory::copy_span`]). Physical allocations `cuMemCreate`
     /// places on a host node are small pages, which an IOMMU translating
     /// the device's reads (DMA mode) maps one by one: on an RTX 3090 their
@@ -1143,11 +1154,16 @@ impl ReservedMemory {
         &self.context
     }
 
-    /// Registered granules, committed or awaiting the device's quiet.
+    /// Registered granules, committed or kept by a growth's retraction.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn registered_granules(&self) -> Option<usize> {
+        self.registered().map(|registered| registered.registered())
+    }
+
+    /// Its registered granules, where it has them.
+    pub(crate) fn registered(&self) -> Option<&Arc<Registered>> {
         match &self.granules {
-            Granules::Registered(registered) => Some(registered.registered()),
+            Granules::Registered(registered) => Some(registered),
             Granules::Created { .. } => None,
         }
     }
@@ -1323,7 +1339,7 @@ impl Drop for ReservedMemory {
                     free(self.base, self.reserved);
                 }
             }
-            // Unregistered once the device is quiet, its range freed then.
+            // Unregistered now, after the holder's last work that uses them.
             Granules::Registered(registered) => registered.drop_reservation(),
         }
     }
@@ -1340,7 +1356,7 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
     let _current = context.enter()?;
     unsafe {
         context.driver.check(
-            context.issuing()?.upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer),
+            context.enqueue().upload_async(pointer, bytes.as_ptr().cast(), bytes.len(), context.transfer),
             "upload",
         )?;
     }
@@ -1361,7 +1377,7 @@ pub(crate) fn download(
     let _current = context.enter()?;
     unsafe {
         context.driver.check(
-            context.issuing()?.download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer),
+            context.enqueue().download_async(bytes.as_mut_ptr().cast(), pointer, bytes.len(), context.transfer),
             "download",
         )?;
     }
@@ -1765,7 +1781,7 @@ impl GraphExec {
 
     pub fn launch(&self, stream: &Stream) -> Result<(), DriverError> {
         let _current = self.context.enter()?;
-        let Some(status) = (unsafe { self.context.issuing()?.graph_launch(self.raw, stream.raw()) }) else {
+        let Some(status) = (unsafe { self.context.enqueue().graph_launch(self.raw, stream.raw()) }) else {
             return graph_symbol::<()>(None);
         };
         self.context.driver.check(status, "kernel graph launch")
@@ -1956,7 +1972,7 @@ impl PinnedUpload {
         );
         let _current = self.context.enter()?;
         let status = unsafe {
-            self.context.issuing()?.upload_async(destination, self.pointer.add(source_offset).cast(), bytes, stream.raw())
+            self.context.enqueue().upload_async(destination, self.pointer.add(source_offset).cast(), bytes, stream.raw())
         };
         self.context.driver.check(status, "asynchronous upload")
     }
@@ -2305,6 +2321,36 @@ mod tests {
                 .unwrap();
         }
         limit
+    }
+
+    /// A function the reservation already covers is loaded with no stack
+    /// limit call and no lock: a device's loads never serialize behind its
+    /// own stack, or another device's, while it runs work.
+    #[test]
+    fn a_function_the_stack_covers_loads_without_a_limit_call() {
+        let Some((_exclusive, opened)) = crate::test_device() else { return };
+        let context = opened.service.context().clone();
+        let driver = context.driver.clone();
+        let ordinal = context.ordinal();
+        let architecture = driver.attribute(75, ordinal).unwrap() as u32 * 10 + driver.attribute(76, ordinal).unwrap() as u32;
+        // A frame of its own, within the reserved stack.
+        let words = RESERVED_STACK_BYTES / 8;
+        let source = format!(
+            "extern \"C\" __global__ void framed(int* out, int seed) {{ volatile int frame[{words}]; \
+             for (int i = 0; i < {words}; i++) frame[i] = i * seed; \
+             out[threadIdx.x] = frame[(seed + threadIdx.x) % {words}]; }}"
+        );
+        let Ok(cubin) = crate::nvrtc::compile_cubin_named(&source, "framed.cu", architecture, &[]) else {
+            return;
+        };
+        let calls = || context.limit_calls.load(std::sync::atomic::Ordering::Relaxed);
+        let before = calls();
+        for _ in 0..3 {
+            let (_module, function) = load_module(&context, &cubin.image, "framed").unwrap();
+            let local = function_attribute(&context, function, LOCAL_SIZE_BYTES).unwrap() as usize;
+            assert!(local > 0 && local <= RESERVED_STACK_BYTES, "the fixture's frame ({local} B) is within the reservation");
+        }
+        assert_eq!(calls(), before, "a covered function calls the driver's stack limit");
     }
 
     /// A retained context reserves `RESERVED_STACK_BYTES` per thread before

@@ -48,8 +48,10 @@ pub struct OwnerHoldings {
 }
 
 /// A bank holding's growth a settle granted: from its size to `to`, the
-/// bytes it backs, of them those borrowed beyond the free room.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// bytes it backs, of them those borrowed beyond the free room, and each
+/// of its steps as the size it reaches and the bytes it backs to there,
+/// rising: what its claim fits the most of ([`ExecutorDomain::grow_expert_bank`]).
+#[derive(Clone, Debug, PartialEq)]
 pub struct BankGrant {
     pub holding: BankHolding,
     pub kind: BankTier,
@@ -57,6 +59,7 @@ pub struct BankGrant {
     pub to: u64,
     pub bytes: u64,
     pub borrowed: u64,
+    pub steps: Vec<(u64, u64)>,
     /// The rate per byte of the steps it grants: what orders grants
     /// across stores.
     pub per_byte: f64,
@@ -739,7 +742,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                 };
                 let (curve, heap) = curve(holding).expect("a granted bank holding has a curve");
-                let bytes = curve.offered[..*steps].iter().map(|step| step.bytes).sum();
+                let reached = curve.offered[..*steps]
+                    .iter()
+                    .scan(0u64, |bytes, step| {
+                        *bytes += step.bytes;
+                        Some((step.to, *bytes))
+                    })
+                    .collect::<Vec<_>>();
+                let bytes = reached.last().map_or(0, |&(_, bytes)| bytes);
                 // What of its bytes the grant borrowed (only a holding that
                 // borrows does, [`Curve::borrows`]).
                 let lent = settled.borrowed.iter().find(|(of, _)| *of == Holding::Bank(*holding)).map_or(0, |&(_, bytes)| bytes);
@@ -750,6 +760,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     to: curve.offered[steps - 1].to,
                     bytes,
                     borrowed: lent,
+                    steps: reached,
                     per_byte: value::per_byte(&heap.offered[..*steps]),
                 });
             }
@@ -820,14 +831,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         prior.rates(step_seconds, resident).map(Some)
     }
 
-    /// Begin `grant` (a settle's, [`Self::settle_memory`]): its bytes,
-    /// which its reservation backs with fresh pages of its store, claimed
-    /// from the heap first and held until the growth finishes
-    /// ([`Self::advance_expert_bank`]); one resize of the holding to its
-    /// settled size (`ElasticBank::grow`). A heap that refuses the claim
-    /// (`Reclaim`, `Capacity`, `Blind`) grows nothing: the settle sized it
-    /// within what the claim admitted, so a refusal is the machine's change
-    /// between the two readings, which the next settle reads afresh.
+    /// Begin `grant` (a settle's, [`Self::settle_memory`]) as far as its
+    /// claim admits: the most of its steps whose bytes, which its
+    /// reservation backs with fresh pages of its store, the heap admits
+    /// beside the unborn state on one fresh reading
+    /// (`DeviceHeap::claim_most`), claimed there and held until the growth
+    /// finishes ([`Self::advance_expert_bank`]); one resize of the holding
+    /// to that size (`ElasticBank::grow`). A heap that admits not even its
+    /// first step (`Reclaim`, `Capacity`, `Blind`) grows nothing: the
+    /// machine changed since the settle's reading, which the next settle
+    /// reads afresh.
     pub fn grow_expert_bank(&mut self, grant: &BankGrant, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         let started = std::time::Instant::now();
         let Some(bank) = self.family.expert_bank() else {
@@ -839,16 +852,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             _ => crate::platform::FitMode::Borrow,
         };
         let planned = self.planned_unheld();
-        let claim = self.memory.borrow_mut().claim_reserved(grant.kind, grant.bytes, unborn, HoldingClass::Model, mode, planned)?;
-        match bank.grow(grant.holding, grant.to, wake) {
+        let steps = u64::try_from(grant.steps.len()).expect("a grant's steps fit u64");
+        assert!(steps > 0, "invariant violated: a settle granted a growth of no step");
+        let reached = |count: u64| grant.steps[usize::try_from(count - 1).expect("a step index fits usize")];
+        let (count, claim) = self
+            .memory
+            .borrow_mut()
+            .claim_most(1, steps, |count| Ok::<_, std::convert::Infallible>(super::heap::reserved(grant.kind, reached(count).1)), unborn, HoldingClass::Model, mode, planned)
+            .unwrap_or_else(|never| match never {})?;
+        let (to, bytes) = reached(count);
+        // Borrowed room is the grant's last: what of it the steps claimed
+        // reach.
+        let borrowed = bytes.saturating_sub(grant.bytes - grant.borrowed);
+        match bank.grow(grant.holding, to, wake) {
             Ok(BankStep::Begun(tier)) => {
                 // The one store's bank's slots on borrowed room are its
                 // reading's (`BankRoom`).
                 let memory = self.memory.get_mut();
                 if grant.holding == BankHolding::Experts && grant.kind == BankTier::Bank && memory.bank_room().is_some() {
-                    memory.grow_bank(grant.borrowed);
+                    memory.grow_bank(borrowed);
                 }
-                self.bank_claim = Some(super::GrowthClaim { id: claim, kind: grant.kind, bytes: grant.bytes });
+                self.bank_claim = Some(super::GrowthClaim { id: claim, kind: grant.kind, bytes });
                 self.resize_held.begin(tier, started);
                 Ok(BankStep::Begun(tier))
             }

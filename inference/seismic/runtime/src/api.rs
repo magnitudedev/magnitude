@@ -720,6 +720,36 @@ pub mod device {
     use seismic_topology::{Contract, DeviceTopology, Executor, Placing, StoreId};
     use std::sync::Arc;
 
+    /// The right to bound every ledger an opened device reaches
+    /// (`DeviceInner::bounds`), released as it drops.
+    pub struct Bounds {
+        memory: Arc<crate::memory::DeviceLedgers>,
+        topology: Arc<DeviceTopology>,
+        _bounder: Arc<crate::memory::Bounder>,
+    }
+
+    impl Bounds {
+        /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
+        /// revokes what is charged. A store's ledger lives only while an
+        /// open device reaches it, so only a store this device reaches can
+        /// be bound.
+        pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
+            match ledger {
+                Ledger::Path(path) => {
+                    self.memory.path(path).ok_or(LimitError::ForeignPath(path))?.share.account().set_bound(bound)
+                }
+                Ledger::Own(store) => {
+                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.set_bound(bound)
+                }
+                Ledger::Store(store) => {
+                    self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
+                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound(bound)
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// One opened executor: its immutable description, execution resources
     /// and ledgers.
     pub struct DeviceInner {
@@ -900,7 +930,7 @@ pub mod device {
                 .map_err(|why| unreservable(Some(why.clone())))?
                 .ok_or_else(|| unreservable(None))?;
             self.kind.allocate_reserved_tensor(
-                crate::driver::ReservedRange::new(contract, span, records, rows, self.info().limits().max_allocation.value),
+                crate::driver::ReservedRange::new(contract, span, records, rows, self.info().limits().max_allocation.bytes()),
                 committed,
                 alignment,
             )
@@ -1002,30 +1032,25 @@ pub mod device {
         pub fn device_ledger(&self) -> DeviceLedgerView {
             self.memory.device_ledger().view()
         }
-        /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
-        /// revokes what is charged. A store's ledger lives only while an
-        /// open device reaches it, so only a store this device reaches can
-        /// be bound.
-        pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
-            match ledger {
-                Ledger::Store(store) => {
-                    self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
-                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound(bound);
-                }
-                Ledger::Path(path) => self
-                    .memory
-                    .path(path)
-                    .ok_or(LimitError::ForeignPath(path))?
-                    .share
-                    .account()
-                    .set_bound(bound),
-                Ledger::Own(store) => self
-                    .memory
-                    .store(store)
-                    .ok_or(LimitError::ForeignStore(store))?
-                    .set_bound(bound),
+        /// The right to bound every ledger the device reaches: its paths'
+        /// accounts, its own ledgers, and each store's ledger, every
+        /// executor's of its scope that reaches the store. One live holder
+        /// per ledger; taking it while another holder lives panics, naming
+        /// both.
+        #[track_caller]
+        pub fn bounds(&self) -> Bounds {
+            let bounder = Arc::new(crate::memory::Bounder {
+                selector: self.info.selector(),
+                taken: std::panic::Location::caller(),
+            });
+            for path in &self.memory.paths {
+                path.share.account().right.take(&bounder);
             }
-            Ok(())
+            for (_, ledger) in &self.memory.stores {
+                ledger.right.take(&bounder);
+                ledger.store().right.take(&bounder);
+            }
+            Bounds { memory: self.memory.clone(), topology: self.topology.clone(), _bounder: bounder }
         }
         /// Start the high-water mark of each of the device's own ledgers
         /// again from what it charges now, and forget its refusals.

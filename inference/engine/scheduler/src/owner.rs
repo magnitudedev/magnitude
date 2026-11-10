@@ -961,11 +961,6 @@ pub struct BetweenFlights {
     /// Memory was observed while a flight held the bindings: the heap is
     /// settled once they return.
     settle_owed: bool,
-    /// The last growth a settle granted that began nothing, as (holding,
-    /// store, from, to): a settle granting the same is not tried again
-    /// until it differs, as its rate per byte moves with the meter at
-    /// every reading while what it would claim does not.
-    declined: Option<(magnitude_executor::BankHolding, BankTier, u64, u64)>,
     /// Whether the measurement room's claim is owed a decision.
     room_owed: RoomOwed,
     /// Each store's running expert bank resize this owner began: the stores
@@ -1006,7 +1001,6 @@ impl BetweenFlights {
             deficits: Vec::new(),
             ladder: Ladder::default(),
             settle_owed: false,
-            declined: None,
             room_owed: RoomOwed::default(),
             bank_began: [None; BankTier::COUNT],
             measurement_room: None,
@@ -2013,6 +2007,12 @@ trait MemoryStep: MemoryHost + Sized {
             let wake = self.completion();
             let (released, slots) = self.domain().release_group_places(wake).map_err(classify_domain_error)?;
             tracing::info!(released, ?slots, "prompt places release settled");
+            // A release deferred (a chain under way, a step of the bank
+            // running) is settled again at the next reading, as a deferred
+            // shrink is.
+            if self.domain().group_places() > self.domain().places_target() {
+                self.domain().settle_again();
+            }
             return Ok(());
         }
         // What the process holds as a resize begins, read only for one.
@@ -2033,36 +2033,37 @@ trait MemoryStep: MemoryHost + Sized {
             }
             return Ok(());
         }
-        let Some(grant) = settled.grants.first().copied() else {
+        let Some(grant) = settled.grants.first().cloned() else {
             return Ok(());
         };
-        let tried = Some((grant.holding, grant.kind, grant.from, grant.to));
-        if self.memory().declined == tried {
-            return Ok(());
-        }
-        self.memory().declined = tried;
         let (before, wake) = (self.domain().memory_moment(), self.completion());
         let decided = |outcome: &dyn std::fmt::Display| {
-            let magnitude_executor::BankGrant { holding, kind, from, to, bytes, borrowed, per_byte } = grant;
+            let magnitude_executor::BankGrant { holding, kind, from, to, bytes, borrowed, per_byte, .. } = &grant;
             tracing::info!(?holding, ?kind, from, to, bytes, borrowed, per_byte, %outcome, "expert bank growth settled");
         };
         match self.domain().grow_expert_bank(&grant, wake) {
             Ok(BankStep::Begun(tier)) => {
                 decided(&"begun");
-                self.memory().declined = None;
                 let begun = BankBegun { held: before, cause: BankBegunFor::Growth };
                 self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
             }
-            Ok(step) => decided(&format_args!("{step:?}")),
-            // Sized within what the claim admitted, a refusal is the
-            // machine's change since: the next reading settles afresh.
-            Err(DomainError::Capacity(refusal)) => decided(&format_args!(
-                "refused: {} bytes required, {} available",
-                refusal.required, refusal.available
-            )),
+            // A growth not begun is never final: the next reading settles
+            // afresh, whatever it reads.
+            Ok(step) => {
+                decided(&format_args!("{step:?}"));
+                self.domain().settle_again();
+            }
+            // Sized by the claim's own test, a refusal is the machine's
+            // change since the settle's reading: not even the grant's first
+            // step fits now.
+            Err(DomainError::Capacity(refusal)) => {
+                decided(&format_args!("refused: {} bytes required, {} available", refusal.required, refusal.available));
+                self.domain().settle_again();
+            }
             Err(error @ (DomainError::Reclaim(_) | DomainError::Blind(_))) => {
                 decided(&format_args!("refused: {error}"));
                 self.refused_for_memory(&error);
+                self.domain().settle_again();
             }
             Err(error) => return Err(classify_domain_error(error)),
         }
@@ -2162,6 +2163,7 @@ trait MemoryStep: MemoryHost + Sized {
                     deciding_micros = times.decided.duration_since(held.started).as_micros() as u64,
                     queued_micros = times.queued.as_micros() as u64,
                     planned_micros = times.planned.as_micros() as u64,
+                    unpinned_micros = times.unpinned.as_micros() as u64,
                     plan_picked_micros = times.trips[0].picked.as_micros() as u64,
                     plan_served_micros = times.trips[0].served.as_micros() as u64,
                     commit_picked_micros = times.trips[1].picked.as_micros() as u64,

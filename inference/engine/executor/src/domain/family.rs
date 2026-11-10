@@ -484,6 +484,10 @@ pub struct ResizeTimes {
     pub installed: std::time::Instant,
     /// The surplus storage was released: the resize took effect.
     pub released: std::time::Instant,
+    /// Of a host tier's or table's shrink, its release's unregistration of
+    /// host pages ([`seismic::BackingTimes::unpin`]: CUDA's, which waits for
+    /// the device's work); zero for a device bank's resize and a growth.
+    pub unpinned: std::time::Duration,
 }
 
 impl ResizeTimes {
@@ -584,8 +588,9 @@ pub trait ProgramFamily: 'static {
     /// Hold a prompt group of `places` places' buffers in place of any held
     /// now; the floor's, of one place, are always held. The caller holds a
     /// heap claim for `group_demand`; a failure keeps the buffers held
-    /// before.
-    fn hold_group(&self, _places: usize) -> Result<(), crate::resources::AllocationError> {
+    /// before. Only in a gap between flights (`quiet`): the expert bank
+    /// takes a group's places only while none of its steps runs.
+    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
         Ok(())
     }
 
@@ -915,7 +920,7 @@ impl ProgramFamily for NativeFamily {
     /// Hold a group's graph buffers and its places' bank words, each
     /// allocated first, so a failure of either keeps both held before; the
     /// bank's words are the steps' once the buffers are held.
-    fn hold_group(&self, places: usize) -> Result<(), crate::resources::AllocationError> {
+    fn hold_group(&self, places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
         let invariant = |detail: String| {
             crate::resources::AllocationError::Plan(crate::error::InvariantError { context: "a group's places", detail })
         };

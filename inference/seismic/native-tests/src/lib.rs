@@ -136,8 +136,9 @@ pub fn every_device() -> Vec<seismic::Device> {
 }
 
 /// Select test devices with the caller's artifact-store configuration. Each
-/// call discovers and opens fresh devices; selection has the same contract
-/// as [`devices`].
+/// call discovers and opens fresh devices, each with its own ledgers, so a
+/// test bounds them alone beside the process's other tests; selection has
+/// the same contract as [`devices`].
 pub fn devices_with(
     backends: &[seismic::BackendName],
     options: seismic::DeviceOptions,
@@ -152,7 +153,7 @@ pub fn devices_with(
     let topology = discovery.topology();
     let opened = backends.iter().copied()
         .filter_map(|backend| seismic::testing::selected(&topology, backend).map(|device| (backend, device.id())))
-        .map(|(backend, id)| discovery.open_with(id, options.clone())
+        .map(|(backend, id)| seismic::testing::open_own_ledgers(&discovery, id, options.clone())
             .unwrap_or_else(|error| panic!("available {backend:?} test device must open: {error}")))
         .collect::<Vec<_>>();
     if let Some(backend) = selected {

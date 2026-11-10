@@ -1043,6 +1043,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ([_], super::queue::Behind::Chain { chunks }) => chunks.len() + 1,
             _ => return Ok(()),
         };
+        // A step of the bank runs: it takes a group's places only between
+        // flights, so the group keeps those it holds, and the next group
+        // opened in a gap takes more, as a shrink asked mid-flight waits for
+        // one (`BankStep::Deferred`).
+        let Some(quiet) = self.quiet() else {
+            return Ok(());
+        };
         let floor = self.resources.group_places();
         let held = floor.get();
         let unborn = self.unborn(seismic::Contract::DeviceOnly);
@@ -1065,7 +1072,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let held = self
                 .resources
                 .grow_class(grown, limits.class_slots(places))
-                .and_then(|grown| self.family.hold_group(places).map(|()| grown))
+                .and_then(|grown| self.family.hold_group(places, quiet).map(|()| grown))
                 .map(|grown| self.resources.hold_class(grown));
             self.release_claim(claim);
             if held.is_ok() {
@@ -1414,6 +1421,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.resources.group_places()
     }
 
+    /// Bound one of the device's ledgers through the heap's right to bound
+    /// them, the one holder while the heap lives.
+    #[cfg(test)]
+    pub(crate) fn bound(&self, ledger: seismic::Ledger, bound: Option<u64>) -> Result<(), seismic::LimitError> {
+        self.memory.borrow().bounds().bound(ledger, bound)
+    }
+
     /// The slots the expert bank commits now; none without an elastic bank.
     pub fn expert_bank_slots(&self) -> Option<u64> {
         self.family.expert_bank().map(|bank| bank.slots())
@@ -1533,7 +1547,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// prompt-group class that no request or launch holds, and the held
     /// class beyond the places it keeps: in Reclaim the floor of one place,
     /// otherwise the places target a settle lowered ([`Self::places_target`]),
-    /// never while a chain holds the queue (its launches hold the class).
+    /// never while a chain holds the queue (its launches hold the class) nor
+    /// while a step of the expert bank runs (it takes a group's places only
+    /// between flights, [`super::Quiet`]).
     /// The class's group buffers now, credited with the charge of the model
     /// storage the release drops whole, as Seismic measured it before, and
     /// the slots on the load's release thread
@@ -1550,10 +1566,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ShrinkPolicy::Reclaim => std::num::NonZeroUsize::MIN,
             ShrinkPolicy::Idle => self.places_target,
         };
-        let class = (keeps < held && self.chain_holder().is_none()).then_some(keeps);
+        // Nor while a step of the bank runs, which takes a group's places
+        // only between flights: the settle releases them again at a later
+        // reading.
+        let class = (keeps < held && self.chain_holder().is_none()).then_some(keeps).zip(self.quiet());
         let released = match class {
             None => 0,
-            Some(places) => {
+            Some((places, quiet)) => {
                 // Every model allocation and its charge now, each once. Only
                 // this thread drops a model allocation (one released off it
                 // only shrinks a reservation, or is no model storage's), so
@@ -1567,17 +1586,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                 });
                 // A group of one holds the floor's alone, which allocates none.
-                self.family.hold_group(places.get()).map_err(|error| DomainError::invariant(error.to_string()))?;
+                self.family.hold_group(places.get(), quiet).map_err(|error| DomainError::invariant(error.to_string()))?;
                 self.refresh_memory()?;
                 charged.into_values().filter(|(observer, _)| observer.charged_bytes().is_none()).map(|(_, bytes)| bytes).sum()
             }
         };
         let limits = self.execution.policy().limits();
-        let slots = match self.resources.release_idle_slots(class.map(|places| (places, limits.class_slots(places.get()))), wake) {
+        let slots = match self.resources.release_idle_slots(class.map(|(places, _)| (places, limits.class_slots(places.get()))), wake) {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         };
-        if let Some(places) = class {
+        if let Some((places, _)) = class {
             tracing::info!(places = places.get(), released, "prompt groups hold fewer places");
         }
         Ok((released, slots))
@@ -1586,8 +1605,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Release the prompt-group class held beyond the places target a
     /// settle lowered ([`Self::release_idle_graph_slots`] at the idle
     /// policy): the bytes released now and the slots' release; nothing while
-    /// a chain holds the queue, a release runs, or the class held is within
-    /// the target.
+    /// a chain holds the queue, a step of the expert bank runs, a release
+    /// runs, or the class held is within the target.
     pub fn release_group_places(&mut self, wake: crate::CompletionWake) -> Result<(u64, SlotRelease), DomainError> {
         self.release_idle_graph_slots(ShrinkPolicy::Idle, wake)
     }

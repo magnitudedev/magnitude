@@ -95,7 +95,7 @@ impl DeviceTopology {
                     "kind": executor.kind(),
                     "driver": executor.driver(),
                     "availability": executor.availability(),
-                    "max_allocation": executor.limits().max_allocation,
+                    "max_allocation": executor.limits().max_allocation.reported(),
                     "tensor_operations": executor.forms_tensor_operations(),
                     "placements": placements,
                 })

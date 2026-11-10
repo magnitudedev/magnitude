@@ -204,6 +204,13 @@ impl ModelLoadPlan {
         Ok(self)
     }
 
+    /// The plan committing `slots` of its bank at the load, its ceiling
+    /// kept: the bank grows back to it while it serves.
+    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
+        let ceiling = self.bank.as_ref().ok_or(PlanError::Topology("a plan without a bank has no slots"))?.ceiling;
+        self.with_bank_slots(slots, ceiling)
+    }
+
     /// The plan without its expert bank: each banked expert stack planned
     /// resident again, as the bank keeps it (`BankLayer::resident`).
     pub fn unbanked(mut self) -> Self {

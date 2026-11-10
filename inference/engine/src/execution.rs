@@ -12,11 +12,12 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use magnitude_artifacts::{ArtifactIdentity, Package, PackageIdentity};
 use magnitude_batching::Demand;
+use crate::planning::Holding;
 use magnitude_executor::{
     AttestedPrograms, ClaimRefusal, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceHeap, MachineReading,
-    ExecutionPlanDraft, ExecutorDomain, KernelCache, Operation, RequestId, ReservedResources,
+    ExecutionPlanDraft, ExecutorDomain, KernelCache, ModelLoadPlan, Operation, RequestId, ReservedResources,
     ResidencyError, ResidencyStore, ResourceAllocator, ResourceCapacity, ResourceDomainId,
-    CatalogError, CatalogFailure, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
+    CatalogError, CatalogFailure, PlanError, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WeightImportError, WorkKind,
     memory::{ClaimDemand, ClaimId, HoldingClass},
@@ -146,7 +147,7 @@ struct LoadPlans {
 /// Plan `manifest`'s load on `selected`: the same derivation metadata-only
 /// assessment and preview plan through (`planning::plan_execution`), its
 /// resident plan kept.
-fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice) -> Result<LoadPlans, LoadError> {
+fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, holding: Holding) -> Result<LoadPlans, LoadError> {
     let backend = selected.info.backend();
     let planned = |error: crate::planning::ExecutionPlanningError| -> LoadError {
         match error {
@@ -161,7 +162,7 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice) 
         .map(|root| KernelCache::open(root, DEFAULT_KERNEL_CACHE_BYTES).map(Arc::new))
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let draft = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(manifest, selected, resident.clone())
+    let draft = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(manifest, selected, resident.clone(), holding)
         .map_err(planned)?
         .into_draft();
     Ok(LoadPlans { resident, draft, kernel_cache })
@@ -173,6 +174,7 @@ fn plan_on_device(
     manifest: &ExecutionManifest,
     package: &Package,
     progress: &dyn Fn(LoadProgress),
+    holding: Holding,
 ) -> Result<PlannedModel, LoadError> {
     let mut phase_started = Instant::now();
     if package.manifest() != manifest.package {
@@ -194,7 +196,7 @@ fn plan_on_device(
             selected.info.forms_tensor_operations(),
         ),
     };
-    let LoadPlans { resident, draft, kernel_cache } = plan_load(manifest, &selected)?;
+    let LoadPlans { resident, draft, kernel_cache } = plan_load(manifest, &selected, holding)?;
     if let Some(bank) = draft.load().expert_bank() {
         let weights = draft.load().weight_bytes().map_err(internal)?;
         let slot = bank.slot_bytes().map_err(internal)?;
@@ -291,7 +293,7 @@ pub(crate) fn search(
         kernel_cache,
         numerical_profile,
         ..
-    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref())?;
+    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref(), Holding::Placed)?;
     let searching = Instant::now();
     let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, opened.device(), progress)?;
     let tuned = AttestedPrograms::search_draft(
@@ -409,6 +411,7 @@ fn prepare(
     package: &Package,
     unprepared: UnpreparedUnits,
     progress: Rc<dyn Fn(LoadProgress)>,
+    holding: Holding,
 ) -> Result<LoadAttempt<PreparedPrograms>, LoadError> {
     // A load asked to report stops here when no Prepare of it has finished,
     // or when its Prepare is to search afresh: before the device is opened,
@@ -432,7 +435,7 @@ fn prepare(
         capacity,
         kernel_cache,
         numerical_profile,
-    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref())?;
+    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref(), holding)?;
     let preparing = Instant::now();
     let workers = Arc::new(seismic::Workers::of_the_host());
     opened.device().staff(Some(workers.clone()));
@@ -509,7 +512,9 @@ fn prepare(
 
 /// A load: one code path whose `unprepared` decides only what happens at a
 /// tuning unit without a stored record, which it meets while its programs
-/// are prepared, before anything of the model is placed.
+/// are prepared, before anything of the model is placed. A plan holding
+/// its experts whole that its target import's claim cannot hold is loaded
+/// again streaming them, its bank fitted by that claim.
 pub(crate) fn build(
     catalog: Devices,
     manifest: &ExecutionManifest,
@@ -518,6 +523,45 @@ pub(crate) fn build(
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<LoadAttempt<NativeDomain>, LoadError> {
     let catalog = Rc::new(catalog);
+    match build_held(catalog.clone(), manifest, package.clone(), unprepared, progress.clone(), Holding::Placed)? {
+        Built::Attempt(attempt) => Ok(attempt),
+        Built::Unheld(refused) => {
+            tracing::info!(
+                "{refused}: the plan holding the experts whole does not fit the memory free now, \
+                 so the load streams them, its bank fitted to what the import admits"
+            );
+            // A plan placed whole has its whole form's tuning records, not
+            // necessarily its streamed form's; units without one serve
+            // their canonical defaults rather than stop unprepared, whose
+            // Prepare would search the whole form again.
+            match build_held(catalog, manifest, package, UnpreparedUnits::ServeDefaults, progress, Holding::Streamed)? {
+                Built::Attempt(attempt) => Ok(attempt),
+                // Experts the host cannot stream beside their tier are held
+                // whole by the streamed plan too: nothing holds them now.
+                Built::Unheld(refused) => Err(refused),
+            }
+        }
+    }
+}
+
+/// What a load attempt holding its experts as `holding` says built
+/// ([`build_held`]).
+enum Built {
+    Attempt(LoadAttempt<NativeDomain>),
+    /// The target import's claim refused a plan holding the experts whole
+    /// that could stream them: the load streams them instead.
+    Unheld(LoadError),
+}
+
+/// [`build`] of a plan holding its experts as `holding` says.
+fn build_held(
+    catalog: Rc<Devices>,
+    manifest: &ExecutionManifest,
+    package: Arc<Package>,
+    unprepared: UnpreparedUnits,
+    progress: Rc<dyn Fn(LoadProgress)>,
+    holding: Holding,
+) -> Result<Built, LoadError> {
     let PreparedPrograms {
         mut startup,
         draft,
@@ -528,9 +572,9 @@ pub(crate) fn build(
         backend,
         capacity,
         workers,
-    } = match prepare(catalog.clone(), manifest, &package, unprepared, progress.clone())? {
+    } = match prepare(catalog.clone(), manifest, &package, unprepared, progress.clone(), holding)? {
         LoadAttempt::Loaded(prepared) => prepared,
-        LoadAttempt::Unprepared => return Ok(LoadAttempt::Unprepared),
+        LoadAttempt::Unprepared => return Ok(Built::Attempt(LoadAttempt::Unprepared)),
     };
     let reserves = manifest.reserves;
     let limits = draft.policy().limits();
@@ -737,6 +781,44 @@ pub(crate) fn build(
     let releases = resources.releases();
     report_load_phase("resource allocation", &mut phase_started);
     report_load_memory("resources allocated", &catalog, &device);
+    startup.hold_host_tables(
+        execution_plan
+            .load()
+            .host_table_bytes()
+            .map_err(|error| internal(error.to_string()))?,
+    )?;
+    // The target import's claim commits the most of the bank's planned
+    // slots it admits now, beside the startup claims after it; the bank
+    // grows back toward its ceiling as it serves.
+    let after_import = plan
+        .target_state()
+        .initial_committed_bytes()
+        .map_err(internal)?
+        .checked_add(match plan.head_state() {
+            Some(state) => state.initial_committed_bytes().map_err(internal)?,
+            None => 0,
+        })
+        .and_then(|bytes| bytes.checked_add(target_binding_constants))
+        .ok_or_else(|| internal("startup claims after the target import overflow"))?;
+    let (execution_plan, planned) = match startup.claim_target_import(execution_plan.load(), after_import)? {
+        Imported::Planned => (execution_plan, planned),
+        Imported::Fitted(slots) => (
+            execution_plan.with_load_slots(slots).map_err(|error| internal(error.to_string()))?,
+            planned.with_load_slots(slots).map_err(|error| internal(error.to_string()))?,
+        ),
+        // A plan holding its experts whole that the memory free now does
+        // not hold streams them, where they can stream.
+        Imported::Unheld(refused) => {
+            return match planned.streaming::<magnitude_executor::AssessmentMemoryCharge>(
+                &manifest.definition,
+                manifest.model.weight_bound,
+            ) {
+                Ok(_) => Ok(Built::Unheld(refused)),
+                Err(PlanError::Unstreamed(_) | PlanError::WeightBound { .. } | PlanError::Resource(_)) => Err(refused),
+                Err(error) => Err(internal(error.to_string())),
+            };
+        }
+    };
     // The served file's volume as the job probed it; with no record it reads
     // at its bounds until a later load's.
     if let Some(root) = &manifest.kernel_cache {
@@ -756,25 +838,6 @@ pub(crate) fn build(
         residency.keep_table_rows(cache.join("table-rows"));
         residency.keep_cpu_site(stored_cpu_site(cache, &device, &site_requests).map_err(internal)?);
     }
-    let target_upload = execution_plan
-        .load()
-        .target_upload_peak_bytes()
-        .map_err(|error| internal(error.to_string()))?;
-    startup.hold_host_tables(
-        execution_plan
-            .load()
-            .host_table_bytes()
-            .map_err(|error| internal(error.to_string()))?,
-    )?;
-    // Each weight allocation in the storage it lies in, and the upload
-    // window, device storage staged through host RAM.
-    let target_demand = execution_plan.load().weight_demands().map_err(internal)?[0];
-    startup.claim_storage(
-        "target import",
-        target_demand
-            .checked_plus(ClaimDemand { device: target_upload, staged: target_upload, ..ClaimDemand::default() })
-            .ok_or_else(|| internal("target import demand overflows"))?,
-    )?;
     let import_progress = progress.clone();
     let import_device = device.clone();
     let import_catalog = catalog.clone();
@@ -919,13 +982,13 @@ pub(crate) fn build(
     domain
         .serve()
         .map_err(|error| internal(format!("the loaded model's memory reading: {error}")))?;
-    Ok(LoadAttempt::Loaded(NativeDomain {
+    Ok(Built::Attempt(LoadAttempt::Loaded(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
         pricing,
-    }))
+    })))
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's
@@ -1330,7 +1393,7 @@ pub fn request_load_points(catalog: &Devices, manifest: &ExecutionManifest, pack
         return Ok(());
     };
     let selected = crate::planning::select_load_device(catalog, manifest).map_err(platform_error)?;
-    let LoadPlans { draft, .. } = plan_load(manifest, &selected)?;
+    let LoadPlans { draft, .. } = plan_load(manifest, &selected, Holding::Placed)?;
     let bank = draft.load().expert_bank();
     let sites = draft.site_requests(&numerical_profile(manifest)?).map_err(internal)?;
     let mut requests = Vec::new();
@@ -1563,6 +1626,17 @@ fn load_memory_record(moment: &str, catalog: &Devices, device: &seismic::Device)
     })
 }
 
+/// What the target import's claim took ([`StartupClaims::claim_target_import`]).
+enum Imported {
+    /// The import as planned.
+    Planned,
+    /// The import with its expert bank at these slots, fewer than planned.
+    Fitted(u64),
+    /// Nothing: the plan holds its experts whole, and the memory free now
+    /// does not hold them so (the refusal).
+    Unheld(LoadError),
+}
+
 /// Startup allocations claimed from the device's heap, the same heap the
 /// domain claims from once loaded. Each claim keeps every domain's headroom
 /// above its planning reserve and is held through its allocation, until the
@@ -1598,6 +1672,50 @@ impl StartupClaims {
             .map_err(|refusal| self.refusal(purpose, refusal))?;
         self.held = Some(claim);
         Ok(())
+    }
+
+    /// Claim the target import of `load`: each weight allocation in the
+    /// storage it lies in, and the upload window, device storage staged
+    /// through host RAM, with `after` more device bytes the startup claims
+    /// after it take kept beside it. A streamed load's bank commits the
+    /// most of its planned slots, down to its floor, the claim admits on
+    /// one reading ([`DeviceHeap::claim_most`]). Experts held whole that
+    /// do not fit are handed back ([`Imported::Unheld`]), unclaimed.
+    /// Releases the previous startup claim.
+    fn claim_target_import(&mut self, load: &ModelLoadPlan, after: u64) -> Result<Imported, LoadError> {
+        const PURPOSE: &str = "target import";
+        if let Some(held) = self.held.take() {
+            self.heap.release(held);
+        }
+        let bank = load.expert_bank();
+        let (floor, planned) = bank.map_or((0, 0), |bank| (bank.floor(), bank.slots));
+        let demand = |slots: u64| -> Result<ClaimDemand, String> {
+            match bank {
+                Some(_) => load.clone().with_load_slots(slots).map_err(|error| error.to_string())?.target_import_demand(),
+                None => load.target_import_demand(),
+            }
+        };
+        let (slots, claim) = match self
+            .heap
+            .claim_most(floor, planned, demand, after, HoldingClass::Model, platform::FitMode::Live, Self::PLANNED)
+            .map_err(internal)?
+        {
+            Ok(claimed) => claimed,
+            // Short of room for experts held whole: streamed, they may fit.
+            Err(refusal @ ClaimRefusal::Deficit { .. }) if bank.is_none() => {
+                return Ok(Imported::Unheld(self.refusal(PURPOSE, refusal)));
+            }
+            Err(refusal) => return Err(self.refusal(PURPOSE, refusal)),
+        };
+        self.held = Some(claim);
+        if slots == planned {
+            return Ok(Imported::Planned);
+        }
+        tracing::info!(
+            "the target import commits {slots} of the expert bank's {planned} planned slots: \
+             the memory free now admits no more beside {after} bytes of startup claims after it",
+        );
+        Ok(Imported::Fitted(slots))
     }
 
     /// Hold the model's host-resident tables (`bytes`) in the host-RAM

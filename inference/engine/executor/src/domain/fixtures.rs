@@ -47,10 +47,41 @@ struct StillHost {
     first: seismic::Status,
     charged: BTreeMap<seismic::StoreId, u64>,
     pressed: Pressed,
+    clock: TestClock,
 }
 
 /// What other programs hold of each store, as a test presses it.
 type Pressed = Rc<std::cell::RefCell<BTreeMap<seismic::StoreId, u64>>>;
+
+/// The time a fixture's heap reads memory at (`StatusReading::now`): the
+/// time since the fixture opened that the test's owner reads memory at
+/// ([`Self::set`]), as the live machine's readings carry the monotonic
+/// time the owner counts. It stands still until a test moves it.
+#[derive(Clone)]
+pub struct TestClock {
+    opened: std::time::Instant,
+    since: Rc<std::cell::Cell<std::time::Duration>>,
+}
+
+impl TestClock {
+    fn new() -> Self {
+        Self { opened: std::time::Instant::now(), since: Rc::default() }
+    }
+
+    /// The owner's time now, `since_ns` since the fixture opened.
+    pub fn set(&self, since_ns: u64) {
+        self.since.set(std::time::Duration::from_nanos(since_ns));
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.opened + self.since.get()
+    }
+}
+
+/// The clock `domain`'s heap reads memory at ([`TestClock`]).
+pub fn clock(domain: &ExecutorDomain<TestFamily>) -> TestClock {
+    domain.family.clock.clone()
+}
 
 /// Another program's hold on the store of a fixture's device storage
 /// ([`press`]), which the fixture's heap reads as the host's: the room left
@@ -83,11 +114,26 @@ pub fn press(domain: &ExecutorDomain<TestFamily>) -> Press {
     Press { store, pressed: domain.family.pressed.clone() }
 }
 
+/// A heap of `backend`'s device on a host that holds still as first read,
+/// beside a [`Press`] on its device storage's store: another program's hold,
+/// which the heap's readings read as the host's.
+#[cfg(test)]
+pub fn pressed_heap(backend: seismic::BackendName) -> (DeviceHeap, Press) {
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let device = Rc::new(crate::test_support::open_backend(&catalog, backend).expect("the backend opens"));
+    let store = state::storage_store(device.topology(), device.info(), seismic::Contract::DeviceOnly)
+        .expect("the device's storage lies in a store");
+    let pressed = Pressed::default();
+    let reading = Rc::new(StillHost::of(catalog, device.clone(), pressed.clone(), TestClock::new()));
+    let heap = DeviceHeap::open(reading, platform::MemoryReserves::of_machine(None), device).expect("the heap opens");
+    (heap, Press { store, pressed })
+}
+
 impl StillHost {
-    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed) -> Self {
-        let first = catalog.status(device.topology(), device.info().id());
+    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed, clock: TestClock) -> Self {
+        let first = catalog.device_status(&device);
         let charged = Self::charges(&device);
-        Self { device, topology: catalog.topology(), first, charged, pressed }
+        Self { device, topology: catalog.topology(), first, charged, pressed, clock }
     }
 
     /// What `device`'s allocations charge each store it reaches: its own
@@ -151,6 +197,10 @@ impl StatusReading for StillHost {
             }
         }
         seismic::Status { sample, runtime }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.clock.now()
     }
 
     /// What the device charges host RAM now.
@@ -384,12 +434,12 @@ pub fn fixture_over(
         .allocate(device.clone())
         .unwrap();
     let head = head.then(|| spare_head_store(device.clone()));
-    let pressed = Pressed::default();
+    let (pressed, clock) = (Pressed::default(), TestClock::new());
     ExecutorDomain::with_family(
         execution,
         definition,
         resources,
-        DeviceHeap::open(Rc::new(StillHost::of(catalog, device.clone(), pressed.clone())), reserves, device).unwrap(),
+        DeviceHeap::open(Rc::new(StillHost::of(catalog, device.clone(), pressed.clone(), clock.clone())), reserves, device).unwrap(),
         store,
         head,
         None,
@@ -401,6 +451,7 @@ pub fn fixture_over(
             waiting: usize::MAX,
             optional: None,
             pressed,
+            clock,
         },
     )
 }
@@ -578,6 +629,7 @@ pub fn with_room<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, room: u64) {
     domain.pace.borrow_mut().domains.insert(store, DomainPace {
         role: DomainRole::Allocation,
         headroom: room,
+        basis: crate::platform::ShownBasis::Headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
         charged: 0,
         band: MemoryBand::Normal,
@@ -840,6 +892,8 @@ pub struct TestFamily {
     pub(crate) optional: Option<seismic::Tensor>,
     /// What other programs hold of each store its heap reads ([`press`]).
     pressed: Pressed,
+    /// The clock its heap reads memory at ([`clock`]).
+    clock: TestClock,
 }
 
 /// A fake elastic expert bank (`ElasticBank`): one reserved tensor of a row
@@ -1131,6 +1185,7 @@ impl ElasticBank for FakeBank {
                 prepared: now,
                 installed: now,
                 released: now,
+                unpinned: std::time::Duration::ZERO,
             };
             let holding = crate::BankHolding::Host;
             *self.host_grown.lock().unwrap() = Some(BankResized::Grown { holding, from, to, grown: to - from, refused: None, times });
@@ -1182,6 +1237,7 @@ impl ElasticBank for FakeBank {
                     prepared: now,
                     installed: now,
                     released: now,
+                    unpinned: std::time::Duration::ZERO,
                 };
                 let finished = match after < charged {
                     true => BankResized::Shrunk {
@@ -1317,6 +1373,19 @@ impl ProgramFamily for TestFamily {
 
     fn expert_bank(&self) -> Option<&dyn ElasticBank> {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
+    }
+
+    /// As the bank's watcher takes a group's places
+    /// (`ExpertBank::hold_places`): only between flights, an invariant
+    /// broken while a step of the bank runs.
+    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
+        match &self.bank {
+            Some(bank) if !bank.in_gap() => Err(crate::resources::AllocationError::Plan(crate::error::InvariantError {
+                context: "a group's places",
+                detail: format!("a bank resize while {} steps run", bank.steps.load(std::sync::atomic::Ordering::Relaxed)),
+            })),
+            _ => Ok(()),
+        }
     }
 
     fn prepared_program_bytes(&self) -> u64 {

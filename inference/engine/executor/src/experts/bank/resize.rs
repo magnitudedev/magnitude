@@ -346,7 +346,7 @@ pub(super) struct Begun {
 impl Begun {
     fn times(self, prepared: Instant, installed: Instant, released: Instant) -> ResizeTimes {
         let Self { decided, queued, planned, trips, moves } = self;
-        ResizeTimes { decided, queued, planned, trips, moves, prepared, installed, released }
+        ResizeTimes { decided, queued, planned, trips, moves, prepared, installed, released, unpinned: Duration::ZERO }
     }
 }
 
@@ -686,7 +686,10 @@ impl ExpertBank {
         };
         let to = cut.slots as u64;
         tier.slots.store(to, Ordering::Release);
-        match recommit(resizers, self.host_rows(to)) {
+        let unpinning = seismic::backing_times();
+        let recommitted = recommit(resizers, self.host_rows(to));
+        let unpinned = seismic::backing_times().since(unpinning).unpin;
+        match recommitted {
             Ok(resizers) => tier.resize = HostResize::Idle(resizers),
             Err(refusal) => {
                 let reason = shrink_refused(refusal);
@@ -694,7 +697,7 @@ impl ExpertBank {
                 return Err(DomainError::invariant(reason));
             }
         }
-        Ok(Shrinking::Begun(LandedShrink { from, to, before, after: self.host_charged()? }))
+        Ok(Shrinking::Begun(LandedShrink { unpinned, from, to, before, after: self.host_charged()? }))
     }
 
     /// Shrink the one store (where the host places), decided at `decided`
@@ -1182,6 +1185,8 @@ pub(super) enum Shrinking<T> {
 /// A shrink of the records the host lands into, done: the slots it took them
 /// from and to, and Seismic's charge of them before and after.
 pub(super) struct LandedShrink {
+    /// Its release's unregistration of host pages.
+    pub(super) unpinned: Duration,
     pub(super) from: u64,
     pub(super) to: u64,
     pub(super) before: u64,

@@ -130,7 +130,7 @@ fn new_storage(
 /// The demand of `bytes` a reservation of `kind` storage backs: device
 /// storage's fresh pages of the device's store, host storage's (a host
 /// tier's) host RAM.
-fn reserved(kind: BankTier, bytes: u64) -> ClaimDemand {
+pub(crate) fn reserved(kind: BankTier, bytes: u64) -> ClaimDemand {
     match kind {
         BankTier::Bank => ClaimDemand { reserved: bytes, ..ClaimDemand::default() },
         BankTier::Host => ClaimDemand { host: bytes, ..ClaimDemand::default() },
@@ -149,6 +149,31 @@ fn besides(demand: ClaimDemand, beside: u64) -> Result<ClaimDemand, ClaimRefusal
     })
 }
 
+/// Why [`DeviceHeap::claim_most`] stopped short of a claim: its demand's
+/// error, or a refusal.
+enum Halted<E> {
+    Demand(E),
+    Refused(ClaimRefusal),
+}
+
+/// The most count that `fits`, between `fitting`, known to fit, and
+/// `over`, known not to (`fitting < over`), by halving: `fits` never admits
+/// a larger count where it refuses a smaller one.
+fn most_fitting<E>(
+    mut fitting: u64,
+    mut over: u64,
+    mut fits: impl FnMut(u64) -> Result<bool, E>,
+) -> Result<u64, E> {
+    while over - fitting > 1 {
+        let middle = fitting + (over - fitting) / 2;
+        match fits(middle)? {
+            true => fitting = middle,
+            false => over = middle,
+        }
+    }
+    Ok(fitting)
+}
+
 /// What the heap reads of the machine: one status sample a reading, every
 /// domain the device uses observed in it, of the device's executor's grants
 /// alone: no other executor's grant is read. Seismic's catalog reads the
@@ -163,13 +188,21 @@ pub trait StatusReading {
     /// allocations are pages of the process (`ExecutorDomain::host_witness`).
     fn footprint(&self) -> Option<u64>;
 
+    /// The time a reading is taken at now: the clock every interval of the
+    /// memory path is measured on (the pace's takes, the bank's room), the
+    /// one the owner reads memory by. The live machine's is the monotonic
+    /// clock the owner's time counts; a test's is its owner's.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     /// The periodic reading taken since the last one this returned, without
     /// waiting for one ([`DeviceHeap::refresh_published`]); none where none
     /// was published since. By default it reads now: a test's readings are
     /// taken where the test asks for them. The live machine's are read on a
     /// thread of their own ([`MachineReading`]).
     fn published(&self, device: &Device) -> Option<Published> {
-        Some(Published { status: self.status(device), footprint: self.footprint(), at: Instant::now() })
+        Some(Published { status: self.status(device), footprint: self.footprint(), at: self.now() })
     }
 }
 
@@ -183,7 +216,7 @@ pub struct Published {
 
 impl StatusReading for Devices {
     fn status(&self, device: &Device) -> seismic::Status {
-        Devices::status(self, device.topology(), device.info().id())
+        self.device_status(device)
     }
 
     fn footprint(&self) -> Option<u64> {
@@ -221,7 +254,7 @@ impl StatusReading for MachineReading {
     fn published(&self, device: &Device) -> Option<Published> {
         let reader = self.reader.get_or_init(|| {
             let devices = Devices::new(self.devices.inventory().clone());
-            Reader::start(devices, device.topology().clone(), device.info().id())
+            Reader::start(devices, device.clone())
         });
         reader.shared.lock().latest.take()
     }
@@ -251,13 +284,13 @@ impl ReaderShared {
 }
 
 impl Reader {
-    fn start(devices: Devices, topology: Arc<seismic::DeviceTopology>, executor: seismic::ExecutorId) -> Self {
+    fn start(devices: Devices, device: Device) -> Self {
         let shared = Arc::new(ReaderShared { state: Mutex::new(ReaderState { latest: None, stopped: false }), stop: Condvar::new() });
         let reading = shared.clone();
         let thread = std::thread::Builder::new()
             .name("magnitude-memory".into())
             .spawn(move || loop {
-                let status = devices.status(&topology, executor);
+                let status = devices.device_status(&device);
                 let footprint = seismic::ProcessMemory::footprint_now();
                 let mut state = reading.lock();
                 state.latest = Some(Published { status, footprint, at: Instant::now() });
@@ -297,6 +330,9 @@ pub struct DeviceHeap {
     /// `known` with what the load measures now ([`Self::measure`]).
     reserves: MemoryReserves,
     device: Rc<Device>,
+    /// The right to bound the stores the device reaches, the heap's alone
+    /// while it lives.
+    bounds: seismic::Bounds,
     capacity_bytes: u64,
     heap: MemoryHeap,
     /// Host-resident gathered tables' bytes (§3.7 of the model-family plan):
@@ -359,11 +395,13 @@ impl DeviceHeap {
         let capacity_bytes = Fit::new(device.topology(), &status, &reserves, room)
             .storage_beside(device.info(), &CLAIMED, &[])?
             .stable_bytes;
+        let bounds = device.bounds();
         let mut heap = Self {
             reading,
             known: reserves,
             reserves,
             device,
+            bounds,
             capacity_bytes,
             heap: MemoryHeap::new(),
             host_table_bytes: 0,
@@ -386,7 +424,7 @@ impl DeviceHeap {
     pub fn serve(&mut self, bank: Option<(u64, u64)>, planned: u64) -> Result<(), MemoryPolicyError> {
         let status = self.status();
         let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
-        let now = std::time::Instant::now();
+        let now = self.reading.now();
         self.room = HostRoom::serving(host, now);
         let counted = matches!(self.room, HostRoom::Load(LoadStage::Serving(_)));
         self.bank = bank.map(|(slots, slot_bytes)| BankRoom::new(counted, slot_bytes, slots, now));
@@ -427,7 +465,7 @@ impl DeviceHeap {
     /// again (`platform::Serving::displaced_bytes`).
     pub fn bank_grown(&mut self, slots: u64) -> Result<(), MemoryPolicyError> {
         let bank = self.bank.as_mut().expect("a growth of the one store's slots is of its bank");
-        if bank.grown(slots, std::time::Instant::now()) {
+        if bank.grown(slots, self.reading.now()) {
             if let HostRoom::Load(LoadStage::Serving(serving)) = &mut self.room {
                 let status = self.reading.status(&self.device);
                 let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
@@ -451,6 +489,12 @@ impl DeviceHeap {
         &self.device
     }
 
+    /// The heap's right to bound the device's ledgers.
+    #[cfg(test)]
+    pub(crate) fn bounds(&self) -> &seismic::Bounds {
+        &self.bounds
+    }
+
     /// A fresh status of the device's executor.
     fn status(&self) -> seismic::Status {
         self.reading.status(&self.device)
@@ -463,6 +507,11 @@ impl DeviceHeap {
     /// The process's host RAM footprint now ([`StatusReading::footprint`]).
     pub fn footprint(&self) -> Option<u64> {
         self.reading.footprint()
+    }
+
+    /// The time a reading is taken at now ([`StatusReading::now`]).
+    pub fn now(&self) -> std::time::Instant {
+        self.reading.now()
     }
 
     /// Observe every domain the device uses from a sample read now, set
@@ -496,12 +545,31 @@ impl DeviceHeap {
         planned: u64,
     ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let readings =
-            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room(), planned);
+            crate::platform::refresh_device_ceiling(&self.device, &self.bounds, status, &self.reserves, self.room(), planned);
         self.account();
         let charged = self.charged();
         self.observed = readings.as_ref().ok().map(|readings| (status.clone(), readings.clone(), charged));
+        // Each reading's planning line by the terms of its margin, where
+        // the memory trace is read.
+        let traced = tracing::enabled!(target: super::MEMORY_TRACE, tracing::Level::DEBUG);
+        for reading in readings.iter().flatten().filter(|_| traced) {
+            let store = self.device.topology().store(reading.domain).expect("a reading is of a store of the device's topology");
+            if !matches!(store.kind(), seismic::StoreKind::Volume(_)) {
+                let terms = self.reserves.margin_terms(store);
+                tracing::debug!(
+                    target: super::MEMORY_TRACE,
+                    store = ?reading.identity,
+                    planning = reading.thresholds.planning_bytes,
+                    fluctuation = terms.fluctuation,
+                    take = terms.take,
+                    latency = terms.latency,
+                    releasing = terms.releasing,
+                    "memory line"
+                );
+            }
+        }
         if let (Ok(readings), Some(bank)) = (&readings, self.bank.as_mut()) {
-            let now = std::time::Instant::now();
+            let now = self.reading.now();
             for reading in readings.iter().filter(|reading| reading.constraint == MemoryConstraint::HostRam) {
                 bank.observe(reading, now);
             }
@@ -636,7 +704,7 @@ impl DeviceHeap {
         }))
     }
 
-    /// The most bytes [`Self::claim_reserved`] of `kind` storage beside
+    /// The most bytes a reservation of `kind` storage backs ([`reserved`]) beside
     /// `beside` device bytes admits in each of `modes`' rooms on the last
     /// reading ([`Self::observe`]) while the process's own charge stands as
     /// it read it, a fresh one otherwise (a status reads the process's
@@ -676,16 +744,58 @@ impl DeviceHeap {
                         None => return Ok(u64::MAX),
                     }
                 }
-                while over - fitting > 1 {
-                    let middle = fitting + (over - fitting) / 2;
-                    match fits(middle)? {
-                        true => fitting = middle,
-                        false => over = middle,
-                    }
-                }
-                Ok(fitting)
+                most_fitting(fitting, over, fits)
             })
             .collect()
+    }
+
+    /// Claim the most of `least..=most` whose demand (`demand`) fits in
+    /// `mode`'s room with `beside` more device bytes, planned and not yet
+    /// allocated, which the claim does not hold: found by halving over
+    /// [`Self::refusal`], the one test of a claim, on one fresh reading, and
+    /// claimed on that same reading, so what it sized is what it holds: the
+    /// one way a load's import and its bank's growth size what they claim.
+    /// `demand` never demands less of a larger count; an error of it ends
+    /// the claim as it is.
+    /// Refused as `least` is where not even it fits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_most<E>(
+        &mut self,
+        least: u64,
+        most: u64,
+        demand: impl Fn(u64) -> Result<ClaimDemand, E>,
+        beside: u64,
+        class: HoldingClass,
+        mode: FitMode,
+        planned: u64,
+    ) -> Result<Result<(u64, ClaimId), ClaimRefusal>, E> {
+        assert!(least <= most, "invariant violated: a claim's least count exceeds its most");
+        let decided = (|| -> Result<u64, Halted<E>> {
+            let (status, readings) = self.sample(planned).map_err(Halted::Refused)?;
+            let fit = Fit::new(self.device.topology(), &status, &self.reserves, self.room());
+            // Why `count`'s demand does not fit; none where it does.
+            let refusal = |count: u64| -> Result<Option<ClaimRefusal>, Halted<E>> {
+                let claim = besides(demand(count).map_err(Halted::Demand)?, beside).map_err(Halted::Refused)?;
+                self.refusal_in(&fit, &readings, claim, 0, mode).map_err(Halted::Refused)
+            };
+            let Some(refused) = refusal(most)? else {
+                return Ok(most);
+            };
+            if least == most {
+                return Err(Halted::Refused(refused));
+            }
+            if let Some(refused) = refusal(least)? {
+                return Err(Halted::Refused(refused));
+            }
+            most_fitting(least, most, |count| Ok(refusal(count)?.is_none()))
+        })();
+        let count = match decided {
+            Ok(count) => count,
+            Err(Halted::Demand(error)) => return Err(error),
+            Err(Halted::Refused(refusal)) => return Ok(Err(refusal)),
+        };
+        let claim = demand(count)?;
+        Ok(self.heap.claim(claim, class).map(|claim| (count, claim.id)).map_err(ClaimRefusal::Accounting))
     }
 
     /// Hold a host-resident table's `bytes` in host RAM for the model's
@@ -725,25 +835,6 @@ impl DeviceHeap {
     /// `required` device bytes.
     pub fn claim_storage(&mut self, demand: ClaimDemand, class: HoldingClass, planned: u64) -> Result<ClaimId, ClaimRefusal> {
         self.claim_in(demand, 0, class, FitMode::Live, planned)
-    }
-
-    /// Claim `bytes` a reservation of `kind` storage backs, the expert
-    /// bank's growth, once they fit in `mode`'s room (the headroom,
-    /// [`FitMode::Live`], or the line the bank borrows within,
-    /// [`FitMode::Borrow`]) with `beside` more device bytes, as
-    /// [`Self::claim_demand`]: no block's free space serves them. Device
-    /// storage's are fresh pages of the device's store; host storage's (a
-    /// host tier's) host RAM.
-    pub fn claim_reserved(
-        &mut self,
-        kind: BankTier,
-        bytes: u64,
-        beside: u64,
-        class: HoldingClass,
-        mode: FitMode,
-        planned: u64,
-    ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(reserved(kind, bytes), beside, class, mode, planned)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes, planned
@@ -870,7 +961,7 @@ mod tests {
             ..ClaimDemand::default()
         };
         assert_eq!(demand(reserved, 2 * GIB).refused[0].store, gpu.id());
-        // A host tier's step (`claim_reserved` of host storage) is host
+        // A host tier's step (`reserved` of host storage) is host
         // RAM: beyond all the device's store has room for, it fits in the
         // host's.
         let host_step = ClaimDemand {
@@ -910,6 +1001,70 @@ mod tests {
             )
             .unwrap()
             .ceiling_bytes
+    }
+
+    /// A count's demand, as a bank's slots move a load's import: `unit`
+    /// device bytes a count beside a fixed part.
+    fn counted(unit: u64) -> impl Fn(u64) -> Result<ClaimDemand, std::convert::Infallible> {
+        move |count| Ok(ClaimDemand { device: unit + count * unit, ..ClaimDemand::default() })
+    }
+
+    /// The most a claim decides is what the one test of a claim admits on
+    /// the same reading: the count it claims fits, one more does not.
+    #[test]
+    fn the_most_claimed_is_what_the_claim_test_admits() {
+        let (mut heap, _press) = crate::domain::fixtures::pressed_heap(BackendName::Cpu);
+        let unit = live_ceiling(&heap) / 64;
+        let demand = counted(unit);
+        let (count, claim) = heap.claim_most(0, 1000, &demand, 0, HoldingClass::Model, FitMode::Live, 0).unwrap().unwrap();
+        assert!((60..64).contains(&count), "{count} of a ceiling of 64 units, one fixed");
+        heap.release(claim);
+        assert_eq!(heap.check(demand(count).unwrap().device, 0, 0), Ok(()));
+        assert!(matches!(heap.check(demand(count + 1).unwrap().device, 0, 0), Err(ClaimRefusal::Deficit { .. })));
+        // What is kept beside the claim takes its room first.
+        let (beside, claim) = heap.claim_most(0, 1000, &demand, 8 * unit, HoldingClass::Model, FitMode::Live, 0).unwrap().unwrap();
+        assert_eq!(beside, count - 8);
+        heap.release(claim);
+    }
+
+    /// Memory another program takes between a plan and its claim shrinks
+    /// the count the claim commits, where a claim of the planned count is
+    /// refused; only a least count it cannot hold is refused.
+    #[test]
+    fn a_press_after_the_plan_shrinks_the_claim_instead_of_refusing_it() {
+        let (mut heap, press) = crate::domain::fixtures::pressed_heap(BackendName::Cpu);
+        let unit = live_ceiling(&heap) / 64;
+        let demand = counted(unit);
+        // Planned on the room as first read: 48 units fit.
+        let planned = 48;
+        assert_eq!(heap.check(demand(planned).unwrap().device, 0, 0), Ok(()));
+        press.take(32 * unit);
+        assert!(matches!(
+            heap.claim(demand(planned).unwrap().device, 0, HoldingClass::Model, 0),
+            Err(ClaimRefusal::Deficit { .. })
+        ));
+        let (count, claim) = heap.claim_most(4, planned, &demand, 0, HoldingClass::Model, FitMode::Live, 0).unwrap().unwrap();
+        assert!((4..planned).contains(&count) && count >= 28, "{count} of {planned} planned after 32 units were taken");
+        heap.release(claim);
+        press.take(63 * unit);
+        assert!(matches!(
+            heap.claim_most(4, planned, &demand, 0, HoldingClass::Model, FitMode::Live, 0).unwrap(),
+            Err(ClaimRefusal::Deficit { .. })
+        ));
+    }
+
+    /// Two heaps of the process's one shared open of an executor bound its
+    /// ledgers from their own readings, each moving the other's room: the
+    /// second to take the right to bound them panics at the first it
+    /// takes, its path account, naming both. A test opens a device of its
+    /// own (`test_support::open`) and takes the right alone.
+    #[test]
+    #[should_panic(expected = "a path ledger is bounded by two live holders")]
+    fn a_second_heap_on_a_shared_device_panics() {
+        let catalog = Rc::new(Devices::discover(&[]).unwrap());
+        let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
+        let _first = DeviceHeap::open(catalog.clone(), MemoryReserves::of_machine(None), device.clone()).unwrap();
+        let _second = DeviceHeap::open(catalog, MemoryReserves::of_machine(None), device);
     }
 
     fn cpu_heap() -> DeviceHeap {

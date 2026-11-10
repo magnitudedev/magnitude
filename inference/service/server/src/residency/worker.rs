@@ -13,7 +13,7 @@ use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_engine::worker::transport::{FramedTransport, stdio_worker_transport};
 use magnitude_engine::LoadAttempt;
 use magnitude_engine::worker::{
-    EngineClient, WorkerConnection, WorkerExit, WorkerProcess, WorkerReport, connect_worker,
+    EngineClient, WorkerConnection, WorkerEnd, WorkerExit, WorkerProcess, WorkerReport, connect_worker,
     serve_worker,
 };
 use magnitude_executor::UnpreparedUnits;
@@ -281,21 +281,29 @@ impl SpawnedWorker {
     }
 
     /// This worker as the process of a model's Prepare (`magnitude_engine::worker::prepare`,
-    /// `load_prepared`): its transport, and the proof of its retirement. A Prepare that
-    /// reported its outcome is left to exit; one that reported nothing is stopped.
+    /// `load_prepared`): its transport, and the proof of its retirement with how it ended. A
+    /// Prepare that reported its outcome is left to exit, as is one whose stream ended, for as
+    /// long as its exit is observed ([`EngineWorker::ended_status`]); one that reported
+    /// nothing is stopped unless it had already ended.
     pub fn into_process(
         self,
-    ) -> WorkerProcess<HostEnd, impl FnOnce(WorkerReport) -> Result<(), String>> {
+    ) -> WorkerProcess<HostEnd, impl FnOnce(WorkerReport) -> Result<WorkerEnd, String>> {
         let Self { worker, transport } = self;
         WorkerProcess {
             transport,
             retire: move |report| {
-                match report {
-                    WorkerReport::Reported => worker.retire_reported(),
-                    WorkerReport::Unreported => worker.retire(),
+                let error = |error: std::io::Error| error.to_string();
+                let exited = match report {
+                    WorkerReport::Reported => {
+                        return worker.retire_reported().map(WorkerEnd::Exited).map_err(error);
+                    }
+                    WorkerReport::Ended => worker.ended_status(),
+                    WorkerReport::Unreported => worker.try_wait().map_err(error)?,
+                };
+                match exited {
+                    Some(status) => Ok(WorkerEnd::Exited(status)),
+                    None => worker.retire().map(|_| WorkerEnd::Stopped).map_err(error),
                 }
-                .map(drop)
-                .map_err(|error| error.to_string())
             },
         }
     }

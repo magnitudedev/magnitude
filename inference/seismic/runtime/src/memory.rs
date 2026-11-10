@@ -12,6 +12,9 @@
 //!   device ledger and the account both count, held to the grant and the
 //!   store capacity the open's topology revision reports.
 //!
+//! At most one holder of the right to bound each store ledger, account and
+//! device ledger lives at once ([`BoundRight`]).
+//!
 //! A charge is applied to a share, its device ledger, its account and its
 //! store in one operation, each level checked against its bound; if any
 //! refuses, nothing is charged. It is owned ([`MemoryCharge`]) and released
@@ -24,6 +27,10 @@
 //! builds check after every charge that a device ledger's and an account's
 //! views are the sums of their shares', and a store's claim the sum of its
 //! accounts' claims. This is process accounting, not an OS-wide reservation.
+//!
+//! The store ledgers and accounts are found in a [`LedgerScope`]: the
+//! process's, which every open of the product shares, or, for a test's
+//! device, one of its own, so tests sharing a process share no store.
 
 use seismic_topology::{
     AccessPath, AccessPathId, Contract, DeviceTopology, Executor, ExecutorSelector, Placing, StoreId,
@@ -90,6 +97,43 @@ pub(crate) struct StoreLedger {
     admissions: Mutex<Vec<(AdmissionKey, Admission)>>,
     /// The accounts that charge it, for the hierarchy's check.
     accounts: Mutex<Vec<Weak<Account>>>,
+    /// The right to bound it.
+    pub(crate) right: BoundRight,
+}
+
+/// One holder of the right to bound ledgers (`api::device::Bounds`): the
+/// executor it bounds them for, and where it was taken.
+pub(crate) struct Bounder {
+    pub(crate) selector: ExecutorSelector,
+    pub(crate) taken: &'static std::panic::Location<'static>,
+}
+
+/// The right to bound one ledger, held by at most one live [`Bounder`]. A
+/// ledger is bounded from one holder's readings, so a second live holder is
+/// a broken invariant: two holders bounding one ledger would each move the
+/// other's room. Taking it then panics, naming both.
+pub(crate) struct BoundRight {
+    /// Which ledger it bounds, for the panic.
+    what: &'static str,
+    holder: Mutex<Weak<Bounder>>,
+}
+
+impl BoundRight {
+    fn new(what: &'static str) -> Self {
+        Self { what, holder: Mutex::new(Weak::new()) }
+    }
+
+    /// Make `bounder` the ledger's one holder; it may take it again.
+    pub(crate) fn take(&self, bounder: &Arc<Bounder>) {
+        let mut held = self.holder.lock().expect("bound right lock poisoned");
+        if let Some(other) = held.upgrade().filter(|other| !Arc::ptr_eq(other, bounder)) {
+            panic!(
+                "a {} ledger is bounded by two live holders: {} (taken at {}) and {} (taken at {})",
+                self.what, other.selector, other.taken, bounder.selector, bounder.taken,
+            );
+        }
+        *held = Arc::downgrade(bounder);
+    }
 }
 
 /// What runs before each admission against a store.
@@ -123,6 +167,7 @@ impl StoreLedger {
             deciding: Mutex::new(()),
             admissions: Mutex::new(Vec::new()),
             accounts: Mutex::new(Vec::new()),
+            right: BoundRight::new("store"),
         })
     }
 
@@ -181,23 +226,58 @@ impl StoreLedger {
     }
 }
 
-/// The process's ledger of `topology`'s store `id`: one per store identity,
-/// shared by every executor and revision that reaches the store.
-pub(crate) fn store_ledger(topology: &DeviceTopology, id: StoreId) -> Arc<StoreLedger> {
-    static LEDGERS: OnceLock<Mutex<HashMap<StoreIdentity, Weak<StoreLedger>>>> = OnceLock::new();
-    let identity = topology
-        .store_identity(id)
-        .expect("store belongs to topology");
-    let mut ledgers = LEDGERS
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("store registry lock poisoned");
-    if let Some(ledger) = ledgers.get(&identity).and_then(Weak::upgrade) {
-        return ledger;
+/// Where opened devices find their store ledgers and accounts: one ledger
+/// per store identity and one account per executor path, shared by every
+/// open in the scope. The product opens every device in the process's
+/// scope ([`Self::process`]); a test's device may open in one of its own
+/// ([`Self::own`]), sharing nothing with other tests' devices.
+#[derive(Default)]
+pub(crate) struct LedgerScope {
+    stores: Mutex<HashMap<StoreIdentity, Weak<StoreLedger>>>,
+    accounts: Mutex<HashMap<AccountKey, Weak<Account>>>,
+}
+
+impl LedgerScope {
+    /// The process's scope.
+    pub(crate) fn process() -> Arc<Self> {
+        static PROCESS: OnceLock<Arc<LedgerScope>> = OnceLock::new();
+        PROCESS.get_or_init(Default::default).clone()
     }
-    let ledger = StoreLedger::new();
-    ledgers.insert(identity, Arc::downgrade(&ledger));
-    ledger
+
+    /// A scope of its own.
+    pub(crate) fn own() -> Arc<Self> {
+        Arc::default()
+    }
+
+    /// The scope's ledger of `topology`'s store `id`: one per store
+    /// identity, shared by every executor and revision that reaches it.
+    pub(crate) fn store_ledger(&self, topology: &DeviceTopology, id: StoreId) -> Arc<StoreLedger> {
+        let identity = topology
+            .store_identity(id)
+            .expect("store belongs to topology");
+        let mut ledgers = self.stores.lock().expect("store registry lock poisoned");
+        if let Some(ledger) = ledgers.get(&identity).and_then(Weak::upgrade) {
+            return ledger;
+        }
+        let ledger = StoreLedger::new();
+        ledgers.insert(identity, Arc::downgrade(&ledger));
+        ledger
+    }
+
+    /// The accounts the scope's opened executors hold, by key.
+    fn accounts(&self) -> MutexGuard<'_, HashMap<AccountKey, Weak<Account>>> {
+        self.accounts.lock().expect("account registry lock poisoned")
+    }
+
+    /// What `executor`'s account along its access path `path` claims now:
+    /// none while no opened executor of the scope holds that account.
+    pub(crate) fn path_claim(&self, topology: &DeviceTopology, executor: &Executor, path: &AccessPath) -> u64 {
+        let key = account_key(topology, executor, path.store(), access_of(topology, path));
+        self.accounts()
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .map_or(0, |account| account.claim())
+    }
 }
 
 /// An account's state: the sums of its shares' views, and its bound.
@@ -212,6 +292,8 @@ pub(crate) struct Account {
     store: Arc<StoreLedger>,
     state: Mutex<AccountState>,
     shares: Mutex<Vec<Weak<Share>>>,
+    /// The right to bound it.
+    pub(crate) right: BoundRight,
 }
 
 impl Account {
@@ -220,6 +302,7 @@ impl Account {
             store: store.clone(),
             state: Mutex::new(AccountState { views: Views::default(), bound: None }),
             shares: Mutex::new(Vec::new()),
+            right: BoundRight::new("path"),
         });
         store
             .accounts
@@ -289,6 +372,8 @@ pub(crate) struct DeviceLedger {
     store: Arc<StoreLedger>,
     state: Mutex<DeviceState>,
     shares: Mutex<Vec<Weak<Share>>>,
+    /// The right to bound it.
+    pub(crate) right: BoundRight,
 }
 
 impl DeviceLedger {
@@ -303,6 +388,7 @@ impl DeviceLedger {
                 refused: None,
             }),
             shares: Mutex::new(Vec::new()),
+            right: BoundRight::new("device"),
         })
     }
 
@@ -557,15 +643,6 @@ enum AccountOf {
 /// identifiers and is shared by every open of the executor.
 type AccountKey = (ExecutorSelector, StoreIdentity, AccountOf);
 
-/// The accounts opened executors hold, by key.
-fn accounts() -> MutexGuard<'static, HashMap<AccountKey, Weak<Account>>> {
-    static ACCOUNTS: OnceLock<Mutex<HashMap<AccountKey, Weak<Account>>>> = OnceLock::new();
-    ACCOUNTS
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("account registry lock poisoned")
-}
-
 /// The key of `executor`'s account for `of` on `topology`'s store `store`.
 fn account_key(
     topology: &DeviceTopology,
@@ -592,16 +669,6 @@ fn access_of(topology: &DeviceTopology, path: &AccessPath) -> AccountOf {
     )
 }
 
-/// What `executor`'s account along its access path `path` claims now: none
-/// while no opened executor holds that account.
-pub(crate) fn path_claim(topology: &DeviceTopology, executor: &Executor, path: &AccessPath) -> u64 {
-    let key = account_key(topology, executor, path.store(), access_of(topology, path));
-    accounts()
-        .get(&key)
-        .and_then(Weak::upgrade)
-        .map_or(0, |account| account.claim())
-}
-
 /// One of the topology's access paths of an opened device, with its share
 /// of the path's account.
 pub(crate) struct AccessShare {
@@ -624,15 +691,17 @@ pub(crate) struct DeviceLedgers {
     pub(crate) paths: Vec<AccessShare>,
     /// The device's own ledger on each store it reaches.
     pub(crate) stores: Vec<(StoreId, Arc<DeviceLedger>)>,
+    /// The scope its store ledgers and accounts are found in.
+    pub(crate) scope: Arc<LedgerScope>,
 }
 
 impl DeviceLedgers {
-    pub(crate) fn new(topology: &DeviceTopology, executor: &Executor) -> Arc<Self> {
-        let mut registry = accounts();
+    pub(crate) fn new(scope: Arc<LedgerScope>, topology: &DeviceTopology, executor: &Executor) -> Arc<Self> {
+        let mut registry = scope.accounts();
         let mut stores: Vec<(StoreId, Arc<DeviceLedger>)> = Vec::new();
         let mut share = |store: StoreId, grant, of| {
             let key = account_key(topology, executor, store, of);
-            let ledger = store_ledger(topology, store);
+            let ledger = scope.store_ledger(topology, store);
             let account = registry.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
                 let account = Account::new(ledger.clone());
                 registry.insert(key, Arc::downgrade(&account));
@@ -688,7 +757,8 @@ impl DeviceLedgers {
             .filter(|kind| kind.executor() == executor.id())
             .map(|kind| (kind.native().id, along(kind.paths())))
             .collect();
-        Arc::new(Self { placed, kinds, staging, paths, stores })
+        drop(registry);
+        Arc::new(Self { placed, kinds, staging, paths, stores, scope })
     }
 
     /// Ledgers of no topology: `device` under `DeviceOnly`, `upload` under
@@ -703,7 +773,7 @@ impl DeviceLedgers {
             };
             (placement.clone(), Vec::new())
         });
-        Self { placed, kinds: Vec::new(), staging: staging.physical(), paths: Vec::new(), stores: Vec::new() }
+        Self { placed, kinds: Vec::new(), staging: staging.physical(), paths: Vec::new(), stores: Vec::new(), scope: LedgerScope::own() }
     }
 
     /// The placement of a buffer placed as `placing`.
@@ -1146,6 +1216,22 @@ impl Drop for MemoryCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One live holder bounds a ledger: it may take the right again, and
+    /// another may once it has dropped; a second live one panics.
+    #[test]
+    #[should_panic(expected = "a store ledger is bounded by two live holders")]
+    fn a_second_live_holder_of_a_ledgers_bounds_panics() {
+        let store = StoreLedger::new();
+        let holder = || Arc::new(Bounder { selector: ExecutorSelector::HostCpu, taken: std::panic::Location::caller() });
+        let first = holder();
+        store.right.take(&first);
+        store.right.take(&first);
+        drop(first);
+        let second = holder();
+        store.right.take(&second);
+        store.right.take(&holder());
+    }
 
     /// A share of a path of `grant` bytes on `store` (of `capacity`), for
     /// the device whose ledger on that store is `device`.

@@ -178,7 +178,7 @@ impl TransferQueue {
     fn queue(&self, steps: &[Checked], value: u32) -> Result<(), crate::driver::DriverError> {
         let context = self.device.context();
         let _current = context.enter()?;
-        let issue = context.issuing()?;
+        let issue = context.enqueue();
         let driver = &context.driver;
         let stream = self.stream.raw();
         // The queue's making checked the driver writes stream words.
@@ -560,7 +560,7 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
         // Shrink to one granule, then refuse a regrowth: granule 1 is
         // registered by someone else first.
         let resizer = resize(resizer, granule);
-        // The device is quiet: the shrink unregistered its granules at once.
+        // The shrink unregisters its granules.
         assert_eq!(tier.reservation().unwrap().registered_granules(), Some(1));
         backed(1);
         let second = unsafe { base.add(granule as usize) };

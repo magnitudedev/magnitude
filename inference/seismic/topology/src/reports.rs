@@ -13,9 +13,10 @@
 
 use crate::kind::{KindMemory, KindReport};
 use crate::model::{
-    Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, ExecutorBuilder, ExecutorKind,
-    ExecutorReport, GrantSource, Limits, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity,
-    Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
+    AllocationLimit, Availability, Builder, DeviceAllocationBound, DeviceMemory, DeviceTopology, Diagnostic,
+    ExecutorBuilder, ExecutorKind, ExecutorReport, GrantSource, Limits, OwnKind, OwnPath,
+    PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision, StoreId, StoreKind,
+    VolumeId,
 };
 use crate::placement::{place, reserving, Contract, Placing};
 use crate::selector::ExecutorSelector;
@@ -351,10 +352,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             availability: reports.cpu.availability.clone(),
             driver: reports.os_build.clone(),
             limits: Limits {
-                max_allocation: Reported::new(
-                    reports.cpu.max_allocation,
-                    ReportedBy::CpuAddressSpace,
-                ),
+                max_allocation: AllocationLimit::AddressSpace(reports.cpu.max_allocation),
             },
             tensor_operations: false,
         });
@@ -397,10 +395,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             availability: availability(admission),
             driver: reports.os_build.clone(),
             limits: Limits {
-                max_allocation: Reported::new(
-                    metal.max_allocation,
-                    ReportedBy::MetalMaxBufferLength,
-                ),
+                max_allocation: AllocationLimit::Device {
+                    bytes: metal.max_allocation,
+                    by: DeviceAllocationBound::MetalMaxBufferLength,
+                },
             },
             tensor_operations: metal.tensor_operations,
         });
@@ -461,7 +459,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             availability: availability(placement.clone().map(|_| ())),
             driver: cuda.driver.clone(),
             limits: Limits {
-                max_allocation: Reported::new(cuda.max_allocation, ReportedBy::CudaTotalMemory),
+                max_allocation: AllocationLimit::Device {
+                    bytes: cuda.max_allocation,
+                    by: DeviceAllocationBound::CudaTotalMemory,
+                },
             },
             tensor_operations: false,
         });
@@ -534,10 +535,10 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             availability: availability(placement.clone().map(|_| ())),
             driver: vulkan.driver.clone(),
             limits: Limits {
-                max_allocation: Reported::new(
-                    vulkan.max_allocation,
-                    ReportedBy::VulkanMaxAllocation,
-                ),
+                max_allocation: AllocationLimit::Device {
+                    bytes: vulkan.max_allocation,
+                    by: DeviceAllocationBound::VulkanMaxAllocation,
+                },
             },
             tensor_operations: false,
         });

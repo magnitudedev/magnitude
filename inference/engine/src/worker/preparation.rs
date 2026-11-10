@@ -31,11 +31,12 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 pub struct WorkerProcess<T, R> {
     /// The host's end of the process's transport.
     pub transport: T,
-    /// Returns once the process no longer exists; an error when that cannot
-    /// be established. A worker that reported its outcome exits on its own
-    /// and is waited for, never killed: killing it would skip everything a
-    /// normal exit completes, the system's compiled-kernel cache its search
-    /// wrote among it. Only a worker that reported nothing is ended.
+    /// Returns how the process ended, once it no longer exists; an error
+    /// when that cannot be established. A worker that reported its outcome,
+    /// or whose stream ended, exits on its own and is waited for, never
+    /// killed: killing it would skip everything a normal exit completes, the
+    /// system's compiled-kernel cache its search wrote among it. Only a
+    /// worker that reported nothing and may still run is ended.
     pub retire: R,
 }
 
@@ -44,9 +45,35 @@ pub struct WorkerProcess<T, R> {
 pub enum WorkerReport {
     /// The worker reported its outcome: it is exiting on its own.
     Reported,
-    /// The worker reported no outcome: it was lost, broke the protocol, or
-    /// is still running.
+    /// The worker's stream ended before it reported an outcome: its process
+    /// is ending, on its own or killed, and its exit says how.
+    Ended,
+    /// The worker reported no outcome and its stream did not end: it broke
+    /// the protocol or its stream failed, and it may still run.
     Unreported,
+}
+
+/// How a retired worker's process ended ([`WorkerProcess::retire`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerEnd {
+    /// It ended on its own, with this status: an exit code, or the signal
+    /// that ended it (a crash, or a kill from outside, such as the
+    /// system's under memory pressure).
+    Exited(ExitStatus),
+    /// Its host ended it, having had no outcome from it.
+    Stopped,
+    /// No process was there to observe: a worker in the host's own process.
+    Unobserved,
+}
+
+impl std::fmt::Display for WorkerEnd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited(status) => write!(formatter, "its process ended: {status}"),
+            Self::Stopped => formatter.write_str("its host ended its process"),
+            Self::Unobserved => formatter.write_str("no process was observed"),
+        }
+    }
 }
 
 /// What became of preparation in a [`load_prepared`]. None of these fails
@@ -88,7 +115,7 @@ pub fn load_prepared<L, T, R>(
 ) -> Result<(L, Preparation), LoadError>
 where
     T: HostTransport,
-    R: FnOnce(WorkerReport) -> Result<(), String>,
+    R: FnOnce(WorkerReport) -> Result<WorkerEnd, String>,
 {
     // Without a kernel cache a Prepare's records reach no load.
     if manifest.kernel_cache.is_none() {
@@ -119,7 +146,7 @@ pub fn prepare<T, R>(
 ) -> Result<Preparation, LoadError>
 where
     T: HostTransport,
-    R: FnOnce(WorkerReport) -> Result<(), String>,
+    R: FnOnce(WorkerReport) -> Result<WorkerEnd, String>,
 {
     if manifest.kernel_cache.is_none() {
         return Ok(Preparation::Unshared);
@@ -133,14 +160,20 @@ where
     let prepared = prepare_worker(transport, manifest.clone(), progress);
     let report = match &prepared {
         Ok(_) => WorkerReport::Reported,
+        Err(lost) if lost.ended => WorkerReport::Ended,
         Err(_) => WorkerReport::Unreported,
     };
-    retire(report).map_err(|reason| LoadError::WorkerLost {
+    let end = retire(report).map_err(|reason| LoadError::WorkerLost {
         reason: format!("the Prepare worker could not be shown to have ended: {reason}"),
     })?;
+    // A worker lost says how its process ended: a crash or a kill leaves
+    // no other trace.
     Ok(match prepared {
         Ok(Ok(())) => Preparation::Prepared,
-        Ok(Err(error)) | Err(error) => Preparation::Incomplete(error),
+        Ok(Err(error)) => Preparation::Incomplete(error),
+        Err(lost) => Preparation::Incomplete(LoadError::WorkerLost {
+            reason: format!("{}; {end}", lost.reason),
+        }),
     })
 }
 
@@ -167,7 +200,7 @@ pub type ChildTransport =
 pub fn start_worker_process(
     command: Command,
 ) -> Result<
-    WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>,
+    WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<WorkerEnd, String>>,
     LoadError,
 > {
     spawn_worker(command, Stdio::inherit()).map(|(process, _)| process)
@@ -180,7 +213,7 @@ pub fn start_worker_process(
 pub fn observe_worker_process(
     command: Command,
 ) -> Result<
-    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>, ChildStderr),
+    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<WorkerEnd, String>>, ChildStderr),
     LoadError,
 > {
     let (process, stderr) = spawn_worker(command, Stdio::piped())?;
@@ -194,7 +227,7 @@ fn spawn_worker(
     mut command: Command,
     stderr: Stdio,
 ) -> Result<
-    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<(), String>>, Option<ChildStderr>),
+    (WorkerProcess<ChildTransport, impl FnOnce(WorkerReport) -> Result<WorkerEnd, String>>, Option<ChildStderr>),
     LoadError,
 > {
     let lost = |reason: String| LoadError::WorkerLost { reason };
@@ -219,28 +252,29 @@ fn spawn_worker(
     ))
 }
 
-/// Return once `child` is gone. A worker that reported its outcome is
-/// waited for, however long its exit takes: after its report it only drops
-/// what it held and exits, with nothing of the host's to wait on, and
-/// nothing here bounds that wait, so a worker that reported and then never
-/// exits holds its host here. A worker that reported nothing is ended if it
-/// still runs.
-fn retire(child: Child, report: WorkerReport) -> Result<(), String> {
-    ended(child, report)
-        .map(drop)
-        .map_err(|error| error.to_string())
+/// Return once `child` is gone, with how it ended. A worker that reported
+/// its outcome, or whose stream ended, is waited for, however long its exit
+/// takes: after its report it only drops what it held and exits, with
+/// nothing of the host's to wait on, and its stream ends only as its
+/// process does; nothing here bounds that wait, so a worker that reported
+/// and then never exits holds its host here. A worker that reported nothing
+/// is ended if it still runs.
+fn retire(child: Child, report: WorkerReport) -> Result<WorkerEnd, String> {
+    ended(child, report).map_err(|error| error.to_string())
 }
 
 /// How `child` ended, once it is gone ([`retire`]).
-fn ended(mut child: Child, report: WorkerReport) -> std::io::Result<ExitStatus> {
+fn ended(mut child: Child, report: WorkerReport) -> std::io::Result<WorkerEnd> {
     if report == WorkerReport::Unreported {
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            return Ok(WorkerEnd::Exited(status));
         }
         // A process that ended between the two calls is gone either way.
         let _ = child.kill();
+        child.wait()?;
+        return Ok(WorkerEnd::Stopped);
     }
-    child.wait()
+    child.wait().map(WorkerEnd::Exited)
 }
 
 #[cfg(test)]
@@ -253,7 +287,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     type HostEnd = ChannelTransport<WorkerMessage, HostMessage>;
-    type Retire<'a> = Box<dyn FnOnce(WorkerReport) -> Result<(), String> + 'a>;
+    type Retire<'a> = Box<dyn FnOnce(WorkerReport) -> Result<WorkerEnd, String> + 'a>;
 
     fn manifest(kernel_cache: Option<std::path::PathBuf>) -> ExecutionManifest {
         crate::options::tests::manifest_with_kernel_cache(kernel_cache)
@@ -289,9 +323,10 @@ mod tests {
                 retire: Box::new(move |report| {
                     events.borrow_mut().push(match report {
                         WorkerReport::Reported => "prepare waited for",
+                        WorkerReport::Ended => "prepare waited for its end",
                         WorkerReport::Unreported => "prepare killed",
                     });
-                    Ok(())
+                    Ok(WorkerEnd::Unobserved)
                 }) as Retire<'a>,
             })
         }
@@ -392,8 +427,9 @@ mod tests {
 
     /// A Prepare that fails, is killed, or cannot be started never fails the
     /// load: its process is still retired first, and the load serves
-    /// canonical defaults. One that reported its failure is waited for; one
-    /// that reported nothing is killed.
+    /// canonical defaults. One that reported its failure is waited for, as
+    /// is one whose stream ended without an outcome, which only its
+    /// process's end closes.
     #[test]
     fn an_unfinished_prepare_leaves_the_load_to_canonical_defaults() {
         let failure = LoadError::Internal {
@@ -407,7 +443,7 @@ mod tests {
                 }],
                 "prepare waited for",
             ),
-            (Vec::new(), "prepare killed"),
+            (Vec::new(), "prepare waited for its end"),
         ] {
             let (missing, events) = (Cell::new(true), RefCell::new(Vec::new()));
             let (loaded, preparation) = load_prepared(
@@ -449,18 +485,39 @@ mod tests {
     fn a_worker_that_reported_is_waited_for_and_one_that_did_not_is_killed() {
         let shell = |script: &str| Command::new("/bin/sh").args(["-c", script]).spawn().unwrap();
         // Still running when its host retires it: it finishes on its own.
+        let code = |end: WorkerEnd| match end {
+            WorkerEnd::Exited(status) => status.code(),
+            end => panic!("{end:?}"),
+        };
         let reported = ended(shell("sleep 0.3; exit 7"), WorkerReport::Reported).unwrap();
-        assert_eq!(reported.code(), Some(7));
-        // No outcome: it is ended, by a signal.
+        assert_eq!(code(reported), Some(7));
+        // No outcome: it is ended, by its host.
         let unreported = ended(shell("sleep 60"), WorkerReport::Unreported).unwrap();
-        assert_eq!(unreported.code(), None);
+        assert_eq!(unreported, WorkerEnd::Stopped);
         // One that reported nothing and is already gone is left as it ended.
         let mut gone = shell("exit 3");
         while gone.try_wait().unwrap().is_none() {
             std::thread::yield_now();
         }
         let gone = ended(gone, WorkerReport::Unreported).unwrap();
-        assert_eq!(gone.code(), Some(3));
+        assert_eq!(code(gone), Some(3));
+    }
+
+    /// A Prepare worker killed before it reported (as the system kills one
+    /// under memory pressure) is a worker lost whose reason names the signal
+    /// that ended it: a kill leaves no other trace, no diagnostics and no
+    /// exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_prepare_worker_killed_names_its_signal() {
+        // It takes the host's request into its pipe, then kills itself.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.5; kill -9 $$"]);
+        let preparation = prepare(&manifest(Some("kernels".into())), || start_worker_process(command), |_| {}).unwrap();
+        let Preparation::Incomplete(LoadError::WorkerLost { reason }) = preparation else {
+            panic!("a killed Prepare is a worker lost: {preparation:?}");
+        };
+        assert!(reason.contains("SIGKILL"), "the reason names the signal: {reason}");
     }
 
     /// Without a kernel cache no record can cross to the load's process:

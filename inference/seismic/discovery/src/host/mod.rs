@@ -91,6 +91,26 @@ pub(crate) fn status(sampler: &HostSampler) -> Result<HostStatus, ObservationErr
     sampler.status(platform::sample()?)
 }
 
+/// Host RAM this process can take now above the kernel's own line: one
+/// reading's [`HostStatus::allocatable_bytes`] less its
+/// [`HostStatus::free_target`], no sampler started. What a one-off taker of
+/// host RAM that must not press the host bounds itself by.
+pub fn host_room() -> Result<u64, ObservationError> {
+    let sample = platform::sample()?;
+    let status = HostStatus {
+        allocatable: sample.allocatable,
+        obtainable: sample.obtainable,
+        limits: sample.limits,
+        limit_visibility: sample.limit_visibility,
+        displacement: None,
+        kernel_pressure: sample.kernel_pressure,
+        free_target: sample.free_target,
+        held: sample.held,
+        displaced_bytes: sample.displaced_bytes,
+    };
+    Ok(status.allocatable_bytes().saturating_sub(status.free_target.unwrap_or(0)))
+}
+
 /// The cadence the host's displacement counters are sampled at: the 1 s
 /// samples of the M1 Ultra traces the memory policy's distress rules were
 /// judged on. Every displacement window is about this long however often a

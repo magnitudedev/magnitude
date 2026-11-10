@@ -1289,7 +1289,7 @@ fn enqueue_kernel(
     params: &mut [*mut std::ffi::c_void; 1],
 ) -> Result<(), TargetError> {
     let status = unsafe {
-        context.issuing().map_err(unavailable)?.launch(false, function, grid, block, 0, stream.raw(), params.as_mut_ptr(), std::ptr::null_mut())
+        context.enqueue().launch(false, function, grid, block, 0, stream.raw(), params.as_mut_ptr(), std::ptr::null_mut())
     };
     context.driver.check(status, "profile probe launch").map_err(unavailable)?;
     Ok(())
@@ -1808,7 +1808,7 @@ fn acquire_core_services(
         "probe_device_copy",
         || unsafe {
             context.driver.check(
-                context.issuing()?.memcpy_device_async(
+                context.enqueue().memcpy_device_async(
                     transfer_destination.pointer,
                     transfer_source.pointer,
                     bytes,
@@ -1827,7 +1827,7 @@ fn acquire_core_services(
         "probe_device_fill",
         || unsafe {
             context.driver.check(
-                context.issuing()?.memset_d8_async(transfer_source.pointer, 0, bytes, stream.raw()),
+                context.enqueue().memset_d8_async(transfer_source.pointer, 0, bytes, stream.raw()),
                 "profile device fill",
             )
         },

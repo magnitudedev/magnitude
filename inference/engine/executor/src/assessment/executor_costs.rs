@@ -2253,11 +2253,12 @@ impl Route {
             .collect::<BTreeMap<_, _>>();
         // Every path held is released whatever fails: the limits set before
         // a failure to set one, and after the allocation.
+        let bounds = device.bounds();
         let mut held = Vec::with_capacity(self.passed.len());
         let mut holding = Ok(());
         for path in &self.passed {
             let charged = charges.get(path).copied().unwrap_or(0);
-            holding = device.bound(seismic::Ledger::Path(*path), Some(charged));
+            holding = bounds.bound(seismic::Ledger::Path(*path), Some(charged));
             if holding.is_err() {
                 break;
             }
@@ -2269,7 +2270,7 @@ impl Route {
         let released = held
             .iter()
             .fold(Ok(()), |released, path| {
-                released.and(device.bound(seismic::Ledger::Path(*path), None))
+                released.and(bounds.bound(seismic::Ledger::Path(*path), None))
             })
             .map_err(|cause| error(&cause));
         let tensors = allocated?;
@@ -2478,7 +2479,7 @@ impl Backings {
         operands: [Operand; N],
     ) -> Result<[Vec<Tensor>; N], ExecutorCostsError> {
         let error = failed("rotated operands");
-        let largest = device.info().limits().max_allocation.value;
+        let largest = device.info().limits().max_allocation.bytes();
         let index = match self
             .routes
             .iter()
@@ -3754,7 +3755,7 @@ fn walk<T: Times>(
 ) -> Result<Walked<T::Missing>, Stop<T::Missing>> {
     let backend = executor.backend();
     let formats = &measured_formats(backend);
-    let largest = executor.limits().max_allocation.value;
+    let largest = executor.limits().max_allocation.bytes();
     let chain = chain_element(backend).ok_or_else(|| {
         Stop::Failed(ExecutorCostsError(format!(
             "{CHAIN_FORMAT:?} has no resident form on {}",
@@ -4996,7 +4997,7 @@ impl ExecutorCosts {
         executor: &Executor,
     ) -> Result<(u64, u64), ExecutorCostsError> {
         let backend = executor.backend();
-        let largest = executor.limits().max_allocation.value;
+        let largest = executor.limits().max_allocation.bytes();
         let chain = chain_element(backend).ok_or_else(|| {
             ExecutorCostsError(format!("{CHAIN_FORMAT:?} has no resident form on {}", backend.as_str()))
         })?;

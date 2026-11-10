@@ -351,6 +351,20 @@ fn submit_claimed(
         .unwrap_or_else(|failure| panic!("claim failed: {}", failure.error()))
 }
 
+/// A group opened while a step of the bank runs keeps the places it holds:
+/// the bank takes a group's places only between flights, so the handover
+/// waits for a group opened in a gap, which takes them
+/// (`a_group_takes_the_places_its_plan_holds`).
+#[test]
+fn a_group_opened_beside_a_running_step_keeps_its_places() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
+        measure_load(&mut domain, &mut bindings);
+        domain.family.bank.as_ref().unwrap().running_steps(1);
+        assert_eq!(group_places_opened((domain, bindings)), 1, "{backend:?}: the handover waits for a gap");
+    }
+}
+
 /// A group of no operations opens no chain and provisions nothing, whatever
 /// chain capacity the load has.
 #[test]
@@ -971,21 +985,75 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
         // What a growth may take: the free headroom's room, which a growth's
         // claim reads.
         let available = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
-        let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap();
+        let held = domain.memory.borrow_mut().claim_demand(heap::reserved(device, available - 5 * row / 2), 0, HoldingClass::Live, 0).unwrap();
         let room = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
         assert!(
             matches!(
-                domain.memory.borrow_mut().claim_reserved(device, room + 1, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0),
+                domain.memory.borrow_mut().claim_demand(heap::reserved(device, room + 1), 0, HoldingClass::Live, 0),
                 Err(ClaimRefusal::Deficit { .. })
             ),
             "one byte past the room is refused"
         );
-        let claim = domain.memory.borrow_mut().claim_reserved(device, room, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap();
+        let claim = domain.memory.borrow_mut().claim_demand(heap::reserved(device, room), 0, HoldingClass::Live, 0).unwrap();
         domain.memory.borrow_mut().release(claim);
         assert!(device_pays(&mut domain));
         assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "within the room");
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }), "two slots of the room");
         domain.memory.borrow_mut().release(held);
+    }
+}
+
+/// A settle's grant whose claim the heap's room falls short of (as the
+/// settle read memory a moment before the claim's fresh reading, short by
+/// 53 MB of a 2.4 GB grant on Flash Next q4) grows as far as the claim
+/// admits: the most of its steps the room holds, not none.
+#[test]
+fn a_grant_the_room_falls_short_of_grows_as_far_as_its_claim_admits() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        let row = bank_row(&domain);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
+        domain.probe_memory().unwrap();
+        let grant = domain.settle_memory(&OwnerHoldings::default()).unwrap().grants[0].clone();
+        assert_eq!((grant.from, grant.to), (1, 4), "the settle grants every slot");
+        assert!(grant.steps.len() > 1, "the grant moves the bank by its slots: {:?}", grant.steps);
+        // Room for all but half a slot of the grant.
+        let device = crate::planning::BankTier::Bank;
+        let available = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
+        let held = domain
+            .memory
+            .borrow_mut()
+            .claim_demand(heap::reserved(device, available - (grant.bytes - row / 2)), 0, HoldingClass::Live, 0)
+            .unwrap();
+        assert_eq!(domain.grow_expert_bank(&grant, unwatched()).unwrap(), BankStep::Begun(device), "the claim admits two of three slots");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }));
+        domain.memory.borrow_mut().release(held);
+    }
+}
+
+/// A growth no room holds now is no decision: once memory frees, the next
+/// settle grants it again and the bank grows.
+#[test]
+fn a_growth_refused_for_room_grows_once_room_frees() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        let row = bank_row(&domain);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
+        domain.probe_memory().unwrap();
+        let grant = domain.settle_memory(&OwnerHoldings::default()).unwrap().grants[0].clone();
+        // Another program takes all but half a slot of the room.
+        let device = crate::planning::BankTier::Bank;
+        let available = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
+        let held = domain
+            .memory
+            .borrow_mut()
+            .claim_demand(heap::reserved(device, available - row / 2), 0, HoldingClass::Live, 0)
+            .unwrap();
+        assert!(matches!(domain.grow_expert_bank(&grant, unwatched()), Err(DomainError::Capacity(_))), "not one slot fits");
+        domain.memory.borrow_mut().release(held);
+        domain.settle_again();
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(device), "the freed room grows the bank");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, .. }));
     }
 }
 
@@ -1117,6 +1185,7 @@ fn a_full_device_leaves_the_host_stores_room() {
     let domain = |role, ceiling| DomainPace {
         role,
         headroom: ceiling,
+        basis: crate::platform::ShownBasis::Headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
         charged: 0,
         band: MemoryBand::Normal,
@@ -1567,7 +1636,7 @@ fn a_paying_growth_stops_at_the_line() {
         // which `available` reads: the free space of the device's blocks serves
         // none of them.
         let leaving = |domain: &ExecutorDomain<TestFamily>, left: u64| {
-            domain.memory.borrow_mut().claim_reserved(kind, available - left, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap()
+            domain.memory.borrow_mut().claim_demand(heap::reserved(kind, available - left), 0, HoldingClass::Live, 0).unwrap()
         };
         let held = leaving(&domain, step / 2);
         assert!(matches!(
@@ -1697,6 +1766,7 @@ fn read_pace_at(
         role: DomainRole::Allocation,
         domain: store,
         headroom_bytes: headroom,
+        shown: crate::platform::Shown::headroom(headroom),
         identity: topology.store_identity(topology.host_ram().id()).unwrap(),
         constraint: crate::platform::MemoryConstraint::HostRam,
         thresholds,
@@ -1816,6 +1886,114 @@ fn a_transient_fall_sets_no_take_past_its_window() {
     read(&mut pace, 51, 8 * PACE_GB);
     assert_eq!(pace.domains[&store].rate, 0.0, "the window holds no fall once flat for it");
     assert!(pace.motions().host.is_none(), "a take that stopped sets no margin");
+}
+
+/// The load's own release is no other program's take: its charge drops at
+/// once, and the host shows it only later, its witness (on Metal the
+/// host's wired count, which the driver's unwiring lowers as free memory
+/// rises) falling by it in the reading the headroom rises by it. With
+/// nothing else moving, the pace reads no take before, across or after
+/// that lag, so no sustained take `s` raises the line over the load's
+/// release latency. A 4 GB release shown half a second late, as a
+/// Flash Next bank's 63→36 slot release on a 48 GB M4 Pro.
+#[test]
+fn a_release_of_the_loads_own_is_no_take() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    for reading in 0..60u32 {
+        let (charged, shown) = match reading {
+            0..20 => (20 * PACE_GB, false),
+            20..25 => (16 * PACE_GB, false),
+            _ => (16 * PACE_GB, true),
+        };
+        let (headroom, witness) = if shown { (34 * PACE_GB, 16 * PACE_GB) } else { (30 * PACE_GB, 20 * PACE_GB) };
+        read_pace_at(&mut pace, store, headroom, charged, Some(witness), start + READING_INTERVAL * reading, 4 * PACE_GB);
+        assert_eq!(pace.domains[&store].rate, 0.0, "reading {reading}: the release is the load's own");
+        assert!(pace.motions().host.is_none(), "reading {reading}: nothing else moved");
+    }
+}
+
+/// The load's own line moving alone is no other program's take, whichever
+/// figure the host reads: while the expert bank holds borrowed room, host
+/// RAM's headroom is the line plus what is lent, so it rises and falls with
+/// the line, and the pace reads the host's obtainable memory instead. On a
+/// 48 GB M4 Pro beside a 25 GB holder, a line alternating by half a GB a
+/// reading and climbing read as takes off that headroom: the margin raised
+/// the line, and the headroom with it, to 51 GB at 0.45 GB apart, 260
+/// readings in Reclaim, and the bank's growth refused with 18 GB free.
+#[test]
+fn a_line_moving_alone_under_borrowed_room_is_no_take() {
+    let topology = seismic::Devices::discover(&[]).unwrap().topology();
+    let store = topology.host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    const LENT: u64 = PACE_GB / 2;
+    const OBTAINABLE: u64 = 36 * PACE_GB;
+    for at in 0..60u32 {
+        let planning = 5 * PACE_GB + u64::from(at % 2) * PACE_GB / 2 + u64::from(at) * PACE_GB / 10;
+        let thresholds = crate::platform::DomainThresholds { planning_bytes: planning, emergency_bytes: 2 * PACE_GB };
+        let headroom = OBTAINABLE.min(planning + LENT);
+        let reading = DomainReading {
+            role: DomainRole::Allocation,
+            domain: store,
+            headroom_bytes: headroom,
+            shown: crate::platform::Shown::obtainable(OBTAINABLE),
+            identity: topology.store_identity(store).unwrap(),
+            constraint: crate::platform::MemoryConstraint::HostRam,
+            thresholds,
+            ceiling_bytes: thresholds.ceiling(headroom),
+            distress: None,
+            held: None,
+            displacement: None,
+            borrowable_bytes: Some(OBTAINABLE),
+            displacing: false,
+            band: MemoryBand::Normal,
+        };
+        let releasable = crate::platform::Releasable { host: 4 * PACE_GB, device: 0 };
+        pace.observe(&[reading], &[(store, 12 * PACE_GB)], Some(12 * PACE_GB), true, releasable, pace_release(), start + READING_INTERVAL * at);
+        assert_eq!(pace.domains[&store].rate, 0.0, "reading {at}: the line is the load's own");
+        assert_eq!(pace.domains[&store].fluctuation.largest, 0, "reading {at}");
+        assert!(pace.motions().host.is_none(), "reading {at}: nothing else moved");
+    }
+}
+
+/// Readings of two of the host's figures measure no motion between them: a
+/// bank that gives back its borrowed room reads allocatable memory again,
+/// far below what was obtainable, and no take follows.
+#[test]
+fn a_change_of_the_hosts_figure_is_no_take() {
+    let topology = seismic::Devices::discover(&[]).unwrap().topology();
+    let store = topology.host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    for at in 0..40u32 {
+        let (headroom, shown) = match at {
+            0..20 => (6 * PACE_GB, crate::platform::Shown::obtainable(36 * PACE_GB)),
+            _ => (20 * PACE_GB, crate::platform::Shown::headroom(20 * PACE_GB)),
+        };
+        let thresholds = crate::platform::DomainThresholds { planning_bytes: 5 * PACE_GB, emergency_bytes: 2 * PACE_GB };
+        let reading = DomainReading {
+            role: DomainRole::Allocation,
+            domain: store,
+            headroom_bytes: headroom,
+            shown,
+            identity: topology.store_identity(store).unwrap(),
+            constraint: crate::platform::MemoryConstraint::HostRam,
+            thresholds,
+            ceiling_bytes: thresholds.ceiling(headroom),
+            distress: None,
+            held: None,
+            displacement: None,
+            borrowable_bytes: None,
+            displacing: false,
+            band: MemoryBand::Normal,
+        };
+        let releasable = crate::platform::Releasable { host: 4 * PACE_GB, device: 0 };
+        pace.observe(&[reading], &[(store, 12 * PACE_GB)], Some(12 * PACE_GB), true, releasable, pace_release(), start + READING_INTERVAL * at);
+        assert_eq!(pace.domains[&store].rate, 0.0, "reading {at}");
+        assert!(pace.motions().host.is_none(), "reading {at}");
+    }
 }
 
 /// A take that sustains reads as itself: another program taking 2 GB/s in
@@ -1961,6 +2139,7 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
     let domain = |headroom| DomainPace {
         role: DomainRole::Allocation,
         headroom,
+        basis: crate::platform::ShownBasis::Headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
         charged: 0,
         band: MemoryBand::Normal,
@@ -2012,6 +2191,7 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
         prepared: at(released),
         installed: at(released),
         released: at(released),
+        unpinned: std::time::Duration::ZERO,
     };
     const GB: u64 = 1_000_000_000;
     let ms = std::time::Duration::from_millis;
@@ -2025,6 +2205,49 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
     assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
     pace.released(GB, &times(300, 400));
     assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
+}
+
+/// The load's own release, however long it took, never raises the line
+/// its next reading is judged at while no other program moves: the line
+/// that decides the next release is not one this release drove. On a
+/// 48 GB M4 Pro, Flash Next's bank released 63→36 slots with an 80 ms
+/// latency and 36→20 with 198 ms; at the page-fill rate over each latency
+/// the host line rose from 3.79 GB to 9.90 GB, past the 9.46 GB the
+/// releases freed, and the load unloaded for its own releases.
+#[test]
+fn a_slow_release_of_the_loads_own_leaves_its_line_where_it_was() {
+    let (mut heap, _press) = pressed_heap(seismic::BackendName::Cpu);
+    let host_line = |heap: &mut DeviceHeap| {
+        heap.refresh(0)
+            .unwrap()
+            .into_iter()
+            .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
+            .expect("the host's RAM is read")
+            .thresholds
+            .planning_bytes
+    };
+    let before = host_line(&mut heap);
+    let start = Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
+    let times = |decided, released| crate::domain::ResizeTimes {
+        decided: at(decided),
+        queued: Default::default(),
+        planned: Default::default(),
+        trips: Default::default(),
+        moves: Default::default(),
+        prepared: at(released),
+        installed: at(released),
+        released: at(released),
+        unpinned: std::time::Duration::ZERO,
+    };
+    let mut pace = MemoryPace::new();
+    let releasable = crate::platform::Releasable { host: 4_000_000_000, device: 0 };
+    for (decided, released) in [(0, 80), (1_000, 1_198)] {
+        pace.released(1_350_205_440, &times(decided, released));
+        let motions = pace.motions();
+        heap.measure(motions.host, motions.device, motions.latency, motions.release, releasable);
+        assert_eq!(host_line(&mut heap), before, "released over {} ms", released - decided);
+    }
 }
 
 /// A shrink's wait for the steps queued on the device is latency, never
@@ -2047,6 +2270,7 @@ fn a_release_rate_excludes_its_wait_for_queued_steps() {
         prepared: released,
         installed: released,
         released,
+        unpinned: std::time::Duration::ZERO,
     };
     const TABLE: u64 = 18_874_368;
     let mut pace = MemoryPace::new();
@@ -2076,6 +2300,7 @@ fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
     let domain = |host: bool, rate: f64, fluctuation: u64| DomainPace {
         role: DomainRole::Allocation,
         headroom: 0,
+        basis: crate::platform::ShownBasis::Headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
         charged: 0,
         band: MemoryBand::Normal,
@@ -3524,6 +3749,7 @@ fn the_supply_reads_the_latest_probe() {
     let pace_of = |headroom: u64, takes: u32| DomainPace {
         role: DomainRole::Allocation,
         headroom,
+        basis: crate::platform::ShownBasis::Headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 2 * GB, emergency_bytes: GB },
         charged: 0,
         band: if headroom > 2 * GB { MemoryBand::Normal } else { MemoryBand::Reclaim },

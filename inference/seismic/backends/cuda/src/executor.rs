@@ -294,13 +294,8 @@ impl Backing for ReservedMemory {
         if stale.is_empty() {
             return Ok(());
         }
-        time_backing(BackingPhase::Zero, || self.zero(stale)).inspect_err(|error| {
-            // Nothing is published: restore the old prefix so its backing
-            // and charge agree.
-            self.commit(start).unwrap_or_else(|rollback| {
-                panic!("CUDA resize zero failed ({error}); backing rollback failed ({rollback})")
-            });
-        })
+        // Nothing is published: the new granules are retracted.
+        time_backing(BackingPhase::Zero, || self.zero(stale)).inspect_err(|_| self.retract(from, to))
     }
 
     /// Unmap the granules from `from`, the tail. Driver failures after the
@@ -309,6 +304,19 @@ impl Backing for ReservedMemory {
     fn unback(&self, from: usize, to: usize) {
         if from < to {
             self.commit(from * self.granularity).expect("a CUDA reservation unmaps what it backs");
+        }
+    }
+
+    /// Registered host granules stay registered and charged, uncommitted
+    /// (their unregistration waits for the device, beside the growth's
+    /// flights); created granules are unmapped.
+    fn retract(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        match self.registered() {
+            Some(registered) => registered.uncommit(from),
+            None => self.unback(from, to),
         }
     }
 
@@ -329,7 +337,7 @@ impl Backing for ReservedMemory {
         let context = self.context();
         {
             let _current = context.enter().map_err(submission_error)?;
-            let status = unsafe { context.issuing().map_err(submission_error)?.memset_d8_async(pointer, 0, length, self.stream.raw()) };
+            let status = unsafe { context.enqueue().memset_d8_async(pointer, 0, length, self.stream.raw()) };
             context.driver.check(status, "reservation zero fill").map_err(submission_error)?;
         }
         self.stream.synchronize().map_err(submission_error)
@@ -513,7 +521,7 @@ impl Submission {
     /// its buffer's copy spans ([`Submission::fill`]).
     fn fill_piece(
         &self,
-        issue: &crate::registered::issue::Issuing<'_>,
+        issue: &crate::enqueue::Enqueue,
         pointer: u64,
         value: FillValue,
         bytes: u64,
@@ -793,7 +801,7 @@ impl Submission {
         let source = env.resolve_view(source)?;
         let destination = env.resolve_view(destination)?;
         let _current = self.device.context.enter().map_err(submission_error)?;
-        let issue = self.device.context.issuing().map_err(submission_error)?;
+        let issue = self.device.context.enqueue();
         // No copy crosses a host reservation's granule (`copy_pieces`).
         for (from, to, piece) in crate::buffer::copy_pieces(
             source.buffer,
@@ -834,11 +842,11 @@ impl Submission {
             panic!("prepared CUDA fill is not element aligned")
         }
         let _current = self.device.context.enter().map_err(submission_error)?;
-        let issue = self.device.context.issuing().map_err(submission_error)?;
+        let issue = self.device.context.enqueue();
         // No fill crosses a host reservation's granule (`fill_pieces`); a
         // granule is whole elements, so each piece is.
         for (offset, piece) in crate::buffer::fill_pieces(destination.buffer, destination.byte_offset, bytes) {
-            self.fill_piece(&issue, destination.buffer.pointer() + offset, value, piece)?;
+            self.fill_piece(issue, destination.buffer.pointer() + offset, value, piece)?;
         }
         Ok(())
     }
@@ -899,7 +907,7 @@ fn launch(
     let context = &kernel.module.context;
     let _current = context.enter().map_err(submission_error)?;
     let status = unsafe {
-        context.issuing().map_err(submission_error)?.launch(
+        context.enqueue().launch(
             mode == CudaLaunchMode::CooperativeGrid,
             kernel.function,
             grid,

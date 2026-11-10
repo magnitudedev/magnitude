@@ -714,6 +714,14 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     settles: std::cell::Cell<u64>,
 }
 
+/// A gap between flights the domain saw: no step of the expert bank runs
+/// (`ElasticBank::in_gap`), so a group's places may be handed to it
+/// (`ProgramFamily::hold_group`). Only the domain makes one
+/// ([`ExecutorDomain::quiet`]); steps begin only on its thread, so one it
+/// holds stays true until it begins a step.
+#[derive(Clone, Copy, Debug)]
+pub struct Quiet(());
+
 impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
     /// The queued steps are the one device work the domain owns: each is
     /// waited for and dropped before any field, so its waits on a streamed
@@ -1018,6 +1026,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.expert_measures().map(|measures| &measures.pass)
     }
 
+    /// A gap between flights ([`Quiet`]): none while a step of the expert
+    /// bank runs; always without a bank.
+    fn quiet(&self) -> Option<Quiet> {
+        self.family.expert_bank().is_none_or(|bank| bank.in_gap()).then_some(Quiet(()))
+    }
+
     /// The epoch a launch submitted now is timed across ([`LaunchEpoch`]);
     /// none while an expert bank resize runs.
     fn launch_epoch(&self) -> Option<LaunchEpoch> {
@@ -1136,7 +1150,8 @@ impl<'d> MemoryProbe<'d> {
     /// [`ExecutorDomain::probe_memory`], beside `bank`: a reading taken now.
     fn probe(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
         let readings = self.observe(bank)?;
-        self.observed(bank, readings, || self.memory.borrow().footprint(), Instant::now())
+        let at = self.memory.borrow().now();
+        self.observed(bank, readings, || self.memory.borrow().footprint(), at)
     }
 
     /// [`Self::probe`] of the periodic reading published since the last
@@ -1463,6 +1478,9 @@ struct PaceMotions {
 struct DomainPace {
     role: DomainRole,
     headroom: u64,
+    /// Which of the host's figures the reading's `untaken` read
+    /// ([`crate::platform::Shown`]).
+    basis: crate::platform::ShownBasis,
     /// The planning and emergency reserves: the line a load reads Reclaim
     /// at, and the headroom it must not run into.
     thresholds: DomainThresholds,
@@ -1574,7 +1592,12 @@ enum Shortfall {
     /// At or above the planning line.
     Above,
     /// Below it by no more than what the process released, which the host
-    /// has yet to show; or in distress above it: nothing to release.
+    /// has yet to show; or in Reclaim with nothing below it, the hold that
+    /// neither grows nor releases: headroom exactly at the line (no claim
+    /// may take more, and a release would only be grown back into), room
+    /// borrowed with nothing left lent (which reads at the line: a release
+    /// would be lent again and taken back), or the host in distress above
+    /// it (no measure says anything is owed).
     Covered,
     /// These bytes short beyond what the process released.
     Short(u64),
@@ -1658,7 +1681,11 @@ impl MemoryPace {
                 "memory read"
             );
             let mut before = self.domains.remove(&reading.domain);
-            let shown = reading.headroom_bytes.saturating_add(charged);
+            // The host's own figure, apart from every line of the load's
+            // (`platform::Shown`): a headroom derived from the load's line
+            // moves with it, and would read its motion as another program's.
+            let basis = reading.shown.basis();
+            let shown = reading.shown.bytes().saturating_add(charged);
             let witness = host.filter(|_| reading.identity == seismic::StoreIdentity::HostRam);
             let unseen = match (reading.band, &before) {
                 (MemoryBand::Reclaim, Some(before)) => {
@@ -1687,8 +1714,10 @@ impl MemoryPace {
             // take low, never invent one; a span across which the charge
             // changed restarts the history.
             let host_ram = reading.identity == seismic::StoreIdentity::HostRam;
-            let untaken = witness.map_or(shown, |held| reading.headroom_bytes.saturating_add(held));
-            let restarts = witness.is_none() && before.as_ref().is_some_and(|before| before.charged != charged);
+            let untaken = witness.map_or(shown, |held| reading.shown.bytes().saturating_add(held));
+            // Readings of different figures measure no motion between them.
+            let rebased = before.as_ref().is_some_and(|before| before.basis != basis);
+            let restarts = rebased || witness.is_none() && before.as_ref().is_some_and(|before| before.charged != charged);
             let releasable = match reading.identity {
                 seismic::StoreIdentity::HostRam => releasable.host,
                 _ => releasable.device,
@@ -1723,7 +1752,7 @@ impl MemoryPace {
                 MemoryBand::Reclaim => Fluctuation::default(),
                 MemoryBand::Normal => {
                     let mut fluctuation = before.map(|before| before.fluctuation).unwrap_or_default();
-                    fluctuation.read(untaken, charged, settled);
+                    fluctuation.read(untaken, charged, settled && !rebased);
                     fluctuation
                 }
             };
@@ -1732,6 +1761,7 @@ impl MemoryPace {
                 DomainPace {
                     role: reading.role,
                     headroom: reading.headroom_bytes,
+                    basis,
                     thresholds: reading.thresholds,
                     charged,
                     band: reading.band,

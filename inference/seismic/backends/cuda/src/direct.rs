@@ -686,7 +686,7 @@ impl Wake {
         let context = writer.context();
         let wakes = writer.wakes().map_err(submission)?.raw();
         let _current = context.enter().map_err(submission)?;
-        let issue = context.issuing().map_err(submission)?;
+        let issue = context.enqueue();
         // SAFETY: both handles are this context's; the event may be
         // destroyed once the wait is queued, and the wake's reference is the
         // host function's to release.
@@ -859,7 +859,7 @@ impl DirectBatch {
         let _current = context.enter().map_err(submission)?;
         // SAFETY: the stream and the event are this context's, and the end
         // event was recorded when its submission committed.
-        let status = unsafe { context.issuing().map_err(submission)?.stream_wait_event(self.stream.raw(), other.end.raw()) };
+        let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), other.end.raw()) };
         context.driver.check(status, "cross-stream wait").map_err(submission)
     }
 
@@ -886,7 +886,7 @@ impl DirectBatch {
         let mut parameters = formed.parameters();
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
-        let issue = context.issuing().map_err(submission)?;
+        let issue = context.enqueue();
         let driver = &context.driver;
         let status = unsafe {
             issue.launch(
@@ -900,7 +900,6 @@ impl DirectBatch {
                 std::ptr::null_mut(),
             )
         };
-        drop(issue);
         driver
             .check(status, "native kernel launch")
             .map_err(submission)
@@ -936,11 +935,11 @@ impl DirectBatch {
         word: &HostWord,
         value: u32,
         flags: u32,
-        operation: impl FnOnce(&crate::registered::issue::Issuing<'_>, Handle, u64, u32, std::ffi::c_uint) -> Option<std::ffi::c_int>,
+        operation: impl FnOnce(&crate::enqueue::Enqueue, Handle, u64, u32, std::ffi::c_uint) -> Option<std::ffi::c_int>,
     ) -> Result<(), ExecutionError> {
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
-        let status = operation(&context.issuing().map_err(submission)?, self.stream.raw(), word.mapped.device, value, flags)
+        let status = operation(context.enqueue(), self.stream.raw(), word.mapped.device, value, flags)
             .ok_or_else(|| {
                 ExecutionError::SubmissionFailed(
                     "the CUDA driver predates driver API 11.7 stream memory operations".into(),

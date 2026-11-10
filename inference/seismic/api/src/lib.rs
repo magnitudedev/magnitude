@@ -38,6 +38,20 @@ pub mod testing {
         TEST_SETUP_UNCHECKED as SETUP_UNCHECKED,
     };
 
+    /// Open executor `id` of `devices` with `options` as a device of its
+    /// own, sharing no ledger with another open: a test's, beside other
+    /// tests in one process, bounds its ledgers alone.
+    #[cfg(feature = "fixtures")]
+    pub fn open_own_ledgers(devices: &super::Devices, id: super::ExecutorId, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
+        devices.inner.open_own_ledgers(id, options).map(|inner| super::Device { inner })
+    }
+
+    /// [`open_own_ledgers`] of the first executor of `backend`.
+    #[cfg(feature = "fixtures")]
+    pub fn open_backend_own_ledgers(devices: &super::Devices, backend: BackendName, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
+        open_own_ledgers(devices, devices.inner.executor_of(backend)?, options)
+    }
+
     /// The executor a test runs `backend` on: the first available one of
     /// it in `topology`, where the runner requests `backend` or none. A
     /// test runs on each backend this names one for, and fails where it
@@ -53,6 +67,7 @@ pub mod testing {
     }
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions, MemoryStore};
+pub use seismic_runtime::api::device::Bounds;
 pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.
@@ -245,7 +260,7 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, pin, place_process, volume_available, volume_identity, Core, DeviceNode,
+    device_node, host_room, pin, place_process, volume_available, volume_identity, Core, DeviceNode,
     DiscoveryError, DisplacementWindow, HostDisplacement, HostHeld, HostStatus, Inventory,
     KernelPressure, LimitVisibility, MemoryNode, ObservationError, PciLocation, ProcessLimitKind,
     ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus, Sample, Status,
@@ -264,8 +279,8 @@ pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
-    AccessPath, AccessPathId, Availability, Contract, DeviceMemory, DeviceTopology, Diagnostic,
-    DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
+    AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, Contract, DeviceMemory, DeviceTopology,
+    Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
     Kind, KindId, KindMemory, Limits, NativeKind, Obtained, Packing, PhysicalDevice,
     PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy, Reservation,
     ReservationCharges, ReservationChunks, ReservedContract, ReservedRecords, Revision, Placing, Store, StoreId,
@@ -371,6 +386,13 @@ impl Devices {
     /// hold.
     pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
         self.inner.status(topology, executor)
+    }
+
+    /// The status of opened `device`, with what the devices of its ledger
+    /// scope hold: as [`Self::status`] reads it for every open of the
+    /// product.
+    pub fn device_status(&self, device: &Device) -> Status {
+        self.inner.device_status(&device.inner)
     }
 
     /// What executor `id`'s recorded graphs hold for their census
@@ -531,10 +553,12 @@ impl Device {
     pub fn device_ledger(&self) -> DeviceLedgerView {
         self.inner.device_ledger()
     }
-    /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
-    /// revokes what is charged.
-    pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
-        self.inner.bound(ledger, bound)
+    /// The right to bound every ledger this device reaches
+    /// ([`Bounds::bound`]): one live holder per ledger. Taking it while
+    /// another holder lives panics, naming both.
+    #[track_caller]
+    pub fn bounds(&self) -> Bounds {
+        self.inner.bounds()
     }
     /// Start the high-water mark of each of the device's own ledgers again
     /// from what it charges now: the next reading is the most charged since

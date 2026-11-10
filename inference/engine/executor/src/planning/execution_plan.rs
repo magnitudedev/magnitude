@@ -461,6 +461,18 @@ impl ExecutionPlanDraft {
         })
     }
 
+    /// A load's experts streamed, whatever whole form the stable room
+    /// holds them in: what a load whose import claim refuses its whole plan
+    /// streams from ([`Unplaced::streamed`]), its bank then fitted by that
+    /// claim. A load whose experts cannot stream is refused with why.
+    pub fn streaming<C: HeldCharge>(self, definition: &ModelDefinition, bound: Option<WeightBound>) -> Result<Unplaced<C>, PlanError> {
+        let capacity = self.device.assessment_capacity_bytes;
+        match self.bank_ceiling(definition, HeldBound::of(bound, capacity))? {
+            Ok(ceiling) => Ok(Unplaced { draft: self, ceiling, bound, held: HeldCharges::default() }),
+            Err(no) => Err(refusal(no, capacity)),
+        }
+    }
+
     /// How a load holds its experts under `bound` ([`HeldBound`]), the one
     /// decision a load and its assessment share, in two stages: placed
     /// whole where `room` holds them so ([`Self::place`]), from memory
@@ -996,6 +1008,13 @@ impl ExecutionPlanDraft {
         self.load.bank.as_ref().expect("a streamed plan holds its bank")
     }
 
+    /// The draft committing `slots` of its expert bank at the load, its
+    /// ceiling kept ([`ModelLoadPlan::with_load_slots`]): what the target
+    /// import's claim admits of the slots planned.
+    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
+        Ok(Self { load: self.load.with_load_slots(slots)?, ..self })
+    }
+
     pub fn admit(self, resources: ResourcePlan) -> Result<ExecutionPlan, PlanError> {
         let planned_weight_bytes = resources
             .bytes()
@@ -1021,6 +1040,12 @@ impl ExecutionPlanDraft {
 }
 
 impl ExecutionPlan {
+    /// The plan committing `slots` of its expert bank at the load, its
+    /// ceiling kept ([`ModelLoadPlan::with_load_slots`]).
+    pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
+        Ok(Self { load: self.load.with_load_slots(slots)?, ..self })
+    }
+
     pub fn device(&self) -> &PlannedDevice {
         &self.device
     }
@@ -1952,7 +1977,7 @@ impl ExecutionPlanner {
                 name: device.info.name().to_owned(),
                 assessment_capacity_bytes: device.assessment_capacity_bytes,
                 tensor_operations: device.info.forms_tensor_operations(),
-                max_allocation_bytes: device.info.limits().max_allocation.value,
+                max_allocation_bytes: device.info.limits().max_allocation.bytes(),
                 reservation: device
                     .info
                     .reserving(match &device.host_tier {
@@ -2987,5 +3012,68 @@ mod tests {
         let streamed = loaded.load().expert_bank().expect("an uncapped load larger than its machine streams its experts");
         assert!(streamed.slots < streamed.widest().get(), "{} of {} slots", streamed.slots, streamed.widest());
         assert!(streamed.pass > PassLaunches::FLOOR, "{:?} of {} places", streamed.pass, streamed.places);
+    }
+
+    /// A plan holding its experts whole, each in its own allocation, that
+    /// the memory free at its import cannot hold, streams them instead
+    /// ([`ExecutionPlanDraft::streaming`]): the import claim refuses the
+    /// whole plan and fits the streamed plan's bank, from its floor, into
+    /// the same room. A small routed model on the recorded M4 Pro, its
+    /// imports claimed from a heap that another program presses to midway
+    /// between the streamed floor's import and the whole plan's.
+    #[test]
+    fn a_whole_plan_the_import_cannot_hold_streams_its_bank_fitted_by_the_claim() {
+        use crate::memory::{ClaimDemand, HoldingClass};
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let (_, _, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let mut definition =
+            routed_fixture_definition(RoutedShape { layers: 8, experts: 64, selected: 4, hidden: 1024, intermediate: 512 });
+        definition.decoder.context_limit = 4096;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let whole = draft.held_whole(&definition).unwrap();
+        assert!(whole.load().expert_bank().is_none(), "the whole plan holds each expert in its own allocation");
+        let prices = Priced::Measured(crate::assessment::synthetic::plan_prices());
+        let streamed = draft
+            .streaming::<AssessmentMemoryCharge>(&definition, None)
+            .unwrap()
+            .streamed(&definition, &prices)
+            .unwrap()
+            .into_draft();
+        let bank = streamed.load().expert_bank().expect("the streamed plan banks its experts").clone();
+        // Each import's storage, claimed as device bytes of the test host's device.
+        let import = |load: &ModelLoadPlan| ClaimDemand { device: load.target_import_demand().unwrap().bytes(), ..ClaimDemand::default() };
+        let at = |slots: u64| Ok::<_, std::convert::Infallible>(import(&streamed.load().clone().with_load_slots(slots).unwrap()));
+        let (whole_bytes, floor_bytes) = (import(whole.load()).device, at(bank.floor()).unwrap().device);
+        assert!(floor_bytes < whole_bytes, "the streamed floor imports {floor_bytes} bytes, the whole plan {whole_bytes}");
+        let (mut heap, press) = crate::domain::fixtures::pressed_heap(BackendName::Cpu);
+        const MIB: u64 = 1 << 20;
+        let (room, claim) = heap
+            .claim_most(0, u64::MAX / MIB, |mib| Ok::<_, std::convert::Infallible>(ClaimDemand { device: mib * MIB, ..ClaimDemand::default() }), 0, HoldingClass::Model, crate::platform::FitMode::Live, 0)
+            .unwrap()
+            .unwrap();
+        heap.release(claim);
+        let target = floor_bytes + (whole_bytes - floor_bytes) / 2;
+        assert!(room * MIB > target, "the test host holds {target} bytes free");
+        press.take(room * MIB - target);
+        // The whole plan is refused for room ...
+        assert!(matches!(
+            heap.claim_most(0, 0, |_| Ok::<_, std::convert::Infallible>(import(whole.load())), 0, HoldingClass::Model, crate::platform::FitMode::Live, 0).unwrap(),
+            Err(crate::domain::ClaimRefusal::Deficit { .. })
+        ));
+        // ... and the streamed plan's bank is fitted into it.
+        let (slots, claim) = heap.claim_most(bank.floor(), bank.slots, &at, 0, HoldingClass::Model, crate::platform::FitMode::Live, 0).unwrap().unwrap();
+        assert!(at(slots).unwrap().device <= target, "{slots} slots of {} fit the {target} bytes left", bank.slots);
+        heap.release(claim);
     }
 }

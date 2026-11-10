@@ -6,11 +6,13 @@
 //! reading's settle, whose supply holds the reserve derived from the host's
 //! measured motion, with no wait beside it. The fixture's heap reads
 //! the host's memory as first sampled, moved only by what the process takes
-//! and gives back and by the test's press (`StillHost`). Each runs on every
-//! backend discovery reports available (`bank_backends`).
+//! and gives back and by the test's press (`StillHost`), each reading taken
+//! at the owner's time (`TestClock`), over which the pace measures the
+//! press. Each runs on every backend discovery reports available
+//! (`bank_backends`).
 
 use magnitude_executor::{
-    fixtures::{bank_backends, bank_row, banked, misses_at, press, price_growth, shrink_settled, TestFamily},
+    fixtures::{bank_backends, bank_row, banked, clock, misses_at, press, price_growth, shrink_settled, TestFamily},
     BankResize, ExpertResidency, ShrinkCause,
 };
 use magnitude_scheduler::{owner::Owner, ServiceLimits};
@@ -78,8 +80,8 @@ fn a_bank_shrunk_for_a_press_regrows_once_the_press_lets_go() {
         // The state's surplus is released already: the bank's is the rung
         // that answers the press.
         shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
-        let press = press(&domain);
-        let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes));
+        let (press, clock) = (press(&domain), clock(&domain));
+        let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes)).reading_memory_at(clock);
         host.observe();
         assert_eq!(experts(&host).slots, 4, "{backend:?}: nothing shrinks while memory is free");
         let reading = read(&host, press.store());

@@ -155,6 +155,7 @@ mod tests {
             role: DomainRole::Allocation,
             domain: store,
             headroom_bytes: 2_000,
+            shown: crate::platform::Shown::headroom(2_000),
             identity: topology.store_identity(store).unwrap(),
             constraint: MemoryConstraint::HostRam,
             thresholds,

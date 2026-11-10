@@ -219,14 +219,17 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
     };
     let displacing = serving.and_then(|serving| serving.baseline).is_some_and(|baseline| displacing(host, &baseline));
     let thresholds = reserves.host_thresholds(store, host);
-    let fit = match serving.and_then(|serving| serving.lent) {
+    let lent = serving.and_then(|serving| serving.lent);
+    let shown = Shown::of_host(host, displaced, lent.is_some());
+    let fit = match lent {
         // Allocatable counts as free the RAM the OS made by displacing other
         // programs' data since, which is free only while that data stays out.
         None => store_fit(
             store,
             thresholds,
             capacity_bytes,
-            host.allocatable_bytes().saturating_sub(displaced),
+            shown.bytes,
+            shown,
             host_distress(host),
             false,
             MemoryConstraint::HostRam,
@@ -242,6 +245,7 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
             thresholds,
             capacity_bytes,
             host.obtainable_bytes().min(thresholds.planning_bytes.saturating_add(lent)),
+            shown,
             host_distress(host),
             displacing,
             MemoryConstraint::HostRam,
@@ -255,7 +259,8 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
 }
 
 /// `store`'s fit from its capacity within process limits, its headroom and
-/// free headroom, and its host's distress: each less its planning reserve,
+/// free headroom, what the host shows of it apart from the load's lines
+/// (`shown`), and its host's distress: each less its planning reserve,
 /// in the Reclaim band at or below the reserve, while the host is in
 /// distress, or where `displacing` (a hold on room borrowed beyond the
 /// hold line, [`Serving::lent`]), its thresholds `thresholds`
@@ -265,6 +270,7 @@ fn store_fit(
     thresholds: DomainThresholds,
     capacity_bytes: u64,
     headroom_bytes: u64,
+    shown: Shown,
     distress: Option<HostDistress>,
     displacing: bool,
     constraint: MemoryConstraint,
@@ -274,6 +280,7 @@ fn store_fit(
         capacity_bytes,
         stable_bytes: capacity_bytes.saturating_sub(thresholds.planning_bytes),
         headroom_bytes,
+        shown,
         ceiling_bytes: thresholds.ceiling(headroom_bytes),
         thresholds,
         distress,
@@ -293,8 +300,39 @@ fn store_fit(
 /// decided.
 pub const READING_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The bytes of fresh memory the page-fill probe takes ([`StoreMotion::of_machine`]).
-const PAGE_FILL_PROBE_BYTES: usize = 256 << 20;
+/// The page-fill probe's samples, each its own cold region
+/// ([`page_fill`]).
+const PAGE_FILL_SAMPLES: usize = 3;
+
+/// The bytes one round of the page-release probe takes and frees, at most
+/// ([`page_release`]).
+const PAGE_RELEASE_ROUND_BYTES: usize = 256 << 20;
+
+/// The page-release probe's rounds a sample times back to back, and its
+/// samples: one round alone varies twofold between runs on an idle
+/// machine, the median over five samples of four does not
+/// ([`page_release`]).
+const PAGE_RELEASE_ROUNDS_PER_SAMPLE: usize = 4;
+const PAGE_RELEASE_SAMPLES: usize = 5;
+
+/// A store's margin over its line by its terms ([`StoreMotion::margin`]):
+/// the fluctuation; the take over a reading interval, `t·interval`; the
+/// sustained take over a release's latency, `s·latency`; and the deficit a
+/// take outrunning the releasing grows, `max(0, s − r)·B/r`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarginTerms {
+    pub fluctuation: u64,
+    pub take: u64,
+    pub latency: u64,
+    pub releasing: u64,
+}
+
+impl MarginTerms {
+    /// The margin: its terms' sum.
+    pub fn total(self) -> u64 {
+        self.fluctuation.saturating_add(self.take).saturating_add(self.latency).saturating_add(self.releasing)
+    }
+}
 
 /// How other programs move a store's available bytes, as measured: the
 /// steady fluctuation (the largest fall between consecutive readings with
@@ -307,8 +345,8 @@ const PAGE_FILL_PROBE_BYTES: usize = 256 << 20;
 /// taking the store, the fastest one program can take it at, measured of
 /// the machine (host RAM's page-fill rate, [`Self::of_machine`]; a volume's
 /// sequential write rate, [`super::VolumeReserve`]). So no margin is zero.
-/// That fastest rate is a burst's: what one program takes before a release
-/// lands. What another program sustains over time is `sustained`, the
+/// That fastest rate is a burst's: what one program takes before a reading
+/// notices it. What another program sustains over time is `sustained`, the
 /// fastest take seen across readings, none before one is seen.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "MotionFigures")]
@@ -376,12 +414,13 @@ impl StoreMotion {
     }
 
     /// The machine's own motion before any reading of it: no measured
-    /// fluctuation, and the rate the machine fills fresh pages at (a byte
-    /// written to every page of [`PAGE_FILL_PROBE_BYTES`] of new memory,
-    /// timed, then freed). No program on one thread takes memory from the OS
-    /// faster than the machine fills its pages, so a load whose line holds
-    /// that rate over a release's latency is not crossed by one program's
-    /// ask before the release lands.
+    /// fluctuation, and the rate a fresh program takes host RAM at over one
+    /// reading interval ([`page_fill`]): what it faults of fresh pages in
+    /// the interval, over the interval, so the take over an interval is
+    /// those bytes. No program on one thread takes memory from the OS
+    /// faster than the machine faults it fresh pages, so a load whose line
+    /// holds that take over a reading interval is not crossed by one
+    /// program's ask before the load notices it.
     ///
     /// A generic figure of the machine, measured once: where `machine`
     /// names a kernel cache and the topology of the machine it serves, the
@@ -390,7 +429,7 @@ impl StoreMotion {
     /// `PhysicalIdentity::Host`), measured and stored there when it keeps
     /// none; elsewhere, measured once per process.
     pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
-        Self::prior(page_rate(machine, "page-fill", |probe| probe.fill))
+        Self::prior(page_rate(machine, "page-fill-interval", |probe| probe.fill))
     }
 
     /// The margin a planning line holds above its store's own line, for a
@@ -399,17 +438,26 @@ impl StoreMotion {
     /// `releasing`'s bytes at its rate (none of a store nothing of ours
     /// releases in, a volume's):
     ///
-    /// `fluctuation + t·(interval + latency) + max(0, s − r)·B / r`
+    /// `fluctuation + t·interval + s·latency + max(0, s − r)·B / r`
     ///
-    /// for the take rate `t`, the sustained take `s`, release rate `r` and
-    /// releasable bytes `B`: one program takes at most `t` before the first
-    /// release lands, so the rest of the host takes `t·(interval + latency)`
-    /// by then; and while another program sustains a take faster than the
-    /// load releases, the deficit grows at `s − r` for the `B / r` releasing
-    /// runs. A burst is no sustained take: before one is seen across
-    /// readings, the releasing adds nothing. Held for the `B / r` seconds a
-    /// release of a 25.2 GB bank runs at 3.1 GB/s, an M4 Pro's 28.8 GB/s
-    /// page-fill burst would be a 208 GB take of a 51.5 GB store.
+    /// for the take rate `t`, the sustained take `s` (none before one is
+    /// seen), release rate `r` and releasable bytes `B`: one program takes
+    /// at most `t` before the next reading notices it, so the rest of the
+    /// host takes `t·interval` by then; what it goes on taking while the
+    /// release lands is what it is seen to sustain, `s·latency`; and while
+    /// it sustains a take faster than the load releases, the deficit grows
+    /// at `s − r` for the `B / r` releasing runs. A burst is no sustained
+    /// take: before one is seen across readings, neither the latency nor
+    /// the releasing adds anything. So the latency, the load's own, moves
+    /// the line only by what other programs are seen taking: a release of
+    /// the load's that took long never raises the line the next release is
+    /// decided at while nothing else moves, and no release of its own drives
+    /// another. Held for the `B / r` seconds a release of a 25.2 GB bank
+    /// runs at 3.1 GB/s, an M4 Pro's 28.8 GB/s page-fill burst would be a
+    /// 208 GB take of a 51.5 GB store; held over a 200 ms release latency,
+    /// 5.8 GB a 48 GB M4 Pro's line rose by at each slow release, until the
+    /// line outran every release and the load unloaded with nothing else
+    /// taking memory.
     ///
     /// The rest of the host never takes more of a store than it holds, so
     /// the margin of a store a load releases in is within the store's
@@ -417,12 +465,24 @@ impl StoreMotion {
     /// invariant violation reported with every input, a panic in debug and
     /// test builds.
     pub fn margin(&self, interval: Duration, latency: Duration, releasing: Option<Releasing>) -> u64 {
-        let lead = self.fluctuation.saturating_add((self.take_rate * (interval + latency).as_secs_f64()) as u64);
+        self.terms(interval, latency, releasing).total()
+    }
+
+    /// [`Self::margin`] by its terms.
+    pub fn terms(&self, interval: Duration, latency: Duration, releasing: Option<Releasing>) -> MarginTerms {
+        let sustained = self.sustained.unwrap_or(0.0);
+        let lead = MarginTerms {
+            fluctuation: self.fluctuation,
+            take: (self.take_rate * interval.as_secs_f64()) as u64,
+            latency: (sustained * latency.as_secs_f64()) as u64,
+            releasing: 0,
+        };
         let Some(releasing) = releasing else {
             return lead;
         };
-        let growth = self.sustained.map_or(0.0, |sustained| (sustained - releasing.rate.0).max(0.0) / releasing.rate.0);
-        let margin = lead.saturating_add((growth * releasing.bytes as f64) as u64);
+        let growth = (sustained - releasing.rate.0).max(0.0) / releasing.rate.0;
+        let terms = MarginTerms { releasing: (growth * releasing.bytes as f64) as u64, ..lead };
+        let margin = terms.total();
         if margin > releasing.store_bytes {
             tracing::error!(
                 margin,
@@ -443,7 +503,7 @@ impl StoreMotion {
                 );
             }
         }
-        margin
+        terms
     }
 
     pub fn fluctuation(&self) -> u64 {
@@ -501,12 +561,11 @@ impl ReleaseRate {
         Self::try_from(bytes_per_second).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// The rate the machine returns fresh pages to the OS at (the
-    /// page-fill probe's memory freed, timed), the fastest any release
-    /// returns memory: a generic figure of the machine, kept and measured
-    /// as [`StoreMotion::of_machine`]'s page-fill rate is.
+    /// The rate the machine returns pages to the OS at, as a release is
+    /// counted on to ([`page_release`]): a generic figure of the machine,
+    /// kept and measured as [`StoreMotion::of_machine`]'s page-fill rate is.
     pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
-        Self::new(page_rate(machine, "page-release", |probe| probe.release))
+        Self::new(page_rate(machine, "page-release-median", |probe| probe.release))
     }
 
     /// The slower of two rates: what a later measurement adds, which never
@@ -583,44 +642,224 @@ fn host_identity(topology: &DeviceTopology) -> Option<String> {
     })
 }
 
-/// The machine's page probe: the rates it fills fresh pages at and returns
-/// them to the OS at, in bytes a second.
-#[derive(Clone, Copy)]
-struct PageProbe {
-    fill: f64,
-    release: f64,
+/// The machine's page probe: the rate a fresh program takes host RAM at
+/// over a reading interval ([`page_fill`]) and the rate the machine returns
+/// pages to the OS at ([`page_release`]), in bytes a second; whether the
+/// host's room cut the fill short (`censored`); and what bounded it: the
+/// room it read, and the bytes each fill sample took, every one returned
+/// before the next, so the largest is the probe's peak.
+#[derive(Clone, Copy, Debug)]
+pub struct PageProbe {
+    pub fill: f64,
+    pub release: f64,
+    pub censored: bool,
+    pub room: u64,
+    pub fill_samples: [usize; PAGE_FILL_SAMPLES],
 }
 
-/// The page probe's `figure` of the machine (`page-fill`, `page-release`),
-/// kept under `{figure}:{host}` ([`machine_rate`]); the probe runs at most
-/// once per process.
+/// A figure the page probe took under a cut it could not measure past: a
+/// lower bound of the figure, used but never kept.
+struct Censored(f64);
+
+/// The page probe's `figure` of the machine (`page-fill-interval`,
+/// `page-release-median`, named by their methods, so a figure another
+/// method stored is never read as theirs), kept under `{figure}:{host}`
+/// ([`machine_rate`]), but for a censored probe's, which is used and not
+/// kept, so a later process probes again; the probe runs at most once per
+/// process.
 fn page_rate(machine: Option<(&std::path::Path, &DeviceTopology)>, figure: &str, rate: fn(PageProbe) -> f64) -> f64 {
     static PROBED: std::sync::OnceLock<PageProbe> = std::sync::OnceLock::new();
     let key = machine.and_then(|(cache, topology)| Some((cache, format!("{figure}:{}", host_identity(topology)?))));
-    machine_rate(key, || Ok::<_, std::convert::Infallible>(rate(*PROBED.get_or_init(page_probe)))).unwrap_or_else(|never| match never {})
+    machine_rate(key, || {
+        let probe = *PROBED.get_or_init(PageProbe::run);
+        if probe.censored { Err(Censored(rate(probe))) } else { Ok(rate(probe)) }
+    })
+    .unwrap_or_else(|Censored(rate)| rate)
 }
 
-/// The page probe, run: a byte written to every page of
-/// [`PAGE_FILL_PROBE_BYTES`] of new memory, timed, then the memory freed,
-/// timed.
-fn page_probe() -> PageProbe {
+impl PageProbe {
+    /// The page probe, run, bounded by half of host RAM's room above the
+    /// kernel's own line (`seismic::host_room`; a page where it cannot be
+    /// read), so it never causes the pressure it guards against: a burst
+    /// the reserve guards against and the probe must both fit in that room,
+    /// so the probe takes at most the share a burst would leave. A fill the
+    /// bound cut short is censored: the take over an interval is then more
+    /// than half the room, the machine already near pressure, and the
+    /// bound's rate a lower bound of it, reported as an event, used and
+    /// never kept. It understates the take only while the room is under
+    /// twice a burst, and a later probe, in more room, corrects it.
+    pub fn run() -> Self {
+        let page = host_page();
+        let room = seismic::host_room().unwrap_or_else(|error| {
+            tracing::warn!(%error, "the page probe could not read host RAM's room, and takes a page at most");
+            0
+        });
+        let bound = usize::try_from(room / 2).unwrap_or(usize::MAX).max(page);
+        let filled = page_fill(bound, page);
+        let (fill, censored) = (filled.rate(), filled.censored());
+        if censored {
+            tracing::warn!(
+                fill_bytes_per_second = fill,
+                room_bytes = room,
+                "the page-fill probe filled the host's room before its reading interval ended: \
+                 its rate is a lower bound, used and not kept"
+            );
+        }
+        let release = page_release(bound.min(PAGE_RELEASE_ROUND_BYTES));
+        Self { fill, release, censored, room, fill_samples: filled.0.map(|(bytes, _)| bytes) }
+    }
+}
+
+/// The host's page size.
+fn host_page() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` reads a constant of the system.
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("the page size is positive")
+    }
+    #[cfg(not(unix))]
+    {
+        4096
+    }
+}
+
+/// What a fresh program takes of host RAM within one reading interval:
+/// [`PAGE_FILL_SAMPLES`] samples, each a fresh region of at most `bound`
+/// bytes the process has never touched (cold: a recycled page faults
+/// faster than a fresh one, which overstates the take), faulted a page at a
+/// time from its start until [`READING_INTERVAL`] elapses or the bound is
+/// reached, then returned before the next.
+fn page_fill(bound: usize, page: usize) -> PageFill {
+    PageFill(std::array::from_fn(|_| ColdRegion::map(bound).fill(page, READING_INTERVAL)))
+}
+
+/// The page-fill probe's samples: each one's bytes faulted, and whether
+/// the bound cut it short of the interval.
+struct PageFill([(usize, bool); PAGE_FILL_SAMPLES]);
+
+impl PageFill {
+    /// The median sample's bytes over the interval.
+    fn rate(&self) -> f64 {
+        let mut bytes = self.0.map(|(bytes, _)| bytes);
+        bytes.sort_unstable();
+        bytes[PAGE_FILL_SAMPLES / 2] as f64 / READING_INTERVAL.as_secs_f64()
+    }
+
+    /// Whether the bound cut any sample short: its rate is then a lower
+    /// bound.
+    fn censored(&self) -> bool {
+        self.0.iter().any(|&(_, cut)| cut)
+    }
+}
+
+/// Fresh address space of the OS's own, mapped for the page-fill probe and
+/// returned to it whole on drop: never memory an allocator recycles.
+struct ColdRegion {
+    base: *mut u8,
+    bytes: usize,
+}
+
+impl ColdRegion {
+    fn map(bytes: usize) -> Self {
+        #[cfg(unix)]
+        // SAFETY: an anonymous private mapping at an address the system
+        // chooses refers to no existing memory; its pages fault in on
+        // first touch.
+        let base = unsafe {
+            let base = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert!(base != libc::MAP_FAILED, "the page-fill probe could not map {bytes} bytes: {}", std::io::Error::last_os_error());
+            base.cast::<u8>()
+        };
+        // An allocation this large is the OS's own fresh pages on Windows,
+        // returned to it when freed.
+        #[cfg(not(unix))]
+        // SAFETY: a non-zero layout, freed with the same layout on drop.
+        let base = unsafe {
+            let base = std::alloc::alloc(std::alloc::Layout::from_size_align(bytes, 4096).expect("the probe's layout"));
+            assert!(!base.is_null(), "the page-fill probe could not take {bytes} bytes");
+            base
+        };
+        Self { base, bytes }
+    }
+
+    /// A byte written to each page from the start, one at a time, until
+    /// `interval` elapses or the region ends: the bytes faulted, and
+    /// whether the region's end cut the interval short.
+    fn fill(&self, page: usize, interval: Duration) -> (usize, bool) {
+        // The clock is read every this many pages, a small part of their
+        // faults' time.
+        const PAGES_PER_READ: usize = 16;
+        let started = Instant::now();
+        let mut offset = 0;
+        while offset < self.bytes {
+            if (offset / page) % PAGES_PER_READ == 0 && started.elapsed() >= interval {
+                return (offset, false);
+            }
+            // SAFETY: within the region, which only this probe touches.
+            unsafe { std::ptr::write_volatile(self.base.add(offset), 1) };
+            offset += page;
+        }
+        (self.bytes, started.elapsed() < interval)
+    }
+}
+
+impl Drop for ColdRegion {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: the whole mapping `map` made, which nothing refers to.
+        {
+            let unmapped = unsafe { libc::munmap(self.base.cast(), self.bytes) };
+            debug_assert_eq!(unmapped, 0, "a whole mapping is unmapped");
+        }
+        #[cfg(not(unix))]
+        // SAFETY: the allocation `map` made, with its layout.
+        unsafe {
+            std::alloc::dealloc(self.base, std::alloc::Layout::from_size_align(self.bytes, 4096).expect("the probe's layout"))
+        };
+    }
+}
+
+/// The rate the machine returns pages to the OS at, as a release is
+/// counted on to: one round discarded, then [`PAGE_RELEASE_SAMPLES`]
+/// samples of [`PAGE_RELEASE_ROUNDS_PER_SAMPLE`] rounds back to back of
+/// `bytes` each ([`page_round`]), the median sample's rate. A release is
+/// help counted on, so a smaller rate is the safe side: the median, never
+/// the fastest.
+fn page_release(bytes: usize) -> f64 {
+    page_round(bytes);
+    let mut samples = (0..PAGE_RELEASE_SAMPLES)
+        .map(|_| {
+            let released = (0..PAGE_RELEASE_ROUNDS_PER_SAMPLE).map(|_| page_round(bytes)).sum::<Duration>();
+            (PAGE_RELEASE_ROUNDS_PER_SAMPLE * bytes) as f64 / released.as_secs_f64().max(f64::MIN_POSITIVE)
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(f64::total_cmp);
+    samples[PAGE_RELEASE_SAMPLES / 2]
+}
+
+/// One round of the page-release probe: a byte written to every page of
+/// `bytes` of new memory, then the memory freed, the free timed.
+fn page_round(bytes: usize) -> Duration {
     let page = 4096;
-    let layout = std::alloc::Layout::from_size_align(PAGE_FILL_PROBE_BYTES, page).expect("the probe's layout");
+    let layout = std::alloc::Layout::from_size_align(bytes, page).expect("the probe's layout");
     // SAFETY: a non-zero layout; every write lies within it, and it is
     // freed with the same layout.
     unsafe {
         let memory = std::alloc::alloc(layout);
-        assert!(!memory.is_null(), "the page-fill probe could not take {PAGE_FILL_PROBE_BYTES} bytes");
-        let started = Instant::now();
-        for offset in (0..PAGE_FILL_PROBE_BYTES).step_by(page) {
+        assert!(!memory.is_null(), "the page-release probe could not take {bytes} bytes");
+        for offset in (0..bytes).step_by(page) {
             std::ptr::write_volatile(memory.add(offset), 1);
         }
-        let filled = started.elapsed().as_secs_f64();
         let started = Instant::now();
         std::alloc::dealloc(memory, layout);
-        let released = started.elapsed().as_secs_f64();
-        let rate = |seconds: f64| PAGE_FILL_PROBE_BYTES as f64 / seconds.max(f64::MIN_POSITIVE);
-        PageProbe { fill: rate(filled), release: rate(released) }
+        started.elapsed()
     }
 }
 
@@ -772,9 +1011,9 @@ impl MemoryReserves {
     }
 
     /// The margin over `host_ram`'s line ([`StoreMotion::margin`]).
+    #[cfg(test)]
     pub fn host_margin(&self, host_ram: &Store) -> u64 {
-        let releasing = Releasing { rate: self.release, bytes: self.releasable.host, store_bytes: host_ram.capacity().value };
-        self.host.margin(self.interval, self.latency, Some(releasing))
+        self.thresholds(host_ram, 0).planning_bytes
     }
 
     /// The thresholds of a store of `kind` whose own line is `line` bytes:
@@ -785,16 +1024,23 @@ impl MemoryReserves {
     /// For a volume, whose reserve is its writer's
     /// ([`super::VolumeReserves`]).
     pub fn thresholds(&self, store: &Store, line: u64) -> DomainThresholds {
-        let margin = match store.kind() {
-            StoreKind::HostRam => self.host_margin(store),
-            StoreKind::DeviceMemory(_) => self.device.map_or(0, |device| {
-                let releasing =
-                    Releasing { rate: self.release, bytes: self.releasable.device, store_bytes: store.capacity().value };
-                device.margin(self.interval, self.latency, Some(releasing))
-            }),
+        DomainThresholds { planning_bytes: line.saturating_add(self.margin_terms(store).total()), emergency_bytes: line }
+    }
+
+    /// The margin over `store`'s line by its terms ([`StoreMotion::terms`]):
+    /// none for a device's own memory before its motion is measured.
+    ///
+    /// # Panics
+    /// For a volume, whose reserve is its writer's
+    /// ([`super::VolumeReserves`]).
+    pub fn margin_terms(&self, store: &Store) -> MarginTerms {
+        let (motion, bytes) = match store.kind() {
+            StoreKind::HostRam => (Some(self.host), self.releasable.host),
+            StoreKind::DeviceMemory(_) => (self.device, self.releasable.device),
             StoreKind::Volume(_) => panic!("a volume's reserve is its writer's (`VolumeReserves`), never a load's"),
         };
-        DomainThresholds { planning_bytes: line.saturating_add(margin), emergency_bytes: line }
+        let releasing = Releasing { rate: self.release, bytes, store_bytes: store.capacity().value };
+        motion.map_or_else(MarginTerms::default, |motion| motion.terms(self.interval, self.latency, Some(releasing)))
     }
 
     /// Host RAM's thresholds as `host` reads its line.
@@ -941,6 +1187,75 @@ impl fmt::Display for MemoryConstraint {
     }
 }
 
+/// What a store shows available as the host's own figures read it, apart
+/// from every line of the load's: what the load's pace measures other
+/// programs' motion from (`MemoryPace::observe`), and nothing else. Host
+/// RAM's headroom while the expert bank holds room borrowed beyond the hold
+/// line is the load's own planning line plus what it lent, capped by what
+/// the OS can obtain ([`Serving::lent`]): it moves with the line, so read
+/// as the host's it counts the line's own motion as another program's take,
+/// whose margin raises the line, and the headroom with it. On a 48 GB M4 Pro
+/// beside a 25 GB holder the line so climbed to 51 GB at 0.45 GB under the
+/// headroom, read Reclaim 260 times, and refused the bank's growth with
+/// 18 GB free. Only a host's or a store's own figures construct one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shown {
+    bytes: u64,
+    basis: ShownBasis,
+}
+
+/// Which of the host's figures a [`Shown`] reads: a pace measures motion
+/// only across readings of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShownBasis {
+    /// The headroom the host reports: allocatable memory less what the OS
+    /// displaced since the load began to serve, or a store's own figure.
+    Headroom,
+    /// What the OS can obtain, displacing other programs' data
+    /// ([`HostStatus::obtainable_bytes`]): host RAM's while the bank holds
+    /// borrowed room, when allocatable memory sits near nothing for as long
+    /// as the bank holds it and tells another program's demand from the
+    /// bank's own no more.
+    Obtainable,
+}
+
+impl Shown {
+    /// Host RAM's as `host` reads it, `displaced` bytes displaced since the
+    /// load began to serve, the bank holding borrowed room or not (`lent`).
+    fn of_host(host: &HostStatus, displaced: u64, lent: bool) -> Self {
+        match lent {
+            false => Self { bytes: host.allocatable_bytes().saturating_sub(displaced), basis: ShownBasis::Headroom },
+            true => Self { bytes: host.obtainable_bytes(), basis: ShownBasis::Obtainable },
+        }
+    }
+
+    /// A device's own memory's or a volume's: the headroom its own figure
+    /// and its driver's grant report.
+    fn of_store(headroom_bytes: u64) -> Self {
+        Self { bytes: headroom_bytes, basis: ShownBasis::Headroom }
+    }
+
+    /// A headroom of `bytes` the host reports, for a test's reading.
+    #[cfg(test)]
+    pub(crate) fn headroom(bytes: u64) -> Self {
+        Self { bytes, basis: ShownBasis::Headroom }
+    }
+
+    /// What the OS can obtain, `bytes`, for a test's reading.
+    #[cfg(test)]
+    pub(crate) fn obtainable(bytes: u64) -> Self {
+        Self { bytes, basis: ShownBasis::Obtainable }
+    }
+
+    pub(crate) fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn basis(self) -> ShownBasis {
+        self.basis
+    }
+}
+
 /// One store's fit: its capacity within process limits and its live
 /// headroom, each less the planning reserve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -953,6 +1268,9 @@ pub struct StoreFit {
     /// Observed available bytes, bounded by every applicable process limit.
     /// Existing Seismic charges are already absent from it.
     pub headroom_bytes: u64,
+    /// What the host shows available apart from any line of the load's
+    /// ([`Shown`]).
+    pub shown: Shown,
     /// Headroom less the planning reserve: what a live claim may take.
     pub ceiling_bytes: u64,
     pub thresholds: DomainThresholds,
@@ -1270,6 +1588,7 @@ impl<'a> Fit<'a> {
             thresholds,
             store.capacity().value,
             headroom_bytes,
+            Shown::of_store(headroom_bytes),
             None,
             false,
             constraint,
@@ -1491,6 +1810,9 @@ pub struct DomainReading {
     /// Observed available bytes, bounded by every applicable process limit.
     /// Existing Seismic charges are already absent from it.
     pub headroom_bytes: u64,
+    /// What the host shows available apart from any line of the load's: what
+    /// the load's pace reads other programs' motion from ([`Shown`]).
+    pub shown: Shown,
     /// The store across revisions, as other processes name it.
     pub identity: seismic::StoreIdentity,
     /// What bounds `ceiling_bytes`.
@@ -1566,7 +1888,7 @@ pub fn observe_domains(
     reserves: &MemoryReserves,
     room: HostRoom,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let status = devices.status(device.topology(), device.info().id());
+    let status = devices.device_status(device);
     domain_readings(device, &status, reserves, room)
 }
 
@@ -1607,6 +1929,7 @@ fn domain_readings(
                 role: DomainRole::of(topology, device.info(), store),
                 domain: store,
                 headroom_bytes: reading.headroom_bytes,
+                shown: reading.shown,
                 identity: topology
                     .store_identity(store)
                     .expect("observed store belongs to topology"),
@@ -1646,15 +1969,16 @@ fn domain_readings(
 /// these bounds read.
 pub(crate) fn refresh_device_ceiling(
     device: &seismic::Device,
+    bounds: &seismic::Bounds,
     status: &Status,
     reserves: &MemoryReserves,
     room: HostRoom,
     planned: u64,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let result = set_device_ceiling(device, status, reserves, room, planned);
+    let result = set_device_ceiling(device, bounds, status, reserves, room, planned);
     if result.is_err() {
         for (store, ledger) in device.ledgers().own {
-            device
+            bounds
                 .bound(seismic::Ledger::Own(store), Some(ledger.claim))
                 .expect("a device bounds its own ledgers");
         }
@@ -1668,6 +1992,7 @@ pub(crate) fn refresh_device_ceiling(
 /// to its live ceiling first. The readings it bound them from.
 fn set_device_ceiling(
     device: &seismic::Device,
+    bounds: &seismic::Bounds,
     status: &Status,
     reserves: &MemoryReserves,
     room: HostRoom,
@@ -1677,7 +2002,7 @@ fn set_device_ceiling(
     let readings = domain_readings(device, status, reserves, room)?;
     for reading in &readings {
         let limit = status.charged(reading.domain).saturating_add(reading.bound_room(planned));
-        device
+        bounds
             .bound(seismic::Ledger::Store(reading.domain), Some(limit))
             .map_err(MemoryPolicyError::Limit)?;
     }
@@ -1690,7 +2015,7 @@ fn set_device_ceiling(
     for path in paths {
         let left = fit.grant(path, FitMode::Live)?;
         let charged = charges.get(&path).copied().unwrap_or(0);
-        device
+        bounds
             .bound(seismic::Ledger::Path(path), Some(charged.saturating_add(left)))
             .map_err(MemoryPolicyError::Limit)?;
     }
@@ -2137,6 +2462,7 @@ mod tests {
             role,
             domain: pressed.store,
             headroom_bytes: pressed.headroom_bytes,
+            shown: pressed.shown,
             identity: m4_pro.store_identity(pressed.store).unwrap(),
             constraint: pressed.constraint,
             thresholds: pressed.thresholds,
@@ -2294,6 +2620,34 @@ mod tests {
         assert!(demand(FitMode::Borrow).fits(), "the bank's growth reads what is obtainable");
     }
 
+    /// While the bank holds borrowed room, host RAM's headroom is the
+    /// load's own line plus what it lent, and moves with that line; what it
+    /// shows its pace is the host's obtainable memory, which no line of the
+    /// load's moves. Two lines over one host status: two headrooms, one
+    /// shown figure, the host's own.
+    #[test]
+    fn a_lent_readings_shown_figure_is_the_hosts_whatever_its_line() {
+        const GB: u64 = 1_000_000_000;
+        let m4_pro = recorded::m4_pro();
+        let host_ram = m4_pro.host_ram();
+        let host = HostStatus {
+            allocatable: Reported::new(GB, ReportedBy::MachAllocatablePages),
+            obtainable: Reported::new(36 * GB, ReportedBy::MachMovablePages),
+            displaced_bytes: Some(9 * GB),
+            ..host(MACOS, 0)
+        };
+        let lent = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: None, borrows: true, lent: Some(GB / 2) }));
+        let at = |fill: f64| host_ram_fit(host_ram, &host, &MemoryReserves::new(StoreMotion::prior(fill), ReleaseRate::new(3e9)), lent);
+        let (low, high) = (at(22.9e9), at(45.6e9));
+        assert!(high.thresholds.planning_bytes > low.thresholds.planning_bytes);
+        assert_eq!(high.headroom_bytes - low.headroom_bytes, high.thresholds.planning_bytes - low.thresholds.planning_bytes, "the lent headroom is the line's");
+        assert_eq!((low.shown, high.shown), (Shown::obtainable(36 * GB), Shown::obtainable(36 * GB)), "the host's own figure");
+        // Without borrowed room the hold line reads allocatable memory, its
+        // shown figure the same headroom.
+        let held = host_ram_fit(host_ram, &host, &MemoryReserves::new(StoreMotion::prior(22.9e9), ReleaseRate::new(3e9)), HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 0, baseline: None, borrows: true, lent: None })));
+        assert_eq!(held.shown, Shown::headroom(held.headroom_bytes));
+    }
+
     /// A window that is itself displacement now never raises the baseline,
     /// and each window is folded in once: the baseline is the fastest of the
     /// steady windows since the bank last grew, seeded by the first.
@@ -2392,26 +2746,53 @@ mod tests {
     }
 
     /// A burst is no sustained take: before another program is seen
-    /// sustaining a take, the margin holds the burst only until the first
-    /// release lands. The inputs an uncapped Flash Next load on a 48 GiB
-    /// M4 Pro read: a 28.8 GB/s page-fill rate, releases at 3.1 GB/s, 25.2 GB
-    /// of its bank releasable; the burst held over the releasing would be a
-    /// 208 GB margin.
+    /// sustaining a take, the margin holds the burst only until a reading
+    /// notices it, whatever the load's release latency. The inputs an
+    /// uncapped Flash Next load on a 48 GiB M4 Pro read: a 28.8 GB/s
+    /// page-fill rate, releases at 3.1 GB/s, 25.2 GB of its bank
+    /// releasable; the burst held over the releasing would be a 208 GB
+    /// margin, and over a 198 ms release latency 5.7 GB more.
     #[test]
-    fn a_burst_takes_only_until_the_first_release_lands() {
+    fn a_burst_takes_only_until_a_reading_notices_it() {
         let interval = Duration::from_millis(100);
-        let latency = Duration::from_micros(6_048);
         let store_bytes = 48 * GIB;
         let releasing = Some(Releasing { rate: ReleaseRate::new(3.1e9), bytes: 25_200_000_000, store_bytes });
         let burst = StoreMotion::prior(28.8e9);
-        let lead = (28.8e9 * (interval + latency).as_secs_f64()) as u64;
-        assert_eq!(burst.margin(interval, latency, releasing), lead);
+        let lead = (28.8e9 * interval.as_secs_f64()) as u64;
+        for latency in [Duration::ZERO, Duration::from_micros(6_048), Duration::from_millis(198)] {
+            assert_eq!(burst.margin(interval, latency, releasing), lead, "{latency:?}");
+        }
         assert!(lead < store_bytes);
+    }
+
+    /// The load's own release latency moves its line only by what another
+    /// program is seen to sustain over it. On a 48 GB M4 Pro holding 25 GB
+    /// for another program that took nothing more, Flash Next's bank
+    /// released 63→36 slots with an 80 ms latency and 36→20 with 198 ms;
+    /// at the page-fill rate over each latency the host line rose from
+    /// 3.79 GB to 9.90 GB, past the 9.46 GB the releases had freed, and the
+    /// load unloaded for memory pressure no other program made.
+    #[test]
+    fn a_release_latency_raises_the_line_only_by_a_sustained_take() {
+        let m4_pro = recorded::m4_pro();
+        let host_ram = m4_pro.host_ram();
+        let opened = MemoryReserves::new(StoreMotion::prior(28.8e9), ReleaseRate::new(3.1e9))
+            .releasing(None, Releasable { host: 4 * GIB, device: 0 });
+        let line = opened.host_margin(host_ram);
+        for latency in [Duration::from_millis(80), Duration::from_millis(198)] {
+            let released = opened.with_latency(latency).releasing(Some(ReleaseRate::new(17e9)), Releasable { host: 4 * GIB, device: 0 });
+            assert_eq!(released.host_margin(host_ram), line, "nothing else moves: {latency:?} raises nothing");
+            // Another program seen taking 1 GB/s goes on taking over it.
+            let taking = released.measured(Some(StoreMotion::new(0, 1e9)), None);
+            let without = opened.measured(Some(StoreMotion::new(0, 1e9)), None);
+            assert_eq!(taking.host_margin(host_ram), without.host_margin(host_ram) + (1e9 * latency.as_secs_f64()) as u64);
+        }
     }
 
     /// A take another program sustains across readings faster than the load
     /// releases grows the deficit over the releasing: at twice the release
-    /// rate, a byte per byte released, on the burst's lead.
+    /// rate, a byte per byte released, on the burst's lead over a reading
+    /// interval and the sustained take's over the release latency.
     #[test]
     fn a_sustained_take_grows_the_margin_over_the_releasing() {
         let interval = Duration::from_millis(100);
@@ -2419,7 +2800,21 @@ mod tests {
         let releasing = Some(Releasing { rate: ReleaseRate::new(3.1e9), bytes: 25_200_000_000, store_bytes: 48 * GIB });
         let measured = StoreMotion::prior(28.8e9).with(StoreMotion::new(0, 6.2e9));
         assert_eq!(measured.take_rate(), 28.8e9, "the burst stays the fastest seen");
-        assert_eq!(measured.margin(interval, latency, releasing), 5_760_000_000 + 25_200_000_000);
+        assert_eq!(measured.margin(interval, latency, releasing), 2_880_000_000 + 620_000_000 + 25_200_000_000);
+    }
+
+    /// A fill the region's end cuts short of its interval is censored, its
+    /// bytes the region's; one the interval ends is not. The probe takes at
+    /// most half the room above the kernel's line it read, a sample at a
+    /// time.
+    #[test]
+    fn a_page_fill_cut_by_its_bound_is_censored() {
+        let page = host_page();
+        assert_eq!(ColdRegion::map(16 * page).fill(page, Duration::from_secs(10)), (16 * page, true));
+        assert_eq!(ColdRegion::map(1 << 30).fill(page, Duration::ZERO), (0, false));
+        let probe = PageProbe::run();
+        let bound = usize::try_from(probe.room / 2).unwrap().max(page);
+        assert!(probe.fill_samples.iter().all(|&bytes| bytes <= bound), "{probe:?}");
     }
 
     /// The rest of the host never takes more of a store than it holds: a
@@ -2467,7 +2862,7 @@ mod tests {
         let topology = recorded::m4_pro();
         let stored = StoreMotion::of_machine(Some((&cache, &topology)));
         crate::kernel_cache::KernelCache::machine_figures(&cache)
-            .store(&format!("page-fill:{}", host_identity(&topology).unwrap()), &MachineRate { bytes_per_second: 7e9 }, MACHINE_RATE_RECORD_BYTES)
+            .store(&format!("page-fill-interval:{}", host_identity(&topology).unwrap()), &MachineRate { bytes_per_second: 7e9 }, MACHINE_RATE_RECORD_BYTES)
             .unwrap();
         assert!(stored.take_rate() > 0.0);
         assert_eq!(StoreMotion::of_machine(Some((&cache, &topology))).take_rate(), 7e9);

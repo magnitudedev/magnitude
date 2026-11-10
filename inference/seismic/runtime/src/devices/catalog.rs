@@ -1,7 +1,7 @@
 use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
-use crate::memory::{path_claim, store_ledger, DeviceLedgers};
+use crate::memory::{DeviceLedgers, LedgerScope};
 use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
 use seismic_topology::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
@@ -87,10 +87,28 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = DeviceLedgers::new(&topology, &info);
+        let memory = DeviceLedgers::new(LedgerScope::process(), &topology, &info);
         let device = crate::backends::open(info, topology, memory, options)?;
         opened.insert(id, Arc::downgrade(&device));
         Ok(device)
+    }
+
+    /// Open `id` with `options` as a device of its own: in a ledger scope
+    /// of its own, shared with no other open, so it charges and bounds no
+    /// store another device of the process reaches. For a test, whose
+    /// process other tests share.
+    #[doc(hidden)]
+    pub fn open_own_ledgers(&self, id: ExecutorId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+        let topology = self.topology();
+        let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
+        if let Availability::Unavailable { reason } = info.availability() {
+            return Err(OpenError::Unavailable {
+                selector: info.selector(),
+                reason: reason.clone(),
+            });
+        }
+        let memory = DeviceLedgers::new(LedgerScope::own(), &topology, &info);
+        crate::backends::open(info, topology, memory, options)
     }
 
     /// The measurement job's running of executor `id`'s probes: each its
@@ -143,6 +161,12 @@ impl Devices {
 
     /// [`Devices::open_backend`] with `options`, as [`Devices::open_with`].
     pub fn open_backend_with(&self, backend: BackendName, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_with(self.executor_of(backend)?, options)
+    }
+
+    /// The first discovered executor of `backend`.
+    #[doc(hidden)]
+    pub fn executor_of(&self, backend: BackendName) -> Result<ExecutorId, OpenError> {
         let topology = self.topology();
         let executor = topology
             .executors()
@@ -157,27 +181,13 @@ impl Devices {
                     .map(|diagnostic| diagnostic.message.clone())
                     .collect(),
             })?;
-        self.open_with(executor.id(), options)
+        Ok(executor.id())
     }
 
     /// The status of `executor` of `topology`: a sample of the stores and
     /// of the executor's grants, with what this process's opened executors
     /// hold.
     pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
-        Status {
-            sample: self.inventory.sample(topology, &[executor]),
-            runtime: self.runtime_status(topology, executor),
-        }
-    }
-
-    /// What only opened executors know: each store's ledger, and what is
-    /// left of each grant of `of` when it is an opened CUDA executor.
-    fn runtime_status(&self, topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
-        let charges = topology
-            .stores()
-            .iter()
-            .map(|store| (store.id(), store_ledger(topology, store.id()).claim()))
-            .collect();
         // Read outside the lock: a driver query must not hold up an open.
         let devices = opened()
             .lock()
@@ -185,6 +195,36 @@ impl Devices {
             .values()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
+        Status {
+            sample: self.inventory.sample(topology, &[executor]),
+            runtime: Self::runtime_status(&LedgerScope::process(), &devices, topology, executor),
+        }
+    }
+
+    /// The status of opened `device`, as [`Self::status`] reads it, with
+    /// what the devices of its ledger scope hold: the process's opened
+    /// executors, or, for a device of its own scope, itself.
+    pub fn device_status(&self, device: &Arc<DeviceInner>) -> Status {
+        let (topology, executor) = (device.topology(), device.info().id());
+        let scope = &device.memory.scope;
+        if Arc::ptr_eq(scope, &LedgerScope::process()) {
+            return self.status(topology, executor);
+        }
+        Status {
+            sample: self.inventory.sample(topology, &[executor]),
+            runtime: Self::runtime_status(scope, std::slice::from_ref(device), topology, executor),
+        }
+    }
+
+    /// What only opened executors know: each store's ledger in `scope`, and
+    /// what is left of each grant of `of` when it is one of `devices`, an
+    /// opened CUDA executor.
+    fn runtime_status(scope: &LedgerScope, devices: &[Arc<DeviceInner>], topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
+        let charges = topology
+            .stores()
+            .iter()
+            .map(|store| (store.id(), scope.store_ledger(topology, store.id()).claim()))
+            .collect();
         let free = devices
             .iter()
             .filter(|device| {
@@ -225,7 +265,7 @@ impl Devices {
                     DeviceMemory::Host => Ok(Reported::new(
                         grant
                             .value
-                            .saturating_sub(path_claim(topology, executor, path)),
+                            .saturating_sub(scope.path_claim(topology, executor, path)),
                         grant.by,
                     )),
                     DeviceMemory::Undecided => {

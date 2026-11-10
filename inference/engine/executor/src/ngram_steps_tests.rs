@@ -838,14 +838,14 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let device = domain.device().clone();
     let own = device.ledgers().own;
     for (store, view) in &own {
-        device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+        domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
     }
     let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
     assert!(matches!(step, crate::BankStep::Begun(_)), "a whole bank shrinks: {step:?}");
     while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
     assert!(domain.expert_bank_slots() < whole, "the bank shrank from {whole:?}");
     for (store, view) in &own {
-        device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+        domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
     }
     let before = domain.graph_replays().recorded;
     bindings = decode(&mut domain, bindings);
@@ -1004,14 +1004,14 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
         let device = domain.device().clone();
         let own = device.ledgers().own;
         for (store, view) in &own {
-            device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+            domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
         }
         let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
         assert!(matches!(step, crate::BankStep::Begun(_)), "{backend:?}: a whole bank shrinks: {step:?}");
         while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
         assert!(domain.expert_bank_slots() < whole, "{backend:?}: the bank shrank from {whole:?}");
         for (store, view) in &own {
-            device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+            domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
         }
         bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, the bank shrink's step", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the bank shrink", backend);

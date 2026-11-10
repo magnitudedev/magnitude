@@ -162,7 +162,7 @@ impl ServedBank {
     /// advance reports, `wake` completed at once.
     fn shrink_host(&self, cuts: (u64, u64), decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
         let holding = BankHolding::Host;
-        let LandedShrink { from, to: at, before, after } = match self.bank.shrink_host(cuts)? {
+        let LandedShrink { unpinned, from, to: at, before, after } = match self.bank.shrink_host(cuts)? {
             Shrinking::Begun(shrunk) => shrunk,
             Shrinking::Running => return Ok(BankStep::Running),
             Shrinking::Deferred => return Ok(in_flight(holding, cuts)),
@@ -177,6 +177,7 @@ impl ServedBank {
             prepared: done,
             installed: done,
             released: done,
+            unpinned,
         };
         let released = before
             .checked_sub(after)
@@ -233,9 +234,10 @@ impl ServedBank {
                 .charged_bytes()
                 .ok_or_else(|| DomainError::invariant("a held table's slots are charged"))
         };
-        let (before, from) = (charged()?, held.table.records());
+        let (before, from, unpinning) = (charged()?, held.table.records(), seismic::backing_times());
         let outcome = held.table.resize(records).map_err(DomainError::invariant)?;
         let (after, to, done) = (charged()?, held.table.records(), Instant::now());
+        let unpinned = seismic::backing_times().since(unpinning).unpin;
         let times = ResizeTimes {
             decided,
             queued,
@@ -245,6 +247,7 @@ impl ServedBank {
             prepared: done,
             installed: done,
             released: done,
+            unpinned,
         };
         let holding = BankHolding::Table { table: index };
         let resized = match outcome {
