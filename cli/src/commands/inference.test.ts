@@ -434,9 +434,10 @@ describe("candidate inspection", () => {
   it("prints the repository step with verdicts, drafters, and the download command", () => {
     const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()], memory: "Device" })
     const lines = output.split("\n")
-    expect(lines.slice(0, 21)).toEqual([
+    expect(lines.slice(0, 22)).toEqual([
       "Qwen Test Uncensored",
       "Variant of Qwen Test · apache-2.0 · pinned to 4f1c2e9",
+      `https://huggingface.co/${TEST_REPOSITORY}`,
       "",
       "VERSION  BITS   SIZE     SPEED        CONTEXT  PLACEMENT    ON THIS COMPUTER",
       "Q2_K_P   2-bit  15 GB    Can't run    —        —            Unsupported: Q2_K weights",
@@ -457,9 +458,9 @@ describe("candidate inspection", () => {
       expect.stringMatching(/^DRAFTER\s+SIZE\s+VERDICT\s+NOTE\s+USE$/),
       expect.stringMatching(/^ {2}HauhauCS\/Qwen-Test-Uncensored-GGUF\/dflash\.gguf\s+1\.2 GB\s+Can't be used: Its drafter wasn't built for this model\s+In this repository\s+/),
     ])
-    expect(lines[21]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
-    expect(lines[22]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
-    expect(lines[23]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
+    expect(lines[22]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
+    expect(lines[23]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
+    expect(lines[24]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
     expect(lines.at(-3)).toBe("Download size: 24.3 GB (model 23.4 GB + drafter 900 MB)")
     expect(lines.at(-2)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`)
   })

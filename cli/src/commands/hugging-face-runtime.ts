@@ -254,7 +254,11 @@ const inspectionHeader = (inspection: CandidateInspection, models: readonly Loca
     ...Option.toArray(inspection.license),
     ...(inspection.source._tag === "HuggingFace" ? [`pinned to ${inspection.source.commit.slice(0, 7)}`] : []),
   ]
-  return [inspection.displayName, ...(details.length > 0 ? [details.join(" · ")] : [])]
+  return [
+    inspection.displayName,
+    ...(details.length > 0 ? [details.join(" · ")] : []),
+    ...(inspection.source._tag === "HuggingFace" ? [`https://huggingface.co/${inspection.source.repository}`] : []),
+  ]
 }
 
 const acquireCommand = (repository: string, version: CandidateVersion, force = false): string =>
