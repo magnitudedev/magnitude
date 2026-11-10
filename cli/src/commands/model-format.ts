@@ -227,6 +227,10 @@ export const assessmentSpeed = (assessment: Option.Option<LocalModelAssessment>)
   },
 })
 
+/** Whether an assessed quant's decode speed is known: it fits and this machine's speed is measured. */
+export const assessmentSpeedKnown = (assessment: Option.Option<LocalModelAssessment>): boolean => Option.exists(fits(assessment), (value) =>
+  value.residency.performance._tag !== "Pending" && Option.isSome(comparisonTokensPerSecond(value.residency.performance, value.served.contextLength)))
+
 /** The context an assessed quant is served at, with the model's own when this computer serves less ("32K of 128K"). */
 export const assessmentContext = (assessment: Option.Option<LocalModelAssessment>): string => Option.match(fits(assessment), {
   onNone: () => "—",

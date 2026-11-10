@@ -59,6 +59,7 @@ import {
   assessmentContext,
   assessmentPlacement,
   assessmentSpeed,
+  assessmentSpeedKnown,
   capabilityLabels,
   modelAssessment,
   modelQuant,
@@ -77,10 +78,13 @@ export * from "./models-status-runtime"
 const catalogModels = (catalog: ModelCatalogState): readonly CatalogLocalModel[] =>
   catalogProducts(catalog).flatMap((model) => model._tag === "Catalog" ? [model] : [])
 
-const assessingCount = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => ({
-  assessing: models.filter((model) => model.servingState._tag === "Assessing").length,
-  failed: models.filter((model) => model.servingState._tag === "Failed").length,
-})
+const assessingCount = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => {
+  const offered = models.filter((model) => model.catalogData.support._tag === "Supported")
+  return {
+    assessing: offered.filter((model) => model.servingState._tag === "Assessing").length,
+    failed: offered.filter((model) => model.servingState._tag === "Failed").length,
+  }
+}
 
 const assessmentNotice = (models: readonly CatalogLocalModel[]): string[] => {
   const { assessing, failed } = assessingCount(models)
@@ -135,7 +139,7 @@ const renderRecommendation = (hardware: LocalInferenceHardware) => (
   return [
     `${index + 1}. ${formatLocalModelDisplayName(model)} - ${developer.name} (${developer.country}) - Intelligence ${intelligenceLabel(model)}`,
     `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, unifiedMemory)}`,
-    `   Model ID: ${model.modelId}${recommendation.meetsTarget ? "" : " - below 20 tok/s on this computer"}`,
+    `   Model ID: ${model.modelId}${recommendation.meetsTarget || !assessmentSpeedKnown(assessment) ? "" : " - below 20 tok/s on this computer"}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     `   Acceleration ${accelerationLabel(model)}${capabilities.length > 0 ? ` - ${capabilities.join(", ")}` : ""}`,
     indent(renderQuantLadder(rungs, Option.some(model.modelId), unifiedMemory), "   "),
