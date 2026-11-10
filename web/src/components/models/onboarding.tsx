@@ -119,7 +119,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
       </div>}
 
       <Section title="Recommended for your machine" aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); setSelection(undefined); setQuantChoice(null) }} className="accent-blue-600" />Only models from US developers</label>}>
-        {measuring ? <OfferedModelsSkeleton /> : <div className="space-y-2">
+        {measuring ? <OfferedModelsSkeleton firstOpened /> : <div className="space-y-2">
             {recommendations.map(({ model, note }) => <ExpandingModel key={model.key} model={model} note={note} expanded={selected === model.key} owned={owned}
               onToggle={() => { setSelection(selected === model.key ? null : model.key); setQuantChoice(null) }}
               quantChoice={selected === model.key ? quantChoice : null} onQuantChoice={setQuantChoice} />)}
