@@ -84,7 +84,7 @@ const locationOf = (model: LocalModel): string | null => {
 const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
   if (model._tag === "Custom") {
     const attached = Option.getOrNull(model.drafter)
-    if (attached) return { method: attached.label, sizeBytes: attached.sizeBytes, attached: true }
+    if (attached) return { method: attached.verdict._tag === "Bound" ? methodName[attached.verdict.method._tag] : attached.label, sizeBytes: attached.sizeBytes, attached: true }
     const recommended = Option.getOrNull(model.recommendedDrafter)
     return recommended ? { method: Option.match(recommended.method, { onNone: () => recommended.label, onSome: method => methodName[method._tag] }), sizeBytes: recommended.sizeBytes, attached: false } : null
   }

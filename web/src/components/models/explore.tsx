@@ -22,13 +22,18 @@ function useDebounced<A>(value: A, delay: number): A {
 }
 
 /** Search results grouped by the model they quantize: one offered model per base, one rung per repository's recommended quant. */
-const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified: boolean): { readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[] } => {
+const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified: boolean): { readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] } => {
   const groups = new Map<string, HuggingFaceSearchResult[]>()
   const unrunnable: UnrunnableFile[] = []
+  const unchecked: UnrunnableFile[] = []
   for (const result of results) {
-    if (Option.isSome(result.unsupported) || Option.isNone(result.recommended)) {
+    if (Option.isSome(result.unsupported)) {
       const architecture = Option.getOrNull(result.architecture)
       unrunnable.push({ name: result.repository, reason: architecture ? `${architecture} architecture` : "Not supported" })
+      continue
+    }
+    if (Option.isNone(result.recommended)) {
+      unchecked.push({ name: result.repository, reason: "Its files took too long to read" })
       continue
     }
     const base = Option.getOrNull(result.base)
@@ -58,7 +63,7 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified:
       recommended: fastest?.key ?? quants[0]?.key ?? null,
     }
   })
-  return { models, unrunnable }
+  return { models, unrunnable, unchecked }
 }
 
 interface ExploreProps {

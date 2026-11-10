@@ -5,7 +5,7 @@ import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { LabLogo, type ModelLab } from "../model-logo"
 import { Badge } from "./parts"
-import { MeasuringRecommendations } from "./skeletons"
+import { MeasuringRecommendations, OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
 import { Unrunnable, type UnrunnableFile } from "./your-models"
 import type { QuantView } from "./view"
@@ -44,7 +44,7 @@ export function WhatRuns({ families }: { families: readonly RunnableFamily[] }) 
 export type ExploreResults =
   | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
   | { readonly _tag: "Searching" }
-  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[] }
+  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[]; readonly unchecked: readonly UnrunnableFile[] }
   | { readonly _tag: "Failed"; readonly message: string }
 
 /** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
@@ -75,11 +75,15 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
           <p className="mb-3 flex items-baseline justify-between text-xs font-medium text-slate-500"><span>Best for your machine</span><span className="font-normal">{results.machine}</span></p>
           {results.measuring ? <MeasuringRecommendations {...results.measuring} /> : <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>}
         </>}
-        {results._tag === "Searching" && <p className="text-[13px] text-slate-500">Searching Hugging Face…</p>}
+        {results._tag === "Searching" && <>
+          <p role="status" className="mb-3 text-xs font-medium text-slate-500">Searching Hugging Face and checking how each result runs on your machine…</p>
+          <OfferedModelsSkeleton />
+        </>}
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
           <p className="mb-3 text-xs font-medium text-slate-500">Results on Hugging Face ({results.models.length})</p>
           {results.models.length > 0 ? <div className="space-y-2">{results.models.map(model => card(model))}</div> : <p className="max-w-lg text-[13px] text-slate-500">Nothing here runs in Magnitude. {runnableSummary(families)}</p>}
+          <Unrunnable files={results.unchecked} title="Couldn’t check in time" />
           <Unrunnable files={results.unrunnable} />
         </>}
       </div>

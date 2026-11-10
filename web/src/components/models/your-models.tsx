@@ -101,12 +101,12 @@ function Details({ model, onAddDrafter }: { model: OwnedModel; onAddDrafter: () 
   </div>
 }
 
-export function Unrunnable({ files }: { files: readonly UnrunnableFile[] }) {
+export function Unrunnable({ files, title = "Doesn’t run in Magnitude yet" }: { files: readonly UnrunnableFile[]; title?: string }) {
   const [open, setOpen] = useState(false)
   if (files.length === 0) return null
   return <div className="mt-3">
     <button type="button" onClick={() => setOpen(value => !value)} className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
-      {open ? <CaretDownIcon className="size-3" /> : <CaretRightIcon className="size-3" />}Doesn’t run in Magnitude yet ({files.length})
+      {open ? <CaretDownIcon className="size-3" /> : <CaretRightIcon className="size-3" />}{title} ({files.length})
     </button>
     {open && <div className="mt-2 divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
       {files.map(file => <div key={file.name} className="flex items-center justify-between gap-3 px-4 py-2.5 text-[13px]">
