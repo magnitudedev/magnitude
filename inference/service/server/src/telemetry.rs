@@ -545,6 +545,7 @@ mod tests {
             .search(magnitude_service_contracts::HuggingFaceModelSearchRequest {
                 query: "model".to_owned(),
                 limit: 5,
+                cursor: None,
             })
             .await;
         tracing::warn!(?search, "search");

@@ -304,7 +304,12 @@ impl ManagedModelStore {
             .and_then(|registry| registry.join(&format!("v2/library/{model}/blobs/{digest}")))
             .map_err(|error| InventoryError::InvalidRequest(error.to_string()))?;
         let mut remote = RemoteRanges::open_url(&self.http, url).await?;
-        let header = crate::remote_header::read_header(&mut remote, &[]).await?;
+        let header = crate::remote_header::read_header(
+            &mut remote,
+            &[],
+            &crate::remote_header::no_sharing,
+        )
+        .await?;
         let directory = read_header(&header)
             .map_err(|error| InventoryError::Integrity(format!("{model}@{digest}: {error}")))?;
         remote_weight_sample(&mut remote, &directory).await

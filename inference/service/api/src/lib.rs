@@ -2460,6 +2460,7 @@ mod tests {
                         }),
                         recommended: None,
                     }],
+                    next_cursor: None,
                 })
             })
         }

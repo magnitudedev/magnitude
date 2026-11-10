@@ -6678,6 +6678,9 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "cursor": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -6756,7 +6759,7 @@
       },
       "HuggingFaceModelSearchResults": {
         "type": "object",
-        "description": "Results of every architecture, unsupported ones last; catalog and drafter repositories\nexcluded.",
+        "description": "One page of results of every architecture, unsupported ones last; catalog and drafter\nrepositories excluded. `next_cursor` requests the page after it, absent on the last.",
         "required": [
           "results"
         ],
@@ -6766,6 +6769,9 @@
             "items": {
               "$ref": "#/components/schemas/HuggingFaceModelSearchResult"
             }
+          },
+          "nextCursor": {
+            "type": "string"
           }
         },
         "additionalProperties": false

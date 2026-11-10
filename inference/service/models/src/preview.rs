@@ -42,7 +42,8 @@ const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-const SEARCH_SHAPE_CONCURRENCY: usize = 8;
+/// A page's results are read and assessed at once: their time is the Hub's latency, not work.
+const SEARCH_SHAPE_CONCURRENCY: usize = MAX_HUB_SEARCH_RESULTS as usize;
 /// How long inspecting a result's repository for its recommended version may take before the
 /// result is shown without one.
 const RECOMMENDATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +99,9 @@ impl HuggingFaceDiscovery {
             .append_pair("sort", "downloads")
             .append_pair("direction", "-1")
             .append_pair("limit", &request.limit.to_string());
+        if let Some(cursor) = &request.cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
         for field in [
             "sha",
             "lastModified",
@@ -113,6 +117,7 @@ impl HuggingFaceDiscovery {
             url.query_pairs_mut().append_pair("expand", field);
         }
         let token = self.models.hub_token();
+        let search_started = std::time::Instant::now();
         let response = send_hub_get(&self.models.http, token.as_deref(), url.clone()).await?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(hub_rate_limited(hub_pause(&url).unwrap_or(DEFAULT_RATE_LIMIT_PAUSE)));
@@ -123,6 +128,7 @@ impl HuggingFaceDiscovery {
                 response.status()
             )));
         }
+        let next_cursor = next_page_cursor(response.headers());
         let metadata: Vec<HubSearchModel> = serde_json::from_slice(
             &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
         )
@@ -172,14 +178,19 @@ impl HuggingFaceDiscovery {
         // Every result's model file is read, an unsupported Hub architecture's too: the Hub names
         // an architecture, never what its files are for, and a drafter of an architecture the
         // engine doesn't know is told by its header alone.
+        tracing::debug!(hub_ms = search_started.elapsed().as_millis(), results = kept.len(), "search hub query");
         let mut results = futures_util::stream::iter(kept)
             .map(|mut result| async move {
+                let shape = std::time::Instant::now();
                 if !self.read_model_file(&mut result, catalog).await {
                     return None;
                 }
+                let shape_ms = shape.elapsed().as_millis();
+                let recommend = std::time::Instant::now();
                 if result.unsupported.is_empty() {
                     result.recommended = self.recommended_version(&result).await;
                 }
+                tracing::debug!(repository = %result.repository, shape_ms, recommend_ms = recommend.elapsed().as_millis(), found = result.recommended.is_some(), "search result");
                 Some(result)
             })
             .buffered(SEARCH_SHAPE_CONCURRENCY)
@@ -193,7 +204,10 @@ impl HuggingFaceDiscovery {
                 std::cmp::Reverse(result.downloads.unwrap_or(0)),
             )
         });
-        Ok(HuggingFaceModelSearchResults { results })
+        Ok(HuggingFaceModelSearchResults {
+            results,
+            next_cursor,
+        })
     }
 
     /// What `result`'s model file says: its header's architecture, which replaces the Hub's and is
@@ -283,6 +297,20 @@ impl HuggingFaceDiscovery {
     }
 }
 
+/// The Hub's cursor for the page after this one, from the `Link: <…cursor=…>; rel="next"` header.
+fn next_page_cursor(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find(|link| link.contains("rel=\"next\""))
+        .and_then(|link| {
+            let target = link.trim().strip_prefix('<')?.split_once('>')?.0;
+            reqwest::Url::parse(target).ok()?.query_pairs().find(|(key, _)| key == "cursor").map(|(_, value)| value.into_owned())
+        })
+}
+
 /// Whether a repository is exactly the query: its `owner/repository`, or its name in the same words, ignoring case, separators
 /// and a trailing `GGUF`, with or without an uploader's `Org_` prefix (`bartowski/Qwen_Qwen3.5-4B-GGUF`
 /// is exactly "Qwen3.5 4B").
@@ -360,7 +388,12 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
                     "Hugging Face search requires a non-empty query of at most {MAX_HUB_SEARCH_QUERY_BYTES} bytes and a limit between 1 and {MAX_HUB_SEARCH_RESULTS}"
                 )));
             }
-            let cache_key = format!("{}:{}", query.to_lowercase(), request.limit);
+            let cache_key = format!(
+                "{}:{}:{}",
+                query.to_lowercase(),
+                request.limit,
+                request.cursor.as_deref().unwrap_or_default()
+            );
             {
                 let mut searches = self.searches.lock().await;
                 searches.retain(|_, (captured, _)| captured.elapsed() <= HUB_SEARCH_TTL);
@@ -1078,6 +1111,7 @@ impl ManagedModelStore {
                 &commit,
                 &component.path,
                 size,
+                &crate::remote_header::cached_sharing(&self.cache),
             )
             .await?;
             let header_digest = self.write_header(&header);
@@ -1814,6 +1848,7 @@ async fn fetch_header(
     commit: &str,
     path: &Path,
     logical_size: u64,
+    sharing: &crate::remote_header::Sharing<'_>,
 ) -> Result<Vec<u8>, InventoryError> {
     let mut remote = RemoteRanges::new(
         http,
@@ -1824,7 +1859,7 @@ async fn fetch_header(
         path,
         logical_size,
     )?;
-    let header = crate::remote_header::read_header(&mut remote, &[]).await?;
+    let header = crate::remote_header::read_header(&mut remote, &[], sharing).await?;
     match header_verdict(header).await? {
         (header, Ok(())) => Ok(header),
         (_, Err(detail)) => Err(InventoryError::Integrity(detail)),
@@ -2176,8 +2211,27 @@ impl ManagedModelStore {
             &file.path,
             file.size_bytes,
         )?;
+        // Entries this read fetches because no stored header holds them and no other read is
+        // fetching them: claimed until this header is stored below, so reads of the same
+        // tokenizer wait and borrow it instead of fetching it too.
+        let claims = std::sync::Mutex::new(Vec::new());
+        let held = &claims;
+        let cache = &self.cache;
+        let sharing = move |head: Vec<u8>| -> futures_util::future::BoxFuture<'_, Vec<Vec<u8>>> {
+            Box::pin(async move {
+                match cache.lend_or_claim(&head).await {
+                    crate::header_cache::Lending::Lent(headers) => headers,
+                    crate::header_cache::Lending::Claimed(claim) => {
+                        if let Ok(mut claims) = held.lock() {
+                            claims.push(claim);
+                        }
+                        Vec::new()
+                    }
+                }
+            })
+        };
         let (bytes, verdict) =
-            match crate::remote_header::read_header(&mut remote, references).await {
+            match crate::remote_header::read_header(&mut remote, references, &sharing).await {
                 Ok(bytes) => header_verdict(bytes).await?,
                 Err(InventoryError::Integrity(detail)) => (Vec::new(), Err(detail)),
                 Err(error) => return Err(error),
@@ -3255,6 +3309,7 @@ mod tests {
             &"a".repeat(40),
             Path::new("model-Q4_K_M.gguf"),
             size,
+            &crate::remote_header::no_sharing,
         )
         .await
         .unwrap();
@@ -3318,6 +3373,7 @@ mod tests {
                 &"a".repeat(40),
                 Path::new("model-00001-of-00006.gguf"),
                 size,
+                &crate::remote_header::no_sharing,
             )
             .await
             .unwrap();
@@ -3350,6 +3406,7 @@ mod tests {
             &"a".repeat(40),
             Path::new("model.gguf"),
             size,
+            &crate::remote_header::no_sharing,
         )
         .await
         .unwrap();
@@ -3380,6 +3437,7 @@ mod tests {
             &"a".repeat(40),
             Path::new("model.gguf"),
             size,
+            &crate::remote_header::no_sharing,
         )
         .await
         .unwrap_err();
@@ -3473,6 +3531,7 @@ mod tests {
                 &"a".repeat(40),
                 Path::new("model.gguf"),
                 1024 * 1024 * 1024,
+                &crate::remote_header::no_sharing,
             )
             .await
             .unwrap_err();
@@ -3628,6 +3687,7 @@ mod tests {
             &"a".repeat(40),
             Path::new("model-Q4_0_4_4.gguf"),
             size,
+            &crate::remote_header::no_sharing,
         )
         .await
         .unwrap_err();
@@ -3727,6 +3787,7 @@ mod tests {
                 .search(HuggingFaceModelSearchRequest {
                     query: "repo".to_owned(),
                     limit: 5,
+                    cursor: None,
                 })
                 .await
                 .expect("search");
@@ -3999,6 +4060,7 @@ mod tests {
             .search(HuggingFaceModelSearchRequest {
                 query: "llama".to_owned(),
                 limit: 10,
+                cursor: None,
             })
             .await
             .unwrap();
@@ -4367,6 +4429,7 @@ mod tests {
             .search(HuggingFaceModelSearchRequest {
                 query: "model".to_owned(),
                 limit: 10,
+                cursor: None,
             })
             .await
             .unwrap()
@@ -4671,6 +4734,7 @@ mod tests {
                 .search(HuggingFaceModelSearchRequest {
                     query: query.to_owned(),
                     limit: 10,
+                    cursor: None,
                 })
                 .await
                 .unwrap();
@@ -5109,6 +5173,7 @@ mod tests {
             .search(HuggingFaceModelSearchRequest {
                 query: "llama 8b".to_owned(),
                 limit: 10,
+                cursor: None,
             })
             .await
             .unwrap();

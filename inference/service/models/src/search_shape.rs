@@ -491,7 +491,8 @@ async fn read_repository_model(
                     &primary.path,
                     primary.size_bytes,
                 )?;
-                match crate::remote_header::read_header(&mut remote, &references).await {
+                let sharing = crate::remote_header::cached_sharing(&models.cache);
+                match crate::remote_header::read_header(&mut remote, &references, &sharing).await {
                     Ok(header) => {
                         return Ok(RepositoryModel::Model {
                             shape: ModelShape::from_header_prefix(&header),

@@ -213,6 +213,17 @@ impl ModelCache {
     /// Whether the header cache holds this header, marking it used for the read that follows;
     /// `read_header` still verifies it.
     #[must_use]
+    /// Cached headers holding a large entry whose fixed part is `head` (see `header_cache`).
+    pub(crate) fn sharing_headers(&self, head: &[u8]) -> Vec<Vec<u8>> {
+        self.headers.sharing(head)
+    }
+
+    /// Cached headers holding that entry, after any read fetching it stores its header; or the
+    /// claim to fetch it (see `header_cache`).
+    pub(crate) async fn lend_or_claim(&self, head: &[u8]) -> crate::header_cache::Lending {
+        self.headers.lend_or_claim(head).await
+    }
+
     pub fn has_header(&self, digest: &str) -> bool {
         self.headers.contains(digest)
     }

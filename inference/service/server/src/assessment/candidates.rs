@@ -59,6 +59,8 @@ use super::inspection_progress::InspectionProgress;
 
 /// Concurrent header requests while classifying a repository's files.
 const HEADER_CONCURRENCY: usize = 12;
+/// Versions a search recommendation assesses at once.
+const SEARCH_RECOMMENDATION_BATCH: usize = 4;
 /// The most concurrent engine assessments of one request's versions or drafters; fewer on
 /// machines with fewer cores.
 const MAX_ASSESSMENT_CONCURRENCY: usize = 6;
@@ -1432,6 +1434,113 @@ impl ManagedModelCandidates {
             (files, classified)
         })
         .await
+    }
+
+    /// The version a repository's inspection would recommend, assessing only what that choice
+    /// needs. The recommended version is the fitting one served at a working context, preferring
+    /// Q4_K-class quantizations, then the largest (`recommended_version`). So versions are
+    /// assessed in that order (Q4_K-class by name first, each set largest first), a batch at a
+    /// time in parallel, and the search stops at the first batch whose best version is served at
+    /// a working context: no version later in the order can beat it. A repository whose versions
+    /// all fit only below a working context is assessed whole. Drafters aren't composed: the
+    /// verdict is the target's own.
+    async fn search_recommendation(
+        &self,
+        repository: &HuggingFaceRepositoryId,
+        commit: &str,
+    ) -> Result<Option<HuggingFaceRecommendedVersion>, InventoryError> {
+        let started = std::time::Instant::now();
+        let snapshot = self.snapshot(repository.as_str(), commit).await?;
+        let snapshot_ms = started.elapsed().as_millis();
+        let files = snapshot
+            .gguf_files
+            .iter()
+            .map(|file| CandidateGguf {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        let mut order = group_ggufs(&files)
+            .into_iter()
+            .filter(|group| !is_projector_name(&group.primary().path))
+            .collect::<Vec<_>>();
+        let named_q4_k =
+            |group: &GgufGroup| is_q4_k_class(&version_label(&group.primary().path, None));
+        order.sort_by_key(|group| (!named_q4_k(group), std::cmp::Reverse(group.size_bytes())));
+        let mut assessed: Vec<(ClassifiedGroup, Option<CachedModelAssessment>)> = Vec::new();
+        for batch in order.chunks(SEARCH_RECOMMENDATION_BATCH) {
+            let checks = batch.iter().cloned().map(|group| async {
+                let read = std::time::Instant::now();
+                let classified = self
+                    .classify_hugging_face_group(&snapshot, group, &[])
+                    .await
+                    .ok()?;
+                let read_ms = read.elapsed().as_millis();
+                if !matches!(classified.role, CandidateFileRole::Target { .. }) {
+                    return None;
+                }
+                let assess = std::time::Instant::now();
+                let assessment = self
+                    .version_assessment(
+                        &classified,
+                        self.cached_hugging_face_identity(&snapshot, &classified.group, None),
+                        self.hugging_face_target(&snapshot, &classified.group.primary().path, None),
+                    )
+                    .await;
+                tracing::debug!(
+                    repository = %snapshot.repository,
+                    version = %classified.group.primary().path.display(),
+                    read_ms,
+                    assess_ms = assess.elapsed().as_millis(),
+                    "search recommendation version"
+                );
+                Some((classified, assessment))
+            });
+            assessed.extend(futures_util::future::join_all(checks).await.into_iter().flatten());
+            let best = recommended_version(
+                assessed.iter().map(|(group, assessment)| (group, assessment.as_ref())),
+            );
+            let settled = best.is_some_and(|index| {
+                matches!(
+                    assessed[index].1.as_ref().map(|assessment| &assessment.profile),
+                    Some(ModelAssessment::Fits { profile, served, .. }) if working_context(profile, served)
+                )
+            });
+            if settled {
+                break;
+            }
+        }
+        tracing::debug!(
+            repository = %snapshot.repository,
+            snapshot_ms,
+            total_ms = started.elapsed().as_millis(),
+            versions = assessed.len(),
+            "search recommendation"
+        );
+        let versions = assessed
+            .iter()
+            .filter_map(|(group, assessment)| {
+                Some(AssessedVersion {
+                    group,
+                    assessment: assessment.clone(),
+                    model_id: hugging_face_model_id(&snapshot.repository, &group.group)?,
+                    catalog_model: None,
+                    on_this_computer: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(candidate_versions(versions, None)
+            .into_iter()
+            .find(|version| version.recommended)
+            .and_then(|version| {
+                Some(HuggingFaceRecommendedVersion {
+                    label: version.label,
+                    model_id: version.model_id,
+                    size_bytes: version.size_bytes,
+                    download_bytes: version.download_bytes,
+                    assessment: version.assessment?,
+                })
+            }))
     }
 
     // Inspection -----------------------------------------------------------------------------
@@ -3015,7 +3124,8 @@ impl CatalogFingerprints for ManagedModelCandidates {
 }
 
 impl RecommendedVersions for ManagedModelCandidates {
-    /// The version the repository's inspection at `commit` recommends, with its verdict.
+    /// The version the repository's inspection at `commit` would recommend, with its verdict,
+    /// found by assessing as few versions as that choice needs (see `search_recommendation`).
     fn recommended_version(
         &self,
         repository: String,
@@ -3023,22 +3133,11 @@ impl RecommendedVersions for ManagedModelCandidates {
     ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>> {
         Box::pin(async move {
             let repository = HuggingFaceRepositoryId::new(repository).ok()?;
-            let inspection = self
-                .inspect_hugging_face(repository, commit, &InspectionProgress::silent())
+            self.search_recommendation(&repository, &commit)
                 .await
-                .map_err(|error| tracing::debug!(%error, "search recommendation inspection failed"))
-                .ok()?;
-            let version = inspection
-                .versions
-                .into_iter()
-                .find(|version| version.recommended)?;
-            Some(HuggingFaceRecommendedVersion {
-                label: version.label,
-                model_id: version.model_id,
-                size_bytes: version.size_bytes,
-                download_bytes: version.download_bytes,
-                assessment: version.assessment?,
-            })
+                .map_err(|error| tracing::debug!(%error, "search recommendation failed"))
+                .ok()
+                .flatten()
         })
     }
 }

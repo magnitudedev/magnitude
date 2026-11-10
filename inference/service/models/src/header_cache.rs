@@ -38,6 +38,50 @@ pub(crate) const HEADER_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
 /// A header used this recently is never evicted.
 pub(crate) const HEADER_EVICTION_GRACE: Duration = Duration::from_secs(10 * 60);
 
+/// The fixed part of the entry a chunk holds (key, type, and an array's element type and count or
+/// a string's length), as the walk delimits it; little-endian headers only.
+fn chunk_head(path: &Path) -> Option<Vec<u8>> {
+    let mut start = Vec::new();
+    fs::File::open(path).ok()?.take(4096).read_to_end(&mut start).ok()?;
+    let key_length = usize::try_from(u64::from_le_bytes(start.get(..8)?.try_into().ok()?)).ok()?;
+    let type_at = 8usize.checked_add(key_length)?;
+    let value_type = u32::from_le_bytes(start.get(type_at..type_at + 4)?.try_into().ok()?);
+    let end = match value_type {
+        9 => type_at + 4 + 4 + 8,
+        8 => type_at + 4 + 8,
+        _ => return None,
+    };
+    start.get(..end).map(<[u8]>::to_vec)
+}
+
+/// What another header's read can borrow for one large entry: headers holding it, or the claim to
+/// fetch it.
+pub(crate) enum Lending {
+    Lent(Vec<Vec<u8>>),
+    Claimed(Claim),
+}
+
+/// The one read fetching a large entry no stored header holds; dropping it, once that read has
+/// stored its header, lets the reads waiting for the entry borrow it.
+pub(crate) struct Claim {
+    key: String,
+    done: tokio::sync::watch::Sender<bool>,
+    flights: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Receiver<bool>>>>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Ok(mut flights) = self.flights.lock() {
+            flights.remove(&self.key);
+        }
+        let _ = self.done.send(true);
+    }
+}
+
+/// Headers listed, and lent, per large entry's fixed part: the most recently seen first.
+const MAX_HEAD_REFERENCES: usize = 2;
+const HEADS_INDEX_BYTES: usize = 4 * 1024;
+
 const RECIPE_MAGIC: &[u8; 4] = b"MGHR";
 const RECIPE_VERSION: u32 = 1;
 const INLINE: u8 = 0;
@@ -54,6 +98,9 @@ struct SweepState {
 pub(crate) struct HeaderCache {
     recipes: PathBuf,
     chunks: PathBuf,
+    heads: PathBuf,
+    flights: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Receiver<bool>>>>,
+    heads_backfilled: Arc<std::sync::Once>,
     lock: PathBuf,
     capacity: u64,
     grace: Duration,
@@ -71,6 +118,9 @@ impl HeaderCache {
         Self {
             recipes: root.join("blobs/gguf-headers"),
             chunks: root.join("blobs/gguf-header-chunks"),
+            heads: root.join("blobs/gguf-header-heads"),
+            flights: Arc::new(Mutex::new(BTreeMap::new())),
+            heads_backfilled: Arc::new(std::sync::Once::new()),
             lock: root.join(".locks/gguf-headers.lock"),
             capacity,
             grace,
@@ -94,6 +144,7 @@ impl HeaderCache {
         {
             Some(header) => {
                 touch(&path);
+                self.index_heads(&header, digest);
                 Some(header)
             }
             None => {
@@ -177,6 +228,7 @@ impl HeaderCache {
             let mut written = 0_u64;
             let mut cursor = 0;
             if let Ok(Walk::Complete(layout)) = walk(header) {
+                self.index_entries(header, &layout.entries, &digest);
                 for entry in layout.entries.iter().filter(|entry| shared(entry)) {
                     let range = entry.range();
                     if range.start > cursor {
@@ -216,6 +268,98 @@ impl HeaderCache {
             state.written_since_sweep = 0;
         }
         digest
+    }
+
+    /// Headers holding a large entry whose fixed part (key, type and element count) is `head`, from
+    /// any repository: references for reading another file's header without fetching that entry
+    /// (see `remote_header`). Each is verified against its digest; an evicted one is skipped.
+    pub(crate) fn sharing(&self, head: &[u8]) -> Vec<Vec<u8>> {
+        self.heads_backfilled.call_once(|| self.backfill_heads());
+        let Some(list) = read_bytes(&self.heads.join(hex_sha256(head)), HEADS_INDEX_BYTES) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&list)
+            .lines()
+            .filter_map(|digest| self.read(digest))
+            .take(MAX_HEAD_REFERENCES)
+            .collect()
+    }
+
+    /// Headers holding a large entry whose fixed part is `head`, waiting for a read already
+    /// fetching that entry to store its header; or, when none holds it and none is fetching it,
+    /// the claim to fetch it, which tells the waiters when dropped (after the header is stored).
+    pub(crate) async fn lend_or_claim(&self, head: &[u8]) -> Lending {
+        let key = hex_sha256(head);
+        loop {
+            let lent = self.sharing(head);
+            if !lent.is_empty() {
+                return Lending::Lent(lent);
+            }
+            let waiting = {
+                let Ok(mut flights) = self.flights.lock() else {
+                    return Lending::Lent(Vec::new());
+                };
+                match flights.get(&key) {
+                    Some(flight) => flight.clone(),
+                    None => {
+                        let (done, flight) = tokio::sync::watch::channel(false);
+                        flights.insert(key.clone(), flight);
+                        return Lending::Claimed(Claim {
+                            key,
+                            done,
+                            flights: Arc::clone(&self.flights),
+                        });
+                    }
+                }
+            };
+            let mut waiting = waiting;
+            // A claim dropped without storing its header (a failed read) ends the wait too; the
+            // loop then finds nothing and claims the entry itself.
+            let _ = waiting.wait_for(|done| *done).await;
+        }
+    }
+
+    /// Records, for each large entry of `header`, that this header holds it.
+    fn index_heads(&self, header: &[u8], digest: &str) {
+        if let Ok(Walk::Complete(layout)) = walk(header) {
+            self.index_entries(header, &layout.entries, digest);
+        }
+    }
+
+    fn index_entries(&self, header: &[u8], entries: &[Entry<'_>], digest: &str) {
+        for entry in entries.iter().filter(|entry| shared(entry)) {
+            self.index_head(&header[entry.head.start..entry.head.end], digest);
+        }
+    }
+
+    fn index_head(&self, head: &[u8], digest: &str) {
+        let path = self.heads.join(hex_sha256(head));
+        let list = read_bytes(&path, HEADS_INDEX_BYTES).unwrap_or_default();
+        let listed = String::from_utf8_lossy(&list).into_owned();
+        if listed.lines().any(|line| line == digest) {
+            return;
+        }
+        let kept = std::iter::once(digest)
+            .chain(listed.lines().filter(|line| valid_digest(line)))
+            .take(MAX_HEAD_REFERENCES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_bytes_atomic(&path, &self.lock, kept.as_bytes(), HEADS_INDEX_BYTES);
+    }
+
+    /// Indexes the headers stored before the index existed (the release catalog's among them)
+    /// from their chunks: each chunk is one large entry, starting with its fixed part.
+    fn backfill_heads(&self) {
+        for (name, path, _, _) in files(&self.recipes) {
+            if !valid_digest(&name) {
+                continue;
+            }
+            for chunk in self.recipe_chunks(&path).unwrap_or_default() {
+                if let Some(head) = chunk_head(&self.chunks.join(&chunk)) {
+                    self.index_head(&head, &name);
+                }
+            }
+        }
     }
 
     /// Evicts least recently used headers until the cache fits its capacity, keeping pinned and

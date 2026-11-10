@@ -37,6 +37,23 @@ const EDGE_BYTES: usize = 16 * 1024;
 /// Bytes compared in the middle of each shared entry.
 const WINDOW_BYTES: usize = 8 * 1024;
 
+/// Cached headers holding a large entry whose fixed part (key, type and element count) is the
+/// given bytes, from any source; it may wait for another read already fetching that entry.
+pub(crate) type Sharing<'a> =
+    dyn Fn(Vec<u8>) -> futures_util::future::BoxFuture<'a, Vec<Vec<u8>>> + Send + Sync + 'a;
+
+/// Lends nothing: a read with only the references it is given.
+pub(crate) fn no_sharing(_: Vec<u8>) -> futures_util::future::BoxFuture<'static, Vec<Vec<u8>>> {
+    Box::pin(std::future::ready(Vec::new()))
+}
+
+/// Lends what the cache already holds, without waiting or claiming.
+pub(crate) fn cached_sharing<'a>(
+    cache: &'a crate::cache::ModelCache,
+) -> impl Fn(Vec<u8>) -> futures_util::future::BoxFuture<'a, Vec<Vec<u8>>> + Send + Sync + 'a {
+    move |head| Box::pin(std::future::ready(cache.sharing_headers(&head)))
+}
+
 struct Reference<'a> {
     bytes: &'a [u8],
     entries: Vec<Entry<'a>>,
@@ -65,6 +82,7 @@ impl SharedRun<'_> {
 pub(crate) async fn read_header(
     remote: &mut RemoteRanges<'_>,
     references: &[&[u8]],
+    sharing: &Sharing<'_>,
 ) -> Result<Vec<u8>, InventoryError> {
     let references = references
         .iter()
@@ -111,16 +129,37 @@ pub(crate) async fn read_header(
                     ));
                 }
                 let estimate = prefix.estimate;
-                if let Some(open) = prefix.open.filter(|open| !declined.contains(&open.start))
-                    && let Some(run) = shared_run(&references, &bytes, &open)
-                {
+                if let Some(open) = prefix.open.filter(|open| !declined.contains(&open.start)) {
                     let start = open.start;
-                    let taken = share(remote, &mut bytes, start, &run, bound).await?;
-                    if taken < run.entries.len() {
-                        declined.push(start + run.entries[taken].head.start - run.start());
-                    }
-                    if taken > 0 {
-                        continue;
+                    let head = bytes[open.start..open.end].to_vec();
+                    // The file's own repository first, then any cached header holding an entry
+                    // with this fixed part (another repository of the same model, the catalog's).
+                    let lent = if shared_run(&references, &bytes, &open).is_some() {
+                        Vec::new()
+                    } else {
+                        sharing(head).await
+                    };
+                    let lent = lent
+                        .iter()
+                        .filter_map(|bytes| match walk(bytes) {
+                            Ok(Walk::Complete(header)) if header.entries.iter().any(shared) => {
+                                Some(Reference { bytes, entries: header.entries })
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let run = shared_run(&references, &bytes, &open)
+                        .or_else(|| shared_run(&lent, &bytes, &open));
+                    if let Some(run) = run {
+                        let taken = share(remote, &mut bytes, start, &run, bound).await?;
+                        if taken < run.entries.len() {
+                            declined.push(start + run.entries[taken].head.start - run.start());
+                        }
+                        if taken > 0 {
+                            continue;
+                        }
+                    } else {
+                        declined.push(start);
                     }
                 }
                 let target = bytes

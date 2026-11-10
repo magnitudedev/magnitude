@@ -5660,6 +5660,7 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
         magnitude_service_contracts::HuggingFaceModelSearchRequest {
             query: "llama".to_owned(),
             limit: 10,
+            cursor: None,
         },
     )
     .await

@@ -789,6 +789,9 @@ impl ModelPreviewComponentRole {
 pub struct HuggingFaceModelSearchRequest {
     pub query: String,
     pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub cursor: Option<String>,
 }
 
 /// How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`
@@ -873,13 +876,16 @@ pub struct HuggingFaceModelSearchResult {
     pub recommended: Option<HuggingFaceRecommendedVersion>,
 }
 
-/// Results of every architecture, unsupported ones last; catalog and drafter repositories
-/// excluded.
+/// One page of results of every architecture, unsupported ones last; catalog and drafter
+/// repositories excluded. `next_cursor` requests the page after it, absent on the last.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
     pub results: Vec<HuggingFaceModelSearchResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub next_cursor: Option<String>,
 }
 
 /// The Hugging Face token presented on every later Hub request; without one, Hub requests are

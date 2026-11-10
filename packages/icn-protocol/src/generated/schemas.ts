@@ -1788,6 +1788,7 @@ export type HuggingFaceModelBase = S.Schema.Type<typeof HuggingFaceModelBase>
 export type HuggingFaceModelBaseEncoded = S.Schema.Encoded<typeof HuggingFaceModelBase>
 
 export const HuggingFaceModelSearchRequest = S.Struct({
+  cursor: S.optionalWith(S.String, { exact: true, as: "Option" }),
   limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   query: S.String,
 })
@@ -1830,6 +1831,7 @@ export type HuggingFaceModelSearchResult = S.Schema.Type<typeof HuggingFaceModel
 export type HuggingFaceModelSearchResultEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResult>
 
 export const HuggingFaceModelSearchResults = S.Struct({
+  nextCursor: S.optionalWith(S.String, { exact: true, as: "Option" }),
   results: S.Array(
     S.suspend(
       (): S.Schema<HuggingFaceModelSearchResult, HuggingFaceModelSearchResultEncoded> => HuggingFaceModelSearchResult,
