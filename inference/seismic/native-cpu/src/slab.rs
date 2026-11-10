@@ -203,21 +203,6 @@ pub unsafe fn region<T>(table: *const u64, slab_index: usize) -> *mut T {
     unsafe { *table.add(slab_index) as usize as *mut T }
 }
 
-/// Resolve one row within a component region.
-///
-/// # Safety
-/// `table` must have a backed slab for `index`, and that region must contain
-/// `rows_per_slab` rows of `row_elements` values of `T`.
-#[inline(always)]
-pub unsafe fn row<T>(
-    table: *const u64,
-    index: usize,
-    rows_per_slab: usize,
-    row_elements: usize,
-) -> *mut T {
-    unsafe { region::<T>(table, index / rows_per_slab).add((index % rows_per_slab) * row_elements) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{reciprocal, slab_of, SlabWalk};
