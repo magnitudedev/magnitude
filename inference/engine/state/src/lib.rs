@@ -16,7 +16,7 @@ pub use advance::{
 pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryReads,
-    HistorySource, produced_domain,
+    HistorySource, batch_state_bytes, produced_domain,
 };
 
 pub use codec::{
@@ -2913,10 +2913,7 @@ impl StateStore {
     /// rounded up to whole pages.
     fn page_demand(&self, domain: HistoryDomainId, end: Option<usize>, count: usize) -> usize {
         let domain = &self.domains[domain.0];
-        count
-            .saturating_sub(domain.arena.borrow().in_place(end))
-            .div_ceil(domain.page_rows)
-            * domain.page_rows
+        layout::page_demand_rows(domain.page_rows, domain.arena.borrow().in_place(end), count)
     }
 
     /// Reserve `counts[domain]` rows in every stored domain (see

@@ -65,6 +65,16 @@ impl HistoryDomainKind {
         }
     }
 
+    /// The most rows an advance of `count` rows adds to the domain from any
+    /// position ([`Self::advance_rows`] at its worst position): one per row,
+    /// or for Block every block the rows can complete, `ceil(count / rate)`.
+    pub fn most_advance_rows(self, count: usize) -> usize {
+        match self {
+            Self::Block { rate } => count.div_ceil(rate),
+            Self::Token | Self::Window { .. } | Self::Shared { .. } => count,
+        }
+    }
+
     /// The first position a query at `position` reads: 0 for Token, and for
     /// Window(n) the start of the `n` most recent tokens including the query
     /// itself (a key at `k` is read while `position - k < n`).
@@ -155,6 +165,43 @@ impl HistoryDomainLayout {
         )
         .map_err(Error::Request)
     }
+}
+
+/// The state backing one submission batch of `rows` rows can newly take in
+/// a store of `domains` at `context` tokens and advances of at most
+/// `max_advance` rows, at its worst: in each stored domain, the whole pages
+/// its rows take (`page_demand_rows` at the domain's page
+/// geometry, [`HistoryDomainLayout::geometry`]) at its row's bytes, summed.
+/// The worst is a history whose last page holds none of the batch in place
+/// (its end on a page boundary, or no rows yet): a batch straddling a page
+/// boundary at `offset` rows into its last page fills `page_rows - offset`
+/// rows in place first, so its new pages, `ceil((rows - (page_rows -
+/// offset)) / page_rows)`, are never more than at offset 0's
+/// `ceil(rows / page_rows)`. A Block domain's batch is at its most blocks
+/// ([`HistoryDomainKind::most_advance_rows`]) at a boundary too. A batch
+/// takes no recurrent state: a sequence's bank is its own, whatever its
+/// rows (`recurrent_bank_bytes`). The load, the assessment and the runtime
+/// ledger read a batch's state from here.
+pub fn batch_state_bytes(
+    domains: &[HistoryDomainLayout],
+    context: usize,
+    max_advance: usize,
+    rows: u64,
+) -> Result<u64, Error> {
+    let rows = usize::try_from(rows).map_err(|_| LayoutError::ArithmeticOverflow("batch rows"))?;
+    domains
+        .iter()
+        .filter(|domain| !domain.components().is_empty())
+        .try_fold(0u64, |total, domain| {
+            let page_rows = domain.geometry(domains, context, max_advance)?.page_rows;
+            let taken = crate::layout::page_demand_rows(page_rows, 0, domain.kind().most_advance_rows(rows));
+            let row_bytes = domain.row_bytes()?;
+            Ok(u64::try_from(taken)
+                .ok()
+                .and_then(|taken| taken.checked_mul(row_bytes))
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or(LayoutError::ArithmeticOverflow("batch state bytes"))?)
+        })
 }
 
 /// Whether a domain of `kind` holding `components` holds produced rows:
@@ -325,7 +372,7 @@ pub(crate) fn validate_domains(
         .iter()
         .map(|plan| plan.layout.clone())
         .collect::<Vec<_>>();
-    for plan in plans {
+    for (plan, layout) in plans.into_iter().zip(&layouts) {
         let kind = plan.layout.kind();
         match plan.layout {
             HistoryDomainLayout::Shared {
@@ -383,25 +430,13 @@ pub(crate) fn validate_domains(
                         plan.logical_rows
                     )));
                 }
-                let mut row_bytes = 0u64;
                 for component in &components {
                     if !layers.insert((component.layer, matches!(kind, HistoryDomainKind::Block { .. }))) {
                         return Err(LayoutError::DuplicateLayer(component.layer).into());
                     }
-                    for plane in component.planes() {
-                        let bytes = u64::try_from(plane.row_bytes)
-                            .map_err(|_| LayoutError::ArithmeticOverflow("plane row bytes"))?;
-                        row_bytes = row_bytes
-                            .checked_add(bytes)
-                            .ok_or(LayoutError::ArithmeticOverflow("history row bytes"))?;
-                    }
                 }
-                let geometry = history_geometry(
-                    row_bytes,
-                    row_limit,
-                    prepared_appended_rows(kind, &components, &layouts, max_advance),
-                )
-                .map_err(Error::Request)?;
+                let row_bytes = layout.row_bytes()?;
+                let geometry = layout.geometry(&layouts, context, max_advance)?;
                 // Every plane's capacity is at most the domain's total.
                 let logical_rows = geometry
                     .reserved_rows(plan.logical_rows)

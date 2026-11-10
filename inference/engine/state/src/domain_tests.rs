@@ -1022,3 +1022,65 @@ fn produced_domains_follow_the_per_token_ones() {
     assert!(ComponentDescriptor::produced(LayerRef::Target(0), DType::F32, 4, true).is_err());
     assert!(ComponentDescriptor::new(INDEX_KEYS, CodecSpec::dense(DType::F32, 4, 4), 1).is_err());
 }
+
+/// A batch's most rows in a domain are its rows at the worst position: one
+/// per row, or every block the rows can complete.
+#[test]
+fn a_batchs_most_rows_are_its_worst_positions() {
+    let kinds = [
+        HistoryDomainKind::Token,
+        HistoryDomainKind::Window { rows: 3 },
+        HistoryDomainKind::Block { rate: 1 },
+        HistoryDomainKind::Block { rate: 4 },
+        HistoryDomainKind::Block { rate: 7 },
+    ];
+    for kind in kinds {
+        for count in 0..20 {
+            let worst = (0..40).map(|position| kind.advance_rows(position, count)).max().unwrap();
+            assert_eq!(kind.most_advance_rows(count), worst, "{kind:?} at {count} rows");
+        }
+    }
+}
+
+/// The backing a submission batch newly takes in each domain, at its worst
+/// page offset (a history whose last page holds none of it), is its
+/// `batch_state_bytes`: a fresh history for the Token and Window domains, and
+/// for the Block(4) domain one at position 3, whose batch completes its
+/// first block.
+#[test]
+fn a_batch_takes_its_state_bytes_of_pages() {
+    let keys = |coordinates| ComponentDescriptor::produced(INDEX_KEYS, DType::F32, 4, coordinates).unwrap();
+    let layouts = [
+        HistoryDomainLayout::Token { components: vec![component(0, 1)] },
+        HistoryDomainLayout::Window { rows: 3, components: vec![keys(true)] },
+        HistoryDomainLayout::Block { rate: 4, components: vec![keys(false)] },
+    ];
+    let (context, max_advance) = (64, 16);
+    for rows in 1..=4 {
+        for (index, (layout, at)) in layouts.iter().zip([0, 0, 3]).enumerate() {
+            let domain = HistoryDomainId(index);
+            let store = indexed_store(cpu_device(), context, max_advance);
+            let state = match at {
+                0 => store.create().unwrap(),
+                at => commit(store.create().unwrap(), at),
+            };
+            let free = store.free_rows(domain);
+            let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+            let taken = (free - store.free_rows(domain)) as u64 * store.history_row_bytes(domain);
+            let single = std::slice::from_ref(layout);
+            assert_eq!(
+                taken,
+                batch_state_bytes(single, context, max_advance, rows as u64).unwrap(),
+                "{:?} at {rows} rows",
+                layout.kind()
+            );
+            let _ = advance.abort();
+        }
+        // The store's every domain at once.
+        let each = layouts
+            .iter()
+            .map(|layout| batch_state_bytes(std::slice::from_ref(layout), context, max_advance, rows as u64).unwrap())
+            .sum::<u64>();
+        assert_eq!(batch_state_bytes(&layouts, context, max_advance, rows as u64).unwrap(), each);
+    }
+}

@@ -82,6 +82,14 @@ pub fn history_geometry(
     })
 }
 
+/// The free-page rows a history takes to append `count` rows when its last
+/// page holds `in_place` more in place: whatever the last page cannot hold,
+/// rounded up to whole pages of `page_rows`. The one rule of a history's
+/// page demand (`StateStore::page_demand`, [`crate::batch_state_bytes`]).
+pub(crate) fn page_demand_rows(page_rows: usize, in_place: usize, count: usize) -> usize {
+    count.saturating_sub(in_place).div_ceil(page_rows) * page_rows
+}
+
 /// Banks in one recurrent slab. A bank larger than the byte target still
 /// occupies one slab by itself.
 pub fn banks_per_slab(bank_bytes: u64) -> Result<usize, String> {
