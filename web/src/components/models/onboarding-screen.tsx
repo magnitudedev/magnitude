@@ -4,7 +4,7 @@ import type { CatalogFormModelId, CustomLocalModel } from "@magnitudedev/sdk"
 import { useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
-import { discoveredModel, unrunnableFile } from "./data"
+import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
 import { machineView } from "./machine"
 import { Onboarding, preparationLabels, type PreparationStep, type Recommendation } from "./onboarding"
 import { recordOnboardingCompleted } from "./onboarding-record"
@@ -24,7 +24,7 @@ export function OnboardingScreen() {
   const recommendations = useRecommendations(usOnly, unified)
   const local = Result.isSuccess(models) ? models.value : null
   const found = (local?.models ?? []).filter((model): model is CustomLocalModel => model._tag === "Custom" && model.origin._tag === "Found")
-  const owned = new Set((local?.models ?? []).filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").map(model => String(model.modelId)))
+  const owned = new Set((local?.models ?? []).filter(onThisComputer).map(model => String(model.modelId)))
   const observation = useServiceObservation()
   const preparation = local?.preparation
   const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`

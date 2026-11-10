@@ -1,24 +1,28 @@
-import { useState } from "react"
+import { useState, type ReactNode } from "react"
 import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MagnifyingGlassIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
+import { CircleNotchIcon, MagnifyingGlassIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
-import { useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { modelDownloadFailureMessage, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
 import { pageLayout } from "../page-layout"
 import { cn } from "@/lib/utils"
-import { MachineCard } from "./parts"
+import { fitLabel, MachineCard } from "./parts"
 import { machineView } from "./machine"
 import { ownedModel, unrunnableFile } from "./data"
 import { YourModels, type OwnedModel } from "./your-models"
 
 const residencyOf = (model: LocalModel) => "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
 
-const running = (model: LocalModel) => {
-  const residency = residencyOf(model)?._tag
-  return residency === "Ready" || residency === "Loading" || residency === "Requested" || residency === "Stopping"
+const transferStage = { queued: "Queued", resolving: "Preparing", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying", publishing: "Finishing" } as const
+
+function Status({ tone = "muted", busy = false, title, children }: { tone?: "muted" | "running" | "failed"; busy?: boolean; title?: string; children: ReactNode }) {
+  return <span title={title} className={cn("inline-flex items-center gap-1.5 whitespace-nowrap text-xs", tone === "failed" ? "text-red-600 dark:text-red-400" : tone === "running" ? "text-green-700 dark:text-green-400" : "text-slate-500")}>
+    {busy ? <CircleNotchIcon className="size-3.5 motion-safe:animate-spin" /> : tone === "running" && <span className="size-1.5 rounded-full bg-green-600 dark:bg-green-400" />}
+    {children}
+  </span>
 }
 
 /** Models: the machine, then the user's models, with Explore models for finding more. */
@@ -39,12 +43,37 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
     const model = byId.get(view.modelId)
     if (!model) return null
     const state = model.acquisitionState
-    const progress = state._tag === "Installing" || state._tag === "Updating" ? state.progress : undefined
-    if (progress) return <span className="flex w-28 flex-col items-end gap-1"><span className="text-xs tabular-nums text-slate-500">Downloading {progress.totalBytes > 0 ? Math.round(progress.completedBytes / progress.totalBytes * 100) : 0}%</span>
-      <span className="h-1 w-full overflow-hidden rounded-full bg-slate-150 dark:bg-slate-750"><span className="block h-full bg-blue-600 dark:bg-blue-400" style={{ width: `${progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : 0}%` }} /></span></span>
-    return running(model)
-      ? <Button size="sm" variant="outline" onClick={() => mutations.stop()}><StopIcon />Stop</Button>
-      : <Button size="sm" variant="outline" onClick={() => mutations.load(model.modelId)}><PlayIcon />Load</Button>
+    const stop = <Button size="sm" variant="outline" onClick={() => mutations.stop()}><StopIcon />Stop</Button>
+    const load = <Button size="sm" variant="outline" onClick={() => mutations.load(model.modelId)}><PlayIcon />Load</Button>
+    if (state._tag === "Installing" || state._tag === "Updating") {
+      const { progress } = state
+      const fraction = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes : 0
+      return <span className="flex items-center gap-2">
+        <span className="flex w-28 flex-col items-end gap-1">
+          <span className="text-xs tabular-nums text-slate-500">{transferStage[progress.stage]}{progress.stage === "downloading" ? ` ${Math.round(fraction * 100)}%` : "…"}</span>
+          <span className="h-1 w-full overflow-hidden rounded-full bg-slate-150 dark:bg-slate-750"><span className="block h-full bg-blue-600 dark:bg-blue-400" style={{ width: `${fraction * 100}%` }} /></span>
+        </span>
+        <Button size="sm" variant="ghost" onClick={() => mutations.cancel(model.modelId)}>Cancel</Button>
+      </span>
+    }
+    if (state._tag === "Optimizing") return <Status busy>Optimizing…</Status>
+    if (state._tag === "InstallFailed" || state._tag === "UpdateFailed") {
+      return <span className="flex items-center gap-2">
+        <Status tone="failed" title={modelDownloadFailureMessage(state.failure)}>Download failed</Status>
+        <Button size="sm" variant="outline" onClick={() => mutations.install(model.modelId)}>Retry</Button>
+      </span>
+    }
+    if (state._tag === "Unavailable") return <Status tone="failed" title={state.failure.message}>Files unavailable</Status>
+    if (!view.quant.fits) return <Status busy={view.quant.measuring}>{fitLabel(view.quant)}</Status>
+    const residency = residencyOf(model)
+    switch (residency?._tag) {
+      case "Requested": return <span className="flex items-center gap-2"><Status busy>Loading…</Status>{stop}</span>
+      case "Loading": return <span className="flex items-center gap-2"><Status busy>Loading {Math.round(residency.fraction * 100)}%</Status>{stop}</span>
+      case "Ready": return <span className="flex items-center gap-2"><Status tone="running">Running</Status>{stop}</span>
+      case "Stopping": return <Status busy>Stopping…</Status>
+      case "Failed": return <span className="flex items-center gap-2"><Status tone="failed" title={residency.failure.message}>Couldn’t load</Status>{load}</span>
+      default: return load
+    }
   }
   const remove = (view: OwnedModel) => {
     const model = byId.get(view.modelId)

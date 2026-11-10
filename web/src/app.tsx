@@ -58,6 +58,7 @@ import { HostNotices } from "./components/host-notices"
 import { ModelsScreen } from "./components/models/models-screen"
 import { Explore } from "./components/models/explore"
 import { OnboardingScreen } from "./components/models/onboarding-screen"
+import { onThisComputer } from "./components/models/data"
 import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
 
@@ -84,7 +85,7 @@ function ModelsPage() {
   const unified = Result.isSuccess(hardware) && hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
   const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
   const recommendations = useRecommendations(false, unified)
-  const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").map(model => String(model.modelId)) : [])
+  const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])
   return <>
     <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
     <Explore open={open} query={query} unified={unified} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}

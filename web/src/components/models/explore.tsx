@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react"
 import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { DownloadSimpleIcon } from "@phosphor-icons/react"
-import type { CatalogFormModelId, HuggingFaceRepositoryId, HuggingFaceSearchResult } from "@magnitudedev/sdk"
-import { formatStorageSize, useAgentClient, useLocalModelMutations } from "@magnitudedev/client-common"
+import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
+import type { CatalogFormModelId, HuggingFaceRepositoryId, HuggingFaceSearchResult, LocalModel } from "@magnitudedev/sdk"
+import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
-import { quantView } from "./data"
+import { onThisComputer, quantView, transferOf } from "./data"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
 import { ExploreModal, type ExploreResults, type RunnableFamily } from "./explore-modal"
@@ -19,6 +19,14 @@ function useDebounced<A>(value: A, delay: number): A {
     return () => clearTimeout(timer)
   }, [value, delay])
   return settled
+}
+
+const TRUSTED_PUBLISHERS = new Set(["unsloth", "bartowski", "ggml-org", "lmstudio-community"])
+
+/** Whether a repository's publisher is one people rely on for quants, or the base model's own lab. */
+const trustedPublisher = (repository: string, base: string | undefined) => {
+  const owner = repository.split("/")[0]?.toLowerCase() ?? ""
+  return TRUSTED_PUBLISHERS.has(owner) || (base !== undefined && base.split("/")[0]?.toLowerCase() === owner)
 }
 
 /** Search results grouped by the model they quantize: one offered model per base, one rung per repository's recommended quant. */
@@ -44,11 +52,16 @@ const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], unified:
     const lead = members[0]!
     const base = Option.getOrNull(lead.base)
     const developer = Option.getOrNull(lead.developer)
-    const quants = members.flatMap(member => Option.match(member.recommended, {
+    // Publishers people rely on first, then the most downloaded: the order rows are listed in, and the first that
+    // fits is the one offered.
+    const ordered = [...members].sort((left, right) =>
+      Number(trustedPublisher(right.repository, base?.repository)) - Number(trustedPublisher(left.repository, base?.repository))
+        || right.downloads - left.downloads)
+    const quants = ordered.flatMap(member => Option.match(member.recommended, {
       onNone: () => [],
       onSome: version => [quantView({ key: version.modelId, name: version.label, repository: member.repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes }, version.assessment, unified)],
-    })).sort((left, right) => left.sizeBytes - right.sizeBytes)
-    const fastest = quants.filter(quant => quant.fits).sort((left, right) => (right.speed ?? 0) - (left.speed ?? 0))[0]
+    }))
+    const fastest = quants.find(quant => quant.fits)
     const first = members.flatMap(member => Option.toArray(member.recommended))[0]
     return {
       key,
@@ -79,19 +92,32 @@ interface ExploreProps {
   readonly owned: ReadonlySet<string>
 }
 
+/** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
 function useDownload() {
   const client = useAgentClient()
   const add = useAtomSet(client.Models.AddHuggingFaceModel)
   const { install } = useLocalModelMutations()
-  return (model: OfferedModel, quant: QuantView) => model.catalog
-    ? <Button disabled={!quant.fits} onClick={() => install(quant.key as CatalogFormModelId)}><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</Button>
-    : quant.repository === null ? null : <Button disabled={!quant.fits} onClick={() => add({
-    repository: quant.repository as HuggingFaceRepositoryId,
-    revision: Option.none(),
-    version: Option.some(quant.name),
-    drafter: { _tag: "Auto" },
-    force: false,
-  })}><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</Button>
+  const local = useLocalModels()
+  const byId = new Map<string, LocalModel>(Result.isSuccess(local) ? local.value.models.map(model => [model.modelId, model]) : [])
+  return (model: OfferedModel, quant: QuantView) => {
+    const existing = byId.get(quant.key)
+    const transfer = existing ? transferOf(existing) : undefined
+    if (transfer) {
+      const percent = transfer.totalBytes > 0 ? Math.round(transfer.completedBytes / transfer.totalBytes * 100) : 0
+      return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
+    }
+    if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
+    const label = <><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</>
+    if (model.catalog) return <Button disabled={!quant.fits} onClick={() => install(quant.key as CatalogFormModelId)}>{label}</Button>
+    if (quant.repository === null) return null
+    return <Button disabled={!quant.fits} onClick={() => add({
+      repository: quant.repository as HuggingFaceRepositoryId,
+      revision: Option.none(),
+      version: Option.some(quant.name),
+      drafter: { _tag: "Auto" },
+      force: false,
+    })}>{label}</Button>
+  }
 }
 
 /**

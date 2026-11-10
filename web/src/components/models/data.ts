@@ -70,9 +70,25 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
   }
 }
 
-/** A model on this computer as a quant this machine runs. */
-export const quantOf = (model: LocalModel, unified: boolean): QuantView =>
-  quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes: model.storageBytes, downloadBytes: model.storageBytes }, assessmentOf(model), unified, model.servingState._tag === "Assessing")
+/** A transfer in progress for a model: its first download or an update. */
+export const transferOf = (model: LocalModel) => {
+  const state = model.acquisitionState
+  return state._tag === "Installing" || state._tag === "Updating" ? state.progress : undefined
+}
+
+/** Whether a model's files are on this computer to run: downloaded (updating or not) or found in another app's folder. */
+export const onThisComputer = (model: LocalModel) => {
+  switch (model.acquisitionState._tag) {
+    case "Installed": case "UpdateAvailable": case "Updating": case "UpdateFailed": case "Optimizing": case "External": return true
+    default: return false
+  }
+}
+
+/** A model on this computer as a quant this machine runs; while its first download runs, its size is the download's. */
+export const quantOf = (model: LocalModel, unified: boolean): QuantView => {
+  const sizeBytes = model.storageBytes > 0 ? model.storageBytes : transferOf(model)?.totalBytes ?? 0
+  return quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes, downloadBytes: sizeBytes }, assessmentOf(model), unified, model.servingState._tag === "Assessing")
+}
 
 const directoryOf = (path: string) => path.replace(/[\\/][^\\/]*$/, "")
 

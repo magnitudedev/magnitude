@@ -1,6 +1,6 @@
 import type { ReactNode } from "react"
 import type { ModelLab } from "../model-logo"
-import { ContextText, ModelCardShell, PlacementBar, QuantLadder, RepositoryLink, quantSource } from "./parts"
+import { ContextText, ModelCardShell, PlacementBar, QuantLadder, QuantList, RepositoryLink, quantSource } from "./parts"
 import type { QuantView } from "./view"
 
 /** A model offered for download: its quant ladder, the rung chosen for this machine, and what it pairs with. */
@@ -34,7 +34,9 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
       {model.country === "US" ? " · 🇺🇸" : ""}
     </>}>
     {expanded && <div className="border-t border-slate-200 bg-slate-50/60 px-4 py-4 dark:border-slate-750 dark:bg-slate-900/40">
-      <QuantLadder quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} limit={model.contextLimit} onSelect={onQuantChoice} />
+      {model.catalog
+        ? <QuantLadder quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} limit={model.contextLimit} onSelect={onQuantChoice} />
+        : <QuantList quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} onSelect={onQuantChoice} />}
       {current.fits && <div className="mt-4"><PlacementBar quant={current} /></div>}
       {footer && <div className="mt-4 flex justify-end">{footer(current)}</div>}
     </div>}

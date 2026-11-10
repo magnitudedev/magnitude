@@ -5,7 +5,7 @@ import { Button } from "../ui/button"
 import { Input } from "../ui/input"
 import { HuggingFaceLogo, LabLogo, modelLabs, type ModelLab } from "../model-logo"
 import { cn } from "@/lib/utils"
-import { ContextText, fitLabel, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
+import { ContextText, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
 import type { QuantView } from "./view"
 
 /** A model on this computer, with where it lives and what Magnitude could tell about its source. */
@@ -145,7 +145,7 @@ export function YourModels({ models, unrunnable, action, onExploreQuants, onRemo
             <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} /></span>
             <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
             <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
-            <span className="flex justify-end" onClick={event => event.stopPropagation()}>{model.quant.fits ? action(model) : <span className="text-xs text-slate-500">{fitLabel(model.quant)}</span>}</span>
+            <span className="flex justify-end" onClick={event => event.stopPropagation()}>{action(model)}</span>
             <ModelMenu onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
           </div>
           {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onAddDrafter={() => onAddDrafter(model)} /></div>}
