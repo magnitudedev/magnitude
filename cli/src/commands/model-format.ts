@@ -241,7 +241,7 @@ export const assessmentContext = (assessment: Option.Option<LocalModelAssessment
 })
 
 /** How an assessed quant runs on this machine: "Fits in memory", "Streams from SSD". */
-const servingMemoryLabel: Record<ServingMemory, string> = { Unified: "Unified memory", Device: "GPU memory", System: "System memory" }
+const servingMemoryLabel: Record<ServingMemory, string> = { Unified: "Unified memory", Device: "GPU", System: "RAM" }
 
 export const assessmentPlacement = (assessment: Option.Option<LocalModelAssessment>, memory: ServingMemory): string =>
   Option.match(fits(assessment), { onNone: () => "—", onSome: (value) => fitPlacementPhrase(value, memory) })
@@ -255,7 +255,7 @@ export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment
       `Placement - ${fitPlacementPhrase(value, memory)}`,
       renderFields([
         [servingMemoryLabel[memory], formatMemorySize(value.placement.deviceBytes)],
-        ...(memory !== "Device" || value.placement.hostBytes === 0 ? [] : [["Host RAM", formatMemorySize(value.placement.hostBytes)] as const]),
+        ...(memory !== "Device" || value.placement.hostBytes === 0 ? [] : [["RAM", formatMemorySize(value.placement.hostBytes)] as const]),
         ...(value.placement.diskBytes === 0 ? [] : [["Read from disk", formatMemorySize(value.placement.diskBytes)] as const]),
       ]),
       "",

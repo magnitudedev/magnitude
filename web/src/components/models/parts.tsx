@@ -52,7 +52,7 @@ const tierColor: Record<PlacementTier["kind"], string> = {
   Disk: "bg-slate-300 dark:bg-slate-600",
 }
 const tierPhrase: Record<PlacementTier["kind"], string> = {
-  Device: "held in GPU memory",
+  Device: "held in GPU",
   Unified: "held in memory",
   Host: "held in RAM",
   Disk: "read from SSD as needed",

@@ -34,7 +34,7 @@ export const phraseOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits
   fitPlacementPhrase(assessment, memory)
 
 const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, memory: ServingMemory): readonly PlacementTier[] => [
-  { kind: memory === "Device" ? "Device" : "Unified", bytes: assessment.placement.deviceBytes },
+  { kind: memory === "Device" ? "Device" : memory === "Unified" ? "Unified" : "Host", bytes: assessment.placement.deviceBytes },
   { kind: "Host", bytes: assessment.placement.hostBytes },
   { kind: "Disk", bytes: assessment.placement.diskBytes },
 ]

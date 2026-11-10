@@ -32,16 +32,16 @@ export const formatQuantLabel = (name: string, repository: Option.Option<string>
   name,
 ].join(" ")
 
-export type FitPlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory" | "Streams from RAM" | "Streams from SSD"
+export type FitPlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory" | "Fits in RAM" | "Streams from RAM" | "Streams from SSD"
 
 /**
- * How a fitting quant runs on this machine, from where its weights are held: every weight in memory (a discrete GPU's
- * own, or unified or system memory), or its experts streamed from RAM or the SSD. `GPU and RAM` is a file size's
+ * How a fitting quant runs on this machine, from where its weights are held: every weight in a discrete GPU, in unified
+ * memory, or in RAM on a machine serving from its CPU, or its experts streamed from RAM or the SSD. `GPU and RAM` is a file size's
  * estimate alone (`sizeFitPhrase`): a plan beyond its GPU's memory streams its experts.
  */
 export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, memory: ServingMemory): FitPlacementPhrase => {
   if (assessment.residency._tag === "Streamed") {
     return assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
   }
-  return memory === "Device" ? "Fits in GPU" : "Fits in memory"
+  return memory === "Device" ? "Fits in GPU" : memory === "Unified" ? "Fits in memory" : "Fits in RAM"
 }

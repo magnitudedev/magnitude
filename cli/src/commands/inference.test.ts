@@ -359,8 +359,8 @@ describe("recommendations, families, and assessment progress", () => {
     const placement = lines.indexOf("Placement - Fits in GPU")
     expect(lines.slice(placement, placement + 8)).toEqual([
       "Placement - Fits in GPU",
-      "  GPU memory  19.3 GB",
-      "  Host RAM    2.1 GB",
+      "  GPU  19.3 GB",
+      "  RAM  2.1 GB",
       "",
       "Estimated decode speed",
       "  25K context           ~28 tok/s",
@@ -381,11 +381,11 @@ describe("recommendations, families, and assessment progress", () => {
 })
 
 describe("placement wording", () => {
-  it("says a model on a machine without a GPU in use is held in system memory", () => {
+  it("says a model on a machine without a GPU in use is held in RAM", () => {
     const sections = fitDetailSections(Option.some(fitsAssessment()), "System")
-    expect(sections).toContain("Placement - Fits in memory")
-    expect(sections.join("\n")).toMatch(/System memory\s+\S/)
-    expect(sections.join("\n")).not.toMatch(/GPU|Host RAM/)
+    expect(sections).toContain("Placement - Fits in RAM")
+    expect(sections.join("\n")).toMatch(/RAM\s+\S/)
+    expect(sections.join("\n")).not.toMatch(/GPU/)
   })
 })
 
@@ -448,8 +448,8 @@ describe("candidate inspection", () => {
       "How Q4_K_P runs on this computer",
       "",
       "Placement - Fits in GPU",
-      "  GPU memory  19.3 GB",
-      "  Host RAM    2.1 GB",
+      "  GPU  19.3 GB",
+      "  RAM  2.1 GB",
       "",
       "Estimated decode speed",
       "  25K context           ~28 tok/s",
