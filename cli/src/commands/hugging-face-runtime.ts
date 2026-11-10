@@ -321,7 +321,7 @@ export const renderInspection = ({ inspection, drafters, models, unifiedMemory }
   ].join("\n"))
   const chosen = Option.getOrUndefined(chosenVersion(inspection))
   const selectedLabel = Option.getOrUndefined(inspection.selectedVersion)
-  const versions = renderTable(inspection.versions, [
+  const versions = renderTable([...inspection.versions].sort((left, right) => left.sizeBytes - right.sizeBytes), [
     { heading: "VERSION", value: ({ label }) => label },
     { heading: "BITS", value: ({ label }) => Option.match(quantBitWidth(label), { onNone: () => "—", onSome: (bits) => `${bits}-bit` }) },
     { heading: "SIZE", value: ({ sizeBytes }) => formatStorageSize(sizeBytes) },
