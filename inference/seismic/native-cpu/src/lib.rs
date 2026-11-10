@@ -37,13 +37,22 @@ pub use weights::RowGeometry;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
-#[cfg(target_arch = "aarch64")]
-pub use isa::{Neon, NeonDot};
-#[cfg(target_arch = "x86_64")]
-pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
+/// Re-exports the tier tokens of this architecture, one per tier of
+/// `seismic_cpu_tiers::tiers!`.
+macro_rules! token_exports {
+    ($($token:ident $name:ident $arch:tt [$($feature:tt),*];)*) => {
+        $(
+            #[cfg(target_arch = $arch)]
+            pub use isa::$token;
+        )*
+    };
+}
 
-/// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-6");
+seismic_cpu_tiers::tiers!(token_exports);
+
+/// The version of this library's kernel code, part of every CPU
+/// implementation digest; bumped in `seismic-cpu-tiers`.
+pub use seismic_cpu_tiers::VERSION;
 
 /// A weight buffer's element as a call reads it: its storage element, that
 /// element's resolved components (which read it in its own layout, a

@@ -2054,7 +2054,7 @@ mod internals {
         // The tier boundaries: each form is a `#[target_feature]` function
         // of its tier, into which the authored kernel and everything it
         // calls inline.
-        for tier in seismic_native_cpu::Tier::EVERY {
+        for tier in seismic_cpu_tiers::Tier::EVERY {
             for (launch_index, launch) in definition.launches.iter().enumerate() {
                 for binding in &bindings {
                     let elements = binding_name(binding);
@@ -2073,7 +2073,7 @@ mod internals {
         let mut digest = Sha256::new();
         digest.update(cpu.text.as_bytes());
         digest.update(library.digest);
-        digest.update(seismic_native_cpu::VERSION.as_bytes());
+        digest.update(seismic_cpu_tiers::VERSION.as_bytes());
         let digest = hex(&digest.finalize().into());
         let element_names = elements
             .dense
@@ -2091,7 +2091,7 @@ mod internals {
                     "      CpuLaunchVariants {{ kernel: {:?}, variants: &[\n",
                     launch.kernel
                 ));
-                for tier in seismic_native_cpu::Tier::EVERY
+                for tier in seismic_cpu_tiers::Tier::EVERY
                     .into_iter()
                     .filter(|tier| tier.arch() == arch)
                 {

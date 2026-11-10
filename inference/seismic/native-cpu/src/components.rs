@@ -169,15 +169,17 @@ macro_rules! inlined_table {
     };
 }
 
+/// Each tier's component instances, in a module named for the tier, one per
+/// tier of `seismic_cpu_tiers::tiers!` of this architecture, `TABLES`, every
+/// tier's table, and (in tests) `inlined_of`, every tier's inlined dots.
 macro_rules! tier_components {
-    ($module:ident, $tier:ident, $features:literal) => {
+    ($($tier:ident $module:ident $arch:tt [$($feature:tt),*];)*) => {
+    $(
+        #[cfg(target_arch = $arch)]
         pub(crate) mod $module {
             use super::*;
 
-            #[cfg(test)]
-            pub(crate) const FEATURES: &str = $features;
-
-            #[target_feature(enable = $features)]
+            #[target_feature($(enable = $feature),*)]
             unsafe fn decode<W: Format>(
                 row: *const u8,
                 geometry: &RowGeometry,
@@ -192,7 +194,7 @@ macro_rules! tier_components {
             /// dot body inlined: the reference a component call is measured
             /// against.
             #[cfg(test)]
-            #[target_feature(enable = $features)]
+            #[target_feature($(enable = $feature),*)]
             unsafe fn inlined<W: Format, const R: usize>(
                 data: *const u8,
                 rows: usize,
@@ -218,7 +220,7 @@ macro_rules! tier_components {
             pub(crate) static INLINED: [[super::tests::InlinedFn; ROW_BLOCKS.len()]; COMPONENTS] =
                 with_components!(inlined_table);
 
-            #[target_feature(enable = $features)]
+            #[target_feature($(enable = $feature),*)]
             unsafe fn dot<W: Format, const R: usize>(
                 rows: *const u8,
                 geometry: &RowGeometry,
@@ -232,7 +234,7 @@ macro_rules! tier_components {
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, R) };
             }
 
-            #[target_feature(enable = $features)]
+            #[target_feature($(enable = $feature),*)]
             unsafe fn dot_q8<W: Format, const R: usize, const M: usize>(
                 rows: *const u8,
                 geometry: &RowGeometry,
@@ -247,7 +249,7 @@ macro_rules! tier_components {
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr().cast::<f32>(), out, M * R) };
             }
 
-            #[target_feature(enable = $features)]
+            #[target_feature($(enable = $feature),*)]
             unsafe fn dot_q8_tiles<W: Format>(
                 rows: *const u8,
                 geometry: &RowGeometry,
@@ -279,44 +281,29 @@ macro_rules! tier_components {
 
             pub(crate) static KERNELS: [WeightKernels; COMPONENTS] = with_components!(kernel_table);
         }
+    )*
+
+        /// Every tier's component table of this architecture.
+        static TABLES: &[&[WeightKernels; COMPONENTS]] =
+            &[$(#[cfg(target_arch = $arch)] &$module::KERNELS),*];
+
+        /// Tier `tier`'s inlined dots (`$module::INLINED`), a tier of this
+        /// architecture.
+        #[cfg(test)]
+        fn inlined_of(tier: Tier) -> &'static [[tests::InlinedFn; ROW_BLOCKS.len()]; COMPONENTS] {
+            match tier {
+                $(
+                    #[cfg(target_arch = $arch)]
+                    Tier::$tier => &$module::INLINED,
+                )*
+                #[allow(unreachable_patterns)]
+                other => panic!("tier {other:?} is not of this architecture"),
+            }
+        }
     };
 }
 
-#[cfg(target_arch = "x86_64")]
-tier_components!(x86v2, X86V2, "sse3,ssse3,sse4.1,sse4.2,popcnt");
-#[cfg(target_arch = "x86_64")]
-tier_components!(
-    x86v3,
-    X86V3,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe"
-);
-#[cfg(target_arch = "x86_64")]
-tier_components!(
-    x86v4,
-    X86V4,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl"
-);
-#[cfg(target_arch = "x86_64")]
-tier_components!(
-    x86v4vnni,
-    X86V4Vnni,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl,avx512vnni"
-);
-#[cfg(target_arch = "aarch64")]
-tier_components!(neon, Neon, "neon");
-#[cfg(target_arch = "aarch64")]
-tier_components!(neondot, NeonDot, "neon,dotprod");
-
-/// Every tier's component table of this architecture.
-#[cfg(target_arch = "x86_64")]
-static TABLES: [&[WeightKernels; COMPONENTS]; 4] = [
-    &x86v2::KERNELS,
-    &x86v3::KERNELS,
-    &x86v4::KERNELS,
-    &x86v4vnni::KERNELS,
-];
-#[cfg(target_arch = "aarch64")]
-static TABLES: [&[WeightKernels; COMPONENTS]; 2] = [&neon::KERNELS, &neondot::KERNELS];
+seismic_cpu_tiers::tiers!(tier_components);
 
 /// The name of every element with a component: the floating dense elements
 /// and the storage elements of the CPU row layouts.
@@ -390,22 +377,6 @@ mod tests {
     #[test]
     fn the_component_table_is_the_registry_table() {
         assert_eq!(COMPONENT_OF.len(), registry::representations().len());
-    }
-
-    #[test]
-    fn instance_features_are_the_tier_features() {
-        #[cfg(target_arch = "x86_64")]
-        {
-            assert_eq!(x86v2::FEATURES, Tier::X86V2.features());
-            assert_eq!(x86v3::FEATURES, Tier::X86V3.features());
-            assert_eq!(x86v4::FEATURES, Tier::X86V4.features());
-            assert_eq!(x86v4vnni::FEATURES, Tier::X86V4Vnni.features());
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            assert_eq!(neon::FEATURES, Tier::Neon.features());
-            assert_eq!(neondot::FEATURES, Tier::NeonDot.features());
-        }
     }
 
     /// Rows of the largest component block.
@@ -905,22 +876,7 @@ mod tests {
         x: &[f32],
         out: &mut [f32],
     ) {
-        let table: &[[InlinedFn; ROW_BLOCKS.len()]; COMPONENTS] = match tier {
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V2 => &x86v2::INLINED,
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V3 => &x86v3::INLINED,
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V4 => &x86v4::INLINED,
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V4Vnni => &x86v4vnni::INLINED,
-            #[cfg(target_arch = "aarch64")]
-            Tier::Neon => &neon::INLINED,
-            #[cfg(target_arch = "aarch64")]
-            Tier::NeonDot => &neondot::INLINED,
-            #[allow(unreachable_patterns)]
-            other => panic!("tier {other:?} is not of this architecture"),
-        };
+        let table = inlined_of(tier);
         let inlined = table[component(registry::representation(representation).unwrap()).unwrap()]
             [row_block(block)];
         unsafe { inlined(data, rows, geometry, x, out) }

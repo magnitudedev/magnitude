@@ -4189,8 +4189,8 @@ dependencies = [
 name = "seismic-build"
 version = "0.1.0"
 dependencies = [
+ "seismic-cpu-tiers",
  "seismic-lang",
- "seismic-native-cpu",
  "seismic-std",
  "sha2 0.11.0",
 ]
@@ -4244,6 +4244,10 @@ dependencies = [
  "seismic-topology",
  "sha2 0.11.0",
 ]
+
+[[package]]
+name = "seismic-cpu-tiers"
+version = "0.1.0"
 
 [[package]]
 name = "seismic-cuda"
@@ -4361,6 +4365,7 @@ name = "seismic-native-cpu"
 version = "0.1.0"
 dependencies = [
  "magnitude-ggml",
+ "seismic-cpu-tiers",
  "seismic-lang",
 ]
 

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 magnitude-ggml.workspace = true
+seismic-cpu-tiers.workspace = true
 seismic-lang.workspace = true
 
 [build-dependencies]

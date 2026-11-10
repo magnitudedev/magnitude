@@ -136,8 +136,11 @@ pub trait Vectors: Isa {
     fn packet(buffer: &mut Self::Buffer) -> &mut [f32; PACKET];
 }
 
+/// `Vectors` for every tier token of this architecture, one per tier of
+/// `seismic_cpu_tiers::tiers!`.
 macro_rules! vectors {
-    ($($token:ident),*) => {$(
+    ($($token:ident $name:ident $arch:tt [$($feature:tt),*];)*) => {$(
+        #[cfg(target_arch = $arch)]
         impl Vectors for crate::isa::$token {
             type Buffer = PacketBuffer<
                 { <crate::isa::$token as Isa>::TIER.vector_bytes() },
@@ -153,10 +156,7 @@ macro_rules! vectors {
     )*};
 }
 
-#[cfg(target_arch = "x86_64")]
-vectors!(X86V2, X86V3, X86V4, X86V4Vnni);
-#[cfg(target_arch = "aarch64")]
-vectors!(Neon, NeonDot);
+seismic_cpu_tiers::tiers!(vectors);
 
 /// Byte geometry of the rows of one weight operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

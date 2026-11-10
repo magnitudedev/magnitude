@@ -12,177 +12,16 @@
 //! fixed-width lanes vectorize to the tier's registers, and intrinsics called
 //! inside inline into it.
 
-/// A tier of the target architecture, as data: the name recorded in device
-/// identity and tuning keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tier {
-    X86V2,
-    X86V3,
-    X86V4,
-    X86V4Vnni,
-    Neon,
-    NeonDot,
-}
-
-impl Tier {
-    /// Every tier of every architecture, as code generators enumerate them.
-    pub const EVERY: [Tier; 6] = [
-        Tier::X86V2,
-        Tier::X86V3,
-        Tier::X86V4,
-        Tier::X86V4Vnni,
-        Tier::Neon,
-        Tier::NeonDot,
-    ];
-
-    /// The `target_arch` of the tier.
-    pub const fn arch(self) -> &'static str {
-        match self {
-            Tier::X86V2 | Tier::X86V3 | Tier::X86V4 | Tier::X86V4Vnni => "x86_64",
-            Tier::Neon | Tier::NeonDot => "aarch64",
-        }
-    }
-
-    /// The name of the tier's token type in this crate.
-    pub const fn token(self) -> &'static str {
-        match self {
-            Tier::X86V2 => "X86V2",
-            Tier::X86V3 => "X86V3",
-            Tier::X86V4 => "X86V4",
-            Tier::X86V4Vnni => "X86V4Vnni",
-            Tier::Neon => "Neon",
-            Tier::NeonDot => "NeonDot",
-        }
-    }
-
-    /// Bytes of the tier's widest vector, which its bodies load and store
-    /// whole: SSE's 128 bits, AVX2's 256, AVX-512's 512, NEON's 128.
-    pub const fn vector_bytes(self) -> usize {
-        match self {
-            Tier::X86V2 | Tier::Neon | Tier::NeonDot => 16,
-            Tier::X86V3 => 32,
-            Tier::X86V4 | Tier::X86V4Vnni => 64,
-        }
-    }
-
-    /// The widest vector of any of `tiers`.
-    pub const fn widest_vector(tiers: &[Tier]) -> usize {
-        let (mut widest, mut tier) = (0, 0);
-        while tier < tiers.len() {
-            if tiers[tier].vector_bytes() > widest {
-                widest = tiers[tier].vector_bytes();
-            }
-            tier += 1;
-        }
-        widest
-    }
-
-    /// Every tier of the architecture this crate is compiled for, lowest
-    /// first.
-    pub const fn all() -> &'static [Tier] {
-        #[cfg(target_arch = "x86_64")]
-        {
-            &[Tier::X86V2, Tier::X86V3, Tier::X86V4, Tier::X86V4Vnni]
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            &[Tier::Neon, Tier::NeonDot]
-        }
-    }
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Tier::X86V2 => "x86v2",
-            Tier::X86V3 => "x86v3",
-            Tier::X86V4 => "x86v4",
-            Tier::X86V4Vnni => "x86v4vnni",
-            Tier::Neon => "neon",
-            Tier::NeonDot => "neondot",
-        }
-    }
-
-    /// The `target_feature` set of the tier, as generated boundaries enable
-    /// it.
-    pub const fn features(self) -> &'static str {
-        match self {
-            Tier::X86V2 => X86V2_FEATURES,
-            Tier::X86V3 => X86V3_FEATURES,
-            Tier::X86V4 => X86V4_FEATURES,
-            Tier::X86V4Vnni => X86V4VNNI_FEATURES,
-            Tier::Neon => NEON_FEATURES,
-            Tier::NeonDot => NEONDOT_FEATURES,
-        }
-    }
-
-    /// How the tier's quantized (INT8) dots multiply: 0 in portable integer
-    /// loops, 1 with vector byte products (AVX2, or NEON `sdot`), 2 with
-    /// AVX-512 VNNI.
-    pub const fn quantized_dots(self) -> u8 {
-        match self {
-            Tier::X86V2 | Tier::Neon => 0,
-            Tier::X86V3 | Tier::X86V4 | Tier::NeonDot => 1,
-            Tier::X86V4Vnni => 2,
-        }
-    }
-
-    /// Whether the host has every feature of the tier.
-    pub fn is_detected(self) -> bool {
-        match self {
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V2 => X86V2::detect().is_some(),
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V3 => X86V3::detect().is_some(),
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V4 => X86V4::detect().is_some(),
-            #[cfg(target_arch = "x86_64")]
-            Tier::X86V4Vnni => X86V4Vnni::detect().is_some(),
-            #[cfg(target_arch = "aarch64")]
-            Tier::Neon => Neon::detect().is_some(),
-            #[cfg(target_arch = "aarch64")]
-            Tier::NeonDot => NeonDot::detect().is_some(),
-            #[allow(unreachable_patterns)]
-            _ => false,
-        }
-    }
-
-    /// The highest tier of this architecture the host supports.
-    pub fn detected() -> Option<Tier> {
-        Tier::all()
-            .iter()
-            .rev()
-            .copied()
-            .find(|tier| tier.is_detected())
-    }
-
-    /// Every tier at or below `self` that the host supports: the tier axis a
-    /// device offers the tuner.
-    pub fn at_or_below(self) -> impl Iterator<Item = Tier> {
-        Tier::all()
-            .iter()
-            .copied()
-            .filter(move |tier| *tier <= self && tier.is_detected())
-    }
-}
-
-pub const X86V2_FEATURES: &str = "sse3,ssse3,sse4.1,sse4.2,popcnt";
-pub const X86V3_FEATURES: &str =
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe";
-pub const X86V4_FEATURES: &str =
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl";
-pub const X86V4VNNI_FEATURES: &str =
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl,avx512vnni";
-pub const NEON_FEATURES: &str = "neon";
-pub const NEONDOT_FEATURES: &str = "neon,dotprod";
+pub use seismic_cpu_tiers::Tier;
 
 /// An instruction-set tier token.
 ///
 /// # Safety
-/// An implementation's `detect` returns a value only when every feature in
-/// `FEATURES` is present, and `assume_detected` is called only where that
-/// holds.
+/// An implementation's `detect` returns a value only when every feature of
+/// `TIER` ([`Tier::features`]) is present, and `assume_detected` is called
+/// only where that holds.
 pub unsafe trait Isa: Copy + Send + Sync + 'static {
     const TIER: Tier;
-    const FEATURES: &'static str;
     /// The tier's quantized-dot mode ([`Tier::quantized_dots`]).
     const QUANTIZED_DOTS: u8 = Self::TIER.quantized_dots();
 
@@ -198,123 +37,32 @@ pub unsafe trait Isa: Copy + Send + Sync + 'static {
     unsafe fn assume_detected() -> Self;
 }
 
-macro_rules! tier {
-    ($name:ident, $tier:ident, $features:ident, [$($feature:tt),*], $detect:ident) => {
-        #[doc = concat!("The `", stringify!($name), "` tier token.")]
-        #[derive(Clone, Copy, Debug)]
-        pub struct $name(());
+/// The tier tokens of this architecture, one per tier of
+/// `seismic_cpu_tiers::tiers!`, each detected by its tier's features.
+macro_rules! tokens {
+    ($($token:ident $name:ident $arch:tt [$($feature:tt),*];)*) => {
+        $(
+            #[cfg(target_arch = $arch)]
+            #[doc = concat!("The `", stringify!($token), "` tier token.")]
+            #[derive(Clone, Copy, Debug)]
+            pub struct $token(());
 
-        // SAFETY: `detect` checks every feature of `FEATURES`.
-        unsafe impl Isa for $name {
-            const TIER: Tier = Tier::$tier;
-            const FEATURES: &'static str = $features;
+            // SAFETY: `detect` checks every feature of the tier.
+            #[cfg(target_arch = $arch)]
+            unsafe impl Isa for $token {
+                const TIER: Tier = Tier::$token;
 
-            fn detect() -> Option<Self> {
-                ($(std::arch::$detect!($feature))&&*).then_some($name(()))
+                fn detect() -> Option<Self> {
+                    Tier::$token.is_detected().then_some($token(()))
+                }
+
+                unsafe fn assume_detected() -> Self {
+                    $token(())
+                }
             }
-
-            unsafe fn assume_detected() -> Self {
-                $name(())
-            }
-        }
+        )*
     };
 }
 
-#[cfg(target_arch = "x86_64")]
-tier!(
-    X86V2,
-    X86V2,
-    X86V2_FEATURES,
-    ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt"],
-    is_x86_feature_detected
-);
-#[cfg(target_arch = "x86_64")]
-tier!(
-    X86V3,
-    X86V3,
-    X86V3_FEATURES,
-    [
-        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
-        "bmi2", "lzcnt", "movbe"
-    ],
-    is_x86_feature_detected
-);
-#[cfg(target_arch = "x86_64")]
-tier!(
-    X86V4,
-    X86V4,
-    X86V4_FEATURES,
-    [
-        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
-        "bmi2", "lzcnt", "movbe", "avx512f", "avx512cd", "avx512bw", "avx512dq", "avx512vl"
-    ],
-    is_x86_feature_detected
-);
-#[cfg(target_arch = "x86_64")]
-tier!(
-    X86V4Vnni,
-    X86V4Vnni,
-    X86V4VNNI_FEATURES,
-    [
-        "sse3",
-        "ssse3",
-        "sse4.1",
-        "sse4.2",
-        "popcnt",
-        "avx",
-        "avx2",
-        "fma",
-        "f16c",
-        "bmi1",
-        "bmi2",
-        "lzcnt",
-        "movbe",
-        "avx512f",
-        "avx512cd",
-        "avx512bw",
-        "avx512dq",
-        "avx512vl",
-        "avx512vnni"
-    ],
-    is_x86_feature_detected
-);
-#[cfg(target_arch = "aarch64")]
-tier!(
-    Neon,
-    Neon,
-    NEON_FEATURES,
-    ["neon"],
-    is_aarch64_feature_detected
-);
-#[cfg(target_arch = "aarch64")]
-tier!(
-    NeonDot,
-    NeonDot,
-    NEONDOT_FEATURES,
-    ["neon", "dotprod"],
-    is_aarch64_feature_detected
-);
+seismic_cpu_tiers::tiers!(tokens);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_host_has_a_tier_and_every_lower_one() {
-        let detected = Tier::detected().expect("every supported host has the floor tier");
-        let below = detected.at_or_below().collect::<Vec<_>>();
-        assert_eq!(below.last(), Some(&detected));
-        assert_eq!(below.first(), Tier::all().first());
-    }
-
-    #[test]
-    fn feature_strings_are_cumulative() {
-        for pair in Tier::all().windows(2) {
-            assert!(
-                pair[1].features().starts_with(pair[0].features()),
-                "{:?}",
-                pair
-            );
-        }
-    }
-}
