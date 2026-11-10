@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimpleIcon, FolderSimpleIcon, WarningCircleIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
@@ -79,6 +79,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
   onDownload: (model: OfferedModel, quant: QuantView) => void; onFinish: () => void
 }) {
   const measuring = preparation !== null
+  const body = useRef<HTMLDivElement>(null)
   const [selection, setSelection] = useState<string | null | undefined>(undefined)
   const [quantChoice, setQuantChoice] = useState<string | null>(null)
   const [showUnrunnable, setShowUnrunnable] = useState(false)
@@ -86,12 +87,12 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
   const picked = recommendations.find(entry => entry.model.key === selected)?.model
   const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
   return <Dialog open onOpenChange={open => { if (!open) onFinish() }} disablePointerDismissal>
-    <DialogContent showCloseButton={false} className="flex h-[88vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
+    <DialogContent showCloseButton={false} initialFocus={body} className="flex h-[88vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
     <div className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4 dark:border-slate-750">
       <DialogTitle className="font-heading text-lg font-semibold">Choose a model</DialogTitle>
       <Button variant="ghost" size="sm" onClick={onFinish}>Skip</Button>
     </div>
-    <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-6 pb-6 pt-5 dark:bg-slate-900/40">
+    <div ref={body} tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-6 pb-6 pt-5 outline-none dark:bg-slate-900/40">
       <div>{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>
       {preparation && <PreparationProgress steps={preparation} />}
 
