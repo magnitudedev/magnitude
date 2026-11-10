@@ -1507,15 +1507,17 @@ impl ManagedModelCandidates {
             let best = recommended_version(
                 assessed.iter().map(|(group, assessment)| (group, assessment.as_ref())),
             );
-            // Largest first: once the best so far is served at a working context and keeps up,
-            // every version not yet assessed is smaller, so none can beat it.
+            // Largest first: once the best so far is a quant held in memory, served at a working
+            // context, that keeps up, every version not yet assessed is smaller, so none can beat
+            // it.
             let settled = best.is_some_and(|index| {
-                matches!(
-                    assessed[index].1.as_ref().map(|assessment| &assessment.profile),
-                    Some(ModelAssessment::Fits { profile, served, residency, .. })
-                        if working_context(profile, served)
-                            && comparison_speed(served, residency).is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND)
-                )
+                !full_precision(&assessed[index].0)
+                    && matches!(
+                        assessed[index].1.as_ref().map(|assessment| &assessment.profile),
+                        Some(ModelAssessment::Fits { profile, served, residency: residency @ ModelResidency::Resident { .. }, .. })
+                            if working_context(profile, served)
+                                && comparison_speed(served, residency).is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND)
+                    )
             });
             if settled {
                 break;
@@ -4081,10 +4083,11 @@ fn candidate_versions(
 
 /// The recommended version, by the rule the catalog's recommendations follow: among the fitting
 /// versions, those served at a working context first (see [`WORKING_CONTEXT`]); of those, the
-/// largest that decodes at [`TARGET_TOKENS_PER_SECOND`] in a long conversation, else the fastest.
-/// A Q8 served at 32K is a worse coding model than a Q6 served at 128K, and a quant held in memory
-/// that keeps up beats a larger one streamed too slowly. Before this machine's speed measurements
-/// exist, Q4_K-class versions, then the largest.
+/// largest that decodes at [`TARGET_TOKENS_PER_SECOND`] in a long conversation, one held whole in
+/// memory before one streamed, else the fastest. A Q8 served at 32K is a worse coding model than a
+/// Q6 served at 128K, and a quant held in memory that keeps up beats a larger one streamed.
+/// Full-precision files are references, recommended only when a repository holds nothing else.
+/// Before this machine's speed measurements exist, Q4_K-class versions, then the largest.
 fn recommended_version<'a>(
     versions: impl Iterator<Item = (&'a ClassifiedGroup, Option<&'a CachedModelAssessment>)>,
 ) -> Option<usize> {
@@ -4096,29 +4099,31 @@ fn recommended_version<'a>(
                 group,
                 working_context(profile, served),
                 comparison_speed(served, residency),
+                matches!(residency, ModelResidency::Resident { .. }),
             )),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let working = fitting.iter().any(|(_, _, working, _)| *working);
+    let working = fitting.iter().any(|candidate| candidate.2);
+    let quantized = fitting.iter().any(|candidate| !full_precision(candidate.1));
     let pool = fitting
         .into_iter()
-        .filter(|(_, _, served_working, _)| *served_working || !working)
+        .filter(|candidate| (candidate.2 || !working) && (!full_precision(candidate.1) || !quantized))
         .collect::<Vec<_>>();
-    if pool.iter().all(|(_, _, _, speed)| speed.is_none()) {
+    if pool.iter().all(|candidate| candidate.3.is_none()) {
         return pool
             .iter()
-            .max_by_key(|(_, group, _, _)| {
+            .max_by_key(|candidate| {
                 (
-                    group.quantization.as_deref().is_some_and(is_q4_k_class),
-                    group.group.size_bytes(),
+                    candidate.1.quantization.as_deref().is_some_and(is_q4_k_class),
+                    candidate.1.group.size_bytes(),
                 )
             })
-            .map(|(index, ..)| *index);
+            .map(|candidate| candidate.0);
     }
     pool.iter()
-        .filter(|(_, _, _, speed)| speed.is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND))
-        .max_by_key(|(_, group, _, _)| group.group.size_bytes())
+        .filter(|candidate| candidate.3.is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND))
+        .max_by_key(|candidate| (candidate.4, candidate.1.group.size_bytes()))
         .or_else(|| {
             pool.iter().max_by(|left, right| {
                 left.3
@@ -4127,7 +4132,13 @@ fn recommended_version<'a>(
                     .then(right.1.group.size_bytes().cmp(&left.1.group.size_bytes()))
             })
         })
-        .map(|(index, ..)| *index)
+        .map(|candidate| candidate.0)
+}
+
+/// Whether a version's weights are unquantized floats: 16 or 32 bits.
+fn full_precision(group: &ClassifiedGroup) -> bool {
+    let label = version_label(&group.group.primary().path, group.quantization.as_deref()).to_ascii_uppercase();
+    ["BF16", "F16", "FP16", "F32", "FP32"].iter().any(|kind| label == *kind || label.ends_with(&format!("-{kind}")))
 }
 
 /// The decode speed recommendations compare: the estimate at the depth nearest

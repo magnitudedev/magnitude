@@ -447,10 +447,22 @@ pub fn split_set(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// A version's presentation label: its header's quantization, spelled by the file or folder name
-/// when that names the same weight type more precisely the way GGUF writers do (`UD-Q4_K_XL`,
-/// `Q4_K_P`); with nothing in the header, the quantization the name spells, else its file stem.
-/// Labels never decide compatibility.
+/// The bit width a quantization label names: 4 for `UD-Q4_K_XL` or `IQ4_XS`, 16 for `BF16`.
+fn label_bits(label: &str) -> Option<u32> {
+    let label = label.to_ascii_uppercase();
+    let label = label.strip_prefix("UD-").unwrap_or(&label);
+    let digits = |rest: &str| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok();
+    ["IQ", "TQ", "Q"]
+        .iter()
+        .find_map(|prefix| label.strip_prefix(prefix).and_then(digits))
+        .or_else(|| ["BF", "FP", "F", "MXFP", "NVFP"].iter().find_map(|prefix| label.strip_prefix(prefix).and_then(digits)))
+}
+
+/// A version's presentation label: its header's quantization (what its weights mostly are), spelled
+/// by the file or folder name when that names the same bit width the way its publisher lists it on
+/// the Hub (`UD-Q4_K_XL`, `Q4_K_P` for a Q4_K header, `UD-Q2_K_XL` for a mostly IQ2_XS one); a name
+/// of another width is ignored, since files are renamed freely. With nothing in the header, the
+/// quantization the name spells, else its file stem. Labels never decide compatibility.
 #[must_use]
 pub fn version_label(path: &Path, header_quantization: Option<&str>) -> String {
     let stem = path
@@ -477,28 +489,13 @@ pub fn version_label(path: &Path, header_quantization: Option<&str>) -> String {
         .unwrap_or_default();
     let named = quantization_label(&stem).or_else(|| quantization_label(directory));
     match (header_label(header_quantization), named) {
-        // A name that spells the header's weight type more precisely (`UD-Q4_K_XL`, `Q4_K_P` for a
-        // Q4_K_M header) keeps its writer's label; any other name is ignored, since files are
-        // renamed freely.
-        (Some(header), Some(named)) if weight_type(&named) == weight_type(&header) => named,
+        (Some(header), Some(named)) if label_bits(&named).is_some() && label_bits(&named) == label_bits(&header) => named,
         (Some(header), _) => header,
         (None, Some(named)) => named,
         (None, None) => stem,
     }
 }
 
-/// The weight type a quantization label names, without its size or mix suffix: `Q4_K` for
-/// `UD-Q4_K_XL`, `Q8_0` for `Q8_0`, `IQ2` for `IQ2_M`, `MXFP4` for `MXFP4_MOE`.
-fn weight_type(label: &str) -> &str {
-    let label = label.strip_prefix("UD-").unwrap_or(label);
-    if label.starts_with('Q') {
-        if let Some(index) = label.find("_K") {
-            return &label[..index + 2];
-        }
-        return label;
-    }
-    label.split('_').next().unwrap_or(label)
-}
 
 fn header_label(header_quantization: Option<&str>) -> Option<String> {
     header_quantization
@@ -727,6 +724,11 @@ mod tests {
         assert_eq!(
             version_label(Path::new("Model-Q4_K_P.gguf"), Some("Q4_K - Medium")),
             "Q4_K_P"
+        );
+        assert_eq!(
+            version_label(Path::new("Model-UD-Q2_K_XL.gguf"), Some("IQ2_XS - 2.3125 bpw")),
+            "UD-Q2_K_XL",
+            "a mixed quantization keeps its publisher's name of the same bit width as its weights"
         );
         assert_eq!(
             version_label(Path::new("renamed-q8.gguf"), Some("Q4_K - Medium")),
