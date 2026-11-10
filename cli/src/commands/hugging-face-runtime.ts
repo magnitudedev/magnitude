@@ -134,6 +134,8 @@ export const renderSearch = ({ query, response, unifiedMemory }: SearchView): st
 export const searchJson = jsonDocument(HuggingFaceSearchResponseJsonSchema, ({ response }: SearchView) => response)
 
 export const SEARCH_LIMIT_MAXIMUM = 50
+/** Hugging Face search accepts queries up to this many bytes. */
+export const SEARCH_QUERY_MAXIMUM_BYTES = 200
 
 const parseSearchLimit = (input: string | undefined) => {
   if (input === undefined) return Effect.succeed(Option.none<number>())
@@ -164,6 +166,9 @@ export const searchHuggingFace = (
   effect: Effect.gen(function* () {
     const trimmed = query.trim()
     if (trimmed.length === 0) return yield* new ModelCommandError({ message: "Search query must not be empty" })
+    if (new TextEncoder().encode(trimmed).length > SEARCH_QUERY_MAXIMUM_BYTES) {
+      return yield* new ModelCommandError({ message: `Search query must be at most ${SEARCH_QUERY_MAXIMUM_BYTES} bytes` })
+    }
     const limit = yield* parseSearchLimit(options.limit)
     const cursor = Option.fromNullable(options.more).pipe(Option.filter((value) => value.length > 0))
     return yield* withClient((client) => readSearch(client, trimmed, limit, cursor))
