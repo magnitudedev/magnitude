@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, HuggingFaceArtifactSelectorSchema,
-  HuggingFaceRepositoryIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema,
+  CountryCodeSchema, HuggingFaceRepositoryIdSchema, LabIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema,
   type AvailableCatalogLocalModel, type CandidateInspection, type CandidateVersion, type CustomLocalModel, type CustomModelOrigin,
   type AttachedDrafter, type AttachedDrafterAvailability, type DrafterCandidate, type LocalModelAssessment, type UnsupportedLocalModel, type UnsupportedReason,
 } from "@magnitudedev/sdk"
@@ -40,7 +40,7 @@ export const catalogModel = (): AvailableCatalogLocalModel => ({
   modelId: catalogId,
   storageBytes: 24 * GB,
   presentation: { displayName: "Qwen3.6 35B-A3B", variantLabel: ModelVariantLabelSchema.make("Q4"), description: "", license: Option.some("apache-2.0"), sourceUrls: [] },
-  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
+  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") }, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
   servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits, rankingScores: { speed: Option.some(1), intelligence: 1, fidelity: 1 } },
   missingComponents: [],
@@ -80,7 +80,7 @@ export const customModel = (origin: CustomModelOrigin, overrides: Partial<Custom
   modelId: CustomFormModelIdSchema.make(origin._tag === "Added" || origin._tag === "Found" && origin.source._tag === "HuggingFaceCache"
     ? `hf:${repository}/Qwen-Q4_K_P.gguf` : "local:qwen3.6-35b-a3b-uncensored-q4_k_p:aaaaaaaaaaaa"),
   origin,
-  presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), license: Option.none(), sourceUrls: [] },
+  presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), developer: Option.none(), license: Option.none(), sourceUrls: [] },
   drafter: Option.none(),
   drafterPending: false,
   drafterChoice: { _tag: "Auto" },
@@ -114,6 +114,7 @@ export const version = (label: string, overrides: Partial<CandidateVersion> = {}
 export const inspection = (overrides: Partial<CandidateInspection> = {}): CandidateInspection => ({
   source: { _tag: "HuggingFace", repository, commit: "4f1c2e9abcdef" },
   displayName: "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive",
+  developer: Option.none(),
   license: Option.some("apache-2.0"),
   variantOf: Option.some(catalogId),
   versions: [

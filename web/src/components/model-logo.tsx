@@ -13,6 +13,7 @@ import openbmb from "../../../assets/brand/model-providers/openbmb.svg"
 import huggingFace from "../../../assets/brand/hugging-face.svg"
 
 export interface ModelLab {
+  readonly id: string
   readonly name: string
   readonly prefixes: readonly string[]
   readonly src: string
@@ -21,17 +22,20 @@ export interface ModelLab {
 
 // Presentation artwork follows canonical catalog families; it does not infer model capabilities.
 export const modelLabs: readonly ModelLab[] = [
-  { name: "Qwen", prefixes: ["qwen"], src: qwen, theme: "" },
-  { name: "DeepSeek", prefixes: ["deepseek"], src: deepseek, theme: "" },
-  { name: "Gemma", prefixes: ["gemma"], src: gemma, theme: "" },
-  { name: "Liquid AI", prefixes: ["lfm"], src: liquid, theme: "dark:invert" },
-  { name: "NVIDIA", prefixes: ["nemotron"], src: nvidia, theme: "" },
-  { name: "Poolside", prefixes: ["laguna"], src: poolside, theme: "" },
-  { name: "Z.ai", prefixes: ["glm"], src: zai, theme: "invert dark:invert-0" },
-  { name: "PrismML", prefixes: ["bonsai"], src: prism, theme: "invert dark:invert-0" },
-  { name: "Meta", prefixes: ["llama", "muse", "glimmer"], src: meta, theme: "" },
-  { name: "OpenBMB", prefixes: ["minicpm"], src: openbmb, theme: "" },
+  { id: "alibaba", name: "Qwen", prefixes: ["qwen"], src: qwen, theme: "" },
+  { id: "deepseek", name: "DeepSeek", prefixes: ["deepseek"], src: deepseek, theme: "" },
+  { id: "google", name: "Gemma", prefixes: ["gemma"], src: gemma, theme: "" },
+  { id: "liquid", name: "Liquid AI", prefixes: ["lfm"], src: liquid, theme: "dark:invert" },
+  { id: "nvidia", name: "NVIDIA", prefixes: ["nemotron"], src: nvidia, theme: "" },
+  { id: "poolside", name: "Poolside", prefixes: ["laguna"], src: poolside, theme: "" },
+  { id: "zai", name: "Z.ai", prefixes: ["glm"], src: zai, theme: "invert dark:invert-0" },
+  { id: "prismml", name: "PrismML", prefixes: ["bonsai"], src: prism, theme: "invert dark:invert-0" },
+  { id: "meta", name: "Meta", prefixes: ["llama", "muse", "glimmer"], src: meta, theme: "" },
+  { id: "openbmb", name: "OpenBMB", prefixes: ["minicpm"], src: openbmb, theme: "" },
 ]
+
+/** The artwork for a developer the service names, by its lab id. */
+export const labForDeveloper = (lab: string): ModelLab | undefined => modelLabs.find(entry => entry.id === lab)
 
 const labForCatalogId = (modelId: string): ModelLab | undefined =>
   modelLabs.find(lab => lab.prefixes.some(prefix => modelId.startsWith(prefix)))

@@ -19,7 +19,7 @@ export interface OwnedModel {
   readonly quant: QuantView
   readonly contextLimit: number | null
   readonly location: string | null
-  readonly drafter: { readonly method: string; readonly sizeBytes: number; readonly attached: boolean } | null
+  readonly drafter: { readonly method: string; readonly sizeBytes: number | null; readonly attached: boolean } | null
   readonly searchText: string
 }
 
@@ -89,8 +89,8 @@ function Details({ model, onAddDrafter }: { model: OwnedModel; onAddDrafter: () 
     ["Source", model.quant.repository ? <span className="inline-flex min-w-0 items-center gap-1 text-slate-700 dark:text-slate-300"><HuggingFaceLogo className="size-3.5" /><RepositoryLink repository={model.quant.repository} /></span> : <span className="text-slate-500">Not matched to a Hugging Face repo</span>],
     ...(model.location ? [["Location", <span className="truncate font-mono text-[11px] text-slate-600 dark:text-slate-400">{model.location}</span>] as const] : []),
     ["Drafter", model.drafter === null ? <span className="text-slate-500">None</span>
-      : model.drafter.attached ? <span className="rounded border border-slate-300 px-1.5 text-[11px] font-medium text-slate-600 dark:border-slate-600 dark:text-slate-300">{model.drafter.method} · {formatStorageSize(model.drafter.sizeBytes)}</span>
-      : <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onAddDrafter() }}><PlusIcon />Add {model.drafter.method} drafter · {formatStorageSize(model.drafter.sizeBytes)}</Button>],
+      : model.drafter.attached ? <span className="rounded border border-slate-300 px-1.5 text-[11px] font-medium text-slate-600 dark:border-slate-600 dark:text-slate-300">{model.drafter.method}{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</span>
+      : <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onAddDrafter() }}><PlusIcon />Add {model.drafter.method} drafter{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</Button>],
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">

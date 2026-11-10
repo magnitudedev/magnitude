@@ -21,14 +21,13 @@ import {
   SunIcon,
   MoonIcon,
   FolderOpenIcon,
-  BuildingsIcon,
   BookOpenIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
 import { Fragment, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { type ProviderModelId, type CatalogLocalModel, type LocalModel } from "@magnitudedev/sdk"
+import { type ProviderModelId } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
@@ -37,16 +36,10 @@ import {
   activeLocalModel,
   useAgentClient,
   type ApplicationPage,
-  useCatalogModels,
-  useLocalModelStopStatus,
   useLocalModels,
   useLocalInferenceHardware,
-  formatLocalModelDisplayName,
   formatStorageSize,
   localModelConnectionOptions,
-  useCustomModels,
-  useHiddenLocalModels,
-  useUnsupportedLocalModels,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
@@ -58,15 +51,11 @@ import { SettingsStatus } from "./components/settings-status"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
-import { HuggingFaceLogo, LabLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
-import { ModelsHeader } from "./components/models-header"
-import { AddModelDialog, type AddDialogRequest } from "./components/add-model-dialog"
-import { UnsupportedModels } from "./components/local-model-lists"
-import { ModelsListing, afterModelAdded, selectModels } from "./components/models-page"
 import { ModelLocationsRow } from "./components/model-locations"
 import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
-import { ModelCard } from "./components/model-card"
+import { ModelsScreen } from "./components/models/models-screen"
+import { Explore } from "./components/models/explore"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -77,73 +66,25 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
 const pageNames: Record<ApplicationPage, string> = { onboarding: "Welcome", chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
 const pageIcons = { models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
-function LabOption({ lab }: { lab: ModelLab | null }) {
-  return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
-}
-function Models() {
-  const catalog = useCatalogModels()
-  const customModels = useCustomModels()
-  const unsupportedModels = useUnsupportedLocalModels()
-  const hiddenModels = useHiddenLocalModels()
-  const localModels = useLocalModels()
-  const active = Result.isSuccess(localModels) ? Option.getOrUndefined(activeLocalModel(localModels.value)) : undefined
-  const stopResult = useLocalModelStopStatus()
-  const hardware = useLocalInferenceHardware()
-  const navigate = useNavigate()
-  const [search, setSearch] = useState("")
-  const filterOptions = [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
-  const sortOptions = [
-    { value: "name", label: "Name A–Z" }, { value: "fastest", label: "Fastest (estimated)" }, { value: "smartest", label: "Most intelligent" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
-  ]
-  const [filter, setFilter] = useState("all")
-  const [lab, setLab] = useState<ModelLab | null>(null)
-  const [sort, setSort] = useState("name")
+/** The Models page and its Explore models modal; a Hugging Face link opens Explore on that repository. */
+function ModelsPage() {
   const session = useSession()
-  const linkedRequest = useAtomValue(session.addModelRequest)
-  const clearLinkedRequest = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
-  const [pageRequest, setPageRequest] = useState(Option.none<AddDialogRequest>())
-  const request: Option.Option<AddDialogRequest> = Option.isSome(linkedRequest) ? linkedRequest : pageRequest
-  const openDialog = (next: AddDialogRequest) => setPageRequest(Option.some(next))
-  const closeDialog = () => { setPageRequest(Option.none()); if (Option.isSome(linkedRequest)) clearLinkedRequest() }
-  if (Result.isFailure(catalog)) return <><h1 className={pageLayout.pageTitle}>{pageNames.models}</h1><ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
-  if (!Result.isSuccess(catalog)) return <ModelsSkeleton />
-  const models = catalog.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog")
-  const custom = Result.isSuccess(customModels) ? customModels.value : []
-  const allModels: readonly LocalModel[] = [...models, ...custom]
-  const hidden = Result.isSuccess(hiddenModels) ? hiddenModels.value : []
-  const assessment = catalog.value.preparation.assessment
-  // Deprecated and disabled models are listed only where installed.
-  const library = allModels.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled")
-  const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
-  const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
-  const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
-  const dialog = <AddModelDialog request={request} models={allModels} onClose={closeDialog} onAdded={afterModelAdded(closeDialog, navigate)} />
-  const filterControls = <>
-    <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
-      <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
-      <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-    </Select>
-    <Select value={lab} onValueChange={setLab}>
-      <SelectTrigger aria-label="Filter by lab"><SelectValue>{(value: ModelLab | null) => <LabOption lab={value} />}</SelectValue></SelectTrigger>
-      <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
-    </Select>
-  </>
-  const sortControl = <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
-    <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
-    <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-  </Select>
+  const linked = useAtomValue(session.addModelRequest)
+  const clearLinked = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
+  const hardware = useLocalInferenceHardware()
+  const models = useLocalModels()
+  const [explore, setExplore] = useState<{ readonly open: boolean; readonly query: string }>({ open: false, query: "" })
+  const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
+  const open = explore.open || Option.isSome(linkedQuery)
+  const query = Option.getOrElse(linkedQuery, () => explore.query)
+  const unified = Result.isSuccess(hardware) && hardware.value.memoryDomains.some(domain => domain.kind === "UnifiedMemory")
+  const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
+  const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").map(model => String(model.modelId)) : [])
   return <>
-    <ModelsHeader title={pageNames.models} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
-      action={<Button variant="outline" onClick={() => openDialog({ _tag: "Search", query: "" })}><HuggingFaceLogo />Add from Hugging Face</Button>}
-      controls={<>{filterControls}{sortControl}</>} />
-    {stopFailure}
-    {!assessment.complete && <p className="mb-4 text-sm text-slate-500">{assessment.totalModels > 0 ? `Assessing models · ${assessment.settledModels} of ${assessment.totalModels}` : "Preparing models for assessment…"}</p>}
-    <ModelsListing filter={filter} models={visible}
-      card={model => <ModelCard key={model.modelId} model={model} models={allModels} hardware={Result.value(hardware)} page="models"
-        {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />}
-      empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : "No models downloaded yet. Add one from Hugging Face."}</p>}
-      footer={<UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
-    {dialog}
+    <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
+    <Explore open={open} query={query} unified={unified} machine={machine} recommended={[]} families={[]} owned={owned}
+      setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
+      setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
@@ -446,7 +387,7 @@ export function App() {
       : page === "usage" ? <ServingUsage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton startingService />)
-      : page === "models" ? <Models />
+      : page === "models" ? <ModelsPage />
       : null}
   </AppShell></>
 }
