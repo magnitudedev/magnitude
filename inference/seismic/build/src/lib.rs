@@ -2980,9 +2980,9 @@ mod native_tests {
         let artifacts = build("out").expect("tuning and scratch symbols are generated ABI");
         let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
         assert!(generated.contains("Some(&cpu_native::KERNELS)"));
-        // Tuning parameters are runtime values: one form per tier (four on
-        // x86-64, one on aarch64) of the one launch, none per value.
-        assert_eq!(generated.matches("as CpuKernelFn").count(), 5);
+        // Tuning parameters are runtime values: one form per tier of the
+        // one launch, none per value.
+        assert_eq!(generated.matches("as CpuKernelFn").count(), seismic_cpu_tiers::Tier::EVERY.len());
         assert!(generated.contains("pub fn param_tile(&self) -> u64 { self.invocation.param(0) }"));
         assert!(
             generated.contains("pub fn param_unroll(&self) -> u64 { self.invocation.param(1) }")
