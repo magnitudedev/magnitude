@@ -221,6 +221,9 @@ const INTERPRETED_KEYS: &[&str] = &[
     // spaces before punctuation.
     "tokenizer.ggml.clean_spaces",
     "tokenizer.ggml.suppress_tokens",
+    // Whether text is NFC-normalized: it must agree with the profile's
+    // normalization, which the profile alone decides.
+    "tokenizer.ggml.normalizer.nfc",
 ];
 
 /// Pieces that end a turn by the GGUF convention (llama.cpp 18443257a30c,
@@ -333,6 +336,14 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     ] {
         if flag(payload, key)? == Some(true) {
             unsupported.push(UnsupportedReason::UnrecognizedMetadata { key: key.into() });
+        }
+    }
+    let declared_nfc = flag(payload, "tokenizer.ggml.normalizer.nfc")?;
+    if let (Ok(profile), Some(nfc)) = (&profile, declared_nfc) {
+        if nfc != (profile.normalization == Normalization::Nfc) {
+            unsupported.push(UnsupportedReason::UnrecognizedMetadata {
+                key: "tokenizer.ggml.normalizer.nfc".into(),
+            });
         }
     }
     let profile = match profile {
@@ -514,6 +525,50 @@ mod eos_tests {
         }
         for values in [Array::from(vec![-1_i64]), Array::from(vec![4_u64]), Array::String(["1"].into_iter().collect())] {
             assert!(additional_eos(&payload(GgufValue::Array(values)), 4).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+    use magnitude_artifacts::gguf::Metadata;
+
+    /// A one-piece BPE tokenizer with pre-tokenizer `pre`, and the NFC
+    /// declaration `nfc` when it has one.
+    fn payload(pre: &str, nfc: Option<bool>) -> TokenizerPayload {
+        let text = |value: &str| GgufValue::Scalar(Scalar::String(value.into()));
+        let strings = |values: &[&str]| GgufValue::Array(Array::String(values.iter().copied().collect()));
+        let mut metadata = vec![
+            Metadata { name: "tokenizer.ggml.model".into(), value: text("gpt2") },
+            Metadata { name: "tokenizer.ggml.pre".into(), value: text(pre) },
+            Metadata { name: "tokenizer.ggml.tokens".into(), value: strings(&["a"]) },
+            Metadata { name: "tokenizer.ggml.token_type".into(), value: GgufValue::Array(Array::from(vec![1_u64])) },
+            Metadata { name: "tokenizer.ggml.merges".into(), value: strings(&[]) },
+            Metadata { name: "tokenizer.ggml.eos_token_id".into(), value: GgufValue::Scalar(Scalar::Unsigned(0)) },
+        ];
+        if let Some(nfc) = nfc {
+            metadata.push(Metadata { name: "tokenizer.ggml.normalizer.nfc".into(), value: GgufValue::Scalar(Scalar::Bool(nfc)) });
+        }
+        TokenizerPayload { metadata }
+    }
+
+    /// The NFC declaration is read when it agrees with the profile's
+    /// normalization, and refused, naming it, when it does not.
+    #[test]
+    fn an_nfc_declaration_must_agree_with_the_profile() {
+        for (pre, nfc) in [("qwen35", None), ("qwen35", Some(true)), ("llama-bpe", Some(false))] {
+            assert_eq!(gguf_tokenizer_vocabulary(&payload(pre, nfc)).unwrap(), 1, "{pre} {nfc:?}");
+        }
+        for (pre, nfc) in [("qwen35", false), ("llama-bpe", true)] {
+            match gguf_tokenizer_vocabulary(&payload(pre, Some(nfc))) {
+                Err(TokenizerError::Unsupported(reasons)) => assert_eq!(
+                    reasons,
+                    [UnsupportedReason::UnrecognizedMetadata { key: "tokenizer.ggml.normalizer.nfc".into() }],
+                    "{pre} {nfc}"
+                ),
+                other => panic!("{pre} {nfc}: {other:?}"),
+            }
         }
     }
 }

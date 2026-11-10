@@ -50,6 +50,13 @@ impl<'a> Tensors<'a> {
 
     /// Binds `name` as stored; its stored shape must be `shape`.
     pub fn bind(&mut self, name: &str, shape: &[u64]) -> Result<WeightDescriptor, HeaderError> {
+        // A vector stored with a leading unit axis (`[1, n]`, as some converters write a parameter
+        // vector) holds the same elements in the same order as `[n]`.
+        if let [length] = *shape {
+            if self.stored(name)?.shape == [1, length] {
+                return self.bind_transformed(name, &[1, length], vec![ImportTransform::Flatten]);
+            }
+        }
         self.bind_transformed(name, shape, Vec::new())
     }
 
@@ -265,6 +272,23 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A vector stored with a leading unit axis binds as the vector, read
+    /// flattened; any other stored shape is still refused.
+    #[test]
+    fn a_vector_stored_with_a_leading_unit_axis_binds_flattened() {
+        let directory = stored(vec![
+            ("row", vec![1, 8], Encoding::F32),
+            ("plain", vec![8], Encoding::F32),
+            ("wide", vec![2, 8], Encoding::F32),
+        ]);
+        let mut tensors = Tensors::new(&directory);
+        let row = tensors.bind("row", &[8]).unwrap();
+        assert_eq!((row.shape, row.transforms), (vec![8], vec![ImportTransform::Flatten]));
+        let plain = tensors.bind("plain", &[8]).unwrap();
+        assert_eq!((plain.shape, plain.transforms), (vec![8], Vec::new()));
+        assert!(matches!(tensors.bind("wide", &[8]), Err(HeaderError::WeightShape { .. })));
     }
 
     /// A grid binds as block scales of its tile in the codes its stored
