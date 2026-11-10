@@ -9,6 +9,7 @@ use lib::attention::attention::{self, Layout};
 use lib::core::{rounding::Rounding, spans};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (share, row) = (group[0] as usize, group[1] as usize);
     let (h, p, w) = (cx.dim_h() as usize, cx.dim_p() as usize, (2 * cx.dim_p() + cx.dim_s()) as usize);
@@ -44,7 +45,7 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let norm = (cx.dim_nq() == 1).then(|| cx.arg_query_norm().row([0, 0]));
     let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
     // A rounded query is rounded from its norm and rotation held in A.
-    let hold = rounding.map(|_| lib::core::activation::publish::<E::A> as fn(f32) -> f32);
+    let hold = rounding.map(|_| lib::core::activation::publish::<E::A>);
     let query = cx.arg_query();
     for head in 0..h {
         lib::core::activation::widen::<E::A>(query.row([row, head, 0]), key);

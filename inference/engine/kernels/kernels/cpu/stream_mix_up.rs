@@ -7,6 +7,7 @@
 use lib::core::activation;
 use lib::projection::projection;
 
+#[inline(always)]
 fn stream_mix_up_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -20,6 +21,7 @@ fn stream_mix_up_stage<L: Isa, E: Elements>(
     projection::stage::<E::A>(cx.arg_low().row([row, 0]), staged);
 }
 
+#[inline(always)]
 fn stream_mix_up_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

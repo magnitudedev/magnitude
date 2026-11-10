@@ -7,6 +7,7 @@
 
 use lib::core::{functions, spans};
 
+#[inline(always)]
 fn rows_topk<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (n, r, k) = (cx.dim_n() as usize, cx.dim_r() as usize, cx.dim_k() as usize);

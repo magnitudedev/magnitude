@@ -11,6 +11,7 @@
 use lib::recurrent::recurrent::{self, Recurrence};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn recurrence<'a, E: Elements>(cx: &Context<'a, E>) -> Recurrence<'a, E::A> {
     Recurrence {
         projection: cx.arg_projection(),
@@ -38,6 +39,7 @@ fn recurrence<'a, E: Elements>(cx: &Context<'a, E>) -> Recurrence<'a, E::A> {
     }
 }
 
+#[inline(always)]
 fn gated_delta_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let r = recurrence(cx);
     let head = group[0] as usize;
@@ -56,6 +58,7 @@ fn gated_delta_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     r.advance(&slot, head, rows, state, &mut prologue);
 }
 
+#[inline(always)]
 fn gated_delta_step_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let r = recurrence(cx);
     let (norm, values) = seismic::cpu::tensor::floats(shared, 2 * r.width).split_at_mut(r.width);

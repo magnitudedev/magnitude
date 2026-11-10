@@ -7,6 +7,7 @@
 use lib::core::activation;
 use lib::projection::projection;
 
+#[inline(always)]
 fn dense_output_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -33,6 +34,7 @@ fn dense_output_stage<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_down_weight()], staged);
 }
 
+#[inline(always)]
 fn dense_output_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

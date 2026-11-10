@@ -1,3 +1,4 @@
+#[inline(always)]
 fn place_logits_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

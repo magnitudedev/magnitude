@@ -9,6 +9,7 @@
 use lib::core::{activation, functions};
 use lib::projection::projection;
 
+#[inline(always)]
 fn attention_output_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -38,6 +39,7 @@ fn attention_output_stage<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_output_weight()], staged);
 }
 
+#[inline(always)]
 fn attention_output_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

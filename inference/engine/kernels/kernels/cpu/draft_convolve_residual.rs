@@ -2,6 +2,7 @@
 // dflash.seismic): one work item per row, which sums each column's taps over
 // the row and its block predecessors in offset order and adds the residual.
 
+#[inline(always)]
 fn draft_convolve_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (channels, taps) = (cx.dim_c() as usize, cx.dim_k() as usize);

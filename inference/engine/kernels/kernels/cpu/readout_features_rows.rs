@@ -6,6 +6,7 @@
 use lib::core::activation;
 use lib::projection::projection;
 
+#[inline(always)]
 fn readout_features_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (d, parts) = (cx.dim_d() as usize, cx.dim_pt() as usize);

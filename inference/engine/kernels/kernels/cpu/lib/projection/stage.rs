@@ -93,6 +93,7 @@ pub fn operand_row(weights: &[&Weights<'_>], row: &mut [f32]) {
 /// onto UE4M3; each value q * g * s with q, x / (g * s) onto E2M1, saturating
 /// at 6 (zero where s is). Every step rounds to nearest even, and q * g * s
 /// is exact in F32.
+#[inline(always)]
 pub fn nvfp4_row(row: &mut [f32]) {
     let amax = row.iter().fold(0.0f32, |held, value| held.max(value.abs()));
     let bits = (amax / 2688.0).to_bits();
@@ -108,6 +109,7 @@ pub fn nvfp4_row(row: &mut [f32]) {
 
 /// v >= 0 onto UE4M3 (exponent bias 7, three mantissa bits, subnormal
 /// quantum 2^-9), saturating at 448.
+#[inline(always)]
 fn ue4m3(v: f32) -> f32 {
     let exponent = ((v.to_bits() >> 23) & 255).max(121);
     let quantum = f32::from_bits((exponent - 3) << 23);
@@ -115,6 +117,7 @@ fn ue4m3(v: f32) -> f32 {
 }
 
 /// v onto E2M1's magnitudes with v's sign, saturating at 6; NaN stays NaN.
+#[inline(always)]
 fn e2m1(v: f32) -> f32 {
     let a = v.abs();
     let m = if a <= 0.25 {

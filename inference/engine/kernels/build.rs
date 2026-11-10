@@ -151,8 +151,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/core/arrive",
-        &[BackendName::Metal, BackendName::Cuda],
-        "last-threadgroup arrival over `sync` scratch, for the GPU natives that declare sync scratch",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Cpu],
+        "last-work-item arrival over `sync` scratch, for the natives that declare sync scratch",
     ),
     (
         "lib/core/gumbel",

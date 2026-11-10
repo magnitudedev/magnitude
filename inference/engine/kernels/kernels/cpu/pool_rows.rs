@@ -12,6 +12,7 @@ use lib::attention::attention::{self, Layout};
 use lib::core::{reduce, rounding::Rounding, spans};
 use seismic::cpu::{math, slab::SlabTensor};
 
+#[inline(always)]
 fn pool_rows_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_window_destinations().get([row]);
@@ -39,6 +40,7 @@ fn pool_rows_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
 /// # Safety
 /// The caller gives each work item distinct writes and no concurrent readers.
 #[allow(clippy::mut_from_ref)]
+#[inline(always)]
 unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows: usize, at: usize) -> &'a mut [i32] {
     // SAFETY: native launch validation owns every named slab and row; a row
     // is four contiguous words.
@@ -48,6 +50,7 @@ unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows
     }
 }
 
+#[inline(always)]
 fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_block_destinations().get([row]);
@@ -94,7 +97,7 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     );
     // A rounded row is rounded from values held in A (`pooled.seismic`).
     let rounding = Rounding::of(cx.arg_block(), cx.arg_element(), cx.arg_scale(), cx.arg_amax_floor());
-    let hold = rounding.map(|_| lib::core::activation::publish::<E::A> as fn(f32) -> f32);
+    let hold = rounding.map(|_| lib::core::activation::publish::<E::A>);
     for (column, pooled) in latent.iter_mut().enumerate() {
         *pooled = if gated {
             let top = rows.iter().fold(f32::NEG_INFINITY, |top, (_, g)| top.max(g[column]));

@@ -194,6 +194,7 @@ pub fn decode_source(rows: u64, source: impl Fn() -> i32, expert: i32) -> Option
 /// `expand_items` items of each used block, a quantize item per block row,
 /// `down_items` items of each used block. The one work item of its launch
 /// writes them.
+#[inline(always)]
 pub fn expert_grids(
     grids: [Scratch<'_>; 4],
     rows: i32,

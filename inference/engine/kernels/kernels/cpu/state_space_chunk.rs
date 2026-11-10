@@ -14,6 +14,7 @@ use lib::recurrent::state_space::{self, StateSpace};
 use lib::recurrent::versions::Slots;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn space<'a, E: Elements>(cx: &Context<'a, E>) -> StateSpace<'a, E::A> {
     let slab_banks = cx.arg_slab_banks() as usize;
     StateSpace {
@@ -45,6 +46,7 @@ fn space<'a, E: Elements>(cx: &Context<'a, E>) -> StateSpace<'a, E::A> {
     }
 }
 
+#[inline(always)]
 fn state_space_chunk_inputs<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let s = space(cx);
     let row = group[0] as usize;
@@ -56,6 +58,7 @@ fn state_space_chunk_inputs<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     s.stage_row(&slot, row - slot.lo, staged);
 }
 
+#[inline(always)]
 fn state_space_chunk_scan<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let s = space(cx);
     let head = group[0] as usize;

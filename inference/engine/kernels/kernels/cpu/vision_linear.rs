@@ -8,6 +8,7 @@ use lib::core::activation;
 use lib::projection::projection;
 use lib::vision::vision;
 
+#[inline(always)]
 fn vision_linear_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (k, n) = (cx.dim_k() as usize, cx.dim_n() as usize);
@@ -21,6 +22,7 @@ fn vision_linear_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     }
 }
 
+#[inline(always)]
 fn vision_linear_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (m, n, k) = (cx.dim_m() as usize, cx.dim_n() as usize, cx.dim_k() as usize);
     let rows = projection::item_rows(group[0], 8, n);

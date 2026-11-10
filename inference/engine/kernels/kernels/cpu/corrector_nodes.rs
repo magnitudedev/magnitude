@@ -3,6 +3,7 @@
 // pass, feature, slot and rank rows with their biases, in the portable body's
 // order.
 
+#[inline(always)]
 fn corrector_nodes<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let node = group[0] as usize;
     let (rows, count) = (cx.dim_j() as usize, cx.dim_k() as usize);

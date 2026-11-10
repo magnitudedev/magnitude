@@ -1,4 +1,5 @@
 // One work item copies every element, or (`WRITE` 0) writes nothing at all.
+#[inline(always)]
 fn omitted_write<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     if cx.param_write() == 0 {
         return;

@@ -11,6 +11,7 @@ use lib::core::{activation, reduce};
 use lib::projection::projection;
 use lib::routed::{ranked, routed};
 
+#[inline(always)]
 fn routed_route_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -28,6 +29,7 @@ fn routed_route_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     activation::store::<E::A>(normalized, unsafe { cx.result_0().row_mut([row, 0]) });
 }
 
+#[inline(always)]
 fn routed_route_logits<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, e) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_e() as usize);
     let rows = projection::item_rows(group[0], cx.param_rows(), e);
@@ -41,6 +43,7 @@ fn routed_route_logits<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     }
 }
 
+#[inline(always)]
 fn routed_route_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (h, e) = (cx.dim_h() as usize, cx.dim_e() as usize);

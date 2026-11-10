@@ -2,6 +2,7 @@
 // item per row. Round r scans the tokens ordered strictly after round r - 1's
 // choice in (value descending, token ascending) order.
 
+#[inline(always)]
 fn draft_top_k<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let count = cx.dim_k() as usize;

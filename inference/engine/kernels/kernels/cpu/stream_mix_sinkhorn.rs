@@ -8,6 +8,7 @@ use lib::core::{activation, functions, reduce};
 /// The most streams a row's coefficients hold in place.
 const MAX_STREAMS: usize = 8;
 
+#[inline(always)]
 fn stream_mix_sinkhorn<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -22,32 +23,37 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
     let streams: [&[f32]; MAX_STREAMS] =
         std::array::from_fn(|stream| if stream < s { hidden.row([row, stream, 0]) } else { &[] });
     let streams = &streams[..s];
-    let squares: f32 = streams.iter().map(|x| reduce::sum_squares(x)).sum();
+    // Plain loops, not closures: a closure is compiled outside the entry's
+    // target features, so the vector reductions inside it would not inline.
+    let mut squares = 0.0f32;
+    for x in streams {
+        squares += reduce::sum_squares(x);
+    }
     let inverse = 1.0 / (squares / (s * h) as f32 + norm_epsilon).sqrt();
     // Mix j of the row: function row j against the flattened streams.
-    let mix = |j: usize| -> f32 {
+    let mut mix = [0.0f32; 2 * MAX_STREAMS + MAX_STREAMS * MAX_STREAMS];
+    for (j, mix) in mix[..2 * s + s * s].iter_mut().enumerate() {
         let weights = function.row([j, 0]);
-        let projected: f32 = streams
-            .iter()
-            .enumerate()
-            .map(|(stream, x)| reduce::dot(&weights[stream * h..(stream + 1) * h], x))
-            .sum();
-        projected * inverse
-    };
+        let mut projected = 0.0f32;
+        for (stream, x) in streams.iter().enumerate() {
+            projected += reduce::dot(&weights[stream * h..(stream + 1) * h], x);
+        }
+        *mix = projected * inverse;
+    }
     // SAFETY: each work item writes its own row of every result.
     let (input, pre, join) = unsafe {
         (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0]), cx.result_2().row_mut([row, 0]))
     };
     for stream in 0..s {
-        pre[stream] = activation::sigmoid(mix(stream) * scale.get([0]) + base.get([stream])) + epsilon;
-        join[stream] = 2.0 * activation::sigmoid(mix(s + stream) * scale.get([1]) + base.get([s + stream]));
+        pre[stream] = activation::sigmoid(mix[stream] * scale.get([0]) + base.get([stream])) + epsilon;
+        join[stream] = 2.0 * activation::sigmoid(mix[s + stream] * scale.get([1]) + base.get([s + stream]));
     }
     let mut comb = [[0.0f32; MAX_STREAMS]; MAX_STREAMS];
     for (source, values) in comb.iter_mut().enumerate().take(s) {
         let values = &mut values[..s];
         for (target, value) in values.iter_mut().enumerate() {
             let at = 2 * s + source * s + target;
-            *value = mix(at) * scale.get([2]) + base.get([at]);
+            *value = mix[at] * scale.get([2]) + base.get([at]);
         }
         let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut total = 0.0f32;
@@ -59,14 +65,6 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
             *value = *value / total + epsilon;
         }
     }
-    let columns = |comb: &mut [[f32; MAX_STREAMS]; MAX_STREAMS]| {
-        for target in 0..s {
-            let sum: f32 = (0..s).fold(0.0, |sum, source| sum + comb[source][target]);
-            for values in comb.iter_mut().take(s) {
-                values[target] /= sum + epsilon;
-            }
-        }
-    };
     for sweep in 0..cx.arg_iterations() {
         if sweep > 0 {
             for values in comb.iter_mut().take(s) {
@@ -76,7 +74,12 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
                 }
             }
         }
-        columns(&mut comb);
+        for target in 0..s {
+            let sum: f32 = (0..s).fold(0.0, |sum, source| sum + comb[source][target]);
+            for values in comb.iter_mut().take(s) {
+                values[target] /= sum + epsilon;
+            }
+        }
     }
     for source in 0..s {
         join[s + source * s..s + (source + 1) * s].copy_from_slice(&comb[source][..s]);

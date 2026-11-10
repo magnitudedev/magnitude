@@ -12,6 +12,7 @@ use lib::attention::attention;
 use lib::core::{activation, spans};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn indexer_select_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_window_destinations().get([row]);
@@ -35,6 +36,7 @@ fn indexer_select_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
 /// # Safety
 /// The caller gives each work item distinct writes and no concurrent readers.
 #[allow(clippy::mut_from_ref)]
+#[inline(always)]
 unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows: usize, at: usize) -> &'a mut [i32] {
     // SAFETY: native launch validation owns every named slab and row; a row
     // is four contiguous words.
@@ -44,6 +46,7 @@ unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows
     }
 }
 
+#[inline(always)]
 fn indexer_select_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_block_destinations().get([row]);
@@ -106,6 +109,7 @@ fn indexer_select_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     unsafe { blocks.row_mut([destination as usize, 0]) }.copy_from_slice(finished);
 }
 
+#[inline(always)]
 fn indexer_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (h, p, w) = (cx.dim_h() as usize, cx.dim_p() as usize, (2 * cx.dim_p() + cx.dim_s()) as usize);

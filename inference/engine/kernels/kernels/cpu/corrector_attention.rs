@@ -5,6 +5,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn corrector_attention<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (row, head) = (group[0] as usize, group[1] as usize);
     let (nodes, width) = (cx.dim_n() as usize, cx.dim_w() as usize);

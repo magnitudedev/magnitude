@@ -8,6 +8,7 @@
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn readout_project_rows_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -34,6 +35,7 @@ fn readout_project_rows_stage<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_weight()], staged);
 }
 
+#[inline(always)]
 fn readout_project_rows_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

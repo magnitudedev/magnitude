@@ -5,6 +5,7 @@
 
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn copy_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let item = group[0] as usize;
     let slab_rows = cx.arg_slab_rows() as usize;

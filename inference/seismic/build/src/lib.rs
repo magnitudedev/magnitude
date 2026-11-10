@@ -1596,6 +1596,10 @@ mod internals {
                         continue;
                     }
                     println!("cargo:rerun-if-changed={}", path.display());
+                    let text = fs::read_to_string(&path).map_err(BuildError::Io)?;
+                    if let Some(function) = out_of_line(&text) {
+                        return Err(BuildError::CpuNative { reason: out_of_line_reason(function), path });
+                    }
                     let modules = path
                         .strip_prefix(root)
                         .expect("a scanned file lies under its root")
@@ -1777,6 +1781,54 @@ mod internals {
                 _ => CpuView::Weights,
             },
         }
+    }
+
+    /// The first function with a body in the CPU source `text` that is not
+    /// `#[inline(always)]`. Each form of a CPU entry is a `#[target_feature]`
+    /// function of its tier, into which the authored kernel and everything it
+    /// calls must inline: a function compiled out of line is compiled once,
+    /// without the tier's features, and so are the vector intrinsics it
+    /// reaches. Tests and functions with their own target features are exempt.
+    fn out_of_line(text: &str) -> Option<&str> {
+        let lines = text.lines().collect::<Vec<_>>();
+        lines.iter().enumerate().find_map(|(index, line)| {
+            let mut rest = line.trim_start();
+            for qualifier in ["pub(crate) ", "pub(super) ", "pub ", "const ", "unsafe "] {
+                rest = rest.strip_prefix(qualifier).unwrap_or(rest);
+            }
+            let rest = rest.strip_prefix("fn ")?;
+            let name = &rest[..rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?];
+            // A trait's required method ends at `;` (outside an array type)
+            // before any body.
+            let mut brackets = 0i32;
+            let body = lines[index..].iter().flat_map(|line| line.chars()).find_map(|c| {
+                match c {
+                    '[' => brackets += 1,
+                    ']' => brackets -= 1,
+                    '{' => return Some(true),
+                    ';' if brackets == 0 => return Some(false),
+                    _ => {}
+                }
+                None
+            })?;
+            let mut attributes = lines[..index]
+                .iter()
+                .rev()
+                .map(|line| line.trim())
+                .take_while(|line| line.starts_with("#[") || line.starts_with("//"));
+            let exempt = |line: &str| {
+                line == "#[inline(always)]"
+                    || line.starts_with("#[test]")
+                    || line.starts_with("#[target_feature")
+            };
+            (body && !attributes.any(exempt)).then_some(name)
+        })
+    }
+
+    fn out_of_line_reason(function: &str) -> String {
+        format!(
+            "`{function}` is not declared `#[inline(always)]`: it must inline into its tier boundary, or it is compiled without the tier's features"
+        )
     }
 
     /// The typed CPU view of an entry's native ABI, the authored source, and
@@ -2052,8 +2104,12 @@ mod internals {
         }
 
         // The tier boundaries: each form is a `#[target_feature]` function
-        // of its tier, into which the authored kernel and everything it
-        // calls inline.
+        // of its tier. The asset is included from its authored path, so the
+        // rule that everything inlines into them is checked here rather than
+        // written in.
+        if let Some(function) = out_of_line(cpu.text) {
+            return Err(BuildError::CpuNative { path: cpu.path.clone(), reason: out_of_line_reason(function) });
+        }
         for tier in seismic_cpu_tiers::Tier::EVERY {
             for (launch_index, launch) in definition.launches.iter().enumerate() {
                 for binding in &bindings {
@@ -2834,7 +2890,7 @@ mod native_tests {
 
     const SPECIALIZED: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cuda from \"native/scale.cu\":\n    static (N)\n    params (TILE in [32, 64] default 32)\n    scratch staging bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n\nnative scale for cpu from \"native/scale.rs\":\n    params (TILE in [32, 64] default 32, UNROLL in [1, 2, 4] default 1)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
 
-    const CPU_SCALE: &str = "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let (x, output, tile) = (cx.arg_x(), cx.result_0(), cx.param_tile());\n    for i in group[0] * tile..((group[0] + 1) * tile).min(cx.dim_n()) {\n        unsafe { output.set([i as usize], x.get([i as usize])) };\n    }\n    let _ = cx.param_unroll();\n}\n";
+    const CPU_SCALE: &str = "#[inline(always)]\nfn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let (x, output, tile) = (cx.arg_x(), cx.result_0(), cx.param_tile());\n    for i in group[0] * tile..((group[0] + 1) * tile).min(cx.dim_n()) {\n        unsafe { output.set([i as usize], x.get([i as usize])) };\n    }\n    let _ = cx.param_unroll();\n}\n";
 
     #[test]
     fn launch_scoped_assets_use_forming_guards_without_tuning_macros() {
@@ -2958,6 +3014,20 @@ mod native_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A CPU function compiled out of line would run without its tier's
+    /// features, so one not declared `#[inline(always)]` is refused.
+    #[test]
+    fn cpu_functions_must_inline_into_their_tier_boundary() {
+        let root = fixture("cpu-inline");
+        let source = root.join("ops.seismic");
+        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cpu from \"native/scale.rs\":\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n").expect("Seismic fixture");
+        fs::create_dir_all(root.join("native")).expect("native directory");
+        fs::write(root.join("native/scale.rs"), "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let i = group[0] as usize;\n    unsafe { cx.result_0().set([i], cx.arg_x().get([i])) };\n}\n").expect("CPU fixture");
+        let error = Build::new("fixture").source(&source).std(false).out_dir(root.join("out")).run().expect_err("an out-of-line function is refused");
+        assert!(error.to_string().contains("`scale` is not declared `#[inline(always)]`"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cuda_assets_admit_tuning_and_scratch_symbols_and_reject_headers() {
         let root = fixture("cuda");
@@ -3020,7 +3090,7 @@ mod native_tests {
         let root = fixture("cpu-host-port");
         let source = root.join("ops.seismic");
         fs::write(&source, "fn scale[N](layout: &host tensor[N] i32, x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cpu from \"native/scale.rs\":\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n").expect("Seismic fixture");
-        fs::write(root.join("native/scale.rs"), "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let i = group[0] as usize;\n    unsafe { cx.result_0().set([i], cx.arg_x().get([i])) };\n}\n").expect("CPU fixture");
+        fs::write(root.join("native/scale.rs"), "#[inline(always)]\nfn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let i = group[0] as usize;\n    unsafe { cx.result_0().set([i], cx.arg_x().get([i])) };\n}\n").expect("CPU fixture");
         let artifacts = Build::new("fixture")
             .source(&source)
             .std(false)

@@ -8,6 +8,7 @@
 use lib::core::{activation, reduce};
 use lib::projection::projection;
 
+#[inline(always)]
 fn stream_mix_down_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -40,6 +41,7 @@ fn stream_mix_down_normalize<L: Isa, E: Elements>(
     }
 }
 
+#[inline(always)]
 fn stream_mix_down_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

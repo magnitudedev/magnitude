@@ -5,6 +5,7 @@
 
 use lib::core::{activation, gathered, reduce};
 
+#[inline(always)]
 fn embedding_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let token = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), cx.dim_f(), |entry, field| {

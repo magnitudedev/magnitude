@@ -12,6 +12,7 @@ use lib::projection::projection;
 use lib::routed::routed;
 use seismic::cpu::Weights;
 
+#[inline(always)]
 fn routed_expand_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -54,6 +55,7 @@ fn routed_expand_stage<L: Isa, E: Elements>(
 /// The rows a gate/up pair takes, the recipe of its `gate` (the entry
 /// declares that the pair shares it): the formed NVFP4 operand rows where it
 /// takes them, else the staged rows.
+#[inline(always)]
 fn rows_for<'a, E: Elements>(cx: &'a Context<'_, E>, gate: &Weights<'_>, m: usize, h: usize) -> &'a [f32] {
     // SAFETY: the stage launch wrote every row before this launch.
     unsafe {
@@ -65,6 +67,7 @@ fn rows_for<'a, E: Elements>(cx: &'a Context<'_, E>, gate: &Weights<'_>, m: usiz
     }
 }
 
+#[inline(always)]
 fn routed_expand_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

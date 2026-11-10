@@ -4,6 +4,7 @@
 
 use lib::core::{activation, gathered};
 
+#[inline(always)]
 fn stored_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let slot = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), cx.dim_f(), |entry, field| {

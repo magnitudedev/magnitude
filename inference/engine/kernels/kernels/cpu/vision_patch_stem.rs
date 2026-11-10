@@ -11,6 +11,7 @@ use lib::core::reduce;
 use lib::projection::projection;
 use lib::vision::vision;
 
+#[inline(always)]
 fn vision_patch_stem_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (c, s, p, h) = (cx.dim_c() as usize, cx.dim_s() as usize, cx.dim_p() as usize, cx.dim_h() as usize);
@@ -41,6 +42,7 @@ fn vision_patch_stem_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     }
 }
 
+#[inline(always)]
 fn vision_patch_stem_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (m, c, s, p, h) =
         (cx.dim_m() as usize, cx.dim_c() as usize, cx.dim_s() as usize, cx.dim_p() as usize, cx.dim_h() as usize);

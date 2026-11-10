@@ -9,6 +9,7 @@
 use lib::core::activation;
 use lib::projection::projection;
 
+#[inline(always)]
 fn attention_project_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -50,6 +51,7 @@ fn attention_project_normalize<L: Isa, E: Elements>(
     );
 }
 
+#[inline(always)]
 fn attention_project_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

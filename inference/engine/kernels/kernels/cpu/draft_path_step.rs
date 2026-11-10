@@ -2,6 +2,7 @@
 // work item per row scores its candidates in order and selects the first
 // highest-scoring one.
 
+#[inline(always)]
 fn draft_path_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (count, rank) = (cx.dim_k() as usize, cx.dim_r() as usize);

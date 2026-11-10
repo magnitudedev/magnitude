@@ -5,6 +5,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn corrector_features<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (count, width) = (cx.dim_k() as usize, cx.dim_h() as usize);

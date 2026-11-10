@@ -46,6 +46,7 @@ fn better(score: f32, token: u32, best: f32, best_token: u32) -> bool {
     best_token == NO_TOKEN || (token != NO_TOKEN && (score > best || (score == best && token < best_token)))
 }
 
+#[inline(always)]
 fn sample_rows_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (part, row) = (group[0] as usize, group[1] as usize);
     let parts = cx.param_parts() as usize;
@@ -82,6 +83,7 @@ fn sample_rows_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
     out.copy_from_slice(&[best.to_bits(), best_token, bad]);
 }
 
+#[inline(always)]
 fn sample_rows_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let parts = cx.param_parts() as usize;

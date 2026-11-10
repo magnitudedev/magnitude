@@ -7,6 +7,7 @@
 
 use lib::projection::projection;
 
+#[inline(always)]
 fn project_rows_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (row, g) = (group[0] as usize, group[1] as usize);
     let (m, k) = (cx.dim_m() as usize, cx.dim_k() as usize);
@@ -29,6 +30,7 @@ fn project_rows_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     projection::operand_row(&[&cx.arg_weight()], staged);
 }
 
+#[inline(always)]
 fn project_rows_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, k, n) = (cx.dim_m() as usize, cx.dim_k() as usize, cx.dim_n() as usize);
     let g = group[1] as usize;

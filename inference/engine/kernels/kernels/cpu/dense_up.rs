@@ -7,6 +7,7 @@
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn dense_up_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -31,6 +32,7 @@ fn dense_up_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     projection::operand_row(&[&cx.arg_up_weight()], normalized);
 }
 
+#[inline(always)]
 fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (o, h, f) = (cx.dim_o() as usize, cx.dim_h() as usize, cx.dim_f() as usize);
     let rows = projection::item_rows(group[0], cx.param_rows(), f);

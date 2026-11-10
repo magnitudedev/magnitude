@@ -17,6 +17,7 @@ use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
 
+#[inline(always)]
 fn routed_experts_grids<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let items = |extent: u64| extent.div_ceil(cx.param_rows()) as usize;
     routed::expert_grids(
@@ -29,6 +30,7 @@ fn routed_experts_grids<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group:
     );
 }
 
+#[inline(always)]
 fn routed_experts_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -55,6 +57,7 @@ fn routed_experts_stage<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_expert_gate(), &cx.arg_expert_up()], staged);
 }
 
+#[inline(always)]
 fn routed_experts_expand<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -110,6 +113,7 @@ fn routed_experts_expand<L: Isa, E: Elements>(
     }
 }
 
+#[inline(always)]
 fn routed_experts_quantize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -139,6 +143,7 @@ fn routed_experts_quantize<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_expert_down()], product);
 }
 
+#[inline(always)]
 fn routed_experts_down<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

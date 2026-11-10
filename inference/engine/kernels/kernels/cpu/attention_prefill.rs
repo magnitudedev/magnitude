@@ -6,9 +6,10 @@
 // span) for the kv head's G query heads and stores their gated outputs.
 
 use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
-use lib::core::{activation, spans};
+use lib::core::spans;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
     Form::new(
         cx.dim_kv(),
@@ -28,6 +29,7 @@ fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
     .with_key_rounding(cx.dim_kr(), cx.arg_key_block(), cx.arg_key_element(), cx.arg_key_scale(), cx.arg_key_amax_floor())
 }
 
+#[inline(always)]
 fn attention_prefill_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let form = form(cx);
@@ -86,7 +88,8 @@ fn attention_prefill_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gr
     }
 }
 
-fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
+#[inline(always)]
+fn attention_prefill_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (row, kv_head) = (group[0] as usize, group[1] as usize);
     let form = form(cx);
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
@@ -100,12 +103,12 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let fresh = if form.fresh { (fresh.get([row, 0]), fresh.get([row, 1])) } else { (0, 0) };
     let range = 0..attention::total(spans.clone(), fresh);
     let turning = 2 * form.heads.p * usize::from(form.output_rotary);
-    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + w + turning);
+    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + attention::work(w, false) + turning);
     let (maximum, work) = work.split_at_mut(g);
     let (denominator, work) = work.split_at_mut(g);
     let (accumulator, work) = work.split_at_mut(g * w);
     let (scores, work) = work.split_at_mut(g * BLOCK);
-    let (key_row, angles) = work.split_at_mut(w);
+    let (work, angles) = work.split_at_mut(attention::work(w, false));
     let mut state = Online { maximum, denominator, accumulator };
     state.reset();
     // SAFETY: the prepare launch wrote every row before this launch.
@@ -125,33 +128,35 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let selection = cx.arg_selection();
     let bitmap: &[u32] = if cx.dim_b() == 0 { &[] } else { selection.row([row, 0]) };
     let block_rows = cx.dim_br() as i32;
-    attention::attend_rows(
+    let history = (attention::history_rows(&history_key, kv_head), attention::history_rows(history_value, kv_head));
+    let batch = (attention::batch_rows(keys, kv, kv_head, w), attention::batch_rows(values, kv, kv_head, w));
+    attention::attend(
+        l,
         &mut state,
         queries,
         cx.arg_scale(),
         scores,
-        key_row,
+        work,
         spans,
         fresh,
         range,
         |ordinal| attention::selected(bitmap, block_rows, ordinal),
-        |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
-        |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
-        |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
-        |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
+        (&history.0, &history.1),
+        (&batch.0, &batch.1),
     );
     // The index-list source's picks, after the row's keys.
     let picks = cx.dim_ks() as usize;
     if picks > 0 {
         let selected = SlabTensor::from_bound(cx.arg_selected(), cx.arg_selected_slab_rows() as usize);
-        attention::attend_picks(
+        attention::attend_picks::<_, E::A>(
+            l,
             &mut state,
             queries,
             cx.arg_scale(),
             scores,
-            key_row,
+            work,
             cx.arg_selected_rows().row([row, 0]),
-            |pick, out| activation::widen::<E::A>(selected.row([pick, kv_head, 0]), out),
+            |pick| selected.row([pick, kv_head, 0]),
         );
     }
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());

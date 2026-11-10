@@ -28,6 +28,7 @@ enum Scale {
 
 impl Element {
     /// Mantissa bits, smallest normal exponent and largest code.
+    #[inline(always)]
     fn codes(self) -> (u32, i32, f32) {
         match self {
             Self::E4M3 => (3, -6, 448.0),
@@ -39,6 +40,7 @@ impl Element {
 impl Rounding {
     /// The rounding of an entry's four scalars: `None` for `block` 0.
     /// Admission forms only the codes `rounding.seismic` defines.
+    #[inline(always)]
     pub fn of(block: i32, element: i32, scale: i32, amax_floor: f32) -> Option<Self> {
         if block == 0 {
             return None;
@@ -59,6 +61,7 @@ impl Rounding {
 
     /// `row` rounded in place, run by run; its length is a multiple of the
     /// run.
+    #[inline(always)]
     pub fn apply(self, row: &mut [f32]) {
         assert_eq!(row.len() % self.block, 0, "a rounded row holds whole runs");
         let (mantissa, min_exponent, max) = self.element.codes();
@@ -73,6 +76,7 @@ impl Rounding {
         }
     }
 
+    #[inline(always)]
     fn scale(self, amax: f32, max: f32) -> f32 {
         let a = amax.max(self.amax_floor);
         match self.scale {

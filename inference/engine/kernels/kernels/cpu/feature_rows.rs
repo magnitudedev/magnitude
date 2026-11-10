@@ -3,6 +3,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn feature_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let source = cx.arg_out_rows().get([row]) as usize;

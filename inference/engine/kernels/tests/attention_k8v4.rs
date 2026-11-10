@@ -4412,3 +4412,42 @@ fn actual_gemma_sequential_publication_matches_batch() {
         "actual sequential publication differs from batch; see per-plane diagnostics"
     );
 }
+
+/// LFM2.5-2.6B's attention: eight kv heads of four query heads, 64 columns.
+const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
+
+/// The CPU's vector tier against its portable tier over affine history, bit
+/// for bit: x86-64-v2 runs the portable body (each row decoded into scratch
+/// by the portable `affine_decode`, the body every x86 tier ran before the
+/// vector body), the detected tier the vector body. PARTS 1, 8 and 16,
+/// histories of 17, 77 and 1000 keys (none a whole number of 32-key blocks)
+/// across 48-row slabs, and query groups of 2, 4 and 12.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn cpu_vector_tier_matches_portable_tier() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for (geometry, base) in [(GROUPED, 5), (SLICED, 65), (LFM, 988)] {
+        // Whole 48-row slabs past every row's destination.
+        let history_rows = (base as usize + 64).next_multiple_of(48);
+        let encoded = Encoded::new(Case::new(geometry, history_rows, 2, &decode_rows(base), 37));
+        for parts in [1, 8, 16] {
+            let run = |tier: u64| {
+                let kernel = decode_kernel(&device, geometry, &[("PARTS", parts), ("cpu.tier", tier)]);
+                let mut bound = Bound::new_with_slab_rows(&device, &encoded, 48, false);
+                let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+                gated.read_to_host().unwrap()
+            };
+            // Tier 0 is the detected tier; 1 names x86-64-v2.
+            assert!(
+                run(0) == run(1),
+                "KV {} G {} W {} PARTS {parts}: the vector tier differs from the portable tier",
+                geometry.kv,
+                geometry.g,
+                geometry.w()
+            );
+        }
+    }
+}

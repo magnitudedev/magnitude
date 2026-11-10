@@ -9,6 +9,7 @@ use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
 use lib::core::spans;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
     Form::new(
         cx.dim_kv(),
@@ -28,6 +29,7 @@ fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
     .affine()
 }
 
+#[inline(always)]
 fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let form = form(cx);
@@ -83,24 +85,25 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
             // SAFETY: destinations are distinct, freshly reserved history rows
             // no row of the call reads.
             unsafe {
-                attention::affine_encode(
+                attention::store_affine_head(
                     &keys[head * w..][..w],
-                    (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    key_codes.row_mut([destination, head, 0]),
-                    key_coefficients.row_mut([destination, head, 0]),
-                );
-                attention::affine_encode(
                     &values[head * w..][..w],
-                    (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    value_codes.row_mut([destination, head, 0]),
-                    value_coefficients.row_mut([destination, head, 0]),
+                    (
+                        (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                        (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    ),
+                    (&key_codes, &key_coefficients),
+                    (&value_codes, &value_coefficients),
+                    destination,
+                    head,
                 );
             }
         }
     }
 }
 
-fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
+#[inline(always)]
+fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (row, kv_head) = (group[0] as usize, group[1] as usize);
     let form = form(cx);
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
@@ -114,12 +117,12 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
     let fresh = if form.fresh { (fresh.get([row, 0]), fresh.get([row, 1])) } else { (0, 0) };
     let range = 0..attention::total(spans.clone(), fresh);
     let turning = 2 * form.heads.p * usize::from(form.output_rotary);
-    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + w + turning);
+    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + attention::work(w, true) + turning);
     let (maximum, work) = work.split_at_mut(g);
     let (denominator, work) = work.split_at_mut(g);
     let (accumulator, work) = work.split_at_mut(g * w);
     let (scores, work) = work.split_at_mut(g * BLOCK);
-    let (key_row, angles) = work.split_at_mut(w);
+    let (work, angles) = work.split_at_mut(attention::work(w, true));
     let mut state = Online { maximum, denominator, accumulator };
     state.reset();
     // SAFETY: the prepare launch wrote every row before this launch.
@@ -143,34 +146,24 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
     let selection = cx.arg_selection();
     let bitmap: &[u32] = if cx.dim_b() == 0 { &[] } else { selection.row([row, 0]) };
     let block_rows = cx.dim_br() as i32;
-    attention::attend_rows(
+    let history = (
+        attention::affine_rows::<8, _>(&key_codes, &key_coefficients, kv_head),
+        attention::affine_rows::<4, _>(&value_codes, &value_coefficients, kv_head),
+    );
+    let batch = (attention::batch_rows(keys, kv, kv_head, w), attention::batch_rows(values, kv, kv_head, w));
+    attention::attend(
+        l,
         &mut state,
         queries,
         cx.arg_scale(),
         scores,
-        key_row,
+        work,
         spans,
         fresh,
         range,
         |ordinal| attention::selected(bitmap, block_rows, ordinal),
-        |token, out| {
-            attention::affine_decode(
-                key_codes.row([token, kv_head, 0]),
-                key_coefficients.row([token, kv_head, 0]),
-                (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                out,
-            )
-        },
-        |token, out| {
-            attention::affine_decode(
-                value_codes.row([token, kv_head, 0]),
-                value_coefficients.row([token, kv_head, 0]),
-                (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                out,
-            )
-        },
-        |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
-        |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
+        (&history.0, &history.1),
+        (&batch.0, &batch.1),
     );
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());
     let softplus = cx.arg_gate_function() != 0;

@@ -9,6 +9,7 @@
 use lib::core::{activation, gathered};
 use lib::projection::projection;
 
+#[inline(always)]
 fn draft_rows_join<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -57,6 +58,7 @@ fn draft_rows_join<L: Isa, E: Elements>(
     }
 }
 
+#[inline(always)]
 fn draft_rows_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

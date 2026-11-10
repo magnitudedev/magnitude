@@ -1029,34 +1029,26 @@ native attention_decode for vulkan from "vulkan/attention_decode.comp":
         threadgroups (M, KV * G, 1)
         threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
 
-# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, and the
-# keys and values of a layer with fresh rows, into F32 scratch; the K/V
-# append), `attend` per (kv head, partition, row) over partitions of max(128,
-# ceil(keys / PARTS)) keys, `merge` per row (the fixed-order partition merge
-# and the output gates). A row's keys absorb in blocks at fixed positions of
-# its key sequence, history and fresh keys alike, so its result is bit for
-# bit the same whatever rows share its launch, as Metal's one-row forms.
+# CPU (`cpu/lib/attention/attention.rs`): one launch, `attend` per (kv head,
+# partition, row): the item prepares its queries and the keys and values of the
+# rows it reads into its own shared bytes (part 0 appends the row's K/V), absorbs
+# its partition of max(128, ceil(keys / PARTS)) keys, and the last item of its
+# (kv head, row) to arrive (`arrivals`) runs the fixed-order partition merge and
+# the output gates of its G query heads. A row's keys absorb in blocks at fixed
+# positions of its key sequence, history and fresh keys alike, so its result is
+# bit for bit the same whatever rows share its launch, as Metal's one-row forms.
+#
 native attention_decode for cpu from "cpu/attention_decode.rs":
     static (P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1
-    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
-    scratch keys bytes (M * KV * (2 * P + S) * 4)
-    scratch values bytes (M * KV * (2 * P + S) * 4)
     scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * PARTS * G * 8)
-    launch attention_decode_prepare:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (P * 8)
+    scratch arrivals bytes (M * KV * 4) sync
     launch attention_decode_attend:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((G * 32 + 2 * P + S) * 4)
-    launch attention_decode_merge:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((G * 32 + 2 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 
 
 # Prefill rows (M >= 16). L1 prepares queries, and for a layer with fresh rows
@@ -1713,30 +1705,21 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CPU: the dense CPU decode's launches; `prepare` appends encoded rows and
-# `attend` decodes history keys and values (F32) as it absorbs them. W is
-# whole affine groups.
+# CPU: the dense CPU decode's launch: `attend` prepares its own queries, keys
+# and values, part 0 appends the encoded row, and it decodes history keys and
+# values (F32) as it absorbs them; the last item of a (kv head, row) to arrive
+# merges. W is whole affine groups.
 native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
-    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
-    scratch keys bytes (M * KV * (2 * P + S) * 4)
-    scratch values bytes (M * KV * (2 * P + S) * 4)
     scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * PARTS * G * 8)
-    launch attention_decode_k8v4_prepare:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (P * 8)
+    scratch arrivals bytes (M * KV * 4) sync
     launch attention_decode_k8v4_attend:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((G * 32 + 2 * P + S) * 4)
-    launch attention_decode_k8v4_merge:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((G * 32 + 4 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 
 # Metal: `attention_prefill`'s launches and forms. DIRECT reads the listed
 # history tiles decoded to F16, in rounds of a `decode` and an attend launch.
@@ -1939,7 +1922,7 @@ native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
     launch attention_prefill_k8v4_attend:
         threadgroups (M, KV, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 3 * (2 * P + S) + 2 * P * RO) * 4)
 
 
 

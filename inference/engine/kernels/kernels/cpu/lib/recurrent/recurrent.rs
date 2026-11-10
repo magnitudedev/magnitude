@@ -279,6 +279,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
     /// (the C - 1 raw rows before its publication row, then the raw rows of
     /// its tape): its value channels and the q/k channels of the key heads
     /// congruent to it modulo NV. A bit-exact copy.
+    #[inline(always)]
     pub fn publish_window(&self, slot: &Slot, head: usize) {
         let (w, nk, nv) = (self.width, self.key_heads, self.value_heads);
         let last = self.taps - 1;
@@ -308,6 +309,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
 
     /// Zeroes state rows `rows` of value head `head` in the raw rows no slot
     /// covers.
+    #[inline(always)]
     pub fn zero_uncovered(&self, head: usize, rows: Range<usize>) {
         for row in self.covered_end()..self.rows {
             // SAFETY: each work item writes its own state rows of the head.
@@ -319,6 +321,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
     /// head RMS-normalized over W with `epsilon` and scaled by the recurrent
     /// norm (`norm`, decoded; A), times the output gate of z (A; code
     /// `gate_function`), published to A in `gated`. `values` holds W floats.
+    #[inline(always)]
     pub fn gate_row(
         &self,
         row: usize,
@@ -367,6 +370,7 @@ impl<'a, A: Dense> Recurrence<'a, A> {
     /// the rows after it recorded in the successor's tape. The work item of
     /// the head's first state rows records the decay and, when the head is
     /// its key head's recorder, the key.
+    #[inline(always)]
     pub fn advance<P: Prologue>(&self, slot: &Slot, head: usize, rows: Range<usize>, state: &mut [f32], prologue: &mut P) {
         let w = self.width;
         let key_head = self.key_head(head);
@@ -448,6 +452,7 @@ pub struct Fused<'r, 'a, A: Dense> {
 
 impl<'r, 'a, A: Dense> Fused<'r, 'a, A> {
     /// Over `buffers` of at least `2 * W + rows.len()` floats.
+    #[inline(always)]
     pub fn new(recurrence: &'r Recurrence<'a, A>, slot: Slot, head: usize, rows: Range<usize>, buffers: &'r mut [f32]) -> Self {
         let w = recurrence.width;
         let (query, rest) = buffers.split_at_mut(w);
@@ -484,6 +489,7 @@ pub struct Staged<'s> {
 }
 
 impl<'s> Staged<'s> {
+    #[inline(always)]
     pub fn new<A: Dense>(recurrence: &Recurrence<'_, A>, staged: &'s [f32], head: usize, rows: Range<usize>) -> Self {
         Self {
             staged,

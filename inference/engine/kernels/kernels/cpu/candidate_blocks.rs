@@ -3,6 +3,7 @@
 // listed scores, the newest block +inf, -inf past the row's blocks; and
 // writes its block list.
 
+#[inline(always)]
 fn candidate_blocks<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (n, nb, bu) = (cx.dim_n() as usize, cx.dim_nb() as usize, cx.dim_bu() as usize);

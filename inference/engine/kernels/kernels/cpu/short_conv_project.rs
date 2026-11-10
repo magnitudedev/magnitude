@@ -7,6 +7,7 @@
 
 use lib::projection::projection;
 
+#[inline(always)]
 fn short_conv_project_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -38,6 +39,7 @@ fn short_conv_project_normalize<L: Isa, E: Elements>(
     );
 }
 
+#[inline(always)]
 fn short_conv_project_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

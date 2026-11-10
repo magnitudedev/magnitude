@@ -8,6 +8,7 @@
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn dense_expand_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -42,6 +43,7 @@ fn dense_expand_normalize<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_gate_weight(), &cx.arg_up_weight()], normalized);
 }
 
+#[inline(always)]
 fn dense_expand_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

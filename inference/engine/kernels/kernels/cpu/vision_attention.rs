@@ -10,6 +10,7 @@
 use lib::core::activation;
 use lib::vision::vision;
 
+#[inline(always)]
 fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (kv_heads, p) = (cx.dim_kv() as usize, cx.dim_p() as usize);
@@ -55,6 +56,7 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     }
 }
 
+#[inline(always)]
 fn vision_attention_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (row, head) = (group[0] as usize, group[1] as usize);
     let (m, kv_heads, grouped, p) =

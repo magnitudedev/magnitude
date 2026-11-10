@@ -8,6 +8,7 @@
 use lib::core::{activation, functions};
 use lib::projection::projection;
 
+#[inline(always)]
 fn per_layer_gate_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let d = cx.dim_d() as usize;
@@ -31,6 +32,7 @@ fn per_layer_gate_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
     projection::operand_row(&[&cx.arg_gate_weight()], staged);
 }
 
+#[inline(always)]
 fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, d, p) = (cx.dim_m() as usize, cx.dim_d() as usize, cx.dim_p() as usize);
     let rows = projection::item_rows(group[0], cx.param_rows(), p);

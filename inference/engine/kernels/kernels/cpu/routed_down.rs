@@ -9,6 +9,7 @@ use lib::core::activation;
 use lib::projection::projection;
 use lib::routed::routed;
 
+#[inline(always)]
 fn routed_down_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (k, f) = (cx.dim_k() as usize, cx.dim_f() as usize);
@@ -34,6 +35,7 @@ fn routed_down_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
     }
 }
 
+#[inline(always)]
 fn routed_down_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, k, f) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_k() as usize, cx.dim_f() as usize);
     let row = group[1] as usize;

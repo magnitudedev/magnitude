@@ -1,4 +1,5 @@
 // One work item per `ROWS` rows.
+#[inline(always)]
 fn scale_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let x = cx.arg_x();
     let result = cx.result_0();

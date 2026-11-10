@@ -9,6 +9,7 @@
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn readout_selected_rows_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -43,6 +44,7 @@ fn readout_selected_rows_normalize<L: Isa, E: Elements>(
     projection::operand_row(&[&cx.arg_weight()], normalized);
 }
 
+#[inline(always)]
 fn readout_selected_rows_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

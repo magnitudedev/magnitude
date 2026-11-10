@@ -2,6 +2,7 @@
 // work item per slot walks its lattice greedily, each mask row selecting the
 // first best-scoring candidate after the previous row's selection.
 
+#[inline(always)]
 fn corrector_path<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let slot = group[0] as usize;
     let (count, steps) = (cx.dim_k() as usize, cx.dim_p() as usize);
