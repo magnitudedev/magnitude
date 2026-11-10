@@ -25,6 +25,12 @@ function Status({ tone = "muted", busy = false, title, children }: { tone?: "mut
   </span>
 }
 
+/** What finds a model's other quants on Hugging Face: its repository's name without owner or `-GGUF`, else its name. */
+const quantSearch = (view: OwnedModel) => {
+  const repository = view.quant.repository?.split("/").pop()?.replace(/[-_.]?gguf$/i, "")
+  return repository && repository.length > 0 ? repository : view.name
+}
+
 /** Models: the machine, then the user's models, with Explore models for finding more. */
 export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void }) {
   const client = useAgentClient()
@@ -96,6 +102,6 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
     {owned.length === 0 && models.value.unsupported.length === 0
       ? <div className={cn("mt-8 rounded-xl border border-slate-200 bg-white px-5 py-6 text-[13px] text-slate-500 dark:border-slate-750 dark:bg-slate-850")}>No models yet. <button type="button" onClick={() => onExplore("")} className="text-blue-700 hover:underline dark:text-blue-400">Explore models</button> to download one.</div>
       : <YourModels models={owned} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
-        onExploreQuants={view => onExplore(view.name)} onRemove={remove} onAddDrafter={addDrafter} />}
+        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onAddDrafter={addDrafter} />}
   </div>
 }

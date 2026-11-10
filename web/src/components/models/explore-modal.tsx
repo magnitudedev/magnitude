@@ -95,7 +95,11 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
           <p className="mb-3 text-xs font-medium text-slate-500">Results on Hugging Face ({results.models.length})</p>
-          {results.models.length > 0 ? <div className="space-y-2">{results.models.map(model => card(model))}</div> : results.more === null && <p className="max-w-lg text-[13px] text-slate-500">Nothing here runs in Magnitude. {runnableSummary(families)}</p>}
+          {results.models.length > 0
+            ? <div className="space-y-2">{results.models.map(model => card(model))}</div>
+            : results.more === null && <p className="max-w-lg text-[13px] text-slate-500">
+              {results.unrunnable.length > 0 || results.unchecked.length > 0 ? "None of these run in Magnitude." : `No GGUF models on Hugging Face match “${query.trim()}”.`} {runnableSummary(families)}
+            </p>}
           {results.more === "Loading" ? <div className="mt-2"><OfferedModelsSkeleton count={2} /></div>
             : results.more && <NextPage onReach={results.more} />}
           <Unrunnable files={results.unchecked} title="Couldn’t check in time" />
