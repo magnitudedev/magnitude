@@ -4658,7 +4658,7 @@ impl Drop for Pulse {
     }
 }
 
-/// One routed tensor of the 35B experts as a Q4_K_M GGUF stores it: the
+/// One routed tensor of a model's experts as its GGUF stores it: the
 /// stored (GGUF) and resident elements and the [rows, columns] of a matrix.
 #[derive(Clone, Copy)]
 struct StreamedKind {
@@ -4684,6 +4684,18 @@ impl StreamedKind {
         .map(|(source, resident, matrix)| Self {
             source: seismic::Element::named(source).unwrap(),
             resident: element_in(resident, layout),
+            matrix,
+        })
+    }
+
+    /// DeepSeek V4.1's MXFP4 gate (and up, the same form) and down, at its
+    /// row bytes (160 packets of 17 bytes, 2720, and 72, 1224) over 133 and
+    /// 139 rows: nine row tiles each, the last partial.
+    fn v41_mxfp4(device: &seismic::Device) -> [Self; 2] {
+        let layout = resident_layout(device);
+        [[133, 160 * 32], [139, 72 * 32]].map(|matrix| Self {
+            source: seismic::Element::named("gguf_mxfp4").unwrap(),
+            resident: element_in("mxfp4g32", layout),
             matrix,
         })
     }
@@ -6094,27 +6106,48 @@ fn streaming_move_moves_the_listed_records_byte_for_byte() {
 
 /// On every backend that streams, `routed_convert` converts the listed
 /// conveyor records byte-equal to a resident import, at the 35B's record
-/// forms: the conveyor a view at an offset into a larger stored tensor (as
-/// lent bank records are); an entry past the count is skipped; a list for
-/// another step converts nothing.
+/// forms (`assert_conveyor_converts`).
 #[test]
 fn streaming_conveyor_records_convert_like_a_resident_import() {
     let Some(device) = streaming_device() else {
         return;
     };
+    let kinds = StreamedKind::qwen35b(&device);
+    assert_conveyor_converts(&device, RECORD_FORMS.map(|form| (kinds[form], form)));
+}
+
+/// On every backend that streams, `routed_convert` converts DeepSeek V4.1's
+/// MXFP4 records (17-byte packets) byte-equal to a resident import
+/// (`assert_conveyor_converts`): gate/up rows of 2720 bytes and down rows of
+/// 1224 bytes (8 off 16), each record of nine row tiles, the last partial (a
+/// row count no multiple of 16), so every other down record starts 8 bytes
+/// off 16-byte alignment, and a down record's last row tile ends so.
+#[test]
+fn streaming_mxfp4_records_convert_like_a_resident_import() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let kinds = StreamedKind::v41_mxfp4(&device);
+    assert_conveyor_converts(&device, [(kinds[0], 0), (kinds[1], 2)]);
+}
+
+/// `routed_convert` converts the listed conveyor records of each (kind,
+/// form) byte-equal to a resident import: the conveyor a view at an offset
+/// into a larger stored tensor (as lent bank records are); an entry past
+/// the count is skipped; a list for another step converts nothing.
+fn assert_conveyor_converts<const KINDS: usize>(device: &seismic::Device, kinds: [(StreamedKind, usize); KINDS]) {
     let (v, s) = CONVEYOR_RECORDS;
     let (pairs, count) = conveyor_list();
-    let step = streaming_step(&device);
-    for form in RECORD_FORMS {
-        let kind = StreamedKind::qwen35b(&device)[form];
+    let step = streaming_step(device);
+    for (kind, form) in kinds {
         let stored = (0..v).map(|pattern| kind.stored(pattern as usize, form)).collect::<Vec<_>>();
         // The conveyor's records sit at [1, 1 + V) of a larger stored tensor.
-        let lent = kind.tensor(&device, kind.source, v + 2, |record| {
+        let lent = kind.tensor(device, kind.source, v + 2, |record| {
             (1..=v as usize).contains(&record).then(|| stored[record - 1].as_slice())
         });
         let conveyor = lent.slice_leading(1, 1 + v).unwrap();
         let convert = routed_convert::native_for_device_with(
-            &device,
+            device,
             routed_convert::Elements {
                 ST: kind.source,
                 U: kind.resident,
@@ -6125,15 +6158,15 @@ fn streaming_conveyor_records_convert_like_a_resident_import() {
         for (sequence, converted) in [(STREAMING_SEQUENCE, true), (STREAMING_SEQUENCE - 1, false)] {
             let label = format!("{} -> {}, converted {converted}", kind.source.name(), kind.resident.name());
             let list = list_words(sequence, count, &pairs, pairs.len());
-            let mut scratch = kind.tensor(&device, kind.resident, s, |_| None);
+            let mut scratch = kind.tensor(device, kind.resident, s, |_| None);
             convert
                 .call(routed_convert::Args {
                     conveyor: &conveyor,
-                    list: &shared_i32(&device, &[list.len() as u64], &list),
+                    list: &shared_i32(device, &[list.len() as u64], &list),
                     step: &step,
                     destination: &mut scratch,
                     // One threadgroup striding over every listed record's items.
-                    grid: &i32_tensor(&device, &[3], &[1, 1, 1]),
+                    grid: &i32_tensor(device, &[3], &[1, 1, 1]),
                 })
                 .unwrap();
             assert_conveyor_scratch(&kind, form, &scratch.read_to_host().unwrap(), converted, &label);
