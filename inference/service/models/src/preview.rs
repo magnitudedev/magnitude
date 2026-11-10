@@ -188,7 +188,15 @@ impl HuggingFaceDiscovery {
                 let shape_ms = shape.elapsed().as_millis();
                 let recommend = std::time::Instant::now();
                 if result.unsupported.is_empty() {
-                    result.recommended = self.recommended_version(&result).await;
+                    match self.recommended_version(&result).await {
+                        crate::search_shape::SearchRecommendation::Version(version) => {
+                            result.recommended = Some(version);
+                        }
+                        crate::search_shape::SearchRecommendation::Unsupported(reasons) => {
+                            result.unsupported = reasons;
+                        }
+                        crate::search_shape::SearchRecommendation::Unknown => {}
+                    }
                 }
                 tracing::debug!(repository = %result.repository, shape_ms, recommend_ms = recommend.elapsed().as_millis(), found = result.recommended.is_some(), "search result");
                 Some(result)
@@ -278,12 +286,12 @@ impl HuggingFaceDiscovery {
         true
     }
 
-    /// The version inspection recommends of `result`'s repository at its commit; none when it
-    /// can't be inspected within [`RECOMMENDATION_TIMEOUT`].
+    /// What search shows of `result`'s versions at its commit; unknown when they can't be
+    /// assessed within [`RECOMMENDATION_TIMEOUT`].
     async fn recommended_version(
         &self,
         result: &HuggingFaceModelSearchResult,
-    ) -> Option<HuggingFaceRecommendedVersion> {
+    ) -> crate::search_shape::SearchRecommendation {
         let inspect = self
             .recommendations
             .recommended_version(result.repository.clone(), result.commit.clone());
@@ -292,8 +300,7 @@ impl HuggingFaceDiscovery {
             .map_err(|_| {
                 tracing::debug!(repository = %result.repository, "search recommendation timed out");
             })
-            .ok()
-            .flatten()
+            .unwrap_or(crate::search_shape::SearchRecommendation::Unknown)
     }
 }
 
@@ -2119,7 +2126,7 @@ fn classification_evidence(
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
     format!(
-        "candidate-classification-v7:{}:{digest}:{}",
+        "candidate-classification-v8:{}:{digest}:{}",
         crate::gguf::RULES,
         architectures.key()
     )
@@ -4064,7 +4071,7 @@ mod tests {
             NoRefusals::new(),
             CatalogLineage::new(Arc::clone(&store), catalog),
             StubCatalog::empty(),
-            Arc::new(StubRecommendations(Some(recommended.clone()))),
+            Arc::new(StubRecommendations(crate::search_shape::SearchRecommendation::Version(recommended.clone()))),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
@@ -4148,13 +4155,13 @@ mod tests {
 
     /// Recommendations of one fixed version for every repository; the inspection that chooses
     /// them is the server's, tested there.
-    struct StubRecommendations(Option<HuggingFaceRecommendedVersion>);
+    struct StubRecommendations(crate::search_shape::SearchRecommendation);
 
     struct NoRecommendations;
 
     impl NoRecommendations {
         fn new() -> Arc<dyn RecommendedVersions> {
-            Arc::new(StubRecommendations(None))
+            Arc::new(StubRecommendations(crate::search_shape::SearchRecommendation::Unknown))
         }
     }
 
@@ -4163,7 +4170,7 @@ mod tests {
             &self,
             _: String,
             _: String,
-        ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>> {
+        ) -> BoxFuture<'_, crate::search_shape::SearchRecommendation> {
             Box::pin(async move { self.0.clone() })
         }
     }

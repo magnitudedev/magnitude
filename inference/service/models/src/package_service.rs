@@ -1068,7 +1068,7 @@ impl ManagedModelStore {
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
             serde_json::to_vec(&(
-                "gguf-inspection-v9",
+                "gguf-inspection-v10",
                 crate::gguf::RULES,
                 content,
                 path.metadata().ok()?.len(),

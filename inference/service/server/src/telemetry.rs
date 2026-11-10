@@ -462,11 +462,8 @@ mod tests {
             &self,
             _: String,
             _: String,
-        ) -> futures_util::future::BoxFuture<
-            '_,
-            Option<magnitude_service_contracts::HuggingFaceRecommendedVersion>,
-        > {
-            Box::pin(async { None })
+        ) -> futures_util::future::BoxFuture<'_, magnitude_service_models::SearchRecommendation> {
+            Box::pin(async { magnitude_service_models::SearchRecommendation::Unknown })
         }
     }
 

@@ -26,10 +26,12 @@ use magnitude_service_contracts::models::{
     CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
     DrafterCandidatesResponse, DrafterCategory, DrafterChoice, DrafterLineage, DrafterReference,
     DrafterVerdict, HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
+    ModelPerformance, ModelResidency,
     ModelAssessmentSubject, ModelCandidate, ModelCandidates, ModelFileRole, ModelFingerprint,
     ModelDeveloper, ModelId, ModelPackage, ModelPackageSource, ParsedModelId, ServableModelBundle, ServingProfile,
     SpeculativeDraftSource, SpeculativeMethod,
 };
+use magnitude_service_models::SearchRecommendation;
 use magnitude_service_contracts::{
     ComponentRole, ContentIdentity, HuggingFaceRecommendedVersion, HuggingFaceRepositoryFile,
     HuggingFaceRepositoryRequest,
@@ -1437,18 +1439,17 @@ impl ManagedModelCandidates {
     }
 
     /// The version a repository's inspection would recommend, assessing only what that choice
-    /// needs. The recommended version is the fitting one served at a working context, preferring
-    /// Q4_K-class quantizations, then the largest (`recommended_version`). So versions are
-    /// assessed in that order (Q4_K-class by name first, each set largest first), a batch at a
+    /// needs. The recommended version is the largest that fits, served at a working context, that
+    /// keeps up (`recommended_version`). So versions are assessed largest first, a batch at a
     /// time in parallel, and the search stops at the first batch whose best version is served at
-    /// a working context: no version later in the order can beat it. A repository whose versions
-    /// all fit only below a working context is assessed whole. Drafters aren't composed: the
-    /// verdict is the target's own.
+    /// a working context and keeps up: every version after it is smaller. A repository none of
+    /// whose versions keeps up is assessed whole. Drafters aren't composed: the verdict is the
+    /// target's own.
     async fn search_recommendation(
         &self,
         repository: &HuggingFaceRepositoryId,
         commit: &str,
-    ) -> Result<Option<HuggingFaceRecommendedVersion>, InventoryError> {
+    ) -> Result<SearchRecommendation, InventoryError> {
         let started = std::time::Instant::now();
         let snapshot = self.snapshot(repository.as_str(), commit).await?;
         let snapshot_ms = started.elapsed().as_millis();
@@ -1460,13 +1461,19 @@ impl ManagedModelCandidates {
                 size_bytes: file.size_bytes,
             })
             .collect::<Vec<_>>();
-        let mut order = group_ggufs(&files)
+        let groups = group_ggufs(&files);
+        // The projector a download brings along, by name: the smallest, as inspection's choice is.
+        let projector_bytes = groups
+            .iter()
+            .filter(|group| is_projector_name(&group.primary().path))
+            .map(GgufGroup::size_bytes)
+            .min()
+            .unwrap_or(0);
+        let mut order = groups
             .into_iter()
             .filter(|group| !is_projector_name(&group.primary().path))
             .collect::<Vec<_>>();
-        let named_q4_k =
-            |group: &GgufGroup| is_q4_k_class(&version_label(&group.primary().path, None));
-        order.sort_by_key(|group| (!named_q4_k(group), std::cmp::Reverse(group.size_bytes())));
+        order.sort_by_key(|group| std::cmp::Reverse(group.size_bytes()));
         let mut assessed: Vec<(ClassifiedGroup, Option<CachedModelAssessment>)> = Vec::new();
         for batch in order.chunks(SEARCH_RECOMMENDATION_BATCH) {
             let checks = batch.iter().cloned().map(|group| async {
@@ -1500,10 +1507,14 @@ impl ManagedModelCandidates {
             let best = recommended_version(
                 assessed.iter().map(|(group, assessment)| (group, assessment.as_ref())),
             );
+            // Largest first: once the best so far is served at a working context and keeps up,
+            // every version not yet assessed is smaller, so none can beat it.
             let settled = best.is_some_and(|index| {
                 matches!(
                     assessed[index].1.as_ref().map(|assessment| &assessment.profile),
-                    Some(ModelAssessment::Fits { profile, served, .. }) if working_context(profile, served)
+                    Some(ModelAssessment::Fits { profile, served, residency, .. })
+                        if working_context(profile, served)
+                            && comparison_speed(served, residency).is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND)
                 )
             });
             if settled {
@@ -1529,18 +1540,43 @@ impl ManagedModelCandidates {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(candidate_versions(versions, None)
-            .into_iter()
+        let versions = candidate_versions(versions, Some(projector_bytes));
+        let shown = versions
+            .iter()
             .find(|version| version.recommended)
-            .and_then(|version| {
-                Some(HuggingFaceRecommendedVersion {
-                    label: version.label,
-                    model_id: version.model_id,
+            .or_else(|| {
+                // Nothing fits: the smallest version that would run, with what it needs.
+                versions
+                    .iter()
+                    .filter(|version| matches!(version.assessment, Some(ModelAssessment::DoesNotFit { .. })))
+                    .min_by_key(|version| version.size_bytes)
+            });
+        if let Some(version) = shown {
+            return Ok(match version.assessment.clone() {
+                Some(assessment) => SearchRecommendation::Version(HuggingFaceRecommendedVersion {
+                    label: version.label.clone(),
+                    model_id: version.model_id.clone(),
                     size_bytes: version.size_bytes,
                     download_bytes: version.download_bytes,
-                    assessment: version.assessment?,
-                })
-            }))
+                    assessment,
+                }),
+                None => SearchRecommendation::Unknown,
+            });
+        }
+        // Every version was assessed and the engine refused each: the reasons of the largest.
+        let refused = versions
+            .iter()
+            .filter_map(|version| match &version.assessment {
+                Some(ModelAssessment::Unsupported { reasons, .. }) => Some(reasons.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        Ok(match refused.first() {
+            Some(reasons) if refused.len() == versions.len() && !versions.is_empty() => {
+                SearchRecommendation::Unsupported(reasons.clone())
+            }
+            _ => SearchRecommendation::Unknown,
+        })
     }
 
     // Inspection -----------------------------------------------------------------------------
@@ -3130,14 +3166,17 @@ impl RecommendedVersions for ManagedModelCandidates {
         &self,
         repository: String,
         commit: String,
-    ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>> {
+    ) -> BoxFuture<'_, SearchRecommendation> {
         Box::pin(async move {
-            let repository = HuggingFaceRepositoryId::new(repository).ok()?;
+            let Ok(repository) = HuggingFaceRepositoryId::new(repository) else {
+                return SearchRecommendation::Unknown;
+            };
             self.search_recommendation(&repository, &commit)
                 .await
-                .map_err(|error| tracing::debug!(%error, "search recommendation failed"))
-                .ok()
-                .flatten()
+                .unwrap_or_else(|error| {
+                    tracing::debug!(%error, "search recommendation failed");
+                    SearchRecommendation::Unknown
+                })
         })
     }
 }
@@ -4040,31 +4079,77 @@ fn candidate_versions(
         .collect()
 }
 
-/// The recommended version: among the fitting versions, those served at a working context first
-/// (see [`WORKING_CONTEXT`]), then Q4_K-class ones, then the largest. A Q8 served at 32K is a
-/// worse coding model than a Q6 served at 128K.
+/// The recommended version, by the rule the catalog's recommendations follow: among the fitting
+/// versions, those served at a working context first (see [`WORKING_CONTEXT`]); of those, the
+/// largest that decodes at [`TARGET_TOKENS_PER_SECOND`] in a long conversation, else the fastest.
+/// A Q8 served at 32K is a worse coding model than a Q6 served at 128K, and a quant held in memory
+/// that keeps up beats a larger one streamed too slowly. Before this machine's speed measurements
+/// exist, Q4_K-class versions, then the largest.
 fn recommended_version<'a>(
     versions: impl Iterator<Item = (&'a ClassifiedGroup, Option<&'a CachedModelAssessment>)>,
 ) -> Option<usize> {
-    versions
+    let fitting = versions
         .enumerate()
-        .filter_map(|(index, (group, assessment))| {
-            match assessment.map(|assessment| &assessment.profile) {
-                Some(ModelAssessment::Fits {
-                    profile, served, ..
-                }) => Some((index, group, working_context(profile, served))),
-                _ => None,
-            }
+        .filter_map(|(index, (group, assessment))| match assessment.map(|assessment| &assessment.profile) {
+            Some(ModelAssessment::Fits { profile, served, residency, .. }) => Some((
+                index,
+                group,
+                working_context(profile, served),
+                comparison_speed(served, residency),
+            )),
+            _ => None,
         })
-        .max_by_key(|(_, group, working)| {
-            (
-                *working,
-                group.quantization.as_deref().is_some_and(is_q4_k_class),
-                group.group.size_bytes(),
-            )
+        .collect::<Vec<_>>();
+    let working = fitting.iter().any(|(_, _, working, _)| *working);
+    let pool = fitting
+        .into_iter()
+        .filter(|(_, _, served_working, _)| *served_working || !working)
+        .collect::<Vec<_>>();
+    if pool.iter().all(|(_, _, _, speed)| speed.is_none()) {
+        return pool
+            .iter()
+            .max_by_key(|(_, group, _, _)| {
+                (
+                    group.quantization.as_deref().is_some_and(is_q4_k_class),
+                    group.group.size_bytes(),
+                )
+            })
+            .map(|(index, ..)| *index);
+    }
+    pool.iter()
+        .filter(|(_, _, _, speed)| speed.is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND))
+        .max_by_key(|(_, group, _, _)| group.group.size_bytes())
+        .or_else(|| {
+            pool.iter().max_by(|left, right| {
+                left.3
+                    .unwrap_or(0.0)
+                    .total_cmp(&right.3.unwrap_or(0.0))
+                    .then(right.1.group.size_bytes().cmp(&left.1.group.size_bytes()))
+            })
         })
-        .map(|(index, _, _)| index)
+        .map(|(index, ..)| *index)
 }
+
+/// The decode speed recommendations compare: the estimate at the depth nearest
+/// [`COMPARISON_CONTEXT_TOKENS`], or the served context when that is shorter.
+fn comparison_speed(served: &ServingProfile, residency: &ModelResidency) -> Option<f64> {
+    let (ModelResidency::Resident { performance } | ModelResidency::Streamed { performance, .. }) =
+        residency;
+    let ModelPerformance::Estimated { samples } = performance else {
+        return None;
+    };
+    let depth = served.context_length.min(COMPARISON_CONTEXT_TOKENS);
+    samples
+        .iter()
+        .min_by_key(|sample| sample.context_tokens.abs_diff(depth))
+        .map(|sample| sample.estimated_tokens_per_second)
+}
+
+/// The decode speed a recommended version should reach: a long agent conversation stays
+/// responsive. The catalog's recommendations hold the same target.
+const TARGET_TOKENS_PER_SECOND: f64 = 20.0;
+/// The depth decode speeds are compared at: a long agent conversation.
+const COMPARISON_CONTEXT_TOKENS: u32 = 50_000;
 
 /// The context a version should be served at to be recommended over one that fits only a smaller
 /// context: 64K, or the model's whole context when it is trained for less.

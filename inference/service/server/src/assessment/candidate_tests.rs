@@ -5586,8 +5586,8 @@ impl magnitude_service_models::RecommendedVersions for NoCatalogFingerprints {
         &self,
         _: String,
         _: String,
-    ) -> BoxFuture<'_, Option<magnitude_service_contracts::HuggingFaceRecommendedVersion>> {
-        Box::pin(async { None })
+    ) -> BoxFuture<'_, magnitude_service_models::SearchRecommendation> {
+        Box::pin(async { magnitude_service_models::SearchRecommendation::Unknown })
     }
 }
 

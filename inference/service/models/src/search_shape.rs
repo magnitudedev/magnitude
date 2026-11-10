@@ -54,15 +54,26 @@ pub trait CatalogFingerprints: Send + Sync {
     fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>>;
 }
 
-/// A repository's recommended version at a commit, chosen and assessed as candidate inspection
-/// chooses and assesses it; none when no version fits or the repository can't be inspected. The
-/// server supplies its inspection.
+/// What search shows of a repository's versions at a commit.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SearchRecommendation {
+    /// The version candidate inspection would recommend, or, when none fits, the smallest with
+    /// its verdict.
+    Version(HuggingFaceRecommendedVersion),
+    /// No version runs on this engine, for these reasons.
+    Unsupported(Vec<UnsupportedReason>),
+    /// The versions couldn't be read or assessed.
+    Unknown,
+}
+
+/// A repository's versions at a commit as search shows them, chosen and assessed as candidate
+/// inspection chooses and assesses them. The server supplies its inspection.
 pub trait RecommendedVersions: Send + Sync {
     fn recommended_version(
         &self,
         repository: String,
         commit: String,
-    ) -> BoxFuture<'_, Option<HuggingFaceRecommendedVersion>>;
+    ) -> BoxFuture<'_, SearchRecommendation>;
 }
 
 /// How much of a model file's header search holds: all of it through its tensor directory, or

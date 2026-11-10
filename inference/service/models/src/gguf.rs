@@ -815,12 +815,7 @@ impl Quantization {
             return declared.map(Self::Declared);
         };
         let declared_type = file_type.kind.weight_type();
-        if unknown_types.contains(&declared_type)
-            || directory
-                .tensors
-                .iter()
-                .any(|tensor| tensor.encoding as u32 == declared_type)
-        {
+        if unknown_types.contains(&declared_type) {
             return Some(Self::Declared(file_type));
         }
         // Weights are matrices; norms and biases are vectors kept in full precision. The token
@@ -837,6 +832,15 @@ impl Quantization {
                 .entry(tensor.encoding as u32)
                 .or_insert((tensor.encoding, 0));
             entry.1 = entry.1.saturating_add(tensor.nbytes);
+        }
+        // The declared type names the file while it holds a good share of the body: llama.cpp's
+        // mixes keep some layers a step higher (a Q3_K_M's in Q4_K), but writers of other mixed
+        // quantizations (Unsloth's dynamic ones) declare one type for every file, which a few of
+        // its tensors use whatever the file mostly is. Otherwise the body's main type names it.
+        let total = bytes.values().map(|(_, bytes)| *bytes).sum::<u64>();
+        let declared_bytes = bytes.get(&declared_type).map_or(0, |(_, bytes)| *bytes);
+        if declared_bytes.saturating_mul(3) >= total {
+            return Some(Self::Declared(file_type));
         }
         Some(
             bytes

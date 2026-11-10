@@ -61,7 +61,7 @@ pub use package_service::{
 };
 pub use search_shape::{
     CatalogFingerprints, HeaderExtent, HeaderVerdicts, ModelShape, RecommendedVersions,
-    SHAPE_PREFIX_BYTES,
+    SHAPE_PREFIX_BYTES, SearchRecommendation,
 };
 pub use weight_lineage::{SampleRead, WeightSample};
 pub use preview::{
