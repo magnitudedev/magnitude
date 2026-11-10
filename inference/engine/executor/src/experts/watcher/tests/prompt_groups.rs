@@ -94,24 +94,13 @@ fn a_rounds_answer_needs_no_transfer() {
     let scratch = &harness.layer.2;
     harness.publish(&prompt, 0, &[5]);
     scratch.request(prompt.sequence(), round(0));
-    // Within a bound, so a service stuck behind a transfer is reported, not
-    // hung on.
-    let within = |check: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !check() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        check()
-    };
-    let answered = within(&|| scratch.answer_of(prompt.sequence(), round(0)) == Some(Answer::Answered));
+    eventually("round 0 answered while no transfer can be issued", || scratch.answer_of(prompt.sequence(), round(0)) == Some(Answer::Answered));
     let absent = (0..EXPERTS).find(|&expert| expert != 5 && harness.in_tier(0, expert).is_none()).unwrap();
     assert!(harness.ask_at(&decode, 0, &[absent]));
-    let served = within(&|| harness.verdict(0, decode.sequence()).is_some());
+    eventually("the decode request served meanwhile", || harness.verdict(0, decode.sequence()).is_some());
     let tiered = listed(&harness.tiered[0]);
     release.send(()).unwrap();
     writer.join().unwrap();
-    assert!(answered, "round 0 is answered while no transfer can be issued");
-    assert!(served, "the decode request is served meanwhile");
     assert_eq!(harness.verdict(0, decode.sequence()), Some(Answer::Answered));
     assert_eq!(harness.tiered[0].load(constants::LIST_SEQUENCE as usize), low_word(prompt.sequence()));
     assert_eq!(tiered, [(record, 5)], "the tier list names 5 at its tier record");

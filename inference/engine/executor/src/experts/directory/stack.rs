@@ -1,4 +1,4 @@
-use crate::experts::reuse::{Ranking, Reuse};
+use crate::experts::reuse::{Evidence, Ranking, Reuse};
 use crate::experts::watcher::Step;
 
 /// One step's routing at one streamed layer, as the device read it: the
@@ -234,7 +234,7 @@ impl Stack {
                 _ => routed.push((expert, 1)),
             }
         }
-        let depths = self.rank(read, routed);
+        let depths = self.rank(read, routed, Evidence::Decode);
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
         if let Some(launch) = counted {
             if count(&mut self.curve, &mut self.counted, read, &depths) {
@@ -251,15 +251,15 @@ impl Stack {
     pub fn read_group(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
         assert!(read.experts.windows(2).all(|pair| pair[0] < pair[1]), "a group's union lists each expert once, ascending");
         assert_eq!(read.experts.len(), routed.len(), "each expert of a group's union has its choices");
-        self.rank(read, read.experts.iter().copied().zip(routed.iter().copied()).collect())
+        self.rank(read, read.experts.iter().copied().zip(routed.iter().copied()).collect(), Evidence::Prompt)
     }
 
-    /// Read `read`'s experts into the ranking ([`Reuse::read`]), each at its
-    /// depth before any of them is ranked again: those depths, in slots, in
-    /// the experts' ascending order.
-    fn rank(&mut self, read: &RoutedRead, routed: Vec<(usize, u32)>) -> Vec<usize> {
+    /// Read `read`'s experts into the ranking ([`Reuse::read`]) as
+    /// `evidence`, each at its depth before any of them is ranked again:
+    /// those depths, in slots, in the experts' ascending order.
+    fn rank(&mut self, read: &RoutedRead, routed: Vec<(usize, u32)>, evidence: Evidence) -> Vec<usize> {
         let (experts, choices): (Vec<usize>, Vec<u32>) = routed.into_iter().unzip();
-        Reuse::feeding(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices)
+        Reuse::feeding(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices, evidence)
     }
 
     /// What the load's counted decode read and ran ([`LiveDecode`]); none

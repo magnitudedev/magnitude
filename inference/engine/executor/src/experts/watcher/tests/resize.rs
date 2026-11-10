@@ -338,14 +338,7 @@ fn a_host_tier_grows_by_its_records_alone() {
 /// The cut beside a running chain asked of `shared` (`Shared::cut_running`),
 /// once residency answers it.
 fn running_cut(shared: &Shared) -> Option<super::super::resize::RunningCut> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(answer) = shared.running_cut() {
-            return answer.expect("the cut is served");
-        }
-        assert!(Instant::now() < deadline, "residency answers a cut beside a running chain at its next turn");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    awaited("residency answering a cut beside a running chain at its next turn", || shared.running_cut()).expect("the cut is served")
 }
 
 /// A cut of the one store beside a running prompt group is answered at

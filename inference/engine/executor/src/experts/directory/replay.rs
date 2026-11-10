@@ -96,7 +96,7 @@ pub fn replay(
         }
         // Bélády's bound ranks by the future alone: it logs no read.
         if recency == Recency::Reuse {
-            Reuse::of(&directory.ranking).read(read, &vec![1; read.experts.len()]);
+            Reuse::of(&directory.ranking).read(read, &vec![1; read.experts.len()], crate::experts::reuse::Evidence::Decode);
         }
         if absent.is_empty() {
             continue;

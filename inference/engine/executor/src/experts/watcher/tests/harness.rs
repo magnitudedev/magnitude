@@ -73,14 +73,7 @@ fn cpu_slots(table: magnitude_kernels::SlotTable, steps: &Steps) -> ExchangeTabl
 /// Spin until lane `lane` of `step`'s slot of `slots` is answered, by the
 /// step or its failure.
 pub(super) fn until_answered(slots: &ExchangeTable, step: Step, lane: u64) -> Answer {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(answer) = slots.answer_of(step, lane) {
-            return answer;
-        }
-        assert!(Instant::now() < deadline, "step {step}'s lane {lane} was never answered");
-        std::thread::yield_now();
-    }
+    awaited(&format!("step {step}'s lane {lane} answered"), || slots.answer_of(step, lane))
 }
 
 /// A watcher over one layer of `EXPERTS` experts in a group of `records`
@@ -580,6 +573,8 @@ pub(super) fn lending_bank(
         spans: false,
     })
     .unwrap();
+    // Its steps compute nothing: its hints are priced on an idle volume.
+    watcher.shared().telemetry.price_at(0.);
     Harness {
         _pool: (!ALONE.get()).then(|| POOL.read().unwrap_or_else(std::sync::PoisonError::into_inner)),
         watcher,
@@ -609,18 +604,31 @@ pub(super) fn lending_bank(
 
 /// Spin until `word` of `words` holds `value`.
 pub(super) fn until(words: &Words, word: usize, value: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while words.load(word) != value {
-        assert!(Instant::now() < deadline, "word {word} never held {value}");
-        std::thread::yield_now();
-    }
+    eventually(&format!("word {word} holding {value}"), || words.load(word) == value);
 }
 
-/// Spin until `check` holds, `what` naming it.
+/// Spin until `check` holds, `what` naming it ([`awaited`]).
 pub(super) fn eventually(what: &str, check: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !check() {
-        assert!(Instant::now() < deadline, "{what}");
+    awaited(what, || check().then_some(()))
+}
+
+/// How long a wait goes between notes of what it still awaits.
+const NOTED: Duration = Duration::from_secs(10);
+
+/// Spin until `ready` gives a value, `what` naming it: however long it
+/// takes, so a loaded host's pace never decides a test's verdict. A wait
+/// unmet past each [`NOTED`] notes what it awaits, so a hang names itself
+/// beside the test runner's own report of a long-running test.
+pub(super) fn awaited<T>(what: &str, ready: impl Fn() -> Option<T>) -> T {
+    let mut noted = Instant::now();
+    loop {
+        if let Some(value) = ready() {
+            return value;
+        }
+        if noted.elapsed() >= NOTED {
+            eprintln!("still awaiting: {what}");
+            noted = Instant::now();
+        }
         std::thread::yield_now();
     }
 }

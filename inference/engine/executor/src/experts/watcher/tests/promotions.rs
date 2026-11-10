@@ -159,11 +159,7 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
         let prompt_only = [0, 1, 2, 4].iter().all(|&expert| depths[3] < depths[expert]);
         prompt_only && [5, 6, 7].iter().all(|expert| kept.contains(expert)) && lacked.into_iter().all(|expert| depths[expert] >= deepest)
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ranked() {
-        assert!(Instant::now() < deadline, "the kept {:?} are not the ranking's most reused (depths {:?})", kept(), depths());
-        std::thread::yield_now();
-    }
+    eventually("the kept are the ranking's most reused", ranked);
 }
 
 /// The host promotes what the ranking keeps, off every step's path: a step

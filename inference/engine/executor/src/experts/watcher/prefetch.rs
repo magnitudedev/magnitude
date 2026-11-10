@@ -686,8 +686,9 @@ impl Prefetch {
     /// ahead, 1 two), issued by the route at `issued`: each
     /// candidate (an expert whose file is on the path:
     /// nothing holds or lands it; one a longer lead's hint reads lands
-    /// already) whose rank's precision at its lead pays for its read
-    /// (`Telemetry::pays`) is read into a
+    /// already) whose rank's precision at its lead pays for its read of its
+    /// bytes, on the volume as busy as steps keep it (`HintPrice::pays`), is
+    /// read into a
     /// staging record beyond the demand reserve, wanted from its layer's
     /// estimated start and worth its expected bytes spared
     /// (`HintPrice::want`), landing into a ready tier record, in the ring's
@@ -737,7 +738,7 @@ impl Prefetch {
                 noted(Fate::Short, ShortOf::Earlier);
                 continue;
             }
-            if !price.pays(rank) {
+            if !price.pays(rank, core.layers[target].expert_bytes()) {
                 noted(Fate::Refused, ShortOf::Nothing);
                 continue;
             }

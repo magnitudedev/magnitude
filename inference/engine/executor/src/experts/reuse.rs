@@ -59,8 +59,13 @@
 //! some half-lives and sizes and punish it at others.
 //!
 //! The bank holds the candidate, a half-life's per-layer shares or its
-//! group pools, that missed the fewest reads so far, the first on a tie
-//! (per-layer recency until the reads tell otherwise). Every candidate is
+//! group pools, that missed the fewest decode reads so far, the first on a
+//! tie (per-layer recency until the reads tell otherwise). A prompt
+//! group's union ranks the experts it read as any read does, but its
+//! misses choose nothing ([`Evidence`]): a prompt streams its rows' experts
+//! through with little reuse, which recency serves best, and its unions,
+//! thousands of reads before decode logs a step, would hold the decode to
+//! the candidate the prompt favoured. Every candidate is
 //! kept up to date at every read, so a change of the one held is a choice
 //! of index: nothing is reranked, and no rank is stored anywhere else to go
 //! stale (whatever ranks asks [`Reuse::rank`]). Sizes are priced by the
@@ -78,6 +83,16 @@ use super::watcher::Step;
 use super::yielding::Yielding;
 use std::collections::BTreeSet;
 use std::sync::{Arc, MutexGuard};
+
+/// What a read logged into the ranking is evidence of: a decode step's
+/// reads, whose misses choose the candidate the bank holds, or a prompt
+/// group's union, whose misses are no evidence of how decode reuses its
+/// experts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    Decode,
+    Prompt,
+}
 
 /// The half-lives, in steps, the ranking measures its reads by, ascending.
 const HALF_LIVES: [f64; 10] = [0., 1., 2., 4., 8., 16., 32., 64., 128., 256.];
@@ -280,14 +295,17 @@ impl Measure {
     /// ([`Self::entering`], by their ranks after it): the most chosen of a
     /// prompt group's union end above the rest where their scores tie, and
     /// experts it leaves tied keep the order the reads before it gave them.
+    /// The misses count only as `evidence` is a decode's.
     /// The depths, and the layers whose experts left the pool.
-    fn read(&mut self, read: &RoutedRead, routed: &[u32], slots: usize) -> (Vec<usize>, BTreeSet<usize>) {
+    fn read(&mut self, read: &RoutedRead, routed: &[u32], slots: usize, evidence: Evidence) -> (Vec<usize>, BTreeSet<usize>) {
         assert_eq!(routed.len(), read.experts.len(), "each expert read has its choices");
         let layer = read.layer;
         let depths = read.experts.iter().map(|&expert| self.depth(layer, expert)).collect::<Vec<_>>();
-        self.misses += depths.iter().filter(|&&depth| depth >= slots).count() as u64;
         let (held, lacked): (Vec<usize>, Vec<usize>) = read.experts.iter().partition(|&&expert| self.pooled[layer][expert]);
-        self.pooled_misses += lacked.len() as u64;
+        if evidence == Evidence::Decode {
+            self.misses += depths.iter().filter(|&&depth| depth >= slots).count() as u64;
+            self.pooled_misses += lacked.len() as u64;
+        }
         let group = self.groups[layer];
         // A held expert's place moves with its score.
         for &expert in &held {
@@ -453,15 +471,17 @@ impl Reuse {
         }
     }
 
-    /// Log the route's `read`, `routed` each expert's choices in it: each
-    /// expert's depth in slots, by the live half-life's stack before the
-    /// read (its layer's experts where never read).
-    pub fn read(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
+    /// Log the route's `read`, `routed` each expert's choices in it, its
+    /// misses evidence for choosing the live candidate where a decode's
+    /// ([`Evidence`]): each expert's depth in slots, by the live
+    /// half-life's stack before the read (its layer's experts where never
+    /// read).
+    pub fn read(&mut self, read: &RoutedRead, routed: &[u32], evidence: Evidence) -> Vec<usize> {
         self.reads += 1;
         self.latest = self.latest.max(Some(read.sequence));
         let slots = self.slots[read.layer];
         let at = self.live % HALF_LIVES.len();
-        let mut reads = self.measures.iter_mut().map(|measure| measure.read(read, routed, slots)).collect::<Vec<_>>();
+        let mut reads = self.measures.iter_mut().map(|measure| measure.read(read, routed, slots, evidence)).collect::<Vec<_>>();
         let (depths, left) = reads.swap_remove(at);
         let live = (0..2 * HALF_LIVES.len()).min_by_key(|&candidate| self.missed(candidate)).expect("candidates");
         // Another candidate reorders every layer; this read moves its own,
@@ -490,6 +510,12 @@ impl Reuse {
         self.measures.iter_mut().for_each(|measure| measure.fit(group, records));
         let members = (0..self.tops.len()).filter(|&member| self.groups[member] == group).collect::<Vec<_>>();
         members.into_iter().for_each(|member| self.retop(member));
+    }
+
+    /// Each layer's bank share, in records: what the bank holds of it, and
+    /// what its measures count misses at.
+    pub fn shares(&self) -> &[usize] {
+        &self.slots
     }
 
     /// Whether `layer`'s `expert` is among what the live candidate holds:
@@ -613,7 +639,7 @@ pub(super) mod tests {
     /// Log `read` into `reuse`, each of its experts chosen once.
     fn log(reuse: &mut Reuse, read: RoutedRead) -> Vec<usize> {
         let routed = once(&read);
-        reuse.read(&read, &routed)
+        reuse.read(&read, &routed, Evidence::Decode)
     }
 
     /// Step `step`'s experts of a pattern that rewards frequency: expert 0
@@ -677,11 +703,11 @@ pub(super) mod tests {
                 missed[at] += lacked(&|expert| holds(at, expert)) as u64;
             }
             for (at, measure) in scored.iter_mut().enumerate() {
-                measure.read(&read, &once(&read), 0);
+                measure.read(&read, &once(&read), 0, Evidence::Decode);
                 take_misses(measure, layer, &read.experts, &mut shares[at][layer], slots);
                 take_misses(measure, layer, &read.experts, &mut pools[at], slots * layers);
             }
-            reuse.read(&read, &once(&read));
+            reuse.read(&read, &once(&read), Evidence::Decode);
         }
     }
 
@@ -689,6 +715,35 @@ pub(super) mod tests {
     fn a_recorded_decode_replays_as_offline() {
         replays_as_offline(include_bytes!("../../../fixtures/reuse/qwen-gguf-47.bin"));
         replays_as_offline(include_bytes!("../../../fixtures/reuse/agent-26.bin"));
+    }
+
+    /// A prompt's unions do not choose the decode's candidate: a prompt
+    /// whose reads favour recency (two experts read hot, then a loop of
+    /// three a longer half-life keeps them out of), then a decode whose
+    /// reads reward a half-life of 32 (a fresh expert every step beside one
+    /// of two experts that recur every 20 steps), and the ranking holds 32,
+    /// as on the decode alone, not the recency the prompt's misses favoured.
+    #[test]
+    fn a_prompt_does_not_choose_the_decodes_half_life() {
+        let mut reuse = Reuse::new(&[400], &[0], vec![3]);
+        let mut prompt = |sequence: Step, experts: &[usize]| {
+            let read = read(sequence, experts);
+            reuse.read(&read, &once(&read), Evidence::Prompt);
+        };
+        for step in 1..=16 {
+            prompt(step, &[200, 201]);
+        }
+        for at in 0..32 {
+            prompt(17 + at, &[300 + at as usize % 3]);
+        }
+        for at in 0..128 {
+            let mut experts = vec![100 + at as usize];
+            if at % 10 == 0 {
+                experts.push(((at / 10) % 2) as usize);
+            }
+            log(&mut reuse, read(49 + at, &experts));
+        }
+        assert_eq!(reuse.half_life(), 32.);
     }
 
     /// Before the reads tell otherwise the ranking is recency: a score is
@@ -736,9 +791,9 @@ pub(super) mod tests {
     fn frequency_outranks_one_later_read_over_a_half_life() {
         let mut measure = Measure::new(4., &[2], &[0], &[2]);
         for step in [1, 2, 3, 4] {
-            measure.read(&read(step, &[0]), &[1], 2);
+            measure.read(&read(step, &[0]), &[1], 2, Evidence::Decode);
         }
-        measure.read(&read(5, &[1]), &[1], 2);
+        measure.read(&read(5, &[1]), &[1], 2, Evidence::Decode);
         assert!(measure.rank(0, 0) > measure.rank(0, 1));
         assert!((Score::at(0).sum(Score::at(0), 4.).0 - 4.).abs() < 1e-12);
     }
@@ -765,7 +820,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>();
         for half_life in [0., 4., 32.] {
             let mut stacked = Measure::new(half_life, &[16], &[0], &[0]);
-            let depths = reads.iter().map(|read| stacked.read(read, &once(read), 0).0).collect::<Vec<_>>();
+            let depths = reads.iter().map(|read| stacked.read(read, &once(read), 0, Evidence::Decode).0).collect::<Vec<_>>();
             for share in [3, 5, 8, 13] {
                 // Each size replayed alone: every miss, as the read's
                 // experts enter, promoted into the least reused record.
@@ -774,7 +829,7 @@ pub(super) mod tests {
                 let mut missed = 0;
                 for read in &reads {
                     missed += read.experts.iter().filter(|&&expert| !held.contains(&(0, expert))).count();
-                    scored.read(read, &once(read), share);
+                    scored.read(read, &once(read), share, Evidence::Decode);
                     take_misses(&scored, 0, &read.experts, &mut held, share);
                 }
                 let counted = depths.iter().flatten().filter(|&&depth| depth >= share).count();
@@ -800,7 +855,7 @@ pub(super) mod tests {
             9 => 20,
             _ => 1,
         });
-        reuse.read(&union, &choices.collect::<Vec<_>>());
+        reuse.read(&union, &choices.collect::<Vec<_>>(), Evidence::Prompt);
         let top = (0..16).filter(|&expert| reuse.in_top(0, expert)).collect::<Vec<_>>();
         assert_eq!(top, [3, 7, 9, 12]);
         for measure in &reuse.measures {

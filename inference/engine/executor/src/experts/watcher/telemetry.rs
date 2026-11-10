@@ -392,8 +392,9 @@ fn step_seconds(previous: Option<Instant>, begun: Instant, now: Instant) -> f64 
 const WINDOW: f64 = 1.0;
 
 /// The latest decode steps, within [`WINDOW`] of decode time: their times
-/// and the time the volume was busy meanwhile
-/// (its account, `seismic_io::accounting`), what share of the time it is busy;
+/// and the time the volume was busy meanwhile with reads a step needs
+/// ([`needed`], from its account, `seismic_io::accounting`), what share of
+/// the time it is busy so;
 /// and their hint candidates by choice rank, each rank's precision.
 /// Every step it holds is a generation step's since the last prompt step, which
 /// drops its reads and starts the window again (`Telemetry::complete_step`).
@@ -404,7 +405,7 @@ struct Recent {
 }
 
 /// A decode step of [`Recent`]: its seconds, its rings' candidates by rank,
-/// and the seconds its volume was busy.
+/// and the seconds its volume was busy with reads a step needs.
 struct RecentStep {
     seconds: f64,
     ranks: Ranks,
@@ -441,14 +442,16 @@ impl Recent {
         (!self.steps.is_empty()).then(|| self.seconds / self.steps.len() as f64)
     }
 
-    /// The share of the window's time the volume was busy, at most all of
-    /// it (the volume's own busy time, `seismic_io::accounting`).
-    /// All of it until a whole window of decode time is measured since the
-    /// last prompt step (the first decode steps after a prefill find its
-    /// burst drained, which their own reads alone would not show).
+    /// The share of the window's time the volume was busy with reads a
+    /// step needs ([`needed`]), at most all of it: over the decode steps
+    /// since the last prompt step until they make a whole window. Before
+    /// any is timed nothing says the volume is busy, so a hint is priced on
+    /// an idle one and its rank's prior read, as its precision is before
+    /// its rank is measured ([`saving`]); the first step timed prices the
+    /// rest.
     fn busy(&self) -> f64 {
-        if self.seconds < WINDOW {
-            return 1.;
+        if self.seconds == 0. {
+            return 0.;
         }
         (self.steps.iter().map(|step| step.busy).sum::<f64>() / self.seconds).min(1.)
     }
@@ -494,7 +497,8 @@ impl Ranks {
 
 /// What a hint's read is priced by at one admission ([`Telemetry::price`]):
 /// each rank's precision (every rank a ring may name, [`Ranks::precision`]),
-/// the volume's busy share, a streamed layer's time in the latest decode
+/// the volume's share busy with reads a step needs ([`Recent::busy`]), a
+/// streamed layer's time in the latest decode
 /// steps (their mean over their streamed layers; none before one is timed),
 /// and the volume's read line (none before it is measured).
 pub(super) struct HintPrice {
@@ -505,22 +509,31 @@ pub(super) struct HintPrice {
 }
 
 impl HintPrice {
-    /// Whether a hint at rank `rank` pays for its read ([`pays`]): a hint's
-    /// rank is a row's choice's, each of which is priced.
-    pub(super) fn pays(&self, rank: usize) -> bool {
-        pays(self.precision[rank], self.busy)
+    /// Whether a hint at rank `rank` of `bytes` pays for its read
+    /// ([`pays`]): a hint's rank is a row's choice's, each of which is
+    /// priced.
+    pub(super) fn pays(&self, rank: usize, bytes: u64) -> bool {
+        pays(self.precision[rank], self.busy, self.latency(bytes))
+    }
+
+    /// A read of `bytes`' latency over its transfer, `λ/(b/D)`: none before
+    /// the volume's line is measured.
+    fn latency(&self, bytes: u64) -> f64 {
+        assert!(bytes > 0, "a hint reads an expert's bytes");
+        self.line.map_or(0., |line| line.latency_seconds() / line.transfer_seconds(bytes as f64))
     }
 
     /// What a hint at rank `rank` of `bytes` is wanted as on its read's link
     /// (`seismic_io::Want`), its layer `ahead` streamed layers past the
     /// device's at `now`: expected from that layer's estimated start,
     /// `ahead` layer times after `now` (read ahead until a step waits on it,
-    /// `Prefetch::hasten`), worth the step time it is expected to save, its
-    /// bytes' time at the volume's rate if right, `p · b/R` (nothing before
-    /// the volume's line is measured); undated before a decode step is
-    /// timed.
+    /// `Prefetch::hasten`), worth the step time it is expected to save net
+    /// of what it costs ([`saving`] of its bytes' transfer, `b/D`; nothing
+    /// before the volume's line is measured); undated before a decode step
+    /// is timed.
     pub(super) fn want(&self, rank: usize, ahead: usize, bytes: u64, now: std::time::Instant) -> seismic_io::Want {
-        let value = self.line.map_or(0., |line| self.precision[rank] * line.transfer_seconds(bytes as f64));
+        let saving = saving(self.precision[rank], self.busy, self.latency(bytes)).max(0.);
+        let value = self.line.map_or(0., |line| saving * line.transfer_seconds(bytes as f64));
         match self.layer {
             Some(layer) => seismic_io::Want::expected(now + std::time::Duration::from_secs_f64(layer * ahead as f64), value),
             None => seismic_io::Want::undated(value),
@@ -528,20 +541,46 @@ impl HintPrice {
     }
 }
 
-/// Whether a hint whose prediction is right with probability `precision`
-/// pays for its read, the volume busy a share `busy` of the time. Both sides
-/// are its bytes' time at the volume's own rate (`seismic_io::accounting`:
-/// bytes over busy time, every job's), so the rate is priced once and
-/// cancels. A right hint, read before its request, removes the demand wait
-/// for its bytes, `b/R`. A wrong one adds its bytes' time, `b/R`, as far as
-/// a demand read then waits for it: in the share of the time the volume is
-/// busy. So it is read where `p ≥ (1 − p)·busy`: from a half on a volume busy
-/// all the time (the prior, a half, is read before its rank is measured),
-/// nearly every hint on an idle one. No term is a job's time from its
-/// submission, which holds the pieces ahead of it (a hint's own bytes, which
-/// would price more hints the more were read).
-fn pays(precision: f64, busy: f64) -> bool {
-    precision >= (1. - precision) * busy
+/// The step time a hint whose prediction is right with probability
+/// `precision` is expected to save, net of what it costs, per second of its
+/// bytes' transfer `b/D`: the volume busy a share `busy` of the time with
+/// reads a step needs ([`needed`]), its read's latency `latency` times its
+/// transfer (`λ/(b/D)`, none before the volume's line is measured). A right
+/// hint's bytes are read for its request anyway: reading them ahead saves
+/// the request's park on them, `λ + b/D`, only as far as the volume would
+/// otherwise idle, `1 − busy`, since on a volume busy with what steps need
+/// they only take the place of bytes a step waits on. A wrong one adds its
+/// bytes' time, `b/D`, to the volume, which delays the reads steps wait on
+/// in the share `busy` of the time they hold it. So
+/// `p·(1 − busy)·(1 + λ/(b/D)) − (1 − p)·busy`: on a saturated volume no
+/// prediction short of certain saves anything; on an idle one, every one.
+/// No term is a job's time from its submission, which holds the pieces
+/// ahead of it (a hint's own bytes, which would price more hints the more
+/// were read), and `busy` leaves out the wrong hints' reads, so whether
+/// hints are read never moves their price.
+fn saving(precision: f64, busy: f64, latency: f64) -> f64 {
+    precision * (1. - busy) * (1. + latency) - (1. - precision) * busy
+}
+
+/// Whether a hint pays for its read: its expected [`saving`] is none lost.
+fn pays(precision: f64, busy: f64, latency: f64) -> bool {
+    saving(precision, busy, latency) >= 0.
+}
+
+/// The seconds of a span the volume was busy with reads a step needs:
+/// its busy seconds `busy` but the share of what it delivered (`spans`,
+/// each volume's) that hints read for experts no route chose, the bytes
+/// read ahead beyond `named`, those of hints a route chose. What else it
+/// read ahead is the fill's, which orders behind every hint and delays no
+/// hint's read, so no hint's price counts it. A hint a step hastened reads
+/// its last pieces due, so `named` may exceed what it read ahead: the
+/// share is then at most the volume's, never below what steps needed.
+fn needed(busy: f64, spans: &[(seismic_io::Volume, seismic_io::Totals)], named: u64) -> f64 {
+    let (bytes, ahead) = spans.iter().fold((0, 0), |(bytes, ahead), (_, span)| (bytes + span.bytes(), ahead + span.ahead.bytes));
+    if bytes == 0 {
+        return busy;
+    }
+    busy * (1. - ahead.saturating_sub(named) as f64 / bytes as f64)
 }
 
 /// Where a route served a choice from, by its routing record's source.
@@ -834,6 +873,10 @@ pub(super) struct Telemetry {
     /// step's end only raises it, so the thread ending steps never waits
     /// on the stack.
     feedable: AtomicU64,
+    /// The share busy with what steps need that hints are priced at in
+    /// place of the one measured ([`Self::price_at`]).
+    #[cfg(test)]
+    priced_busy: Mutex<Option<f64>>,
     /// Whether a block's span is the device's cost of its work: its backend
     /// times spans of a graph run (`seismic::BackendName::times_spans`) and
     /// its parks wait inside kernels (`parks_in_kernels`). Where parks are
@@ -1027,6 +1070,8 @@ impl Telemetry {
             stack: Mutex::new(stack),
             whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
             feedable: AtomicU64::new(0),
+            #[cfg(test)]
+            priced_busy: Mutex::new(None),
             spans,
             sampled: Mutex::new(BTreeMap::new()),
         }
@@ -1374,6 +1419,8 @@ impl Telemetry {
         // The step's hint candidates by choice rank, into the window that
         // prices hints ([`Recent`]).
         let mut ranks = Ranks::default();
+        // The bytes its hints read of experts its routes chose ([`needed`]).
+        let mut named_bytes = 0;
         if let Some((_, routed, tiered, sourced, absent, blocks)) = &decoded {
             for (experts, read) in cost.experts.iter_mut().zip(routed) {
                 experts.routed = Some(read.clone());
@@ -1451,6 +1498,7 @@ impl Telemetry {
                     // step's record counts: row `lead` of a ring hints
                     // `lead + 1` layers ahead.
                     if candidate.read {
+                        named_bytes += u64::from(named) * facts.bytes[layer];
                         let reads = &mut cost.layers[layer];
                         reads.hint_reads += 1;
                         reads.used += u64::from(named);
@@ -1486,7 +1534,7 @@ impl Telemetry {
                 cost.seconds = step_seconds(ended.0, begun, ended.1);
                 let busy;
                 (busy, cost.storage) = self.delivered(costs);
-                costs.recent.step(cost.seconds, ranks, busy);
+                costs.recent.step(cost.seconds, ranks, needed(busy, &cost.storage, named_bytes));
             }
             LaunchWork::Prompt => {
                 (_, cost.storage) = self.delivered(costs);
@@ -1775,7 +1823,19 @@ impl Telemetry {
         let window = costs.recent.ranks();
         let ranks = (0..self.routing.selected).map(|rank| window.precision(lead, rank)).collect();
         let layer = costs.recent.mean_step().map(|step| step / self.routing.maps.len() as f64);
-        HintPrice { precision: ranks, busy: costs.recent.busy(), layer, line: costs.line }
+        let busy = costs.recent.busy();
+        #[cfg(test)]
+        let busy = self.priced_busy.lock().expect("the priced busy share").unwrap_or(busy);
+        HintPrice { precision: ranks, busy, layer, line: costs.line }
+    }
+
+    /// Price hints on a volume busy `busy` of the time with what steps
+    /// need: a harness's steps compute nothing, so every step it times is
+    /// read-bound and, measured, would price every hint out; its hints'
+    /// mechanics are tested on a compute-bound load's volume.
+    #[cfg(test)]
+    pub(super) fn price_at(&self, busy: f64) {
+        *self.priced_busy.lock().expect("the priced busy share") = Some(busy);
     }
 
     /// Count a hint read of `bytes`.
@@ -2029,20 +2089,20 @@ mod tests {
     }
 
     /// The volume's busy share is its busy time over the latest decode
-    /// steps' time, at most 1, and 1 until a whole window of decode time is
-    /// measured: a gap between steps (a tool call's) is no step's time, and
-    /// steps past the window leave it.
+    /// steps' time, at most 1, and none before a step is timed: a gap
+    /// between steps (a tool call's) is no step's time, and steps past the
+    /// window leave it.
     #[test]
     fn the_busy_share_is_the_volumes_busy_time_over_the_latest_steps() {
         let mut traffic = Recent::default();
-        assert_eq!(traffic.busy(), 1., "unmeasured: as busy as can be");
-        // 50 ms steps, the volume busy 25 ms of each: half busy, once a
-        // whole window of them is measured, and as busy as can be before.
+        assert_eq!(traffic.busy(), 0., "unmeasured: nothing says it is busy");
+        // 50 ms steps, the volume busy 25 ms of each: half busy from the
+        // first, and over a whole window.
+        traffic.step(0.05, Ranks::default(), 0.025);
+        assert!((traffic.busy() - 0.5).abs() < 1e-9, "the first step prices the rest");
         for _ in 0..19 {
             traffic.step(0.05, Ranks::default(), 0.025);
         }
-        assert_eq!(traffic.busy(), 1., "less than a window of decode time");
-        traffic.step(0.05, Ranks::default(), 0.025);
         assert!((traffic.busy() - 0.5).abs() < 1e-9);
         // A step begun after a 30 s idle gap counts from its begin.
         let begun = Instant::now();
@@ -2059,15 +2119,50 @@ mod tests {
     }
 
     /// A hint is read where its precision pays for its bytes at the
-    /// volume's own rate, which cancels: on a volume busy all the time from
-    /// a half (the prior is read before its rank is measured), busy half
-    /// the time from a third, idle at any precision.
+    /// volume's own rate, which cancels: before the read's latency is
+    /// measured, where it is right as often as the volume is busy with what
+    /// steps need; a latency it spares too lowers the bar. On an idle volume
+    /// every hint pays; on one busy all the time none short of certain does,
+    /// the prior's half included.
     #[test]
     fn a_hint_is_read_where_its_rank_pays_for_its_bytes() {
-        assert!(pays(0.5, 1.), "the prior before any candidate is seen");
-        assert!(!pays(0.49, 1.));
-        assert!(pays(0.334, 0.5) && !pays(0.333, 0.5));
-        assert!(pays(0.01, 0.));
+        assert!(pays(0.5, 0.5, 0.) && !pays(0.49, 0.5, 0.));
+        assert!(pays(0.3, 0.3, 0.) && !pays(0.29, 0.3, 0.));
+        // Flash Next's ~1.9 MB expert at λ = 0.26 ms and 3 GB/s.
+        assert!(pays(0.24, 0.3, 0.41) && !pays(0.23, 0.3, 0.41));
+        assert!(pays(0.01, 0., 0.));
+        assert!(!pays(0.5, 1., 0.), "the prior on a saturated volume");
+        assert!(pays(0.5, Recent::default().busy(), 0.), "the prior before a step is timed");
+        assert!(pays(1., 1., 0.));
+    }
+
+    /// The volume's busy time counts the reads steps need: demand reads and
+    /// hints a route chose. Wrong hints' bytes, and what a hastened hint
+    /// read due beside them, never count against a hint.
+    #[test]
+    fn a_volume_is_busy_with_what_steps_need() {
+        let span = |due: u64, ahead: u64| seismic_io::Totals {
+            due: seismic_io::Class { bytes: due, ..Default::default() },
+            ahead: seismic_io::Class { bytes: ahead, ..Default::default() },
+            ..Default::default()
+        };
+        let volume = seismic_io::Volume(0);
+        let busy = |due, ahead, named| needed(0.8, &[(volume, span(due, ahead))], named);
+        assert!((busy(60, 40, 0) - 0.48).abs() < 1e-12, "every hint wrong");
+        assert!((busy(60, 40, 10) - 0.56).abs() < 1e-12);
+        assert_eq!(busy(60, 40, 50), 0.8, "a hastened hint read due");
+        assert_eq!(busy(100, 0, 0), 0.8, "no hint read");
+        assert_eq!(needed(0., &[], 0), 0., "nothing delivered");
+    }
+
+    /// On a volume busy with what steps need, a right hint's bytes are read
+    /// anyway and save nothing; a wrong one's delay them. DeepSeek V4.1 on an
+    /// M4 Pro at 16 slots: busy 0.81 of the step without hints, its best
+    /// ranks right about half the time.
+    #[test]
+    fn a_hint_on_a_saturated_volume_saves_nothing() {
+        assert!(!pays(0.45, 0.81, 0.));
+        assert!(!pays(0.5, 0.97, 0.));
     }
 }
 
