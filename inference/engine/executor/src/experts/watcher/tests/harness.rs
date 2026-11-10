@@ -647,13 +647,19 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 }
 
 /// Demand reads standing in the read engine's pool ahead of a test's until
-/// it finishes them: a file of 16 MiB read whole, `count` times at once,
-/// into one record nothing reads. Each read is submitted again as it ends,
-/// on the worker that read it, before that worker takes another piece, so
-/// with more reads than workers the line never drains, however fast the
-/// volume: a read the test issues behind it at a lesser priority (a hint's,
-/// a fill's) is not taken until the test finishes the line, and one at
-/// demand waits for the reads queued as it was issued.
+/// it finishes them: a file of 16 MiB read whole, as many times at once as
+/// the pool has workers and two more, into one record nothing reads. Each
+/// read is submitted again as it ends, by the worker that ended it, before
+/// that worker takes another piece (`seismic_io::read_workers`). So a
+/// read of the line not queued has a piece on a worker, or its end runs on
+/// one, or the line's first submissions are still being made on the test's
+/// thread: at most one more than the workers. Two more always leave one
+/// queued, parked, on the volume's link, however fast the volume or late a
+/// resubmission: a read the test issues behind it at a lesser priority (a
+/// hint's, a fill's) is not taken until the test finishes the line ("Order
+/// and depth"), and one at demand waits for the reads queued as it was
+/// issued. The pool grows only as a reader opens whose volume needs more
+/// workers, and a test that queues a line holds the pool alone (`alone`).
 pub(super) struct Ahead {
     line: Arc<AheadLine>,
     path: std::path::PathBuf,
@@ -666,6 +672,8 @@ struct AheadLine {
     records: Mutex<Records>,
     done: std::sync::atomic::AtomicBool,
     tickets: Mutex<Vec<Ticket>>,
+    /// How long a read's end waits before it submits the read again.
+    late: Duration,
 }
 
 impl AheadLine {
@@ -691,6 +699,7 @@ impl AheadLine {
             ticket.on_end(move |_, _| {
                 // Ended while its hook was registered: the loop reads again.
                 if ending.compare_exchange(REGISTERING, ENDED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    std::thread::sleep(line.late);
                     line.stand();
                 }
             });
@@ -705,16 +714,28 @@ impl AheadLine {
 impl Ahead {
     const FILE: u64 = 16 << 20;
 
-    pub(super) fn queue(name: &str, count: usize) -> Self {
+    pub(super) fn queue(name: &str) -> Self {
+        Self::resubmitting_after(name, Duration::ZERO)
+    }
+
+    /// [`Self::queue`], each read submitted again `late` after it ended.
+    pub(super) fn resubmitting_after(name: &str, late: Duration) -> Self {
         assert!(ALONE.get(), "a test queuing reads ahead holds the pool alone (`alone`)");
         let path = std::env::temp_dir().join(format!("expert-watcher-{name}-{}", std::process::id()));
         std::fs::write(&path, vec![0u8; Self::FILE as usize]).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &urgent()).unwrap();
         let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
         let records = Records::new(sink, Self::FILE, 1).unwrap();
-        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default() });
-        (0..count).for_each(|_| line.stand());
+        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), late });
+        (0..seismic_io::read_workers() + 2).for_each(|_| line.stand());
         Self { line, path }
+    }
+
+    /// A read of the line's file behind it, wanted as `want`, outside the
+    /// line: the test's to observe and to end.
+    pub(super) fn read(&self, want: seismic_io::Want) -> Ticket {
+        let read = Read::new(0, 0, Self::FILE, &self.line.records.lock().unwrap(), 0);
+        self.line.source.request(vec![read], want).unwrap()
     }
 
     /// End the line: every read in it lands, and none follows it.
@@ -1286,4 +1307,20 @@ pub(super) fn listed(list: &Words) -> Vec<(i32, i32)> {
             )
         })
         .collect()
+}
+
+/// A line holds back every read ahead behind it however late its reads are
+/// submitted again: each read's end waits a second before it resubmits,
+/// longer than a volume takes to read one of its reads, so its ends pile up
+/// on the workers, and a read of the line stays queued all the same
+/// (`Ahead`).
+#[test]
+fn a_line_holds_back_a_read_ahead_however_late_its_reads_resubmit() {
+    let _alone = alone();
+    let line = Ahead::resubmitting_after("late-line", Duration::from_secs(1));
+    let held = line.read(seismic_io::Want::undated(1.));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(held.running(), "a read ahead was taken past the line");
+    drop(held);
+    line.finish();
 }

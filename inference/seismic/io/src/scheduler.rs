@@ -12,7 +12,7 @@ mod engine;
 mod handle;
 mod queue;
 
-pub use engine::{engine_work, read_buffers, EngineWork, Flight, Outstanding};
+pub use engine::{engine_work, read_buffers, read_workers, EngineWork, Flight, Outstanding};
 pub use handle::{Ending, Handle};
 
 pub(crate) use engine::{deepen, reading, totals, Buffers, Reading};

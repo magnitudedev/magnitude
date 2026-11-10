@@ -887,7 +887,7 @@ fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
 #[test]
 fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
     let _alone = alone();
-    let ahead = Ahead::queue("store-kept-ahead", 512);
+    let ahead = Ahead::queue("store-kept-ahead");
     let conveying = Conveying::of(2);
     let harness = lending("store-kept", EXPERTS, EXPERTS as u64, 1, 2 * STAGING, conveying, EXPERTS as u32, Placer::Bank, false);
     let step = harness.prompt_step();

@@ -53,7 +53,7 @@ fn a_hinted_experts_read_still_running_answers_its_request() {
     harness.demand_step(4);
     harness.staging_free();
     harness.tier_ready();
-    let ahead = Ahead::queue("hint-ahead", 512);
+    let ahead = Ahead::queue("hint-ahead");
     let step = harness.step();
     harness.hint(&step, 0, &[5]);
     eventually("the hint was never read", || harness.watcher.shared().costs().hints.reads == 1);
@@ -82,7 +82,7 @@ fn a_second_leads_hint_answers_the_request_two_layers_on() {
     harness.demand_step(4);
     harness.staging_free();
     harness.tier_ready();
-    let ahead = Ahead::queue("hint-two-ahead", 512);
+    let ahead = Ahead::queue("hint-two-ahead");
     let step = harness.step();
     harness.hint_at(&step, 0, 1, &[5]);
     eventually("the second lead's hint was never read", || harness.watcher.shared().costs().hints.reads == 1);
@@ -113,7 +113,7 @@ fn a_passed_hint_reads_nothing() {
     harness.tiering(1, &[0, 1, 2]);
     harness.demand_step(4);
     harness.tier_ready();
-    let ahead = Ahead::queue("hint-passed-ahead", 512);
+    let ahead = Ahead::queue("hint-passed-ahead");
     let step = harness.step();
     harness.hint(&step, 0, &[5]);
     eventually("the hint was never issued", || harness.watcher.shared().costs().hints.reads == 1);
@@ -158,7 +158,7 @@ fn a_hint_withdrawn_unread_lands_nothing() {
     let harness = layered("hint-withdrawn", EXPERTS, 12, 2, 4 + 4);
     harness.demand_step(4);
     let absent = settled(&harness);
-    let ahead = Ahead::queue("hint-withdrawn-ahead", 512);
+    let ahead = Ahead::queue("hint-withdrawn-ahead");
     let step = harness.step();
     harness.hint(&step, 0, &[absent[0] as i32]);
     eventually("the hint was never issued", || harness.watcher.shared().costs().hints.reads == 1);
@@ -182,7 +182,7 @@ fn a_hint_of_a_layer_routed_without_a_request_reads_nothing() {
     }
     harness.demand_step(4);
     harness.tier_ready();
-    let ahead = Ahead::queue("hint-routed-ahead", 512);
+    let ahead = Ahead::queue("hint-routed-ahead");
     let step = harness.step();
     let reads = harness.watcher.shared().costs().hints.reads;
     harness.hint(&step, 0, &[5]);

@@ -118,6 +118,15 @@ pub(crate) fn deepen(count: usize) -> Result<(), Error> {
     engine().deepen(count)
 }
 
+/// The pool's workers now. Each reads one piece at a time and, when it
+/// reads a request's last piece, runs that request's end before it takes
+/// another. The pool only grows, as a reader opens whose volume needs more
+/// ([`Engine::deepen`]).
+#[doc(hidden)]
+pub fn read_workers() -> usize {
+    *engine().workers.lock().expect("read workers")
+}
+
 /// The pool, its workers started by the readers that need them
 /// ([`Engine::deepen`]).
 pub(crate) fn engine() -> &'static Engine {
