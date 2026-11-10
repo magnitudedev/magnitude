@@ -20,6 +20,12 @@ const GetCatalog = query(
   { staleTime: Infinity, gcTime: Infinity }
 );
 
+const GetRecommendations = query(
+  Rpcs.getRecommendations,
+  (client) => client.models.getRecommendations,
+  { staleTime: Infinity, gcTime: Infinity }
+);
+
 const GetSlots = query(Rpcs.getSlots, (client) => client.models.getSlots, {
   staleTime: Infinity,
   gcTime: Infinity,
@@ -249,6 +255,7 @@ export const Models = Group.make({
   GetServingUsage,
   ListServableModels,
   GetCatalog,
+  GetRecommendations,
   GetSlots,
   GetLocalEnvironment,
   PreviewSlotLoad,

@@ -8,6 +8,7 @@ import {
   makeCatalogModel,
   makeHardware,
   makeInstalledCatalogModel,
+  recommendedModel,
 } from "./fixtures/inference"
 import { readHardwareNaming } from "./inference-client"
 import {
@@ -20,7 +21,7 @@ import {
 
 const streamedFit = () => {
   const model = makeCatalogModel()
-  if (model.servingState._tag !== "Assessed" || !("rankingScores" in model.servingState)) {
+  if (model.servingState._tag !== "Assessed") {
     throw new Error("the fixture model fits")
   }
   const assessment = { ...fitsAssessment(), residency: streamedFitResidency() }
@@ -48,7 +49,7 @@ describe("expert streaming", () => {
     expect(detail).toMatch(/Expert floor\s+1%/)
     expect(detail).toMatch(/Speed at the floor\s+~5 tok\/s/)
     const recommendation = renderRecommendations({
-      catalog: catalogState([model]), models: [model], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [model],
+      catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel),
     })
     expect(recommendation).toContain(
       "   Experts this machine allows 60%, the rest read from disk - Expert floor 1% - Speed at the floor ~5 tok/s")
@@ -83,7 +84,7 @@ describe("expert streaming", () => {
     expect(detail).toMatch(/Experts in Test GPU · GPU 1\s+300 MB/)
     expect(detail).not.toContain("Experts this machine allows")
     const recommendation = renderRecommendations({
-      catalog: catalogState([model]), models: [model], hardware: servingHardware("Discrete"), preference: { label: "Balanced" }, ranked: [model],
+      catalog: catalogState([model]), models: [model], hardware: servingHardware("Discrete"), developerCountry: Option.none(), recommended: [model].map(recommendedModel),
     })
     expect(recommendation).toContain("   Experts in memory 40%, floor 1%, ceiling 60% - Experts in Test GPU · GPU 1 300 MB")
     expect(recommendation).not.toContain("Experts this machine allows")

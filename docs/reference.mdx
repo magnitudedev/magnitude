@@ -35,7 +35,7 @@ Assessment and downloads run in the background. Use status commands to check pro
 | `catalog status` | Check catalog preparation and assessment. |
 | `catalog list` | List compatible catalog models. |
 | `catalog show <model-id>` | Read model details. |
-| `catalog recommendations` | Rank recommendations; defaults to Balanced and a limit of 10. |
+| `catalog recommendations` | Show the tested models recommended for this computer, each at the quant chosen for it; a limit of 10 by default. |
 | `catalog pull <model-id>` | Download or update a catalog model. |
 | `catalog cancel <model-id>` | Cancel a download or model update. |
 | `catalog remove <model-id>` | Remove an installed model. |
@@ -43,7 +43,7 @@ Assessment and downloads run in the background. Use status commands to check pro
 | `models load <model-id>` | Load a downloaded model into memory. |
 | `models stop [model-id]` | Stop a model, or the active one, without deleting it. |
 
-Prefix each command with `magnitude`. Recommendation preferences are `fastest`, `faster`, `balanced`, `smarter`, and `smartest`; use `--preference` and `--limit` to choose.
+Prefix each command with `magnitude`. Use `--country US` to recommend only models from developers in one country, and `--limit` to show fewer.
 
 ## Connections
 

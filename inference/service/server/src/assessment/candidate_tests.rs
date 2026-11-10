@@ -794,6 +794,7 @@ impl CatalogModels for StubCatalog {
                 revision: 1,
                 reconciliation_complete: true,
                 models: Vec::new(),
+                families: Vec::new(),
             })
         })
     }
@@ -1143,7 +1144,10 @@ async fn llama_test_catalog(
                 country: "CN".to_owned(),
             },
             support: CatalogSupport::Supported { intelligence: 1 },
-            fidelity_rank: 1,
+            quant: magnitude_service_contracts::models::CatalogQuant {
+                repository: "publisher/model-GGUF".to_owned(),
+                name: "Q4_K_M".to_owned(),
+            },
             quantization_aware: false,
         }],
         diagnostics: Vec::new(),
@@ -5958,7 +5962,11 @@ impl CatalogModels for ListedCatalog {
                 country: "CN".to_owned(),
             },
             support: CatalogSupport::Supported { intelligence: 1 },
-            fidelity_rank: 1,
+            quant: magnitude_service_contracts::models::CatalogQuant {
+                repository: "publisher/model-GGUF".to_owned(),
+                name: "Q4_K_M".to_owned(),
+            },
+            drafter: None,
             quantization_aware: false,
             local_state: magnitude_service_contracts::models::CatalogModelState::NotInstalled,
             aliases: Vec::new(),
@@ -5968,6 +5976,7 @@ impl CatalogModels for ListedCatalog {
                 revision: 1,
                 reconciliation_complete: true,
                 models: vec![model],
+                families: Vec::new(),
             })
         })
     }

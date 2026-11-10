@@ -3898,7 +3898,10 @@ mod tests {
                     country: "CN".to_owned(),
                 },
                 support: CatalogSupport::Supported { intelligence: 1 },
-                fidelity_rank: 1,
+                quant: magnitude_service_contracts::models::CatalogQuant {
+                    repository: "publisher/model-GGUF".to_owned(),
+                    name: "Q4_K_M".to_owned(),
+                },
                 quantization_aware: false,
             }],
             diagnostics: Vec::new(),

@@ -24,14 +24,14 @@ import {
   ModelStreamingStatusSchema,
   StreamingHostStatusSchema,
   StreamingTierStatusSchema,
-  UnavailableCatalogServingStateSchema,
+  CatalogLocalModelServingStateSchema,
 } from "@magnitudedev/sdk"
 import { Schema, Struct } from "effect"
 
 /*
  * `--json` documents carry the product facts the text form shows,
  * never the service's internal identities: assessment and environment IDs, memory-domain,
- * accelerator and device identities, managed paths and file ownership, or raw ranking inputs.
+ * accelerator and device identities, or managed paths and file ownership.
  * Catalog documents also carry no acquisition or residency state. These schemas mirror the
  * protocol's without those fields; encoding a protocol value through them drops the fields, so
  * callers pass protocol values unchanged.
@@ -129,8 +129,7 @@ const CustomAcquisitionStateJsonSchema = Schema.Union(
   Schema.Struct({ ...unavailable.fields, installation: InstallationJsonSchema }),
 )
 
-// Ranking scores are internal to recommendations, so JSON shows every catalog model's state as an unranked one.
-const [catalogAssessing, catalogFailed, catalogAssessedFits, catalogAssessedDoesNotFit] = UnavailableCatalogServingStateSchema.members
+const [catalogAssessing, catalogFailed, catalogAssessedFits, catalogAssessedDoesNotFit] = CatalogLocalModelServingStateSchema.members
 const CatalogServingStateJsonSchema = Schema.Union(
   catalogAssessing,
   catalogFailed,
@@ -145,12 +144,7 @@ const CustomServingStateJsonSchema = Schema.Union(
   Schema.Struct({ ...customAssessed.fields, assessment: LocalModelAssessmentJsonSchema }),
 )
 
-const [supportedCatalogData, disabledCatalogData, deprecatedCatalogData] = LocalModelCatalogDataSchema.members
-const CatalogDataJsonSchema = Schema.Union(
-  Schema.Struct(Struct.omit(supportedCatalogData.fields, "fidelityRank")),
-  Schema.Struct(Struct.omit(disabledCatalogData.fields, "fidelityRank")),
-  Schema.Struct(Struct.omit(deprecatedCatalogData.fields, "fidelityRank")),
-)
+const CatalogDataJsonSchema = LocalModelCatalogDataSchema
 
 /** A catalog model as catalog commands show it: curated and machine-specific evidence, nothing on disk. */
 export const CatalogModelJsonSchema = Schema.Struct({

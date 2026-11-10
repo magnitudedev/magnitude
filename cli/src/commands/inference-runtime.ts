@@ -5,23 +5,21 @@ import {
   formatLocalModelDisplayName,
   formatMemorySize,
   formatStorageSize,
-  LOCAL_MODEL_RANKING_SCALE_LABELS,
-  LOCAL_MODEL_RANKING_SCALE_VALUES,
   localModelAllocation,
   localModelExpertFacts,
   localModelFitFacts,
-  localModelIsInstalled,
   localModelRadarAxes,
   modelServingFacts,
-  rankedLocalModelOptions,
-  targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
 import {
+  CountryCodeSchema,
   LocalModelPreparationSchema,
   localModelDeprecation,
   localModelIntelligence,
-  type AvailableCatalogLocalModel,
   type CatalogLocalModel,
+  type CountryCode,
+  type RecommendedModel,
+  type Recommendations,
   type LocalInferenceHardware,
   type LocalModel,
   type ModelCatalogState,
@@ -31,6 +29,7 @@ import {
   catalogProducts,
   readCatalog,
   readHardware,
+  readRecommendations,
   withClient,
 } from "./inference-client"
 import { describeLocalHardware, formatContext } from "./inference-format"
@@ -201,19 +200,14 @@ export const showModelCatalog = (options: JsonOption = {}) => commandEffect({
   json: asJson(options, catalogListJson),
 })
 
-const preferenceNames = ["fastest", "faster", "balanced", "smarter", "smartest"] as const
-
-const parsePreference = (input: string) => {
-  const index = preferenceNames.indexOf(input.toLowerCase() as typeof preferenceNames[number])
-  return index < 0
-    ? Effect.fail(new ModelCommandError({
-        message: "Preference must be one of: fastest, faster, balanced, smarter, smartest",
-      }))
-    : Effect.succeed({
-        label: LOCAL_MODEL_RANKING_SCALE_LABELS[index]!,
-        value: LOCAL_MODEL_RANKING_SCALE_VALUES[index]!,
-      })
-}
+const parseCountry = (input: string | undefined) => input === undefined
+  ? Effect.succeed(Option.none<CountryCode>())
+  : Schema.decodeUnknown(CountryCodeSchema)(input.toUpperCase()).pipe(
+      Effect.map(Option.some),
+      Effect.mapError(() => new ModelCommandError({
+        message: "Country must be a two-letter ISO 3166-1 code, such as US",
+      })),
+    )
 
 export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => {
   const limit = Number(input)
@@ -226,8 +220,15 @@ export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => 
       }))
 }
 
+/** A recommended model with the catalog model of its chosen rung and the quant name of each rung. */
+export interface RecommendedCatalogModel {
+  readonly recommendation: RecommendedModel
+  readonly chosen: CatalogLocalModel
+  readonly quants: readonly string[]
+}
+
 const renderRecommendation = (hardware: LocalInferenceHardware) => (
-  model: AvailableCatalogLocalModel,
+  { recommendation, chosen: model, quants }: RecommendedCatalogModel,
   index: number,
 ): string => {
   const capabilities = capabilityLabels(model)
@@ -236,7 +237,8 @@ const renderRecommendation = (hardware: LocalInferenceHardware) => (
     `${index + 1}. ${labeledModelName(model)}`,
     `   ID: ${model.modelId}`,
     `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${model.catalogData.intelligence}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    `   Intelligence ${intelligenceLabel(model)} - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    `   Quants: ${quants.join(", ")}${recommendation.meetsTarget ? "" : " - below 20 tok/s on this computer"}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
@@ -249,36 +251,75 @@ export interface RecommendationsView {
   readonly catalog: ModelCatalogState
   readonly models: readonly CatalogLocalModel[]
   readonly hardware: LocalInferenceHardware
-  readonly preference: { readonly label: string }
-  readonly ranked: readonly AvailableCatalogLocalModel[]
+  readonly developerCountry: Option.Option<CountryCode>
+  readonly recommended: readonly RecommendedCatalogModel[]
 }
 
 export const RecommendationsJsonSchema = Schema.Struct({
   initializing: Schema.Boolean,
-  preference: Schema.String,
-  models: Schema.Array(CatalogModelJsonSchema),
+  developerCountry: optional(Schema.String),
+  models: Schema.Array(Schema.Struct({
+    base: Schema.String,
+    rungs: Schema.Array(Schema.String),
+    meetsTarget: Schema.Boolean,
+    meetsOnboardingFloor: Schema.Boolean,
+    model: CatalogModelJsonSchema,
+  })),
 })
 
 export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view: RecommendationsView) => ({
   initializing: view.catalog._tag === "Initializing",
-  preference: view.preference.label,
-  models: view.ranked,
+  developerCountry: view.developerCountry,
+  models: view.recommended.map(({ recommendation, chosen }) => ({
+    base: recommendation.base,
+    rungs: recommendation.rungs,
+    meetsTarget: recommendation.meetsTarget,
+    meetsOnboardingFloor: recommendation.meetsOnboardingFloor,
+    model: chosen,
+  })),
 }))
 
-export const showRecommendations = (preferenceInput: string, limitInput: string, options: JsonOption = {}) => commandEffect({
-  effect: Effect.all([parsePreference(preferenceInput), parseLimit(limitInput)]).pipe(
-    Effect.flatMap(([preference, limit]) => withClient((client) => Effect.gen(function* () {
-      const [catalog, hardware] = yield* Effect.all([readCatalog(client), readHardware(client)])
+/** The recommendations with a chosen rung, in order, each with its chosen catalog model. */
+export const recommendedCatalogModels = (
+  recommendations: Recommendations,
+  models: readonly CatalogLocalModel[],
+  limit: number,
+): readonly RecommendedCatalogModel[] => {
+  const byId = new Map(models.map((model) => [model.modelId as string, model] as const))
+  return recommendations.models.flatMap((recommendation) => Option.match(
+    Option.flatMap(recommendation.chosen, (id) => Option.fromNullable(byId.get(id))), {
+      onNone: () => [],
+      onSome: (chosen) => [{
+        recommendation,
+        chosen,
+        quants: recommendation.rungs.map((id) => Option.match(Option.fromNullable(byId.get(id)), {
+          onNone: () => String(id),
+          onSome: (rung) => String(rung.catalogData.quant.name),
+        })),
+      }],
+    })).slice(0, limit)
+}
+
+export const showRecommendations = (
+  countryInput: string | undefined,
+  limitInput: string,
+  options: JsonOption = {},
+) => commandEffect({
+  effect: Effect.all([parseCountry(countryInput), parseLimit(limitInput)]).pipe(
+    Effect.flatMap(([developerCountry, limit]) => withClient((client) => Effect.gen(function* () {
+      const [catalog, hardware, recommendations] = yield* Effect.all([
+        readCatalog(client),
+        readHardware(client),
+        readRecommendations(client, developerCountry),
+      ])
       const models = catalogModels(catalog)
-      const ranked = rankedLocalModelOptions(models.map((model) => ({
-        id: String(model.modelId),
-        kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const,
-        model,
-      })), {
-        fastToSmart: preference.value,
-        memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
-      }, limit).map(({ model }) => model)
-      return { catalog, models, hardware, preference, ranked }
+      return {
+        catalog,
+        models,
+        hardware,
+        developerCountry,
+        recommended: recommendedCatalogModels(recommendations, models, limit),
+      }
     }))),
   ),
   render: renderRecommendations,
@@ -289,23 +330,24 @@ export function renderRecommendations({
   catalog,
   models,
   hardware,
-  preference,
-  ranked,
+  developerCountry,
+  recommended,
 }: RecommendationsView): string {
   if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
   const system = describeLocalHardware(hardware).system.name
   const notice = [...assessmentNotice(models, "recommendations"), ...catalogWarnings(catalog)]
-  if (ranked.length === 0) return ensureTrailingNewline([
-    `No compatible recommendations are available for ${preference.label}.`,
+  const scope = Option.match(developerCountry, { onNone: () => "", onSome: (country) => ` from ${country} developers` })
+  if (recommended.length === 0) return ensureTrailingNewline([
+    `No models${scope} run on this computer.`,
     ...notice,
     "",
     HUGGING_FACE_HINT,
   ].join("\n"))
   return ensureTrailingNewline([
-    `Local model recommendations - ${preference.label}`,
+    `Recommended for this computer${scope}`,
     `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
     "",
-    ranked.map(renderRecommendation(hardware)).join("\n\n"),
+    recommended.map(renderRecommendation(hardware)).join("\n\n"),
     ...(notice.length > 0 ? ["", ...notice] : []),
     "",
     "Learn more: magnitude docs recommendations",

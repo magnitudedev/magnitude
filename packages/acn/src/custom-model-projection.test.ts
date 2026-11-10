@@ -79,7 +79,6 @@ describe("custom model rows", () => {
     expect(row.presentation.sourceUrls).toEqual(["https://huggingface.co/other/found-GGUF"])
     expect(row.acquisitionState._tag).toBe("External")
     expect(row.servingState._tag).toBe("Assessed")
-    expect(row.servingState).not.toHaveProperty("rankingScores")
   })
 
   it("shows the license ICN read for a custom model, and none when it read nothing", () => {
@@ -333,6 +332,7 @@ describe("local models state", () => {
     localModelsRevision: 2,
     reconciliationComplete: true,
     catalogModels: [],
+    families: [],
     customModels: models,
     hiddenModels,
     unsupported: [{
@@ -411,7 +411,8 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: modelId,
         source: {
-          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1,
+          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B",
+          quant: { repository: "unsloth/gemma-4-E2B-it-qat-GGUF", name: "UD-Q4_K_XL" }, drafter: Option.none(),
           license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, developer: { lab: "alibaba", name: "Alibaba", country: "CN" }, quantizationAware: true,
           releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported", intelligence: 1 }, variantLabel: "Q4 QAT",
           localState: {
@@ -451,7 +452,8 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: "minicpm5-2b:gguf:q8",
         source: {
-          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1,
+          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B",
+          quant: { repository: "openbmb/MiniCPM5-2B-GGUF", name: "Q8_0" }, drafter: Option.none(),
           desired: { metadata: { storageBytes: 2_679_710_688 }, profile: { contextLength: 131_072 }, speculativeMethod: Option.none() },
           drafterWithheld: true,
           license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, developer: { lab: "alibaba", name: "Alibaba", country: "CN" }, quantizationAware: false,
@@ -483,7 +485,8 @@ describe("local models state", () => {
         description: "",
         desired,
         displayName: "Catalog Model",
-        fidelityRank: 1,
+        quant: { repository: "owner/catalog-GGUF", name: "Q4_K_M" },
+        drafter: Option.none(),
         license: "apache-2.0",
         localState: {
           _tag: "Installed",

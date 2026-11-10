@@ -31,7 +31,9 @@ import {
   ModelIdSchema,
   ModelLocationSchema,
   ModelCatalogStateSchema,
+  CountryCodeSchema,
   ModelLoadPlanSchema,
+  RecommendationsSchema,
   ModelSlotsStateSchema,
   ProviderModelIdentitySchema,
   SlotIdSchema,
@@ -50,6 +52,17 @@ const ListServableModels = Rpc.make("ListServableModels", {
 const GetCatalog = Rpc.make("GetModelCatalog", {
   payload: Schema.Struct({}),
   success: ModelCatalogStateSchema,
+}).pipe(replaySafe)
+
+/**
+ * The tested models in the order they are recommended for this machine, each with its chosen rung, and the
+ * families Magnitude runs. With `developerCountry`, only models whose developer is from that country.
+ */
+const GetRecommendations = Rpc.make("GetRecommendations", {
+  payload: Schema.Struct({
+    developerCountry: Schema.optionalWith(CountryCodeSchema, { as: "Option", exact: true }),
+  }),
+  success: RecommendationsSchema,
 }).pipe(replaySafe)
 
 const GetSlots = Rpc.make("GetModelSlots", {
@@ -267,6 +280,7 @@ export const Models = {
   getServingUsage: GetServingUsage,
   listServableModels: ListServableModels,
   getCatalog: GetCatalog,
+  getRecommendations: GetRecommendations,
   getSlots: GetSlots,
   getLocalEnvironment: GetLocalEnvironment,
   refreshCatalog: RefreshCatalog,

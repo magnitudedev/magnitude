@@ -3209,6 +3209,29 @@
           "Drafter"
         ]
       },
+      "CatalogDrafter": {
+        "type": "object",
+        "description": "A catalog model's separately packaged drafter: its method, the repository that publishes it\nand the bytes it adds to the download.",
+        "required": [
+          "method",
+          "repository",
+          "sizeBytes"
+        ],
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/SpeculativeMethod"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "CatalogInstallationAdmission": {
         "oneOf": [
           {
@@ -3519,7 +3542,7 @@
           "parameterization",
           "developer",
           "support",
-          "fidelityRank",
+          "quant",
           "quantizationAware",
           "localState"
         ],
@@ -3563,10 +3586,11 @@
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
           },
-          "fidelityRank": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
+          "quant": {
+            "$ref": "#/components/schemas/CatalogQuant"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/CatalogDrafter"
           },
           "quantizationAware": {
             "type": "boolean"
@@ -3699,7 +3723,8 @@
         "required": [
           "revision",
           "reconciliationComplete",
-          "models"
+          "models",
+          "families"
         ],
         "properties": {
           "revision": {
@@ -3714,6 +3739,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CatalogModel"
+            }
+          },
+          "families": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelFamily"
             }
           }
         },
@@ -3754,6 +3785,23 @@
           "preparing",
           "tuning"
         ]
+      },
+      "CatalogQuant": {
+        "type": "object",
+        "description": "The quant a catalog model is: the repository that publishes it and its file quant name (for\nexample `UD-Q4_K_XL`), which states its bit width.",
+        "required": [
+          "repository",
+          "name"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "CatalogSupport": {
         "oneOf": [
@@ -8516,6 +8564,42 @@
           }
         },
         "additionalProperties": false
+      },
+      "ModelFamily": {
+        "type": "object",
+        "description": "A family of models Magnitude runs, by the GGUF architectures its models declare; fine-tunes and\nre-uploads of these architectures run too.",
+        "required": [
+          "name",
+          "developer",
+          "architectures",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
+          "architectures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "$ref": "#/components/schemas/ModelFamilyStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelFamilyStatus": {
+        "type": "string",
+        "description": "Whether Magnitude runs a model family now or will.",
+        "enum": [
+          "Supported",
+          "ComingSoon"
+        ]
       },
       "ModelFile": {
         "type": "object",

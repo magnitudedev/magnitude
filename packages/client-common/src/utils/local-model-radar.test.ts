@@ -33,7 +33,7 @@ describe("local model radar", () => {
     expect(intelligence.detail).toBe("Not rated")
   })
 
-  it("rates a custom model's fidelity from its weight type on the catalog's scale", () => {
+  it("rates a custom model's fidelity from its weight type", () => {
     expect(axis(makeFoundModel(), "FIDELITY")).toEqual({ label: "FIDELITY", value: Option.some(0.4), detail: "Medium (Q4)" })
     expect(axis(withQuantization("Q8_0", "Q8_0"), "FIDELITY")).toEqual({ label: "FIDELITY", value: Option.some(0.8), detail: "Very high (Q8)" })
     expect(axis(withQuantization("Q5_K", "Q5_K_M"), "FIDELITY").detail).toBe("High (Q5)")
@@ -66,8 +66,8 @@ describe("local model radar", () => {
     expect(ladder).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1].map(Option.some))
   })
 
-  it("keeps a catalog model's intelligence and catalog fidelity rank", () => {
+  it("keeps a catalog model's intelligence and rates its fidelity from its quant's bit width", () => {
     expect(axis(makeSetupModel(true), "INTELLIGENCE").detail).toBe("1%")
-    expect(axis(makeSetupModel(true), "FIDELITY").detail).toBe("Reduced (Q4)")
+    expect(axis(makeSetupModel(true), "FIDELITY").detail).toBe("Medium (Q4)")
   })
 })

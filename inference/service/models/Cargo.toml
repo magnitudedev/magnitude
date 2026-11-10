@@ -31,3 +31,6 @@ tempfile = "3.24.0"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+magnitude-family-registry = { path = "../../engine/families/registry" }

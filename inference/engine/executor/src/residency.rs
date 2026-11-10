@@ -1989,7 +1989,7 @@ mod tests {
         let device = crate::test_support::open_backend(&devices, seismic::BackendName::Metal).unwrap();
         for model in [
             "qwen3.8-flash-next:gguf:q4",
-            "qwen3.8-flash-next:gguf:nvfp4",
+            "qwen3.8-flash-next:gguf:q2",
         ] {
             let component = headers::index()
                 .iter()

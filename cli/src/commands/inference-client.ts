@@ -1,5 +1,5 @@
 import { localModelNamesMemory } from "@magnitudedev/client-common"
-import type { LocalInferenceHardware, LocalModel, MagnitudeClient, ModelCatalogState } from "@magnitudedev/sdk"
+import type { CountryCode, LocalInferenceHardware, LocalModel, MagnitudeClient, ModelCatalogState } from "@magnitudedev/sdk"
 import { Context, Effect, Option, type Scope } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 
@@ -20,6 +20,8 @@ export const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A,
 
 export const readCatalog = (client: CliModelsClient) => client.models.getCatalog({})
 export const readHardware = (client: CliModelsClient) => client.models.getLocalEnvironment({})
+export const readRecommendations = (client: CliModelsClient, developerCountry: Option.Option<CountryCode>) =>
+  client.models.getRecommendations({ developerCountry })
 
 /** The hardware a model's facts name its memory by; read only for a model whose facts do. */
 export const readHardwareNaming = (

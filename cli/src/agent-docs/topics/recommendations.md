@@ -1,21 +1,15 @@
 # Model recommendations
 
-`magnitude catalog recommendations` suggests local-model configurations that Magnitude expects to
-work well on this computer. It considers whether a configuration is compatible with the machine
-and likely to fit in memory, then weighs model intelligence, expected generation speed, and how
-faithfully the local artifact preserves the source model.
+`magnitude catalog recommendations` lists the models Magnitude has tested, in the order it
+recommends them for this computer. Each tested model has a ladder of quants, smallest to largest,
+and each recommendation names the quant chosen for this computer: the largest one that fits in
+memory, has room on disk and is estimated to decode at 20 tokens per second or more in a long agent
+conversation, or else the fastest one that fits.
 
-The default `Balanced` view aims for a useful compromise between speed and intelligence. The
-other preferences shift that tradeoff; they are not separate model catalogs. Use `faster` or
-`smarter` for normal requests to lean toward speed or intelligence while still meaningfully
-considering both. If a user asks for “fast and smart options,” these are the two views to compare.
-
-`fastest` and `smartest` are extremes. `fastest` prioritizes speed and gives intelligence only
-limited consideration, so use it only when the user clearly cares little about intelligence and
-wants maximum speed. `smartest` prioritizes intelligence and gives speed only limited
-consideration, so use it only when the user clearly accepts slow generation in exchange for maximum
-intelligence. A recommendation is a starting point for choosing with the user, not a claim that one
-model is best for every workload.
+Models whose chosen quant reaches 20 tokens per second come first, by intelligence; the rest follow,
+also by intelligence, marked "below 20 tok/s on this computer". `--country US` recommends only
+models whose developer is from that country, choosing among them the same way. A recommendation is
+a starting point for choosing with the user, not a claim that one model is best for every workload.
 
 ## What the displayed properties tell you
 
@@ -31,14 +25,15 @@ model is best for every workload.
   does, shown as "64K of 256K". Below 32K a model is reported as not fitting, since a coding agent's
   prompt and tools alone fill much of a smaller context. A request longer than the served context
   fails with `context_length_exceeded` rather than running the computer out of memory; connected
-  harnesses are updated with the served context. Recommendations prefer a version that serves 64K
-  or more over a higher-fidelity one that serves less.
+  harnesses are updated with the served context.
 - **Intelligence** is the model's Artificial Analysis Intelligence Index score. Magnitude displays
   it with a percent sign, but it is an index score—not a probability or the percentage of questions
   the model answers correctly. Quantized variants of the same source model generally share this
   model-level score.
 - **Fidelity** describes how faithfully the local artifact is expected to preserve the source model
-  after quantization. It does not mean factual accuracy and is separate from Intelligence.
+  after quantization, from its quant's bit width. It does not mean factual accuracy and is separate
+  from Intelligence.
+- **Quants** lists the model's tested ladder by quant name, smallest to largest.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
   configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`,
   `DSpark`, and `LiLiCorr` mean and how Magnitude sets them up.

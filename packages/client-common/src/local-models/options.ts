@@ -1,14 +1,8 @@
 import { Option } from "effect"
-import {
-  localModelIsAvailable,
-  parseModelId,
-  type AvailableCatalogLocalModel,
-  type CatalogLocalModel,
-} from "@magnitudedev/sdk"
+import { localModelIsAvailable } from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
-  LocalModelRankingScores,
   LocalModelsState,
   ModelSlotsState,
   ProviderModelId,
@@ -22,62 +16,16 @@ export interface LocalModelOption {
   readonly model: LocalModel
 }
 
-/** An option recommendations rank: only a supported catalog model is ranked. */
-export interface RankedLocalModelOption extends LocalModelOption {
-  readonly model: AvailableCatalogLocalModel
-}
-
-export interface LocalModelRankingPreference {
-  readonly fastToSmart: number
-  readonly memoryBudgetBytes: number
-}
-
-export const LOCAL_MODEL_RANKING_SCALE_LABELS = [
-  "Fastest",
-  "Faster",
-  "Balanced",
-  "Smarter",
-  "Smartest",
-] as const
-
-export const LOCAL_MODEL_RANKING_SCALE_VALUES = [0.05, 0.25, 0.5, 0.75, 0.95] as const
-
-export const LOCAL_MODEL_RANKING_SCALE_INTERVALS = LOCAL_MODEL_RANKING_SCALE_VALUES.length - 1
-
-export const localModelRankingScaleIndex = (value: number): number =>
-  LOCAL_MODEL_RANKING_SCALE_VALUES.reduce((closestIndex, candidate, index) =>
-    Math.abs(candidate - value) < Math.abs(LOCAL_MODEL_RANKING_SCALE_VALUES[closestIndex]! - value)
-      ? index
-      : closestIndex, 0)
-
-const clamp01 = (value: number): number => Number.isFinite(value)
-  ? Math.min(1, Math.max(0, value))
-  : 0
-
 const kindOrder: Record<LocalModelOption["kind"], number> = {
   running: 0,
   stored: 1,
   downloadable: 2,
 }
 
-/** Utility over the scores present; without a speed estimate it is intelligence and fidelity alone. */
-export const localModelRankingUtility = (
-  scores: LocalModelRankingScores,
-  fastToSmart: number,
-): number => {
-  const preference = clamp01(fastToSmart)
-  return scores.intelligence ** (0.9 * preference)
-    * Option.match(scores.speed, {
-      onNone: () => 1,
-      onSome: (speed) => speed ** (0.9 * (1 - preference)),
-    })
-    * scores.fidelity ** 0.1
-}
-
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
   hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
 
-/** Every installed, fitting model an agent can use, including custom models without ranking scores. */
+/** Every installed, fitting model an agent can use, catalog or custom. */
 export const localModelConnectionOptions = (
   models: readonly LocalModel[],
 ): readonly { readonly id: ProviderModelId; readonly label: string }[] => models
@@ -86,54 +34,6 @@ export const localModelConnectionOptions = (
     label: formatLocalModelDisplayName(model),
   }))))
   .sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id))
-
-export const rankedLocalModelOptions = (
-  options: readonly LocalModelOption[],
-  preference: LocalModelRankingPreference,
-  limit = 10,
-): readonly RankedLocalModelOption[] => options
-  .flatMap((option): readonly {
-    readonly option: RankedLocalModelOption
-    readonly speedEstimated: boolean
-    readonly utility: number
-  }[] => {
-    const { model } = option
-    if (model._tag !== "Catalog" || !localModelIsAvailable(model)) return []
-    const serving = model.servingState
-    if (serving._tag !== "Assessed"
-      || serving.assessment._tag !== "Fits"
-      || !("rankingScores" in serving)
-      || !Number.isFinite(preference.memoryBudgetBytes)
-      || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
-    return [{
-      option: { ...option, model },
-      speedEstimated: Option.isSome(serving.rankingScores.speed),
-      utility: localModelRankingUtility(serving.rankingScores, preference.fastToSmart),
-    }]
-  })
-  // Utilities with and without the speed term are not comparable, so a fitting model whose speed
-  // is pending or unavailable follows every model with an estimate, ranked among its own kind.
-  .sort((left, right) => Number(right.speedEstimated) - Number(left.speedEstimated)
-    || right.utility - left.utility
-    || left.option.model.modelId.localeCompare(right.option.model.modelId))
-  .slice(0, Math.max(0, Math.floor(limit)))
-  .map(({ option }) => option)
-
-/** Keep up to two configurations of each catalog base, preserving ranking order. */
-export const featuredCatalogModels = (
-  ranked: readonly CatalogLocalModel[],
-  limit = 5,
-): readonly CatalogLocalModel[] => {
-  const represented = new Map<string, number>()
-  return ranked.filter(model => {
-    const identity = parseModelId(model.modelId)
-    const baseId = identity._tag === "Catalog" ? identity.baseId : model.modelId
-    const count = represented.get(baseId) ?? 0
-    if (count >= 2) return false
-    represented.set(baseId, count + 1)
-    return true
-  }).slice(0, Math.max(0, Math.floor(limit)))
-}
 
 export const localModelOptions = (
   models: LocalModelsState,

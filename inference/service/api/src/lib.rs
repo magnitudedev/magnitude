@@ -3365,6 +3365,7 @@ mod tests {
                     revision: 0,
                     reconciliation_complete: true,
                     models: Vec::new(),
+                    families: Vec::new(),
                 })
             })
         }

@@ -36,6 +36,7 @@ import {
   TEST_REPOSITORY,
   unsupportedAssessment,
   unreadableAssessment,
+  recommendedModel,
 } from "./fixtures/inference"
 import { registerInferenceCommands } from "./inference"
 import type { CliModelsClient } from "./inference-client"
@@ -139,8 +140,8 @@ const program = () => {
 
 describe("inference argument validation", () => {
   it.each([
-    [() => showRecommendations("unknown", "10"), "Preference must be one of: fastest, faster, balanced, smarter, smartest"],
-    [() => showRecommendations("balanced", "0"), "Limit must be a positive integer"],
+    [() => showRecommendations("USA", "10"), "Country must be a two-letter ISO 3166-1 code, such as US"],
+    [() => showRecommendations(undefined, "0"), "Limit must be a positive integer"],
     [() => showCatalogModel(""), "Invalid catalog model ID: "],
     [() => showCatalogModel("hf:test/model/model.gguf"), "Invalid catalog model ID: hf:test/model/model.gguf"],
     [() => pullModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
@@ -207,7 +208,7 @@ describe("inference command surface", () => {
       "catalog status": { arguments: [], options: [] },
       "catalog list": { arguments: [], options: [] },
       "catalog show": { arguments: ["<model-id>"], options: [] },
-      "catalog recommendations": { arguments: [], options: ["--preference", "--limit"] },
+      "catalog recommendations": { arguments: [], options: ["--country", "--limit"] },
       "catalog search": { arguments: ["<query>"], options: ["--limit"] },
       "catalog inspect": { arguments: ["<reference>"], options: [] },
       "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
@@ -292,11 +293,11 @@ describe("catalog renderers", () => {
 
   it("ends recommendations with the methodology and Hugging Face hints", () => {
     const model = makeCatalogModel()
-    const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), preference: { label: "Balanced" } }
-    const lines = renderRecommendations({ ...view, ranked: [model] }).trimEnd().split("\n")
+    const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none() }
+    const lines = renderRecommendations({ ...view, recommended: [model].map(recommendedModel) }).trimEnd().split("\n")
     expect(lines.at(-2)).toBe("Learn more: magnitude docs recommendations")
     expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude catalog search \"<model name>\"")
-    expect(renderRecommendations({ ...view, ranked: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude catalog search")
+    expect(renderRecommendations({ ...view, recommended: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude catalog search")
   })
 
   it("heads recommendations with the machine, and lists the device in use before available ones", () => {
@@ -307,7 +308,7 @@ describe("catalog renderers", () => {
     const hardware = { ...base, accelerators: [igpu, ...base.accelerators],
       memoryDomains: [{ memoryDomainId: system, kind: "System" as const, totalBytes: base.totalSystemMemoryBytes, availableBytes: Option.none() }, ...base.memoryDomains] }
     const model = makeCatalogModel()
-    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, preference: { label: "Balanced" }, ranked: [model] }).split("\n")
+    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
     expect(lines[1]).toBe("Workstation · Test CPU - 68.7 GB")
     expect(describeLocalHardware(hardware).accelerators).toEqual([
       { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
@@ -319,7 +320,7 @@ describe("catalog renderers", () => {
     const GB = 1_000_000_000
     const fitting = (served: number) => {
       const model = makeCatalogModel()
-      if (model.servingState._tag !== "Assessed" || !("rankingScores" in model.servingState)) {
+      if (model.servingState._tag !== "Assessed") {
         throw new Error("the fixture model fits")
       }
       return makeCatalogModel({ servingState: { ...model.servingState, assessment: {
@@ -1125,7 +1126,7 @@ describe("drafter updates", () => {
 })
 
 describe("--json internal identities", () => {
-  const internal = /"(assessmentId|environmentId|rankingScores|fidelityRank|acceleratorId|memoryDomainId|deviceId|primaryPath|ownership|limitingResource)"/
+  const internal = /"(assessmentId|environmentId|acceleratorId|memoryDomainId|deviceId|primaryPath|ownership|limitingResource)"/
   const loading = (model: CustomLocalModel): CustomLocalModel => model.acquisitionState._tag === "External"
     ? { ...model, acquisitionState: { ...model.acquisitionState, residencyState: { _tag: "Requested" } } }
     : model
@@ -1137,7 +1138,7 @@ describe("--json internal identities", () => {
     const documents = [
       encode(catalogListJson, catalog),
       encode(catalogDetailJson, { model: makeCatalogModel(), models: [] }),
-      encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [makeCatalogModel()] }),
+      encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), developerCountry: Option.none(), recommended: [makeCatalogModel()].map(recommendedModel) }),
       encode(modelsStatusJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
       encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
       encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }),

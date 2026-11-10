@@ -4,7 +4,7 @@ import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
 } from "@magnitudedev/acn-protocol"
-import type { CatalogModel, CustomModel, UnsupportedLocalModel } from "@magnitudedev/icn-protocol/schemas"
+import type { CatalogModel, CustomModel, ModelFamily, UnsupportedLocalModel } from "@magnitudedev/icn-protocol/schemas"
 import { materializeProjection } from "./materialized-projection"
 
 export interface CatalogModelSource {
@@ -22,6 +22,7 @@ export interface LocalModelSourcesState {
   readonly localModelsRevision: number
   readonly reconciliationComplete: boolean
   readonly catalogModels: readonly CatalogModelSource[]
+  readonly families: readonly ModelFamily[]
   readonly customModels: readonly CustomModelSource[]
   readonly hiddenModels: readonly CustomModelSource[]
   readonly unsupported: readonly UnsupportedLocalModel[]
@@ -65,6 +66,7 @@ export const LocalModelSourcesLive: Layer.Layer<LocalModelSources, never, IcnCat
         localModelsRevision: local.state.revision,
         reconciliationComplete: catalog.state.reconciliationComplete && local.state.reconciliationComplete,
         catalogModels,
+        families: catalog.state.families,
         customModels,
         hiddenModels,
         unsupported: local.state.unsupported,

@@ -31,6 +31,7 @@ import {
   makeSearchResponse,
   TEST_COMMIT,
   TEST_REPOSITORY,
+  recommendedModel,
 } from "./fixtures/inference"
 import { CliModelsConnection, withClient, type CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
@@ -531,8 +532,6 @@ describe("models status variant and drafter columns", () => {
 const INTERNAL_KEYS = [
   "assessmentId",
   "environmentId",
-  "rankingScores",
-  "fidelityRank",
   "acceleratorId",
   "memoryDomainId",
   "deviceId",
@@ -601,7 +600,7 @@ describe("--json never leaks internals", () => {
     const documents: Record<string, unknown>[] = [
       encode(catalogListJson, state),
       encode(catalogDetailJson, { model: catalog, models: all }),
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog, ...catalogs] }),
+      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog, ...catalogs].map(recommendedModel) }),
       encode(modelsStatusJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
       ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
@@ -622,7 +621,7 @@ describe("--json never leaks internals", () => {
     const documents = [
       encode(catalogListJson, state),
       encode(catalogDetailJson, { model: catalog, models: [catalog] }),
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog] }),
+      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel) }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(/"(acquisitionState|residencyState|installation)"/)
   })

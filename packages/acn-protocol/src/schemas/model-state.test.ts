@@ -4,7 +4,7 @@ import {
   LocalModelFitsAssessmentSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
-  AvailableCatalogServingStateSchema,
+  CatalogLocalModelServingStateSchema,
   CatalogSupportSchema,
   CandidateInspectionSchema,
   CustomLocalModelServingStateSchema,
@@ -20,7 +20,8 @@ import {
   ModelIdSchema,
   ModelLocationSchema,
   StreamingResizeSchema,
-  UnavailableCatalogServingStateSchema,
+  RecommendedModelSchema,
+  comparisonTokensPerSecond,
   modelLocationState,
   ModelParameterizationSchema,
   ModelReleaseDateSchema,
@@ -41,7 +42,7 @@ const catalogModel = {
     developer: { lab: "alibaba", name: "Alibaba", country: "CN" },
     intelligence: 1,
     support: { _tag: "Supported" },
-    fidelityRank: 1,
+    quant: { repository: "publisher/model-GGUF", name: "Q4_K_M" },
     quantizationAware: false,
     aliases: [],
   },
@@ -382,17 +383,13 @@ describe("LocalModelSchema invariants", () => {
           },
         },
       },
-      rankingScores: { intelligence: 0.5, speed: 0.1, fidelity: 0.5 },
     }
     const withPerformance = (performance: unknown) => ({
       ...fits,
       assessment: { ...fits.assessment, residency: { _tag: "Resident", performance } },
     })
     const withoutPerformance = withPerformance({ _tag: "Estimated", samples: [] })
-    const pending = {
-      ...withPerformance({ _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } }),
-      rankingScores: { intelligence: 0.5, fidelity: 0.5 },
-    }
+    const pending = withPerformance({ _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } })
     const unavailable = withPerformance({
       _tag: "Unavailable",
       failure: { code: "performance_unavailable", message: "hung", retryable: false },
@@ -407,16 +404,11 @@ describe("LocalModelSchema invariants", () => {
         detail: "unrecognized architecture deepseek4",
       },
     }
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(fits)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(withoutPerformance)).toThrow()
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(pending)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unavailable)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unsupported)).toThrow()
-    expect(() => Schema.decodeUnknownSync(UnavailableCatalogServingStateSchema)(unsupported)).toThrow()
-    // A fitting available model is ranked; an unavailable one never is.
-    const { rankingScores: _rankingScores, ...unranked } = fits
-    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unranked)).toThrow()
-    expect(() => Schema.decodeUnknownSync(UnavailableCatalogServingStateSchema)(unranked)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(pending)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unavailable)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
     const { profile: _profile, ...unreadable } = unsupported.assessment
     expect(Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
@@ -702,5 +694,46 @@ describe("ModelCapabilitiesSchema reasoning", () => {
     expect(capabilities({ supported: false, efforts: [], defaultEffort: "none" })._tag).toBe("Left")
     expect(capabilities({ supported: true, efforts: ["high", "high"], defaultEffort: "high" })._tag).toBe("Left")
     expect(capabilities({ supported: true, efforts: ["none", "high"], defaultEffort: "low" })._tag).toBe("Left")
+  })
+})
+
+describe("comparisonTokensPerSecond", () => {
+  const samples = [
+    { contextTokens: 25_000, estimatedTokensPerSecond: 30 },
+    { contextTokens: 50_000, estimatedTokensPerSecond: 24 },
+    { contextTokens: 131_072, estimatedTokensPerSecond: 12 },
+  ]
+
+  it("reads the estimate nearest 50K, or nearest the served context when it is shorter", () => {
+    expect(comparisonTokensPerSecond({ _tag: "Estimated", samples }, 131_072)).toEqual(Option.some(24))
+    expect(comparisonTokensPerSecond({ _tag: "Estimated", samples }, 32_768)).toEqual(Option.some(30))
+    expect(comparisonTokensPerSecond({ _tag: "Pending", measurement: { _tag: "Measuring" } }, 131_072))
+      .toEqual(Option.none())
+  })
+})
+
+describe("RecommendedModelSchema", () => {
+  const recommendation = {
+    base: "model",
+    name: "Model",
+    developer: { lab: "google", name: "Google", country: "US" },
+    intelligence: 40,
+    chosen: "model:gguf:q4",
+    rungs: ["model:gguf:q2", "model:gguf:q4"],
+    meetsTarget: true,
+    meetsOnboardingFloor: true,
+  }
+
+  it("requires the chosen rung among the rungs, and a speed only of a chosen rung", () => {
+    expect(() => Schema.decodeUnknownSync(RecommendedModelSchema)(recommendation)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(RecommendedModelSchema)({ ...recommendation, chosen: "model:gguf:q8" }))
+      .toThrow()
+    const { chosen: _chosen, ...unchosen } = recommendation
+    expect(() => Schema.decodeUnknownSync(RecommendedModelSchema)(unchosen)).toThrow()
+    expect(() => Schema.decodeUnknownSync(RecommendedModelSchema)({
+      ...unchosen,
+      meetsTarget: false,
+      meetsOnboardingFloor: false,
+    })).not.toThrow()
   })
 })

@@ -1667,8 +1667,49 @@ pub struct RecommendableModel {
     pub parameterization: ModelParameterization,
     pub developer: ModelDeveloper,
     pub support: CatalogSupport,
-    pub fidelity_rank: u32,
+    pub quant: CatalogQuant,
     pub quantization_aware: bool,
+}
+
+/// The quant a catalog model is: the repository that publishes it and its file quant name (for
+/// example `UD-Q4_K_XL`), which states its bit width.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogQuant {
+    pub repository: String,
+    pub name: String,
+}
+
+/// A catalog model's separately packaged drafter: its method, the repository that publishes it
+/// and the bytes it adds to the download.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogDrafter {
+    pub method: SpeculativeMethod,
+    pub repository: String,
+    pub size_bytes: u64,
+}
+
+/// Whether Magnitude runs a model family now or will.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelFamilyStatus {
+    Supported,
+    ComingSoon,
+}
+
+/// A family of models Magnitude runs, by the GGUF architectures its models declare; fine-tunes and
+/// re-uploads of these architectures run too.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelFamily {
+    pub name: String,
+    pub developer: ModelDeveloper,
+    pub architectures: Vec<String>,
+    pub status: ModelFamilyStatus,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1761,7 +1802,10 @@ pub struct CatalogModel {
     pub parameterization: ModelParameterization,
     pub developer: ModelDeveloper,
     pub support: CatalogSupport,
-    pub fidelity_rank: u32,
+    pub quant: CatalogQuant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub drafter: Option<CatalogDrafter>,
     pub quantization_aware: bool,
     pub local_state: CatalogModelState,
     #[serde(default)]
@@ -1775,6 +1819,7 @@ pub struct CatalogModelsResponse {
     pub revision: u64,
     pub reconciliation_complete: bool,
     pub models: Vec<CatalogModel>,
+    pub families: Vec<ModelFamily>,
 }
 
 /// Where a scanned custom model was found.

@@ -1,5 +1,5 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CountryCodeSchema, LabIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type AvailableCatalogLocalModel, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CountryCodeSchema, LabIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, HuggingFaceRepositoryIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, QuantNameSchema, type AvailableCatalogLocalModel, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
 export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel => {
   return {
@@ -19,7 +19,8 @@ export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel =
         developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") },
         intelligence: 1,
         support: { _tag: "Supported" },
-        fidelityRank: 1,
+        quant: { repository: HuggingFaceRepositoryIdSchema.make("owner/Setup-Model-GGUF"), name: QuantNameSchema.make("Q4_K_M") },
+        drafter: Option.none(),
         quantizationAware: false,
         aliases: [],
     },
@@ -75,11 +76,6 @@ export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel =
             samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
           },
         },
-      },
-      rankingScores: {
-        intelligence: 0.7,
-        speed: installed ? Option.none() : Option.some(0.8),
-        fidelity: 0.9,
       },
     },
   }

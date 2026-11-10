@@ -53,9 +53,8 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Model recommendations")
     expect(result.output).toContain("Artificial Analysis Intelligence Index")
-    expect(result.output).toContain("normal requests to lean toward speed or intelligence")
-    expect(result.output).toContain("`fastest` and `smartest` are extremes")
-    expect(result.output).toContain("`smartest` prioritizes intelligence and gives speed only")
+    expect(result.output).toContain("estimated to decode at 20 tokens per second or more")
+    expect(result.output).toContain("`--country US` recommends only")
     expect(result.output).toContain("shorter and longer contexts")
     expect(result.output).toContain("useful reference points")
     expect(result.output).toContain("magnitude docs speculative-methods")

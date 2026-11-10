@@ -18,6 +18,14 @@
     { "id": "zai", "name": "Z.ai", "country": "CN", "huggingFaceOrganizations": ["zai-org"] },
     { "id": "prismml", "name": "PrismML", "country": "US", "huggingFaceOrganizations": ["prism-ml"] }
   ],
+  "families": [
+    { "name": "Qwen 3.5–3.8", "lab": "alibaba", "architectures": ["qwen35", "qwen35moe", "qwen4exp"], "status": "supported" },
+    { "name": "Gemma 4", "lab": "google", "architectures": ["gemma4"], "status": "supported" },
+    { "name": "LFM 2.5 and 3", "lab": "liquid", "architectures": ["lfm2", "lfm2moe", "lfm3"], "status": "supported" },
+    { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
+    { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
+    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" }
+  ],
   "models": [
     {
       "id": "qwen3.5-4b",
@@ -30,7 +38,7 @@
       "sources": [
         {
           "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -61,7 +69,7 @@
       "sources": [
         {
           "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -88,7 +96,7 @@
       "sources": [
         {
           "repository": "unsloth/Qwen3.8-27B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -114,16 +122,15 @@
       "support": { "level": "supported" },
       "sources": [
         {
-          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "path": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-          "projector": { "path": "mmproj-BF16.gguf" },
-          "license": "qwen-community-1.0"
+          "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
+          "license": "apache-2.0"
         },
         {
-          "repository": "magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF",
-          "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "Qwen3.8-Flash-Next-NVFP4-00001-of-00003.gguf", "variantLabel": "NVFP4", "fidelityRank": 70, "quantizationAware": true}],
-          "projector": { "path": "mmproj-Qwen3.8-Flash-Next-NVFP4-BF16.gguf" },
-          "license": "nvidia-open-model-license"
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "qwen-community-1.0"
         }
       ],
       "speculativeDecoding": {
@@ -151,7 +158,7 @@
       "sources": [
         {
           "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -185,7 +192,7 @@
       "sources": [
         {
           "repository": "unsloth/Muse-Glimmer-30B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
           "license": "apache-2.0"
         }
@@ -212,7 +219,7 @@
       "sources": [
         {
           "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -250,7 +257,7 @@
       "sources": [
         {
           "repository": "unsloth/gemma-4-E4B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -288,7 +295,7 @@
       "sources": [
         {
           "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "lfm1.0"
         }
       ],
@@ -325,7 +332,7 @@
       "sources": [
         {
           "repository": "LiquidAI/LFM2.5-8B-A1B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "lfm1.0"
         }
       ],
@@ -368,7 +375,7 @@
       "sources": [
         {
           "repository": "LiquidAI/LFM2.5-24B-A2B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "lfm1.0"
         }
       ],
@@ -399,7 +406,7 @@
       "sources": [
         {
           "repository": "LiquidAI/LFM3-1.7B-GGUF",
-          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "fidelityRank": 40, "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "lfm1.0"
         }
       ],
@@ -430,7 +437,7 @@
       "sources": [
         {
           "repository": "LiquidAI/LFM3-VL-2B-GGUF",
-          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "fidelityRank": 40, "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": {"path": "mmproj-LFM3-VL-2B-BF16.gguf"},
           "license": "lfm1.0"
         }
@@ -463,7 +470,7 @@
       "sources": [
         {
           "repository": "openbmb/MiniCPM5-1B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "apache-2.0"
         }
       ],
@@ -492,7 +499,7 @@
       "sources": [
         {
           "repository": "openbmb/MiniCPM5-2B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "apache-2.0"
         }
       ],
@@ -518,7 +525,7 @@
       "sources": [
         {
           "repository": "openbmb/MiniCPM-V-4.7-1B-gguf",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": {"path": "mmproj-model-f16-4x.gguf"},
           "license": "apache-2.0"
         }
@@ -557,7 +564,7 @@
       "sources": [
         {
           "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
-          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": {"path": "mmproj-model-f16-4x.gguf"},
           "license": "apache-2.0"
         }
@@ -601,7 +608,7 @@
       "sources": [
         {
           "repository": "prism-ml/Bonsai-8B-gguf",
-          "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "fidelityRank": 20, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "quantizationAware": true}],
           "license": "apache-2.0"
         }
       ],
@@ -631,7 +638,7 @@
       "sources": [
         {
           "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -669,7 +676,7 @@
       "sources": [
         {
           "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -707,7 +714,7 @@
       "sources": [
         {
           "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -745,7 +752,7 @@
       "sources": [
         {
           "repository": "unsloth/Laguna-S-2.1-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "openmdw-1.1"
         }
       ]
@@ -761,7 +768,7 @@
       "sources": [
         {
           "repository": "unsloth/Qwen3.5-122B-A10B-MTP-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "apache-2.0"
         }
@@ -787,7 +794,7 @@
       "sources": [
         {
           "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
           "license": "nvidia-nemotron-open-model-license"
         }
       ],
@@ -812,7 +819,7 @@
       "sources": [
         {
           "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
-          "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "openmdw-1.1"
         }
       ],
@@ -845,7 +852,7 @@
       "sources": [
         {
           "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
-          "variants": [{"variantId": "gguf:iq2-qat", "format": "IQ2_XXS", "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", "variantLabel": "IQ2 QAT", "fidelityRank": 38, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:iq2-qat", "format": "IQ2_XXS", "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", "variantLabel": "IQ2 QAT", "quantizationAware": true}],
           "projector": { "path": "mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf" },
           "license": "openmdw-1.1"
         }
@@ -885,7 +892,7 @@
       "sources": [
         {
           "repository": "unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF",
-          "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "path": "NVFP4/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-00001-of-00003.gguf", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
           "projector": { "path": "mmproj-BF16.gguf" },
           "license": "openmdw-1.1"
         }
@@ -919,7 +926,7 @@
       "sources": [
         {
           "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF",
-          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
           "license": "mit"
         }
       ],
@@ -936,7 +943,7 @@
       "sources": [
         {
           "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
-          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
           "license": "openmdw-1.1"
         }
       ],
@@ -961,7 +968,7 @@
       "sources": [
         {
           "repository": "unsloth/GLM-5.2-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
           "license": "mit"
         }
       ],

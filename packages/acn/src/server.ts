@@ -93,6 +93,7 @@ import { LocalModelSourcesLive } from "./local-model-sources"
 import { LocalModelsLive } from "./local-models"
 import { LocalModelRemovalsLive } from "./local-model-removals"
 import { ModelCatalogLive } from "./model-catalog"
+import { RecommendationsLive } from "./recommendations"
 import { ModelCommandsLive } from "./model-commands"
 import { LocalProviderOfferingsLive } from "./local-provider-offerings"
 import type { AcnOwnerControl } from "./owned-control"
@@ -365,7 +366,7 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ChatServiceLive.pipe(Layer.provide(ChatStoreLive.pipe(Layer.provide(BunSqliteDriverLayer)))),
     withInference,
   )
-  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withChats)
+  const withModelCatalog = Layer.provideMerge(Layer.merge(ModelCatalogLive, RecommendationsLive), withChats)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
     withModelCatalog

@@ -84,7 +84,7 @@ docker logs magnitude
 </Step>
 <Step title="Download a model">
 ```sh
-docker exec magnitude magnitude catalog recommendations --preference balanced --limit 5
+docker exec magnitude magnitude catalog recommendations --limit 5
 docker exec magnitude magnitude catalog pull "MODEL_ID"
 docker exec magnitude magnitude models status "MODEL_ID"
 ```

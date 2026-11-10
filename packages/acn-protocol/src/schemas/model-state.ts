@@ -576,6 +576,24 @@ export const localModelPerformanceContexts = (contextLength: number): readonly n
   contextLength,
 ])].sort((left, right) => left - right)
 
+/** The context depth models are compared at: a long agent conversation, capped at the served context. */
+export const COMPARISON_CONTEXT_TOKENS = 50_000
+
+/**
+ * A fit's estimated decode speed at the comparison depth: the estimate whose depth is nearest
+ * min(50K, served context); none until speed is estimated.
+ */
+export const comparisonTokensPerSecond = (
+  performance: LocalModelPerformance,
+  servedContextLength: number,
+): Option.Option<number> => {
+  if (performance._tag !== "Estimated") return Option.none()
+  const depth = Math.min(COMPARISON_CONTEXT_TOKENS, servedContextLength)
+  return Option.some(performance.samples.reduce((closest, candidate) =>
+    Math.abs(candidate.contextTokens - depth) < Math.abs(closest.contextTokens - depth) ? candidate : closest,
+  ).estimatedTokensPerSecond)
+}
+
 export const ResolvedModelInstallationSchema = Schema.TaggedStruct("Resolved", {
   installedBytes: NonNegativeSafeInteger,
   primaryPath: NonEmptyString,
@@ -812,6 +830,15 @@ export const CatalogSupportSchema = Schema.Union(
 )
 export type CatalogSupport = typeof CatalogSupportSchema.Type
 
+export const SpeculativeMethodSchema = Schema.Union(
+  Schema.TaggedStruct("Mtp", {}),
+  Schema.TaggedStruct("DFlash", {}),
+  Schema.TaggedStruct("DFlash2", {}),
+  Schema.TaggedStruct("DSpark", {}),
+  Schema.TaggedStruct("LiLiCorr", {}),
+)
+export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
+
 export const LabIdSchema = NonEmptyString.pipe(Schema.brand("LabId"))
 export type LabId = typeof LabIdSchema.Type
 
@@ -830,11 +857,31 @@ export const LocalModelDeveloperSchema = Schema.Struct({
 })
 export type LocalModelDeveloper = typeof LocalModelDeveloperSchema.Type
 
+/** A quant's file quant name in its repository (for example `UD-Q4_K_XL`), which states its bit width. */
+export const QuantNameSchema = NonEmptyString.pipe(Schema.brand("QuantName"))
+export type QuantName = typeof QuantNameSchema.Type
+
+/** The quant a catalog model is: the repository that publishes it and its quant name there. */
+export const CatalogQuantSchema = Schema.Struct({
+  repository: HuggingFaceRepositoryIdSchema,
+  name: QuantNameSchema,
+})
+export type CatalogQuant = typeof CatalogQuantSchema.Type
+
+/** A catalog model's separately packaged drafter, with the bytes it adds to the download. */
+export const CatalogDrafterSchema = Schema.Struct({
+  method: SpeculativeMethodSchema,
+  repository: HuggingFaceRepositoryIdSchema,
+  sizeBytes: NonNegativeSafeInteger,
+})
+export type CatalogDrafter = typeof CatalogDrafterSchema.Type
+
 const LocalModelCatalogDataFields = {
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
   developer: LocalModelDeveloperSchema,
-  fidelityRank: NonNegativeSafeInteger,
+  quant: CatalogQuantSchema,
+  drafter: Schema.optionalWith(CatalogDrafterSchema, { as: "Option", exact: true }),
   quantizationAware: Schema.Boolean,
   aliases: Schema.Array(CustomFormModelIdSchema),
 } as const
@@ -866,19 +913,6 @@ export const LocalModelCatalogDataSchema = Schema.Union(
   DeprecatedCatalogDataSchema,
 )
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
-
-const NormalizedRankingScoreSchema = Schema.Number.pipe(
-  Schema.finite(),
-  Schema.between(0, 1),
-)
-
-/** A fitting catalog model's normalized ranking terms; speed is absent until it is estimated. */
-export const LocalModelRankingScoresSchema = Schema.Struct({
-  intelligence: NormalizedRankingScoreSchema,
-  speed: Schema.optionalWith(NormalizedRankingScoreSchema, { as: "Option", exact: true }),
-  fidelity: NormalizedRankingScoreSchema,
-})
-export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
 
 /** What a fitting model's required memory holds: its weights, the conversation at the served context, and the rest. */
 export const MemoryBreakdownSchema = Schema.Struct({
@@ -1082,15 +1116,6 @@ export const LocalModelPresentationSchema = Schema.Struct({
   { message: () => "local model source URLs must be unique" }))
 export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 
-export const SpeculativeMethodSchema = Schema.Union(
-  Schema.TaggedStruct("Mtp", {}),
-  Schema.TaggedStruct("DFlash", {}),
-  Schema.TaggedStruct("DFlash2", {}),
-  Schema.TaggedStruct("DSpark", {}),
-  Schema.TaggedStruct("LiLiCorr", {}),
-)
-export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
-
 const LocalModelAssessingServingStateSchema = Schema.TaggedStruct("Assessing", {
   profile: ServingProfileSchema,
 })
@@ -1122,27 +1147,16 @@ const CustomModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
   assessment: LocalModelAssessmentSchema,
 })
-/** An available catalog model's serving state: when it fits, it carries the scores it is ranked by. */
-export const AvailableCatalogServingStateSchema = Schema.Union(
-  LocalModelAssessingServingStateSchema,
-  LocalModelFailedServingStateSchema,
-  Schema.TaggedStruct("Assessed", { ...CatalogModelAssessedFitsFields, rankingScores: LocalModelRankingScoresSchema }),
-  CatalogModelAssessedDoesNotFitServingStateSchema,
-)
-export type AvailableCatalogServingState = typeof AvailableCatalogServingStateSchema.Type
-
-/** An unavailable catalog model's serving state: it is never ranked, so it has no ranking scores. */
-export const UnavailableCatalogServingStateSchema = Schema.Union(
+/** A catalog model's serving state; the service never reports a catalog model as unsupported. */
+export const CatalogLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   LocalModelFailedServingStateSchema,
   Schema.TaggedStruct("Assessed", CatalogModelAssessedFitsFields),
   CatalogModelAssessedDoesNotFitServingStateSchema,
 )
-export type UnavailableCatalogServingState = typeof UnavailableCatalogServingStateSchema.Type
+export type CatalogLocalModelServingState = typeof CatalogLocalModelServingStateSchema.Type
 
-export type CatalogLocalModelServingState = AvailableCatalogServingState | UnavailableCatalogServingState
-
-/** Custom models are never ranked; `Unsupported` stays only on added models, whose files remain removable. */
+/** `Unsupported` stays only on added models, whose files remain removable. */
 export const CustomLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   CustomModelFailedServingStateSchema,
@@ -1151,8 +1165,7 @@ export const CustomLocalModelServingStateSchema = Schema.Union(
 export type CustomLocalModelServingState = typeof CustomLocalModelServingStateSchema.Type
 
 export const LocalModelServingStateSchema = Schema.Union(
-  AvailableCatalogServingStateSchema,
-  UnavailableCatalogServingStateSchema,
+  CatalogLocalModelServingStateSchema,
   CustomLocalModelServingStateSchema,
 )
 export type LocalModelServingState = typeof LocalModelServingStateSchema.Type
@@ -1380,19 +1393,19 @@ export const CatalogLocalModelFields = {
   drafterWithheld: Schema.Boolean,
 } as const
 
-/** A supported catalog model: rated, and ranked when it fits. */
+/** A supported catalog model, which is always rated. */
 export const AvailableCatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...CatalogLocalModelFields,
   catalogData: AvailableCatalogDataSchema,
-  servingState: AvailableCatalogServingStateSchema,
+  servingState: CatalogLocalModelServingStateSchema,
 })
 export type AvailableCatalogLocalModel = typeof AvailableCatalogLocalModelSchema.Type
 
-/** A disabled or deprecated catalog model: shown with its reason, never ranked. */
+/** A disabled or deprecated catalog model: shown with its reason, never recommended. */
 export const UnavailableCatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...CatalogLocalModelFields,
   catalogData: UnavailableCatalogDataSchema,
-  servingState: UnavailableCatalogServingStateSchema,
+  servingState: CatalogLocalModelServingStateSchema,
 })
 export type UnavailableCatalogLocalModel = typeof UnavailableCatalogLocalModelSchema.Type
 
@@ -1954,3 +1967,46 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
       memoryDomainIds.every(id => domains.has(id))))
 }, { message: () => "hardware identities must be unique and accelerator memory-domain references must resolve" }))
 export type LocalInferenceHardware = typeof LocalInferenceHardwareSchema.Type
+
+// =============================================================================
+// Recommendations
+// =============================================================================
+
+export const LocalModelFamilyStatusSchema = Schema.Literal("Supported", "ComingSoon")
+export type LocalModelFamilyStatus = typeof LocalModelFamilyStatusSchema.Type
+
+/** A family of models Magnitude runs, by the GGUF architectures its models declare; their fine-tunes run too. */
+export const LocalModelFamilySchema = Schema.Struct({
+  name: NonEmptyString,
+  developer: LocalModelDeveloperSchema,
+  architectures: Schema.NonEmptyArray(NonEmptyString),
+  status: LocalModelFamilyStatusSchema,
+})
+export type LocalModelFamily = typeof LocalModelFamilySchema.Type
+
+/**
+ * A tested model recommended for this machine. `rungs` is its ladder of quants, smallest to largest; `chosen` is
+ * the rung chosen for this machine, none when no rung fits or its family is coming soon. `meetsTarget`: the chosen
+ * rung reaches the target decode speed; `meetsOnboardingFloor`: it reaches the onboarding floor.
+ */
+export const RecommendedModelSchema = Schema.Struct({
+  base: CatalogBaseIdSchema,
+  name: NonEmptyString,
+  developer: LocalModelDeveloperSchema,
+  intelligence: Schema.optionalWith(IntelligenceScoreSchema, { as: "Option", exact: true }),
+  chosen: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  rungs: Schema.NonEmptyArray(CatalogFormModelIdSchema),
+  meetsTarget: Schema.Boolean,
+  meetsOnboardingFloor: Schema.Boolean,
+}).pipe(Schema.filter((model) => Option.match(model.chosen, {
+  onNone: () => !model.meetsTarget && !model.meetsOnboardingFloor,
+  onSome: (chosen) => model.rungs.includes(chosen) && (!model.meetsTarget || model.meetsOnboardingFloor),
+}), { message: () => "a recommendation's chosen rung is one of its rungs, and only a chosen rung meets a speed" }))
+export type RecommendedModel = typeof RecommendedModelSchema.Type
+
+/** The tested models in recommendation order, and the families Magnitude runs. */
+export const RecommendationsSchema = Schema.Struct({
+  models: Schema.Array(RecommendedModelSchema),
+  families: Schema.Array(LocalModelFamilySchema),
+})
+export type Recommendations = typeof RecommendationsSchema.Type

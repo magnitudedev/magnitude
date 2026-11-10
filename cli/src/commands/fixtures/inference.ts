@@ -1,6 +1,7 @@
 import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
+  CatalogBaseIdSchema,
   CatalogFormModelIdSchema,
   CountryCodeSchema,
   CustomFormModelIdSchema,
@@ -13,13 +14,17 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   ModelAssessmentIdSchema,
   ModelVariantLabelSchema,
+  QuantNameSchema,
   type AvailableCatalogLocalModel,
   type CandidateInspection,
   type CandidateVersion,
   type CustomLocalModel,
   type DrafterCandidate,
   type HuggingFaceSearchResponse,
+  localModelIntelligence,
   localModelPerformanceContexts,
+  parseModelId,
+  type CatalogLocalModel,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
@@ -29,6 +34,7 @@ import {
   type ModelReleaseDate,
   type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
+import type { RecommendedCatalogModel } from "../inference-runtime"
 
 const GIB = 1024 ** 3
 const GB = 1_000_000_000
@@ -156,7 +162,12 @@ const makeCatalogOnlyModel = (
     developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") },
     intelligence: 75,
     support: { _tag: "Supported" },
-    fidelityRank: 75,
+    quant: { repository: HuggingFaceRepositoryIdSchema.make("unsloth/Qwen3.5-9B-MTP-GGUF"), name: QuantNameSchema.make("UD-Q4_K_XL") },
+    drafter: Option.some({
+      method: { _tag: "DFlash" },
+      repository: HuggingFaceRepositoryIdSchema.make("magnitudedev/Qwen3.5-9B-DFlash-GGUF"),
+      sizeBytes: 1_000_000_000,
+    }),
     quantizationAware: false,
     aliases: [],
   },
@@ -170,7 +181,6 @@ const makeCatalogOnlyModel = (
     capabilities,
     speculativeMethod: Option.some({ _tag: "DFlash" }),
     assessment: fitsAssessment(),
-    rankingScores: { intelligence: 0.75, speed: Option.some(0.65), fidelity: 0.75 },
   },
   ...overrides,
 })
@@ -446,3 +456,22 @@ export const makeLocations = (): readonly ModelLocation[] => [
   { kind: "Ollama", paths: [{ path: "/Users/test/.ollama/models", state: "Found" }], enabled: false, automatic: true, state: "Found" },
   { kind: "Folder", paths: [{ path: "/Volumes/External/models", state: "Found" }], enabled: true, automatic: false, state: "Found" },
 ]
+
+/** A catalog model recommended at its own quant, the only rung of its ladder, reaching the target speed. */
+export const recommendedModel = (model: CatalogLocalModel): RecommendedCatalogModel => {
+  const parsed = parseModelId(model.modelId)
+  return {
+    recommendation: {
+      base: CatalogBaseIdSchema.make(parsed._tag === "Catalog" ? parsed.baseId : model.modelId),
+      name: model.presentation.displayName,
+      developer: model.catalogData.developer,
+      intelligence: localModelIntelligence(model),
+      chosen: Option.some(model.modelId),
+      rungs: [model.modelId],
+      meetsTarget: true,
+      meetsOnboardingFloor: true,
+    },
+    chosen: model,
+    quants: [model.catalogData.quant.name],
+  }
+}

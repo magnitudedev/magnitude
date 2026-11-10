@@ -1,5 +1,6 @@
 import { Option } from "effect"
 import {
+  comparisonTokensPerSecond,
   localModelIntelligence,
   localModelServingState,
   type GenerationPerformanceEvidence,
@@ -96,8 +97,8 @@ const quantizationBits = (model: LocalModel): Option.Option<number> => {
   return Option.none()
 }
 
-/** A custom model's fidelity rank on the catalog's scale, where a variant's rank is ten per weight bit (Q4 is 40, Q8 is 80). */
-const customFidelityRank = (model: LocalModel): Option.Option<number> =>
+/** A model's fidelity rank, ten per weight bit of its quant (Q4 is 40, Q8 is 80). */
+const fidelityRank = (model: LocalModel): Option.Option<number> =>
   Option.map(quantizationBits(model), (bits) => bits * 10)
 
 const memoryFitLabel = (assessment: ModelAssessment): string => {
@@ -162,8 +163,7 @@ export const localModelEstimatedTokensPerSecond = (model: LocalModel): Option.Op
   const serving = Option.getOrUndefined(localModelServingState(model))
   if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return Option.none()
   const { residency: { performance }, served } = serving.assessment
-  if (performance._tag !== "Estimated") return Option.none()
-  return Option.some(nearestSample(performance.samples, Math.min(50_000, served.contextLength)).estimatedTokensPerSecond)
+  return comparisonTokensPerSecond(performance, served.contextLength)
 }
 
 export const localModelRadarAxes = (
@@ -176,13 +176,9 @@ export const localModelRadarAxes = (
 
   const assessment = serving.assessment
   const performance = assessment.residency.performance
-  const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const variant = String(model.presentation.variantLabel)
-  const fidelityRank = Option.match(catalog, {
-    onNone: () => customFidelityRank(model),
-    onSome: ({ fidelityRank }) => Option.some(fidelityRank),
-  })
+  const fidelity = fidelityRank(model)
   const intelligence = localModelIntelligence(model)
   const axes: LocalModelRadarAxes = [
     {
@@ -211,9 +207,9 @@ export const localModelRadarAxes = (
       )})`,
     },
     {
-      value: Option.map(fidelityRank, (rank) => clamp01(rank / 100)),
+      value: Option.map(fidelity, (rank) => clamp01(rank / 100)),
       label: "FIDELITY",
-      detail: Option.match(fidelityRank, {
+      detail: Option.match(fidelity, {
         onNone: () => `Not rated (${variant})`,
         onSome: (rank) => `${fidelityLabel(rank)} (${shortVariantLabel(variant)})`,
       }),

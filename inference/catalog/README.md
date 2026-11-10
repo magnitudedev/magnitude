@@ -12,6 +12,16 @@ gives every catalog model its lab's developer, and attributes any other model by
 of its Hugging Face repository, else of a base model its GGUF declares, else through the catalog
 model whose shape it has.
 
+`families` lists the model families Magnitude runs: each family's display `name`, its `lab`, the
+GGUF `architectures` its models declare and its `status` (`supported` or `comingSoon`). Every
+target architecture the engine's family registry admits belongs to exactly one family; drafter-only
+architectures belong to none. Clients show the table as what runs in Magnitude, and a model of a
+family that is coming soon is recommended with no chosen quant.
+
+A variant's `format` is its quant name in its repository (for example `UD-Q4_K_XL`), which clients
+show with the repository as the quant's identity and read its bit width from. A model's variants
+are its tested ladder, which recommendations choose a rung from.
+
 Input modality is inspected from the exact target package. Image-capable targets receive a
 projector during generation: a sole repository `mmproj` is selected automatically, while
 repositories with multiple candidates require an exact `projector.path` declaration on the source.

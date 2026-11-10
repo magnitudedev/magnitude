@@ -6,7 +6,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogComponent, CatalogInstallationAdmission, CatalogInstallationRemoval,
+    CatalogBaseId, CatalogComponent, CatalogDrafter, CatalogInstallationAdmission, CatalogInstallationRemoval,
     CatalogMissingComponent, CatalogModel, CatalogModelState, CatalogVariantId,
     CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, CatalogSupport,
     CatalogUpdatePart,
@@ -345,6 +345,7 @@ impl ModelDomainResolver {
         Ok(CatalogModelsResponse {
             revision: installed.revision + self.catalog_changes.generation.load(Ordering::Acquire),
             reconciliation_complete: installed.reconciliation_complete,
+            families: crate::catalog::model_families().to_vec(),
             models: self
                 .catalog
                 .models
@@ -778,7 +779,8 @@ fn catalog_model(
         parameterization: definition.parameterization.clone(),
         developer: definition.developer.clone(),
         support: definition.support.clone(),
-        fidelity_rank: definition.fidelity_rank,
+        quant: definition.quant.clone(),
+        drafter: catalog_drafter(definition),
         quantization_aware: definition.quantization_aware,
         aliases: Vec::new(),
         local_state: match resolution.state {
@@ -1277,6 +1279,26 @@ fn current_target_missing_components(
     projector.into_iter().chain(drafter).collect()
 }
 
+/// A catalog model's separately packaged drafter as the catalog declares it, whether or not this
+/// computer serves it.
+fn catalog_drafter(definition: &RecommendableModel) -> Option<CatalogDrafter> {
+    let ServableModelBundle::SpeculativeDecoding { method, .. } = &definition.configuration.bundle
+    else {
+        return None;
+    };
+    let draft = catalog_draft(definition)?;
+    let magnitude_service_contracts::models::ModelPackageSource::HuggingFace { repository, .. } =
+        &draft.source
+    else {
+        return None;
+    };
+    Some(CatalogDrafter {
+        method: method.clone(),
+        repository: repository.clone(),
+        size_bytes: draft.files.iter().map(|file| file.size_bytes).sum(),
+    })
+}
+
 fn catalog_draft(definition: &RecommendableModel) -> Option<&ModelPackage> {
     match &definition.configuration.bundle {
         ServableModelBundle::SpeculativeDecoding {
@@ -1462,7 +1484,10 @@ mod tests {
                 country: "CN".to_owned(),
             },
             support: CatalogSupport::Supported { intelligence: 1 },
-            fidelity_rank: 1,
+            quant: magnitude_service_contracts::models::CatalogQuant {
+                repository: "publisher/model-GGUF".to_owned(),
+                name: "Q4_K_M".to_owned(),
+            },
             quantization_aware: false,
         }
     }

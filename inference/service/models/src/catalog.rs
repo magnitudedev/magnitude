@@ -11,8 +11,9 @@ use magnitude_artifacts::catalog_headers::{
 };
 use magnitude_service_contracts::ComponentRole;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, LabId, ModelDeveloper,
-    ModelFailure, ModelFileRole, ModelId, ModelPackage, ModelPackageSource, ModelParameterization,
+    CatalogBaseId, CatalogDiagnostic, CatalogQuant, CatalogSupport, CatalogVariantId, LabId,
+    ModelDeveloper, ModelFailure, ModelFamily, ModelFamilyStatus, ModelFileRole, ModelId,
+    ModelPackage, ModelPackageSource, ModelParameterization,
     ModelReleaseDate, ModelServingConfiguration, PackageValidation, ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
@@ -50,7 +51,26 @@ const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 struct CatalogSource {
     artificial_analysis_frontier: ArtificialAnalysisFrontier,
     labs: Vec<CatalogLab>,
+    families: Vec<CatalogFamily>,
     models: Vec<CatalogModel>,
+}
+
+/// A family of models Magnitude runs: its display name, its lab and the GGUF architectures its
+/// models declare. Each architecture the engine serves as a target belongs to exactly one family.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogFamily {
+    name: String,
+    lab: String,
+    architectures: Vec<String>,
+    status: CatalogFamilyStatus,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CatalogFamilyStatus {
+    Supported,
+    ComingSoon,
 }
 
 /// A lab that develops catalog models: its display name, its country (ISO 3166-1 alpha-2) and the
@@ -77,11 +97,30 @@ impl CatalogLab {
 impl CatalogSource {
     /// The developer of a catalog model, whose lab `catalog_source` requires the table to hold.
     fn developer(&self, model: &CatalogModel) -> ModelDeveloper {
+        self.lab_developer(&model.lab)
+    }
+
+    fn lab_developer(&self, lab: &str) -> ModelDeveloper {
         self.labs
             .iter()
-            .find(|lab| lab.id == model.lab)
-            .expect("catalog_source requires every model's lab in the lab table")
+            .find(|candidate| candidate.id == lab)
+            .expect("catalog_source requires every lab a model or family names in the lab table")
             .developer()
+    }
+
+    fn families(&self) -> Vec<ModelFamily> {
+        self.families
+            .iter()
+            .map(|family| ModelFamily {
+                name: family.name.clone(),
+                developer: self.lab_developer(&family.lab),
+                architectures: family.architectures.clone(),
+                status: match family.status {
+                    CatalogFamilyStatus::Supported => ModelFamilyStatus::Supported,
+                    CatalogFamilyStatus::ComingSoon => ModelFamilyStatus::ComingSoon,
+                },
+            })
+            .collect()
     }
 
     fn developers(&self) -> ModelDevelopers {
@@ -107,6 +146,16 @@ pub fn model_developers() -> &'static ModelDevelopers {
             .developers()
     });
     &DEVELOPERS
+}
+
+/// The model families of the compiled catalog, whose source its tests validate.
+pub fn model_families() -> &'static [ModelFamily] {
+    static FAMILIES: std::sync::LazyLock<Vec<ModelFamily>> = std::sync::LazyLock::new(|| {
+        catalog_source()
+            .expect("the compiled catalog source is valid")
+            .families()
+    });
+    &FAMILIES
 }
 
 /// The top Artificial Analysis Intelligence Index result. Catalog intelligence is each model's
@@ -284,7 +333,6 @@ struct CatalogVariant {
     #[serde(default)]
     path: Option<PathBuf>,
     variant_label: String,
-    fidelity_rank: u32,
     quantization_aware: bool,
 }
 
@@ -446,6 +494,11 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             "invalid or duplicate catalog lab declaration".to_owned(),
         ));
     }
+    if !valid_families(&source.families, &source.labs) {
+        return Err(InventoryError::Integrity(
+            "invalid or duplicate catalog family declaration".to_owned(),
+        ));
+    }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
@@ -499,7 +552,6 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     || variant.variant_label.trim() != variant.variant_label.as_str()
                     || variant.variant_label.contains('(')
                     || variant.variant_label.contains(')')
-                    || variant.fidelity_rank == 0
             })
             || model
                 .speculative_decoding
@@ -564,6 +616,23 @@ fn valid_labs(labs: &[CatalogLab]) -> bool {
                     valid_identity_component(organization)
                         && !organization.contains('/')
                         && organizations.insert(organization.to_lowercase())
+                })
+        })
+}
+
+/// Every family has a unique name, a lab in the lab table and at least one architecture, and no
+/// architecture belongs to two families.
+fn valid_families(families: &[CatalogFamily], labs: &[CatalogLab]) -> bool {
+    let mut names = BTreeSet::new();
+    let mut architectures = BTreeSet::new();
+    !families.is_empty()
+        && families.iter().all(|family| {
+            valid_non_empty(&family.name)
+                && names.insert(family.name.as_str())
+                && labs.iter().any(|lab| lab.id == family.lab)
+                && !family.architectures.is_empty()
+                && family.architectures.iter().all(|architecture| {
+                    valid_non_empty(architecture) && architectures.insert(architecture.as_str())
                 })
         })
 }
@@ -1755,7 +1824,10 @@ fn recommendable_model(
         parameterization: declaration.parameterization.clone(),
         developer: catalog.developer(declaration),
         support: declaration.rated_support(&catalog.artificial_analysis_frontier),
-        fidelity_rank: variant.fidelity_rank,
+        quant: CatalogQuant {
+            repository: source.repository.clone(),
+            name: variant.format.clone(),
+        },
         quantization_aware: variant.quantization_aware,
     })
 }
@@ -2420,6 +2492,35 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_target_architecture_belongs_to_exactly_one_family() {
+        // Llama is registered only as a drafter architecture, which no family serves as a target.
+        const DRAFTER_ONLY: &[&str] = &["llama"];
+        let source = catalog_source().expect("catalog source should be valid");
+        let registered = magnitude_family_registry::FAMILIES
+            .iter()
+            .flat_map(|family| family.architectures().iter().copied())
+            .collect::<BTreeSet<_>>();
+        for architecture in registered.iter().filter(|architecture| !DRAFTER_ONLY.contains(architecture)) {
+            let families = source
+                .families
+                .iter()
+                .filter(|family| family.architectures.iter().any(|declared| declared == architecture))
+                .count();
+            assert_eq!(families, 1, "{architecture} belongs to {families} catalog families");
+        }
+        for family in &source.families {
+            for architecture in &family.architectures {
+                assert!(
+                    registered.contains(architecture.as_str())
+                        && !DRAFTER_ONLY.contains(&architecture.as_str()),
+                    "{} declares {architecture}, which is not a registered target architecture",
+                    family.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn authored_catalog_declares_valid_parameterization_for_every_model() {
         let source = catalog_source().expect("catalog source should be valid");
         assert!(
@@ -2765,9 +2866,9 @@ mod tests {
         for (id, repository, license) in [
             ("qwen3.8-flash-next:gguf:q4", shared_draft, "qwen-community-1.0"),
             (
-                "qwen3.8-flash-next:gguf:nvfp4",
-                "magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF",
-                "nvidia-open-model-license",
+                "qwen3.8-flash-next:gguf:q2",
+                "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+                "apache-2.0",
             ),
         ] {
             let selected = select(id).unwrap();

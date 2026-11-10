@@ -341,6 +341,14 @@ export const CatalogComponent = S.Union(S.Literal("Projector"), S.Literal("Draft
 export type CatalogComponent = S.Schema.Type<typeof CatalogComponent>
 export type CatalogComponentEncoded = S.Schema.Encoded<typeof CatalogComponent>
 
+export const CatalogDrafter = S.Struct({
+  method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+  repository: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CatalogDrafter = S.Schema.Type<typeof CatalogDrafter>
+export type CatalogDrafterEncoded = S.Schema.Encoded<typeof CatalogDrafter>
+
 export const CatalogInstallationAdmission = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
@@ -485,14 +493,18 @@ export const CatalogModel = S.Struct({
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
   developer: S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
   displayName: S.String,
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<CatalogDrafter, CatalogDrafterEncoded> => CatalogDrafter),
+    { exact: true, as: "Option" },
+  ),
   drafterWithheld: S.Boolean,
-  fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelState, CatalogModelStateEncoded> => CatalogModelState),
   parameterization: S.suspend(
     (): S.Schema<ModelParameterization, ModelParameterizationEncoded> => ModelParameterization,
   ),
+  quant: S.suspend((): S.Schema<CatalogQuant, CatalogQuantEncoded> => CatalogQuant),
   quantizationAware: S.Boolean,
   releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   sourceUrls: S.Array(S.String),
@@ -507,6 +519,7 @@ export type CatalogModelSelection = S.Schema.Type<typeof CatalogModelSelection>
 export type CatalogModelSelectionEncoded = S.Schema.Encoded<typeof CatalogModelSelection>
 
 export const CatalogModelsResponse = S.Struct({
+  families: S.Array(S.suspend((): S.Schema<ModelFamily, ModelFamilyEncoded> => ModelFamily)),
   models: S.Array(S.suspend((): S.Schema<CatalogModel, CatalogModelEncoded> => CatalogModel)),
   reconciliationComplete: S.Boolean,
   revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -560,6 +573,13 @@ export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof Catalog
 export const CatalogOptimizationStage = S.Union(S.Literal("waiting"), S.Literal("preparing"), S.Literal("tuning"))
 export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
 export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
+
+export const CatalogQuant = S.Struct({
+  name: S.String,
+  repository: S.String,
+})
+export type CatalogQuant = S.Schema.Type<typeof CatalogQuant>
+export type CatalogQuantEncoded = S.Schema.Encoded<typeof CatalogQuant>
 
 export const CatalogSupport = S.Union(
   S.extend(
@@ -2471,6 +2491,19 @@ export const ModelFailure = S.Struct({
 })
 export type ModelFailure = S.Schema.Type<typeof ModelFailure>
 export type ModelFailureEncoded = S.Schema.Encoded<typeof ModelFailure>
+
+export const ModelFamily = S.Struct({
+  architectures: S.Array(S.String),
+  developer: S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+  name: S.String,
+  status: S.suspend((): S.Schema<ModelFamilyStatus, ModelFamilyStatusEncoded> => ModelFamilyStatus),
+})
+export type ModelFamily = S.Schema.Type<typeof ModelFamily>
+export type ModelFamilyEncoded = S.Schema.Encoded<typeof ModelFamily>
+
+export const ModelFamilyStatus = S.Union(S.Literal("Supported"), S.Literal("ComingSoon"))
+export type ModelFamilyStatus = S.Schema.Type<typeof ModelFamilyStatus>
+export type ModelFamilyStatusEncoded = S.Schema.Encoded<typeof ModelFamilyStatus>
 
 export const ModelFile = S.Struct({
   id: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),

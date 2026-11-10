@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, HuggingFaceArtifactSelectorSchema,
-  CountryCodeSchema, HuggingFaceRepositoryIdSchema, LabIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema,
+  CountryCodeSchema, HuggingFaceRepositoryIdSchema, LabIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, QuantNameSchema,
   type AvailableCatalogLocalModel, type CandidateInspection, type CandidateVersion, type CustomLocalModel, type CustomModelOrigin,
   type AttachedDrafter, type AttachedDrafterAvailability, type DrafterCandidate, type LocalModelAssessment, type UnsupportedLocalModel, type UnsupportedReason,
 } from "@magnitudedev/sdk"
@@ -40,9 +40,9 @@ export const catalogModel = (): AvailableCatalogLocalModel => ({
   modelId: catalogId,
   storageBytes: 24 * GB,
   presentation: { displayName: "Qwen3.6 35B-A3B", variantLabel: ModelVariantLabelSchema.make("Q4"), description: "", license: Option.some("apache-2.0"), sourceUrls: [] },
-  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") }, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
+  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") }, support: { _tag: "Supported" }, quant: { repository: HuggingFaceRepositoryIdSchema.make("unsloth/Qwen3.6-35B-A3B-MTP-GGUF"), name: QuantNameSchema.make("UD-Q4_K_XL") }, drafter: Option.none(), quantizationAware: false, aliases: [] },
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
-  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits, rankingScores: { speed: Option.some(1), intelligence: 1, fidelity: 1 } },
+  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits },
   missingComponents: [],
   storedComponents: [],
   drafterWithheld: false,

@@ -2652,6 +2652,7 @@ dependencies = [
  "hf-hub",
  "libc",
  "magnitude-artifacts",
+ "magnitude-family-registry",
  "magnitude-service-contracts",
  "magnitude-service-utils",
  "notify",

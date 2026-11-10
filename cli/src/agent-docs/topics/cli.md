@@ -42,7 +42,7 @@ magnitude hardware
 magnitude catalog status
 magnitude catalog list
 magnitude catalog show|cancel|remove <model-id>
-magnitude catalog recommendations [--preference <value>] [--limit <count>]
+magnitude catalog recommendations [--country <code>] [--limit <count>]
 magnitude catalog search <query> [--limit <count>]
 magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
 magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force]

@@ -4,12 +4,14 @@ import {
   AssessmentEnvironmentIdSchema,
   CatalogSupportSchema,
   CountryCodeSchema,
+  HuggingFaceRepositoryIdSchema,
   LabIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   LocalModelSchema,
   ModelIdSchema,
   ModelAssessmentIdSchema,
   ModelVariantLabelSchema,
+  QuantNameSchema,
   localModelIsAvailable,
   type AvailableCatalogLocalModel,
   type CatalogSupport,
@@ -108,15 +110,13 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") },
       intelligence: 1,
       support: { _tag: "Supported" },
-      fidelityRank: 1,
+      quant: { repository: HuggingFaceRepositoryIdSchema.make("publisher/model-GGUF"), name: QuantNameSchema.make("Q4_K_M") },
+      drafter: Option.none(),
       quantizationAware: false,
       aliases: [],
     },
     acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
-    servingState: {
-      ...servingState,
-      rankingScores: { intelligence: 0.01, speed: Option.none(), fidelity: 0.01 },
-    },
+    servingState,
     missingComponents: [],
     storedComponents: [],
     drafterWithheld: false,
@@ -129,9 +129,8 @@ const catalogAssessed = (modelId: string): AvailableCatalogLocalModel => {
   return model
 }
 
-/** The same model as the release disables or deprecates it: still rated, and no longer ranked. */
+/** The same model as the release disables or deprecates it: still rated. */
 const unavailable = (model: AvailableCatalogLocalModel, support: CatalogSupport): LocalModel => {
-  const { rankingScores: _rankingScores, ...servingState } = model.servingState as { readonly rankingScores?: unknown }
   const { intelligence } = model.catalogData
   return Schema.validateSync(LocalModelSchema)({
     ...model,
@@ -140,7 +139,6 @@ const unavailable = (model: AvailableCatalogLocalModel, support: CatalogSupport)
       support,
       intelligence: support._tag === "Disabled" ? Option.some(intelligence) : intelligence,
     },
-    servingState,
   })
 }
 

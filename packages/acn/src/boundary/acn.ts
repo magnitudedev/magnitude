@@ -18,6 +18,7 @@ import { AcnServiceLifecycle } from "../service-lifecycle";
 import { getSkill, listSkills } from "../skill-ops";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
+import { Recommendations } from "../recommendations";
 import { ModelCommands } from "../model-commands";
 import { CustomModelCommands } from "../custom-model-commands";
 import { LocalInferenceHardware } from "../local-inference-hardware";
@@ -54,6 +55,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const inferenceActivity = yield* InferenceActivity;
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
+    const recommendations = yield* Recommendations;
     const modelCommands = yield* ModelCommands;
     const customModelCommands = yield* CustomModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
@@ -183,6 +185,9 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
 
       GetModelCatalog: () =>
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
+
+      GetRecommendations: ({ developerCountry }) =>
+        observeRpcDefects("GetRecommendations", recommendations.get(developerCountry)),
 
       GetServingUsage: request => servingUsage.read(request),
       ListServableModels: () => observeRpcDefects("ListServableModels", inference.models),
