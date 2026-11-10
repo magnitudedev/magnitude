@@ -92,6 +92,21 @@ interface ExploreProps {
   readonly owned: ReadonlySet<string>
 }
 
+/**
+ * A quant's Download, which says it is starting from the click until the service lists the download (this button is
+ * then replaced); if nothing is listed within half a minute, the request failed and it offers Download again.
+ */
+function DownloadButton({ size, disabled, start }: { size: number; disabled: boolean; start: () => void }) {
+  const [starting, setStarting] = useState(false)
+  useEffect(() => {
+    if (!starting) return
+    const timer = setTimeout(() => setStarting(false), 30_000)
+    return () => clearTimeout(timer)
+  }, [starting])
+  if (starting) return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Starting…</Button>
+  return <Button disabled={disabled} onClick={() => { setStarting(true); start() }}><DownloadSimpleIcon />Download {formatStorageSize(size)}</Button>
+}
+
 /** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
 function useDownload() {
   const client = useAgentClient()
@@ -107,16 +122,17 @@ function useDownload() {
       return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
     }
     if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
-    const label = <><DownloadSimpleIcon />Download {formatStorageSize(quant.downloadBytes)}</>
-    if (model.catalog) return <Button disabled={!quant.fits} onClick={() => install(quant.key as CatalogFormModelId)}>{label}</Button>
-    if (quant.repository === null) return null
-    return <Button disabled={!quant.fits} onClick={() => add({
-      repository: quant.repository as HuggingFaceRepositoryId,
-      revision: Option.none(),
-      version: Option.some(quant.name),
-      drafter: { _tag: "Auto" },
-      force: false,
-    })}>{label}</Button>
+    if (!model.catalog && quant.repository === null) return null
+    const start = model.catalog
+      ? () => install(quant.key as CatalogFormModelId)
+      : () => add({
+          repository: quant.repository as HuggingFaceRepositoryId,
+          revision: Option.none(),
+          version: Option.some(quant.name),
+          drafter: { _tag: "Auto" },
+          force: false,
+        })
+    return <DownloadButton key={quant.key} size={quant.downloadBytes} disabled={!quant.fits} start={start} />
   }
 }
 
