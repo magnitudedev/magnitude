@@ -25,6 +25,7 @@ import {
   DrafterChoiceSchema,
   DrafterTargetSchema,
   HuggingFaceRepositoryIdSchema,
+  HuggingFaceSearchQuerySchema,
   HuggingFaceSearchResponseSchema,
   LocalInferenceHardwareSchema,
   LocalModelSyncOutcomeSchema,
@@ -185,7 +186,7 @@ const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
  */
 const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
   payload: Schema.Struct({
-    query: Schema.String,
+    query: HuggingFaceSearchQuerySchema,
     limit: optional(Schema.Int.pipe(Schema.between(1, 50))),
     cursor: optional(NonEmptyString),
   }),

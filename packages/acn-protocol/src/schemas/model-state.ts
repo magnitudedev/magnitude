@@ -1534,6 +1534,15 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
+/** The longest search query Hugging Face accepts, in UTF-8 bytes. */
+export const HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES = 200
+
+/** A Hugging Face search query: within the length Hugging Face accepts. */
+export const HuggingFaceSearchQuerySchema = Schema.String.pipe(Schema.filter(
+  (query) => new TextEncoder().encode(query).length <= HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES,
+  { message: () => `A Hugging Face search query is at most ${HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES} bytes` },
+))
+
 /** One page of repositories of every architecture, unsupported ones last; `nextCursor` requests the next page. */
 export const HuggingFaceSearchResponseSchema = Schema.Struct({
   results: Schema.Array(HuggingFaceSearchResultSchema),

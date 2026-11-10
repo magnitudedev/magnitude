@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
-import type { CatalogFormModelId, HuggingFaceRepositoryId, HuggingFaceSearchResult, LocalModel } from "@magnitudedev/sdk"
+import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, type CatalogFormModelId, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
 import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
@@ -168,7 +168,11 @@ function Searched({ settled, props }: { settled: string; props: ExploreProps }) 
 export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
   const download = useDownload()
-  return settled === ""
-    ? <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }} download={download} />
-    : <Searched settled={settled} props={props} />
+  if (settled === "") {
+    return <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }} download={download} />
+  }
+  if (new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES) {
+    return <ExploreModal {...props} results={{ _tag: "Failed", message: `Hugging Face searches are at most ${HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES} characters. Shorten the search.` }} download={download} />
+  }
+  return <Searched settled={settled} props={props} />
 }
