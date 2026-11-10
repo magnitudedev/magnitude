@@ -281,11 +281,11 @@ describe("recommendations, families, and assessment progress", () => {
     const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
     expect(lines.slice(3, 9)).toEqual([
       "1. Qwen Test (Q4) - Alibaba (CN) - Intelligence 75%",
-      "   4-bit unsloth UD-Q4_K_XL - 17.2 GB - ~24 tok/s - 32K context - Fits in GPU",
+      "   4-bit unsloth UD-Q4_K_XL - 17.2 GB - ~24 tok/s - 32K context - GPU and RAM",
       "   Model ID: qwen-test:gguf:q4",
       "   Acceleration DFlash - tools, structured output",
       "   QUANT                       SIZE     SPEED      CONTEXT  PLACEMENT    MODEL ID",
-      "   4-bit unsloth UD-Q4_K_XL *  17.2 GB  ~24 tok/s  32K      Fits in GPU  qwen-test:gguf:q4",
+      "   4-bit unsloth UD-Q4_K_XL *  17.2 GB  ~24 tok/s  32K      GPU and RAM  qwen-test:gguf:q4",
     ])
   })
 
@@ -356,9 +356,9 @@ describe("recommendations, families, and assessment progress", () => {
     const small = makeCatalogModel()
     const large = makeCatalogModel({ modelId: CatalogFormModelIdSchema.make("qwen-test:gguf:q8"), storageBytes: small.storageBytes * 2 })
     const lines = renderModelDetail({ model: small, models: [small, large], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false }).split("\n")
-    const placement = lines.indexOf("Placement - Fits in GPU")
+    const placement = lines.indexOf("Placement - GPU and RAM")
     expect(lines.slice(placement, placement + 8)).toEqual([
-      "Placement - Fits in GPU",
+      "Placement - GPU and RAM",
       "  GPU memory  19.3 GB",
       "  Host RAM    2.1 GB",
       "",
@@ -369,7 +369,7 @@ describe("recommendations, families, and assessment progress", () => {
     ])
     const quants = lines.indexOf("Quants")
     expect(lines[quants + 1]).toMatch(/^QUANT\s+SIZE\s+SPEED\s+CONTEXT\s+PLACEMENT\s+MODEL ID$/)
-    expect(lines[quants + 2]).toMatch(/^4-bit unsloth UD-Q4_K_XL \*\s+17\.2 GB\s+~24 tok\/s\s+32K\s+Fits in GPU\s+qwen-test:gguf:q4$/)
+    expect(lines[quants + 2]).toMatch(/^4-bit unsloth UD-Q4_K_XL \*\s+17\.2 GB\s+~24 tok\/s\s+32K\s+GPU and RAM\s+qwen-test:gguf:q4$/)
     expect(lines[quants + 3]).toMatch(/qwen-test:gguf:q8$/)
   })
 
@@ -381,14 +381,18 @@ describe("recommendations, families, and assessment progress", () => {
 })
 
 describe("Hugging Face search", () => {
-  it("lists repositories with their base model and how their recommended quant runs here", () => {
+  it("lists repositories with their base model and how their recommended quant runs here, and those not checked in time apart", () => {
     const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), unifiedMemory: false })
     expect(output).toBe([
       "Hugging Face models matching \"qwen test\"",
       "",
-      "MODEL                  BASE MODEL                   QUANT                  SIZE     SPEED      PLACEMENT    DOWNLOADS  REPOSITORY",
-      "Qwen Test Uncensored   Fine-tune of Qwen/Qwen-Test  4-bit HauhauCS Q4_K_P  23.4 GB  ~24 tok/s  Fits in GPU  48K        HauhauCS/Qwen-Test-Uncensored-GGUF",
-      "Qwen Test abliterated  —                            —                      —        —          —            912        huihui-ai/Qwen-Test-abliterated-GGUF",
+      "MODEL                 BASE MODEL                   QUANT                  SIZE     SPEED      PLACEMENT    DOWNLOADS  REPOSITORY",
+      "Qwen Test Uncensored  Fine-tune of Qwen/Qwen-Test  4-bit HauhauCS Q4_K_P  23.4 GB  ~24 tok/s  GPU and RAM  48K        HauhauCS/Qwen-Test-Uncensored-GGUF",
+      "",
+      "Not checked in time",
+      "",
+      "MODEL                  BASE MODEL  DOWNLOADS  REPOSITORY",
+      "Qwen Test abliterated  —           912        huihui-ai/Qwen-Test-abliterated-GGUF",
       "",
       "See every quant: magnitude models show <repository>",
       "",
@@ -427,13 +431,13 @@ describe("candidate inspection", () => {
       "",
       "VERSION  BITS   SIZE     SPEED        CONTEXT  PLACEMENT    ON THIS COMPUTER",
       "Q2_K_P   2-bit  15 GB    Can't run    —        —            Unsupported: Q2_K weights",
-      "Q4_K_P   4-bit  23.4 GB  ~24 tok/s    32K      Fits in GPU  Fits (recommended)",
-      "Q6_K_P   6-bit  30.6 GB  ~24 tok/s    32K      Fits in GPU  Fits · already on this computer",
+      "Q4_K_P   4-bit  23.4 GB  ~24 tok/s    32K      GPU and RAM  Fits (recommended)",
+      "Q6_K_P   6-bit  30.6 GB  ~24 tok/s    32K      GPU and RAM  Fits · already on this computer",
       "Q8_K_P   8-bit  43.6 GB  Doesn't fit  —        —            Too large",
       "",
       "How Q4_K_P runs on this computer",
       "",
-      "Placement - Fits in GPU",
+      "Placement - GPU and RAM",
       "  GPU memory  19.3 GB",
       "  Host RAM    2.1 GB",
       "",

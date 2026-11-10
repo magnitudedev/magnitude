@@ -32,7 +32,6 @@ import {
   type DrafterCandidate,
   type DrafterChoice,
   type DrafterTarget,
-  type HuggingFaceRecommendedVersion,
   type HuggingFaceSearchResponse,
   type HuggingFaceSearchResult,
   type LocalModel,
@@ -85,33 +84,43 @@ export interface SearchView {
 
 const reasonsLine = (reasons: readonly UnsupportedReason[]) => unsupportedReasonMessages(reasons).join(". ")
 
-const recommendedFact = (
-  result: HuggingFaceSearchResult,
-  fact: (version: HuggingFaceRecommendedVersion) => string,
-): string => Option.match(result.recommended, { onNone: () => "—", onSome: fact })
-
 export const renderSearch = ({ query, response, unifiedMemory }: SearchView): string => {
-  const supported = response.results.filter(({ unsupported }) => Option.isNone(unsupported))
+  const supported = response.results.flatMap((result) => Option.isSome(result.unsupported) ? [] : Option.match(result.recommended, {
+    onNone: () => [],
+    onSome: (recommended) => [{ result, recommended }],
+  }))
+  const unchecked = response.results.filter((result) => Option.isNone(result.unsupported) && Option.isNone(result.recommended))
   const unsupported = response.results.flatMap((result) => Option.match(result.unsupported, {
     onNone: () => [],
     onSome: (reasons) => [{ result, reasons }],
   }))
   const supportedSection = supported.length === 0
-    ? [`No Hugging Face models that run in Magnitude match ${quoted(query)}.`]
+    ? [unchecked.length === 0 ? `No Hugging Face models that run in Magnitude match ${quoted(query)}.` : `Hugging Face models matching ${quoted(query)}`]
     : [
         `Hugging Face models matching ${quoted(query)}`,
         "",
         renderTable(supported, [
-          { heading: "MODEL", value: ({ displayName, gated }) => gated ? `${displayName} · ${GATED_SEARCH_RESULT_LABEL}` : displayName },
-          { heading: "BASE MODEL", value: baseLabel },
-          { heading: "QUANT", value: (result) => recommendedFact(result, ({ label }) => formatQuantLabel(label, Option.some(result.repository))) },
-          { heading: "SIZE", value: (result) => recommendedFact(result, ({ sizeBytes }) => formatStorageSize(sizeBytes)) },
-          { heading: "SPEED", value: (result) => recommendedFact(result, ({ assessment }) => assessmentSpeed(Option.some(assessment))) },
-          { heading: "PLACEMENT", value: (result) => recommendedFact(result, ({ assessment }) => assessmentPlacement(Option.some(assessment), unifiedMemory)) },
-          { heading: "DOWNLOADS", value: ({ downloads }) => formatDownloads(downloads) },
-          { heading: "REPOSITORY", value: ({ repository }) => repository },
+          { heading: "MODEL", value: ({ result: { displayName, gated } }) => gated ? `${displayName} · ${GATED_SEARCH_RESULT_LABEL}` : displayName },
+          { heading: "BASE MODEL", value: ({ result }) => baseLabel(result) },
+          { heading: "QUANT", value: ({ result, recommended }) => formatQuantLabel(recommended.label, Option.some(result.repository)) },
+          { heading: "SIZE", value: ({ recommended }) => formatStorageSize(recommended.sizeBytes) },
+          { heading: "SPEED", value: ({ recommended }) => assessmentSpeed(Option.some(recommended.assessment)) },
+          { heading: "PLACEMENT", value: ({ recommended }) => assessmentPlacement(Option.some(recommended.assessment), unifiedMemory) },
+          { heading: "DOWNLOADS", value: ({ result }) => formatDownloads(result.downloads) },
+          { heading: "REPOSITORY", value: ({ result }) => result.repository },
         ]).trimEnd(),
       ]
+  const uncheckedSection = unchecked.length === 0 ? [] : [
+    "",
+    "Not checked in time",
+    "",
+    renderTable(unchecked, [
+      { heading: "MODEL", value: ({ displayName }) => displayName },
+      { heading: "BASE MODEL", value: baseLabel },
+      { heading: "DOWNLOADS", value: ({ downloads }) => formatDownloads(downloads) },
+      { heading: "REPOSITORY", value: ({ repository }) => repository },
+    ]).trimEnd(),
+  ]
   const unsupportedSection = unsupported.length === 0 ? [] : [
     "",
     "Can't run in Magnitude",
@@ -125,8 +134,9 @@ export const renderSearch = ({ query, response, unifiedMemory }: SearchView): st
   ]
   return ensureTrailingNewline([
     ...supportedSection,
+    ...uncheckedSection,
     ...unsupportedSection,
-    ...(supported.length > 0 ? ["", "See every quant: magnitude models show <repository>"] : []),
+    ...(supported.length + unchecked.length > 0 ? ["", "See every quant: magnitude models show <repository>"] : []),
     ...Option.toArray(Option.map(response.nextCursor, (cursor) => `More results: magnitude models search ${quoted(query)} --more '${cursor}'`)),
   ].join("\n"))
 }
