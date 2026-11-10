@@ -688,7 +688,7 @@ impl NativeGraphDraft {
             let shape = node.kernel.inner.shape(&arguments)?;
             results.push(shape.results.clone());
             planned.push(PlannedNode {
-                args: node.args,
+                args: Arc::new(node.args),
                 scratch: shape.scratch.clone(),
                 condition: node
                     .condition
@@ -1179,7 +1179,7 @@ impl NativeGraphMetadataDraft {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
             .map_err(CallError::Workflow)?;
-        validate_metadata_arguments(&args, &parameter_shapes, &self.ports, &self.results)?;
+        validate_metadata_arguments(&args, &parameter_shapes, &self.ports, &self.results, None)?;
         validate_park(&self.timelines, self.nodes.len(), shape.parks).map_err(CallError::Workflow)?;
         let results = result_shapes
             .into_iter()
@@ -1198,7 +1198,7 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
-        self.nodes.push(PlannedNode { args, scratch, condition: None, share: None });
+        self.nodes.push(PlannedNode { args: Arc::new(args), scratch, condition: None, share: None });
         self.shapes.push(shape);
         self.results.push(results);
         Ok(PendingWorkflowResults::new(self.identity, node, count))
@@ -1293,15 +1293,26 @@ impl NativeGraphMetadataDraft {
         })
     }
 
-    /// Validate a graph once before using its ordered edges and exports as a
-    /// resource template for other exact shape classes.
-    pub fn validate_topology(&self) -> Result<(), WorkflowError> {
+    /// It as a resource template for other exact shape classes, once its
+    /// ordered edges and exports are validated.
+    pub fn validated(self) -> Result<ValidatedMetadataDraft, WorkflowError> {
+        self.validate_topology()?;
+        Ok(ValidatedMetadataDraft {
+            plan_heap: self.plan_heap(),
+            bound_heap: bindings_heap(self.ports.len(), self.timelines.len()),
+            census: self.recorded(),
+            draft: self,
+        })
+    }
+
+    /// Validate a graph's ordered edges and exports.
+    fn validate_topology(&self) -> Result<(), WorkflowError> {
         if self.nodes.is_empty() {
             return Err(WorkflowError::Empty);
         }
         validate_used_ports(
             self.ports.len(),
-            self.nodes.iter().map(|node| &node.args),
+            self.nodes.iter().map(|node| &*node.args),
             &self.exports,
             &self.stores,
         )?;
@@ -1313,6 +1324,88 @@ impl NativeGraphMetadataDraft {
         }
         validate_stores(&self.stores, &self.ports, &self.results, &self.exports)?;
         validate_shares(&self.nodes, &self.results, &self.exports, &self.stores)
+    }
+}
+
+/// A metadata draft whose topology is validated
+/// ([`NativeGraphMetadataDraft::validated`]): what a resource template
+/// certifies every class of, each class checked and placed against the one
+/// validation. What its topology alone decides is derived once with it.
+pub struct ValidatedMetadataDraft {
+    draft: NativeGraphMetadataDraft,
+    plan_heap: HostHeap,
+    bound_heap: HostHeap,
+    /// What recording one run of it takes.
+    census: GraphCensus,
+}
+
+impl ValidatedMetadataDraft {
+    /// Whether this validated topology is valid at other shapes: each port's
+    /// extents as `ports` gives them, each node's parameter and result
+    /// shapes as `parameters` and `results` give them, and each view at
+    /// `facts` (a graph trace's evaluated at another model's facts). Every check enqueueing,
+    /// storing and sharing made of a shape is made again at them: each
+    /// argument against its parameter, each stored result against its port,
+    /// each shared result against its primary. The topology is this one's.
+    #[allow(clippy::type_complexity)]
+    pub fn validate_at(
+        &self,
+        facts: &[u64],
+        ports: &[Vec<u64>],
+        parameters: &[Vec<Option<(RepresentationId, Vec<u64>)>>],
+        results: &[Vec<Option<(RepresentationId, Vec<u64>)>>],
+    ) -> Result<(), CallError> {
+        let topology = || CallError::Workflow(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology));
+        if ports.len() != self.draft.ports.len() || parameters.len() != self.draft.nodes.len() || results.len() != self.draft.results.len() {
+            return Err(topology());
+        }
+        let ports = self
+            .draft
+            .ports
+            .iter()
+            .zip(ports)
+            .map(|(port, extents)| {
+                let layout = layout::canonical(port.representation, extents).map_err(CallError::Execution)?;
+                Ok(PortSpec {
+                    extents: extents.clone(),
+                    strides: layout.strides,
+                    byte_len: layout.byte_len,
+                    ..port.clone()
+                })
+            })
+            .collect::<Result<Vec<_>, CallError>>()?;
+        let results = self
+            .draft
+            .results
+            .iter()
+            .zip(results)
+            .map(|(row, shapes)| {
+                if row.len() != shapes.len() {
+                    return Err(topology());
+                }
+                row.iter()
+                    .zip(shapes)
+                    .map(|(recorded, shape)| match (recorded, shape) {
+                        (Some(recorded), Some((representation, extents))) if recorded.representation == *representation => {
+                            let layout = layout::canonical(*representation, extents).map_err(CallError::Execution)?;
+                            Ok(Some(NativeTensorSpec {
+                                representation: *representation,
+                                extents: extents.clone(),
+                                strides: layout.strides,
+                                byte_len: layout.byte_len,
+                            }))
+                        }
+                        (None, None) => Ok(None),
+                        _ => Err(topology()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (node, parameters) in self.draft.nodes.iter().zip(parameters) {
+            validate_metadata_arguments(&node.args, parameters, &ports, &results, Some(facts))?;
+        }
+        validate_stores(&self.draft.stores, &ports, &results, &self.draft.exports).map_err(CallError::Workflow)?;
+        validate_shares(&self.draft.nodes, &results, &self.draft.exports, &self.draft.stores).map_err(CallError::Workflow)
     }
 
     /// Place this validated topology once with every buffer at its supplied
@@ -1326,22 +1419,75 @@ impl NativeGraphMetadataDraft {
         results: &[Vec<u64>],
         scratch: Vec<Vec<ScratchNeed>>,
     ) -> Result<NativeGraphLayout, WorkflowError> {
-        self.validate_topology()?;
-        let shaped = ports.len() == self.ports.len()
-            && results.len() == self.results.len()
+        let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
+        Ok(make_layout(
+            &ports,
+            &nodes,
+            &results,
+            &self.draft.exports,
+            &self.draft.stores,
+            self.plan_heap,
+            self.draft.timelines.len(),
+            self.census,
+        ))
+    }
+
+    /// What [`Self::capacity_layout`] at the same capacities holds, exactly:
+    /// the same storage plan's sizes, without the layout a load seals into
+    /// (its offsets, signature and capacities).
+    pub fn capacity_storage(
+        &self,
+        ports: &[u64],
+        results: &[Vec<u64>],
+        scratch: Vec<Vec<ScratchNeed>>,
+    ) -> Result<NativeGraphStorageBytes, WorkflowError> {
+        let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
+        let storage = plan_storage(&ports, &nodes, &results, &self.draft.exports, &self.draft.stores);
+        Ok(NativeGraphStorageBytes {
+            workspace: storage.scratch_bytes,
+            output: storage.output_bytes,
+            upload: storage.upload_bytes,
+            recorded: self.census,
+        })
+    }
+
+    /// The host heap of the plan this topology seals to
+    /// ([`NativeGraphMetadataDraft::plan_heap`]).
+    pub fn plan_heap(&self) -> HostHeap {
+        self.plan_heap
+    }
+
+    /// The host heap of one static binding of a plan of this topology
+    /// ([`NativeGraphLayout::bound_heap`]).
+    pub fn bound_heap(&self) -> HostHeap {
+        self.bound_heap
+    }
+
+    /// This validated topology with every buffer at its supplied byte
+    /// capacity.
+    #[allow(clippy::type_complexity)]
+    fn at_capacities(
+        &self,
+        ports: &[u64],
+        results: &[Vec<u64>],
+        scratch: Vec<Vec<ScratchNeed>>,
+    ) -> Result<(Vec<PortSpec>, Vec<PlannedNode>, Vec<Vec<Option<NativeTensorSpec>>>), WorkflowError> {
+        let shaped = ports.len() == self.draft.ports.len()
+            && results.len() == self.draft.results.len()
             && results
                 .iter()
-                .zip(&self.results)
+                .zip(&self.draft.results)
                 .all(|(capacities, row)| capacities.len() == row.len())
-            && scratch.len() == self.nodes.len()
+            && scratch.len() == self.draft.nodes.len()
             && scratch
                 .iter()
-                .zip(&self.nodes)
+                .zip(&self.draft.nodes)
                 .all(|(capacities, node)| capacities.len() == node.scratch.len());
         if !shaped {
             return Err(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology));
         }
         let ports = self
+            .draft
             .ports
             .iter()
             .zip(ports)
@@ -1351,6 +1497,7 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Vec<_>>();
         let results = self
+            .draft
             .results
             .iter()
             .zip(results)
@@ -1367,26 +1514,18 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Vec<_>>();
         let nodes = self
+            .draft
             .nodes
             .iter()
             .zip(scratch)
             .map(|(node, scratch)| PlannedNode {
-                args: node.args.clone(),
+                args: Arc::clone(&node.args),
                 scratch,
                 condition: node.condition,
                 share: node.share,
             })
             .collect::<Vec<_>>();
-        Ok(make_layout(
-            &ports,
-            &nodes,
-            &results,
-            &self.exports,
-            &self.stores,
-            self.plan_heap(),
-            self.timelines.len(),
-            self.recorded(),
-        ))
+        Ok((ports, nodes, results))
     }
 }
 
@@ -1421,11 +1560,15 @@ fn make_layout(
     }
 }
 
+/// Check each argument of a node against its parameter's shape: at the
+/// recording, or, with `facts`, each view's operations at a graph trace's
+/// facts (`NativeGraphMetadataDraft::validate_at`).
 fn validate_metadata_arguments(
     args: &EncodedWorkflowArgs,
     parameter_shapes: &[Option<(RepresentationId, Vec<u64>)>],
     ports: &[PortSpec],
     results: &[Vec<Option<NativeTensorSpec>>],
+    facts: Option<&[u64]>,
 ) -> Result<(), CallError> {
     if parameter_shapes.len() != args.arguments().len() {
         return Err(CallError::Workflow(
@@ -1436,7 +1579,7 @@ fn validate_metadata_arguments(
     {
         match (argument, expected) {
             (EncodedWorkflowArgument::Tensor(argument), Some((representation, extents))) => {
-                let actual = metadata_argument_shape(argument, ports, results)?;
+                let actual = metadata_argument_shape(argument, ordinal, ports, results, facts)?;
                 if actual.0 != *representation || actual.1 != *extents {
                     return Err(CallError::Workflow(
                         WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
@@ -1456,14 +1599,26 @@ fn validate_metadata_arguments(
 
 fn metadata_argument_shape(
     argument: &WorkflowTensorArgument,
+    ordinal: usize,
     ports: &[PortSpec],
     results: &[Vec<Option<NativeTensorSpec>>],
+    facts: Option<&[u64]>,
 ) -> Result<(RepresentationId, Vec<u64>), CallError> {
     let (reference, operations) = match argument {
-        WorkflowTensorArgument::Result(reference) => (*reference, &[][..]),
-        WorkflowTensorArgument::ResultView { result, operations } => {
-            (*result, operations.as_slice())
-        }
+        WorkflowTensorArgument::Result(reference) => (*reference, std::borrow::Cow::Borrowed(&[][..])),
+        WorkflowTensorArgument::ResultView { result, operations, expressions } => match (facts, expressions) {
+            (Some(facts), Some(expressions)) => (
+                *result,
+                std::borrow::Cow::Owned(
+                    expressions
+                        .iter()
+                        .map(|expression| expression.at(facts))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal }))?,
+                ),
+            ),
+            _ => (*result, std::borrow::Cow::Borrowed(operations.as_slice())),
+        },
         WorkflowTensorArgument::External(_) => {
             return Err(CallError::Workflow(WorkflowError::NativePortMismatch {
                 port: usize::MAX,
@@ -1494,7 +1649,7 @@ fn metadata_argument_shape(
             },
         )
     };
-    for operation in operations {
+    for operation in operations.iter() {
         geometry = layout::apply_view(representation, geometry, operation)
             .map_err(|error| CallError::Workflow(WorkflowError::TensorView(error)))?;
     }
@@ -1658,6 +1813,7 @@ fn describe_arguments(
             EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
                 result,
                 operations,
+                ..
             }) => {
                 let mut descriptor = describe_reference(*result, ports, results, identity, device)?;
                 for operation in operations {
@@ -1722,7 +1878,8 @@ fn describe_reference(
 
 /// A node as storage planning sees it.
 struct PlannedNode {
-    args: EncodedWorkflowArgs,
+    /// Its arguments, which every class a resource template places shares.
+    args: Arc<EncodedWorkflowArgs>,
     /// Each of the node's call-private scratch buffers.
     scratch: Vec<ScratchNeed>,
     /// Its condition (`NodeCondition`): the external port, the word and what
@@ -4788,7 +4945,7 @@ mod layout_certificate_tests {
             result: 0,
         });
         let node = PlannedNode {
-            args,
+            args: Arc::new(args),
             scratch: vec![ScratchNeed {
                 bytes: rows * 4,
                 sync: false,

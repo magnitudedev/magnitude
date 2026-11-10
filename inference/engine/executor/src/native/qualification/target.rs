@@ -971,7 +971,8 @@ pub(super) fn qualify_routed(
         } else {
             let routed = route(&mut routes, &mut scores)?;
             let blocks = grouped_blocks(rows, e, k)
-                .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
+                .map_err(|error| qualification_dynamic("routed_group", &label, error))?
+                .fixed();
             let grouped = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
             let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;
@@ -1314,7 +1315,7 @@ pub(super) fn qualify_general_routed(
                 .map_err(failed!("routed_down"))?
                 .value
         } else {
-            let blocks = grouped_blocks(rows, e, k).map_err(failed!("routed_group"))?;
+            let blocks = grouped_blocks(rows, e, k).map_err(failed!("routed_group"))?.fixed();
             let grouped_rows = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
             let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;

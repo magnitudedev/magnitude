@@ -401,7 +401,7 @@ pub enum VisionAttentionScale {
 }
 
 /// The keys a patch row attends to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionAttentionSpan {
     /// Every patch row of the image.

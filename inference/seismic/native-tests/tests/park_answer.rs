@@ -30,9 +30,9 @@ fn busy_graph(device: &seismic::Device) -> impl FnMut() -> seismic::NativeGraphC
     let kernel = scale_rows::native_for_device(device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
     let mut graph = device.native_graph();
     let input = graph.port(Element::f32(), &[1, 4]).unwrap();
-    let mut value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 1.0 }).unwrap().value;
+    let mut value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(1.0) }).unwrap().value;
     for _ in 1..NODES {
-        value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: 1.0 }).unwrap().value;
+        value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: seismic::Argument::from(1.0) }).unwrap().value;
     }
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
@@ -126,7 +126,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
             .unwrap()
             .value;
         let value = graph
-            .enqueue(&after_kernel, scale_rows::WorkflowArgs { x: (&waited.reshape(&[1, n])).into(), factor: 2.0 })
+            .enqueue(&after_kernel, scale_rows::WorkflowArgs { x: (&waited.reshape(&[1, n])).into(), factor: seismic::Argument::from(2.0) })
             .unwrap()
             .value;
         let after = graph.timeline(seismic::timeline::Signal);

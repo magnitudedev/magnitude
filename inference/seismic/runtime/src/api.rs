@@ -3112,6 +3112,12 @@ pub mod kernel {
         ResultView {
             result: WorkflowResultRef,
             operations: Vec<ViewOperation>,
+            /// The operations with their numbers as expressions over a
+            /// graph trace's facts (`native::dimension`), each of
+            /// `operations` the one at the recording's; none where no fact
+            /// reaches any of them, so `operations` are the view at every
+            /// model's facts.
+            expressions: Option<Arc<[crate::native::dimension::ViewExpr]>>,
         },
     }
 
@@ -3147,9 +3153,10 @@ pub mod kernel {
             &mut self,
             result: WorkflowResultRef,
             operations: Vec<ViewOperation>,
+            expressions: Option<Arc<[crate::native::dimension::ViewExpr]>>,
         ) {
             self.arguments.push(EncodedWorkflowArgument::Tensor(
-                WorkflowTensorArgument::ResultView { result, operations },
+                WorkflowTensorArgument::ResultView { result, operations, expressions },
             ));
         }
         #[doc(hidden)]

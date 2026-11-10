@@ -10,11 +10,11 @@ use super::{
         slot_scores,
     },
     entry::{
-        EntryTokens, TARGET_TABLE, embedding_weight, entry_graph_topology, keeps_token_rows,
+        EntryTokens, EntryWidth, TARGET_TABLE, embedding_transform, entry_graph_topology, keeps_token_rows,
         notifies_selection,
     },
     prepared::{block_graph_shapes, block_scopes, block_taps, chain_rows, trailing_run},
-    weights::{CheckedLandingEntries, activation},
+    weights::{CheckedLandingEntries, PlannedWeights, activation},
 };
 use crate::{
     ModelLoadPlan, ResourceLimits,
@@ -800,7 +800,7 @@ mod resource_template_tests {
                 ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let certificate =
-                certify_target_family(backend, &load, &definition.decoder, &state, plan.target(), limits, crate::PassLaunches::whole_chain(limits))
+                certify_target_family::<seismic::NativeGraphLayout>(backend, &load, &definition.decoder, &state, plan.target(), limits, crate::PassLaunches::whole_chain(limits))
                     .unwrap();
             let chained = &certificate.graphs.chained;
             if backend.graphs_update_in_flight() {
@@ -943,7 +943,7 @@ mod resource_template_tests {
                 .unwrap();
                 let geometry = &definition.decoder;
                 let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
-                let weight = embedding_weight(&load).unwrap();
+                let weight = load.weight(TARGET_TABLE).unwrap();
                 let elements = [("EW", weight.resident), ("A", activation(geometry))];
                 // The graphs a load seals and their plans' host heap, from
                 // each exact class's own topology: blocks of one shape seal
@@ -1041,9 +1041,12 @@ mod resource_template_tests {
                             notifies_selection(&load).then_some(&[][..]),
                             landing.as_ref().map(CheckedLandingEntries::entries),
                             keeps_token_rows(&load),
-                            weight,
-                            geometry,
-                            rows,
+                            &weight,
+                            EntryWidth {
+                                hidden: &seismic::Dim::from(geometry.hidden),
+                                transform: crate::programs::native_target_graph::entry::transform_arguments(embedding_transform(geometry)),
+                            },
+                            &seismic::Dim::from(rows),
                             source,
                         )
                         .unwrap()

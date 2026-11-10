@@ -16,18 +16,20 @@
 //! bound once with the weights.
 
 use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
-use crate::operators::{self, InputForm, Join, SublayerInput};
+use crate::operators::{self, InputForm, Join, SublayerInput, scalar};
 use crate::programs::graph::{
     GraphError,
-    draft::{ControlSource, GraphDraft},
+    draft::GraphDraft,
 };
 use super::pooled::{
-    Picked, PickedBlock, PickedEntries, PickedInputs, PickedPorts, PickedWeights, PoolEntry,
-    PooledEntries, PooledWeights, Pooling,
+    Picked, PickedEntries, PickedInputs, PickedPorts, PickedWeights, PoolEntry, PooledEntries,
+    PooledWeights, Pooling,
 };
 use super::selection::{CandidateEntries, IndexerEntries, ProjectionInput};
-use crate::programs::native_target_graph::{PackedWeight, WeightOperands, WeightPort};
-use crate::{AttentionBinding, AttentionShape, AttentionValues, SelectionShape, SublayerTail};
+use super::split::{AttentionBlock, AttentionTopology, PickedPart, SelectedRead, SelectionReals, both, picked as picked_part};
+use crate::planning::{RoundingArguments, axis};
+use crate::programs::native_target_graph::{PackedWeight, PlannedWeights, WeightOperands, WeightPort};
+use crate::{AttentionBinding, AttentionShape, AttentionValues, SublayerTail};
 use crate::{
     native::{
         AttentionHistoryKernels, AttentionKernels, DenseDecodeKernels, PoolKernel,
@@ -35,9 +37,7 @@ use crate::{
     },
     programs::native_constants::GraphConstant,
 };
-use magnitude_family_contracts::{
-    Attention, HeadNorm, HeadWeights, Rotary, WeightKind, WeightRole, WeightScope,
-};
+use magnitude_family_contracts::{Attention, Rotary, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
     attention_output, attention_prefill, attention_prefill_k8v4, attention_project, indexer_select,
@@ -45,7 +45,7 @@ use magnitude_kernels::{
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, HistoryValue};
 use seismic::{
-    Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort, WorkflowTensor,
+    Argument, Dim, Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
@@ -284,6 +284,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
 
 /// Entry element assignments from the same program binding used by native
 /// preparation. The checked graph obtains all shapes from the entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedAttentionEntries {
     project: [(&'static str, Element); 7],
     mix: [(&'static str, Element); 1],
@@ -313,6 +314,7 @@ pub(crate) struct CheckedAttentionEntries {
 /// (`widen_rows`, `pool_rows` or at rate 1 `attention_append_dense`,
 /// `indexer_keys`, `indexer_score`;
 /// `rows_topk`, `candidate_blocks` and `candidate_rows` read none).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CheckedPickedEntries {
     elements: super::pooled::PickedElements,
     activation: [(&'static str, Element); 1],
@@ -364,7 +366,7 @@ fn admit_lane_roundings(binding: AttentionBinding, backend: seismic::BackendName
         BackendName::Metal | BackendName::Cuda => {}
         BackendName::Cpu | BackendName::Vulkan => return Ok(()),
     }
-    let width = binding.shape.width;
+    let width = binding.shape.widths.width;
     let pooled = match binding.picked {
         Some(crate::PickedBinding::Own(pooled)) => Some(pooled.rounding),
         Some(crate::PickedBinding::Reindex { .. } | crate::PickedBinding::Reused) | None => None,
@@ -583,8 +585,8 @@ pub(crate) fn affine_dimensions(codec: CodecSpec) -> Result<Vec<(&'static str, u
 pub(crate) const DECODE_ROWS: u64 = 8;
 
 /// Whether a `rows`-row class attends with the decode entry.
-pub(crate) fn decodes(rows: u64) -> bool {
-    rows <= DECODE_ROWS
+pub(crate) fn decodes(rows: impl Into<Dim>) -> bool {
+    rows.into().at_most(DECODE_ROWS)
 }
 
 /// The block's weight tensors, as ports of the graph being built. The
@@ -663,37 +665,28 @@ impl AttentionOperands {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn planned<G: GraphDraft>(
         graph: &mut G,
-        load: &crate::ModelLoadPlan,
+        weights: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
-        operator: &Attention,
-        shape: &AttentionShape,
+        topology: &AttentionTopology,
+        numbers: &AttentionBlock,
         attends: bool,
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
         let mut operands = |graph: &mut G, read: bool, kind| match read {
             true => {
-                WeightOperands::planned(graph, load, WeightRole { scope, kind }, ports, constants)
+                WeightOperands::planned(graph, weights, WeightRole { scope, kind }, ports, constants)
             }
             false => WeightOperands::absent(graph, constants),
         };
-        let selected =
-            attends && operators::attention::admitted_selection(operator).is_some();
-        let (rows, indexer) = match operators::attention::picked_source(operator)
-            .map_err(|error| error.to_string())?
-        {
-            Some(operators::attention::PickedSource::Own { rows, indexer, .. }) => {
-                (Some(rows), Some(indexer))
-            }
-            Some(operators::attention::PickedSource::Reindex { indexer, .. }) => (None, Some(indexer)),
-            Some(operators::attention::PickedSource::Reused { .. }) | None => (None, None),
-        };
-        let picked = match indexer {
-            Some(indexer) if attends => Some(PickedOperands {
-                rows: match rows {
-                    Some(rows) => Some(PooledOperands {
+        let selected = attends && numbers.selection.is_some();
+        let form = &topology.form;
+        let picked = match picked_part(topology, numbers) {
+            Some(PickedPart::Indexed { source: index, .. }) if attends => Some(PickedOperands {
+                rows: match &index.own {
+                    Some(own) => Some(PooledOperands {
                         projection: operands(graph, true, WeightKind::PooledProjection)?,
-                        gate: match super::pooled::gated(rows) {
+                        gate: match own.gated {
                             true => Some(operands(graph, true, WeightKind::PooledGate)?),
                             false => None,
                         },
@@ -702,11 +695,9 @@ impl AttentionOperands {
                     None => None,
                 },
                 query: operands(graph, true, WeightKind::IndexerQuery)?,
-                head_weights: match indexer.head_weights {
-                    HeadWeights::Projected(_) => {
-                        Some(operands(graph, true, WeightKind::IndexerHeadWeights)?)
-                    }
-                    HeadWeights::Uniform => None,
+                head_weights: match index.head_weights {
+                    true => Some(operands(graph, true, WeightKind::IndexerHeadWeights)?),
+                    false => None,
                 },
             }),
             _ => None,
@@ -715,32 +706,22 @@ impl AttentionOperands {
             picked,
             indexer_query: operands(graph, selected, WeightKind::IndexerQuery)?,
             indexer_key: operands(graph, selected, WeightKind::IndexerKey)?,
-            query: operands(
-                graph,
-                attends,
-                operators::attention::query_segment_kind(operator),
-            )?,
-            low_rank_query: match attends
-                && operators::attention::low_rank_query(operator).is_some()
-            {
-                true => Some(operands(
-                    graph,
-                    true,
-                    operators::attention::query_kind(operator),
-                )?),
+            query: operands(graph, attends, topology.query_segment_kind)?,
+            low_rank_query: match attends && numbers.low_rank_query.is_some() {
+                true => Some(operands(graph, true, topology.query_kind)?),
                 false => None,
             },
             gate: operands(
                 graph,
-                attends && shape.gate_rows() > 0,
+                attends && form.gated_separately(),
                 WeightKind::AttentionGate,
             )?,
-            key: operands(graph, shape.key_rows() > 0, WeightKind::Key)?,
-            value: operands(graph, shape.value_rows() > 0, WeightKind::Value)?,
+            key: operands(graph, form.fresh, WeightKind::Key)?,
+            value: operands(graph, form.projects_values(), WeightKind::Value)?,
             output: operands(graph, attends, WeightKind::AttentionOutput)?,
             grouped: operands(
                 graph,
-                attends && operators::attention::grouped_output(operator).is_some(),
+                attends && numbers.grouped.is_some(),
                 WeightKind::AttentionOutputGrouped,
             )?,
         })
@@ -749,56 +730,56 @@ impl AttentionOperands {
     /// The projection's scale and bound dimensions, in `attention_project`'s
     /// order: a history injection (`inject_only`) projects only keys and
     /// values.
-    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, u64); 8] {
-        let attended = |extent: u64| if inject_only { 0 } else { extent };
+    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, Dim); 8] {
+        let attended = |dim: Dim| if inject_only { Dim::from(0) } else { dim };
         [
-            ("QS", attended(self.query.scale.extent)),
-            ("GS", attended(self.gate.scale.extent)),
-            ("KS", self.key.scale.extent),
-            ("VS", self.value.scale.extent),
-            ("QB", attended(self.query.bound.extent)),
-            ("GB", attended(self.gate.bound.extent)),
-            ("KB", self.key.bound.extent),
-            ("VB", self.value.bound.extent),
+            ("QS", attended(self.query.scale.extent.clone())),
+            ("GS", attended(self.gate.scale.extent.clone())),
+            ("KS", self.key.scale.extent.clone()),
+            ("VS", self.value.scale.extent.clone()),
+            ("QB", attended(self.query.bound.extent.clone())),
+            ("GB", attended(self.gate.bound.extent.clone())),
+            ("KB", self.key.bound.extent.clone()),
+            ("VB", self.value.bound.extent.clone()),
         ]
     }
 
-    /// A low-rank query's up projection's scale and bound dimensions, in
-    /// `attention_project`'s order (a query segment alone), from its
-    /// `up`'s `operands`.
-    pub(crate) fn low_rank_query_dimensions(operands: &WeightOperands) -> [(&'static str, u64); 8] {
+    /// A query segment's scale and bound dimensions alone, in
+    /// `attention_project`'s order, from its weight's `operands`: a
+    /// low-rank query's up projection, or an indexer's projection.
+    pub(crate) fn query_dimensions(operands: &WeightOperands) -> [(&'static str, Dim); 8] {
         [
-            ("QS", operands.scale.extent),
-            ("GS", 0),
-            ("KS", 0),
-            ("VS", 0),
-            ("QB", operands.bound.extent),
-            ("GB", 0),
-            ("KB", 0),
-            ("VB", 0),
+            ("QS", operands.scale.extent.clone()),
+            ("GS", Dim::from(0)),
+            ("KS", Dim::from(0)),
+            ("VS", Dim::from(0)),
+            ("QB", operands.bound.extent.clone()),
+            ("GB", Dim::from(0)),
+            ("KB", Dim::from(0)),
+            ("VB", Dim::from(0)),
         ]
     }
 
     /// The indexer projection's scale and bound dimensions, in
     /// `attention_project`'s order (no gate or value segments).
-    pub(crate) fn indexer_dimensions(&self) -> [(&'static str, u64); 8] {
+    pub(crate) fn indexer_dimensions(&self) -> [(&'static str, Dim); 8] {
         [
-            ("QS", self.indexer_query.scale.extent),
-            ("GS", 0),
-            ("KS", self.indexer_key.scale.extent),
-            ("VS", 0),
-            ("QB", self.indexer_query.bound.extent),
-            ("GB", 0),
-            ("KB", self.indexer_key.bound.extent),
-            ("VB", 0),
+            ("QS", self.indexer_query.scale.extent.clone()),
+            ("GS", Dim::from(0)),
+            ("KS", self.indexer_key.scale.extent.clone()),
+            ("VS", Dim::from(0)),
+            ("QB", self.indexer_query.bound.extent.clone()),
+            ("GB", Dim::from(0)),
+            ("KB", self.indexer_key.bound.extent.clone()),
+            ("VB", Dim::from(0)),
         ]
     }
 
     /// The output projection's scale and bound dimensions.
-    pub(crate) fn output_dimensions(&self) -> [(&'static str, u64); 2] {
+    pub(crate) fn output_dimensions(&self) -> [(&'static str, Dim); 2] {
         [
-            ("OS", self.output.scale.extent),
-            ("OB", self.output.bound.extent),
+            ("OS", self.output.scale.extent.clone()),
+            ("OB", self.output.bound.extent.clone()),
         ]
     }
 }
@@ -821,61 +802,14 @@ pub(crate) struct IndexerWeights {
     pub key_norm: WorkflowTensor,
 }
 
-/// One attention block at one graph class.
-pub(crate) struct AttentionBlock<'a> {
-    pub rows: u64,
-    pub segments: u64,
-    pub history_rows: u64,
-    pub slab_rows: u32,
-    /// The history row tiles one launch of the class can see
-    /// (`HistoryStorePlan::launch_tiles` of its request slots).
-    pub history_tiles: u64,
-    pub shape: AttentionShape,
-    pub operator: &'a Attention,
-    /// The input norm's epsilon.
-    pub epsilon: f32,
-    /// The head norms' one epsilon.
-    pub head_epsilon: f32,
-    /// The post-norm's epsilon, read only by a post-norm tail.
-    pub post_norm_epsilon: f32,
-    /// The post-norm's output scale: 1, or the layer's output scale.
-    pub post_norm_scale: f32,
-    pub activation: Element,
-    /// Draft priming only publishes K/V history; its attention output is unused.
-    pub inject_only: bool,
-    /// Causal target rows consume earlier rows through the cache codec.
-    pub causal_cache: bool,
-    /// A selected read's indexer and its history domains.
-    pub selection: Option<SelectionBlock>,
-    /// An index-list source's rows (`HistorySource` 1).
-    pub picked: Option<PickedBlock<'a>>,
-    /// How the graph takes its launch's controls.
-    pub controls: ControlSource,
-}
-
-/// A selected read's indexer at one graph class: its static axes and its
-/// raw keys' (Window) and block keys' (Block) history rows and slab rows.
-#[derive(Clone, Copy)]
-pub(crate) struct SelectionBlock {
-    pub shape: SelectionShape,
-    /// Whether the class scores: some row of its launch has more than
-    /// `blocks` complete blocks. A class without scoring appends the
-    /// indexer's keys alone and reads every visible row.
-    pub scored: bool,
-    pub window_rows: u64,
-    pub window_slab_rows: u32,
-    pub block_rows: u64,
-    pub block_slab_rows: u32,
-}
-
 /// The segments `C` a decode row of a read selecting `blocks` blocks reads
 /// (`indexer_select`'s Segments form): every run of its selected blocks and
 /// of its tail in its visible spans, split at most where one of those spans
 /// (at most the class of `MAX_HISTORY_SPANS`) ends. One capacity for every
 /// class, so a load's graphs agree on it: the decode entries' `R` in a
 /// selected block's classes (`decode_class_segments`).
-pub(crate) fn selected_segments(blocks: u64) -> u64 {
-    blocks + 1 + magnitude_state::MAX_HISTORY_SPANS.next_power_of_two() as u64
+pub(crate) fn selected_segments<D: std::ops::Add<u64, Output = D>>(blocks: D) -> D {
+    blocks + (1 + magnitude_state::MAX_HISTORY_SPANS.next_power_of_two() as u64)
 }
 
 /// The class slice of a block whose attention is `operator`: a selected
@@ -898,68 +832,56 @@ pub(crate) fn decode_class_segments(
     }
 }
 
-/// The attention projection's dimensions at `rows` rows: the query
-/// segment projects the query rows, or a low-rank query's `rank` rows of
-/// `qr` (`query_rank`).
-pub(crate) fn project_dimensions(
-    shape: &AttentionShape,
-    query_rank: Option<u64>,
-    rows: u64,
-) -> [(&'static str, u64); 6] {
-    let mut dimensions = shape.project_dimensions(rows);
-    if let Some(rank) = query_rank {
-        dimensions[2].1 = rank;
-    }
-    dimensions
-}
-
-/// A low-rank query's up projection's dimensions at `rows` rows
-/// (`attention_project`): its `rank`-wide `qr` rows to the query rows, no
-/// gate, key or value.
-pub(crate) fn low_rank_query_dimensions(
-    shape: &AttentionShape,
-    rank: u64,
-    rows: u64,
-) -> [(&'static str, u64); 6] {
+/// A query segment's projection alone at `rows` rows (`attention_project`):
+/// its `inputs`-wide rows to `outputs` rows, no gate, key or value. A
+/// low-rank query's up projection (its `rank`-wide `qr` rows to the query
+/// rows), and each of an indexer's projections.
+pub(crate) fn query_projection_dimensions<D: From<u64>>(
+    rows: D,
+    inputs: D,
+    outputs: D,
+) -> [(&'static str, D); 6] {
     [
         ("M", rows),
-        ("D", rank),
-        ("Q", shape.query_rows()),
-        ("GR", 0),
-        ("K", 0),
-        ("V", 0),
+        ("D", inputs),
+        ("Q", outputs),
+        ("GR", D::from(0)),
+        ("K", D::from(0)),
+        ("V", D::from(0)),
     ]
 }
 
 /// The indexer projection's dimensions at `rows` rows over a `hidden`-wide
-/// input (`attention_project`): its query heads and raw key, no gate or
-/// value.
-pub(crate) fn indexer_project_dimensions(
-    hidden: u64,
-    selection: SelectionShape,
-    rows: u64,
-) -> [(&'static str, u64); 6] {
+/// input (`attention_project`): its `heads` query heads and raw key of
+/// `width`, no gate or value.
+pub(crate) fn indexer_project_dimensions<D: Clone + From<u64> + std::ops::Mul<Output = D>>(
+    hidden: D,
+    heads: D,
+    width: D,
+    rows: D,
+) -> [(&'static str, D); 6] {
     [
         ("M", rows),
         ("D", hidden),
-        ("Q", selection.heads * selection.width),
-        ("GR", 0),
-        ("K", selection.width),
-        ("V", 0),
+        ("Q", heads * width.clone()),
+        ("GR", D::from(0)),
+        ("K", width),
+        ("V", D::from(0)),
     ]
 }
 
 /// A selected read's indexer inputs at one graph class: its selection
 /// entry, the projected query heads `[rows, heads, width]` and raw keys
-/// `[rows, width]`, its norm rows and its block.
-pub(crate) struct SelectionInputs<'a, G: GraphDraft + 'a> {
+/// `[rows, width]`, its norm rows, whether the class scores and its numbers.
+pub(crate) struct SelectionInputs<'n, 'a, G: GraphDraft + 'a> {
     pub select: G::Binding<'a, indexer_select::Entry>,
     pub prefill: SelectedPrefillEntries<'a, G>,
     pub query: WorkflowTensorView,
     pub key: WorkflowTensorView,
     pub query_norm: WorkflowTensorView,
     pub key_norm: WorkflowTensorView,
-    pub block: SelectionBlock,
+    pub read: &'n SelectedRead<Dim>,
+    pub reals: &'n SelectionReals<Argument<f64>>,
 }
 
 /// What a selected read's attention reads, from `indexer_select`: a decode
@@ -974,39 +896,41 @@ struct Selected {
 /// reads (`indexer_select`), the Segments form for decode rows, the
 /// WorkList bitmap for prefill rows. Its planes and per-run tables are
 /// ports of the graph; `rotary` is the attention's table.
+#[allow(clippy::too_many_arguments)]
 fn select<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    selection: &SelectionInputs<'a, G>,
-    block: &AttentionBlock<'_>,
+    selection: &SelectionInputs<'_, 'a, G>,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
     controls: &AttentionControlPorts,
     rotary: [&WorkflowTensor; 3],
     constants: &mut Vec<GraphConstant>,
 ) -> Result<(Selected, IndexerStatePorts, IndexerControlPorts), GraphError> {
-    let binding = selection.block.shape;
-    let pairs = block.shape.rotary_pairs;
-    let rows = block.rows;
+    let read = selection.read;
+    let pairs = &numbers.widths.rotary_pairs;
+    let rows = &numbers.rows;
     // A class without scoring only appends (B = C = 0).
-    let scored = selection.block.scored;
+    let scored = read.scored;
     let segments = if scored && decodes(rows) {
-        selected_segments(binding.blocks)
+        selected_segments(read.blocks.clone())
     } else {
-        0
+        Dim::from(0)
     };
-    let words = if scored { binding.words } else { 0 };
+    let words = if scored { read.words.clone() } else { Dim::from(0) };
     let dimensions = [
-        ("M", rows),
-        ("TW", selection.block.window_rows),
-        ("TB", selection.block.block_rows),
-        ("H", binding.heads),
-        ("P", pairs),
-        ("S", binding.width - 2 * pairs),
-        ("SB", binding.block),
-        ("R", block.segments),
-        ("C", segments),
-        ("B", words),
+        ("M", rows.clone()),
+        ("TW", read.window.rows.clone()),
+        ("TB", read.blocks_plane.rows.clone()),
+        ("H", read.heads.clone()),
+        ("P", pairs.clone()),
+        ("S", &read.width - pairs * 2),
+        ("SB", read.block.clone()),
+        ("R", numbers.segments.clone()),
+        ("C", segments.clone()),
+        ("B", words.clone()),
     ];
     let mut input =
-        |name: &str| graph.control_for(block.controls, selection.select, name, &dimensions);
+        |name: &str| graph.control_for(topology.controls, selection.select, name, &dimensions);
     let tables = IndexerControlPorts {
         window_visible: input("window_visible")?,
         window_destinations: input("window_destinations")?,
@@ -1014,20 +938,16 @@ fn select<'a, G: GraphDraft + 'a>(
         block_destinations: input("block_destinations")?,
     };
     let mut planes = IndexerStatePorts {
-        window_keys: graph.port(
-            Element::f32(),
-            &[selection.block.window_rows, binding.width],
-        )?,
-        window_coordinates: graph.port(Element::i32(), &[selection.block.window_rows, 4])?,
-        block_keys: graph.port(Element::f32(), &[selection.block.block_rows, binding.width])?,
-    };
-    let Some(indexer) = operators::attention::admitted_selection(block.operator) else {
-        return Err("a selected block's operator reads every visible row".into());
+        window_keys: graph.port(Element::f32(), &[read.window.rows.clone(), read.width.clone()])?,
+        window_coordinates: graph
+            .port(Element::i32(), &[read.window.rows.clone(), Dim::from(4)])?,
+        block_keys: graph
+            .port(Element::f32(), &[read.blocks_plane.rows.clone(), read.width.clone()])?,
     };
     // Extent-only arguments: zero rows of a row table, and an empty bitmap.
     let none = controls.destinations.tensor().slice_leading(0, 0);
-    let block_slots = none.reshape(&[0, binding.block]);
-    let segment_slots = none.reshape(&[0, segments]);
+    let block_slots = none.reshape(&[Dim::from(0), read.block.clone()]);
+    let segment_slots = none.reshape(&[Dim::from(0), segments]);
     let bitmap_words = GraphConstant::u32_zeros(graph, 0, words)?;
     let visible = controls
         .visible
@@ -1056,11 +976,11 @@ fn select<'a, G: GraphDraft + 'a>(
             window_keys: planes.window_keys.tensor_mut().into(),
             window_coordinates: planes.window_coordinates.tensor_mut().into(),
             block_keys: planes.block_keys.tensor_mut().into(),
-            selected: i32::try_from(binding.blocks).map_err(|_| "selected blocks exceed i32")?,
-            epsilon: indexer.query_norm.epsilon as f32,
-            slab_rows: block.slab_rows,
-            window_slab_rows: selection.block.window_slab_rows,
-            block_slab_rows: selection.block.block_slab_rows,
+            selected: scalar(&read.blocks, "selected blocks")?,
+            epsilon: selection.reals.epsilon.f32(),
+            slab_rows: scalar(&numbers.slab_rows, "slab rows")?,
+            window_slab_rows: scalar(&read.window.slab_rows, "slab rows")?,
+            block_slab_rows: scalar(&read.blocks_plane.slab_rows, "slab rows")?,
         },
     )?;
     constants.push(bitmap_words);
@@ -1123,11 +1043,10 @@ pub(crate) struct AttentionControlPorts {
 }
 
 /// The `history_tiles` input of a graph class that lists the history row
-/// tiles its launch's rows see, and the tiles it lists.
+/// tiles its launch's rows see.
 #[derive(Clone)]
 pub(crate) struct HistoryTilesPort {
     pub port: NativePort,
-    pub tiles: usize,
 }
 
 /// The history row tiles the rows of a launch see, from its encoded
@@ -1146,52 +1065,42 @@ pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>
         .map(|tiles| tiles.iter().flat_map(|tile| tile.to_le_bytes()).collect())
 }
 
-/// The block's attention weights in the order and presence its operator's
-/// form, input form, sublayer tail and projection operands define.
+/// The block's attention weights in the order and presence its topology,
+/// input form, sublayer tail and projection operands define.
 pub(crate) fn attention_weights(
-    shape: &AttentionShape,
-    operator: &Attention,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
     form: InputForm,
     needs_output: bool,
-    post_norm: bool,
     operands: AttentionOperands,
     mut weight: impl FnMut(WeightKind) -> Result<WorkflowTensor, GraphError>,
 ) -> Result<AttentionWeights, GraphError> {
+    let layer = &topology.form;
     let mut present = |present: bool, kind| present.then(|| weight(kind)).transpose();
     Ok(AttentionWeights {
         input_norm: present(form.normalized, WeightKind::InputNorm)?,
-        query: present(true, operators::attention::query_segment_kind(operator))?
-            .ok_or("query")?,
+        query: present(true, topology.query_segment_kind)?.ok_or("query")?,
         low_rank_query: {
-            let low_rank = needs_output && operators::attention::low_rank_query(operator).is_some();
+            let low_rank = needs_output && numbers.low_rank_query.is_some();
             present(low_rank, WeightKind::QueryDownNorm)?
-                .zip(present(low_rank, operators::attention::query_kind(operator))?)
+                .zip(present(low_rank, topology.query_kind)?)
                 .map(|(norm, up)| LowRankQueryWeights { norm, up })
         },
-        gate: present(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
-        key: present(shape.key_rows() > 0, WeightKind::Key)?,
-        value: present(shape.value_rows() > 0, WeightKind::Value)?,
-        query_norm: present(needs_output && shape.query_norm > 0, WeightKind::QueryNorm)?,
+        gate: present(layer.gated_separately(), WeightKind::AttentionGate)?,
+        key: present(layer.fresh, WeightKind::Key)?,
+        value: present(layer.projects_values(), WeightKind::Value)?,
+        query_norm: present(needs_output && layer.query_norm, WeightKind::QueryNorm)?,
         // A Shared layer projects no keys, so it has no key norm.
-        key_norm: present(shape.key_norm > 0 && shape.fresh > 0, WeightKind::KeyNorm)?,
-        sinks: present(needs_output && shape.sinks > 0, WeightKind::AttentionSinks)?,
+        key_norm: present(layer.key_norm && layer.fresh, WeightKind::KeyNorm)?,
+        sinks: present(needs_output && layer.sinks, WeightKind::AttentionSinks)?,
         output: present(needs_output, WeightKind::AttentionOutput)?,
         grouped: present(
-            needs_output && operators::attention::grouped_output(operator).is_some(),
+            needs_output && numbers.grouped.is_some(),
             WeightKind::AttentionOutputGrouped,
         )?,
-        post_norm: present(post_norm, WeightKind::PostNorm)?,
-        picked: match (
-            &operands.picked,
-            operators::attention::picked_source(operator).map_err(|error| error.to_string())?,
-        ) {
-            (
-                Some(picked),
-                Some(
-                    operators::attention::PickedSource::Own { indexer, .. }
-                    | operators::attention::PickedSource::Reindex { indexer, .. },
-                ),
-            ) => {
+        post_norm: present(topology.post_norm.is_some(), WeightKind::PostNorm)?,
+        picked: match (&operands.picked, picked_part(topology, numbers)) {
+            (Some(picked), Some(PickedPart::Indexed { reals: index, .. })) => {
                 let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
                     weight,
                     operands: operands.clone(),
@@ -1211,9 +1120,9 @@ pub(crate) fn attention_weights(
                         None => None,
                     },
                     query: packed(weight(WeightKind::IndexerQuery)?, &picked.query),
-                    query_norm: match indexer.query.norm {
-                        HeadNorm::Rms(_) => Some(weight(WeightKind::IndexerQueryNorm)?),
-                        HeadNorm::None => None,
+                    query_norm: match index.query_norm {
+                        Some(_) => Some(weight(WeightKind::IndexerQueryNorm)?),
+                        None => None,
                     },
                     head_weights: match &picked.head_weights {
                         Some(head_weights) => {
@@ -1229,7 +1138,7 @@ pub(crate) fn attention_weights(
             }
         },
         operands,
-        indexer: match operators::attention::admitted_selection(operator) {
+        indexer: match numbers.selection {
             None => None,
             Some(_) => Some(IndexerWeights {
                 query: weight(WeightKind::IndexerQuery)?,
@@ -1241,18 +1150,25 @@ pub(crate) fn attention_weights(
     })
 }
 
+/// The attention block `topology` at `numbers` over `input`: its
+/// projection, mix and output, the new residual, and its state and control
+/// ports.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: AttentionGraphEntries<'a, G>,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
     weights: &AttentionWeights,
     constants: &mut Vec<GraphConstant>,
     input: SublayerInput<'_>,
     residual: &WorkflowTensor,
     join: &Join,
-    block: AttentionBlock<'_>,
 ) -> Result<(WorkflowTensor, AttentionStatePorts, AttentionControlPorts), GraphError> {
-    let shape = block.shape;
-    let (rows, width, heads) = (block.rows, shape.width, shape.heads());
+    let (form, widths) = (&topology.form, &numbers.widths);
+    let (rows, width, heads) = (&numbers.rows, &widths.width, widths.heads());
+    let hidden = &widths.hidden;
+    let inject_only = topology.inject_only;
     let input_norm = match &weights.input_norm {
         Some(norm) => norm.clone(),
         None => GraphConstant::absent(graph, constants)?.tensor().clone(),
@@ -1265,47 +1181,50 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         .map(|gate| gate.slice_leading(0, 0))
         .unwrap_or_else(|| empty_weight.clone());
     let operands = &weights.operands;
-    // A low-rank query's projection segment projects its `rank` rows of
-    // `qr` (a history injection projects no query).
-    let low_rank = operators::attention::low_rank_query(block.operator);
     // A history injection reads neither the query's nor the gate's operands.
-    let (query, gate) = match block.inject_only {
+    let (query, gate) = match inject_only {
         true => {
             let absent = WeightOperands::absent(graph, constants)?;
             (absent.clone(), absent)
         }
         false => (operands.query.clone(), operands.gate.clone()),
     };
+    // A low-rank query's projection segment projects its `rank` rows of
+    // `qr` (a history injection projects no query).
     let projected = graph.enqueue(
         kernels.project,
         &[
-            if block.inject_only {
-                shape.key_value_dimensions(rows)
+            if inject_only {
+                widths.key_value_dimensions(form, rows.clone())
             } else {
-                project_dimensions(&shape, low_rank.map(|(rank, _)| rank), rows)
+                widths.project_dimensions(
+                    form,
+                    rows.clone(),
+                    numbers.low_rank_query.as_ref().map(|low_rank| &low_rank.rank),
+                )
             }
             .as_slice(),
-            operands.project_dimensions(block.inject_only).as_slice(),
-            &input.form.dimensions(shape.hidden),
+            operands.project_dimensions(inject_only).as_slice(),
+            &input.form.dimensions(hidden.clone()),
         ]
         .concat(),
         attention_project::WorkflowArgs {
             hidden: input.rows.into(),
             input_norm: (&input_norm).into(),
-            query_weight: if block.inject_only {
+            query_weight: if inject_only {
                 (&empty_weight).into()
             } else {
                 (&weights.query).into()
             },
-            gate_weight: if block.inject_only {
+            gate_weight: if inject_only {
                 (&empty_gate_weight).into()
             } else {
                 segment(&weights.gate, &empty_weight)
             },
             key_weight: segment(&weights.key, &empty_weight),
             value_weight: segment(&weights.value, &empty_weight),
-            epsilon: block.epsilon,
-            project_mode: 0,
+            epsilon: topology.epsilon.f32(),
+            project_mode: 0.into(),
             query_scale: (&query.scale.tensor).into(),
             gate_scale: (&gate.scale.tensor).into(),
             key_scale: (&operands.key.scale.tensor).into(),
@@ -1321,18 +1240,19 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // normalizes them by their norm in its prologue and projects the query
     // heads.
     let (query, qr) = match (
-        block.inject_only,
-        low_rank,
+        inject_only,
+        both(&numbers.low_rank_query, &topology.low_rank_query, "low-rank query"),
         kernels.low_rank_query,
         &weights.low_rank_query,
         &operands.low_rank_query,
     ) {
         (true, ..) | (false, None, None, None, None) => (projected.r0, None),
-        (false, Some((rank, epsilon)), Some(entries), Some(up), Some(up_operands)) => {
+        (false, Some((low_rank, low_rank_reals)), Some(entries), Some(up), Some(up_operands)) => {
+            let rank = &low_rank.rank;
             let qr = graph
                 .enqueue(
                     entries.widen,
-                    &[("M", rows), ("D", rank)],
+                    &[("M", rows.clone()), ("D", rank.clone())],
                     widen_rows::WorkflowArgs {
                         rows: (&projected.r0).into(),
                     },
@@ -1344,9 +1264,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 .enqueue(
                     entries.project,
                     &[
-                        low_rank_query_dimensions(&shape, rank, rows).as_slice(),
-                        AttentionOperands::low_rank_query_dimensions(up_operands).as_slice(),
-                        &InputForm::SINGLE.dimensions(rank),
+                        query_projection_dimensions(
+                            rows.clone(),
+                            rank.clone(),
+                            widths.query_rows(form),
+                        )
+                        .as_slice(),
+                        AttentionOperands::query_dimensions(up_operands).as_slice(),
+                        &InputForm::SINGLE.dimensions(rank.clone()),
                     ]
                     .concat(),
                     attention_project::WorkflowArgs {
@@ -1356,8 +1281,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         gate_weight: (&empty).into(),
                         key_weight: (&empty).into(),
                         value_weight: (&empty).into(),
-                        epsilon: epsilon as f32,
-                        project_mode: 0,
+                        epsilon: low_rank_reals.epsilon.f32(),
+                        project_mode: 0.into(),
                         query_scale: (&up_operands.scale.tensor).into(),
                         gate_scale: (&absent).into(),
                         key_scale: (&absent).into(),
@@ -1369,7 +1294,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     },
                 )?
                 .r0;
-            (query, Some((qr, rank, epsilon as f32, &up.norm)))
+            (query, Some((qr, rank.clone(), low_rank_reals.epsilon.f32(), &up.norm)))
         }
         _ => {
             return Err(
@@ -1379,48 +1304,56 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         }
     };
     // The mix entries read the projection per head.
+    let attended_heads = if inject_only { Dim::from(0) } else { heads.clone() };
+    let fresh = axis(form.fresh);
+    let key_width = widths.key_width();
     let projected = ProjectedRows {
         query: query.reshape(&[
-            rows,
-            if block.inject_only { 0 } else { heads },
-            width + shape.interleaved_gate,
+            rows.clone(),
+            attended_heads.clone(),
+            width + widths.interleaved_gate(form),
         ]),
-        gate: projected.r1.reshape(&[
-            rows,
-            if block.inject_only { 0 } else { heads },
-            shape.separate_gate,
-        ]),
+        gate: projected
+            .r1
+            .reshape(&[rows.clone(), attended_heads, widths.separate_gate(form)]),
         key: projected
             .r2
-            .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
-        value: match shape.values {
+            .reshape(&[fresh.clone(), rows.clone(), key_width.clone()]),
+        value: match form.values {
             AttentionValues::Projected => projected
                 .r3
-                .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
-            AttentionValues::RawKey => projected
-                .r2
-                .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
+                .reshape(&[fresh, rows.clone(), key_width]),
+            AttentionValues::RawKey => projected.r2.reshape(&[fresh, rows.clone(), key_width]),
             // The entries take no value of their own (`VK`): zero layers.
             AttentionValues::StoredKey => projected
                 .r2
                 .slice_leading(0, 0)
-                .reshape(&[0, rows, shape.kv_heads * width]),
+                .reshape(&[Dim::from(0), rows.clone(), key_width]),
         },
     };
     // A selected read's indexer projects its query heads and raw key from
     // the same input under the same norm.
-    let selection = match (kernels.selection, &weights.indexer, block.selection) {
+    let selection = match (
+        kernels.selection,
+        &weights.indexer,
+        both(&numbers.selection, &topology.selection, "selected read"),
+    ) {
         (None, None, None) => None,
-        (Some(entries), Some(indexer), Some(selection)) => {
-            let binding = selection.shape;
+        (Some(entries), Some(indexer), Some((read, reals))) => {
             let empty = indexer.query.slice_leading(0, 0);
             let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
             let projected = graph.enqueue(
                 entries.project,
                 &[
-                    indexer_project_dimensions(shape.hidden, binding, rows).as_slice(),
+                    indexer_project_dimensions(
+                        hidden.clone(),
+                        read.heads.clone(),
+                        read.width.clone(),
+                        rows.clone(),
+                    )
+                    .as_slice(),
                     operands.indexer_dimensions().as_slice(),
-                    &input.form.dimensions(shape.hidden),
+                    &input.form.dimensions(hidden.clone()),
                 ]
                 .concat(),
                 attention_project::WorkflowArgs {
@@ -1438,34 +1371,41 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     gate_weight: (&empty).into(),
                     key_weight: (&indexer.key).into(),
                     value_weight: (&empty).into(),
-                    epsilon: block.epsilon,
-                    project_mode: 0,
+                    epsilon: topology.epsilon.f32(),
+                    project_mode: 0.into(),
                 },
             )?;
             Some(SelectionInputs {
                 select: entries.select,
                 prefill: entries.prefill,
-                query: projected.r0.reshape(&[rows, binding.heads, binding.width]),
-                key: projected.r2.reshape(&[rows, binding.width]),
-                query_norm: indexer.query_norm.reshape(&[1, binding.width]),
-                key_norm: indexer.key_norm.reshape(&[1, binding.width]),
-                block: selection,
+                query: projected
+                    .r0
+                    .reshape(&[rows.clone(), read.heads.clone(), read.width.clone()]),
+                key: projected.r2.reshape(&[rows.clone(), read.width.clone()]),
+                query_norm: indexer.query_norm.reshape(&[Dim::from(1), read.width.clone()]),
+                key_norm: indexer.key_norm.reshape(&[Dim::from(1), read.width.clone()]),
+                read,
+                reals,
             })
         }
         _ => return Err("attention selection entries, weights and block disagree".into()),
     };
     // An own index-list source projects the layer's normed input and its
     // indexer the low-rank query's `qr` rows.
-    let x = input.rows.slice_leading(0, rows);
-    let x_norm = input_norm.reshape(&[if weights.input_norm.is_some() { shape.hidden } else { 0 }]);
+    let x = input.rows.slice_leading(0, rows.clone());
+    let x_norm = input_norm.reshape(&[if weights.input_norm.is_some() {
+        hidden.clone()
+    } else {
+        Dim::from(0)
+    }]);
     let qr_rows = qr.as_ref().map(|(qr, rank, epsilon, norm)| {
-        (qr.slice_leading(0, rows), *rank, *epsilon, norm.reshape(&[*rank]))
+        (qr.slice_leading(0, rows.clone()), rank.clone(), *epsilon, norm.reshape(&[rank.clone()]))
     });
-    let picked = match block.picked {
+    let picked = match picked_part(topology, numbers) {
         None => None,
-        Some(PickedBlock::Reused { plane }) => Some(Picked::Reused { plane }),
-        Some(PickedBlock::Indexed { plane, index, own }) => {
-            let (Some(entries), Some(picked), Some((qr, rank, qr_epsilon, qr_norm))) =
+        Some(PickedPart::Reused { plane }) => Some(Picked::Reused { plane }),
+        Some(PickedPart::Indexed { source, reals }) => {
+            let (Some(entries), Some(weights), Some((qr, rank, qr_epsilon, qr_norm))) =
                 (kernels.picked, &weights.picked, &qr_rows)
             else {
                 return Err(
@@ -1474,22 +1414,21 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 );
             };
             Some(Picked::Indexed {
-                plane,
-                index,
-                own,
+                source,
+                reals,
                 inputs: PickedInputs {
                     entries,
-                    weights: picked,
+                    weights,
                     x: ProjectionInput {
                         rows: &x,
-                        width: shape.hidden,
+                        width: hidden.clone(),
                         form: input.form,
                     },
                     input_norm: &x_norm,
-                    epsilon: block.epsilon,
+                    epsilon: topology.epsilon.f32(),
                     qr: ProjectionInput {
                         rows: qr,
-                        width: *rank,
+                        width: rank.clone(),
                         form: InputForm::SINGLE,
                     },
                     qr_norm,
@@ -1505,12 +1444,13 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         &weights.sinks,
         constants,
         &projected,
-        &block,
+        topology,
+        numbers,
         selection,
         picked,
         join.class,
     )?;
-    if block.inject_only {
+    if inject_only {
         return Ok((residual.clone(), state, controls));
     }
     let attended = attended.ok_or("attention result is absent")?;
@@ -1521,26 +1461,25 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // A grouped output first projects each group's run of the attended row
     // through its own block of `a` (`project_rows` over the groups, in A);
     // the output projection reads those products as its `(Q, W)` rows.
-    let (attended, (q, w)) = match (
-        operators::attention::grouped_output(block.operator),
-        kernels.grouped,
-        &weights.grouped,
-    ) {
-        (None, None, None) => (attended.reshape(&[rows, heads, width]), (heads, width)),
+    let (attended, (q, w)) = match (&numbers.grouped, kernels.grouped, &weights.grouped) {
+        (None, None, None) => (
+            attended.reshape(&[rows.clone(), heads.clone(), width.clone()]),
+            (heads.clone(), width.clone()),
+        ),
         (Some(grouped), Some(entry), Some(weight)) => {
             let products = graph
                 .enqueue(
                     entry,
                     &[
-                        ("M", rows),
-                        ("G", grouped.groups),
-                        ("K", grouped.inputs),
-                        ("N", grouped.rank),
-                        ("WS", operands.grouped.scale.extent),
-                        ("WB", operands.grouped.bound.extent),
+                        ("M", rows.clone()),
+                        ("G", grouped.groups.clone()),
+                        ("K", grouped.inputs.clone()),
+                        ("N", grouped.rank.clone()),
+                        ("WS", operands.grouped.scale.extent.clone()),
+                        ("WB", operands.grouped.bound.extent.clone()),
                     ],
                     project_rows::WorkflowArgs {
-                        source: (&attended.reshape(&[rows, heads * width])).into(),
+                        source: (&attended.reshape(&[rows.clone(), &heads * width])).into(),
                         weight: weight.into(),
                         weight_scale: (&operands.grouped.scale.tensor).into(),
                         weight_bound: (&operands.grouped.bound.tensor).into(),
@@ -1548,23 +1487,23 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 )?
                 .value;
             (
-                products.reshape(&[rows, grouped.groups, grouped.rank]),
-                (grouped.groups, grouped.rank),
+                products.reshape(&[rows.clone(), grouped.groups.clone(), grouped.rank.clone()]),
+                (grouped.groups.clone(), grouped.rank.clone()),
             )
         }
         _ => return Err("grouped attention output entries, weights and form disagree".into()),
     };
-    let mixed = match (kernels.output, &weights.post_norm) {
-        (TailEntries::Residual(output), None) => {
+    let mixed = match (kernels.output, &weights.post_norm, &topology.post_norm) {
+        (TailEntries::Residual(output), None, None) => {
             let [streams, injected] = join.dimensions();
-            let inject = join.inject(graph, rows, constants)?;
+            let inject = join.inject(graph, rows.clone(), constants)?;
             graph
                 .enqueue(
                     output,
                     &[
                         [
-                            ("M", rows),
-                            ("D", shape.hidden),
+                            ("M", rows.clone()),
+                            ("D", hidden.clone()),
                             streams,
                             injected,
                             ("Q", q),
@@ -1585,13 +1524,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 )?
                 .value
         }
-        (TailEntries::PostNorm(entries), Some(norm)) => {
-            let out_rows = GraphConstant::row_identity(graph, rows, Some("M"))?;
+        (TailEntries::PostNorm(entries), Some(norm), Some(tail)) => {
+            let out_rows = GraphConstant::row_identity(graph, rows.clone(), Some("M"))?;
+            let inputs = q * w;
             let mixed = post_norm(
                 graph,
                 entries,
                 residual,
-                (&attended.reshape(&[rows, q * w])).into(),
+                (&attended.reshape(&[rows.clone(), inputs.clone()])).into(),
                 &PackedWeight {
                     weight: output_weight.clone(),
                     operands: operands.output.clone(),
@@ -1599,13 +1539,12 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 norm,
                 out_rows.port().tensor(),
                 PostNormShape {
-                    rows,
-                    out: rows,
-                    inputs: q * w,
-                    outputs: shape.hidden,
+                    rows: rows.clone(),
+                    out: rows.clone(),
+                    inputs,
+                    outputs: hidden.clone(),
                 },
-                block.post_norm_epsilon,
-                block.post_norm_scale,
+                tail,
             )?;
             constants.push(out_rows);
             mixed
@@ -1623,7 +1562,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
 pub(crate) struct PickedReads {
     pub rows: WorkflowTensorView,
     pub plane: WorkflowTensorView,
-    pub slab_rows: u32,
+    pub slab_rows: Argument<u32>,
 }
 
 /// The per-head rows the history codec's attention entry reads: the query
@@ -1653,8 +1592,9 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     sinks: &Option<WorkflowTensor>,
     constants: &mut Vec<GraphConstant>,
     projected: &ProjectedRows,
-    block: &AttentionBlock<'_>,
-    selection: Option<SelectionInputs<'a, G>>,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
+    selection: Option<SelectionInputs<'_, 'a, G>>,
     picked: Option<Picked<'_, '_, 'a, G>>,
     row_class: Option<&'static str>,
 ) -> Result<
@@ -1665,71 +1605,83 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     ),
     GraphError,
 > {
-    let shape = block.shape;
-    let (rows, width) = (block.rows, shape.width);
+    let (form, widths) = (&topology.form, &numbers.widths);
+    let (rows, width, kv_heads) = (&numbers.rows, &widths.width, &widths.kv_heads);
+    let inject_only = topology.inject_only;
     // A selected read's class that scores reads through the indexer's
     // selection: its prefill through a bitmap of `B` words of `BR`-key
     // blocks.
-    let scoring = selection
-        .as_ref()
-        .filter(|selection| selection.block.scored);
-    let words = scoring.map_or(0, |selection| selection.block.shape.words);
-    let block_keys = scoring.map_or(1, |selection| selection.block.shape.block);
+    let scoring = selection.as_ref().filter(|selection| selection.read.scored);
+    let words = scoring.map_or(Dim::from(0), |selection| selection.read.words.clone());
+    let block_keys = scoring.map_or(Dim::from(1), |selection| selection.read.block.clone());
     let selected_prefill = scoring.map(|selection| selection.prefill);
     let dense = matches!(&history, AttentionHistoryEntries::Dense { .. });
-    if !dense && (shape.key_rounding.rounds() || shape.picks > 0 || picked.is_some()) {
+    let key_rounding = both(&numbers.key_rounding, &topology.key_rounding, "key rounding");
+    if !dense && (key_rounding.is_some() || picked.is_some()) {
         unreachable!("the binding admits a rounded or index-list source beside a dense history alone");
     }
     // Priming publishes history rows alone, and an index-list source's
     // pooled rows and keys only its attending graph makes.
-    if block.inject_only && picked.is_some() {
+    if inject_only && picked.is_some() {
         return Err("a history injection of an attention with an index-list source".into());
     }
     // The dense entries also take source 0's key rounding (`KR`) and the
     // index-list source's picks (`KS`) of its plane's `TS` rows.
-    let dimensions = match &history {
-        AttentionHistoryEntries::Dense { .. } => shape.dense_mix_dimensions(
-            rows,
-            block.history_rows,
-            block.segments,
-            picked.as_ref().map_or(0, |picked| picked.plane().rows),
+    let mut dimensions = widths
+        .mix_dimensions(
+            form,
+            rows.clone(),
+            numbers.history_rows.clone(),
+            numbers.segments.clone(),
+        )
+        .to_vec();
+    match &history {
+        AttentionHistoryEntries::Dense { .. } => {
+            dimensions.extend(widths.dense_statics(key_rounding.is_some()));
+            dimensions.push((
+                "TS",
+                picked.as_ref().map_or(Dim::from(0), |picked| picked.plane().rows.clone()),
+            ));
+        }
+        AttentionHistoryEntries::AffineK8V4 { codec, .. } => dimensions.extend(
+            affine_dimensions(*codec)?
+                .into_iter()
+                .map(|(name, extent)| (name, Dim::from(extent))),
         ),
-        AttentionHistoryEntries::AffineK8V4 { codec, .. } => shape
-            .mix_dimensions(rows, block.history_rows, block.segments)
-            .into_iter()
-            .chain(affine_dimensions(*codec)?)
-            .collect(),
-    };
+    }
+    let dimensions = dimensions;
+    let heads = widths.heads();
     // The sink rows: the operator's, or none (an injection attends nothing
     // and binds none).
     let sinks = match sinks {
-        Some(sinks) => sinks.reshape(&[shape.sinks, shape.heads()]),
-        None if shape.sinks == 0 || block.inject_only => GraphConstant::absent(graph, constants)?
+        Some(sinks) => sinks.reshape(&[axis(form.sinks), heads.clone()]),
+        None if !form.sinks || inject_only => GraphConstant::absent(graph, constants)?
             .tensor()
-            .reshape(&[0, shape.heads()]),
+            .reshape(&[Dim::from(0), heads.clone()]),
         None => return Err("attention sink weights are absent".into()),
     };
     let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense {
             decode: DenseDecodeEntries::Decode { single, .. },
             ..
-        } => graph.control_for(block.controls, *single, name, &dimensions),
+        } => graph.control_for(topology.controls, *single, name, &dimensions),
         AttentionHistoryEntries::Dense {
             decode: DenseDecodeEntries::Prefill(kernel),
             ..
         } => graph.control_for(
-            block.controls,
+            topology.controls,
             *kernel,
             name,
-            &prefill_dimensions(&dimensions, words, block_keys),
+            &prefill_dimensions(&dimensions, &words, &block_keys),
         ),
         AttentionHistoryEntries::AffineK8V4 { decode, .. } => {
-            graph.control_for(block.controls, *decode, name, &dimensions)
+            graph.control_for(topology.controls, *decode, name, &dimensions)
         }
     };
     // A class the prefill entry attends is a prefill class here, decode
     // rows among them (`dense_decodes`).
-    let decode = decodes(rows)
+    let decode_rows = decodes(rows);
+    let decode = decode_rows
         && !matches!(
             &history,
             AttentionHistoryEntries::Dense {
@@ -1745,36 +1697,37 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         AttentionHistoryEntries::AffineK8V4 {
             prefill_listed: Some(kernel),
             ..
-        } if !decode && !block.inject_only && block.history_tiles > 0 => Some(*kernel),
+        } if !decode && !inject_only && !numbers.history_tiles.is_zero() => Some(*kernel),
         _ => None,
     };
     let tile_dimensions = dimensions
         .iter()
-        .copied()
+        .cloned()
         .chain([
-            ("L", u64::from(listed.is_some())),
-            ("HT", listed.map_or(1, |_| block.history_tiles)),
-            ("B", words),
-            ("BR", block_keys),
+            ("L", axis(listed.is_some())),
+            (
+                "HT",
+                listed.map_or(Dim::from(1), |_| numbers.history_tiles.clone()),
+            ),
+            ("B", words.clone()),
+            ("BR", block_keys.clone()),
         ])
         .collect::<Vec<_>>();
     let history_tiles = listed
         .map(|kernel| {
             Ok::<_, GraphError>(HistoryTilesPort {
                 port: graph.input_for(kernel, "history_tiles", &tile_dimensions)?,
-                tiles: usize::try_from(block.history_tiles)
-                    .map_err(|_| "history tile count exceeds host domain")?,
             })
         })
         .transpose()?;
     let mut controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
-        visible: if block.inject_only {
+        visible: if inject_only {
             None
         } else {
             Some(input(graph, "visible")?)
         },
-        fresh: if block.inject_only {
+        fresh: if inject_only {
             None
         } else {
             Some(input(graph, "fresh")?)
@@ -1783,36 +1736,42 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         history_tiles,
         indexer: None,
     };
-    let rotary = &block.operator.rotary;
-    let components = GraphConstant::i32(graph, &rotary_components(rotary)?)?;
-    let frequencies = GraphConstant::f32(graph, &rotary_frequencies(rotary))?;
-    let amplitudes = GraphConstant::f32(graph, &rotary_amplitudes(rotary))?;
+    let pairs = [numbers.widths.rotary_pairs.clone()];
+    let rotary = &topology.rotary;
+    let components = GraphConstant::table(graph, Element::i32(), &pairs, &rotary.components)?;
+    let frequencies = GraphConstant::table(graph, Element::f32(), &pairs, &rotary.frequencies)?;
+    let amplitudes = GraphConstant::table(graph, Element::f32(), &pairs, &rotary.amplitudes)?;
     // The unit norm row: the unweighted value norm, and (zero rows of it)
     // every absent head norm.
-    let unit = GraphConstant::f32_shaped(graph, &[1, width], &vec![1.0; width as usize])?;
+    let unit = GraphConstant::f32_filled(graph, &[Dim::from(1), width.clone()], 1.0)?;
     let absent_norm = unit.port().tensor().slice_leading(0, 0);
     // The rotary layout (RA, RT), output rotary (RO) and stored-key values
     // (VK), and for the dense entries the key rounding (KR), carried by the
     // extents of empty tables; the appends take no output rotary.
     let empty_table = controls.destinations.tensor().slice_leading(0, 0);
-    let rounded = dense.then_some(shape.rounds_keys());
-    let form = empty_table.reshape(
+    let rounded = dense.then(|| axis(key_rounding.is_some()));
+    let form_table = empty_table.reshape(
         &[
-            0,
-            shape.rotary_adjacent,
-            shape.rotary_trailing,
-            shape.output_rotary,
-            shape.stored_key(),
+            Dim::from(0),
+            axis(form.rotary_adjacent),
+            axis(form.rotary_trailing),
+            axis(form.output_rotary),
+            axis(form.stored_key()),
+        ]
+        .into_iter()
+        .chain(rounded.clone())
+        .collect::<Vec<_>>(),
+    );
+    let append_form = empty_table.reshape(
+        &[
+            Dim::from(0),
+            axis(form.rotary_adjacent),
+            axis(form.rotary_trailing),
+            axis(form.stored_key()),
         ]
         .into_iter()
         .chain(rounded)
         .collect::<Vec<_>>(),
-    );
-    let append_form = empty_table.reshape(
-        &[0, shape.rotary_adjacent, shape.rotary_trailing, shape.stored_key()]
-            .into_iter()
-            .chain(rounded)
-            .collect::<Vec<_>>(),
     );
     // The dense entries' index-list source: each row's picks in the
     // source's pooled plane (made or bound here first), or (KS = TS = 0)
@@ -1821,7 +1780,8 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         None => None,
         Some(picked) => Some(super::pooled::picked(
             graph,
-            block,
+            topology,
+            numbers,
             picked,
             &controls.coordinates,
             [
@@ -1834,41 +1794,51 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     };
     let (picked, picked_state) = picked.unzip();
     let picked = picked.as_ref();
+    // An absent plane `[0, KV, W]` in the activation element, which its
+    // entry binds and reads nothing of.
+    let empty_plane = |graph: &mut G, constants: &mut Vec<GraphConstant>| {
+        GraphConstant::empty_port(
+            graph,
+            topology.activation,
+            &[Dim::from(0), kv_heads.clone(), width.clone()],
+            constants,
+        )
+    };
     // Only an attending graph reads the picks: a history injection's append
     // reads none, and a graph port no entry reads is unbound.
     let unpicked_plane = match picked {
         Some(_) => None,
-        None if dense && !block.inject_only => Some(GraphConstant::empty_port(
-            graph,
-            block.activation,
-            &[0, shape.kv_heads, width],
-            constants,
-        )?),
+        None if dense && !inject_only => Some(empty_plane(graph, constants)?),
         None => None,
     };
     // The affine entries read none.
     let picks = match (picked, &unpicked_plane) {
         (Some(picked), _) => Some((picked.rows.clone(), picked.plane.clone(), picked.slab_rows)),
         (None, Some(plane)) => Some((
-            empty_table.reshape(&[rows, 0]),
-            plane.tensor().reshape(&[0, shape.kv_heads, width]),
-            0,
+            empty_table.reshape(&[rows.clone(), Dim::from(0)]),
+            plane
+                .tensor()
+                .reshape(&[Dim::from(0), kv_heads.clone(), width.clone()]),
+            Argument::from(0),
         )),
         (None, None) => None,
     };
-    let key_rounding = shape.key_rounding;
+    let key_rounding = RoundingArguments::of(key_rounding)?;
     let head_norm = |weight: &Option<WorkflowTensor>| match weight {
-        Some(weight) => weight.reshape(&[1, width]),
+        Some(weight) => weight.reshape(&[Dim::from(1), width.clone()]),
         None => absent_norm.clone(),
     };
     let query_norm = head_norm(query_norm);
     // A Shared layer's unread key norm port takes its query norm.
-    let key_norm = if shape.fresh == 0 {
-        query_norm.clone()
-    } else {
+    let key_norm = if form.fresh {
         head_norm(key_norm)
+    } else {
+        query_norm.clone()
     };
-    let value_norm = unit.port().tensor().slice_leading(0, shape.value_norm);
+    let value_norm = unit
+        .port()
+        .tensor()
+        .slice_leading(0, u64::from(form.value_norm));
     let ProjectedRows {
         query,
         gate,
@@ -1887,34 +1857,34 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         .map(|descriptor| {
             graph.port(
                 Element::from(descriptor.dtype),
-                &[block.history_rows, shape.kv_heads, descriptor.row_elements as u64],
+                &[
+                    numbers.history_rows.clone(),
+                    kv_heads.clone(),
+                    Dim::from(descriptor.row_elements as u64),
+                ],
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     // A history without a value plane (stored-key values) binds the dense
     // entries' `history_value` to zero rows of one, which they never touch.
     let mut absent_values = match codec.value {
-        HistoryValue::Key => Some(GraphConstant::empty_port(
-            graph,
-            block.activation,
-            &[0, shape.kv_heads, width],
-            constants,
-        )?),
+        HistoryValue::Key => Some(empty_plane(graph, constants)?),
         HistoryValue::Own { .. } | HistoryValue::None => None,
     };
-    let scale = block.operator.scale as f32;
-    let gate_function = operators::attention::gate_function(block.operator);
+    let scale = topology.scale.f32();
+    let gate_function = scalar::<i32>(&numbers.gate_function, "an attention gate code")?;
+    let slab_rows = scalar::<u32>(&numbers.slab_rows, "slab rows")?;
     let mut destinations = controls.destinations.tensor().clone();
     // What the entry reads: the host's visible spans and fresh rows, or for
     // a selected read's decode rows the indexer's segments.
     let mut visible = controls
         .visible
         .as_ref()
-        .map(|port| port.tensor().reshape(&[rows, block.segments, 2]));
+        .map(|port| port.tensor().reshape(&[rows.clone(), numbers.segments.clone(), Dim::from(2)]));
     let fresh = controls
         .fresh
         .as_ref()
-        .map(|port| port.tensor().reshape(&[rows, 2]));
+        .map(|port| port.tensor().reshape(&[rows.clone(), Dim::from(2)]));
     let mut attend_dimensions = dimensions.clone();
     // Every entry takes the same arguments but its history planes.
     macro_rules! mix {
@@ -1950,11 +1920,11 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         destinations: (&destinations).into(),
                         $($extra: $value,)*
                         $($plane: $plane.tensor_mut().into(),)*
-                        form: (&form).into(),
-                        epsilon: block.head_epsilon,
+                        form: (&form_table).into(),
+                        epsilon: topology.head_epsilon.f32(),
                         scale,
                         gate_function,
-                        slab_rows: block.slab_rows,
+                        slab_rows,
                     },
                 )?
 
@@ -1964,7 +1934,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     macro_rules! append {
         ($kernel:expr, $module:ident, {$($extra:ident: $value:expr),*}, $($plane:ident),*) => {{
             let [$($plane),*] = entry_planes(&mut planes, absent_values.as_mut())?;
-            let append_dimensions = dimensions.iter().copied()
+            let append_dimensions = dimensions.iter().cloned()
                 .filter(|(name, _)| !AttentionShape::unread_by_appends(name)).collect::<Vec<_>>();
             graph.enqueue(*$kernel, &append_dimensions, $module::WorkflowArgs {
                 key: (&key).into(), value: (&value).into(),
@@ -1977,7 +1947,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 $($extra: $value,)*
                 $($plane: $plane.tensor_mut().into(),)*
                 form: (&append_form).into(),
-                epsilon: block.head_epsilon, slab_rows: block.slab_rows,
+                epsilon: topology.head_epsilon.f32(), slab_rows,
             })?;
         }};
     }
@@ -1989,7 +1959,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 key_block: key_rounding.block,
                 key_element: key_rounding.element,
                 key_scale: key_rounding.scale,
-                key_amax_floor: key_rounding.amax_floor()
+                key_amax_floor: key_rounding.amax_floor
             }, history_key, history_value)
         };
     }
@@ -2005,7 +1975,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 key_block: key_rounding.block,
                 key_element: key_rounding.element,
                 key_scale: key_rounding.scale,
-                key_amax_floor: key_rounding.amax_floor()
+                key_amax_floor: key_rounding.amax_floor
                 $(, $extra: $value)*
             }, history_key, history_value)
         }};
@@ -2013,7 +1983,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     // Priming only publishes context K/V. Select the state-only entry at
     // graph formation to omit attention/merge launches and their scratch
     // buffers, even for a large prompt chunk.
-    if block.inject_only {
+    if inject_only {
         match &history {
             AttentionHistoryEntries::Dense { append, .. } => {
                 dense_append!(append);
@@ -2049,7 +2019,8 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             let (selected, planes, tables) = select(
                 graph,
                 selection,
-                block,
+                topology,
+                numbers,
                 &controls,
                 [
                     components.port().tensor(),
@@ -2060,21 +2031,18 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             )?;
             controls.indexer = Some(tables);
             indexer_planes = Some(planes);
-            selection
-                .block
-                .scored
-                .then_some((selected, selection.block.shape))
+            selection.read.scored.then_some((selected, selection.read))
         }
     };
     // A selected decode row reads the indexer's segments of its visible
     // spans (its launch's earlier rows among them, `cached_causal_domain`)
     // and its own row fresh, as a dense decode row does.
-    if let (Some((selected, binding)), true) = (&selected, decode) {
-        let segments = selected_segments(binding.blocks);
-        visible = Some(selected.segments.reshape(&[rows, segments, 2]));
+    if let (Some((selected, read)), true) = (&selected, decode) {
+        let segments = selected_segments(read.blocks.clone());
+        visible = Some(selected.segments.reshape(&[rows.clone(), segments.clone(), Dim::from(2)]));
         for (name, value) in &mut attend_dimensions {
             if *name == "R" {
-                *value = segments;
+                *value = segments.clone();
             }
         }
     }
@@ -2083,7 +2051,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     // cannot publish rows other threadgroups read in the same launch, so
     // publish once first and suppress its later append. Prefill already has
     // an ordered prepare launch and needs no additional phase.
-    if block.causal_cache && decode && rows > 1 && shape.fresh > 0 {
+    if topology.causal_cache && decode && rows.greater_than(1) && form.fresh {
         let published = match &history {
             AttentionHistoryEntries::AffineK8V4 { append, .. } => {
                 append!(
@@ -2106,7 +2074,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             AttentionHistoryEntries::Dense { .. } => false,
         };
         if published {
-            let disabled = GraphConstant::row_filled(graph, rows, -1)?;
+            let disabled = GraphConstant::row_filled(graph, rows.clone(), -1)?;
             destinations = disabled.port().tensor().clone();
             constants.push(disabled);
         }
@@ -2116,7 +2084,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         .destinations
         .tensor()
         .slice_leading(0, 0)
-        .reshape(&[0, block_keys]);
+        .reshape(&[Dim::from(0), block_keys.clone()]);
     let attended = match &history {
         AttentionHistoryEntries::Dense {
             decode:
@@ -2125,7 +2093,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                     ..
                 },
             ..
-        } if decode && rows > 1 => {
+        } if decode && rows.greater_than(1) => {
             dense_mix!(kernel, attention_decode, &attend_dimensions)
         }
         AttentionHistoryEntries::Dense {
@@ -2141,20 +2109,20 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         } => {
             let kernel = match (&selected_prefill, dense_decode) {
                 (Some(SelectedPrefillEntries::Dense(selected)), _) => selected,
-                (None, DenseDecodeEntries::Prefill(kernel)) if decodes(rows) => kernel,
+                (None, DenseDecodeEntries::Prefill(kernel)) if decode_rows => kernel,
                 (None, _) => prefill,
                 (Some(_), _) => return Err("a selected prefill of another codec".into()),
             };
             let bitmap = prefill_selection(graph, rows, &selected, row_class, constants)?;
             dense_mix!(kernel, attention_prefill,
-                &prefill_dimensions(&dimensions, words, block_keys),
+                &prefill_dimensions(&dimensions, &words, &block_keys),
                 selection: (&bitmap).into(),
                 block_slots: (&block_slots).into())
         }
         AttentionHistoryEntries::AffineK8V4 {
             verify_four: Some(kernel),
             ..
-        } if decode && rows == 4 => mix!(
+        } if decode && rows.equals(4) => mix!(
             kernel,
             attention_decode_k8v4,
             history_key_codes,
@@ -2165,7 +2133,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         AttentionHistoryEntries::AffineK8V4 {
             verify_eight: Some(kernel),
             ..
-        } if decode && rows > 4 => mix!(
+        } if decode && rows.greater_than(4) => mix!(
             kernel,
             attention_decode_k8v4,
             history_key_codes,
@@ -2176,7 +2144,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         AttentionHistoryEntries::AffineK8V4 {
             verify: Some(kernel),
             ..
-        } if decode && rows > 1 => mix!(
+        } if decode && rows.greater_than(1) => mix!(
             kernel,
             attention_decode_k8v4,
             history_key_codes,
@@ -2198,7 +2166,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 .destinations
                 .tensor()
                 .slice_leading(0, 0)
-                .reshape(&[0, 1]);
+                .reshape(&[Dim::from(0), Dim::from(1)]);
             let kernel = match &selected_prefill {
                 Some(SelectedPrefillEntries::AffineK8V4(selected)) => selected,
                 None => listed.as_ref().unwrap_or(prefill),
@@ -2254,8 +2222,8 @@ fn entry_planes<'p, const N: usize>(
 /// (`indexer_select`), or none (`no_selection`, every visible row).
 fn prefill_selection<G: GraphDraft>(
     graph: &mut G,
-    rows: u64,
-    selected: &Option<(Selected, SelectionShape)>,
+    rows: &Dim,
+    selected: &Option<(Selected, &SelectedRead<Dim>)>,
     row_class: Option<&'static str>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError> {
@@ -2269,14 +2237,14 @@ fn prefill_selection<G: GraphDraft>(
 /// row's WorkList bitmap (0 in the Visible form), and `BR`, the keys of its
 /// blocks (1 in the Visible form).
 fn prefill_dimensions(
-    dimensions: &[(&'static str, u64)],
-    words: u64,
-    block: u64,
-) -> Vec<(&'static str, u64)> {
+    dimensions: &[(&'static str, Dim)],
+    words: &Dim,
+    block: &Dim,
+) -> Vec<(&'static str, Dim)> {
     dimensions
         .iter()
-        .copied()
-        .chain([("B", words), ("BR", block)])
+        .cloned()
+        .chain([("B", words.clone()), ("BR", block.clone())])
         .collect()
 }
 
@@ -2284,11 +2252,11 @@ fn prefill_dimensions(
 /// class's.
 fn no_selection<G: GraphDraft>(
     graph: &mut G,
-    rows: u64,
+    rows: &Dim,
     row_class: Option<&'static str>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError> {
-    let selection = GraphConstant::row_zeros(graph, Element::u32(), rows, 0, row_class)?;
+    let selection = GraphConstant::row_zeros(graph, Element::u32(), rows.clone(), 0, row_class)?;
     let tensor = selection.port().tensor().clone();
     constants.push(selection);
     Ok(tensor)
@@ -2381,6 +2349,7 @@ pub(crate) fn rotary_amplitudes(rotary: &Rotary) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planning::{AttentionForm, AttentionWidths, GateForm};
 
     /// A launch takes the class that lists its history row tiles exactly
     /// when its rows see at most that class's tiles: one request with a long
@@ -2477,12 +2446,12 @@ mod tests {
             value: Element::bf16(),
             output: Element::bf16(),
             activation: Element::bf16(),
-            history: match shape.values {
+            history: match shape.form.values {
                 AttentionValues::StoredKey => {
-                    CodecSpec::stored_key(DType::BF16, shape.width as usize)
+                    CodecSpec::stored_key(DType::BF16, shape.widths.width as usize)
                 }
                 AttentionValues::Projected | AttentionValues::RawKey => {
-                    CodecSpec::dense(DType::BF16, shape.width as usize, shape.width as usize)
+                    CodecSpec::dense(DType::BF16, shape.widths.width as usize, shape.widths.width as usize)
                 }
             },
             tail: SublayerTail::Residual,
@@ -2491,37 +2460,46 @@ mod tests {
             picked: None,
         };
         let v41 = AttentionShape {
-            hidden: 4096,
-            kv_heads: 1,
-            group: 64,
-            rotary_pairs: 32,
-            width: 512,
-            interleaved_gate: 0,
-            separate_gate: 0,
-            fresh: 1,
-            query_norm: 0,
-            key_norm: 1,
-            value_norm: 0,
-            values: AttentionValues::StoredKey,
-            sinks: 1,
-            rotary_adjacent: 1,
-            rotary_trailing: 1,
-            output_rotary: 1,
+            form: AttentionForm {
+                gate: GateForm::None,
+                fresh: true,
+                query_norm: false,
+                key_norm: true,
+                value_norm: false,
+                values: AttentionValues::StoredKey,
+                sinks: true,
+                rotary_adjacent: true,
+                rotary_trailing: true,
+                output_rotary: true,
+            },
             key_rounding: crate::RoundingArgs::NONE,
-            picks: 0,
+            widths: AttentionWidths {
+                hidden: 4096,
+                kv_heads: 1,
+                group: 64,
+                rotary_pairs: 32,
+                width: 512,
+                picks: 0,
+            },
         };
         let qwen = AttentionShape {
-            kv_heads: 2,
-            group: 8,
-            width: 256,
-            interleaved_gate: 256,
-            query_norm: 1,
-            values: AttentionValues::Projected,
-            sinks: 0,
-            rotary_adjacent: 0,
-            rotary_trailing: 0,
-            output_rotary: 0,
-            ..v41
+            form: AttentionForm {
+                gate: GateForm::Interleaved,
+                query_norm: true,
+                values: AttentionValues::Projected,
+                sinks: false,
+                rotary_adjacent: false,
+                rotary_trailing: false,
+                output_rotary: false,
+                ..v41.form
+            },
+            widths: AttentionWidths {
+                kv_heads: 2,
+                group: 8,
+                width: 256,
+                ..v41.widths
+            },
+            key_rounding: crate::RoundingArgs::NONE,
         };
         let decodes = |backend, shape| dense_decodes(backend, binding(shape)).unwrap();
         assert!(decodes(BackendName::Metal, v41));
@@ -2562,10 +2540,13 @@ mod tests {
             (decode, prefill)
         };
         let forms = [
-            AttentionShape { query_norm: 0, ..qwen },
-            AttentionShape { rotary_adjacent: 1, ..qwen },
-            AttentionShape { rotary_trailing: 1, ..qwen },
-            AttentionShape { interleaved_gate: 0, output_rotary: 1, ..qwen },
+            AttentionShape { form: AttentionForm { query_norm: false, ..qwen.form }, ..qwen },
+            AttentionShape { form: AttentionForm { rotary_adjacent: true, ..qwen.form }, ..qwen },
+            AttentionShape { form: AttentionForm { rotary_trailing: true, ..qwen.form }, ..qwen },
+            AttentionShape {
+                form: AttentionForm { gate: GateForm::None, output_rotary: true, ..qwen.form },
+                ..qwen
+            },
             v41,
         ];
         for backend in [BackendName::Cuda, BackendName::Vulkan] {

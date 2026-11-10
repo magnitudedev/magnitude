@@ -5,15 +5,17 @@
 //! advances every row binds the identity table as a graph constant, so no run
 //! uploads it.
 
-use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
-use crate::operators::routed::Expansion;
+use crate::operators::output::{CheckedPostNormEntries, PostNorm, PostNormShape, TailEntries, post_norm};
+use crate::operators::routed::{Expansion, ExpansionForm};
+use crate::operators::scalar;
+use crate::programs::graph::facts::Numbers;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
+use crate::programs::native_target_graph::{PlannedWeights, WeightPort, packed_weight, weight};
 use crate::{DenseBinding, ModelLoadPlan, SublayerTail, native::DenseKernels};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output};
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 /// The same dense topology accepts prepared entries or checked metadata
 /// bindings. The latter carries only element assignments, never shapes.
@@ -31,6 +33,7 @@ impl<'a> From<&'a DenseKernels> for DenseGraphEntries<'a, NativeGraph> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedDenseEntries {
     expand: [(&'static str, Element); 4],
     output: [(&'static str, Element); 2],
@@ -69,12 +72,38 @@ impl CheckedDenseEntries {
     }
 }
 
-/// Dimensions come from the resident weight plan used for both routes.
-pub(crate) fn dimensions(
+/// The numbers of a dense feed-forward: its residual's width, its features
+/// and its expansion's activation code (`dense_expand`'s `activation`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DenseNumbers<D = Dim> {
+    pub hidden: D,
+    pub features: D,
+    pub activation: D,
+}
+
+impl<D> Numbers<D> for DenseNumbers<D> {
+    type Of<E> = DenseNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> DenseNumbers<E> {
+        DenseNumbers { hidden: f(self.hidden), features: f(self.features), activation: f(self.activation) }
+    }
+}
+
+impl DenseNumbers {
+    /// The expansion and output entries' dimensions over `rows` rows.
+    pub(crate) fn dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 4] {
+        [("M", rows.clone()), ("O", rows.clone()), ("H", self.hidden.clone()), ("F", self.features.clone())]
+    }
+}
+
+/// The topology (its expansion, `up`'s) and numbers of the dense
+/// feed-forward of `scope`, the numbers from its resident gate weight's
+/// `[features, hidden]` plan (both routes' plan): the only reading of the
+/// model they make.
+pub(crate) fn split(
     load: &ModelLoadPlan,
     scope: WeightScope,
-    rows: u64,
-) -> Result<[(&'static str, u64); 4], String> {
+    up: &magnitude_family_contracts::FeedForwardUp,
+) -> Result<(ExpansionForm, DenseNumbers<u64>), GraphError> {
     let role = WeightRole {
         scope,
         kind: WeightKind::DenseGate,
@@ -86,48 +115,54 @@ pub(crate) fn dimensions(
     let [features, hidden] = plan.shape.as_slice() else {
         return Err("dense gate weight is not rank two".into());
     };
-    Ok([("M", rows), ("O", rows), ("H", *hidden), ("F", *features)])
+    let expansion = Expansion::of(up);
+    Ok((
+        expansion.form(),
+        DenseNumbers { hidden: *hidden, features: *features, activation: expansion.activation_number() },
+    ))
 }
 
-/// `post_norm_epsilon` is the sublayer's post-norm epsilon, read only by a
-/// post-norm tail.
+/// `tail` is the sublayer's post-norm tail's reals, none for a
+/// residual tail. Its row identity follows the class dimension `rows_class`
+/// (`GraphConstant::row_identity`), or is fixed without one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: DenseGraphEntries<'a, G>,
-    load: &ModelLoadPlan,
+    expansion: ExpansionForm,
+    numbers: &DenseNumbers,
+    planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
-    rows: u64,
-    epsilon: f32,
-    expansion: Expansion,
-    post_norm_epsilon: f32,
-    post_norm_scale: f32,
+    rows: &Dim,
+    rows_class: Option<&'static str>,
+    epsilon: Argument<f32>,
+    tail: Option<&PostNorm>,
 ) -> Result<WorkflowTensor, GraphError> {
-    let dimensions = dimensions(load, scope, rows)?;
-    let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
+    let dimensions = numbers.dimensions(rows);
+    let norm = weight(graph, planned, scope, WeightKind::InputNorm, weights)?;
     let mut packed =
-        |graph: &mut G, kind| packed_weight(graph, load, scope, kind, weights, constants);
+        |graph: &mut G, kind| packed_weight(graph, planned, scope, kind, weights, constants);
     let gate = packed(graph, WeightKind::DenseGate)?;
     let up = packed(graph, WeightKind::DenseUp)?;
     let down = packed(graph, WeightKind::DenseDown)?;
-    let out_rows = GraphConstant::row_identity(graph, rows, None)?;
+    let out_rows = GraphConstant::row_identity(graph, rows, rows_class)?;
     let expand_dimensions = [
         dimensions.as_slice(),
         &[
-            ("GS", gate.operands.scale.extent),
-            ("US", up.operands.scale.extent),
-            ("GB", gate.operands.bound.extent),
-            ("UB", up.operands.bound.extent),
-            ("LB", magnitude_family_contracts::GluLimit::word(expansion.limit)),
+            ("GS", gate.operands.scale.extent.clone()),
+            ("US", up.operands.scale.extent.clone()),
+            ("GB", gate.operands.bound.extent.clone()),
+            ("UB", up.operands.bound.extent.clone()),
+            ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(expansion.limit))),
         ],
     ]
     .concat();
     let output_dimensions = [
         dimensions.as_slice(),
-        &[("DS", down.operands.scale.extent), ("DB", down.operands.bound.extent)],
+        &[("DS", down.operands.scale.extent.clone()), ("DB", down.operands.bound.extent.clone())],
     ]
     .concat();
     let product = graph
@@ -140,8 +175,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 gate_weight: (&gate.weight).into(),
                 up_weight: (&up.weight).into(),
                 out_rows: out_rows.port().tensor().into(),
-                eps: epsilon,
-                activation: expansion.activation,
+                eps: epsilon.into(),
+                activation: scalar(&numbers.activation, "a dense activation code")?,
                 gate_scale: (&gate.operands.scale.tensor).into(),
                 up_scale: (&up.operands.scale.tensor).into(),
                 gate_bound: (&gate.operands.bound.tensor).into(),
@@ -150,8 +185,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let output = match kernels.output {
-        TailEntries::Residual(output) => {
+    let output = match (kernels.output, tail) {
+        (TailEntries::Residual(output), None) => {
             graph
                 .enqueue(
                     output,
@@ -167,9 +202,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 )?
                 .value
         }
-        TailEntries::PostNorm(entries) => {
-            let post_norm_weight = weight(graph, load, scope, WeightKind::PostNorm, weights)?;
-            let [_, _, (_, hidden), (_, features)] = dimensions;
+        (TailEntries::PostNorm(entries), Some(tail)) => {
+            let post_norm_weight = weight(graph, planned, scope, WeightKind::PostNorm, weights)?;
             post_norm(
                 graph,
                 entries,
@@ -179,15 +213,15 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 &post_norm_weight,
                 out_rows.port().tensor(),
                 PostNormShape {
-                    rows,
-                    out: rows,
-                    inputs: features,
-                    outputs: hidden,
+                    rows: rows.clone(),
+                    out: rows.clone(),
+                    inputs: numbers.features.clone(),
+                    outputs: numbers.hidden.clone(),
                 },
-                post_norm_epsilon,
-                post_norm_scale,
+                tail,
             )?
         }
+        _ => return Err("dense output entries disagree with its post-norm tail".into()),
     };
     constants.push(out_rows);
     Ok(output)

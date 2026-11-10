@@ -115,7 +115,7 @@ fn prefix_metadata(bytes: &[u8]) -> Option<(Directory, Option<u64>)> {
     };
     let vocab_size = entries
         .iter()
-        .map(|entry| entry.head)
+        .map(|entry| entry.head())
         .chain(open)
         .find(|head| head.key == TOKENS_KEY)
         .filter(|head| head.stored == StoredType::Array(ValueType::String))

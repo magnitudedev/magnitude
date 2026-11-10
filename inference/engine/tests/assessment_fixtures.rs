@@ -9,7 +9,7 @@ use magnitude_engine::{
     assessment::{
         AssessmentSetup, AssessmentStructure, DrafterVerdict, Measurements, ModelAssessment,
         ModelAssessmentError, ModelExecution, ModelPackagePaths, ModelResidency, Performance, PreparedModelAssessment,
-        SpeculativeMethod, assess_model, finish_model_assessment, plan_prices,
+        SpeculativeMethod, assess_model, finish_model_assessment,
         prepare_model_assessment,
     },
     error::UnsupportedReason,
@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
     assessment::{AssessmentError, ColdSource, ExecutionFit, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, MemoryReserves, StoreMotion},
 };
@@ -567,11 +567,12 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
         },
         standard_service_limits(),
     );
-    let PreparedModelAssessment::Planned { definition, draft, .. } = prepare_model_assessment(&package, &setup.structure)
+    let PreparedModelAssessment::Planned { definition, execution, .. } = prepare_model_assessment(&package, &setup.structure)
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
     else {
         panic!("Qwen3.6 35B is planned streamed on the RTX 3090 under the cap");
     };
+    let draft = execution.draft();
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
     assert!(!bank.reservation().host_addressed);
     let conveyor = bank.conveyor();
@@ -621,15 +622,15 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     for backend in [BackendName::Cuda, BackendName::Vulkan] {
         let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(backend, MemoryReserves::of_machine(None), policy, standard_service_limits());
-        let (draft, execution) = match prepare_model_assessment(&package, &setup.structure) {
-            Ok(PreparedModelAssessment::Planned { draft, execution, .. }) => (draft, execution),
+        let (definition, execution) = match prepare_model_assessment(&package, &setup.structure) {
+            Ok(PreparedModelAssessment::Planned { definition, execution, .. }) => (definition, execution),
             Ok(PreparedModelAssessment::Unsupported { unsupported, .. }) => {
                 panic!("{backend:?}: Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
             Err(error) => panic!("{backend:?}: Qwen3.6 35B is planned on the RTX 3090 under the cap: {error}"),
         };
-        assert!(draft.load().expert_bank().is_some(), "{backend:?}: a capped load streams");
-        let charge = execution.memory_charge().clone();
+        assert!(execution.draft().load().expert_bank().is_some(), "{backend:?}: a capped load streams");
+        let charge = execution.memory_charge(&definition, setup.structure.selected.graph_cost).unwrap();
         let graphs = charge.bounds.recorded_graph_bytes;
         assert!(0 < graphs && graphs < charge.allocation_bytes / 8, "{backend:?}: startup graphs {graphs} bytes");
     }
@@ -662,11 +663,12 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     };
     let prepare = |weight_cap| assess(weight_cap).unwrap_or_else(|error| panic!("operational failure: {error}"));
     let PreparedModelAssessment::Planned {
-        definition, draft, ..
+        definition, execution, ..
     } = prepare(None)
     else {
         panic!("Qwen3.6 35B is planned resident");
     };
+    let draft = execution.draft();
     let Err(PlanError::WeightBound {
         needed: floor_weights,
         ..
@@ -691,8 +693,8 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     };
     assert_eq!(weights(bank.floor()), floor_weights);
     let granted = |cap: u64| match prepare(Some(cap)) {
-        PreparedModelAssessment::Planned { draft, .. } => {
-            draft.load().expert_bank().expect("a capped load streams").slots
+        PreparedModelAssessment::Planned { execution, .. } => {
+            execution.draft().load().expert_bank().expect("a capped load streams").slots
         }
         PreparedModelAssessment::Unsupported { unsupported, .. } => {
             panic!("a cap of {cap} bytes: {unsupported:?}")
@@ -729,7 +731,7 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
         prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"))
     };
     let draft = match prepare(MemoryReserves::of_machine(None)) {
-        PreparedModelAssessment::Planned { draft, .. } => draft,
+        PreparedModelAssessment::Planned { execution, .. } => execution.draft().clone(),
         PreparedModelAssessment::Unsupported { unsupported, .. } => panic!("Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}"),
     };
     let bank = draft.load().expert_bank().expect("a capped load streams");
@@ -738,9 +740,10 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     // its tier into the host's room, here a fluctuation of the whole store.
     let host = seismic::fixtures::recorded::rtx3090().host_ram().capacity().value;
     let roomless = prepare(host_room(host, 0));
-    let PreparedModelAssessment::Planned { definition, draft, .. } = roomless else {
+    let PreparedModelAssessment::Planned { definition, execution, .. } = roomless else {
         panic!("a capped load is prepared from its structure");
     };
+    let draft = execution.draft().clone();
     let Err(PlanError::Unstreamed(reason)) = draft.with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(6_890_894_474)), &synthetic_prices()) else {
         panic!("no host room leaves the experts unstreamed");
     };
@@ -765,7 +768,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         let prepared = prepare_model_assessment(&package, &setup.structure)
             .unwrap_or_else(|error| panic!("operational failure: {error}"));
         match prepared {
-            PreparedModelAssessment::Planned { definition, draft, .. } => (setup, definition, draft),
+            PreparedModelAssessment::Planned { definition, execution, .. } => (setup, definition, execution.draft().clone()),
             PreparedModelAssessment::Unsupported { unsupported, .. } => {
                 panic!("Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
@@ -774,13 +777,20 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let (setup, definition, draft) = prepare(MemoryReserves::of_machine(None));
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
     let ceiling = bank.host_ceiling().expect("a discrete bank's tier is linked");
-    assert_eq!(bank.host_slots, ceiling, "host RAM holds the tier's ceiling");
-    // A draft re-planned as an assessment's fallback does keeps its tier
-    // under its cap, which is then what its fit reports the cold experts
+    // The assessment's fit holds the tier's ceiling where host RAM has
+    // room for it, and reports it as where the cold experts lie.
+    let prepared = prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
+    let assessed = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES).unwrap_or_else(|error| panic!("operational failure: {error}"));
+    let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { shares, .. }, .. }, .. } = assessed else {
+        panic!("Qwen3.6 35B fits the RTX 3090 streamed under the cap: {assessed:?}");
+    };
+    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling }, "host RAM holds the tier's ceiling");
+    // A load's re-plan of the draft keeps its tier at the cap's ceiling
+    // where host RAM has room for it, which is then what its fit reports the cold experts
     // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
+            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), unbounded, |_, _| {
                 Ok::<_, AssessmentError>(Ok(()))
             })
             .unwrap()
@@ -795,11 +805,13 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let shares = ExpertShares::of(&bank);
     assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling });
     assert_eq!(shares.held(shares.floor()).host as u64, ceiling);
-    // The host RAM the load holds beside the tier's floor.
+    // The host RAM the load holds beside the tier's floor: its own plan's
+    // charge, which holds the tier at its floor (`with_host_tier`), not the
+    // assessment's floor form, whose pass is the floor's.
     let structure = &setup.structure;
-    let device = structure.topology.resolve(draft.device().selector()).unwrap();
-    let fit = execution_memory_charge(&definition, &draft)
-        .unwrap()
+    let device = structure.topology.resolve(replanned.draft().device().selector()).unwrap();
+    let fit = replanned
+        .charge()
         .assess_fit(&structure.topology, device, &structure.status, &structure.reserves)
         .unwrap();
     let host = fit.domains.iter().find(|domain| domain.role == DomainRole::Staging).unwrap();
@@ -858,9 +870,10 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let mut setup = rtx3090_setup(BackendName::Cuda, MemoryReserves::of_machine(None), ModelPolicy::default(), standard_service_limits());
     setup.measurements = synthetic_measurements();
     let prepared = prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
-    let PreparedModelAssessment::Planned { definition, draft, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
         panic!("Qwen3.6 35B is planned on the RTX 3090");
     };
+    let draft = execution.draft();
     let structure = &setup.structure;
     let device = structure.topology.resolve(draft.device().selector()).unwrap();
     let fit = execution_memory_charge(definition, draft).unwrap().assess_fit(&structure.topology, device, &structure.status, &structure.reserves).unwrap();
@@ -870,9 +883,9 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         let left = bound.saturating_sub(mandatory);
         PlanRoom { free: left, ceiling: left }
     };
-    let prices = plan_prices(&setup.measurements, draft);
+    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let (planned, ()) = draft
-        .with_held_experts(definition, HeldBound::room(bound), &prices, magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+        .with_held_experts(definition, HeldBound::room(bound), &prices, room, |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -997,9 +1010,10 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // holdings the fit's settle grants on the machine's prices. Room short
     // of the resident plan alone would still hold the bank whole beside a
     // smaller pass, which misses nothing.
-    let PreparedModelAssessment::Planned { draft: whole, .. } = &whole else {
+    let PreparedModelAssessment::Planned { execution: whole, .. } = &whole else {
         unreachable!("the model was assessed");
     };
+    let whole = whole.draft();
     let whole_weights = whole.load().clone().unbanked().weight_bytes().unwrap();
     assert!(whole_weights < resident_bytes);
     let reserves = host_room(capacity, whole_weights);
@@ -1010,22 +1024,24 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
     assert!(shares.floor() <= shares.slots() && shares.slots() < shares.experts().get());
     assert!(shares.floor_share() <= shares.share() && shares.share() < 1.0);
-    let PreparedModelAssessment::Planned { definition, draft, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
         unreachable!("the model was assessed");
     };
+    let draft = execution.draft();
     let Err(PlanError::WeightBound { needed: floor_weights, .. }) =
         draft.clone().with_bank::<AssessmentMemoryCharge>(definition, Some(WeightBound::Cap(0)), &synthetic_prices())
     else {
         panic!("no bank holds no weights");
     };
 
-    // The plan and the fit are one settle: a plan of the fit's room on the
-    // same prices, confirmed by the same stable fit, holds the fit's slots,
-    // and a plan of half that room, as a release slower than another
-    // program's take leaves it while it serves, holds no more.
+    // The fit holds the most slots the room admits at the floor of places,
+    // and a load's settle of the fit's room on the machine's prices,
+    // confirmed by the same stable fit, holds no more (it may trade slots
+    // for prompt places); nor does a plan of half that room, as a release
+    // slower than another program's take leaves it while it serves.
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
-    let prices = plan_prices(&setup.measurements, draft);
+    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let structure = &setup.structure;
     let stable = StableRoom {
         topology: &structure.topology,
@@ -1039,7 +1055,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::room(bound), &prices, magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |candidate, charge| {
+            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |candidate, charge| {
                 Ok::<_, AssessmentError>(match stable.fit(candidate, charge).unwrap().verdict {
                     AssessmentFitVerdict::Fits => Ok(()),
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
@@ -1049,8 +1065,8 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             .unwrap();
         planned.draft().load().expert_bank().unwrap().slots
     };
-    assert_eq!(settled(1), shares.slots());
-    assert!(settled(2) <= shares.slots());
+    assert!(settled(1) <= shares.slots());
+    assert!(settled(2) <= settled(1));
 
     // A machine whose figures are pending leaves a plan that must stream
     // pending: no plan is sized unpriced.

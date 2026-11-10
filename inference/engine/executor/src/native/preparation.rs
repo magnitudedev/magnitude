@@ -1507,8 +1507,8 @@ impl<'a> Preparation<'a> {
                 let packed_four_rows = split_decode
                     && separates_packed_attention_rows(
                         self.spec.backend(),
-                        shape.group,
-                        shape.width,
+                        shape.widths.group,
+                        shape.widths.width,
                         self.limits.max_rows,
                     );
                 let verify = if split_decode {
@@ -1554,7 +1554,7 @@ impl<'a> Preparation<'a> {
                     && crate::planning::reads_decoded_history(
                         self.spec.backend(),
                         self.spec.forms_tensor_operations(),
-                        shape.width,
+                        shape.widths.width,
                     );
                 // A launch whose rows see at most one request's history
                 // lists the tiles they see; the unlisted kernel serves the
@@ -1629,15 +1629,15 @@ impl<'a> Preparation<'a> {
                 let select = fixed!(
                     self.spec,
                     indexer_select,
-                    format!("{selection:?};P={}", shape.rotary_pairs),
+                    format!("{selection:?};P={}", shape.widths.rotary_pairs),
                     indexer_select::Elements {
                         A: binding.activation
                     },
                     statics
                         & [
                             ("H", selection.shape.heads),
-                            ("P", shape.rotary_pairs),
-                            ("S", selection.shape.width - 2 * shape.rotary_pairs),
+                            ("P", shape.widths.rotary_pairs),
+                            ("S", selection.shape.width - 2 * shape.widths.rotary_pairs),
                             ("SB", selection.shape.block),
                         ]
                 );
@@ -1758,9 +1758,12 @@ impl<'a> Preparation<'a> {
                 },
             )
         };
-        let hidden = PooledProjectInput::Hidden { hidden: shape.hidden };
-        let pairs = shape.rotary_pairs;
-        let rotary = [("RA", shape.rotary_adjacent), ("RT", shape.rotary_trailing)];
+        let hidden = PooledProjectInput::Hidden { hidden: shape.widths.hidden };
+        let pairs = shape.widths.rotary_pairs;
+        let rotary = [
+            ("RA", u64::from(shape.form.rotary_adjacent)),
+            ("RT", u64::from(shape.form.rotary_trailing)),
+        ];
         // An own source's rows and keys.
         let rows = match (binding.picked, elements.rows) {
             (Some(crate::PickedBinding::Own(pooled)), Some(rows)) => {
@@ -1776,8 +1779,8 @@ impl<'a> Preparation<'a> {
                     rows.key_project,
                     [Some(WeightKind::IndexerKey), None],
                     match rows.pooling {
-                        Pooling::Grouped => PooledProjectInput::Plain { width: shape.width },
-                        Pooling::Identity => PooledProjectInput::Tokens { width: shape.width },
+                        Pooling::Grouped => PooledProjectInput::Plain { width: shape.widths.width },
+                        Pooling::Identity => PooledProjectInput::Tokens { width: shape.widths.width },
                     },
                 )?;
                 let widen = fixed!(
@@ -1786,7 +1789,7 @@ impl<'a> Preparation<'a> {
                     format!("A={}", activation.name()),
                     widen_rows::Elements { A: activation }
                 );
-                let width = [("P", pairs), ("S", shape.width - 2 * pairs)];
+                let width = [("P", pairs), ("S", shape.widths.width - 2 * pairs)];
                 let pool = match rows.pooling {
                     Pooling::Identity => fixed!(
                         self.spec,
@@ -1794,7 +1797,7 @@ impl<'a> Preparation<'a> {
                         format!("{pooled:?};{shape:?}"),
                         attention_append_dense::Elements { A: activation },
                         statics
-                            & [width.as_slice(), &Pooling::identity_append(pooled.rounding), &rotary].concat()
+                            & [width.as_slice(), &Pooling::identity_append(pooled.rounding.rounds()), &rotary].concat()
                     )
                     .map(PoolKernel::Identity),
                     Pooling::Grouped => fixed!(

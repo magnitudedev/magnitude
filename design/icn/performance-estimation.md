@@ -72,18 +72,27 @@ or its identity, so a model never loaded has the same estimate as one loaded man
   executor's cost walk, what its recorded graphs hold, the model store's read line, the device's
   convert at one reference record form, and, where a bank can have a host tier (a discrete device),
   the host memory's read line with every CPU reading and a CPU site's lines at one reference form.
-  They are measured first in every job, in one 10 s allocation with the walk's points (each point an
-  equal part of the time left; nothing starts past the deadline). Every load, banked or not, plans
+  They are measured once per machine and build, first and in one job: a 10 s budget from the job's
+  start (discovery, probes and kernel forming within it), whatever the machine and whatever time
+  the job is given, which their points divide. Each point samples for its part of the time left
+  beside the fewest passes (making, a lead and a sample) the walk forecasts for the standing points
+  after it, or until its median resolves, passing what it does not take on; none starts that would
+  end past the budget or leave the required figures after it less than their fewest passes. A
+  point the budget cannot hold is recorded unobtainable and priced from those read, as any
+  unobtainable point is, so a slower machine gets less precision, never more time; a required
+  figure, which nothing prices, is never recorded so: the budget ending before it leaves it
+  unrecorded, and the next job resumes from the records stored. Every load, banked or not, plans
   and serves only on the executor's costs, waiting once per machine for the walk's required figures
   (the probe, the launch graph's times and the composition chain), every later figure priced from
   those read until it is. The walk keeps its order: the launch graph's host times wait for every
   compile to end, so they follow the points measured while the kernels form, and the costs complete
   as the formation ends either way. The job walks to the last required figure, then measures what a
   streamed load's bank is priced by (the read line, the convert, a host tier's lines), then the rest
-  of the walk: a fresh machine's first job, which ends inside the walk, prices a streamed bank, and
-  the walk's later figures, priced closer without them, follow. Loads' own requests (CPU sites, shrink moves, their forms' converts, tier copies, volume
-  windows) are runtime: the job measures them after the standing requests, and no estimate reads
-  them.
+  of the walk, whose later figures are priced closer without them, so what the budget leaves unread
+  is what is priced closest. Loads' own requests (CPU sites, shrink moves, their forms' converts,
+  tier copies, volume windows) are runtime: the job measures them after the standing requests in
+  what is left of its time, and no estimate reads them; a load's point the job's time ends is
+  measured by the next job, given longer where a job measured nothing.
 - **Storage.** The model store's volume is priced by one read line, `λ + b/D`: the job reads a
   probe file it keeps in the store (256 MiB, written once) past the file cache, timing full reads
   (32 readers of 1 MiB at once: `1/D`) and lone 128 KiB reads (`λ`, what one takes past its bytes
@@ -131,9 +140,11 @@ reference convert and the host memory's line). Measurement timestamps, live usag
 estimation.
 
 Every record that enters the identity revises the service's assessments as the measurement job
-stores it, with no restart. A record that prices the structure anew (the device's graph memory,
-priced at its backend's bound until recorded) prepares every model again on the new structure; a
-figure an estimate reads finishes each model again over the demand it was prepared with.
+stores it, with no restart. No record prepares a model again: a preparation reads only the
+structure, and nothing of it a record prices, so the device's graph memory (priced at its
+backend's bound until recorded) enters the environment's identity, not the structure's, and is
+applied when each model is finished. Every record finishes each model again over what it was
+prepared with: arithmetic over its outlined forms and demand.
 
 ## Conformance
 

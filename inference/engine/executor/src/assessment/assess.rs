@@ -16,7 +16,7 @@ use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldCharge, HeldCharges,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
     HostProcessBytes, ResourceCapacity, ResourcePlanner, UndraftedBounds,
 };
 use magnitude_family_contracts::ModelDefinition;
@@ -242,19 +242,17 @@ pub struct ExecutionShortfall {
     pub deficit_bytes: NonZeroU64,
 }
 
-/// Basis-independent decode demand and the standard workload's checked
-/// memory charge.
+/// Basis-independent decode demand and the structure of the standard
+/// workload's memory charge in each way of holding the experts
+/// ([`crate::FloorForms`]), at the model's largest served context: every
+/// fit is arithmetic over them ([`assess_execution_fit`]).
 pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
     /// Of a plan that banks its experts, its demand holding them whole: the
     /// resident form its decode runs while its bank holds every expert. None
     /// of a plan that holds them whole, whose own demand is that form.
     whole: Option<DecodeDemand>,
-    fit_context_tokens: u32,
-    charge: AssessmentMemoryCharge,
-    /// The charges planning's search made, which a fit's search of the
-    /// draft charges from again ([`assess_execution_fit`]).
-    held: HeldCharges,
+    forms: crate::FloorForms,
 }
 
 impl PreparedExecutionAssessment {
@@ -263,56 +261,58 @@ impl PreparedExecutionAssessment {
         &self.demand
     }
 
+    /// The form the demand and structure are read from
+    /// ([`crate::FloorForms::primary`]).
+    pub fn primary(&self) -> &crate::HeldForm {
+        self.forms.primary()
+    }
+
+    /// The primary form's plan ([`Self::primary`]).
+    pub fn draft(&self) -> &ExecutionPlanDraft {
+        &self.primary().draft
+    }
+
     /// The plan's decode step at `depth` over `sequences` sequences in each
     /// form ([`form_seconds`]): its experts held whole, and as the plan holds
-    /// them. A plan prepared whole has no streamed form of its own: a fit
-    /// that streams it plans its bank anew (`assess_execution_fit`), and its
-    /// streamed form is priced as its resident one.
+    /// them.
     pub fn form_seconds(&self, pricing: &Pricing<'_>, sequences: u64, depth: u32) -> Result<super::FormSeconds, AssessmentError> {
         form_seconds(self.whole.as_ref().unwrap_or(&self.demand), &self.demand, pricing, sequences, depth)
     }
 
-    /// The checked header and graph charge, shared with physical finalization.
-    pub fn memory_charge(&self) -> &AssessmentMemoryCharge {
-        &self.charge
+    /// The charge of the primary plan at `definition`'s context, its
+    /// recorded graphs priced at `pricing` (the machine's graph cost as its
+    /// records give it now, which the preparation does not read): what a
+    /// load of it holds, shared with physical finalization.
+    pub fn memory_charge(
+        &self,
+        definition: &ModelDefinition,
+        pricing: crate::platform::GraphPricing,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let primary = self.primary();
+        primary.structure.charge(definition, &primary.draft.clone().with_graph_pricing(pricing))
     }
 }
 
 /// Perform model-specific arithmetic while the fixed generic basis is
-/// measured: the plain decode step's demand ([`decode_demand`]), and of a
-/// plan that banks its experts its demand holding them whole, beside the
-/// memory charge planning confirmed of the draft ([`ChargedDraft`]).
-pub fn prepare_execution_assessment<C: HeldCharge>(
+/// measured: the plain decode step's demand ([`decode_demand`]) of the
+/// forms' primary plan, and of a plan that banks its experts its demand
+/// holding them whole, beside the forms' charge structures.
+pub fn prepare_execution_assessment(
     definition: &ModelDefinition,
-    planned: &ChargedDraft<C>,
-    context_limit: u32,
+    forms: crate::FloorForms,
 ) -> Result<PreparedExecutionAssessment, AssessmentError> {
-    if definition.decoder.context_limit != u64::from(context_limit) {
-        return Err(AssessmentError::Plan(format!(
-            "assessed context limit {} differs from the planned model's {}",
-            context_limit, definition.decoder.context_limit
-        )));
-    }
-    let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
-        .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    let draft = planned.draft();
+    let draft = &forms.primary().draft;
     let whole = match draft.load().expert_bank() {
         Some(_) => Some(decode_demand(definition, &draft.held_whole(definition)?)?),
         None => None,
     };
-    Ok(PreparedExecutionAssessment {
-        demand: decode_demand(definition, draft)?,
-        whole,
-        fit_context_tokens,
-        charge: planned.charge().clone(),
-        held: planned.held().charges(),
-    })
+    Ok(PreparedExecutionAssessment { demand: decode_demand(definition, draft)?, whole, forms })
 }
 
 /// The standard workload's checked memory charge of `definition` planned
 /// as `draft`, at the model's context ([`StructuralCharge`] of the draft,
-/// charged at its own bank). It builds every graph a load prepares, so this
-/// fails with `AssessmentError::Graph` exactly when the model's program
+/// charged at its own bank). It outlines every graph a load prepares, so
+/// this fails with `AssessmentError::Graph` exactly when the model's program
 /// cannot be built on the planned backend.
 pub fn execution_memory_charge(
     definition: &ModelDefinition,
@@ -321,47 +321,24 @@ pub fn execution_memory_charge(
     StructuralCharge::of(definition, draft)?.charge(definition, draft)
 }
 
-/// [`execution_memory_charge`], with the bounds its certification gives of
-/// the draft's target alone ([`StructuralCharge::with_undrafted`]).
-pub fn execution_memory_charge_with_undrafted(
-    definition: &ModelDefinition,
-    draft: &ExecutionPlanDraft,
-) -> Result<(AssessmentMemoryCharge, UndraftedBounds), AssessmentError> {
-    let (structure, undrafted) = StructuralCharge::with_undrafted(definition, draft)?;
-    Ok((structure.charge(definition, draft)?, undrafted))
-}
-
-/// The standard workload's checked memory charge of the target's plan
-/// alone, `plain`, at its drafted plan's holding of experts, whose target
-/// and vision families are that plan's `undrafted` ones
-/// ([`StructuralCharge::undrafted`]).
-pub fn undrafted_memory_charge(
-    definition: &ModelDefinition,
-    plain: &ExecutionPlanDraft,
-    undrafted: UndraftedBounds,
-) -> Result<AssessmentMemoryCharge, AssessmentError> {
-    StructuralCharge::undrafted(definition, plain, undrafted)?.charge(definition, plain)
-}
-
-/// The terms of a draft's charge that its expert bank's slots leave as they
-/// are: its state plan's bytes, its graph resource bound, which builds and
-/// certifies every graph a load prepares, and its process bytes. A bank's
-/// slots size only its record tensors' committed records
+/// The terms of a draft's charge that its expert bank's slots and the
+/// served context leave as they are: its graph resource bound, which
+/// outlines every graph a load prepares (no layout built), and its process
+/// bytes. A bank's slots size only its record tensors' committed records
 /// (`ExpertBankPlan::records_at`) and the banked stacks' resident bytes; its
 /// records' extents, binding, conveyor, scratch and host tier, which the
 /// program plan, the graphs and the kernels read, are of its structure
-/// alone (`BankStructure`). So the charge of any draft that differs from
-/// this one's only in its bank's slots is this structure with that draft's
-/// weights and header bounds ([`Self::charge`]), and is derived once for
-/// every size a bank search confirms.
+/// alone (`BankStructure`). The served context sizes only the state, which
+/// [`Self::charge`] plans at the definition's context; the graphs outlined
+/// at the largest served context bound every smaller one's. So the charge
+/// of any draft that differs from this one's only in its bank's slots, at
+/// any served context up to this one's, is this structure with that draft's
+/// weights, state and header bounds ([`Self::charge`]).
 #[derive(Debug)]
 pub struct StructuralCharge {
     graph: AssessmentGraphResourceBounds,
     host_process: HostProcessBytes,
     device_process: DeviceProcessBytes,
-    workload_state_bytes: u64,
-    startup_state_bytes: u64,
-    loaded_state_bytes: u64,
 }
 
 impl StructuralCharge {
@@ -408,7 +385,7 @@ impl StructuralCharge {
     /// drafted plan's holding of its experts
     /// (`ExecutionPlanDraft::holding_as`), whose target and vision families'
     /// bounds are the drafted plan's `undrafted` ([`Self::with_undrafted`]):
-    /// every other family of `plain` is certified here, those not again.
+    /// every other family of `plain` is outlined here, those not again.
     pub fn undrafted(
         definition: &ModelDefinition,
         plain: &ExecutionPlanDraft,
@@ -441,19 +418,7 @@ impl StructuralCharge {
     ) -> Result<(Self, T), AssessmentError> {
         let policy = draft.policy();
         let backend = draft.device().backend();
-        let state = ResourcePlanner::state_plan(
-            definition,
-            draft.load(),
-            policy.method(),
-            policy.codec(),
-            policy.limits(),
-            ResourceCapacity {
-                domain_bytes: draft.device().assessment_capacity_bytes(),
-                tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
-            },
-        )
-        .map_err(AssessmentError::Plan)?;
-        let (graph, more) = graph(&state).map_err(AssessmentError::Graph)?;
+        let (graph, more) = graph(&state_plan(definition, draft)?).map_err(AssessmentError::Graph)?;
         let host_process =
             HostProcessBytes::derive(definition, draft.load(), draft.programs(), policy.limits(), backend)
                 .map_err(AssessmentError::Memory)?;
@@ -462,25 +427,24 @@ impl StructuralCharge {
             .device_allocations()
             .and_then(|allocations| DeviceProcessBytes::derive(backend, host_process.kernels, allocations))
             .map_err(AssessmentError::Memory)?;
-        let state_bytes = || -> Result<_, String> {
-            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?, state.loaded_state_bytes()?))
-        };
-        let (workload_state_bytes, startup_state_bytes, loaded_state_bytes) =
-            state_bytes().map_err(AssessmentError::Memory)?;
-        Ok((
-            Self { graph, host_process, device_process, workload_state_bytes, startup_state_bytes, loaded_state_bytes },
-            more,
-        ))
+        Ok((Self { graph, host_process, device_process }, more))
     }
 
-    /// The charge of `draft`, a draft of this structure: its weights'
-    /// terms and header bounds beside the structure's.
+    /// The charge of `draft`, a draft of this structure, at `definition`'s
+    /// context: its weights' terms, its state planned there and its header
+    /// bounds beside the structure's.
     pub fn charge(
         &self,
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
     ) -> Result<AssessmentMemoryCharge, AssessmentError> {
         let policy = draft.policy();
+        let state = state_plan(definition, draft)?;
+        let state_bytes = || -> Result<_, String> {
+            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?, state.loaded_state_bytes()?))
+        };
+        let (workload_state_bytes, startup_state_bytes, loaded_state_bytes) =
+            state_bytes().map_err(AssessmentError::Memory)?;
         let terms = AssessmentMemoryTerms::derive(
             definition,
             draft.load(),
@@ -502,14 +466,31 @@ impl StructuralCharge {
             .and_then(|bounds| {
                 terms.charge(
                     bounds,
-                    self.workload_state_bytes,
-                    self.startup_state_bytes,
-                    self.loaded_state_bytes,
+                    workload_state_bytes,
+                    startup_state_bytes,
+                    loaded_state_bytes,
                     group_class(draft, &self.graph)?,
                 )
             })
             .map_err(AssessmentError::Memory)
     }
+}
+
+/// The state plan of `definition` planned as `draft`, at its context.
+fn state_plan(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<crate::StateResourcePlan, AssessmentError> {
+    let policy = draft.policy();
+    ResourcePlanner::state_plan(
+        definition,
+        draft.load(),
+        policy.method(),
+        policy.codec(),
+        policy.limits(),
+        ResourceCapacity {
+            domain_bytes: draft.device().assessment_capacity_bytes(),
+            tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
+        },
+    )
+    .map_err(AssessmentError::Plan)
 }
 
 /// What a prompt group's class holds beyond the floor's
@@ -573,73 +554,107 @@ fn planned_executor<'a>(
     })
 }
 
-/// Whether the standard workload of one prepared model of `definition` fits
-/// stable capacity: its experts held as a load holds them
-/// ([`ExecutionPlanDraft::with_held_experts`]), placed whole where the
-/// allocation domain's stable room holds them so, else streamed within it;
-/// where neither fits, the prepared plan's own shortfall is the verdict.
-/// Its plans are charged from the charges planning made ([`HeldCharges`]),
-/// so a way of holding the experts planning charged is never charged from
-/// its structure again. On a machine whose prices are not measured a
-/// streamed fit is sized by memory alone
-/// ([`crate::Unmeasured::SizedByMemory`]): fit is assessed, and speed is
-/// what is pending.
+/// Whether the standard workload of one prepared model fits stable
+/// capacity at `definition`'s context (a served context up to the one it
+/// was prepared at), its experts held as a load holds them: whole where
+/// the room holds them so (a bank of every expert, else their own
+/// allocations), else streamed through the most bank slots the room holds,
+/// each at its floor of places ([`crate::FloorForms`]); where none fits,
+/// the shortfall of the least of them. Arithmetic over the prepared forms'
+/// structures ([`StructuralCharge::charge`]), each plan confirmed as a
+/// load's is (`StableRoom::fit`), its recorded graphs priced at `pricing`,
+/// the machine's graph cost as its records give it now.
 pub fn assess_execution_fit(
     definition: &ModelDefinition,
     prepared: &PreparedExecutionAssessment,
-    draft: &ExecutionPlanDraft,
+    pricing: crate::platform::GraphPricing,
     topology: &DeviceTopology,
     status: &Status,
-    request: &AssessmentRequest,
-    prices: &crate::assessment::Priced<crate::PlanPrices>,
+    reserves: &MemoryReserves,
 ) -> Result<ExecutionAssessment, AssessmentError> {
-    let device = planned_executor(draft, topology)?;
-    // Every plan is confirmed as a load's plan of it is (`StableRoom::fit`),
-    // and settles into the same room: the allocation domain's stable fit;
-    // every other store `Fit` places the plan in is its confirm's.
-    let room = crate::planning::StableRoom { topology, executor: device, status, reserves: &request.reserves };
-    let fit = room.fit(draft, &prepared.charge)?;
-    // A prepared plan whose experts are whole (a bank of every expert at
-    // its largest pass, or their own allocations) that fits is the plan
-    // placement holds first.
-    if matches!(fit.verdict, AssessmentFitVerdict::Fits) && draft.load().expert_bank().is_none_or(|bank| bank.whole()) {
-        return Ok(ExecutionAssessment::Fits(ExecutionFit {
-            fit_context_tokens: prepared.fit_context_tokens,
-            breakdown: prepared.charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
+    let forms = &prepared.forms;
+    let device = planned_executor(prepared.draft(), topology)?;
+    let room = crate::planning::StableRoom { topology, executor: device, status, reserves };
+    let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
+        .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
+    // The charge of `draft` of `form`'s structure and its fit.
+    let charged = |form: &crate::HeldForm, draft: ExecutionPlanDraft| -> Result<_, AssessmentError> {
+        let draft = draft.with_graph_pricing(pricing);
+        let charge = form.structure.charge(definition, &draft)?;
+        let fit = room.fit(&draft, &charge)?;
+        Ok((draft, charge, fit))
+    };
+    let fits = |draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge, fit: crate::AssessmentFit| -> Result<_, AssessmentError> {
+        Ok(ExecutionAssessment::Fits(ExecutionFit {
+            fit_context_tokens,
+            breakdown: charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
             domains: fit.domains,
             bank: draft.load().expert_bank().cloned(),
-        }));
-    }
-    let bound = fit.settle_bound().map_err(AssessmentError::Memory)?;
-    let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
-        let fit = room.fit(candidate, charge)?;
-        Ok::<_, AssessmentError>(match fit.verdict {
-            AssessmentFitVerdict::Fits => {
-                Ok((charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?, fit.domains))
-            }
-            AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
-        })
+        }))
     };
-    let mut held = prepared.held.clone();
-    Ok(match draft.with_held_experts(definition, crate::HeldBound::room(bound), prices, crate::Unmeasured::SizedByMemory, &mut held, room, confirm)? {
-        Ok((held, (breakdown, domains))) => ExecutionAssessment::Fits(ExecutionFit {
-            fit_context_tokens: prepared.fit_context_tokens,
-            domains,
-            breakdown,
-            bank: held.draft().load().expert_bank().cloned(),
-        }),
-        Err(_) => match fit.verdict {
-            AssessmentFitVerdict::DoesNotFit { limiting, deficit_bytes } => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
-                fit_context_tokens: prepared.fit_context_tokens,
-                domains: fit.domains,
-                limiting,
-                deficit_bytes,
-            }),
-            AssessmentFitVerdict::Fits => {
-                return Err(AssessmentError::Plan("the prepared plan fits, yet no holding of its experts does".into()));
+    let holds = |fit: &crate::AssessmentFit| matches!(fit.verdict, AssessmentFitVerdict::Fits);
+    // Whole: a bank of every expert, else the experts' own allocations.
+    if let Some(bank) = forms.bank().filter(|bank| bank.points.last() == Some(&bank.experts)) {
+        let (draft, charge, fit) = charged(&bank.form, bank.at_slots(bank.experts)?)?;
+        if holds(&fit) {
+            return fits(&draft, &charge, fit);
+        }
+    }
+    let resident = match forms.resident() {
+        Some(resident) => {
+            let (draft, charge, fit) = charged(resident, resident.draft.clone())?;
+            if holds(&fit) {
+                return fits(&draft, &charge, fit);
             }
-        },
-    })
+            Some(fit)
+        }
+        None => None,
+    };
+    // Streamed: the most slots that fit, a bank's fit falling as its slots
+    // do, beside the host tier host memory holds.
+    let least = match forms.bank() {
+        Some(bank) => {
+            let at = |slots: u64| -> Result<_, AssessmentError> {
+                let (_, charge, fit) = charged(&bank.form, bank.at_slots(slots)?)?;
+                Ok((charge, fit))
+            };
+            let (floor_charge, floor_fit) = at(bank.points[0])?;
+            if holds(&floor_fit) {
+                let (mut fitting, mut short) = (0, bank.points.len());
+                let mut held = (floor_charge, floor_fit);
+                while short - fitting > 1 {
+                    let middle = fitting + (short - fitting) / 2;
+                    let (charge, fit) = at(bank.points[middle])?;
+                    if holds(&fit) {
+                        (fitting, held) = (middle, (charge, fit));
+                    } else {
+                        short = middle;
+                    }
+                }
+                let slots = bank.points[fitting];
+                let (charge, fit) = held;
+                match bank.with_host_tier(slots, &charge)? {
+                    Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
+                    Err(reason) => {
+                        return Err(AssessmentError::Plan(format!(
+                            "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
+                        )));
+                    }
+                }
+            }
+            floor_fit
+        }
+        None => resident.expect("experts that cannot stream are held whole (`FloorForms::Resident`)"),
+    };
+    match least.verdict {
+        AssessmentFitVerdict::DoesNotFit { limiting, deficit_bytes } => Ok(ExecutionAssessment::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
+            domains: least.domains,
+            limiting,
+            deficit_bytes,
+        })),
+        AssessmentFitVerdict::Fits => unreachable!("a form that fits is held above"),
+    }
 }
 
 /// A banked plan's launch of some rows at some depth in each form
@@ -685,13 +700,12 @@ pub fn decode_pricing<'a>(draft: &ExecutionPlanDraft, costs: &'a ExecutorCosts) 
 /// planned executor's measured kernel costs.
 pub fn estimate_execution(
     prepared: &PreparedExecutionAssessment,
-    draft: &ExecutionPlanDraft,
     costs: &ExecutorCosts,
     request: &AssessmentRequest,
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
     estimate_decode(
         &prepared.demand,
-        &decode_pricing(draft, costs),
+        &decode_pricing(prepared.draft(), costs),
         u64::from(request.sequences),
         &performance_depths(request.context_limit, &request.performance_depths),
     )
@@ -716,9 +730,28 @@ pub(crate) mod tests {
     }
 
     impl Environment {
-        /// The draft with its charge, as planning gives it.
-        fn planned(&self) -> ChargedDraft {
-            ChargedDraft::of(&self.definition, self.draft.clone()).unwrap()
+        /// The draft prepared as assessment prepares it: each way of holding
+        /// its experts outlined at its floor.
+        fn prepared(&self) -> PreparedExecutionAssessment {
+            let forms = self
+                .draft
+                .floor_forms::<(), AssessmentError>(&self.definition, None, |draft| {
+                    StructuralCharge::of(&self.definition, draft).map(|charge| (charge, ()))
+                })
+                .unwrap();
+            prepare_execution_assessment(&self.definition, forms).unwrap()
+        }
+
+        /// The prepared draft's fit at `request`'s reserves.
+        fn fit(&self, prepared: &PreparedExecutionAssessment, request: &AssessmentRequest) -> Result<ExecutionAssessment, AssessmentError> {
+            assess_execution_fit(
+                &self.definition,
+                prepared,
+                self.draft.device().graph_pricing(),
+                &self.topology,
+                &self.status,
+                &request.reserves,
+            )
         }
     }
 
@@ -774,22 +807,7 @@ pub(crate) mod tests {
     }
 
     fn assess(environment: &Environment, request: &AssessmentRequest) -> ExecutionAssessment {
-        let prepared = prepare_execution_assessment(
-            &environment.definition,
-            &environment.planned(),
-            request.context_limit,
-        )
-        .unwrap();
-        assess_execution_fit(
-            &environment.definition,
-            &prepared,
-            &environment.draft,
-            &environment.topology,
-            &environment.status,
-            request,
-            &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()),
-        )
-        .unwrap()
+        environment.fit(&environment.prepared(), request).unwrap()
     }
 
     #[test]
@@ -848,12 +866,9 @@ pub(crate) mod tests {
     fn a_fitting_model_is_estimated_at_each_depth() {
         let environment = environment(150_000);
         let request = request(150_000, &[25_000, 50_000, 50_000, 200_000]);
-        let prepared =
-            prepare_execution_assessment(&environment.definition, &environment.planned(), 150_000)
-                .unwrap();
+        let prepared = environment.prepared();
         let costs = crate::assessment::fixtures::costs();
-        let estimates =
-            estimate_execution(&prepared, &environment.draft, &costs, &request).unwrap();
+        let estimates = estimate_execution(&prepared, &costs, &request).unwrap();
         assert_eq!(
             estimates
                 .iter()
@@ -878,28 +893,10 @@ pub(crate) mod tests {
         // are 38.4 MB, beyond a 16 MiB domain.
         let environment = environment_within(150_000, 16 << 20);
         let request = request(150_000, &[25_000]);
-        let prepared =
-            prepare_execution_assessment(&environment.definition, &environment.planned(), 150_000)
-                .expect("a context the domain cannot back is not a planning failure");
-        assert_eq!(prepared.fit_context_tokens, 150_000);
-        assert!(assess_execution_fit(
-            &environment.definition,
-            &prepared,
-            &environment.draft,
-            &environment.topology,
-            &environment.status,
-            &request,
-            &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn a_mismatched_context_limit_is_an_error() {
-        let environment = environment(128);
-        assert!(matches!(
-            prepare_execution_assessment(&environment.definition, &environment.planned(), 256),
-            Err(AssessmentError::Plan(_))
-        ));
+        let fit_context_tokens = match environment.fit(&environment.prepared(), &request).unwrap() {
+            ExecutionAssessment::Fits(fit) => fit.fit_context_tokens,
+            ExecutionAssessment::DoesNotFit(shortfall) => shortfall.fit_context_tokens,
+        };
+        assert_eq!(fit_context_tokens, 150_000);
     }
 }

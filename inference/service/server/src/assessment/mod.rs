@@ -49,8 +49,8 @@ struct AssessmentTarget {
 }
 
 /// One preparation per bundle on one structure, shared by every profile, source slice and
-/// environment that names it: a preparation reads only the structure, so the records that price
-/// an input of the structure anew prepare every bundle again.
+/// environment that names it: a preparation reads only the structure, and nothing of it the
+/// records price (`AssessmentEnvironment::structure_id`), so no record prepares a bundle again.
 #[derive(Default)]
 struct PreparationCoordinator {
     cells: Mutex<
@@ -902,8 +902,8 @@ impl ManagedModelAssessments {
     }
 
     /// Move the pool to `environment`: work not yet assessed moves at once, and every assessed
-    /// model is finished again in it ([`Self::refinish`]): arithmetic over its prepared demand
-    /// while the structure is the same, prepared again on a structure the records priced anew.
+    /// model is finished again in it ([`Self::refinish`]): arithmetic over its preparation, which
+    /// every environment of one structure shares.
     fn adopt_environment(
         self: &Arc<Self>,
         environment: Arc<AssessmentEnvironment>,

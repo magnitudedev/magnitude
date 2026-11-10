@@ -4,9 +4,11 @@
 //! drafter. Independent header checks (weight encodings, the family's
 //! interpretation, the tokenizer and the chat templates) each run and their
 //! refusals are reported together. An admitted target is planned through
-//! [`crate::planning::plan_ceiling`] (the production planning inputs)
-//! with its drafter, and the target's plan alone is charged beside it from
-//! its headers, which decides whether it runs here; a drafter that does not
+//! [`crate::planning::plan_resident`] (the production planning inputs)
+//! with its drafter, each way of holding its experts outlined once at its
+//! floor (`ExecutionPlanDraft::floor_forms`), and the target's plan alone
+//! is charged beside it from its headers; every served tier's fit, bank and
+//! verdict is arithmetic over those outlines. A drafter that does not
 //! bind or plan is `Rejected` without affecting the target, which is then
 //! planned alone. A projector the family cannot bind is `Rejected`
 //! the same way: the target is interpreted and planned without it, taking
@@ -22,7 +24,7 @@ use crate::error::{
 use crate::fingerprint::ModelFingerprint;
 use crate::host::{bind_draft, interpret_target, vocabulary_mismatch, InterpretedTarget};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
-use crate::planning::{plan_backend, plan_ceiling, plan_resident, ExecutionPlanningError};
+use crate::planning::{plan_backend, plan_resident, ExecutionPlanningError};
 use magnitude_artifacts::{
     gguf::{Directory, FileHeaders, HeaderSource, TensorDescriptor},
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest, TemplatePayload,
@@ -34,16 +36,16 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        assess_execution_fit, decode_pricing, decode_step, estimate_execution, performance_depths,
-        prepare_execution_assessment, undrafted_memory_charge, AssessmentError,
+        assess_execution_fit, decode_pricing, estimate_execution, performance_depths,
+        prepare_execution_assessment, AssessmentError, StructuralCharge,
         AssessmentRequest,
         ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
     },
-    platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
-    held_storage, resident_layout, scaled_source_element, stored_weights, AssessmentMemoryCharge,
-    ChargedDraft, DraftedCharge, ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache, PlanPrices,
+    platform::{self, DeviceRequest, GraphPricing, MemoryReserves, PlatformError, SelectedDevice},
+    held_storage, resident_layout, scaled_source_element, stored_weights,
+    ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, FloorForms, KernelCache, UndraftedBounds,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
@@ -218,27 +220,6 @@ pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, 
     }
 }
 
-/// The prices a plan of `definition` as `plan` (its plan before any bank)
-/// settles its holdings on (`PlanPrices`): the executor's costs and the
-/// streamed figures `measurements` hold, and its decode on those costs in
-/// each form, `plan`'s and the banked plan's streamed form's
-/// (`assessment::decode_step`). Pending or unavailable as the measurements
-/// or their streamed figures are: a plan that holds a bank waits for them.
-pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
-    match measurements {
-        Measurements::Pending => Priced::Pending("the executor's costs are not measured yet".into()),
-        Measurements::Unavailable { reason } => Priced::Unavailable(reason.clone()),
-        Measurements::Measured { costs, streamed, .. } => streamed.as_ref().and_then(|figures| {
-            let (resident, steps) = (plan.clone(), ExecutorCosts::clone(costs));
-            Priced::Measured(PlanPrices::new(
-                ExecutorCosts::clone(costs),
-                *figures,
-                Box::new(move |definition, banked| decode_step(definition, &resident, banked, steps.clone())),
-            ))
-        }),
-    }
-}
-
 /// What this machine's measurements give assessment. Only the measurement
 /// job takes them (device topology spec §2.15); assessment reads what it
 /// stored.
@@ -332,9 +313,11 @@ pub enum ProjectorVerdict {
     Rejected(UnsupportedModel),
 }
 
-/// Host-side model facts established from headers.
+/// Host-side model facts established from headers, with the drafter's
+/// verdict as `D`: a prepared model's drafter ([`PreparedDrafter`]) until
+/// its assessment is finished.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelFacts {
+pub struct ModelFacts<D = DrafterVerdict> {
     pub capabilities: ModelCapabilities,
     /// [`magnitude_chat::TemplateInspection::fingerprint`] of the package's
     /// chat templates and reasoning profile.
@@ -345,7 +328,90 @@ pub struct ModelFacts {
     pub context_limit: u32,
     pub fingerprint: Option<ModelFingerprint>,
     pub projector: ProjectorVerdict,
-    pub drafter: DrafterVerdict,
+    pub drafter: D,
+}
+
+impl<D> ModelFacts<D> {
+    /// These facts with `drafter`'s verdict.
+    fn with_drafter<E>(&self, drafter: E) -> ModelFacts<E> {
+        ModelFacts {
+            capabilities: self.capabilities.clone(),
+            template_fingerprint: self.template_fingerprint.clone(),
+            context_limit: self.context_limit,
+            fingerprint: self.fingerprint.clone(),
+            projector: self.projector.clone(),
+            drafter,
+        }
+    }
+}
+
+/// A prepared model's drafter: what [`DrafterVerdict`] its finished
+/// assessment reports, a bound drafter's memory charged at the served tier
+/// on the machine's graph pricing ([`finish_model_assessment`]).
+pub enum PreparedDrafter {
+    None,
+    /// It binds and plans with the target: the target's plan alone at the
+    /// drafted plan's holding of experts, which its memory is the drafted
+    /// plan's charge less of.
+    Bound {
+        method: SpeculativeMethod,
+        alone: TargetAlone,
+    },
+    Rejected(UnsupportedModel),
+}
+
+/// The target's plan alone at a drafted plan's holding of experts
+/// (`ExecutionPlanDraft::holding_as`) and its charge's structure, whose
+/// target and vision families are the drafted plan's without its drafter's
+/// writes (`StructuralCharge::undrafted`).
+pub struct TargetAlone {
+    definition: ModelDefinition,
+    draft: ExecutionPlanDraft,
+    structure: StructuralCharge,
+}
+
+impl PreparedDrafter {
+    /// The drafter's verdict at `context` tokens of the served context, its
+    /// graphs priced at `pricing`: a bound drafter's memory is the drafted
+    /// plan's serving and host charge (`execution`'s primary form of
+    /// `definition`) less the target's alone at the same holding of experts.
+    fn verdict(
+        &self,
+        definition: &ModelDefinition,
+        execution: &PreparedExecutionAssessment,
+        context: u32,
+        pricing: GraphPricing,
+    ) -> Result<DrafterVerdict, ModelAssessmentError> {
+        let (method, alone) = match self {
+            Self::None => return Ok(DrafterVerdict::None),
+            Self::Rejected(unsupported) => return Ok(DrafterVerdict::Rejected(unsupported.clone())),
+            Self::Bound { method, alone } => (*method, alone),
+        };
+        let held = |definition: &ModelDefinition, draft: &ExecutionPlanDraft, structure: &StructuralCharge| {
+            let charge = structure
+                .charge(&at_context(definition, context), &draft.clone().with_graph_pricing(pricing))
+                .map_err(ModelAssessmentError::Assessment)?;
+            charge
+                .host_bytes()
+                .and_then(|host| charge.serving_bytes.checked_add(host).ok_or_else(|| "held charge overflows".to_owned()))
+                .map_err(ModelAssessmentError::Planning)
+        };
+        let primary = execution.primary();
+        let with = held(definition, &primary.draft, &primary.structure)?;
+        let without = held(&alone.definition, &alone.draft, &alone.structure)?;
+        assert!(
+            with >= without,
+            "a drafted plan holds {with} bytes, less than its target's plan alone ({without}) at the same holding of experts"
+        );
+        Ok(DrafterVerdict::Bound { method, memory_bytes: with - without })
+    }
+}
+
+/// `definition` served at `context` tokens.
+fn at_context(definition: &ModelDefinition, context: u32) -> ModelDefinition {
+    let mut definition = definition.clone();
+    definition.decoder.context_limit = u64::from(context);
+    definition
 }
 
 /// A complete assessment of one package on one execution environment.
@@ -451,76 +517,19 @@ pub enum PreparedModelAssessment {
         fingerprint: Option<ModelFingerprint>,
     },
     /// The package planned at its largest served tier, `facts.context_limit`
-    /// (`definition`, `draft` and `execution`, its drafter verdict in
-    /// `facts`), and its smaller tiers, each planned when assessment first
-    /// reaches it (`below`).
+    /// (`definition` and `execution`, its drafter in `facts`): every served
+    /// tier's fit and its drafter's memory are arithmetic over it
+    /// ([`finish_model_assessment`]).
     Planned {
-        facts: ModelFacts,
-        /// The definition `draft` plans.
+        facts: ModelFacts<PreparedDrafter>,
+        /// The definition `execution` plans, at the largest served tier.
         definition: ModelDefinition,
-        draft: ExecutionPlanDraft,
         execution: PreparedExecutionAssessment,
-        below: LowerTiers,
+        /// The package's served tiers, largest first: every one of
+        /// [`served_contexts`], or the one
+        /// [`AssessmentStructure::served_context`] fixes.
+        tiers: Vec<u32>,
     },
-}
-
-/// The plan of a package served at one of its tiers below the largest: the
-/// drafter verdict, definition, plan and prepared assessment a load serving
-/// it at that context has.
-struct TierPlan {
-    drafter: DrafterVerdict,
-    definition: ModelDefinition,
-    draft: ExecutionPlanDraft,
-    execution: PreparedExecutionAssessment,
-}
-
-/// A package's served tiers below its largest, largest first, each planned
-/// once, when assessment first reaches it ([`finish_model_assessment`]):
-/// a fit decided at the largest tier, as a streamed model's always is where
-/// its bank's floor fits, plans no other. A tier is planned as a load
-/// serving it is, so its charge and bank are exactly that load's.
-pub struct LowerTiers {
-    admitted: Box<AdmittedPackage>,
-    tiers: Vec<(u32, std::sync::Mutex<Option<Arc<TierPlan>>>)>,
-}
-
-impl LowerTiers {
-    /// The tiers below `admitted`'s served context: none where the
-    /// structure fixes the context ([`AssessmentStructure::served_context`]),
-    /// else the rest of [`served_contexts`].
-    fn of(admitted: Box<AdmittedPackage>, structure: &AssessmentStructure) -> Self {
-        let tiers = match structure.served_context {
-            Some(_) => Vec::new(),
-            None => served_contexts(admitted.context_limit).split_off(1),
-        };
-        Self {
-            tiers: tiers.into_iter().map(|tier| (tier, std::sync::Mutex::new(None))).collect(),
-            admitted,
-        }
-    }
-
-    /// The `index`th tier below the largest and its plan, planned on
-    /// `structure` (the one the package was prepared on) the first time it
-    /// is asked for. A package planned at its largest tier and refused at a
-    /// smaller one is a planning defect, reported as an error.
-    fn plan(&self, index: usize, structure: &AssessmentStructure) -> Result<(u32, Arc<TierPlan>), ModelAssessmentError> {
-        let (tier, plan) = &self.tiers[index];
-        let mut plan = plan.lock().expect("a tier's plan is never left poisoned");
-        if let Some(plan) = plan.as_ref() {
-            return Ok((*tier, Arc::clone(plan)));
-        }
-        let planned = match plan_tier(&self.admitted, *tier, structure)? {
-            Ok(planned) => Arc::new(planned),
-            Err(unsupported) => {
-                return Err(ModelAssessmentError::Planning(format!(
-                    "the package plans at {} tokens of context but is refused at {tier}: {}",
-                    self.admitted.context_limit, unsupported.detail
-                )));
-            }
-        };
-        *plan = Some(Arc::clone(&planned));
-        Ok((*tier, planned))
-    }
 }
 
 /// The smallest context a model is served at when its trained limit allows
@@ -548,21 +557,21 @@ pub fn served_contexts(context_limit: u32) -> Vec<u32> {
 }
 
 /// Complete a prepared model against stable capacity at the largest of its
-/// served tiers it fits ([`served_contexts`], [`served_tier`]), each planned
-/// as a load serving it there plans it, and, when it fits, estimate its
-/// decode speed at the requested depths within that context with
-/// `sequences` conversations decoding at once from the setup's
-/// measurements: arithmetic over the prepared demand. A streamed model's
-/// tier does not trade its bank for context: the bank is planned against
-/// the room the tier's state leaves, and while it serves it borrows the
-/// state no request has committed.
+/// served tiers it fits ([`served_contexts`], [`served_tier`]), and, when it
+/// fits, estimate its decode speed at the requested depths within that
+/// context with `sequences` conversations decoding at once from the setup's
+/// measurements: arithmetic over the prepared structure and demand. A
+/// smaller tier's charge is the prepared structure with its state planned
+/// at that context; the graphs outlined at the largest tier bound every
+/// smaller one's. A streamed model's tier does not trade its bank for
+/// context: the bank is sized against the room the tier's state leaves.
 pub fn finish_model_assessment(
     prepared: &PreparedModelAssessment,
     setup: &AssessmentSetup,
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let (facts, largest, below) = match prepared {
+    let (facts, definition, execution, tiers) = match prepared {
         PreparedModelAssessment::Unsupported {
             unsupported,
             fingerprint,
@@ -572,73 +581,48 @@ pub fn finish_model_assessment(
                 fingerprint: fingerprint.clone(),
             });
         }
-        PreparedModelAssessment::Planned {
-            facts,
-            definition,
-            draft,
-            execution,
-            below,
-        } => (facts, (definition, draft, execution), below),
+        PreparedModelAssessment::Planned { facts, definition, execution, tiers } => (facts, definition, execution, tiers),
     };
     let structure = &setup.structure;
-    let request_at = |context_limit| AssessmentRequest {
-        context_limit,
-        performance_depths: performance_depths.to_vec(),
-        reserves: structure.reserves,
-        sequences,
-    };
-    // The `index`th tier, largest first: its context and, below the
-    // largest, its plan.
-    let tier = |index: usize| match index {
-        0 => Ok((facts.context_limit, None)),
-        _ => below.plan(index - 1, structure).map(|(context, plan)| (context, Some(plan))),
-    };
-    let served = served_tier(1 + below.tiers.len(), |index| {
-        let (context, plan) = tier(index)?;
-        let (definition, draft, execution) = match &plan {
-            None => largest,
-            Some(plan) => (&plan.definition, &plan.draft, &plan.execution),
-        };
+    let pricing = structure.selected.graph_cost;
+    let served = served_tier(tiers.len(), |index| {
         let fit = assess_execution_fit(
-            definition,
+            &at_context(definition, tiers[index]),
             execution,
-            draft,
+            pricing,
             &structure.topology,
             &structure.status,
-            &request_at(context),
-            &plan_prices(&setup.measurements, draft),
+            &structure.reserves,
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {
-            ExecutionAssessment::Fits(fit) => Ok((plan, fit)),
-            ExecutionAssessment::DoesNotFit(shortfall) => Err(shortfall),
+            ExecutionAssessment::Fits(fit) => Ok((tiers[index], fit)),
+            ExecutionAssessment::DoesNotFit(shortfall) => Err((tiers[index], shortfall)),
         })
     })?;
-    let (plan, fit) = match served {
-        Ok(served) => served,
-        Err(shortfall) => {
+    let tier = match &served {
+        Ok((tier, _)) | Err((tier, _)) => *tier,
+    };
+    let facts = facts.with_drafter(facts.drafter.verdict(definition, execution, tier, pricing)?);
+    let fit = match served {
+        Ok((_, fit)) => fit,
+        Err((_, shortfall)) => {
             return Ok(ModelAssessment::Assessed {
-                facts: facts.clone(),
+                facts,
                 execution: ModelExecution::DoesNotFit(shortfall),
             });
         }
     };
-    let (draft, preparation, facts) = match &plan {
-        None => (largest.1, largest.2, facts.clone()),
-        Some(plan) => (
-            &plan.draft,
-            &plan.execution,
-            ModelFacts {
-                drafter: plan.drafter.clone(),
-                ..facts.clone()
-            },
-        ),
+    let request = AssessmentRequest {
+        context_limit: fit.fit_context_tokens,
+        performance_depths: performance_depths.to_vec(),
+        reserves: structure.reserves,
+        sequences,
     };
-    let request = request_at(fit.fit_context_tokens);
     let residency = match fit.residency() {
         FitResidency::Streamed(bank) => {
             let shares = ExpertShares::of(&bank);
-            let at = |held| streamed_performance(&setup.measurements, preparation, draft, &bank, &request, held);
+            let at = |held| streamed_performance(&setup.measurements, execution, &bank, &request, held);
             ModelResidency::Streamed {
                 performance: at(shares.held(shares.slots()))?,
                 floor_performance: at(shares.held(shares.floor()))?,
@@ -646,7 +630,7 @@ pub fn finish_model_assessment(
             }
         }
         FitResidency::Resident => ModelResidency::Resident {
-            performance: resident_performance(&setup.measurements, preparation, draft, &request)?,
+            performance: resident_performance(&setup.measurements, execution, &request)?,
         },
     };
     Ok(ModelAssessment::Assessed {
@@ -658,8 +642,7 @@ pub fn finish_model_assessment(
 /// The largest of `count` served tiers, largest first, at which `assess`
 /// finds a fit, or the shortfall at the smallest: the largest is assessed
 /// first, then the smallest, then the tiers between by bisection, a smaller
-/// context holding less. A fit at the largest assesses no other tier, and
-/// a shortfall at both ends none between.
+/// context holding less.
 fn served_tier<F, S, E>(
     count: usize,
     mut assess: impl FnMut(usize) -> Result<Result<F, S>, E>,
@@ -691,7 +674,6 @@ fn served_tier<F, S, E>(
 fn resident_performance(
     measurements: &Measurements,
     preparation: &PreparedExecutionAssessment,
-    draft: &ExecutionPlanDraft,
     request: &AssessmentRequest,
 ) -> Result<Performance, ModelAssessmentError> {
     Ok(match measurements {
@@ -700,7 +682,7 @@ fn resident_performance(
             reason: reason.clone(),
         },
         Measurements::Measured { costs, .. } => Performance::Estimated(
-            estimate_execution(preparation, draft, costs, request)
+            estimate_execution(preparation, costs, request)
                 .map_err(ModelAssessmentError::Assessment)?,
         ),
     })
@@ -712,7 +694,6 @@ fn resident_performance(
 fn streamed_performance(
     measurements: &Measurements,
     preparation: &PreparedExecutionAssessment,
-    draft: &ExecutionPlanDraft,
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
     held: magnitude_executor::assessment::HeldSlots,
@@ -723,7 +704,7 @@ fn streamed_performance(
         Measurements::Measured { costs, streamed, .. } => match streamed {
             Priced::Pending(_) => Ok(Performance::Pending),
             Priced::Unavailable(reason) => Ok(Performance::Unavailable { reason: reason.clone() }),
-            Priced::Measured(figures) => streamed_estimate(costs, figures, preparation, draft, bank, request, held),
+            Priced::Measured(figures) => streamed_estimate(costs, figures, preparation, bank, request, held),
         },
     }
 }
@@ -740,7 +721,6 @@ pub fn streamed_estimate(
     costs: &ExecutorCosts,
     figures: &StreamedFigures,
     preparation: &PreparedExecutionAssessment,
-    draft: &ExecutionPlanDraft,
     bank: &ExpertBankPlan,
     request: &AssessmentRequest,
     held: magnitude_executor::assessment::HeldSlots,
@@ -750,7 +730,7 @@ pub fn streamed_estimate(
         Priced::Pending(_) => return Ok(Performance::Pending),
         Priced::Unavailable(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
     };
-    let pricing = decode_pricing(draft, costs);
+    let pricing = decode_pricing(preparation.draft(), costs);
     let mut estimates = Vec::new();
     for depth in performance_depths(request.context_limit, &request.performance_depths) {
         let compute = preparation
@@ -790,17 +770,13 @@ pub fn assess_model(
 
 /// Prepare one package from its headers on the selected execution
 /// configuration: admission (every header refusal at once), then the plan
-/// assessed, with its decode demand and checked memory charge: the drafted
-/// plan when a drafter is admitted, the target's plan alone otherwise. A
-/// drafter is `Bound` with what its plan adds to the target's alone at the
-/// fit depth and the drafted plan's holding of experts: its weights, state
-/// and prepared resources on the device
-/// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`]) and the
-/// host memory of its kernels and graphs
-/// ([`magnitude_executor::AssessmentMemoryCharge::host_bytes`]), the target
-/// alone charged from its headers beside the drafted plan's certification
-/// (`drafter_memory_bytes`). Reads only the structure, so a preparation
-/// holds under every measurement of it.
+/// assessed, with its decode demand and each way of holding its experts
+/// outlined at its floor: the drafted plan when a drafter is admitted, the
+/// target's plan alone otherwise, beside which a bound drafter keeps the
+/// target's plan alone at the drafted plan's holding of experts
+/// ([`PreparedDrafter`]). Reads only the structure, and nothing of it the
+/// measurement records price (its graphs' cost, which finishing applies),
+/// so a preparation holds under every measurement of it.
 pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     structure: &AssessmentStructure,
@@ -826,10 +802,10 @@ pub fn prepare_model_assessment_from(
                 fingerprint,
             });
         }
-        Admission::Admitted(admitted) => Box::new(admitted.served_at(structure.served_context)?),
+        Admission::Admitted(admitted) => admitted.served_at(structure.served_context)?,
     };
-    let largest = match plan_tier(&admitted, admitted.context_limit, structure)? {
-        Ok(plan) => plan,
+    let (drafter, definition, execution) = match plan_package(&admitted, structure)? {
+        Ok(planned) => planned,
         Err(unsupported) => {
             return Ok(PreparedModelAssessment::Unsupported {
                 unsupported,
@@ -838,27 +814,24 @@ pub fn prepare_model_assessment_from(
         }
     };
     Ok(PreparedModelAssessment::Planned {
-        facts: admitted.facts(largest.drafter),
-        definition: largest.definition,
-        draft: largest.draft,
-        execution: largest.execution,
-        below: LowerTiers::of(admitted, structure),
+        facts: admitted.facts(drafter),
+        definition,
+        execution,
+        tiers: match structure.served_context {
+            Some(_) => vec![admitted.context_limit],
+            None => served_contexts(admitted.context_limit),
+        },
     })
 }
 
-/// `admitted` planned at `context_limit` tokens of context, as a load
-/// serving it at that context plans it: the drafted plan when its drafter
-/// plans, the target's alone otherwise; or the target's refusal.
-fn plan_tier(
+/// `admitted` planned at its served context, as a load serving it there
+/// plans it, each way of holding its experts outlined once
+/// ([`prepare_forms`]): the drafted plan when its drafter plans, the
+/// target's alone otherwise; or the target's refusal.
+fn plan_package(
     admitted: &AdmittedPackage,
-    context_limit: u32,
     structure: &AssessmentStructure,
-) -> Result<Result<TierPlan, UnsupportedModel>, ModelAssessmentError> {
-    let served = |definition: &ModelDefinition| {
-        let mut definition = definition.clone();
-        definition.decoder.context_limit = u64::from(context_limit);
-        definition
-    };
+) -> Result<Result<(PreparedDrafter, ModelDefinition, PreparedExecutionAssessment), UnsupportedModel>, ModelAssessmentError> {
     let environment = Environment {
         policy: &structure.policy,
         service: &structure.service,
@@ -866,25 +839,25 @@ fn plan_tier(
         reserves: structure.reserves,
     };
     let plain = environment
-        .plain(admitted, served(&admitted.definition))
+        .plain(admitted, admitted.definition.clone())
         .map_err(ModelAssessmentError::Configuration)?;
     let drafted = match &admitted.drafter {
-        DrafterAdmission::None => Err(DrafterVerdict::None),
+        DrafterAdmission::None => Err(PreparedDrafter::None),
         DrafterAdmission::Rejected(unsupported) => {
-            Err(DrafterVerdict::Rejected(unsupported.clone()))
+            Err(PreparedDrafter::Rejected(unsupported.clone()))
         }
         DrafterAdmission::Candidate { definition, method } => environment
-            .drafted(admitted, &served(definition), *method)
+            .drafted(admitted, definition, *method)
             .and_then(|(manifest, method)| {
-                match prepare_plan::<DraftedCharge>(manifest, &structure.selected, context_limit) {
-                    Ok(planned) => Ok((method, planned)),
+                match prepare_forms(&manifest, &structure.selected, StructuralCharge::with_undrafted) {
+                    Ok(forms) => Ok((method, manifest, forms)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {
                         Err(UnsupportedModel::mismatch(error.to_string()))
                     }
                 }
             })
-            .map_err(DrafterVerdict::Rejected),
+            .map_err(PreparedDrafter::Rejected),
     };
     // The target's plan alone is a package's refusal: a drafter's own is
     // the drafter's.
@@ -892,60 +865,50 @@ fn plan_tier(
         Refusal::Unsupported(unsupported) => Ok(Err(unsupported)),
         Refusal::Failed(error) => Err(error),
     };
-    let (drafter, definition, draft, execution) = match drafted {
-        Ok((method, (definition, planned, execution))) => {
-            match drafter_memory_bytes(plain, &structure.selected, &planned) {
-                Ok(memory_bytes) => {
-                    (DrafterVerdict::Bound { method, memory_bytes }, definition, planned.into_draft(), execution)
-                }
-                Err(refusal) => return refused(refusal),
-            }
-        }
+    let (drafter, definition, forms) = match drafted {
+        Ok((method, manifest, forms)) => match target_alone(plain, &structure.selected, &forms) {
+            Ok(alone) => (PreparedDrafter::Bound { method, alone }, manifest.definition, forms.structures()),
+            Err(refusal) => return refused(refusal),
+        },
         Err(verdict) => {
-            match prepare_plan::<AssessmentMemoryCharge>(plain, &structure.selected, context_limit) {
-                Ok((definition, planned, execution)) => (verdict, definition, planned.into_draft(), execution),
+            let outline = |definition: &ModelDefinition, draft: &ExecutionPlanDraft| {
+                StructuralCharge::of(definition, draft).map(|charge| (charge, ()))
+            };
+            match prepare_forms(&plain, &structure.selected, outline) {
+                Ok(forms) => (verdict, plain.definition, forms),
                 Err(refusal) => return refused(refusal),
             }
         }
     };
-    Ok(Ok(TierPlan { drafter, definition, draft, execution }))
+    match prepare_execution_assessment(&definition, forms) {
+        Ok(execution) => Ok(Ok((drafter, definition, execution))),
+        Err(AssessmentError::Graph(error)) => refused(Refusal::of(classify_graph(error))),
+        Err(error) => Err(ModelAssessmentError::Assessment(error)),
+    }
 }
 
-/// What a drafter adds to the target's plan alone (`plain`) at the drafted
-/// plan's holding of experts (`ExecutionPlanDraft::holding_as`): the
-/// device's serving charge and the host's, of `drafted` less of the target
-/// alone. The target alone's target family is the drafted plan's without its
-/// drafter's writes, certified with it (`ChargedDraft::undrafted`); every
-/// other term is the target's own, from its headers.
-fn drafter_memory_bytes(
+/// The target's plan alone (`plain`) at the drafted plan's holding of
+/// experts (`ExecutionPlanDraft::holding_as`), at the drafted plan's primary
+/// form (`FloorForms::primary`), and its charge's structure: its target and
+/// vision families are the drafted plan's without its drafter's writes,
+/// outlined with it (`StructuralCharge::with_undrafted`); every other term
+/// is the target's own, from its headers.
+fn target_alone(
     plain: ExecutionManifest,
     selected: &SelectedDevice,
-    drafted: &ChargedDraft<DraftedCharge>,
-) -> Result<u64, Refusal> {
+    drafted: &FloorForms<UndraftedBounds>,
+) -> Result<TargetAlone, Refusal> {
     let backend = selected.info.backend();
-    let resident = plan_resident(&plain, selected).map_err(|error| match error {
-        ExecutionPlanningError::Plan(error) => Refusal::of(classify_plan(error, backend)),
-        error => Refusal::Failed(ModelAssessmentError::Planning(error.to_string())),
-    })?;
-    let alone = resident
-        .holding_as(&plain.definition, drafted.draft())
+    let primary = drafted.primary();
+    let draft = plan_resident(&plain, selected)
+        .map_err(|error| planning_refusal(error, backend))?
+        .holding_as(&plain.definition, &primary.draft)
         .map_err(|error| Refusal::of(classify_plan(error, backend)))?;
-    let charge = undrafted_memory_charge(&plain.definition, &alone, drafted.undrafted().clone()).map_err(|error| match error {
+    let structure = StructuralCharge::undrafted(&plain.definition, &draft, primary.more.clone()).map_err(|error| match error {
         AssessmentError::Graph(error) => Refusal::of(classify_graph(error)),
         error => Refusal::Failed(ModelAssessmentError::Assessment(error)),
     })?;
-    let held = |charge: &AssessmentMemoryCharge| {
-        charge
-            .host_bytes()
-            .and_then(|host| charge.serving_bytes.checked_add(host).ok_or_else(|| "held charge overflows".to_owned()))
-            .map_err(|error| Refusal::Failed(ModelAssessmentError::Planning(error)))
-    };
-    let (with, without) = (held(drafted.charge())?, held(&charge)?);
-    assert!(
-        with >= without,
-        "a drafted plan holds {with} bytes, less than its target's plan alone ({without}) at the same holding of experts"
-    );
-    Ok(with - without)
+    Ok(TargetAlone { definition: plain.definition, draft, structure })
 }
 
 /// The native kernels a load of one package prepares on a backend, or why
@@ -1051,35 +1014,52 @@ impl Refusal {
     }
 }
 
-/// Assessment plans its structure and ceilings, never a priced settle (`with_bank`): no plan of
-/// its waits on the machine's prices.
+/// Assessment plans its structure and outlines its floor forms (`ExecutionPlanDraft::floor_forms`),
+/// never a priced settle (`with_bank`): no plan of its waits on the machine's prices.
 fn unpriced(reason: &str) -> ! {
     unreachable!("an assessment plan settled on the machine's prices, which are pending: {reason}")
 }
 
-/// Plan `manifest` on the selected device, then its decode demand and
-/// checked memory charge, which builds every graph a load prepares. Planner
-/// refusals and kernel domains classify exactly as a load's do.
-fn prepare_plan<C: HeldCharge>(
-    manifest: ExecutionManifest,
+/// `manifest` planned on the selected device, each way of holding its
+/// experts outlined once by `structure` (`ExecutionPlanDraft::floor_forms`).
+/// Planner refusals and kernel domains classify exactly as a load's do.
+fn prepare_forms<T>(
+    manifest: &ExecutionManifest,
     selected: &SelectedDevice,
-    context_limit: u32,
-) -> Result<(ModelDefinition, ChargedDraft<C>, PreparedExecutionAssessment), Refusal> {
-    let planned = match plan_ceiling(&manifest, selected) {
-        Ok(planned) => planned,
-        Err(ExecutionPlanningError::Plan(error)) => {
-            return Err(Refusal::of(classify_plan(error, selected.info.backend())));
-        }
-        Err(error) => {
-            return Err(Refusal::Failed(ModelAssessmentError::Planning(
-                error.to_string(),
-            )));
-        }
-    };
-    match prepare_execution_assessment(&manifest.definition, &planned, context_limit) {
-        Ok(execution) => Ok((manifest.definition, planned, execution)),
-        Err(AssessmentError::Graph(error)) => Err(Refusal::of(classify_graph(error))),
-        Err(error) => Err(Refusal::Failed(ModelAssessmentError::Assessment(error))),
+    structure: impl Fn(&ModelDefinition, &ExecutionPlanDraft) -> Result<(StructuralCharge, T), AssessmentError>,
+) -> Result<FloorForms<T>, Refusal> {
+    let backend = selected.info.backend();
+    let resident = plan_resident(manifest, selected).map_err(|error| planning_refusal(error, backend))?;
+    resident
+        .floor_forms(&manifest.definition, manifest.model.weight_bound, |draft| {
+            structure(&manifest.definition, draft).map_err(FormError::Assessment)
+        })
+        .map_err(|error| match error {
+            FormError::Plan(error) => Refusal::of(classify_plan(error, backend)),
+            FormError::Assessment(AssessmentError::Graph(error)) => Refusal::of(classify_graph(error)),
+            FormError::Assessment(error) => Refusal::Failed(ModelAssessmentError::Assessment(error)),
+        })
+}
+
+/// Why a form of a plan has no outline: its planning's refusal, or its
+/// charge's.
+enum FormError {
+    Plan(magnitude_executor::PlanError),
+    Assessment(AssessmentError),
+}
+
+impl From<magnitude_executor::PlanError> for FormError {
+    fn from(error: magnitude_executor::PlanError) -> Self {
+        Self::Plan(error)
+    }
+}
+
+/// A planning failure as a refusal: the planner's refusal classified as a
+/// load's, any other the engine's.
+fn planning_refusal(error: ExecutionPlanningError, backend: seismic::BackendName) -> Refusal {
+    match error {
+        ExecutionPlanningError::Plan(error) => Refusal::of(classify_plan(error, backend)),
+        error => Refusal::Failed(ModelAssessmentError::Planning(error.to_string())),
     }
 }
 
@@ -1206,7 +1186,7 @@ impl AdmittedPackage {
         Ok(*self)
     }
 
-    fn facts(&self, drafter: DrafterVerdict) -> ModelFacts {
+    fn facts<D>(&self, drafter: D) -> ModelFacts<D> {
         ModelFacts {
             capabilities: ModelCapabilities {
                 vision: self.definition.vision.is_some(),

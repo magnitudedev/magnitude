@@ -1978,7 +1978,7 @@ impl NativeTargetProgram {
         let (start, last_rows, run) = backs.last().unwrap_or(head);
         let rows = last_rows + start - first;
         let (graph, bound, pass_rows) = self.graphs.pass(index, launches).map_err(invalid)?;
-        let into = &graph.ports;
+        let into = &graph.ports.ports;
         let group = run.region.group.clone();
         let SplitValues { crossing, merged } = group.split(index).map_err(invalid)?;
         // The pass's graph holds `pass_rows` crossed rows: the group's rows
@@ -2001,7 +2001,7 @@ impl NativeTargetProgram {
             }
         }
         bindings
-            .set(&into.experts, &merged.experts.slice_leading(0, into.blocks).map_err(device)?)
+            .set(&into.experts, &merged.experts.slice_leading(0, graph.ports.blocks).map_err(device)?)
             .map_err(device)?;
         bindings.set(&into.inverse, &rows_of(&merged.inverse)?).map_err(device)?;
         for (port, entry) in [(&into.rows, rows), (&into.first, first)] {

@@ -2143,7 +2143,12 @@ pub(crate) fn build_model(
         .read_index::<CachedModelMetadata>(ModelIndexKind::InventoryMetadata, &metadata_evidence);
     let inspected = match cached_metadata {
         Some(inspection) => inspection,
-        None => match gguf::inspect_complete(primary) {
+        None => match primary
+            .metadata()
+            .map_err(gguf::GgufError::from)
+            .and_then(|metadata| local_gguf_of(cache, primary, &metadata, |_| {}))
+            .and_then(gguf::LocalGguf::complete)
+        {
             Ok(inspection) => {
                 let evidence = fingerprint(&inspection.fingerprint_material);
                 let name = inspection.name.clone().unwrap_or_else(|| {
@@ -2345,25 +2350,36 @@ pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::Gg
 }
 
 /// What one read of a local GGUF establishes, cached by its path, size and modification time, so
-/// an unchanged file is never read again. `read` receives the header bytes of a file that had to
-/// be read.
+/// an unchanged file is never read again (the inventory's scan, its models and the assessment's
+/// candidates all take it from here). `read` receives the read of a file that had to be read: its
+/// header bytes and their directory.
 pub(crate) fn local_gguf_cached(
     cache: &ModelCache,
     path: &Path,
-    read: impl FnOnce(&[u8]),
+    read: impl FnOnce(&gguf::LocalGgufRead),
 ) -> Result<gguf::LocalGguf, InventoryError> {
     let metadata = path.metadata().map_err(io_error)?;
+    local_gguf_of(cache, path, &metadata, read)
+        .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))
+}
+
+/// [`local_gguf_cached`] for a file with this `metadata`.
+fn local_gguf_of(
+    cache: &ModelCache,
+    path: &Path,
+    metadata: &fs::Metadata,
+    read: impl FnOnce(&gguf::LocalGgufRead),
+) -> Result<gguf::LocalGguf, gguf::GgufError> {
     let evidence = format!(
         "gguf-file-v9\0{}\0{}",
         gguf::RULES,
-        file_identity(path, &metadata)
+        file_identity(path, metadata)
     );
     if let Some(gguf) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Ok(gguf);
     }
-    let local = gguf::read_local(path)
-        .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
-    read(&local.header);
+    let local = gguf::read_local(path)?;
+    read(&local);
     cache.write_index(ModelIndexKind::GgufInspection, &evidence, &local.gguf);
     Ok(local.gguf)
 }
@@ -2373,8 +2389,8 @@ impl ManagedModelStore {
     /// A file that is read has its header kept in the content-addressed header cache, so its
     /// header is read from there afterwards.
     pub fn local_gguf(&self, path: &Path) -> Result<gguf::LocalGguf, InventoryError> {
-        local_gguf_cached(&self.cache, path, |header| {
-            self.write_header(header);
+        local_gguf_cached(&self.cache, path, |read| {
+            self.write_header(&read.header);
         })
     }
 
@@ -2385,9 +2401,9 @@ impl ManagedModelStore {
         path: &Path,
     ) -> Result<(gguf::LocalGguf, Vec<u8>), InventoryError> {
         let mut read = None;
-        let gguf = local_gguf_cached(&self.cache, path, |header| {
-            self.write_header(header);
-            read = Some(header.to_vec());
+        let gguf = local_gguf_cached(&self.cache, path, |local| {
+            self.write_header(&local.header);
+            read = Some(local.header.clone());
         })?;
         if let Some(header) = read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest))
         {

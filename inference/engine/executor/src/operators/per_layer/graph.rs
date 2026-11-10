@@ -10,16 +10,80 @@
 //! post-norm tail.
 
 use crate::native::{PerLayerEntryKernels, PerLayerKernels, TableConversion};
-use crate::operators::output::{CheckedPostNormEntries, PostNormEntries, PostNormShape, post_norm};
+use crate::operators::output::{CheckedPostNormEntries, PostNorm, PostNormEntries, PostNormShape, post_norm};
+use crate::programs::graph::facts::Numbers;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{PackedWeight, ScaledWeight};
-use crate::{PerLayerBinding, PerLayerEntryBinding, SublayerTail, WeightPlan};
+use crate::programs::native_target_graph::{PackedWeight, ScaledWeight, WeightView};
+use crate::{PerLayerBinding, PerLayerEntryBinding, SublayerTail};
 use magnitude_family_contracts::PerLayerEntry;
 use magnitude_kernels::{
     conditioning_overlay, import_dense, per_layer_gate, per_layer_inputs, project_rows,
     repack_weight,
 };
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+
+/// The numbers of the per-layer rows: the residual's width, the layers and
+/// each layer's width.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PerLayerNumbers<D = Dim> {
+    pub hidden: D,
+    pub layers: D,
+    pub width: D,
+}
+
+impl<D> Numbers<D> for PerLayerNumbers<D> {
+    type Of<E> = PerLayerNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> PerLayerNumbers<E> {
+        PerLayerNumbers { hidden: f(self.hidden), layers: f(self.layers), width: f(self.width) }
+    }
+}
+
+impl PerLayerNumbers<u64> {
+    /// The numbers of a per-layer input sublayer's `binding`.
+    pub(crate) fn of(binding: &PerLayerBinding) -> Self {
+        Self { hidden: binding.hidden, layers: binding.layers, width: binding.width }
+    }
+}
+
+/// What decides the per-layer entry graph beside its numbers and its
+/// weights: the reals its combine takes (its projection norm's epsilon and
+/// its scales), `R` (`RecurrentTopology`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PerLayerEntryTopology<R = Argument<f64>> {
+    pub epsilon: R,
+    pub gathered_scale: R,
+    pub projected_scale: R,
+    pub scale: R,
+}
+
+impl<R> Numbers<R> for PerLayerEntryTopology<R> {
+    type Of<E> = PerLayerEntryTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> PerLayerEntryTopology<E> {
+        PerLayerEntryTopology {
+            epsilon: f(self.epsilon),
+            gathered_scale: f(self.gathered_scale),
+            projected_scale: f(self.projected_scale),
+            scale: f(self.scale),
+        }
+    }
+}
+
+/// The topology and numbers of the per-layer entry of `binding` and
+/// `entry`.
+pub(crate) fn split_entry(
+    binding: &PerLayerEntryBinding,
+    entry: &PerLayerEntry,
+) -> (PerLayerEntryTopology<f64>, PerLayerNumbers<u64>) {
+    (
+        PerLayerEntryTopology {
+            epsilon: entry.projection_norm.epsilon,
+            gathered_scale: entry.table_scale,
+            projected_scale: entry.projection_scale,
+            scale: entry.combine_scale,
+        },
+        PerLayerNumbers { hidden: binding.hidden, layers: binding.layers, width: binding.width },
+    )
+}
 
 /// How the uploaded table rows become resident rows.
 pub(crate) enum TableEntry<'a, G: GraphDraft + 'a> {
@@ -58,6 +122,7 @@ impl<'a> From<&'a PerLayerEntryKernels> for PerLayerEntryEntries<'a, NativeGraph
 }
 
 /// Entry element assignments of the per-layer entry graph from its binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedPerLayerEntryEntries {
     round: [(&'static str, Element); 2],
     project: [(&'static str, Element); 3],
@@ -129,59 +194,65 @@ pub(crate) fn per_layer_entry_class_slice(
         .scoped("repack_weight", "N", rows)
 }
 
-/// The per-layer entry over `rows` batch rows.
+/// The per-layer entry over `rows` batch rows, its `projection` and `norm`
+/// weights' views.
 pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: PerLayerEntryEntries<'a, G>,
-    projection: &WeightPlan,
-    norm: &WeightPlan,
-    binding: PerLayerEntryBinding,
-    entry: &PerLayerEntry,
-    rows: u64,
+    topology: &PerLayerEntryTopology,
+    numbers: &PerLayerNumbers,
+    projection: &WeightView,
+    norm: &WeightView,
+    rows: &Dim,
 ) -> Result<PerLayerEntryPorts, GraphError> {
-    let channels = binding.layers * binding.width;
+    let PerLayerNumbers { hidden: width, layers, width: layer_width } = numbers;
+    let channels = layers * layer_width;
     // The projection's scale and packing bound where it has them; the
     // absent operand binds their ports where it has none.
-    let (scale_extent, bound_extent) = (projection.scale_extent(), projection.bound);
-    let mut operand = |extent: u64| {
-        (extent != 0)
-            .then(|| graph.port(Element::f32(), &[extent]))
+    let mut operand = |extent: &Option<Dim>| {
+        extent
+            .as_ref()
+            .map(|extent| graph.port(Element::f32(), std::slice::from_ref(extent)))
             .transpose()
     };
-    let projection_scale = operand(scale_extent)?;
-    let projection_bound = operand(bound_extent)?;
+    let projection_scale = operand(&projection.scale)?;
+    let projection_bound = operand(&projection.bound)?;
+    let none = || Dim::from(0);
+    let (scale_extent, bound_extent) =
+        (projection.scale.clone().unwrap_or_else(none), projection.bound.clone().unwrap_or_else(none));
     let projection = graph.port(projection.resident, &projection.shape)?;
     let norm = graph.port(norm.resident, &norm.shape)?;
     let absent = graph.port(Element::f32(), &[0])?;
-    let hidden = graph.port_with_class_extent(Element::f32(), &[rows, binding.hidden], 0, "M")?;
-    let table_dimensions = [("B", 1), ("N", rows), ("K", channels)];
+    let hidden = graph.port_with_class_extent(Element::f32(), &[rows.clone(), width.clone()], 0, "M")?;
+    let table_dimensions = [("B", Dim::from(1)), ("N", rows.clone()), ("K", channels.clone())];
     let gathered = match entries.table {
         TableEntry::Dense(kernel) => graph.input_for(kernel, "source", &table_dimensions)?,
         TableEntry::Repack(kernel) => graph.input_for(kernel, "source", &table_dimensions)?,
     };
     let mut destination =
-        graph.port_with_class_extent(Element::f32(), &[rows, channels], 0, "M")?;
+        graph.port_with_class_extent(Element::f32(), &[rows.clone(), channels.clone()], 0, "M")?;
     let rounded = graph
         .enqueue(
             entries.round,
-            &[("B", 1), ("N", rows), ("K", binding.hidden)],
+            &[("B", Dim::from(1)), ("N", rows.clone()), ("K", width.clone())],
             import_dense::WorkflowArgs {
-                source: (&hidden.tensor().reshape(&[1, rows, binding.hidden])).into(),
-            },        )?
+                source: (&hidden.tensor().reshape(&[Dim::from(1), rows.clone(), width.clone()])).into(),
+            },
+        )?
         .value;
     let projected = graph
         .enqueue(
             entries.project,
             &[
-                ("M", rows),
-                ("G", 1),
-                ("K", binding.hidden),
-                ("N", channels),
+                ("M", rows.clone()),
+                ("G", Dim::from(1)),
+                ("K", width.clone()),
+                ("N", channels.clone()),
                 ("WS", scale_extent),
                 ("WB", bound_extent),
             ],
             project_rows::WorkflowArgs {
-                source: (&rounded.reshape(&[rows, binding.hidden])).into(),
+                source: (&rounded.reshape(&[rows.clone(), width.clone()])).into(),
                 weight: projection.tensor().into(),
                 weight_scale: projection_scale.as_ref().unwrap_or(&absent).tensor().into(),
                 weight_bound: projection_bound.as_ref().unwrap_or(&absent).tensor().into(),
@@ -213,20 +284,21 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     let combined = graph
         .enqueue(
             entries.inputs,
-            &[("M", rows), ("L", binding.layers), ("P", binding.width)],
+            &[("M", rows.clone()), ("L", layers.clone()), ("P", layer_width.clone())],
             per_layer_inputs::WorkflowArgs {
-                gathered: (&table.reshape(&[rows, channels])).into(),
+                gathered: (&table.reshape(&[rows.clone(), channels.clone()])).into(),
                 projected: (&projected).into(),
                 norm: norm.tensor().into(),
-                epsilon: entry.projection_norm.epsilon as f32,
-                gathered_scale: entry.table_scale as f32,
-                projected_scale: entry.projection_scale as f32,
-                scale: entry.combine_scale as f32,
-            },        )?
+                epsilon: topology.epsilon.f32(),
+                gathered_scale: topology.gathered_scale.f32(),
+                projected_scale: topology.projected_scale.f32(),
+                scale: topology.scale.f32(),
+            },
+        )?
         .value;
     graph.enqueue(
         entries.copy,
-        &[("M", rows), ("D", channels)],
+        &[("M", rows.clone()), ("D", channels)],
         conditioning_overlay::WorkflowArgs {
             input: (&combined).into(),
             out: destination.tensor_mut().into(),
@@ -261,6 +333,7 @@ impl<'a> From<&'a PerLayerKernels> for PerLayerEntries<'a, NativeGraph> {
 }
 
 /// Entry element assignments of a per-layer input sublayer.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedPerLayerEntries {
     gate: [(&'static str, Element); 2],
     output: CheckedPostNormEntries,
@@ -303,27 +376,27 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
     residual: &WorkflowTensor,
     inputs: &WorkflowTensor,
     out_rows: &WorkflowTensor,
-    binding: PerLayerBinding,
-    layer: i32,
-    activation: i32,
-    rows: u64,
-    epsilon: f32,
-    scale: f32,
+    numbers: &PerLayerNumbers,
+    layer: Argument<i32>,
+    activation: Argument<i32>,
+    rows: &Dim,
+    tail: &PostNorm,
 ) -> Result<WorkflowTensor, GraphError> {
+    let PerLayerNumbers { hidden, layers, width } = numbers;
     let gated = graph
         .enqueue(
             entries.gate,
             &[
-                ("M", rows),
-                ("D", binding.hidden),
-                ("L", binding.layers),
-                ("P", binding.width),
-                ("GS", weights.gate.scale.extent),
+                ("M", rows.clone()),
+                ("D", hidden.clone()),
+                ("L", layers.clone()),
+                ("P", width.clone()),
+                ("GS", weights.gate.scale.extent.clone()),
             ],
             per_layer_gate::WorkflowArgs {
                 hidden: residual.into(),
                 gate_weight: (&weights.gate.weight).into(),
-                inputs: (&inputs.reshape(&[rows, binding.layers, binding.width])).into(),
+                inputs: (&inputs.reshape(&[rows.clone(), layers.clone(), width.clone()])).into(),
                 layer,
                 activation,
                 gate_scale: (&weights.gate.scale.tensor).into(),
@@ -338,12 +411,11 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
         &weights.post_norm,
         out_rows,
         PostNormShape {
-            rows,
-            out: rows,
-            inputs: binding.width,
-            outputs: binding.hidden,
+            rows: rows.clone(),
+            out: rows.clone(),
+            inputs: width.clone(),
+            outputs: hidden.clone(),
         },
-        epsilon,
-        scale,
+        tail,
     )
 }

@@ -34,6 +34,7 @@ pub(crate) fn engine_kernels() -> std::path::PathBuf {
 mod bundle_identity_tests;
 pub mod cpu;
 mod cuda;
+pub mod dimension;
 pub mod graph;
 mod graph_replays;
 // The order a submission's launches need: Metal encodes them concurrently

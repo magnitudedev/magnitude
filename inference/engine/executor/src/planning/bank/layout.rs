@@ -148,6 +148,81 @@ impl BankPart {
             _ => places,
         }
     }
+
+    /// Every part a streamed layer's bank of `rounds` convert rounds may
+    /// hold, of which [`ExpertBankPlan::held_parts`] keeps those a layer
+    /// holds.
+    pub(crate) fn every(rounds: u64) -> impl Iterator<Item = Self> {
+        // Exhaustive, so a part added to the bank is listed below.
+        let _listed = |part: Self| match part {
+            Self::Step
+            | Self::Resident
+            | Self::SlotMap
+            | Self::Map
+            | Self::TierMap
+            | Self::Tier { .. }
+            | Self::FileTable
+            | Self::ScratchTable
+            | Self::Rings
+            | Self::Routing
+            | Self::Policy
+            | Self::SiteTable
+            | Self::SiteRows
+            | Self::SiteOutput
+            | Self::Commits
+            | Self::Conveyor { .. }
+            | Self::Staging { .. }
+            | Self::LandingList
+            | Self::LandingGrids
+            | Self::Scratch { .. }
+            | Self::ScratchFlags
+            | Self::ConvertList { .. }
+            | Self::ConvertStaged
+            | Self::TierList
+            | Self::SeedList
+            | Self::TierGrid
+            | Self::TierStaged
+            | Self::SeedGrid
+            | Self::SeedStaged
+            | Self::ScratchGrids
+            | Self::GroupReads => (),
+        };
+        let records = RoutedTensor::ALL.into_iter().flat_map(|kind| {
+            [Self::Tier { kind }, Self::Conveyor { kind }, Self::Staging { kind }, Self::Scratch { kind }]
+        });
+        let rounds = (0..=u8::MAX).take_while(move |&round| u64::from(round) < rounds).map(|round| Self::ConvertList { round });
+        [
+            Self::Step,
+            Self::Resident,
+            Self::SlotMap,
+            Self::Map,
+            Self::TierMap,
+            Self::FileTable,
+            Self::ScratchTable,
+            Self::Rings,
+            Self::Routing,
+            Self::Policy,
+            Self::SiteTable,
+            Self::SiteRows,
+            Self::SiteOutput,
+            Self::Commits,
+            Self::LandingList,
+            Self::LandingGrids,
+            Self::ScratchFlags,
+            Self::ConvertStaged,
+            Self::TierList,
+            Self::SeedList,
+            Self::TierGrid,
+            Self::TierStaged,
+            Self::SeedGrid,
+            Self::SeedStaged,
+            Self::ScratchGrids,
+            Self::GroupReads,
+        ]
+        .into_iter()
+        .chain(records)
+        .chain(rounds)
+    }
 }
 
 /// One allocation of a bank (`ExpertBankPlan::layout`): how it is held, and
@@ -611,98 +686,106 @@ impl ExpertBankPlan {
         self.shape_of(layer, part, || self.binding(layer))
     }
 
+    /// Every part streamed layer `layer` holds ([`BankPart::every`]), with
+    /// its element and extents ([`Self::part_shape`]).
+    pub(crate) fn held_parts(&self, layer: usize) -> Result<Vec<(BankPart, Element, Vec<u64>)>, String> {
+        // A layer's binding is derived once for all its parts.
+        let binding = self.binding(layer)?;
+        let mut parts = Vec::new();
+        for part in BankPart::every(self.rounds()) {
+            if let Some((element, extents)) = self.held_shape(layer, part, || Ok(binding))? {
+                parts.push((part, element, extents));
+            }
+        }
+        Ok(parts)
+    }
+
     /// [`Self::part_shape`] with the layer's binding from `binding`, called
     /// only for the parts that read it: a placed part's shape is bound at
     /// every run of every step (`ExpertBank::placed`), and deriving the
     /// binding (its floor, which lays out the scratch) there costs
     /// milliseconds a step; [`Self::layout`], which reads it of every part,
-    /// derives it once a layer.
+    /// derives it once a layer. A part the layer does not hold is an error.
     fn shape_of(
         &self,
         layer: usize,
         part: BankPart,
         binding: impl Fn() -> Result<BankBinding, String>,
     ) -> Result<(Element, Vec<u64>), String> {
-        let words = |count: u64| Ok((Element::i32(), vec![count]));
+        self.held_shape(layer, part, binding)?
+            .ok_or_else(|| format!("bank part {part:?} is not held by streamed layer {layer}"))
+    }
+
+    /// [`Self::shape_of`], none of a part the layer does not hold: a host
+    /// tier's of a bank without one, a CPU site's of a layer without one,
+    /// a landing's where the device places, a convert list past its rounds,
+    /// a record part of a kind its record lacks.
+    fn held_shape(
+        &self,
+        layer: usize,
+        part: BankPart,
+        binding: impl Fn() -> Result<BankBinding, String>,
+    ) -> Result<Option<(Element, Vec<u64>)>, String> {
+        let words = |count: u64| Ok(Some((Element::i32(), vec![count])));
         match part {
             BankPart::Step => words(constants::STEP_WORDS),
-            BankPart::SlotMap => Ok((Element::i32(), vec![self.layers()[layer].experts, constants::MAP_WORDS])),
+            BankPart::SlotMap => Ok(Some((Element::i32(), vec![self.layers()[layer].experts, constants::MAP_WORDS]))),
             BankPart::GroupReads => words(self.layers()[layer].experts),
             // The load's flags of each place, which every layer's request
             // counts into in turn: the widest layer's.
             BankPart::ScratchFlags => words(self.widest().get()),
-            BankPart::FileTable => Ok((Element::i32(), binding()?.words.file().extents().to_vec())),
-            BankPart::ScratchTable => Ok((Element::i32(), binding()?.words.scratch().extents().to_vec())),
-            BankPart::Rings => Ok((Element::i32(), vec![self.ahead(layer), binding()?.words.ring_words()])),
+            BankPart::FileTable => Ok(Some((Element::i32(), binding()?.words.file().extents().to_vec()))),
+            BankPart::ScratchTable => Ok(Some((Element::i32(), binding()?.words.scratch().extents().to_vec()))),
+            BankPart::Rings => Ok(Some((Element::i32(), vec![self.ahead(layer), binding()?.words.ring_words()]))),
             BankPart::Routing => {
                 let words = binding()?.words;
-                Ok((Element::i32(), vec![words.flight, words.routing_words()]))
+                Ok(Some((Element::i32(), vec![words.flight, words.routing_words()])))
             }
-            BankPart::Map => Ok((Element::i32(), vec![self.group_experts(self.layers()[layer].group), constants::MAP_WORDS])),
-            BankPart::TierMap | BankPart::Tier { .. } if self.tier_reservation().is_none() => {
-                Err(format!("bank part {part:?} of a bank without a host tier"))
-            }
+            BankPart::Map => Ok(Some((Element::i32(), vec![self.group_experts(self.layers()[layer].group), constants::MAP_WORDS]))),
+            BankPart::TierMap | BankPart::Tier { .. } if self.tier_reservation().is_none() => Ok(None),
             BankPart::TierMap => words(self.layers()[layer].experts),
-            BankPart::SiteTable | BankPart::SiteRows | BankPart::SiteOutput if !self.sited(layer) =>
-            {
-                Err(format!("bank part {part:?} of a layer without a CPU site"))
-            }
-            BankPart::SiteTable => Ok((Element::i32(), binding()?.words.site().extents().to_vec())),
+            BankPart::SiteTable | BankPart::SiteRows | BankPart::SiteOutput if !self.sited(layer) => Ok(None),
+            BankPart::SiteTable => Ok(Some((Element::i32(), binding()?.words.site().extents().to_vec()))),
             // A slot's rows: every decode class's, so a slot's row m lies
             // where it does for every class (the experts' width H, of the
             // down matrix `[H, F]`); and its answer's, the weighted sum of
             // the CPU's choices of each row.
             BankPart::SiteRows | BankPart::SiteOutput => {
                 let binding = binding()?;
-                Ok((Element::f32(), vec![binding.words.site().slots(), constants::DECODE_ROWS, binding.record.down.matrix[0]]))
+                Ok(Some((Element::f32(), vec![binding.words.site().slots(), constants::DECODE_ROWS, binding.record.down.matrix[0]])))
             }
             BankPart::Tier { kind } => {
                 let record = binding()?.record;
-                let tensor = record
+                Ok(record
                     .get(kind)
-                    .ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                Ok((tensor.resident, vec![self.host_extent(self.layers()[layer].group), tensor.matrix[0], tensor.matrix[1]]))
+                    .map(|tensor| (tensor.resident, vec![self.host_extent(self.layers()[layer].group), tensor.matrix[0], tensor.matrix[1]])))
             }
             BankPart::Resident => words(1),
             BankPart::Policy => words(constants::POLICY_WORDS),
             BankPart::Commits => words(binding()?.records),
             BankPart::Conveyor { kind } => {
                 let binding = binding()?;
-                let tensor = binding
-                    .record
-                    .get(kind)
-                    .ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                Ok((tensor.source, vec![binding.conveyor, tensor.matrix[0], tensor.matrix[1]]))
+                Ok(binding.record.get(kind).map(|tensor| (tensor.source, vec![binding.conveyor, tensor.matrix[0], tensor.matrix[1]])))
             }
             BankPart::Scratch { kind } => {
                 let binding = binding()?;
-                let tensor = binding
-                    .record
-                    .get(kind)
-                    .ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                Ok((tensor.resident, vec![binding.experts, tensor.matrix[0], tensor.matrix[1]]))
+                Ok(binding.record.get(kind).map(|tensor| (tensor.resident, vec![binding.experts, tensor.matrix[0], tensor.matrix[1]])))
             }
-            BankPart::Staging { .. } | BankPart::LandingGrids if self.placer() != Placer::Bank => {
-                Err(format!("bank part {part:?} of a bank the device places"))
-            }
+            BankPart::Staging { .. } | BankPart::LandingGrids if self.placer() != Placer::Bank => Ok(None),
             BankPart::Staging { kind } => {
                 let binding = binding()?;
-                let tensor = binding
-                    .record
-                    .get(kind)
-                    .ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                Ok((tensor.source, vec![binding.staging, tensor.matrix[0], tensor.matrix[1]]))
+                Ok(binding.record.get(kind).map(|tensor| (tensor.source, vec![binding.staging, tensor.matrix[0], tensor.matrix[1]])))
             }
             BankPart::LandingList => words(list_extent(self.choices())),
-            BankPart::LandingGrids => Ok((Element::i32(), vec![1, constants::ROUND_GRIDS, 3])),
+            BankPart::LandingGrids => Ok(Some((Element::i32(), vec![1, constants::ROUND_GRIDS, 3]))),
             BankPart::ConvertList { round } if u64::from(round) < self.rounds() => {
                 words(self.list_words())
             }
-            BankPart::ConvertList { .. } => Err(format!("bank part {part:?} names no convert round")),
+            BankPart::ConvertList { .. } => Ok(None),
             BankPart::ConvertStaged => words(self.list_words()),
             BankPart::TierList | BankPart::SeedList | BankPart::TierStaged | BankPart::SeedStaged => words(self.expert_list_words()),
             BankPart::TierGrid | BankPart::SeedGrid => words(3),
-            BankPart::ScratchGrids => Ok((Element::i32(), vec![self.rounds(), constants::ROUND_GRIDS, 3])),
+            BankPart::ScratchGrids => Ok(Some((Element::i32(), vec![self.rounds(), constants::ROUND_GRIDS, 3]))),
         }
     }
 

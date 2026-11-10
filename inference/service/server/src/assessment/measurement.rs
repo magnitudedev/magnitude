@@ -268,10 +268,12 @@ async fn read_stored<M: MeasuredMachine>(machine: &Arc<M>) -> M::Stored {
 }
 
 /// Run jobs, each for its [`JobTime`] at most, while a point request is outstanding: assessment's
-/// standing request for the executor's cost points, whatever the models assessed, and what loads request
-/// (`PointRequests`), which the job measures first. Assessment has its costs, and the state is `Measured`,
-/// once the probe and the figures nothing else prices are stored; the jobs after that refine the
-/// figures it prices meanwhile. Each
+/// standing requests, whatever the models assessed, and what loads request (`PointRequests`). A job
+/// measures assessment's standing points first, within `MEASUREMENT_SECONDS` of its start whatever
+/// its time, pricing those the budget cannot hold except the required figures, which nothing prices
+/// and the next job resumes; assessment has its costs, and the state is `Measured`, once the probe
+/// and the figures nothing else prices are stored, and the jobs after that measure only what loads
+/// request. Each
 /// job runs with the device to itself or beside an idle resident model, once that model's worker
 /// made its room, deferring while a model in use or loading shares it or a catalog optimization
 /// holds it ([`DeviceLock::measurement`]) and while `settled` does not hold, preempted when

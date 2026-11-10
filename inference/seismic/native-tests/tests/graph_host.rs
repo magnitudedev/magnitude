@@ -45,7 +45,7 @@ fn sealed_and_planned_heap(device: &Device, nodes: usize) -> (HostHeap, HostHeap
                 &scale,
                 scale_rows::WorkflowArgs {
                     x: (&value).into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -75,7 +75,7 @@ fn sealed_and_planned_heap(device: &Device, nodes: usize) -> (HostHeap, HostHeap
                 &[("M", m), ("N", n)],
                 scale_rows::WorkflowArgs {
                     x: (&value).into(),
-                    factor: 2.0,
+                    factor: seismic::Argument::from(2.0),
                 },
             )
             .unwrap()
@@ -144,7 +144,7 @@ fn host_time_per_run_of_a_300_node_graph() {
                 &kernel,
                 scale_rows::WorkflowArgs {
                     x: input.tensor().into(),
-                    factor: 1.0,
+                    factor: seismic::Argument::from(1.0),
                 },
             )
             .unwrap()
@@ -155,7 +155,7 @@ fn host_time_per_run_of_a_300_node_graph() {
                     &kernel,
                     scale_rows::WorkflowArgs {
                         x: (&value).into(),
-                        factor: 1.0,
+                        factor: seismic::Argument::from(1.0),
                     },
                 )
                 .unwrap()
@@ -222,7 +222,7 @@ fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[1, 8]).unwrap();
         let value = graph.enqueue(&kernel, scale_rows::WorkflowArgs {
-            x: input.tensor().into(), factor: 2.0,
+            x: input.tensor().into(), factor: seismic::Argument::from(2.0),
         }).unwrap().value;
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();

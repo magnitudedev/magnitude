@@ -26,13 +26,15 @@ pub(crate) mod split;
 pub(crate) mod streamed;
 
 use crate::error::PlanError;
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
 use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
     ActivationFunction, Decoder, ExpertSelection, FeedForwardUp, GluLimit, Operator,
     RouteNormalization, RoutedFfn, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
     WeightKind,
 };
-use seismic::Element;
+use seismic::{Dim, Element};
 
 use super::dense_ffn::activation_code;
 
@@ -54,6 +56,26 @@ impl Expansion {
             limit: up.limit(),
         }
     }
+
+    /// What its graph branches on: its form and clamp (the clamp sets its
+    /// entries' `LB` static).
+    pub(crate) fn form(self) -> ExpansionForm {
+        ExpansionForm { gated: self.gated, limit: self.limit }
+    }
+
+    /// Its activation code as a number, which reaches only its entries'
+    /// `activation` argument.
+    pub(crate) fn activation_number(self) -> u64 {
+        crate::operators::code(self.activation)
+    }
+}
+
+/// An [`Expansion`]'s structure: gated or up-only, and its clamp. Its
+/// activation code is a number of its graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ExpansionForm {
+    pub gated: bool,
+    pub limit: Option<GluLimit>,
 }
 
 /// Every static axis and numerical parameter of a general routed operator
@@ -124,35 +146,168 @@ impl GeneralRoutedShape {
         })
     }
 
+    /// The operator's numbers as constant dimensions.
+    fn numbers(&self) -> GeneralRoutedNumbers {
+        crate::programs::graph::facts::constant(self.split().1)
+    }
+
+    /// The operator's topology and its numbers: every static axis apart
+    /// from its form.
+    pub(crate) fn split(&self) -> (GeneralRoutedForm<f64>, GeneralRoutedNumbers<u64>) {
+        (
+            GeneralRoutedForm {
+                latent: self.latent,
+                experts_expansion: self.experts_expansion.form(),
+                shared: self.shared.map(|(_, expansion)| expansion.form()),
+                normalization_epsilon: f64::from(f32::from_bits(self.normalization_epsilon)),
+                scale: f64::from(f32::from_bits(self.scale)),
+                bias: self.bias,
+                expert_scale: self.expert_scale,
+                router_norm: self.router_norm,
+            },
+            GeneralRoutedNumbers {
+                hidden: self.hidden,
+                experts: self.experts,
+                selected: self.selected,
+                intermediate: self.intermediate,
+                expert_hidden: self.expert_hidden,
+                activation: self.experts_expansion.activation_number(),
+                score: crate::operators::code(self.score),
+                normalization: crate::operators::code(self.normalization),
+                shared: self.shared.map(|(features, expansion)| SharedExpertNumbers {
+                    features,
+                    activation: expansion.activation_number(),
+                }),
+            },
+        )
+    }
+
+    /// [`GeneralRoutedNumbers::expert_scale_extent`] of the operator.
+    pub fn expert_scale_extent(&self, down: u64) -> u64 {
+        let (form, numbers) = (self.split().0, self.numbers());
+        numbers.expert_scale_extent(&form, Dim::from(down)).fixed()
+    }
+
+    /// [`GeneralRoutedNumbers::select_dimensions`] of the operator.
+    pub fn select_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+        self.numbers().select_dimensions(&Dim::from(rows)).map(|(name, dim)| (name, dim.fixed()))
+    }
+
+    /// [`GeneralRoutedNumbers::expert_dimensions`] of the operator.
+    pub fn expert_dimensions(&self, rows: u64) -> [(&'static str, u64); 5] {
+        self.numbers().expert_dimensions(&Dim::from(rows)).map(|(name, dim)| (name, dim.fixed()))
+    }
+}
+
+/// What decides a general routed operator's graph beside its numbers
+/// ([`GeneralRoutedNumbers`]): every form of its [`GeneralRoutedShape`].
+/// Its reals `R`: the model's (`f64`), a key's (`RealIndex`), or its
+/// builder's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GeneralRoutedForm<R = Argument<f64>> {
+    pub latent: bool,
+    pub experts_expansion: ExpansionForm,
+    /// The shared expert's expansion, where it has one.
+    pub shared: Option<ExpansionForm>,
+    pub normalization_epsilon: R,
+    pub scale: R,
+    pub bias: bool,
+    pub expert_scale: bool,
+    pub router_norm: bool,
+}
+
+impl<R> Numbers<R> for GeneralRoutedForm<R> {
+    type Of<E> = GeneralRoutedForm<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> GeneralRoutedForm<E> {
+        GeneralRoutedForm {
+            latent: self.latent,
+            experts_expansion: self.experts_expansion,
+            shared: self.shared,
+            normalization_epsilon: f(self.normalization_epsilon),
+            scale: f(self.scale),
+            bias: self.bias,
+            expert_scale: self.expert_scale,
+            router_norm: self.router_norm,
+        }
+    }
+}
+
+/// The numbers of a general routed operator ([`GeneralRoutedShape`]): its
+/// residual's width, experts, selected experts, expert features, the width
+/// its experts act in, the codes its entries take as arguments (the
+/// experts' activation, `routed_select`'s `score` and `normalization`), and
+/// its shared expert's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GeneralRoutedNumbers<D = Dim> {
+    pub hidden: D,
+    pub experts: D,
+    pub selected: D,
+    pub intermediate: D,
+    pub expert_hidden: D,
+    pub activation: D,
+    pub score: D,
+    pub normalization: D,
+    pub shared: Option<SharedExpertNumbers<D>>,
+}
+
+/// A shared expert's features and activation code.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedExpertNumbers<D = Dim> {
+    pub features: D,
+    pub activation: D,
+}
+
+/// A form's code as a number of its graph.
+impl<D> Numbers<D> for GeneralRoutedNumbers<D> {
+    type Of<E> = GeneralRoutedNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> GeneralRoutedNumbers<E> {
+        GeneralRoutedNumbers {
+            hidden: f(self.hidden),
+            experts: f(self.experts),
+            selected: f(self.selected),
+            intermediate: f(self.intermediate),
+            expert_hidden: f(self.expert_hidden),
+            activation: f(self.activation),
+            score: f(self.score),
+            normalization: f(self.normalization),
+            shared: self.shared.map(|shared| SharedExpertNumbers {
+                features: f(shared.features),
+                activation: f(shared.activation),
+            }),
+        }
+    }
+}
+
+impl GeneralRoutedNumbers {
     /// The extent of the combine's per-expert scale port (`routed_select`'s
     /// ES) given the down weight's per-expert scale extent `down`: the stored
     /// output scales' (E) where the operator has them, else `down` (plan
     /// admission refuses both at once).
-    pub fn expert_scale_extent(&self, down: u64) -> u64 {
-        match self.expert_scale {
-            true => self.experts,
+    pub fn expert_scale_extent<R>(&self, form: &GeneralRoutedForm<R>, down: Dim) -> Dim {
+        match form.expert_scale {
+            true => self.experts.clone(),
             false => down,
         }
     }
 
     /// `routed_select`'s dimensions.
-    pub fn select_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+    pub fn select_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 4] {
         [
-            ("M", rows),
-            ("H", self.hidden),
-            ("E", self.experts),
-            ("K", self.selected),
+            ("M", rows.clone()),
+            ("H", self.hidden.clone()),
+            ("E", self.experts.clone()),
+            ("K", self.selected.clone()),
         ]
     }
 
     /// The decode expert entries' dimensions, in the experts' width.
-    pub fn expert_dimensions(&self, rows: u64) -> [(&'static str, u64); 5] {
+    pub fn expert_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 5] {
         [
-            ("M", rows),
-            ("H", self.expert_hidden),
-            ("E", self.experts),
-            ("K", self.selected),
-            ("F", self.intermediate),
+            ("M", rows.clone()),
+            ("H", self.expert_hidden.clone()),
+            ("E", self.experts.clone()),
+            ("K", self.selected.clone()),
+            ("F", self.intermediate.clone()),
         ]
     }
 }

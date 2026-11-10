@@ -232,19 +232,28 @@ pub fn classify_header(
     architectures: &RecognizedArchitectures,
 ) -> Result<HeaderClassification, InventoryError> {
     let (directory, inspection) = header_inspection(header)?;
+    Ok(classify(&directory, &inspection, architectures))
+}
+
+/// Classify the GGUF header with this directory and inspection.
+pub(crate) fn classify(
+    directory: &Directory,
+    inspection: &crate::gguf::GgufInspection,
+    architectures: &RecognizedArchitectures,
+) -> HeaderClassification {
     let architecture = directory
         .value("general.architecture")
         .and_then(Value::string);
-    Ok(HeaderClassification {
+    HeaderClassification {
         embedded_mtp: matches!(
-            crate::gguf::GgufTensors::of(&directory, architecture),
+            crate::gguf::GgufTensors::of(directory, architecture),
             crate::gguf::GgufTensors::Model { embedded_mtp: true }
         ),
-        role: CandidateFileRole::of(&directory, architectures),
-        base_repositories: header_base_repositories(&directory),
-        quantization: inspection.quantization,
-        declared_bytes: crate::gguf::declared_length(&directory),
-    })
+        role: CandidateFileRole::of(directory, architectures),
+        base_repositories: header_base_repositories(directory),
+        quantization: inspection.quantization.clone(),
+        declared_bytes: crate::gguf::declared_length(directory),
+    }
 }
 
 /// The header directory of a GGUF on disk (every shard's, for a split file's first shard).

@@ -439,10 +439,11 @@ impl Ceilings {
     }
 }
 
-/// Measure `requests` on `device` in this process, as the measurement job
-/// measures them (`assessment::requests::measure`), each walk given its job
-/// time (`worker::measure::JobTime`), into `store`, until no point is left
-/// expired: the harness is a tool, which may measure in its own process.
+/// Measure `requests` (a load's) on `device` in this process, as the
+/// measurement job measures them (`assessment::requests::measure`), each
+/// walk given its job time (`worker::measure::JobTime`), into `store`,
+/// until no point is left expired: the harness is a tool, which may
+/// measure in its own process.
 /// Why the walks could not run, or stopped before measuring the rest.
 fn measure_requested(
     device: &seismic::Device,
@@ -455,13 +456,13 @@ fn measure_requested(
     let mut time = JobTime::default();
     loop {
         let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-        let deadline = std::time::Instant::now() + time.given();
+        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), time.given());
         let (mut measured, mut failed, mut expired) = (false, false, false);
         let walked = requests::measure(
             &mut measurer,
             device,
             store,
-            requests,
+            &magnitude_executor::assessment::Outstanding { standing: Vec::new(), loads: requests.to_vec() },
             deadline,
             &mut |_| seismic::measure::Attempt::Proceed,
             &mut |_, outcome| match outcome {
@@ -2116,7 +2117,7 @@ fn estimated(
         measurements,
         prepared,
     } = assessment;
-    let PreparedModelAssessment::Planned { facts, draft, execution, .. } = prepared else {
+    let PreparedModelAssessment::Planned { facts, execution, .. } = prepared else {
         return Err(unavailable("the model is unsupported here"));
     };
     let Measurements::Measured { costs: machine, streamed, .. } = measurements else {
@@ -2141,11 +2142,11 @@ fn estimated(
     let host = window_host_slots(cell)?;
     // The bank the plan streams its experts through, whose slots are priced
     // at each count: none where the plan holds them whole.
-    let bank = draft.load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
+    let bank = execution.draft().load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
         let held = magnitude_executor::assessment::HeldSlots { slots, host };
-        let performance = streamed_estimate(machine, figures, execution, draft, bank, &request, held)
+        let performance = streamed_estimate(machine, figures, execution, bank, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {
             return Err(unavailable(format!("at {slots} slots: {performance:?}")));
@@ -2164,7 +2165,7 @@ fn estimated(
             .ok_or("the window's mean step")?;
     // The resident step as the estimate prices it: at the request's rows and
     // the context.
-    let pricing = decode_pricing(draft, machine);
+    let pricing = decode_pricing(execution.draft(), machine);
     let resident = step_seconds(execution.demand(), &pricing, u64::from(request.sequences), context)
         .map_err(|error| error.to_string())?
         .total();

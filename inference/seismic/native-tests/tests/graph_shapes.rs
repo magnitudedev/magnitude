@@ -43,12 +43,12 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
         let input = graph.port(Element::f32(), &[m, n]).unwrap();
         let landing = graph.port(Element::f32(), &[m, n]).unwrap();
         let scaled = graph
-            .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 2.0 })
+            .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(2.0) })
             .unwrap()
             .value;
         graph.store(&scaled, &landing).unwrap();
         let after = graph
-            .enqueue(&kernel, scale_rows::WorkflowArgs { x: landing.tensor().into(), factor: 3.0 })
+            .enqueue(&kernel, scale_rows::WorkflowArgs { x: landing.tensor().into(), factor: seismic::Argument::from(3.0) })
             .unwrap()
             .value;
         graph.export(&after).unwrap();
@@ -159,9 +159,9 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let mut graph = device.native_graph();
         let busy_input = graph.port(Element::f32(), &[busy_rows, n]).unwrap();
-        let mut value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: busy_input.tensor().into(), factor: 1.0 }).unwrap().value;
+        let mut value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: busy_input.tensor().into(), factor: seismic::Argument::from(1.0) }).unwrap().value;
         for _ in 1..BUSY_NODES {
-            value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: 1.0 }).unwrap().value;
+            value = graph.enqueue(&kernel, scale_rows::WorkflowArgs { x: (&value).into(), factor: seismic::Argument::from(1.0) }).unwrap().value;
         }
         graph.export(&value).unwrap();
         let busy = graph.seal().unwrap();
@@ -191,7 +191,7 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
             let source = graph.port(Element::f32(), &[rows, n]).unwrap();
             let destination = graph.port(Element::f32(), &[rows, n]).unwrap();
             let scaled = graph
-                .enqueue(&kernel, scale_rows::WorkflowArgs { x: source.tensor().into(), factor: 2.0 })
+                .enqueue(&kernel, scale_rows::WorkflowArgs { x: source.tensor().into(), factor: seismic::Argument::from(2.0) })
                 .unwrap()
                 .value;
             graph.store(&scaled, &destination).unwrap();
@@ -231,7 +231,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
         let input = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
         let landing = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
         let scaled = template
-            .enqueue::<scale_rows::Entry>(&[], &[("M", 4), ("N", n)], scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 2.0 })
+            .enqueue::<scale_rows::Entry>(&[], &[("M", 4), ("N", n)], scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(2.0) })
             .unwrap()
             .value;
         template.store(&scaled, &landing).unwrap();
@@ -249,7 +249,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
                 let input = graph.port(Element::f32(), &[m, n]).unwrap();
                 let landing = graph.port(Element::f32(), &[m, n]).unwrap();
                 let scaled = graph
-                    .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 2.0 })
+                    .enqueue(&kernel, scale_rows::WorkflowArgs { x: input.tensor().into(), factor: seismic::Argument::from(2.0) })
                     .unwrap()
                     .value;
                 graph.store(&scaled, &landing).unwrap();

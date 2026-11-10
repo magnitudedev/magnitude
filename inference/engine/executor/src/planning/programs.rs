@@ -37,12 +37,15 @@ pub enum ImportProgramSlot {
 impl ImportProgramSlot {
     /// The import that makes `weight` resident from its upload.
     pub fn of(weight: &WeightPlan) -> Self {
-        match (weight.upload.dtype(), weight.resident.dtype()) {
-            (Some(source), Some(resident)) => Self::Dense { source, resident },
-            _ => Self::Repack {
-                source: weight.upload,
-                resident: weight.resident,
-            },
+        Self::between(weight.upload, weight.resident)
+    }
+
+    /// The import that makes a weight resident as `resident` from its
+    /// upload as `upload`.
+    pub fn between(upload: Element, resident: Element) -> Self {
+        match (upload.dtype(), resident.dtype()) {
+            (Some(source), Some(resident_dtype)) => Self::Dense { source, resident: resident_dtype },
+            _ => Self::Repack { source: upload, resident },
         }
     }
 }

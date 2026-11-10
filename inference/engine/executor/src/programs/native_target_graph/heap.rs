@@ -1,13 +1,13 @@
 use super::{
-    block::{BlockGraphs, PreparedTargetBlockGraph},
+    block::{BlockGraphs, PassGraph, PreparedTargetBlockGraph},
     bound::BlockBindings,
     certify::CertifiedBlockGraph,
     classes::StagedClass,
     weights::{BankPort, GraphTimeline, WeightPort},
 };
 use crate::{
-    operators::routed::split::{OnceStage, PassPorts, SplitPorts, Stage},
-    programs::native_constants::GraphConstant,
+    operators::routed::split::{OnceStage, SplitPorts, Stage},
+    programs::{graph::draft::Certified, native_constants::GraphConstant},
 };
 use seismic::{
     BoundNativeGraphPlan, HostHeap, NativeGraphLayout, NativeGraphPlan, NativePort,
@@ -133,7 +133,7 @@ pub(super) fn block_graph_storage(classes: &[GraphCounts], sealed: GraphCounts) 
             ))?
             .plus(HostHeap::allocation(
                 counts.passes,
-                size_of::<(u64, Arc<PreparedTargetBlockGraph<PassPorts>>)>(),
+                size_of::<(u64, Arc<PreparedTargetBlockGraph<PassGraph>>)>(),
             ))?
             .plus(HostHeap::allocation(
                 counts.untapped,
@@ -141,7 +141,7 @@ pub(super) fn block_graph_storage(classes: &[GraphCounts], sealed: GraphCounts) 
             ))
         })
         .and_then(|heap| heap.plus(shared(sealed.runs, shared_block_graph_bytes::<Option<SplitPorts>>())?))
-        .and_then(|heap| heap.plus(shared(sealed.passes, shared_block_graph_bytes::<PassPorts>())?))
+        .and_then(|heap| heap.plus(shared(sealed.passes, shared_block_graph_bytes::<PassGraph>())?))
         .ok_or_else(|| "prepared block graph storage overflows".to_owned())
 }
 
@@ -171,7 +171,7 @@ pub(super) struct PlannedHeap {
 }
 
 impl PlannedHeap {
-    pub(super) fn seal(&mut self, layout: &NativeGraphLayout) -> Result<(), String> {
+    pub(super) fn seal(&mut self, layout: &impl Certified) -> Result<(), String> {
         self.graphs += 1;
         self.plans = self
             .plans
@@ -180,7 +180,7 @@ impl PlannedHeap {
         Ok(())
     }
 
-    pub(super) fn seal_block(&mut self, certified: &CertifiedBlockGraph) -> Result<(), String> {
+    pub(super) fn seal_block<L: Certified>(&mut self, certified: &CertifiedBlockGraph<L>) -> Result<(), String> {
         self.seal(&certified.layout)?;
         self.owned = self
             .owned

@@ -1,5 +1,5 @@
 use super::{
-    block::PreparedTargetBlockGraph,
+    block::{PassGraph, PreparedTargetBlockGraph},
     classes::{Passes, StagedClass, block_class, once_class},
     entry::{EntryTokens, PreparedPerLayerEntryGraph, PreparedTargetEntryGraph},
     heap::{GraphCounts, block_binding_storage},
@@ -10,7 +10,7 @@ use crate::{
     AllocationError, ResidentTarget,
     device_table::ResidentTable,
     operators::routed::split::{
-        Extents, Merged, OnceStage, PassPorts, RunStage, SplitValues, Stage,
+        Extents, Merged, OnceStage, RunStage, SplitValues, Stage,
     },
     programs::native_constants::ConstantTensors,
     stored_table::{SelectionNotice, StoredTable},
@@ -112,15 +112,15 @@ impl BankRun {
 
     /// Register the parks and publications of `graph`'s run as block
     /// `index` of this step that took a value when it was queued
-    /// (`outputs`, its outputs), each at block `index`'s streamed layer,
-    /// whichever block the graph was prepared for.
+    /// (`outputs`, its outputs), each at block `index`'s streamed layer
+    /// (`block_scope`).
     pub(crate) fn register_parks<P>(
         &self,
         graph: &PreparedTargetBlockGraph<P>,
         index: usize,
         outputs: &seismic::NativeGraphOutputs,
     ) -> Result<(), String> {
-        let layer = |scope: WeightScope| self.bank.streamed_layer(block_scope(scope, graph.block, index)?);
+        let layer = |scope: WeightScope| self.bank.streamed_layer(block_scope(scope, index)?);
         for &(node, port) in &graph.parks {
             let Some(value) = outputs.park(port) else {
                 continue;
@@ -160,7 +160,7 @@ pub(crate) fn placed_banks<'g, P>(
         .iter()
         .filter(|(bank, _)| bank.part.placed())
         .map(|(port, native)| {
-            let scope = block_scope(port.scope, graph.block, index)?;
+            let scope = block_scope(port.scope, index)?;
             Ok((native, bank.placed(scope, port.part, place)?))
         })
         .collect()
@@ -374,17 +374,17 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
             .weights
             .iter()
             .map(|(weight, port)| {
-                // A graph shared by equal-shape blocks names the roles of
-                // the block it was prepared for; each block binds its own.
+                // A graph shared by equal-shape blocks names its roles
+                // relative to its block; each block binds its own.
                 let role = WeightRole {
-                    scope: block_scope(weight.role.scope, graph.block, index)?,
+                    scope: block_scope(weight.role.scope, index)?,
                     kind: weight.role.kind,
                 };
                 Ok((port, resident.bound(role, weight.part)?))
             })
             // A placed bank part is a run's own place's.
             .chain(graph.banks.iter().filter(|(bank, _)| !bank.part.placed()).map(|(bank, port)| {
-                let scope = block_scope(bank.scope, graph.block, index)?;
+                let scope = block_scope(bank.scope, index)?;
                 Ok((port, resident.bank_part(BankPort { scope, ..*bank })?))
             }))
             .chain(constant_tensors.iter().map(|(port, tensor)| Ok((*port, tensor))))
@@ -573,7 +573,7 @@ impl BoundTargetGraphs {
         &self,
         index: usize,
         launches: usize,
-    ) -> Result<(&PreparedTargetBlockGraph<PassPorts>, &BoundNativeGraphPlan, u64), String> {
+    ) -> Result<(&PreparedTargetBlockGraph<PassGraph>, &BoundNativeGraphPlan, u64), String> {
         let rows = self.prepared.passes.of_chain(launches);
         let (graph, bound) = sealed_and_bound(
             &self.prepared.blocks_by_class[index].passes,

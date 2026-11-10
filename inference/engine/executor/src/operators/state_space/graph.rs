@@ -6,23 +6,25 @@
 //! ports.
 
 use crate::operators::gated_delta::graph::{
-    RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
+    RecurrentControlPorts, RecurrentStatePorts, chunked, slab_banks,
 };
-use crate::operators::{InputForm, Join};
+use crate::operators::{InputForm, Join, RecurrentBank, split_bank};
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
 use crate::programs::graph::{
     GraphError,
     draft::{ControlSource, GraphDraft},
 };
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, scaled_weight, weight};
-use crate::{
-    ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels,
+use crate::programs::native_target_graph::{
+    PackingBound, PlannedWeights, WeightPort, scaled_weight, weight,
 };
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use crate::{StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels};
+use magnitude_family_contracts::{StateSpace, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 pub(crate) struct StateSpaceGraphEntries<'a, G: GraphDraft + 'a> {
     pub project: G::Binding<'a, attention_project::Entry>,
@@ -46,6 +48,7 @@ impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph>
 
 /// Entry element assignments from the program binding. The projection's
 /// empty segments are views of the projection weight.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedStateSpaceEntries {
     project: [(&'static str, Element); 7],
     activation: [(&'static str, Element); 1],
@@ -80,38 +83,98 @@ impl CheckedStateSpaceEntries {
     }
 }
 
-/// One state-space block at one graph class.
-pub(crate) struct StateSpaceBlock {
-    pub rows: u64,
-    pub slots: u64,
-    pub slab_banks: u32,
-    pub shape: StateSpaceShape,
+/// What decides a state-space block's graph beside its entries: no model
+/// number. Its reals `R` (`RecurrentTopology`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StateSpaceTopology<R = Argument<f64>> {
     /// The input norm's epsilon.
-    pub epsilon: f32,
+    pub epsilon: R,
     /// The output group norm's epsilon.
-    pub norm_epsilon: f32,
-    /// Index of this layer's window component in the store's recurrent
-    /// components; its state and tape components follow it.
-    pub component_index: usize,
+    pub norm_epsilon: R,
+    /// The elements of the layer's window, state and tape components.
+    pub bank: [Element; 3],
     /// How the graph takes its launch's slot tables.
     pub controls: ControlSource,
+}
+
+impl<R> Numbers<R> for StateSpaceTopology<R> {
+    type Of<E> = StateSpaceTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> StateSpaceTopology<E> {
+        StateSpaceTopology {
+            epsilon: f(self.epsilon),
+            norm_epsilon: f(self.norm_epsilon),
+            bank: self.bank,
+            controls: self.controls,
+        }
+    }
+}
+
+/// The numbers of one state-space block at one graph class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StateSpaceBlock<D = Dim> {
+    pub rows: D,
+    pub slots: D,
+    pub shape: StateSpaceShape<D>,
+    pub bank: RecurrentBank<D, 3>,
+}
+
+impl<D> Numbers<D> for StateSpaceBlock<D> {
+    type Of<E> = StateSpaceBlock<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> StateSpaceBlock<E> {
+        StateSpaceBlock {
+            rows: f(self.rows),
+            slots: f(self.slots),
+            shape: self.shape.map(f),
+            bank: self.bank.map(f),
+        }
+    }
+}
+
+/// The topology and numbers of the state-space block of `space` over a
+/// `hidden`-wide residual at a class of `rows` rows and `slots` slots, its
+/// bank `state`'s components from `component_index` on.
+pub(crate) fn split(
+    space: &StateSpace,
+    hidden: u64,
+    rows: u64,
+    slots: u64,
+    epsilon: f32,
+    state: &StateResourcePlan,
+    component_index: usize,
+    controls: ControlSource,
+) -> Result<(StateSpaceTopology<f64>, StateSpaceBlock<u64>), GraphError> {
+    let (elements, bank) = split_bank(state, component_index)?;
+    Ok((
+        StateSpaceTopology {
+            epsilon: f64::from(epsilon),
+            norm_epsilon: space.norm.epsilon,
+            bank: elements,
+            controls,
+        },
+        StateSpaceBlock {
+            rows,
+            slots,
+            shape: StateSpaceShape::of(hidden, space).map_err(|error| error.to_string())?,
+            bank,
+        },
+    ))
 }
 
 pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: StateSpaceGraphEntries<'a, G>,
-    state: &StateResourcePlan,
-    load: &ModelLoadPlan,
+    topology: &StateSpaceTopology,
+    block: &StateSpaceBlock,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    weights: &mut Vec<(WeightPort, NativePort)>,
+    ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     join: &Join,
-    block: StateSpaceBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
-    let shape = block.shape;
+    let shape = &block.shape;
     let mut bound = |graph: &mut G, kind| {
-        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
+        PackingBound::planned(graph, weights, WeightRole { scope, kind }, ports, constants)
     };
     let projection_bound = bound(graph, WeightKind::StateSpaceProjection)?;
     let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
@@ -119,10 +182,10 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     // and scales.
     let absent = PackingBound::absent(graph, constants)?;
     let projection_weight =
-        scaled_weight(graph, load, scope, WeightKind::StateSpaceProjection, weights, constants)?;
+        scaled_weight(graph, weights, scope, WeightKind::StateSpaceProjection, ports, constants)?;
     let output_weight =
-        scaled_weight(graph, load, scope, WeightKind::RecurrentOutput, weights, constants)?;
-    let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
+        scaled_weight(graph, weights, scope, WeightKind::RecurrentOutput, ports, constants)?;
+    let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
     let convolution_bias = weight(graph, WeightKind::RecurrentConvolutionBias)?;
@@ -131,26 +194,28 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let skip = weight(graph, WeightKind::StateSpaceSkip)?;
     let state_norm = weight(graph, WeightKind::StateSpaceNorm)?;
 
-    let (mut ports, banks, tape_rows) = bank_ports(graph, state, block.component_index)?;
+    let (mut bank, tape_rows) = RecurrentStatePorts::of(graph, &topology.bank, &block.bank)?;
+    let slab_banks = slab_banks(&block.bank)?;
     // The projection has only its query segment: the others read zero rows
     // of the projection weight.
     let empty = projection_weight.weight.slice_leading(0, 0);
+    let none = || Dim::from(0u64);
     let projection = graph
         .enqueue(
             kernels.project,
             &[
-                shape.project_dimensions(block.rows).as_slice(),
+                shape.project_dimensions(&block.rows).as_slice(),
                 &[
-                    ("QS", projection_weight.scale.extent),
-                    ("GS", 0),
-                    ("KS", 0),
-                    ("VS", 0),
-                    ("QB", projection_bound.extent),
-                    ("GB", 0),
-                    ("KB", 0),
-                    ("VB", 0),
+                    ("QS", projection_weight.scale.extent.clone()),
+                    ("GS", none()),
+                    ("KS", none()),
+                    ("VS", none()),
+                    ("QB", projection_bound.extent.clone()),
+                    ("GB", none()),
+                    ("KB", none()),
+                    ("VB", none()),
                 ],
-                &InputForm::SINGLE.dimensions(shape.hidden),
+                &InputForm::SINGLE.dimensions(shape.hidden.clone()),
             ]
             .concat(),
             attention_project::WorkflowArgs {
@@ -160,8 +225,8 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 gate_weight: (&empty).into(),
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
-                epsilon: block.epsilon,
-                project_mode: 0,
+                epsilon: topology.epsilon.f32(),
+                project_mode: 0.into(),
                 query_scale: (&projection_weight.scale.tensor).into(),
                 gate_scale: (&absent.tensor).into(),
                 key_scale: (&absent.tensor).into(),
@@ -173,11 +238,12 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             },
         )?
         .r0;
-    let dimensions = shape.state_dimensions(block.rows, block.slots, banks, tape_rows);
+    let dimensions =
+        shape.state_dimensions(&block.rows, &block.slots, &block.bank.banks, &tape_rows);
     // The step and chunk entries share one contract, so their inputs have the
     // same geometry whichever advances this class.
     let input = |graph: &mut G, name: &str| {
-        graph.control_for(block.controls, kernels.step, name, &dimensions)
+        graph.control_for(topology.controls, kernels.step, name, &dimensions)
     };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
@@ -204,42 +270,49 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                         previous_bank: controls.previous_bank.tensor().into(),
                         previous_tape: controls.previous_tape.tensor().into(),
                         following_bank: controls.following_bank.tensor().into(),
-                        window: ports.window.tensor_mut().into(),
-                        state: ports.delta.tensor_mut().into(),
-                        tape: ports.tape.tensor_mut().into(),
-                        slab_banks: block.slab_banks,
+                        window: bank.window.tensor_mut().into(),
+                        state: bank.delta.tensor_mut().into(),
+                        tape: bank.tape.tensor_mut().into(),
+                        slab_banks,
                     },
                 )?
                 .value
         };
     }
-    let mixed = if chunked(block.rows) {
+    let mixed = if chunked(&block.rows) {
         advance!(state_space_chunk, kernels.chunk)
     } else {
         advance!(state_space_step, kernels.step)
     };
     // The stored `[groups, group width]` norm, flattened by the family, is
     // the gate's `[G, U, P]`.
-    let state_norm = state_norm.reshape(&[shape.norm_groups(), shape.norm_heads, shape.head_width]);
+    let state_norm = state_norm.reshape(&[
+        shape.norm_groups(),
+        shape.norm_heads.clone(),
+        shape.head_width.clone(),
+    ]);
     let gated = graph
         .enqueue(
             kernels.gate,
-            &shape.gate_dimensions(block.rows),
+            &shape.gate_dimensions(&block.rows),
             state_space_gate::WorkflowArgs {
                 mixed: (&mixed).into(),
                 projection: (&projection).into(),
                 state_norm: (&state_norm).into(),
-                epsilon: block.norm_epsilon,
+                epsilon: topology.norm_epsilon.f32(),
             },
         )?
         .value;
-    let inject = join.inject(graph, block.rows, constants)?;
+    let inject = join.inject(graph, &block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
             &[
-                shape.output_dimensions(block.rows).as_slice(),
-                &[("OS", output_weight.scale.extent), ("OB", output_bound.extent)],
+                shape.output_dimensions(&block.rows).as_slice(),
+                &[
+                    ("OS", output_weight.scale.extent.clone()),
+                    ("OB", output_bound.extent.clone()),
+                ],
             ]
             .concat(),
             attention_output::WorkflowArgs {
@@ -252,7 +325,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    Ok((output, ports, controls))
+    Ok((output, bank, controls))
 }
 
 #[cfg(test)]

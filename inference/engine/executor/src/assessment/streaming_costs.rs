@@ -2017,8 +2017,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
             let store = seismic::measure::HeldStore::default();
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let requests = [super::super::requests::PointRequest::TierCopy];
+            let deadline = super::super::requests::JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(30));
+            let requests = super::super::Outstanding { standing: Vec::new(), loads: vec![super::super::requests::PointRequest::TierCopy] };
             super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| ()).unwrap();
             let costs = TierCopyCosts::stored(device.topology(), device.info(), &store).unwrap();
             let rate = 1. / costs.link_byte_seconds();
@@ -2282,8 +2282,8 @@ mod tests {
         // read from the records.
         let measured = |form: MoveForm| {
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = Instant::now() + std::time::Duration::from_secs(120);
-            let requests = [super::super::PointRequest::Moves(form)];
+            let deadline = super::super::requests::JobDeadlines::new(Instant::now(), std::time::Duration::from_secs(120));
+            let requests = super::super::Outstanding { standing: Vec::new(), loads: vec![super::super::PointRequest::Moves(form)] };
             let ended = super::super::requests::measure(&mut measurer, device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
             assert!(ended.ended.is_empty() && ended.failures.is_empty(), "{ended:?}");
             MoveCosts::stored(device.topology(), device.info(), form, &store).unwrap()

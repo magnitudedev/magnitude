@@ -152,18 +152,8 @@ impl GroupUnion {
         }
     }
 
-    /// The experts a group of `steps` steps is expected to read of those the
-    /// group read at least `depth` slots deep, and how many of those there
-    /// were.
-    fn deeper(&self, steps: usize, depth: u64) -> (f64, usize) {
-        self.experts
-            .iter()
-            .filter(|&&(at, _)| at as u64 >= depth)
-            .fold((0., 0), |(expected, read), &(_, choices)| (expected + self.chance(steps, choices), read + 1))
-    }
-
     /// The experts a group of `steps` steps is expected to read of all the
-    /// group read ([`Self::deeper`] at no depth), by each count of choices.
+    /// group read, by each count of choices.
     fn read(&self, steps: usize) -> f64 {
         self.routed.iter().map(|&(choices, experts)| experts as f64 * self.chance(steps, choices)).sum()
     }

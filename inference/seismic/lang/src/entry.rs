@@ -855,6 +855,50 @@ impl CompiledEntryShapes {
         Ok(evaluated)
     }
 
+    /// A tensor's shape with every entry dimension but `varying` fixed at
+    /// `dimensions`: compiled once, then evaluated at each point of the
+    /// varying dimensions alone ([`BoundTensorShape::at`]), with no lookup
+    /// by name. A graph regime binds one per buffer and evaluates it per
+    /// class.
+    pub fn bound(
+        self: &std::sync::Arc<Self>,
+        tensor: TensorSlot<'_>,
+        dimensions: &[(&str, u64)],
+        varying: &[&str],
+    ) -> Result<BoundTensorShape, CheckedTensorShapeError> {
+        let slot = match tensor {
+            TensorSlot::Parameter(name) => self.parameter_slot(name)?.0,
+            TensorSlot::Result(ordinal) => {
+                self.result_tensor(ordinal)?;
+                ShapeSlot::Result(ordinal)
+            }
+        };
+        let varying = varying
+            .iter()
+            .map(|name| {
+                self.dimensions
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, symbol)| *symbol)
+                    .ok_or_else(|| CheckedTensorShapeError::MissingDimension((*name).to_owned()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(BoundTensorShape {
+            shapes: std::sync::Arc::clone(self),
+            slot,
+            fixed: self.values(dimensions)?,
+            varying,
+        })
+    }
+
+    fn slot_shape(&self, slot: ShapeSlot) -> &CompiledTensorShape {
+        match slot {
+            ShapeSlot::Parameter(index) => self.parameters[index].1.as_ref(),
+            ShapeSlot::Result(ordinal) => self.results[ordinal].as_ref(),
+        }
+        .expect("a bound slot is a tensor")
+    }
+
     /// Forget every shape evaluated so far and return how many there were.
     /// The memo only saves evaluating a shape again, so forgetting changes
     /// no result: what built many graph classes holds them until it is
@@ -967,6 +1011,33 @@ impl CompiledEntryShapes {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((parameters, results))
+    }
+}
+
+/// A tensor of an entry's signature, by parameter name or result ordinal.
+#[derive(Clone, Copy, Debug)]
+pub enum TensorSlot<'n> {
+    Parameter(&'n str),
+    Result(usize),
+}
+
+/// A tensor's shape over a few varying dimensions, the rest fixed
+/// ([`CompiledEntryShapes::bound`]).
+pub struct BoundTensorShape {
+    shapes: std::sync::Arc<CompiledEntryShapes>,
+    slot: ShapeSlot,
+    fixed: InvocationValues,
+    varying: Vec<SymbolId>,
+}
+
+impl BoundTensorShape {
+    /// The shape at `values` of the varying dimensions, in their order.
+    pub fn at(&self, values: &[u64]) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let mut bound = self.fixed.clone();
+        for (&symbol, &value) in self.varying.iter().zip(values) {
+            bound.bind(symbol, SymbolValue::Nat(value.into()));
+        }
+        CompiledEntryShapes::shape(self.shapes.slot_shape(self.slot), &bound)
     }
 }
 

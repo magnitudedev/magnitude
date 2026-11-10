@@ -544,7 +544,7 @@ fn print_breakdown(
     options: &Options,
 ) -> Result<(), magnitude_engine::assessment::ModelAssessmentError> {
     let PreparedModelAssessment::Planned {
-        draft, execution, ..
+        definition, execution, ..
     } = prepared
     else {
         return Ok(());
@@ -556,7 +556,7 @@ fn print_breakdown(
         );
         return Ok(());
     };
-    let charge = execution.memory_charge();
+    let charge = execution.memory_charge(definition, setup.structure.selected.graph_cost).map_err(magnitude_engine::assessment::ModelAssessmentError::Assessment)?;
     let bounds = &charge.bounds;
     let host = &bounds.host_process;
     eprintln!(
@@ -590,7 +590,7 @@ fn print_breakdown(
     );
     let failed = magnitude_engine::assessment::ModelAssessmentError::Assessment;
     let sequences = u64::from(options.sequences);
-    let pricing = decode_pricing(draft, costs);
+    let pricing = decode_pricing(execution.draft(), costs);
     let demand = execution.demand();
     eprintln!(
         "magnitude-assess: {}: {} calls, {sequences} sequences, lookahead {}, activations at \

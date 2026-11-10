@@ -768,6 +768,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
                     EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
                         result,
                         operations,
+                        ..
                     }) => ArgumentBinding::ResultView {
                         result: output_ref(result),
                         operations,

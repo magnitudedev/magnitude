@@ -15,8 +15,7 @@ use std::{
 mod walk;
 
 pub use walk::{
-    Entry, EntryHead, HEADER_LIMIT, Header, Preamble, Prefix, TensorInfo, Walk, read_header_bytes,
-    walk,
+    Entry, EntryHead, HEADER_LIMIT, Header, HeaderBytes, Preamble, Prefix, TensorInfo, Walk, walk,
 };
 
 /// The `general.architecture` a multimodal projector declares.
@@ -637,7 +636,19 @@ pub fn read_directory<R: Read + Seek>(source: &mut R) -> Result<Directory, Error
 /// Read a GGUF header held in memory (every byte through the aligned data
 /// offset); tensor payloads need not follow it.
 pub fn read_header(bytes: &[u8]) -> Result<Directory, Error> {
-    stored_directory(bytes, bytes.len() as u64, false).map(|(directory, _)| directory)
+    let Walk::Complete(header) = walk(bytes)? else {
+        return Err(Error::Truncated {
+            offset: bytes.len() as u64,
+        });
+    };
+    header.directory()
+}
+
+impl Header<'_> {
+    /// The directory of this header ([`read_header`]), from its walk.
+    pub fn directory(&self) -> Result<Directory, Error> {
+        stored_directory(self, None).map(|(directory, _)| directory)
+    }
 }
 
 /// Inspect one downloaded GGUF file header before weight payloads exist.
@@ -871,28 +882,20 @@ fn read_stored_directory<R: Read + Seek>(
 ) -> Result<(Directory, Vec<StoredType>), Error> {
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    read_header_bytes(source, &mut bytes)?;
-    stored_directory(&bytes, size, require_payload)
+    let mut bytes = HeaderBytes::new();
+    stored_directory(&bytes.read(source)?, require_payload.then_some(size))
 }
 
-/// The directory of the GGUF header `bytes` begin, for a file of `size` bytes, with the stored
-/// type of each of its metadata values. With `require_payload`, every tensor's bytes must lie
-/// within the file.
+/// The directory of a walked GGUF header, with the stored type of each of its metadata values.
+/// With the `size` of its file, every tensor's bytes must lie within the file.
 fn stored_directory(
-    bytes: &[u8],
-    size: u64,
-    require_payload: bool,
+    header: &Header<'_>,
+    size: Option<u64>,
 ) -> Result<(Directory, Vec<StoredType>), Error> {
-    let Walk::Complete(header) = walk(bytes)? else {
-        return Err(Error::Truncated {
-            offset: bytes.len() as u64,
-        });
-    };
     let (metadata, types) = header
         .entries
         .iter()
-        .map(|entry| (entry.metadata(), entry.head.stored))
+        .map(|entry| (entry.metadata(), entry.head().stored))
         .unzip();
     let alignment = header.alignment;
     let mut tensors = Vec::new();
@@ -942,7 +945,7 @@ fn stored_directory(
         let next = start
             .checked_add(tensor.nbytes)
             .ok_or_else(|| invalid("GGUF tensor end overflows"))?;
-        if start < end || (require_payload && next > size) {
+        if start < end || size.is_some_and(|size| next > size) {
             return Err(invalid(format!(
                 "overlapping or truncated tensor {:?}",
                 tensor.name

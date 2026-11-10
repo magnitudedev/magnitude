@@ -32,7 +32,10 @@
 //! are separate graphs, so the picks and the pool cross between them as the
 //! launch-scoped tables they bind, as the launch's bound controls do.
 
-use super::graph::{AttentionBlock, PickedReads};
+use super::graph::PickedReads;
+use crate::operators::scalar;
+use super::split::{AttentionBlock, AttentionTopology, Candidates, IndexedReals, IndexedSource, OwnReals, OwnRows, Plane, both};
+use crate::planning::{RoundingArguments, axis};
 use super::selection::{
     self, IndexerClass, IndexerEntries, IndexerInputs, KeyWrite, Projection, ProjectionInput,
 };
@@ -41,9 +44,9 @@ use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::PackedWeight;
 use crate::{CandidatesBinding, PickedBinding};
-use magnitude_family_contracts::{HeadWeights, Indexer, Pool, PooledRows};
+use magnitude_family_contracts::{Indexer, Pool, PooledRows};
 use magnitude_kernels::{attention_append_dense, attention_project, indexer_keys, pool_rows, widen_rows};
-use seismic::{Element, NativeGraphClassSlice, NativePort, WorkflowTensor, WorkflowTensorView};
+use seismic::{Argument, Dim, Element, NativeGraphClassSlice, NativePort, WorkflowTensor, WorkflowTensorView};
 
 /// An own source's rows' entries at one graph class: the `u` and `g`
 /// projections (the query and gate segments), their widening to the F32
@@ -71,7 +74,7 @@ impl<'a, G: GraphDraft + 'a> Clone for PooledEntries<'a, G> {
 /// stores its keys (normed, rotated and rounded at the row's own
 /// coordinates), and its index keys' projection forms the latent in its
 /// input norm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Pooling {
     Grouped,
     Identity,
@@ -89,13 +92,12 @@ impl Pooling {
 
     /// `attention_append_dense`'s form at rate 1 beside the row's `P`, `S`
     /// and layout: one head (`KV`) of one layer's rows (`F`), its key normed
-    /// (`N`) and rounded as the pooled rows are (`KR`, by `rounding`; a
+    /// (`N`) and rounded as the pooled rows are (`KR`, where `rounds`; a
     /// rounded key is held in the activation dtype after its norm and its
     /// rotation, as the trained model's are), and no value plane (`VK`,
     /// `NV`).
-    pub(crate) fn identity_append(rounding: crate::planning::RoundingArgs) -> [(&'static str, u64); 6] {
-        let kr = u64::from(rounding.rounds());
-        [("KV", 1), ("F", 1), ("N", 1), ("NV", 0), ("VK", 1), ("KR", kr)]
+    pub(crate) fn identity_append(rounds: bool) -> [(&'static str, u64); 6] {
+        [("KV", 1), ("F", 1), ("N", 1), ("NV", 0), ("VK", 1), ("KR", u64::from(rounds))]
     }
 }
 
@@ -136,7 +138,7 @@ impl<'a, G: GraphDraft + 'a> Clone for PickedEntries<'a, G> {
 /// A; the index projections are published in A, and `u | g` in F32 for a
 /// softmax-gated pool (whose pooling is F32 from its projections on) and in
 /// A otherwise.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PickedElements {
     /// The indexer the layer runs itself.
     pub indexer: crate::IndexerBinding,
@@ -150,7 +152,7 @@ pub(crate) struct PickedElements {
 
 /// An own source's rows' projections' elements (`PickedElements::rows`),
 /// and its pooling, which names its pooling entry ([`PoolEntry`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PooledElements {
     pub project: [(&'static str, Element); 7],
     pub key_project: [(&'static str, Element); 7],
@@ -302,13 +304,12 @@ pub(crate) struct PooledWindow {
 /// with what it takes of the attention's input, or a reused source's plane.
 pub(crate) enum Picked<'o, 'v, 'a, G: GraphDraft + 'a> {
     Indexed {
-        plane: PickedPlane,
-        index: IndexBlock<'o>,
-        own: Option<OwnBlock<'o>>,
+        source: &'o IndexedSource<Dim>,
+        reals: &'o IndexedReals<Argument<f64>>,
         inputs: PickedInputs<'v, 'a, G>,
     },
     Reused {
-        plane: PickedPlane,
+        plane: &'o Plane<Dim>,
     },
 }
 
@@ -329,16 +330,17 @@ pub(crate) struct PickedInputs<'v, 'a, G: GraphDraft + 'a> {
     pub weights: &'v PickedWeights,
     pub x: ProjectionInput<'v>,
     pub input_norm: &'v WorkflowTensorView,
-    pub epsilon: f32,
+    pub epsilon: Argument<f32>,
     pub qr: ProjectionInput<'v>,
     pub qr_norm: &'v WorkflowTensorView,
-    pub qr_epsilon: f32,
+    pub qr_epsilon: Argument<f32>,
 }
 
 impl<'a, G: GraphDraft + 'a> Picked<'_, '_, 'a, G> {
-    pub(crate) fn plane(&self) -> PickedPlane {
+    pub(crate) fn plane(&self) -> &Plane<Dim> {
         match self {
-            Self::Indexed { plane, .. } | Self::Reused { plane } => *plane,
+            Self::Indexed { source, .. } => &source.plane,
+            Self::Reused { plane } => plane,
         }
     }
 }
@@ -441,7 +443,7 @@ pub(crate) fn gated(source: &PooledRows) -> bool {
 /// coordinates.
 struct Pooled {
     keys: WorkflowTensorView,
-    keys_norm: Option<(WorkflowTensorView, f32)>,
+    keys_norm: Option<(WorkflowTensorView, Argument<f32>)>,
     latent_rows: WorkflowTensorView,
     latent_coordinates: WorkflowTensorView,
 }
@@ -452,9 +454,11 @@ struct Pooled {
 #[allow(clippy::too_many_arguments)]
 fn own_rows<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    block: &AttentionBlock<'_>,
-    own: OwnBlock<'_>,
-    plane_spec: PickedPlane,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
+    own: &OwnRows<Dim>,
+    own_reals: &OwnReals<Argument<f64>>,
+    plane_numbers: &Plane<Dim>,
     plane: &mut NativePort,
     entries: PooledEntries<'a, G>,
     weights: &PooledWeights,
@@ -463,10 +467,13 @@ fn own_rows<'a, G: GraphDraft + 'a>(
     rotary: [&WorkflowTensor; 3],
     constants: &mut Vec<GraphConstant>,
 ) -> Result<(Pooled, OwnPorts), GraphError> {
-    let shape = block.shape;
-    let (rows, width) = (block.rows, shape.width);
-    let source = own.rows;
-    let gate_rows = u64::from(gated(source)) * width;
+    let form = &topology.form;
+    let (rows, width) = (&numbers.rows, &numbers.widths.width);
+    let pairs = &numbers.widths.rotary_pairs;
+    let pooled_epsilon = own_reals.epsilon.f32();
+    let slab_rows = |plane: &Plane<Dim>| scalar::<u32>(&plane.slab_rows, "slab rows");
+    let gt = axis(own.gated);
+    let gate_rows = &gt * width;
     // The tokens' `u` and `g` under the input norm, then in F32.
     let empty = weights.projection.weight.slice_leading(0, 0);
     let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
@@ -475,33 +482,28 @@ fn own_rows<'a, G: GraphDraft + 'a>(
         &weights.projection.operands,
         gate.map(|gate| &gate.operands),
     );
+    let operand = |extent: Option<&Dim>| extent.cloned().unwrap_or(Dim::from(0));
     let projected = graph.enqueue(
         entries.project,
         &[
             [
-                ("M", rows),
-                ("D", inputs.x.width),
-                ("Q", width),
-                ("GR", gate_rows),
-                ("K", 0),
-                ("V", 0),
-                ("QS", projection.scale.extent),
-                (
-                    "GS",
-                    gate_operands.map_or(0, |operands| operands.scale.extent),
-                ),
-                ("KS", 0),
-                ("VS", 0),
-                ("QB", projection.bound.extent),
-                (
-                    "GB",
-                    gate_operands.map_or(0, |operands| operands.bound.extent),
-                ),
-                ("KB", 0),
-                ("VB", 0),
+                ("M", rows.clone()),
+                ("D", inputs.x.width.clone()),
+                ("Q", width.clone()),
+                ("GR", gate_rows.clone()),
+                ("K", Dim::from(0)),
+                ("V", Dim::from(0)),
+                ("QS", projection.scale.extent.clone()),
+                ("GS", operand(gate_operands.map(|operands| &operands.scale.extent))),
+                ("KS", Dim::from(0)),
+                ("VS", Dim::from(0)),
+                ("QB", projection.bound.extent.clone()),
+                ("GB", operand(gate_operands.map(|operands| &operands.bound.extent))),
+                ("KB", Dim::from(0)),
+                ("VB", Dim::from(0)),
             ]
             .as_slice(),
-            &inputs.x.form.dimensions(inputs.x.width),
+            &inputs.x.form.dimensions(inputs.x.width.clone()),
         ]
         .concat(),
         attention_project::WorkflowArgs {
@@ -515,7 +517,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
             key_weight: (&empty).into(),
             value_weight: (&empty).into(),
             epsilon: inputs.epsilon,
-            project_mode: 0,
+            project_mode: 0.into(),
             query_scale: (&projection.scale.tensor).into(),
             gate_scale: match gate_operands {
                 Some(operands) => (&operands.scale.tensor).into(),
@@ -532,12 +534,12 @@ fn own_rows<'a, G: GraphDraft + 'a>(
             value_bound: (&absent).into(),
         },
     )?;
-    let widen = |graph: &mut G, narrow: &WorkflowTensor, columns: u64| {
+    let widen = |graph: &mut G, narrow: &WorkflowTensor, columns: &Dim| {
         Ok::<_, GraphError>(
             graph
                 .enqueue(
                     entries.widen,
-                    &[("M", rows), ("D", columns)],
+                    &[("M", rows.clone()), ("D", columns.clone())],
                     widen_rows::WorkflowArgs {
                         rows: narrow.into(),
                     },
@@ -551,54 +553,69 @@ fn own_rows<'a, G: GraphDraft + 'a>(
         Some(_) => projected.r0.clone(),
         None => widen(graph, &projected.r0, width)?,
     };
-    let rounding = crate::planning::rounding_args(source.rounding);
+    let rounding = RoundingArguments::of(both(&own.rounding, &own_reals.rounding, "own rows' rounding"))?;
     let [components, frequencies, amplitudes] = rotary;
-    let norm = weights.norm.reshape(&[1, width]);
+    let norm = weights.norm.reshape(&[Dim::from(1), width.clone()]);
     // The entry's `form`: the row's rotary layout (RA, RT), then `rest`.
-    let form = |rest: &[u64]| {
-        let extents = [&[0, shape.rotary_adjacent, shape.rotary_trailing][..], rest].concat();
+    let form_table = |rest: &[Dim]| {
+        let extents = [
+            &[
+                Dim::from(0),
+                axis(form.rotary_adjacent),
+                axis(form.rotary_trailing),
+            ][..],
+            rest,
+        ]
+        .concat();
         coordinates.tensor().slice_leading(0, 0).reshape(&extents)
     };
     // Both entries' dimensions: the rows and the row's layout.
     let layout = [
-        ("M", rows),
-        ("P", shape.rotary_pairs),
-        ("S", width - 2 * shape.rotary_pairs),
-        ("RA", shape.rotary_adjacent),
-        ("RT", shape.rotary_trailing),
+        ("M", rows.clone()),
+        ("P", pairs.clone()),
+        ("S", width - pairs * 2),
+        ("RA", axis(form.rotary_adjacent)),
+        ("RT", axis(form.rotary_trailing)),
     ];
-    let pooling = (entries.pool, own.window);
+    let pooling = (entries.pool, own.window.as_ref());
     let (pooled, block_destinations, window) = match pooling {
         // Groups of the rate, the incomplete group's tokens in the Window
         // domain, read through its spans.
         (PoolEntry::Grouped(entry), Some(window)) => {
-            let gt = u64::from(gated(source));
             let g = match gate {
-                Some(_) => projected.r1.reshape(&[rows, gate_rows]),
+                Some(_) => projected.r1.reshape(&[rows.clone(), gate_rows.clone()]),
                 // No gate scores: zero columns of the F32 rows.
-                None => u.slice_leading(0, 0).reshape(&[rows, 0]),
+                None => u.slice_leading(0, 0).reshape(&[rows.clone(), Dim::from(0)]),
             };
             let dimensions = [
                 &layout[..],
                 &[
-                    ("TB", plane_spec.rows),
-                    ("TW", window.rows),
-                    ("GT", gt),
-                    ("R", block.segments),
-                    ("RATE", source.rate),
+                    ("TB", plane_numbers.rows.clone()),
+                    ("TW", window.rows.clone()),
+                    ("GT", gt.clone()),
+                    ("R", numbers.segments.clone()),
+                    ("RATE", own.rate.clone()),
                 ],
             ]
             .concat();
-            let control = |graph: &mut G, name: &str| graph.control_for(block.controls, entry, name, &dimensions);
+            let control = |graph: &mut G, name: &str| {
+                graph.control_for(topology.controls, entry, name, &dimensions)
+            };
             let block_destinations = control(graph, "block_destinations")?;
             let destinations = control(graph, "window_destinations")?;
             let visible = control(graph, "window_visible")?;
-            let mut rows_port = graph.port(Element::f32(), &[window.rows, width + gate_rows])?;
-            let mut coordinates_port = graph.port(Element::i32(), &[window.rows, 4])?;
-            let spans = visible.tensor().reshape(&[rows, block.segments, 2]);
+            let mut rows_port =
+                graph.port(Element::f32(), &[window.rows.clone(), width + &gate_rows])?;
+            let mut coordinates_port =
+                graph.port(Element::i32(), &[window.rows.clone(), Dim::from(4)])?;
+            let spans = visible
+                .tensor()
+                .reshape(&[rows.clone(), numbers.segments.clone(), Dim::from(2)]);
             // It writes the plane's rows `[TB, W]`.
-            let mut block_rows = plane.tensor_mut().reshape(&[plane_spec.rows, width]);
-            let form = form(&[source.rate, gt]);
+            let mut block_rows = plane
+                .tensor_mut()
+                .reshape(&[plane_numbers.rows.clone(), width.clone()]);
+            let form = form_table(&[own.rate.clone(), gt]);
             let pooled = graph.enqueue(
                 entry,
                 &dimensions,
@@ -617,13 +634,13 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                     window_coordinates: coordinates_port.tensor_mut().into(),
                     block_rows: (&mut block_rows).into(),
                     form: (&form).into(),
-                    epsilon: source.norm.epsilon as f32,
-                    window_slab_rows: window.slab_rows,
-                    block_slab_rows: plane_spec.slab_rows,
+                    epsilon: pooled_epsilon,
+                    window_slab_rows: slab_rows(window)?,
+                    block_slab_rows: slab_rows(plane_numbers)?,
                     block: rounding.block,
                     element: rounding.element,
                     scale: rounding.scale,
-                    amax_floor: rounding.amax_floor(),
+                    amax_floor: rounding.amax_floor,
                 },
             )?;
             let window = WindowPorts {
@@ -633,10 +650,10 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                 destinations,
             };
             let pooled = Pooled {
-                keys: pooled.r0.slice_leading(0, rows),
+                keys: pooled.r0.slice_leading(0, rows.clone()),
                 keys_norm: None,
-                latent_rows: pooled.r1.reshape(&[rows]),
-                latent_coordinates: pooled.r2.reshape(&[rows, 4]),
+                latent_rows: pooled.r1.reshape(&[rows.clone()]),
+                latent_coordinates: pooled.r2.reshape(&[rows.clone(), Dim::from(4)]),
             };
             (pooled, block_destinations, Some(window))
         }
@@ -645,22 +662,38 @@ fn own_rows<'a, G: GraphDraft + 'a>(
         // rotated at the row's coordinates (held after each where rounded),
         // rounded, with no value plane.
         (PoolEntry::Identity(entry), None) => {
-            let append = Pooling::identity_append(rounding);
-            let dimensions = [&layout[..], &[("T", plane_spec.rows)], &append].concat();
-            let block_destinations = graph.control_for(block.controls, entry, "destinations", &dimensions)?;
-            let key = projected.r0.reshape(&[1, rows, width]);
-            let mut history_key = plane.tensor_mut().reshape(&[plane_spec.rows, 1, width]);
-            let mut history_value = GraphConstant::empty_port(graph, block.activation, &[0, 1, width], constants)?;
+            let append = Pooling::identity_append(own.rounding.is_some()).map(|(name, extent)| (name, Dim::from(extent)));
+            let dimensions = [&layout[..], &[("T", plane_numbers.rows.clone())], &append].concat();
+            let block_destinations =
+                graph.control_for(topology.controls, entry, "destinations", &dimensions)?;
+            let key = projected.r0.reshape(&[Dim::from(1), rows.clone(), width.clone()]);
+            let mut history_key = plane
+                .tensor_mut()
+                .reshape(&[plane_numbers.rows.clone(), Dim::from(1), width.clone()]);
+            let mut history_value = GraphConstant::empty_port(
+                graph,
+                topology.activation,
+                &[Dim::from(0), Dim::from(1), width.clone()],
+                constants,
+            )?;
             let [.., (_, vk), (_, kr)] = append;
-            let form = form(&[vk, kr]);
+            let form = form_table(&[vk, kr]);
             graph.enqueue(
                 entry,
                 &dimensions,
                 attention_append_dense::WorkflowArgs {
                     key: (&key).into(),
-                    value: (&projected.r0.slice_leading(0, 0).reshape(&[0, rows, width])).into(),
+                    value: (&projected
+                        .r0
+                        .slice_leading(0, 0)
+                        .reshape(&[Dim::from(0), rows.clone(), width.clone()]))
+                        .into(),
                     key_norm: (&norm).into(),
-                    value_norm: (&weights.norm.slice_leading(0, 0).reshape(&[0, width])).into(),
+                    value_norm: (&weights
+                        .norm
+                        .slice_leading(0, 0)
+                        .reshape(&[Dim::from(0), width.clone()]))
+                        .into(),
                     rotary_components: components.into(),
                     rotary_frequencies: frequencies.into(),
                     rotary_amplitudes: amplitudes.into(),
@@ -669,22 +702,22 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                     history_key: (&mut history_key).into(),
                     history_value: history_value.tensor_mut().into(),
                     form: (&form).into(),
-                    epsilon: source.norm.epsilon as f32,
-                    slab_rows: plane_spec.slab_rows,
+                    epsilon: pooled_epsilon,
+                    slab_rows: slab_rows(plane_numbers)?,
                     key_block: rounding.block,
                     key_element: rounding.element,
                     key_scale: rounding.scale,
-                    key_amax_floor: rounding.amax_floor(),
+                    key_amax_floor: rounding.amax_floor,
                 },
             )?;
             // Its latent is `u` under the pooled norm, which the keys'
             // projection forms; each stored row is its own, at its own
             // coordinates.
             let pooled = Pooled {
-                keys: u.slice_leading(0, rows),
-                keys_norm: Some((weights.norm.reshape(&[width]), source.norm.epsilon as f32)),
-                latent_rows: block_destinations.tensor().reshape(&[rows]),
-                latent_coordinates: coordinates.tensor().reshape(&[rows, 4]),
+                keys: u.slice_leading(0, rows.clone()),
+                keys_norm: Some((weights.norm.reshape(&[width.clone()]), pooled_epsilon)),
+                latent_rows: block_destinations.tensor().reshape(&[rows.clone()]),
+                latent_coordinates: coordinates.tensor().reshape(&[rows.clone(), Dim::from(4)]),
             };
             (pooled, block_destinations, None)
         }
@@ -703,26 +736,28 @@ fn own_rows<'a, G: GraphDraft + 'a>(
 /// rotary table `rotary`: what the dense entries read, and its ports.
 pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    block: &AttentionBlock<'_>,
+    topology: &AttentionTopology,
+    numbers: &AttentionBlock,
     picked: Picked<'_, '_, 'a, G>,
     coordinates: &NativePort,
     rotary: [&WorkflowTensor; 3],
     constants: &mut Vec<GraphConstant>,
 ) -> Result<(PickedReads, PickedPorts), GraphError> {
-    let shape = block.shape;
-    let (rows, width) = (block.rows, shape.width);
-    let (plane_spec, index, own, inputs) = match picked {
-        Picked::Indexed { plane, index, own, inputs } => (plane, index, own, inputs),
-        Picked::Reused { plane: plane_spec } => {
-            let plane = plane_port(graph, block.activation, plane_spec.rows, width)?;
-            let picks = graph.port(Element::i32(), &[rows, shape.picks])?;
+    let form = &topology.form;
+    let widths = &numbers.widths;
+    let (rows, width, kv_heads) = (&numbers.rows, &widths.width, &widths.kv_heads);
+    let (index, reals, inputs) = match picked {
+        Picked::Indexed { source, reals, inputs } => (source, reals, inputs),
+        Picked::Reused { plane: plane_numbers } => {
+            let plane = plane_port(graph, topology.activation, plane_numbers, width)?;
+            let picks = graph.port(Element::i32(), &[rows.clone(), widths.picks.clone()])?;
             let read = picked_reads(
-                picks.tensor().reshape(&[rows, shape.picks]),
+                picks.tensor().reshape(&[rows.clone(), widths.picks.clone()]),
                 &plane,
-                plane_spec,
-                shape.kv_heads,
+                plane_numbers,
+                kv_heads,
                 width,
-            );
+            )?;
             return Ok((
                 read,
                 PickedPorts {
@@ -733,18 +768,27 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             ));
         }
     };
-    let indexer = index.indexer;
-    let plane_rows = plane_spec.rows;
-    let mut plane = plane_port(graph, block.activation, plane_rows, width)?;
+    let IndexedSource {
+        plane: plane_numbers,
+        heads,
+        width: index_width,
+        top,
+        spans,
+        scores,
+        ..
+    } = index;
+    let mut plane = plane_port(graph, topology.activation, plane_numbers, width)?;
     let weights = inputs.weights;
     // An own source makes its rows, whose keys its indexer writes.
-    let pooled = match (own, inputs.entries.rows, &weights.rows) {
-        (Some(own), Some(entries), Some(rows_weights)) => {
+    let pooled = match (both(&index.own, &reals.own, "own rows"), inputs.entries.rows, &weights.rows) {
+        (Some((own, own_reals)), Some(entries), Some(rows_weights)) => {
             let (pooled, ports) = own_rows(
                 graph,
-                block,
+                topology,
+                numbers,
                 own,
-                plane_spec,
+                own_reals,
+                plane_numbers,
                 &mut plane,
                 entries,
                 rows_weights,
@@ -759,103 +803,110 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
         _ => return Err("an index-list source's rows, entries and weights disagree".into()),
     };
     // The indexer over the read's index keys: each row's picks.
-    let index_width = indexer.width;
-    let mut index_keys = graph.port(Element::f32(), &[plane_rows, index_width])?;
+    let mut index_keys =
+        graph.port(Element::f32(), &[plane_numbers.rows.clone(), index_width.clone()])?;
     // A row lists the read's visible spans, or a restricted indexer the
     // candidate pool of `blocks` blocks and those spans' fill.
-    let (list_spans, list_scores) = match index.candidates {
-        CandidatesBinding::All | CandidatesBinding::Produce(_) => (index.spans, index.scores),
-        CandidatesBinding::Restrict(pool) => {
-            (pool.blocks + index.spans, pool.units().min(index.scores))
-        }
+    let (list_spans, list_scores) = match &index.candidates {
+        Candidates::All | Candidates::Produce(_) => (spans.clone(), scores.clone()),
+        Candidates::Restrict(pool) => (
+            &pool.blocks + spans,
+            pool.units().min(scores),
+        ),
     };
+    let pairs = &widths.rotary_pairs;
     let class = IndexerClass {
-        rows,
-        spans: list_spans,
-        scores: list_scores,
-        plane_rows,
-        slab_rows: plane_spec.slab_rows,
-        rotary_pairs: shape.rotary_pairs,
+        source: index,
+        rows: rows.clone(),
+        spans: list_spans.clone(),
+        scores: list_scores.clone(),
+        rotary_pairs: pairs.clone(),
     };
     let score_dimensions = [
-        ("M", rows),
-        ("H", indexer.heads),
-        ("P", shape.rotary_pairs),
-        ("S", index_width - 2 * shape.rotary_pairs),
-        ("NQ", u64::from(weights.query_norm.is_some())),
+        ("M", rows.clone()),
+        ("H", heads.clone()),
+        ("P", pairs.clone()),
+        ("S", index_width - pairs * 2),
+        ("NQ", axis(weights.query_norm.is_some())),
         (
             "HW",
             if weights.head_weights.is_some() {
-                indexer.heads
+                heads.clone()
             } else {
-                0
+                Dim::from(0)
             },
         ),
-        ("TB", plane_rows),
-        ("R", list_spans),
-        ("N", list_scores),
-        ("RA", shape.rotary_adjacent),
-        ("RT", shape.rotary_trailing),
+        ("TB", plane_numbers.rows.clone()),
+        ("R", list_spans.clone()),
+        ("N", list_scores.clone()),
+        ("RA", axis(form.rotary_adjacent)),
+        ("RT", axis(form.rotary_trailing)),
     ];
     let entries = inputs.entries.indexer;
     // The lists: the read's visible spans (a launch control), or the pool
     // table a restricted indexer binds. A pool table's spans, and every
     // node of a restricted indexer over them, take the pool's blocks beside
     // the class's segments ([`CANDIDATE_LISTS`]).
-    let restricted = matches!(index.candidates, CandidatesBinding::Restrict(_));
-    let lists = match index.candidates {
-        CandidatesBinding::All => ListPorts::Visible {
-            spans: graph.control_for(block.controls, entries.score, "spans", &score_dimensions)?,
+    let lists = match &index.candidates {
+        Candidates::All => ListPorts::Visible {
+            spans: graph.control_for(topology.controls, entries.score, "spans", &score_dimensions)?,
             pool: None,
         },
-        CandidatesBinding::Produce(pool) => {
-            let spans =
-                graph.control_for(block.controls, entries.score, "spans", &score_dimensions)?;
-            let mut pool_dimensions = score_dimensions;
+        Candidates::Produce(pool) => {
+            let mut pool_dimensions = score_dimensions.clone();
             for (name, value) in &mut pool_dimensions {
                 if *name == "R" {
-                    *value = pool.blocks + index.spans;
+                    *value = &pool.blocks + &list_spans;
                 }
             }
+            let visible = graph.control_for(
+                topology.controls,
+                entries.score,
+                "spans",
+                &score_dimensions,
+            )?;
             graph.set_class_scope(Some(CANDIDATE_LISTS));
             let table = graph.port_for(entries.score, "spans", &pool_dimensions);
             graph.set_class_scope(None);
             ListPorts::Visible {
-                spans,
+                spans: visible,
                 pool: Some(table?),
             }
         }
-        CandidatesBinding::Restrict(_) => {
+        Candidates::Restrict(_) => {
             graph.set_class_scope(Some(CANDIDATE_LISTS));
             ListPorts::Pool(graph.port_for(entries.score, "spans", &score_dimensions)?)
         }
     };
-    let spans = match &lists {
+    let restricted = matches!(index.candidates, Candidates::Restrict(_));
+    let spans_port = match &lists {
         ListPorts::Visible { spans, .. } | ListPorts::Pool(spans) => spans,
     };
     let complete = graph.control_for(
-        block.controls,
+        topology.controls,
         entries.topk,
         "complete",
         &[
-            ("M", rows),
-            ("N", list_scores),
-            ("R", list_spans),
-            ("K", indexer.top),
+            ("M", rows.clone()),
+            ("N", list_scores.clone()),
+            ("R", list_spans.clone()),
+            ("K", top.clone()),
         ],
     )?;
     let query_norm = weights
         .query_norm
         .as_ref()
-        .map(|norm| norm.reshape(&[1, index_width]));
-    let coordinates_view = coordinates.tensor().reshape(&[rows, 4]);
-    let spans_view = spans.tensor().reshape(&[rows, list_spans, 2]);
-    let complete_view = complete.tensor().reshape(&[rows]);
-    let head_weights = match (&indexer.head_weights, &weights.head_weights) {
-        (HeadWeights::Projected(_), Some(weight)) => Some((
+        .map(|norm| norm.reshape(&[Dim::from(1), index_width.clone()]));
+    let coordinates_view = coordinates.tensor().reshape(&[rows.clone(), Dim::from(4)]);
+    let spans_view = spans_port
+        .tensor()
+        .reshape(&[rows.clone(), list_spans, Dim::from(2)]);
+    let complete_view = complete.tensor().reshape(&[rows.clone()]);
+    let head_weights = match (index.head_weights, &weights.head_weights) {
+        (true, Some(weight)) => Some((
             ProjectionInput {
                 rows: inputs.x.rows,
-                width: inputs.x.width,
+                width: inputs.x.width.clone(),
                 form: inputs.x.form,
             },
             Projection {
@@ -865,11 +916,11 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
                 epsilon: inputs.epsilon,
             },
         )),
-        (HeadWeights::Projected(_), None) => {
+        (true, None) => {
             return Err("an indexer's projected head weights are absent".into());
         }
-        (HeadWeights::Uniform, None) => None,
-        (HeadWeights::Uniform, Some(_)) => {
+        (false, None) => None,
+        (false, Some(_)) => {
             return Err("head weights of an indexer that projects none".into());
         }
     };
@@ -879,22 +930,23 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     let key_norms = pooled.as_ref().map(|(_, _, _, rows_weights)| {
         (
             rows_weights.key_norm.slice_leading(0, 0),
-            rows_weights.key_norm.reshape(&[1, index_width]),
+            rows_weights
+                .key_norm
+                .reshape(&[Dim::from(1), index_width.clone()]),
         )
     });
     let write = pooled.as_ref().zip(key_norms.as_ref()).map(
         |((pooled, _, entries, rows_weights), (none, key_norm))| {
             let (form, norm, epsilon) = match &pooled.keys_norm {
-                None => (InputForm::PLAIN, none, 0.0),
+                None => (InputForm::PLAIN, none, Argument::from(0.0)),
                 Some((norm, epsilon)) => (InputForm::SINGLE, norm, *epsilon),
             };
             KeyWrite {
-                rounding: index.key_rounding,
                 project: entries.key_project,
                 write: entries.keys,
                 latent: ProjectionInput {
                     rows: &pooled.keys,
-                    width,
+                    width: width.clone(),
                     form,
                 },
                 latent_rows: &pooled.latent_rows,
@@ -911,13 +963,13 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     );
     let indexed = selection::indexer(
         graph,
-        class,
-        indexer,
+        &class,
+        reals,
         entries,
         IndexerInputs {
             query_input: ProjectionInput {
                 rows: inputs.qr.rows,
-                width: inputs.qr.width,
+                width: inputs.qr.width.clone(),
                 form: inputs.qr.form,
             },
             query: Projection {
@@ -927,13 +979,12 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
                 epsilon: inputs.qr_epsilon,
             },
             query_norm: query_norm.as_ref(),
-            query_rounding: index.query_rounding,
             head_weights,
             write,
             coordinates: &coordinates_view,
             rotary,
-            rotary_adjacent: shape.rotary_adjacent,
-            rotary_trailing: shape.rotary_trailing,
+            rotary_adjacent: form.rotary_adjacent,
+            rotary_trailing: form.rotary_trailing,
             keys: &mut index_keys,
             spans: &spans_view,
             complete: &complete_view,
@@ -945,16 +996,16 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     }
     // A producing indexer's candidate pool, from its scores over the
     // read's spans, for the restricted indexers after it.
-    match (index.candidates, &lists, entries.candidates) {
+    match (&index.candidates, &lists, entries.candidates) {
         (
-            CandidatesBinding::Produce(candidate),
+            Candidates::Produce(pool),
             ListPorts::Visible { pool: Some(stored), .. },
             Some(candidates),
         ) => {
             let made = selection::candidate_pool(
                 graph,
-                class,
-                candidate,
+                &class,
+                pool,
                 entries.topk,
                 candidates,
                 &indexed.scores,
@@ -963,21 +1014,21 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             )?;
             graph.store(&made, stored)?;
         }
-        (CandidatesBinding::All | CandidatesBinding::Restrict(_), _, None) => {}
+        (Candidates::All | Candidates::Restrict(_), _, None) => {}
         _ => return Err("an indexer's candidate pool, its table and its entries disagree".into()),
     }
     // The launch's picks table of the read, for the later layers reusing
     // them.
-    let stored = graph.port(Element::i32(), &[rows, indexer.top])?;
+    let stored = graph.port(Element::i32(), &[rows.clone(), top.clone()])?;
     graph.store(&indexed.picks, &stored)?;
     Ok((
         picked_reads(
-            indexed.picks.reshape(&[rows, indexer.top]),
+            indexed.picks.reshape(&[rows.clone(), top.clone()]),
             &plane,
-            plane_spec,
-            shape.kv_heads,
+            plane_numbers,
+            kv_heads,
             width,
-        ),
+        )?,
         PickedPorts {
             plane,
             picks: stored,
@@ -991,29 +1042,31 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     ))
 }
 
-/// What the dense entries read of the source: each row's `picks` in its
-/// `plane`, viewed `[TS, KV, W]`.
 /// A pooled source's Block plane, as its state stores it
-/// (`magnitude_state`'s pooled component): `rows` rows of one `width` head.
+/// (`magnitude_state`'s pooled component): its rows of one `width` head.
 fn plane_port<G: GraphDraft>(
     graph: &mut G,
     element: Element,
-    rows: u64,
-    width: u64,
+    plane: &Plane<Dim>,
+    width: &Dim,
 ) -> Result<NativePort, GraphError> {
-    Ok(graph.port(element, &[rows, 1, width])?)
+    Ok(graph.port(element, &[plane.rows.clone(), Dim::from(1), width.clone()])?)
 }
 
+/// What the dense entries read of the source: each row's `picks` in its
+/// `plane`, viewed `[TS, KV, W]`.
 fn picked_reads(
     picks: WorkflowTensorView,
     plane: &NativePort,
-    spec: PickedPlane,
-    kv_heads: u64,
-    width: u64,
-) -> PickedReads {
-    PickedReads {
+    numbers: &Plane<Dim>,
+    kv_heads: &Dim,
+    width: &Dim,
+) -> Result<PickedReads, GraphError> {
+    Ok(PickedReads {
         rows: picks,
-        plane: plane.tensor().reshape(&[spec.rows, kv_heads, width]),
-        slab_rows: spec.slab_rows,
-    }
+        plane: plane
+            .tensor()
+            .reshape(&[numbers.rows.clone(), kv_heads.clone(), width.clone()]),
+        slab_rows: scalar(&numbers.slab_rows, "slab rows")?,
+    })
 }

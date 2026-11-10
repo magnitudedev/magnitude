@@ -549,7 +549,7 @@ pub(super) fn block_listings(
         crate::MixerProgramSlot::Attention(binding)
             if crate::operators::attention::graph::lists_history_tiles(binding) =>
         {
-            state.decoded_history_form(backend, binding.shape.width)
+            state.decoded_history_form(backend, binding.shape.widths.width)
         }
         _ => None,
     };
@@ -632,6 +632,27 @@ pub(super) fn block_class(
         if history { listed } else { 0 },
         u64::from(history && scored),
     )
+}
+
+/// The class dimensions of a block's slices (`block_class_slice`) that are
+/// numbers of its split, `listed` of a regime that lists history tiles: what
+/// its traces vary per class (`seismic::ClassFact`).
+pub(super) fn block_class_numbers(
+    block: &PairedBlock,
+    listed: bool,
+) -> Vec<(Option<&'static str>, &'static str, super::block::ClassNumber)> {
+    use super::block::ClassNumber;
+    let keeps = block.keeps();
+    [(None, "M", ClassNumber::Rows), (None, "O", ClassNumber::Rows)]
+        .into_iter()
+        .chain(keeps.history().then_some((None, "R", ClassNumber::Segments)))
+        .chain((keeps.history() && listed).then_some((None, "HT", ClassNumber::Listed)))
+        .chain(match keeps {
+            BlockKeeps::History => None,
+            BlockKeeps::Bank => Some((None, "B", ClassNumber::Slots)),
+            BlockKeeps::HistoryAndBank => Some((Some(crate::operators::ngram::graph::NGRAM_SLOTS), "B", ClassNumber::Slots)),
+        })
+        .collect()
 }
 
 /// The admitted classes of one block for a `rows`-row launch, as one slice:

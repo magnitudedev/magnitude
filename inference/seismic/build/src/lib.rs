@@ -2139,7 +2139,7 @@ mod internals {
                 }
                 TensorAccess::Mutable => "seismic::WorkflowTensorMut<'a>".to_owned(),
             },
-            ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
+            ParameterSummaryKind::Scalar(dtype) => format!("seismic::Argument<{}>", scalar_type(*dtype)),
             ParameterSummaryKind::Index => "seismic::BigUint".to_owned(),
             ParameterSummaryKind::Range => "(seismic::BigUint, seismic::BigUint)".to_owned(),
         }

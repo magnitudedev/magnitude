@@ -18,17 +18,20 @@
 //! none for the latent, the producer's for rate-1 tokens), published in the activation element, from which
 //! the indexer entries compute in F32.
 
+use super::graph::{AttentionOperands, query_projection_dimensions};
+use crate::operators::scalar;
+use super::split::{IndexedReals, IndexedSource, both};
 use crate::CandidatePool;
+use crate::planning::axis;
 use crate::operators::InputForm;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::WeightOperands;
-use crate::planning::RoundingArgs;
-use magnitude_family_contracts::{HeadNorm, Indexer, IndexerKeys};
+use crate::planning::RoundingArguments;
 use magnitude_kernels::{
     attention_project, candidate_blocks, candidate_rows, indexer_keys, indexer_score, rows_topk,
 };
-use seismic::{NativePort, WorkflowTensor, WorkflowTensorView};
+use seismic::{Argument, Dim, NativePort, WorkflowTensor, WorkflowTensorView};
 
 /// The indexer's entries at one graph class.
 pub(crate) struct IndexerEntries<'a, G: GraphDraft + 'a> {
@@ -70,21 +73,19 @@ pub(crate) struct Projection<'v> {
     pub weight: &'v WorkflowTensor,
     pub operands: &'v WeightOperands,
     pub norm: &'v WorkflowTensorView,
-    pub epsilon: f32,
+    pub epsilon: Argument<f32>,
 }
 
 /// One projection input: F32 rows `[rows, parts · width]` in `form`.
 pub(crate) struct ProjectionInput<'v> {
     pub rows: &'v WorkflowTensorView,
-    pub width: u64,
+    pub width: Dim,
     pub form: InputForm,
 }
 
 /// The write of the keys of the rows a producer completes, by the indexer
 /// keeping its own (`IndexerKeys::Latent`).
 pub(crate) struct KeyWrite<'v, 'a, G: GraphDraft + 'a> {
-    /// The keys' trained rounding (`IndexBlock::key_rounding`).
-    pub rounding: RoundingArgs,
     /// The key projection, bound to its weight's element, and the write.
     pub project: G::Binding<'a, attention_project::Entry>,
     pub write: G::Binding<'a, indexer_keys::Entry>,
@@ -110,8 +111,6 @@ pub(crate) struct IndexerInputs<'v, 'a, G: GraphDraft + 'a> {
     pub query: Projection<'v>,
     /// The query heads' own norm `[1, width]` (`IndexerQuery::norm`), if any.
     pub query_norm: Option<&'v WorkflowTensorView>,
-    /// The query rows' trained rounding (`IndexBlock::query_rounding`).
-    pub query_rounding: RoundingArgs,
     /// The layer's input `x` and the head weights' projection under the
     /// input norm, for `HeadWeights::Projected`.
     pub head_weights: Option<(ProjectionInput<'v>, Projection<'v>)>,
@@ -121,8 +120,8 @@ pub(crate) struct IndexerInputs<'v, 'a, G: GraphDraft + 'a> {
     /// table (components, frequencies, amplitudes) in its layout.
     pub coordinates: &'v WorkflowTensorView,
     pub rotary: [&'v WorkflowTensor; 3],
-    pub rotary_adjacent: u64,
-    pub rotary_trailing: u64,
+    pub rotary_adjacent: bool,
+    pub rotary_trailing: bool,
     /// The key plane, the pooled source's Block-domain component.
     pub keys: &'v mut NativePort,
     /// Each row's list over the key plane (`[rows, R, 2]` spans: the
@@ -132,20 +131,18 @@ pub(crate) struct IndexerInputs<'v, 'a, G: GraphDraft + 'a> {
     pub complete: &'v WorkflowTensorView,
 }
 
-/// The extents of one class of the indexer.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct IndexerClass {
-    pub rows: u64,
+/// The extents of one class of the indexer `source`.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexerClass<'s> {
+    pub source: &'s IndexedSource<Dim>,
+    pub rows: Dim,
     /// Spans per row of its lists (`R`).
-    pub spans: u64,
+    pub spans: Dim,
     /// Scores per row (`N`): at least the longest list a row of the class
     /// can have.
-    pub scores: u64,
-    /// The key plane's rows and slab rows.
-    pub plane_rows: u64,
-    pub slab_rows: u32,
+    pub scores: Dim,
     /// The rotary pairs of the attention's head width.
-    pub rotary_pairs: u64,
+    pub rotary_pairs: Dim,
 }
 
 /// What the indexer of one class computes: each row's scores over its list
@@ -160,8 +157,8 @@ pub(crate) struct Indexed {
 fn project<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entry: G::Binding<'a, attention_project::Entry>,
-    rows: u64,
-    out: u64,
+    rows: &Dim,
+    out: Dim,
     input: &ProjectionInput<'_>,
     projection: &Projection<'_>,
     constants: &mut Vec<GraphConstant>,
@@ -169,26 +166,15 @@ fn project<'a, G: GraphDraft + 'a>(
     let empty = projection.weight.slice_leading(0, 0);
     let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
     let operands = projection.operands;
-    let dimensions = [
-        ("M", rows),
-        ("D", input.width),
-        ("Q", out),
-        ("GR", 0),
-        ("K", 0),
-        ("V", 0),
-        ("QS", operands.scale.extent),
-        ("GS", 0),
-        ("KS", 0),
-        ("VS", 0),
-        ("QB", operands.bound.extent),
-        ("GB", 0),
-        ("KB", 0),
-        ("VB", 0),
-    ];
     Ok(graph
         .enqueue(
             entry,
-            &[dimensions.as_slice(), &input.form.dimensions(input.width)].concat(),
+            &[
+                query_projection_dimensions(rows.clone(), input.width.clone(), out).as_slice(),
+                AttentionOperands::query_dimensions(operands).as_slice(),
+                &input.form.dimensions(input.width.clone()),
+            ]
+            .concat(),
             attention_project::WorkflowArgs {
                 hidden: input.rows.into(),
                 input_norm: projection.norm.into(),
@@ -197,7 +183,7 @@ fn project<'a, G: GraphDraft + 'a>(
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
                 epsilon: projection.epsilon,
-                project_mode: 0,
+                project_mode: 0.into(),
                 query_scale: (&operands.scale.tensor).into(),
                 gate_scale: (&absent).into(),
                 key_scale: (&absent).into(),
@@ -211,50 +197,60 @@ fn project<'a, G: GraphDraft + 'a>(
         .r0)
 }
 
-/// The indexer `indexer` of one class: writes the keys of the rows the
+/// The indexer `index` of one class: writes the keys of the rows the
 /// producer completes (an indexer keeping its own), scores each row's list
 /// and picks from it, the `selected_rows` attention reads (`[rows, top]`
 /// i32).
 pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    class: IndexerClass,
-    indexer: &Indexer,
+    class: &IndexerClass<'_>,
+    reals: &IndexedReals<Argument<f64>>,
     entries: IndexerEntries<'a, G>,
     inputs: IndexerInputs<'_, 'a, G>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<Indexed, GraphError> {
-    let (rows, heads, width) = (class.rows, indexer.heads, indexer.width);
-    let pairs = class.rotary_pairs;
+    let (rows, heads, width) = (&class.rows, &class.source.heads, &class.source.width);
+    let pairs = &class.rotary_pairs;
+    let slab_rows = scalar::<u32>(&class.source.plane.slab_rows, "slab rows")?;
     let rotary = [
-        ("P", pairs),
-        ("S", width - 2 * pairs),
-        ("RA", inputs.rotary_adjacent),
-        ("RT", inputs.rotary_trailing),
+        ("P", pairs.clone()),
+        ("S", width - pairs * 2),
+        ("RA", axis(inputs.rotary_adjacent)),
+        ("RT", axis(inputs.rotary_trailing)),
     ];
     // Extent-only tensors: zero rows of the complete units' table.
     let none = inputs.complete.slice_leading(0, 0);
-    let form = none.reshape(&[0, inputs.rotary_adjacent, inputs.rotary_trailing]);
+    let form = none.reshape(&[
+        Dim::from(0),
+        axis(inputs.rotary_adjacent),
+        axis(inputs.rotary_trailing),
+    ]);
     let [components, frequencies, amplitudes] = inputs.rotary;
     // The query heads' own norm (`[1, width]`) and its epsilon, or none
     // (zero rows of the absent F32 operand).
-    let (query_norm, query_epsilon) = match (&indexer.query.norm, inputs.query_norm) {
-        (HeadNorm::Rms(norm), Some(weight)) => (weight.clone(), norm.epsilon as f32),
-        (HeadNorm::None, None) => (
-            GraphConstant::absent(graph, constants)?.tensor().reshape(&[0, width]),
-            0.0,
+    let (query_norm, query_epsilon) = match (reals.query_norm, inputs.query_norm) {
+        (Some(epsilon), Some(weight)) => (weight.clone(), epsilon.f32()),
+        (None, None) => (
+            GraphConstant::absent(graph, constants)?
+                .tensor()
+                .reshape(&[Dim::from(0), width.clone()]),
+            Argument::from(0.0),
         ),
         _ => return Err("an indexer's query norm and its weight disagree".into()),
     };
-    let normed = u64::from(matches!(indexer.query.norm, HeadNorm::Rms(_)));
     // The completed rows' keys, before any row scores them: an indexer
     // keeping its own writes them, one sharing them reads its owner's.
-    match (&indexer.keys, &inputs.write) {
-        (IndexerKeys::Latent { norm, .. }, Some(write)) => {
-            let rounding = write.rounding;
-            let key = project(graph, write.project, rows, width, &write.latent, &write.key, constants)?;
+    match (reals.key_norm, &inputs.write) {
+        (Some(key_epsilon), Some(write)) => {
+            let rounding = RoundingArguments::of(both(&class.source.key_rounding, &reals.key_rounding, "indexer key rounding"))?;
+            let key = project(graph, write.project, rows, width.clone(), &write.latent, &write.key, constants)?;
             graph.enqueue(
                 write.write,
-                &[[("M", rows), ("TB", class.plane_rows)].as_slice(), &rotary].concat(),
+                &[
+                    [("M", rows.clone()), ("TB", class.source.plane.rows.clone())].as_slice(),
+                    &rotary,
+                ]
+                .concat(),
                 indexer_keys::WorkflowArgs {
                     key: (&key).into(),
                     key_norm: write.key_norm.into(),
@@ -265,47 +261,57 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
                     coordinates: write.latent_coordinates.into(),
                     keys: inputs.keys.tensor_mut().into(),
                     form: (&form).into(),
-                    epsilon: norm.epsilon as f32,
+                    epsilon: key_epsilon.f32(),
                     block: rounding.block,
                     element: rounding.element,
                     scale: rounding.scale,
-                    amax_floor: rounding.amax_floor(),
-                    slab_rows: class.slab_rows,
+                    amax_floor: rounding.amax_floor,
+                    slab_rows,
                 },
             )?;
         }
-        (IndexerKeys::Shared { .. }, None) => {}
-        (IndexerKeys::Latent { .. } | IndexerKeys::Shared { .. }, _) => {
-            return Err("an indexer's keys and their write disagree".into());
-        }
-        (IndexerKeys::Pooled(_), _) => {
-            unreachable!("picked_source refuses pooled indexer keys over a pooled source")
-        }
+        (None, None) => {}
+        _ => return Err("an indexer's keys and their write disagree".into()),
     }
-    let query = project(graph, entries.query_project, rows, heads * width, &inputs.query_input, &inputs.query, constants)?
-        .reshape(&[rows, heads, width]);
+    let query = project(
+        graph,
+        entries.query_project,
+        rows,
+        heads * width,
+        &inputs.query_input,
+        &inputs.query,
+        constants,
+    )?
+    .reshape(&[rows.clone(), heads.clone(), width.clone()]);
     let head_weights = match (&inputs.head_weights, entries.weights_project) {
         (Some((input, projection)), Some(entry)) => {
-            project(graph, entry, rows, heads, input, projection, constants)?.reshape(&[rows, heads])
+            project(graph, entry, rows, heads.clone(), input, projection, constants)?
+                .reshape(&[rows.clone(), heads.clone()])
         }
-        (None, None) => query.slice_leading(0, 0).reshape(&[rows, 0]),
+        (None, None) => query
+            .slice_leading(0, 0)
+            .reshape(&[rows.clone(), Dim::from(0)]),
         _ => return Err("an indexer's head-weight projection and its inputs disagree".into()),
     };
-    let query_rounding = inputs.query_rounding;
-    let scores = class.scores;
-    let score_slots = none.reshape(&[0, scores]);
+    let query_rounding =
+        RoundingArguments::of(both(&class.source.query_rounding, &reals.query_rounding, "indexer query rounding"))?;
+    let scores = &class.scores;
+    let score_slots = none.reshape(&[Dim::from(0), scores.clone()]);
     let score = graph
         .enqueue(
             entries.score,
             &[
                 [
-                    ("M", rows),
-                    ("H", heads),
-                    ("NQ", normed),
-                    ("HW", if inputs.head_weights.is_some() { heads } else { 0 }),
-                    ("TB", class.plane_rows),
-                    ("R", class.spans),
-                    ("N", scores),
+                    ("M", rows.clone()),
+                    ("H", heads.clone()),
+                    ("NQ", axis(reals.query_norm.is_some())),
+                    (
+                        "HW",
+                        if inputs.head_weights.is_some() { heads.clone() } else { Dim::from(0) },
+                    ),
+                    ("TB", class.source.plane.rows.clone()),
+                    ("R", class.spans.clone()),
+                    ("N", scores.clone()),
                 ]
                 .as_slice(),
                 &rotary,
@@ -323,21 +329,26 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
                 spans: inputs.spans.into(),
                 score_slots: (&score_slots).into(),
                 form: (&form).into(),
-                scale: indexer.scale as f32,
+                scale: reals.scale.f32(),
                 epsilon: query_epsilon,
                 block: query_rounding.block,
                 element: query_rounding.element,
                 rounding_scale: query_rounding.scale,
-                amax_floor: query_rounding.amax_floor(),
-                slab_rows: class.slab_rows,
+                amax_floor: query_rounding.amax_floor,
+                slab_rows,
             },
         )?
         .value;
-    let top_slots = none.reshape(&[0, indexer.top]);
+    let top_slots = none.reshape(&[Dim::from(0), class.source.top.clone()]);
     let picks = graph
         .enqueue(
             entries.topk,
-            &[("M", rows), ("N", scores), ("R", class.spans), ("K", indexer.top)],
+            &[
+                ("M", rows.clone()),
+                ("N", scores.clone()),
+                ("R", class.spans.clone()),
+                ("K", class.source.top.clone()),
+            ],
             rows_topk::WorkflowArgs {
                 scores: (&score).into(),
                 complete: inputs.complete.into(),
@@ -358,24 +369,29 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn candidate_pool<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    class: IndexerClass,
-    pool: CandidatePool,
+    class: &IndexerClass<'_>,
+    pool: &CandidatePool<Dim>,
     topk: G::Binding<'a, rows_topk::Entry>,
     entries: CandidateEntries<'a, G>,
     scores: &WorkflowTensor,
     spans: &WorkflowTensorView,
     complete: &WorkflowTensorView,
 ) -> Result<WorkflowTensor, GraphError> {
-    let rows = class.rows;
+    let rows = &class.rows;
     // The blocks a row's list of at most N units spans.
-    let listed = class.scores.div_ceil(pool.block_units);
+    let listed = class.scores.ceil_div(&pool.block_units);
     // Extent-only tensors: zero rows of the complete units' table.
     let none = complete.slice_leading(0, 0);
-    let block_slots = none.reshape(&[0, listed]);
-    let block_form = none.reshape(&[0, pool.block_units]);
+    let block_slots = none.reshape(&[Dim::from(0), listed.clone()]);
+    let block_form = none.reshape(&[Dim::from(0), pool.block_units.clone()]);
     let scored = graph.enqueue(
         entries.blocks,
-        &[("M", rows), ("N", class.scores), ("NB", listed), ("BU", pool.block_units)],
+        &[
+            ("M", rows.clone()),
+            ("N", class.scores.clone()),
+            ("NB", listed.clone()),
+            ("BU", pool.block_units.clone()),
+        ],
         candidate_blocks::WorkflowArgs {
             scores: scores.into(),
             complete: complete.into(),
@@ -383,11 +399,16 @@ pub(crate) fn candidate_pool<'a, G: GraphDraft + 'a>(
             form: (&block_form).into(),
         },
     )?;
-    let top_slots = none.reshape(&[0, pool.blocks]);
+    let top_slots = none.reshape(&[Dim::from(0), pool.blocks.clone()]);
     let picked = graph
         .enqueue(
             topk,
-            &[("M", rows), ("N", listed), ("R", 1), ("K", pool.blocks)],
+            &[
+                ("M", rows.clone()),
+                ("N", listed),
+                ("R", Dim::from(1)),
+                ("K", pool.blocks.clone()),
+            ],
             rows_topk::WorkflowArgs {
                 scores: (&scored.r0).into(),
                 complete: complete.into(),
@@ -396,16 +417,16 @@ pub(crate) fn candidate_pool<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let rows_form = none.reshape(&[0, pool.block_units, pool.top]);
+    let rows_form = none.reshape(&[Dim::from(0), pool.block_units.clone(), pool.top.clone()]);
     Ok(graph
         .enqueue(
             entries.rows,
             &[
-                ("M", rows),
-                ("R", class.spans),
-                ("B", pool.blocks),
-                ("BU", pool.block_units),
-                ("K", pool.top),
+                ("M", rows.clone()),
+                ("R", class.spans.clone()),
+                ("B", pool.blocks.clone()),
+                ("BU", pool.block_units.clone()),
+                ("K", pool.top.clone()),
             ],
             candidate_rows::WorkflowArgs {
                 blocks: (&picked).into(),

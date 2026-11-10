@@ -5,13 +5,14 @@ use crate::{
     DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan,
     StateWork, SubmitError, ValidatedStateLaunch,
     native::AttestedState,
-    programs::graph::{GraphError, draft::GraphDraft},
+    programs::graph::{GraphError, draft::{Certified, GraphDraft}, facts::{FactIndex, FactSink}},
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
-    BackendName, Device, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphOutputs,
-    NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
+    BackendName, ClassFact, Device, Dim, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata,
+    NativeGraphOutputs, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativeGraphTraces,
+    NativePort, Reals, Tensor,
 };
 use std::rc::Rc;
 
@@ -201,6 +202,74 @@ pub(crate) struct StateCopyGraphClass {
     pub slab_rows: u32,
 }
 
+impl StateCopyGraphClass {
+    /// What its graph is built of beside its topology ([`CopyTopology`]):
+    /// its plane's rows, middle extent and width, the rows its map moves
+    /// (the class dimension `N` the family's slices vary), and its slab
+    /// rows (its kernel's argument). A validated class's (`validate_class`).
+    fn numbers(&self) -> [u64; 5] {
+        let [rows, middle, width] = self.source_extents[..] else {
+            unreachable!("a validated state copy class has a rank-three plane")
+        };
+        [rows, middle, width, self.map_rows, u64::from(self.slab_rows)]
+    }
+
+    /// Its numbers as its trace's facts, in [`Self::numbers`]' order, and
+    /// the fact of its map rows (the class dimension `N`).
+    fn facts(&self) -> (FactSink, FactIndex) {
+        let mut facts = FactSink::new();
+        let [_, _, _, map_rows, _] = facts.index(self.numbers());
+        (facts, map_rows)
+    }
+
+    fn topology(&self, backend: BackendName) -> CopyTopology {
+        CopyTopology {
+            backend,
+            element: self.element,
+        }
+    }
+}
+
+/// What decides a state copy graph's topology: its backend and its plane's
+/// element. Every number of it is a fact of its trace
+/// ([`StateCopyGraphClass::facts`]).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CopyTopology {
+    backend: BackendName,
+    element: Element,
+}
+
+/// The state copy graphs' traces, one per topology.
+static COPY_TRACES: NativeGraphTraces<CopyTopology> = NativeGraphTraces::new();
+
+/// How many state copy traces this process recorded.
+#[cfg(test)]
+pub(crate) fn copy_traces_recorded() -> usize {
+    COPY_TRACES.recorded()
+}
+
+/// The template of a state copy graph of `topology` at `facts`
+/// ([`StateCopyGraphClass::facts`]).
+fn record_copy_graph(
+    topology: &CopyTopology,
+    facts: &[Dim],
+    _reals: &Reals,
+) -> Result<(NativeGraphResourceTemplate, ()), GraphError> {
+    let [rows, middle, width, map_rows, slab_rows] = facts else {
+        unreachable!("a state copy graph is recorded at its five facts")
+    };
+    let elements = [("A", topology.element)];
+    let (graph, ..) = copy_graph_draft(
+        NativeGraphMetadata::new_template(topology.backend),
+        &elements,
+        topology.element,
+        [rows, middle, width],
+        map_rows,
+        slab_rows,
+    )?;
+    Ok((graph.seal_template()?, ()))
+}
+
 pub struct PreparedStateCopyGraphs {
     variants: Vec<PreparedStateCopyGraph>,
     family: NativeGraphFamily,
@@ -224,7 +293,7 @@ impl PreparedStateCopyGraphs {
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, graphs, layouts) = certify_copy_family(target_device.backend(), &classes)
+        let (_, graphs, layouts) = certify_copy_family::<NativeGraphLayout>(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;
         let planned = copy_family_heap(&classes, &layouts).map_err(invalid)?;
         // The graphs go into a vector of exactly the classes, and each
@@ -384,21 +453,35 @@ fn copy_graph_topology<'a, G: GraphDraft + 'a>(
     entry: G::Binding<'a, copy_rows::Entry>,
     class: &StateCopyGraphClass,
 ) -> Result<(G::Plan, NativePort, NativePort, NativePort), GraphError> {
-    let (graph, rows, from, to) = copy_graph_draft(graph, entry, class)?;
+    let [rows, middle, width, map_rows, slab_rows] = class.numbers().map(Dim::from);
+    let (graph, rows, from, to) = copy_graph_draft(
+        graph,
+        entry,
+        class.element,
+        [&rows, &middle, &width],
+        &map_rows,
+        &slab_rows,
+    )?;
     Ok((graph.seal()?, rows, from, to))
 }
 
+/// A state copy graph: the plane `plane` (rows, middle extent, width) of
+/// `element`, `map_rows` of whose rows its `from` and `to` maps move within
+/// slabs of `slab_rows`.
 fn copy_graph_draft<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entry: G::Binding<'a, copy_rows::Entry>,
-    class: &StateCopyGraphClass,
+    element: Element,
+    plane: [&Dim; 3],
+    map_rows: &Dim,
+    slab_rows: &Dim,
 ) -> Result<(G, NativePort, NativePort, NativePort), GraphError> {
-    let rows = graph.port(class.element, &class.source_extents)?;
+    let rows = graph.port(element, &plane)?;
     let dimensions = [
-        ("N", class.map_rows),
-        ("T", class.source_extents[0]),
-        ("KV", class.source_extents[1]),
-        ("W", class.source_extents[2]),
+        ("N", map_rows),
+        ("T", plane[0]),
+        ("KV", plane[1]),
+        ("W", plane[2]),
     ];
     let from = graph.input_for(entry, "from", &dimensions)?;
     let to = graph.input_for(entry, "to", &dimensions)?;
@@ -410,7 +493,7 @@ fn copy_graph_draft<'a, G: GraphDraft + 'a>(
             rows: (&mut rows_tensor).into(),
             from: from.tensor().into(),
             to: to.tensor().into(),
-            slab_rows: class.slab_rows,
+            slab_rows: slab_rows.word().ok_or("state slab rows exceed u32")?,
         },
     )?;
     Ok((graph, rows, from, to))
@@ -431,7 +514,7 @@ pub(crate) fn checked_copy_family(
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
 ) -> Result<(NativeGraphStorageBytes, LaunchGraphs, HostHeap), GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
-    let (storage, graphs, layouts) = certify_copy_family(backend, &classes)?;
+    let (storage, graphs, layouts) = certify_copy_family::<seismic::NativeGraphOutline>(backend, &classes)?;
     Ok((storage, graphs, copy_family_heap(&classes, &layouts)?))
 }
 
@@ -441,7 +524,7 @@ pub(crate) fn checked_copy_family(
 /// planner counts and what `PreparedStateCopyGraphs::prepare` allocates.
 fn copy_family_heap(
     classes: &[StateCopyGraphClass],
-    layouts: &[NativeGraphLayout],
+    layouts: &[impl Certified],
 ) -> Result<HostHeap, String> {
     use std::mem::size_of;
     let mut heap = HostHeap::allocation(classes.len(), size_of::<PreparedStateCopyGraph>());
@@ -455,10 +538,10 @@ fn copy_family_heap(
     Ok(heap)
 }
 
-fn certify_copy_family(
+pub(crate) fn certify_copy_family<L: Certified>(
     backend: BackendName,
     classes: &[StateCopyGraphClass],
-) -> Result<(NativeGraphStorageBytes, LaunchGraphs, Vec<NativeGraphLayout>), GraphError> {
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, Vec<L>), GraphError> {
     let mut family: Option<NativeGraphStorageBytes> = None;
     // Each group's layout, a graph its copies replay, none in a decode
     // step's launch.
@@ -481,13 +564,15 @@ fn certify_copy_family(
     }
     for group in groups {
         let first = &classes[group[0]];
-        let elements = [("A", first.element)];
-        let (graph, _, _, _) =
-            copy_graph_draft(NativeGraphMetadata::new_template(backend), &elements, first)?;
-        let layout = graph.seal_template().and_then(|template| {
-            template.certify(&[NativeGraphClassSlice::new()
-                .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
-        })?;
+        let (facts, map_rows) = first.facts();
+        let (layout, ()) = L::traced(
+            &COPY_TRACES,
+            &first.topology(backend),
+            &facts,
+            &[ClassFact { fact: map_rows.position(), scope: None, dimension: "N" }],
+            vec![NativeGraphClassSlice::new().dimension("N", group.iter().map(|&index| classes[index].map_rows))],
+            record_copy_graph,
+        )?;
         let storage = layout.storage_bytes();
         graphs.push(LaunchedGraph { graph: storage.recorded, pinned_runs: 0, runs: 1 });
         match &mut family {

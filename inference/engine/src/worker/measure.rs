@@ -3,11 +3,14 @@
 //! host process opens an executor or waits on a native submission.
 //!
 //! The job discovers the machine, opens the selected executor and measures
-//! the point requests outstanding on it in the order of who waits on them
-//! ([`magnitude_executor::assessment::requests`]: the load that waited
-//! latest first, then assessment's costs), through `seismic-measure`, each
-//! record stored in the kernel cache as it is taken, and ends with the
-//! points it could not measure. Before each point it records the key it is
+//! the point requests outstanding on it
+//! ([`magnitude_executor::assessment::requests`]: assessment's standing
+//! requests first, within `MEASUREMENT_SECONDS` of the job's start whatever
+//! time it is given, those the budget cannot hold priced unless they read
+//! a required figure, which the next job measures; then the loads',
+//! the load that waited latest first, within the job's time), through
+//! `seismic-measure`, each record stored in the kernel cache as it is
+//! taken, and ends with the points it could not measure. Before each point it records the key it is
 //! attempting ([`AttemptMarkers`]): a point that ends two jobs (the second
 //! confirms the first was no transient) is recorded unobtainable with its
 //! reason and not measured again while the hardware and driver it names are
@@ -42,11 +45,16 @@ const LONGEST_JOB: u32 = 8;
 
 /// The time each measurement job is given from its start, whichever host
 /// runs the jobs: in its own process ([`InProcessJobs`]) or in a worker
-/// beside it. A point whose first sample is not read when a job's time ends
-/// is released uncounted, and the next job starts at the same point, so a
-/// job that measured nothing and reported no failure of its own gives the
-/// next twice its time, up to [`LONGEST_JOB`] times the first, and one that
-/// measured gives the next the first again.
+/// beside it. Assessment's standing points take `MEASUREMENT_SECONDS` of it
+/// at most, whatever it is (`requests::JobDeadlines`), and each ends in the
+/// job, measured or priced, except a required figure's, which nothing
+/// prices: the budget ending before it leaves it unrecorded, and the next
+/// job resumes it from the records stored. A load's point whose first
+/// sample is not read when a job's time ends is released uncounted, and the
+/// next job starts at the same point, so a job that measured nothing and
+/// reported no failure of its own gives the next twice its time, up to
+/// [`LONGEST_JOB`] times the first, and one that measured gives the next the
+/// first again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobTime {
     given: std::time::Duration,
@@ -161,8 +169,8 @@ pub struct MeasureRequest {
     pub job: MeasureJob,
     /// The time the job has from its start: what its host's time for it
     /// ([`JobTime::given`]) has left, the bound however many points are
-    /// requested: the order, not a larger budget, measures what loads wait
-    /// on first.
+    /// requested, of which assessment's standing points take
+    /// `MEASUREMENT_SECONDS` at most (`requests::JobDeadlines`).
     pub time: std::time::Duration,
 }
 
@@ -427,7 +435,7 @@ pub struct InProcessJobs {
 /// What the in-process jobs measured.
 pub struct JobRun {
     /// The requests still outstanding after them.
-    pub outstanding: Vec<magnitude_executor::assessment::PointRequest>,
+    pub outstanding: magnitude_executor::assessment::Outstanding,
     /// What the job that measured could not.
     pub failures: Vec<MeasureFailure>,
 }
@@ -440,7 +448,7 @@ pub enum JobsStopped {
     /// A job measured nothing, and its time gives no next one.
     Stalled {
         stall: JobStall,
-        outstanding: Vec<magnitude_executor::assessment::PointRequest>,
+        outstanding: magnitude_executor::assessment::Outstanding,
         failures: Vec<MeasureFailure>,
     },
 }
@@ -487,7 +495,7 @@ impl InProcessJobs {
 
     /// The requests a job has points of left to measure, in its order
     /// ([`PointRequests::outstanding`]).
-    pub fn outstanding(&self) -> Result<Vec<magnitude_executor::assessment::PointRequest>, String> {
+    pub fn outstanding(&self) -> Result<magnitude_executor::assessment::Outstanding, String> {
         let records = KernelCache::measurement_records(&self.request.kernels);
         let costs = ExecutorCosts::stored(&self.topology, &self.executor, &records).ok().and_then(|walked| walked.outstanding());
         PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
@@ -539,9 +547,12 @@ pub fn probe_machine(
 }
 
 /// Measure the outstanding point requests of the request's executor, in
-/// the order of who waits on them ([`PointRequests::outstanding`]), within
-/// the request's time: what it does not reach is left for the next
-/// job, its attempts released. A point that ended two jobs is not timed: it
+/// the order of who waits on them ([`PointRequests::outstanding`]), by
+/// their deadlines from the job's start (`requests::JobDeadlines`):
+/// assessment's within `MEASUREMENT_SECONDS`, the points its time cannot
+/// hold priced, but for a required figure's; the loads' within the
+/// request's time, what it does not reach (and a required figure's) left
+/// for the next job, its attempts released. A point that ended two jobs is not timed: it
 /// is recorded unobtainable, so the executor's costs complete without it. Each attempt reaches `report`
 /// before it is recorded, and each record as soon as the job stores it.
 /// Returns what could not be measured, and what the job's points were made
@@ -551,9 +562,9 @@ pub fn measure_machine(
     request: &MeasureRequest,
     report: &mut dyn FnMut(MeasureEvent),
 ) -> MeasureEnd {
-    // The job's time runs from its start: discovering the machine and
-    // opening the executor are part of it.
-    let deadline = std::time::Instant::now() + request.time;
+    // The job's time runs from its start: discovering the machine, probing
+    // and opening the executor are part of it.
+    let deadlines = requests::JobDeadlines::new(std::time::Instant::now(), request.time);
     let machine = |reason: String| MeasureEnd {
         failures: vec![MeasureFailure::Machine { reason }],
         held: None,
@@ -576,7 +587,7 @@ pub fn measure_machine(
             let executor = catalog
                 .resolve(request.executor)
                 .map_err(|error| error.to_string())?;
-            let probes = catalog.probe(executor, &cache, deadline).map_err(|error| error.to_string())?;
+            let probes = catalog.probe(executor, &cache, deadlines.standing()).map_err(|error| error.to_string())?;
             for kept in &probes.kept {
                 tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
             }
@@ -618,7 +629,7 @@ pub fn measure_machine(
         &device,
         &records,
         &outstanding,
-        deadline,
+        deadlines,
         &mut |key| {
             // A point that ended two jobs is not timed again; the measurer
             // records it unobtainable with this reason.
@@ -670,9 +681,10 @@ pub fn measure_machine(
                     });
                     return;
                 }
-                // The job's time ended before the point read a sample: no
-                // failure of it, so its attempt is released, as a killed
-                // job's is, and the next job takes it.
+                // The job's time ended before a load's point, or a required
+                // figure's, read a sample (any other standing point's is
+                // priced, `Skipped`): no failure of it, so its attempt is
+                // released, as a killed job's is, and the next job takes it.
                 Outcome::Expired => {
                     if let Err(error) = markers.release(&key, request.job) {
                         unrecorded.borrow_mut().push(error);
@@ -818,19 +830,25 @@ mod tests {
         }
     }
 
-    /// A job whose time ends before its first point reads a sample leaves
-    /// every point expired, released uncounted, and reports no failure: its
-    /// time, not the machine, cut it off, so the jobs go on, the next given
-    /// longer, and measure.
+    /// A job whose time ends before its first point reads a sample prices
+    /// assessment's points rather than leaving them to a later job, but for
+    /// the required figures, which nothing prices: it stores the others'
+    /// records, so the next is given the first time, its time, not the
+    /// machine, cut it off, so it reports no failure of its own, and the
+    /// required figures stay outstanding until the next job measures them.
     #[test]
-    fn a_job_cut_off_before_its_first_sample_is_followed_by_a_longer_one() {
+    fn a_job_given_no_time_prices_assessments_points_but_the_required() {
+        use magnitude_executor::assessment::{CostWalk, Outstanding, PointRequest};
+        let required = |outstanding: &Outstanding| outstanding.standing.contains(&PointRequest::Costs(CostWalk::Required));
         let root = tempfile::tempdir().unwrap();
         let mut jobs = cut_off_jobs(root.path());
         let run = jobs.run().unwrap();
-        assert_eq!(jobs.request.job, MeasureJob(2), "the cut-off job is followed by one that measures");
-        assert_eq!(jobs.request.time, JobTime::first(), "twice no time, never less than the first");
-        assert_eq!(jobs.time.given(), JobTime::first(), "a job that measured gives the next the first time");
+        assert_eq!(jobs.request.job, MeasureJob(1), "the cut-off job stored records");
+        assert_eq!(jobs.time.given(), JobTime::first(), "a job that stored gives the next the first time");
+        assert!(required(&run.outstanding), "the required figures are left to the next job: {:?}", run.outstanding);
         assert!(run.failures.iter().all(|failure| !failure.fails_job()), "{:?}", run.failures);
+        let next = jobs.run().unwrap();
+        assert!(!required(&next.outstanding), "the next job measures them: {:?}", next.outstanding);
     }
 
     /// A job that measured nothing and reported no failure of its own gives

@@ -1,19 +1,24 @@
-#[cfg(test)]
-use super::weights::{CheckedLandingEntries, activation};
-use super::weights::{LandedReadPorts, LandingEntries, landed_read, reads_landed};
+use super::weights::{
+    CheckedLandingEntries, LandedReadPorts, LandingEntries, PlannedWeights, WeightView, activation, landed_read,
+};
+use crate::programs::graph::{
+    draft::Certified,
+    facts::{FactIndex, FactSink, Facts, RealIndex},
+};
 use crate::{
     ModelLoadPlan, TargetProgramPlan,
     native::AttestedTarget,
-    operators::per_layer::graph::{PerLayerEntryEntries, PerLayerEntryPorts, per_layer_entry},
+    operators::per_layer::graph::{PerLayerEntryEntries, PerLayerEntryPorts, per_layer_entry, split_entry},
     programs::graph::{GraphError, draft::GraphDraft},
     stored_table::SelectionNotice,
 };
 use magnitude_family_contracts::{Decoder, EmbeddingScale, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{embedding_rows, selection_notice};
 #[cfg(test)]
-use seismic::{BackendName, NativeGraphMetadata, NativeGraphStorageBytes};
+use seismic::NativeGraphStorageBytes;
+use seismic::{Argument, BackendName, ClassFact, NativeGraphClassSlice, NativeGraphMetadata, NativeGraphResourceTemplate, NativeGraphTraces};
 use seismic::{
-    Device, Element, NativeGraphLayout, NativeGraphPlan, NativePort, NativeTimelinePort,
+    Device, Dim, Element, NativeGraphLayout, NativeGraphPlan, NativePort, NativeTimelinePort,
     WorkflowTensor,
 };
 
@@ -29,8 +34,7 @@ pub(super) struct PerLayerEntryGraphSource<'a> {
     kernels: &'a crate::native::PerLayerEntryKernels,
     binding: crate::PerLayerEntryBinding,
     entry: &'a magnitude_family_contracts::PerLayerEntry,
-    projection: &'a crate::WeightPlan,
-    norm: &'a crate::WeightPlan,
+    load: &'a ModelLoadPlan,
     pub(super) layout: &'a NativeGraphLayout,
 }
 
@@ -53,8 +57,7 @@ impl<'a> PerLayerEntryGraphSource<'a> {
                 kernels,
                 binding,
                 entry,
-                projection: target_weight(load, WeightKind::PerLayerModelProjection)?,
-                norm: target_weight(load, WeightKind::PerLayerProjectionNorm)?,
+                load,
                 layout,
             })),
             _ => Err("the per-layer entry's kernels, binding and geometry disagree".into()),
@@ -63,14 +66,16 @@ impl<'a> PerLayerEntryGraphSource<'a> {
 
     pub(super) fn prepare(&self, device: &Device, rows: u64) -> Result<PreparedPerLayerEntryGraph, String> {
         let mut graph = device.native_graph_with_layout(self.layout);
+        let (topology, numbers) = split_entry(&self.binding, self.entry);
+        let topology = crate::programs::graph::facts::constant_reals(topology);
         let ports = per_layer_entry(
             &mut graph,
             PerLayerEntryEntries::from(self.kernels),
-            self.projection,
-            self.norm,
-            self.binding,
-            self.entry,
-            rows,
+            &topology,
+            &crate::programs::graph::facts::constant(numbers),
+            &target_view(self.load, WeightKind::PerLayerModelProjection)?,
+            &target_view(self.load, WeightKind::PerLayerProjectionNorm)?,
+            &seismic::Dim::from(rows),
         )
         .map_err(|error| format!("per-layer entry graph rows {rows}: {error}"))?;
         let plan = GraphDraft::seal(graph).map_err(|error| error.to_string())?;
@@ -83,7 +88,7 @@ impl<'a> PerLayerEntryGraphSource<'a> {
 }
 
 /// How an entry graph receives its `[rows, 2]` (token, status) input rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum EntryTokens {
     /// Written by the host into the step's upload region.
     Uploaded,
@@ -149,9 +154,9 @@ impl PreparedTargetEntryGraph {
             notice,
             landing.map(LandingEntries::native),
             keeps_token_rows(load),
-            embedding_weight(load)?,
-            geometry,
-            rows,
+            &load.weight(TARGET_TABLE).map_err(|error| error.to_string())?,
+            EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
+            &Dim::from(rows),
             source,
         )
         .map_err(|error| error.to_string())?;
@@ -211,18 +216,9 @@ pub(super) fn token_rows_extents(load: &ModelLoadPlan, rows: u64) -> Option<[u64
     keeps_token_rows(load).then_some([rows, 2])
 }
 
-pub(super) fn embedding_weight(load: &ModelLoadPlan) -> Result<&crate::WeightPlan, String> {
-    target_weight(load, WeightKind::Embedding)
-}
-
-pub(super) fn target_weight(load: &ModelLoadPlan, kind: WeightKind) -> Result<&crate::WeightPlan, String> {
-    let role = WeightRole {
-        scope: WeightScope::Target,
-        kind,
-    };
-    load.weights()
-        .find(|weight| weight.role == role)
-        .ok_or_else(|| format!("target weight {kind:?} is absent"))
+/// The view of the target's planned weight of `kind`.
+pub(super) fn target_view(load: &ModelLoadPlan, kind: WeightKind) -> Result<WeightView, String> {
+    load.weight(WeightRole { scope: WeightScope::Target, kind }).map_err(|error| error.to_string())
 }
 
 /// An entry graph before it is sealed, and its external ports.
@@ -251,31 +247,25 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     notice: Option<G::Binding<'a, selection_notice::Entry>>,
     landing: Option<LandingEntries<'a, G>>,
     keeps_tokens: bool,
-    weight: &crate::WeightPlan,
-    geometry: &Decoder,
-    rows: u64,
+    weight: &WeightView,
+    width: EntryWidth<'_>,
+    rows: &Dim,
     source: EntryTokens,
 ) -> Result<EntryGraphDraft<G>, GraphError> {
     let table = graph.port(weight.resident, &weight.shape)?;
+    let two = Dim::from(2);
     // Uploaded tokens are the host's: of a streamed table it writes their
     // slots. Selected tokens are the device's, which finds their slots in
     // the directory.
     let [entries, fields] = match source {
-        EntryTokens::Uploaded => [0, 1],
-        EntryTokens::Selected => weight.directory_shape(),
+        EntryTokens::Uploaded => [Dim::from(0), Dim::from(1)],
+        EntryTokens::Selected => weight.directory.clone(),
     };
-    let dimensions = [
-        ("M", rows),
-        ("V", weight.shape[0]),
-        ("D", geometry.hidden),
-        ("R", entries),
-        ("F", fields),
-    ];
+    let table_rows = weight.shape.first().ok_or("the token table has no rows")?;
+    let dimensions = [("M", rows), ("V", table_rows), ("D", width.hidden), ("R", &entries), ("F", &fields)];
     let tokens = match source {
         EntryTokens::Uploaded => graph.input_for(embedding, "tokens", &dimensions)?,
-        EntryTokens::Selected => {
-            graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?
-        }
+        EntryTokens::Selected => graph.port_with_class_extent(Element::i32(), &[rows, &two], 0, "M")?,
     };
     // Selected tokens reach the host first, as early in the step as they
     // can: the filler of a stored table learns from them the rows the step
@@ -285,7 +275,7 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     let copy_entry = notice;
     let notice = match (notice, source) {
         (Some(entry), EntryTokens::Selected) => {
-            let mut copied = graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?;
+            let mut copied = graph.port_with_class_extent(Element::i32(), &[rows, &two], 0, "M")?;
             graph.enqueue::<selection_notice::Entry>(
                 entry,
                 &[("M", rows)],
@@ -308,8 +298,7 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         (true, EntryTokens::Uploaded) => {
             let copy = copy_entry.ok_or("kept token rows need the token row copy entry")?;
             let uploaded = graph.input_for(copy, "selection", &[("M", rows)])?;
-            let mut rows_port =
-                graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?;
+            let mut rows_port = graph.port_with_class_extent(Element::i32(), &[rows, &two], 0, "M")?;
             graph.enqueue::<selection_notice::Entry>(
                 copy,
                 &[("M", rows)],
@@ -325,8 +314,8 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         }
         _ => None,
     };
-    let directory = graph.port(Element::i32(), &[entries, fields])?;
-    let (scale, normalize, epsilon) = embedding_transform(geometry);
+    let directory = graph.port(Element::i32(), &[&entries, &fields])?;
+    let (scale, normalize, epsilon) = width.transform;
     let embed = |graph: &mut G| {
         graph.enqueue::<embedding_rows::Entry>(
             embedding,
@@ -336,13 +325,13 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
                 tokens: tokens.tensor().into(),
                 directory: directory.tensor().into(),
                 scale,
-                normalize,
+                normalize: normalize.into(),
                 epsilon,
             },
         )
     };
     let (result, landed) = match source {
-        EntryTokens::Selected if reads_landed(weight)? => {
+        EntryTokens::Selected if weight.reads_landed()? => {
             let landing = landing
                 .ok_or_else(|| format!("a landed read of {:?} without its entries", weight.role))?;
             let (result, ports) = landed_read(
@@ -371,6 +360,99 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     })
 }
 
+/// What decides a target entry graph's topology: everything it is built
+/// from but its numbers (its token table's extents, its rows and width),
+/// which are facts of its trace (`certify_entry`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct EntryTopology {
+    backend: BackendName,
+    source: EntryTokens,
+    activation: Element,
+    notifies: bool,
+    landing: Option<CheckedLandingEntries>,
+    keeps_tokens: bool,
+    transform: (RealIndex, i32, RealIndex),
+    table: WeightView<FactIndex>,
+    rows: FactIndex,
+    hidden: FactIndex,
+}
+
+/// The target entry graphs' traces, one per topology.
+pub(super) static ENTRY_TRACES: NativeGraphTraces<EntryTopology, ()> = NativeGraphTraces::new();
+
+/// The template of a target entry graph of `topology` at `facts`.
+fn record_entry(
+    topology: &EntryTopology,
+    facts: &[Dim],
+    reals: &seismic::Reals,
+) -> Result<(NativeGraphResourceTemplate, ()), GraphError> {
+    let facts = Facts::new(facts, reals);
+    let weight = facts.dims(topology.table.clone());
+    let elements = [("EW", weight.resident), ("A", topology.activation)];
+    let (scale, normalize, epsilon) = topology.transform;
+    let draft = entry_graph_topology(
+        NativeGraphMetadata::new_template(topology.backend),
+        &elements,
+        topology.notifies.then_some(&[][..]),
+        topology.landing.as_ref().map(CheckedLandingEntries::entries),
+        topology.keeps_tokens,
+        &weight,
+        EntryWidth { hidden: &facts.dim(topology.hidden), transform: (facts.real(scale).f32(), normalize, facts.real(epsilon).f32()) },
+        &facts.dim(topology.rows),
+        topology.source,
+    )?;
+    Ok((draft.graph.seal_template()?, ()))
+}
+
+/// The target entry graph of `source`, certified over the row classes
+/// `row_classes`, the largest `largest_rows`: from the entry graphs' traces
+/// (`Certified::traced_each`).
+pub(super) fn certify_entry<L: Certified>(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    source: EntryTokens,
+    row_classes: &[u64],
+    largest_rows: u64,
+) -> Result<L, GraphError> {
+    let (scale, normalize, epsilon) = embedding_transform(geometry);
+    let mut facts = FactSink::new();
+    let topology = EntryTopology {
+        backend,
+        source,
+        activation: activation(geometry),
+        notifies: notifies_selection(load),
+        landing: CheckedLandingEntries::of(load, TARGET_TABLE)?,
+        keeps_tokens: keeps_token_rows(load),
+        transform: (facts.real(f64::from(scale)), normalize, facts.real(f64::from(epsilon))),
+        table: facts.index(WeightView::planned(load, TARGET_TABLE)?),
+        rows: facts.fact(largest_rows),
+        hidden: facts.fact(geometry.hidden),
+    };
+    let rows = ClassFact { fact: topology.rows.position(), scope: None, dimension: "M" };
+    let slices = [vec![NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())]];
+    let [(layout, ())] = <[_; 1]>::try_from(
+        L::traced_each(&ENTRY_TRACES, &topology, &facts, &[rows], &slices, record_entry)
+            .map_err(|error| error.context("target entry graph"))?,
+    )
+    .unwrap_or_else(|_| unreachable!("one slice set certifies to one layout"));
+    Ok(layout)
+}
+
+/// What an entry graph embeds into: the rows' width and `embedding_rows`'
+/// transform (`embedding_transform`).
+#[derive(Clone, Copy)]
+pub(super) struct EntryWidth<'d> {
+    pub(super) hidden: &'d Dim,
+    pub(super) transform: (Argument<f32>, i32, Argument<f32>),
+}
+
+/// A constant transform (`embedding_transform`) as `embedding_rows` takes
+/// its arguments.
+pub(super) fn transform_arguments((scale, normalize, epsilon): (f32, i32, f32)) -> (Argument<f32>, i32, Argument<f32>) {
+    (scale.into(), normalize, epsilon.into())
+}
+
 /// `embedding_rows`' (`scale`, `normalize`, `epsilon`) for the decoder's
 /// entry form: the text-row scale, and the unweighted RMS when present (its
 /// epsilon is not read otherwise).
@@ -393,7 +475,7 @@ pub(crate) fn checked_entry_graph_storage(
     rows: u64,
     uploaded: bool,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    let weight = embedding_weight(load)?;
+    let weight = load.weight(TARGET_TABLE)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
     let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     let draft = entry_graph_topology(
@@ -402,9 +484,9 @@ pub(crate) fn checked_entry_graph_storage(
         notifies_selection(load).then_some(&[][..]),
         landing.as_ref().map(CheckedLandingEntries::entries),
         keeps_token_rows(load),
-        weight,
-        geometry,
-        rows,
+        &weight,
+        EntryWidth { hidden: &Dim::from(geometry.hidden), transform: transform_arguments(embedding_transform(geometry)) },
+        &Dim::from(rows),
         if uploaded {
             EntryTokens::Uploaded
         } else {

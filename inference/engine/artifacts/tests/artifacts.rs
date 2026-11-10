@@ -448,7 +448,7 @@ fn a_header_cut_short_is_truncated_and_one_past_the_limit_is_invalid() {
     let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
         panic!("a whole header");
     };
-    let text = header.entries[0].head.end;
+    let text = header.entries[0].head().end;
     for (length, beyond) in [(gguf::HEADER_LIMIT - text, false), (gguf::HEADER_LIMIT - text + 1, true)] {
         bytes[text - 8..text].copy_from_slice(&(length as u64).to_le_bytes());
         let error = gguf::read_directory(&mut Cursor::new(bytes.clone())).unwrap_err();
