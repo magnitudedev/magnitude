@@ -321,7 +321,14 @@ export const showModel = (input: string, options: JsonOption = {}) => commandEff
       }))
     }
     if (Option.isNone(parseHuggingFaceReference(reference))) {
-      return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
+      // A catalog model named without its quant (`lfm3-1.7b`) is shown at the quant chosen for this computer.
+      const rung = yield* withClient((client) => readRecommendations(client, Option.none())).pipe(
+        Effect.map(({ models }) => Option.fromNullable(models.find(({ base }) => base === reference.toLowerCase())).pipe(
+          Option.flatMap(({ chosen, rungs }) => Option.orElse(chosen, () => Option.fromNullable(rungs[0])))),
+        ),
+      )
+      if (Option.isNone(rung)) return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
+      return { _tag: "Model" as const, result: yield* withClient((client) => readModelDetail(client, rung.value)) }
     }
     return { _tag: "Repository" as const, view: yield* withClient((client) => readInspection(client, reference)) }
   }),
