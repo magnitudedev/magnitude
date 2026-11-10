@@ -33,6 +33,16 @@ fn module() -> CheckedModule {
         path: "streams.seismic".into(),
         text: include_str!("../kernels/streams.seismic").into(),
     });
+    // The Sinkhorn sites split at `DECODE_ROWS`, which `routed.seismic`
+    // declares, beside the words it reads.
+    sources.push(SourceFile {
+        path: "routed.seismic".into(),
+        text: include_str!("../kernels/routed.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "streaming_words.seismic".into(),
+        text: include_str!("../kernels/streaming_words.seismic").into(),
+    });
     crate::common::check(sources)
 }
 
@@ -900,16 +910,31 @@ fn portable_sinkhorn_site_matches_the_single_pass_formulas() {
     }
 }
 
-/// The natives at V4.1's geometry, for decode and prefill rows, over two
+/// The natives at V4.1's geometry, for decode rows (split across
+/// threadgroups, to the last decode row) and prefill rows, over two
 /// consecutive sites joined by the comb scatter, the second site reading
 /// the streams and pre the first left: each site's input, pre and join row,
 /// and the joined streams, against the formulas over the natives' inputs.
 #[test]
 fn native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas() {
+    check_sinkhorn_sites(&[1, 2, 7, 8, 20]);
+}
+
+/// Prefill rows in the GPU natives' row tiles (16 rows, two a simdgroup): 9
+/// rows, the fewest past the decode rows, one partial tile whose second rows
+/// only its first simdgroup holds; 17, a whole tile and a tile of one row.
+#[test]
+fn native_sinkhorn_prefill_tiles_match_the_single_pass_formulas() {
+    check_sinkhorn_sites(&[9, 17]);
+}
+
+/// [`native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas`] at
+/// each of `row_counts`.
+fn check_sinkhorn_sites(row_counts: &[usize]) {
     let (h, s, n) = V41;
     let width = s * h;
     let sites = [Sinkhorn::new(h, s, 51), Sinkhorn::new(h, s, 61)];
-    for rows in [1, 2, 7, 20] {
+    for &rows in row_counts {
         let mut x = pattern(rows * width, 71 + rows as u32, 2.0);
         for (index, value) in x.iter_mut().enumerate() {
             *value *= 1.0 + (index % width / h) as f32;
@@ -1130,5 +1155,85 @@ fn native_stream_collapse_matches_its_formula() {
                 &bound,
             );
         }
+    }
+}
+
+/// Metal's or CUDA's `stream_mix_sinkhorn` at V4.1's geometry (S 4, H 5120)
+/// at decode rows: one row at 20 Sinkhorn iterations and at none (their
+/// difference the normalizations' serial cost), and the last decode row
+/// count at 20; and at V4.1's prefill shape, a 2048-token prompt's rows at
+/// 20. Each call reads one of 32 function matrices (63 MB), so they stream
+/// from memory as a step's layers do. Interleaved round by round, best batch
+/// of each.
+#[test]
+#[ignore = "timing"]
+fn native_sinkhorn_split_timing() {
+    use seismic::BackendName::{Cuda, Metal};
+    let Some(device) = seismic_native_tests::devices(&[Cuda, Metal]).into_iter().next() else {
+        return;
+    };
+    let (h, s, n) = V41;
+    let mixes = (2 + s) * s;
+    let functions = (0..32u32)
+        .map(|copy| tensor(&device, DType::F32, &[mixes, s * h], &pattern(mixes * s * h, 300 + copy, 0.01)))
+        .collect::<Vec<_>>();
+    let base = tensor(&device, DType::F32, &[mixes], &pattern(mixes, 52, 1.0));
+    let scale = tensor(&device, DType::F32, &[3], &[0.6, 0.9, 1.7]);
+    let specialization = seismic::generated::native_implementation::<stream_mix_sinkhorn::Entry>(&device)
+        .unwrap()
+        .unwrap()
+        .default_specialization(&seismic::NativeSpecialization::new().with_static("H", h as u64).with_static("S", s as u64))
+        .unwrap();
+    let kernel = stream_mix_sinkhorn::native_for_device(&device, &specialization).unwrap();
+    // (rows, iterations)
+    let cases = [(1usize, n), (1, 0), (8, n), (2048, n)];
+    let rows_of = |rows: usize| {
+        (
+            tensor(&device, DType::F32, &[rows, s, h], &pattern(rows * s * h, 71, 2.0)),
+            tensor(&device, DType::F32, &[rows, s], &narrow(&entry_pre(rows, s))),
+            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, h as u64]).unwrap(),
+            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, s as u64]).unwrap(),
+            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, (s + s * s) as u64]).unwrap(),
+        )
+    };
+    let mut tensors = cases.iter().map(|&(rows, _)| rows_of(rows)).collect::<Vec<_>>();
+    const CALLS: u32 = 64;
+    let mut best = vec![std::time::Duration::MAX; cases.len()];
+    for _ in 0..10 {
+        for ((&(_, iterations), (hidden, previous, input, pre, join)), best) in
+            cases.iter().zip(&mut tensors).zip(&mut best)
+        {
+            let mut batch = seismic::NativeTensorBatch::new(&device);
+            for call in 0..CALLS as usize {
+                batch
+                    .push(
+                        &kernel,
+                        stream_mix_sinkhorn::Args {
+                            hidden: &*hidden,
+                            previous: &*previous,
+                            function: &functions[call % functions.len()],
+                            base: &base,
+                            scale: &scale,
+                            epsilon: V41_EPSILON,
+                            norm_epsilon: V41_NORM_EPSILON,
+                            iterations: u32::try_from(iterations).unwrap(),
+                        },
+                        stream_mix_sinkhorn::OutputArgs { r0: &mut *input, r1: &mut *pre, r2: &mut *join },
+                    )
+                    .unwrap();
+            }
+            let started = std::time::Instant::now();
+            batch.submit().unwrap().wait().unwrap();
+            *best = (*best).min(started.elapsed() / CALLS);
+        }
+    }
+    let function_bytes = (mixes * s * h * 4) as f64;
+    for ((rows, iterations), best) in cases.iter().zip(&best) {
+        println!(
+            "{:?} M {rows} iterations {iterations:>2}: {:>7.1} us, {:>6.1} GB/s of the function matrix",
+            device.backend(),
+            best.as_secs_f64() * 1e6,
+            function_bytes / best.as_secs_f64() / 1e9
+        );
     }
 }
