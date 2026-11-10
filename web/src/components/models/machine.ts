@@ -28,6 +28,6 @@ export const machineView = (hardware: LocalInferenceHardware, identity: MachineI
     gpus: gpus.map(({ name, memoryBytes }) => ({ name, memoryBytes })),
     servingGpu: Math.max(0, gpus.findIndex(gpu => gpu.serving)),
     ramBytes: hardware.totalSystemMemoryBytes,
-    freeDiskBytes: null,
+    freeDiskBytes: Option.getOrNull(Option.map(hardware.modelStorage, storage => storage.freeBytes)),
   }
 }
