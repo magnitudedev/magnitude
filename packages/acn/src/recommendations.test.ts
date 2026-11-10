@@ -95,7 +95,7 @@ describe("recommendations", () => {
   it("is complete only once every rung of a listed model is measured, speed included", () => {
     const measured = rung({ id: "a:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 30 })
     expect(project([measured]).complete).toBe(true)
-    expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, assessing: true })]).complete).toBe(false)
+    expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, assessing: true })])).toMatchObject({ complete: false, measured: 1, rungs: 2 })
     expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB })]).complete).toBe(false)
     expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, fits: false })]).complete).toBe(true)
   })

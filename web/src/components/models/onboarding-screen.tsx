@@ -33,9 +33,9 @@ export function OnboardingScreen() {
     { label: preparationLabels[1], done: Result.isSuccess(hardware), detail: null, fraction: null },
     { label: preparationLabels[2], done: preparation?.discovery.complete ?? false,
       detail: preparation && (preparation.discovery.complete || preparation.discovery.modelsFound > 0) ? `${plural(preparation.discovery.modelsFound, "model")} found` : null, fraction: null },
-    { label: preparationLabels[3], done: (preparation?.assessment.complete ?? false) && recommendations.ready && recommendations.measuring === null,
-      detail: preparation && preparation.assessment.totalModels > 0 ? `${preparation.assessment.settledModels} of ${plural(preparation.assessment.totalModels, "model")}` : null,
-      fraction: preparation && preparation.assessment.totalModels > 0 ? preparation.assessment.settledModels / preparation.assessment.totalModels : null },
+    { label: preparationLabels[3], done: recommendations.ready && recommendations.measuring === null,
+      detail: recommendations.measuring && recommendations.measuring.total > 0 ? `${recommendations.measuring.settled} of ${plural(recommendations.measuring.total, "quant")}` : null,
+      fraction: recommendations.measuring && recommendations.measuring.total > 0 ? recommendations.measuring.settled / recommendations.measuring.total : null },
   ]
   const active = progress.findIndex(step => !step.done)
   const steps: readonly PreparationStep[] | null = active === -1 ? null

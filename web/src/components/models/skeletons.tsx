@@ -51,7 +51,7 @@ export function MeasuringRecommendations({ settled, total }: { settled: number; 
     <div role="status" aria-live="polite" className="mb-3">
       <p className="flex items-center justify-between gap-3 text-[13px] text-slate-600 dark:text-slate-400">
         <span>Measuring how each model runs on your machine…</span>
-        {total > 0 && <span className="text-xs tabular-nums text-slate-500">{settled} of {total} models</span>}
+        {total > 0 && <span className="text-xs tabular-nums text-slate-500">{settled} of {total} quants</span>}
       </p>
       <div className="mt-2 h-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-750">
         <div className="h-full rounded-full bg-blue-600 transition-[width] duration-500 dark:bg-blue-400" style={{ width: `${total > 0 ? Math.max(0.04, settled / total) * 100 : 4}%` }} />

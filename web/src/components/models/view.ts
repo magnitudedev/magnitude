@@ -8,7 +8,7 @@ export interface PlacementTier {
   readonly bytes: number
 }
 
-export type PlacementPhrase = "Fits in GPU" | "Fits in memory" | "Streams from RAM" | "Streams from SSD"
+export type PlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory" | "Streams from RAM" | "Streams from SSD"
 
 /** One quant of a model as this machine would run it. */
 export interface QuantView {

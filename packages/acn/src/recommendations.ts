@@ -131,13 +131,17 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
     const parsed = parseModelId(model.modelId)
     return parsed._tag === "Catalog" ? parsed.baseId : model.modelId
   })
-  let complete = true
+  let measured = 0
+  let rungs = 0
   const models = Object.entries(ladders).flatMap(([base, variants]): readonly RecommendedModel[] => {
     const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
       .map((model) => rung(model, inputs.hardware))
     if (!Array.isNonEmptyReadonlyArray(ladder)) return []
     const first = ladder[0].model
-    if (!comingSoon(first) && ladder.some((candidate) => !candidate.measured)) complete = false
+    if (!comingSoon(first)) {
+      rungs += ladder.length
+      measured += ladder.filter((candidate) => candidate.measured).length
+    }
     const chosen = comingSoon(first) ? Option.none() : chooseRung(ladder)
     return [{
       base: base as CatalogBaseId,
@@ -150,7 +154,7 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
       meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
     }]
   })
-  return { complete, models: Array.sort(models, recommendationOrder), families: inputs.families }
+  return { complete: measured === rungs, measured, rungs, models: Array.sort(models, recommendationOrder), families: inputs.families }
 }
 
 export interface RecommendationsApi {

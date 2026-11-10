@@ -30,11 +30,11 @@ export function useRecommendations(usOnly: boolean, unified: boolean): Recommend
   const models = useLocalModels()
   return useMemo(() => {
     if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], families: [] }
-    const assessment = models.value.preparation.assessment
+    const { complete, measured, rungs } = recommendations.value
     const byId = new Map<string, LocalModel>(models.value.models.map(model => [model.modelId, model]))
     return {
       ready: true,
-      measuring: recommendations.value.complete ? null : { settled: assessment.settledModels, total: assessment.totalModels },
+      measuring: complete ? null : { settled: measured, total: rungs },
       offered: recommendations.value.models.flatMap(recommendation => {
         const model = offeredFromRecommendation(recommendation, byId, unified)
         return model ? [{ recommendation, model }] : []

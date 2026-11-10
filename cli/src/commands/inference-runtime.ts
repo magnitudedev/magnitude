@@ -350,14 +350,14 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
     ...memory.domains.flatMap((domain) => [
       `  ${domain.label}`,
       ...(domain.usedBytes === null || domain.freeBytes === null ? [`  ${domain.notice ?? "Current memory usage is unavailable."}`] : [
-        `  ${formatMemorySize(domain.usedBytes)} / ${formatMemorySize(domain.totalBytes)} used`,
+        `  ${formatMemoryCapacity(domain.usedBytes)} / ${formatMemoryCapacity(domain.totalBytes)} used`,
         ...(Option.isSome(allocation) ? [
-          `  Weights       ${formatMemorySize(domain.weightsBytes ?? 0)}`,
-          `  Context       ${formatMemorySize(domain.kvCacheBytes ?? 0)}`,
-          `  Overhead      ${formatMemorySize(domain.overheadBytes ?? 0)}`,
-          `  System & apps ${formatMemorySize(domain.systemAndAppsBytes ?? 0)}`,
+          `  Weights       ${formatMemoryCapacity(domain.weightsBytes ?? 0)}`,
+          `  Context       ${formatMemoryCapacity(domain.kvCacheBytes ?? 0)}`,
+          `  Overhead      ${formatMemoryCapacity(domain.overheadBytes ?? 0)}`,
+          `  System & apps ${formatMemoryCapacity(domain.systemAndAppsBytes ?? 0)}`,
         ] : []),
-        `  Free          ${formatMemorySize(domain.freeBytes)}`,
+        `  Free          ${formatMemoryCapacity(domain.freeBytes)}`,
       ]),
     ]),
     "",

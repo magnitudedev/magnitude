@@ -2007,10 +2007,13 @@ export type RecommendedModel = typeof RecommendedModelSchema.Type
 
 /**
  * The tested models in recommendation order, and the families Magnitude runs. The order and chosen rungs are final
- * only once `complete`: every rung has been measured on this machine, so none is still counted as not fitting.
+ * only once `complete`: every rung of a listed model has been measured on this machine (`measured` of `rungs`), so
+ * none is still counted as not fitting. Catalog entries no recommendation lists never hold it back.
  */
 export const RecommendationsSchema = Schema.Struct({
   complete: Schema.Boolean,
+  measured: Schema.NonNegativeInt,
+  rungs: Schema.NonNegativeInt,
   models: Schema.Array(RecommendedModelSchema),
   families: Schema.Array(LocalModelFamilySchema),
 })

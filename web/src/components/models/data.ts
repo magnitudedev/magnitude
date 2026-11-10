@@ -32,7 +32,7 @@ const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
 
 export const phraseOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): PlacementPhrase =>
   assessment.residency._tag === "Resident"
-    ? unified ? "Fits in memory" : "Fits in GPU"
+    ? unified ? "Fits in memory" : assessment.placement.hostBytes > 0 ? "GPU and RAM" : "Fits in GPU"
     : assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
 
 const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): readonly PlacementTier[] => [

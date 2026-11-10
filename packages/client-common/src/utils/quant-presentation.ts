@@ -31,10 +31,13 @@ export const formatQuantLabel = (name: string, repository: Option.Option<string>
   name,
 ].join(" ")
 
-/** How a fitting quant runs on this machine, from its placement: held whole in memory, or streamed from RAM or disk. */
+/**
+ * How a fitting quant runs on this machine, from its placement: held whole in memory (on a discrete GPU, in its memory
+ * alone or split with host RAM), or its experts streamed from RAM or disk.
+ */
 export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, unifiedMemory: boolean): string =>
   assessment.residency._tag === "Resident"
-    ? unifiedMemory ? "Fits in memory" : "Fits in GPU"
+    ? unifiedMemory ? "Fits in memory" : assessment.placement.hostBytes > 0 ? "GPU and RAM" : "Fits in GPU"
     : assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk"
       ? "Streams from SSD"
       : "Streams from RAM"
