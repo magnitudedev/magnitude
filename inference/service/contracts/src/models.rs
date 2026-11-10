@@ -2784,12 +2784,12 @@ pub struct MemoryBreakdown {
     pub overhead_bytes: u64,
 }
 
-/// Where a fitting model is placed on this machine before any load, by tier: `device_bytes` held
-/// in the serving device's memory (GPU memory, or unified memory on Apple silicon), `host_bytes`
-/// held in host RAM beside a discrete device (a streamed model's host tier, host tables, graphs
-/// and the process; none on unified memory), the two together the memory breakdown's total and the
-/// host tier's growth into the host memory the fit leaves, and `disk_bytes` read from the model file as needed rather than held (routed experts neither the
-/// expert bank nor the host tier holds, and side-table rows beyond their caches, as stored).
+/// Where a fitting model's weights are held as it runs, as its files store them, so the three sum
+/// to its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on
+/// Apple silicon), a table read by rows among them; `host_bytes` the routed experts only a
+/// streamed model's host tier holds, in host RAM beside a discrete device; `disk_bytes` the routed
+/// experts neither holds, read from the model file as needed. What it holds beside its weights is
+/// its memory breakdown's.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

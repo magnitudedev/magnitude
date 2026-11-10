@@ -69,7 +69,7 @@ pub use weights::{
     NGramBinding, NGramGateForm, NGramRowRule, NGramTaps, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
     ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoundingArgs, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlacement, WeightPlan, WeightScalePlan, WeightStorageIdentity,
     held_storage, resident_element, resident_elements, resident_layout, scaled_source_element,
     rounding_args, source_element, stored_weights,
 };

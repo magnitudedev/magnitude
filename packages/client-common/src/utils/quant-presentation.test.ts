@@ -48,10 +48,9 @@ describe("quant presentation", () => {
     expect(ladderBitWidths(["Q2_0", "IQ3_S", "custom"])).toEqual([Option.some(2), Option.some(3), Option.none()])
   })
 
-  it("says a discrete GPU's model is split only when its weights and conversation don't all fit in GPU memory", () => {
-    expect(fitPlacementPhrase(resident(12 * GB, GB), "Device")).toBe("Fits in GPU")
-    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "Device")).toBe("GPU and RAM")
-    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "Unified")).toBe("Fits in memory")
-    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), "System")).toBe("Fits in memory")
+  it("says a model holding every weight fits the memory it serves from", () => {
+    expect(fitPlacementPhrase(resident(10 * GB, 0), "Device")).toBe("Fits in GPU")
+    expect(fitPlacementPhrase(resident(10 * GB, 0), "Unified")).toBe("Fits in memory")
+    expect(fitPlacementPhrase(resident(10 * GB, 0), "System")).toBe("Fits in memory")
   })
 })

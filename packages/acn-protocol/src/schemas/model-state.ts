@@ -943,11 +943,10 @@ export const LocalModelMemorySchema = Schema.Struct({
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
 /**
- * Where a fitting model is placed on this machine before any load, by tier: `deviceBytes` held in
- * the serving device's memory (GPU memory, or unified memory on Apple silicon), `hostBytes` in host
- * RAM beside a discrete device (a streamed model's host tier, host tables, graphs and the process;
- * none on unified memory), and `diskBytes` read from the model file as needed rather than held (streamed experts neither tier
- * holds, and side-table rows beyond their caches).
+ * Where a fitting model's weights are held as it runs, as its files store them, so the three sum to its weights:
+ * `deviceBytes` in the serving device's memory (GPU memory, or unified memory on Apple silicon), `hostBytes` the routed
+ * experts only a streamed model's host tier holds in host RAM, and `diskBytes` the routed experts neither holds, read
+ * from the model file as needed.
  */
 export const LocalModelPlacementSchema = Schema.Struct({
   deviceBytes: NonNegativeSafeInteger,

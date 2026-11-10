@@ -67,23 +67,17 @@ pub struct MemoryBreakdown {
     pub overhead_bytes: u64,
 }
 
-/// Where a fitting plan places the model on this machine before any load,
-/// by tier, from the plan and its fit. `device_bytes` is what the fit
-/// requires of the serving device's memory (its allocation domains: GPU
-/// memory, or unified memory on Apple silicon), and `host_bytes` what the
-/// plan holds in host RAM beside a discrete device: what the fit requires
-/// of its staging domains (host tables' row caches, graphs, the process and
-/// a streamed plan's host tier at its landing reserve), and the host tier's
-/// slots beyond that reserve, which grow into the host memory the fit
-/// leaves (`ModelLoadPlan::host_tier_bytes`); none on unified memory, where
-/// host RAM is the device's memory. The two sum to the fit's required
-/// bytes, its [`MemoryBreakdown`]'s weights, context and overhead, and that
-/// growth. `disk_bytes` is what the plan reads from
-/// the model file as steps name it rather than holding it
-/// (`ModelLoadPlan::unheld_bytes`): the routed experts neither its bank nor
-/// its host tier holds, and the rows of side tables (n-gram tables) beyond
-/// their slots and row caches, as stored. A plan that holds every weight
-/// whole reads none from disk.
+/// How a fitting plan holds the model's weights as it runs, as its files
+/// store them, so the three sum to the weights' stored bytes: `device_bytes`
+/// held in the serving device's memory (GPU memory, or unified memory on
+/// Apple silicon), `host_bytes` the routed experts only a streamed plan's
+/// host tier holds, in host RAM beside a discrete device, and `disk_bytes`
+/// the routed experts neither holds, which its misses read from the model
+/// file (`ModelLoadPlan::weight_placement`). A table read by rows (an
+/// embedding, an n-gram table) is held: its rows are read from the file as
+/// they are named and stay in the OS file cache. What the plan holds beside
+/// its weights (the conversation's state, graphs, buffers) is its
+/// [`MemoryBreakdown`]'s, not its placement's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelPlacement {
     pub device_bytes: u64,
@@ -92,22 +86,10 @@ pub struct ModelPlacement {
 }
 
 impl ModelPlacement {
-    /// The placement of `load`, whose fit reached `domains`.
-    pub fn of(load: &crate::ModelLoadPlan, domains: &[DomainFit]) -> Result<Self, String> {
-        let required = |role: DomainRole| {
-            domains
-                .iter()
-                .filter(|domain| domain.role == role)
-                .try_fold(0u64, |total, domain| total.checked_add(domain.required_bytes))
-                .ok_or_else(|| "required bytes overflow".to_owned())
-        };
-        Ok(Self {
-            device_bytes: required(DomainRole::Allocation)?,
-            host_bytes: required(DomainRole::Staging)?
-                .checked_add(load.host_tier_bytes()?)
-                .ok_or_else(|| "host bytes overflow".to_owned())?,
-            disk_bytes: load.unheld_bytes()?,
-        })
+    /// The placement of `load`'s weights.
+    pub fn of(load: &crate::ModelLoadPlan) -> Result<Self, String> {
+        let crate::WeightPlacement { held, host, streamed } = load.weight_placement()?;
+        Ok(Self { device_bytes: held, host_bytes: host, disk_bytes: streamed })
     }
 }
 
@@ -633,7 +615,7 @@ pub fn assess_execution_fit(
         Ok(ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             breakdown: charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
-            placement: ModelPlacement::of(draft.load(), &fit.domains).map_err(AssessmentError::Memory)?,
+            placement: ModelPlacement::of(draft.load()).map_err(AssessmentError::Memory)?,
             domains: fit.domains,
             bank: draft.load().expert_bank().cloned(),
         }))
@@ -869,13 +851,10 @@ pub(crate) mod tests {
         assert_eq!(fit.residency(), Residency::Resident);
         let ExecutionFit { fit_context_tokens, domains, breakdown, placement, .. } = fit;
         assert_eq!(fit_context_tokens, 150_000);
-        // A resident plan of no side table reads nothing from disk, and
-        // its tiers hold what its domains require.
-        assert_eq!(placement.disk_bytes, 0);
-        assert_eq!(
-            placement.device_bytes + placement.host_bytes,
-            breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes
-        );
+        // A resident plan holds every weight in the device's memory: none in
+        // a host tier, none read from disk.
+        assert_eq!((placement.host_bytes, placement.disk_bytes), (0, 0));
+        assert!(placement.device_bytes > 0);
         assert!(breakdown.weights_bytes > 0 && breakdown.context_bytes > 0);
         assert_eq!(
             breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes,

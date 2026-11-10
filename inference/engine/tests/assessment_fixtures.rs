@@ -1084,59 +1084,55 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     );
 }
 
-/// Each tier of a fit's placement is the plan's: Qwen3.6 35B on the M4 Pro
-/// resident holds every byte it requires in unified memory and reads from
-/// disk only its streamed token table's rows beyond the table's slots;
-/// with room for its whole weights and nothing beside them it streams, its
-/// device bytes still what its fit requires and its disk bytes beside the
-/// table's every expert its bank does not hold, as stored; on the recorded
-/// RTX 3090 with 8 GB of its device reserved, host RAM holds what the fit
-/// requires there and its host tier's growth past the landing reserve the
-/// fit charges, and disk the experts neither tier holds beside the table's
-/// rows.
+/// A fit's placement is where its weights are held as they run, as stored,
+/// so every plan of the same weights places the same bytes. Qwen3.6 35B on
+/// the M4 Pro resident holds all of them in unified memory, its token table
+/// (read by rows) among them; with room for its whole weights and nothing
+/// beside them it streams, reading from disk exactly the experts its bank
+/// does not hold; on the recorded RTX 3090 with 8 GB of its device reserved,
+/// host RAM holds the experts only its host tier holds, and disk those
+/// neither holds.
 #[test]
-fn a_fits_placement_is_its_plans_tiers() {
+fn a_fits_placement_is_where_its_weights_are_held() {
     let scratch = Scratch::new("qwen36-placement");
     let package = qwen36_35b(&scratch);
-    let required = |fit: &ExecutionFit| fit.breakdown.weights_bytes + fit.breakdown.context_bytes + fit.breakdown.overhead_bytes;
-    // Every routed expert as stored, less those each layer holds in its
-    // bank's slots or its host tier's.
-    let unheld = |fit: &ExecutionFit| {
+    let total = |fit: &ExecutionFit| fit.placement.device_bytes + fit.placement.host_bytes + fit.placement.disk_bytes;
+    // Each layer's routed experts as stored that fall in `[from, to)` of its
+    // expert order, given in slots.
+    let experts = |fit: &ExecutionFit, held: &dyn Fn(u64, u64) -> u64| {
         let bank = fit.bank.as_ref().expect("a routed load banks its experts");
         bank.layers()
             .iter()
             .map(|layer| {
                 let stored = layer.resident.iter().map(|(_, weight)| weight.source_bytes).sum::<u64>();
-                let held = bank.slots.max(bank.host_slots).min(layer.experts);
-                stored / layer.experts * (layer.experts - held)
+                stored / layer.experts * held(layer.experts, bank.slots.min(layer.experts))
             })
             .sum::<u64>()
     };
 
     let (_, whole, resident) = assess_qwen36_35b(&package, MemoryReserves::of_machine(None));
-    let ModelExecution::Fits { fit, residency: ModelResidency::Resident { .. } } = resident else {
+    let ModelExecution::Fits { fit: resident, residency: ModelResidency::Resident { .. } } = resident else {
         panic!("Qwen3.6 35B fits the M4 Pro resident: {resident:?}");
     };
-    let PreparedModelAssessment::Planned { draft: whole, .. } = &whole else {
+    let PreparedModelAssessment::Planned { execution: whole, .. } = &whole else {
         unreachable!("the model was assessed");
     };
-    let streamed_tables = whole.load().target().iter().filter(|weight| weight.streamed().is_some()).collect::<Vec<_>>();
-    assert!(!streamed_tables.is_empty(), "the token table is streamed by rows");
-    let tables = streamed_tables.iter().map(|weight| weight.unheld_bytes().unwrap()).sum::<u64>();
-    assert!(tables > 0);
-    assert_eq!(fit.placement.device_bytes, required(&fit));
-    assert_eq!((fit.placement.host_bytes, fit.placement.disk_bytes), (0, tables));
+    let whole = whole.draft();
+    assert!(whole.load().target().iter().any(|weight| weight.streamed().is_some()), "the token table is streamed by rows");
+    assert_eq!((resident.placement.host_bytes, resident.placement.disk_bytes), (0, 0), "a table read by rows is held");
 
-    let allocation = fit.domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
+    let allocation = resident.domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let whole_weights = whole.load().clone().unbanked().weight_bytes().unwrap();
     let (_, _, streamed) = assess_qwen36_35b(&package, host_room(allocation.capacity_bytes, whole_weights));
     let ModelExecution::Fits { fit, residency: ModelResidency::Streamed { .. } } = streamed else {
         panic!("Qwen3.6 35B fits streamed: {streamed:?}");
     };
-    assert_eq!(fit.placement.device_bytes, required(&fit));
+    let bank = fit.bank.as_ref().unwrap();
+    let unheld = experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts));
+    assert!(unheld > 0);
     assert_eq!(fit.placement.host_bytes, 0, "unified memory has no host tier");
-    assert!(unheld(&fit) > 0);
-    assert_eq!(fit.placement.disk_bytes, unheld(&fit) + tables);
+    assert_eq!(fit.placement.disk_bytes, unheld);
+    assert_eq!(total(&fit), total(&resident));
 
     let reserves = MemoryReserves::of_machine(None).measured(None, Some(StoreMotion::new(8_000_000_000 - 1, 10.0)));
     let mut setup = rtx3090_setup(BackendName::Cuda, reserves, ModelPolicy::default(), standard_service_limits());
@@ -1148,15 +1144,9 @@ fn a_fits_placement_is_its_plans_tiers() {
         panic!("Qwen3.6 35B fits the RTX 3090 streamed");
     };
     let bank = fit.bank.as_ref().unwrap();
-    let held = |role| fit.domains.iter().filter(|domain| domain.role == role).map(|domain| domain.required_bytes).sum::<u64>();
-    assert_eq!(fit.placement.device_bytes, held(DomainRole::Allocation));
-    let tier = bank.host_charge(bank.host_slots).unwrap() - bank.host_charge(0).unwrap();
-    assert!(tier > 0, "host RAM holds a host tier past its landing reserve");
-    assert_eq!(fit.placement.host_bytes, held(DomainRole::Staging) + tier);
-    assert_eq!(fit.placement.device_bytes + fit.placement.host_bytes, required(&fit) + tier);
-    let PreparedModelAssessment::Planned { draft, .. } = &prepared else {
-        unreachable!("the model was assessed");
-    };
-    let tables = draft.load().target().iter().map(|weight| weight.unheld_bytes().unwrap()).sum::<u64>();
-    assert_eq!(fit.placement.disk_bytes, unheld(&fit) + tables);
+    let tier_only = experts(&fit, &|experts, slots| bank.host_slots.min(experts).saturating_sub(slots));
+    assert!(tier_only > 0, "host RAM holds experts the bank does not");
+    assert_eq!(fit.placement.host_bytes, tier_only);
+    assert_eq!(fit.placement.disk_bytes, experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts)));
+    assert_eq!(total(&fit), total(&resident));
 }

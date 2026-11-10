@@ -813,6 +813,21 @@ impl ExpertBankPlan {
         })
     }
 
+    /// The stored bytes of the experts the host tier's host slots hold that
+    /// the bank's slots do not: what the plan holds in host RAM alone. None
+    /// without a tier.
+    pub fn host_only_bytes(&self) -> Result<u64, String> {
+        let overflow = || "host tier expert bytes overflow".to_owned();
+        self.layers().iter().try_fold(0u64, |total, layer| {
+            let expert = self.groups()[layer.group]
+                .record
+                .iter()
+                .try_fold(0u64, |bytes, (_, tensor)| bytes.checked_add(tensor.stored_bytes()?).ok_or_else(overflow))?;
+            let alone = Self::layer_slots(self.host_slots, layer.experts).saturating_sub(Self::layer_slots(self.slots, layer.experts));
+            alone.checked_mul(expert).and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
+        })
+    }
+
     /// Whether growth reaches every expert ([`Self::ceiling`]): only such a
     /// bank is ever whole, each expert at its home record.
     pub fn reaches_whole(&self) -> bool {

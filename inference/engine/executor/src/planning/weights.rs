@@ -66,6 +66,18 @@ pub enum Holding {
     Banked { group: usize },
 }
 
+/// A load's weights as their files store them, by where it holds them as it
+/// runs: `held` in the serving device's memory (a table read by rows among
+/// them, its rows in the OS file cache), `host` the routed experts only its
+/// host tier holds in host RAM, and `streamed` the routed experts neither
+/// holds, read from the model file as steps miss them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeightPlacement {
+    pub held: u64,
+    pub host: u64,
+    pub streamed: u64,
+}
+
 /// The rows of a streamed gathered table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedRows {
@@ -1597,6 +1609,36 @@ impl ModelLoadPlan {
             .into_iter()
             .try_fold(0u64, |total, (_, bytes)| total.checked_add(bytes))
             .ok_or_else(|| "resident weight byte count overflow".to_owned())
+    }
+
+    /// The model's weights as its files store them, by where the load holds
+    /// them as it runs ([`WeightPlacement`]).
+    pub fn weight_placement(&self) -> Result<WeightPlacement, String> {
+        let overflow = || "weight placement bytes overflow".to_owned();
+        // Each stored tensor once, however many roles or representations
+        // the load gives it (a tied embedding is a table and a head).
+        let mut counted = HashSet::new();
+        let mut stored = 0u64;
+        let weights = [self.target.as_slice(), self.head.as_deref().unwrap_or_default(), self.vision.as_deref().unwrap_or_default()];
+        for weight in weights.into_iter().flatten() {
+            if counted.insert((weight.component, weight.descriptor.name.clone())) {
+                stored = stored.checked_add(representation_bytes(weight.source, &weight.stored_shape())?).ok_or_else(overflow)?;
+            }
+        }
+        for table in &self.host_tables {
+            if counted.insert((table.component, table.descriptor.name.clone())) {
+                stored = stored.checked_add(representation_bytes(table.source, &table.shape)?).ok_or_else(overflow)?;
+            }
+        }
+        let (host, streamed) = match &self.bank {
+            Some(bank) => (bank.host_only_bytes()?, bank.unheld_bytes()?),
+            None => (0, 0),
+        };
+        let held = stored
+            .checked_sub(host)
+            .and_then(|rest| rest.checked_sub(streamed))
+            .ok_or("a plan's tiers hold more than its weights")?;
+        Ok(WeightPlacement { held, host, streamed })
     }
 
     /// The host tier's slots beyond its landing reserve; none without a
