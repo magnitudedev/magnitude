@@ -80,18 +80,22 @@ const rung = (model: CatalogLocalModel, hardware: LocalInferenceHardwareState): 
 const reaches = (rung: Rung, tokensPerSecond: number): boolean =>
   Option.exists(rung.speed, (speed) => speed >= tokensPerSecond)
 
+/** The share of the fastest rung's speed within which rungs decode alike; the inference service's recommendations hold the same share. */
+const NEAR_FASTEST = 0.9
+
 /**
  * The rung chosen for this machine: the highest that fits, has room on disk and reaches the target speed; else the
- * fastest that fits.
+ * highest that fits within `NEAR_FASTEST` of the fastest, since a smaller rung a few percent faster is no better
+ * choice; else, before any speed is measured, the smallest that fits.
  */
 const chooseRung = (ladder: readonly Rung[]): Option.Option<Rung> => {
   const fitting = ladder.filter((candidate) => candidate.fits)
   const target = fitting.filter((candidate) => candidate.roomOnDisk && reaches(candidate, TARGET_TOKENS_PER_SECOND))
   if (target.length > 0) return Array.last(target)
-  return Array.head(Array.sort(fitting, Order.mapInput(
-    Order.reverse(Order.number),
-    (candidate: Rung) => Option.getOrElse(candidate.speed, () => 0),
-  )))
+  const fastest = Math.max(0, ...fitting.flatMap((candidate) => Option.toArray(candidate.speed)))
+  return Array.last(fitting.filter((candidate) => reaches(candidate, fastest * NEAR_FASTEST))).pipe(
+    Option.orElse(() => Array.head(fitting)),
+  )
 }
 
 const byIntelligence = Order.mapInput(

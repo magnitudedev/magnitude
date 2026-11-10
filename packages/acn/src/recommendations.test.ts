@@ -120,7 +120,7 @@ describe("recommendations", () => {
     expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
   })
 
-  it("falls back to the fastest fitting rung when none reaches 20 tok/s", () => {
+  it("falls back to the highest fitting rung near the fastest when none reaches 20 tok/s", () => {
     const { models: [model] } = project([
       rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 12 }),
       rung({ id: "slow:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 8 }),
@@ -128,6 +128,11 @@ describe("recommendations", () => {
     ])
     expect(model?.chosen).toEqual(Option.some("slow:gguf:q2"))
     expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([false, true])
+    const { models: [alike] } = project([
+      rung({ id: "alike:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 19 }),
+      rung({ id: "alike:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 18 }),
+    ])
+    expect(alike?.chosen).toEqual(Option.some("alike:gguf:q4"))
   })
 
   it("orders fast models by intelligence, then slow ones, then those that do not fit", () => {

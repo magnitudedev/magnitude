@@ -4084,7 +4084,8 @@ fn candidate_versions(
 /// The recommended version, by the rule the catalog's recommendations follow: among the fitting
 /// versions, those served at a working context first (see [`WORKING_CONTEXT`]); of those, the
 /// largest that decodes at [`TARGET_TOKENS_PER_SECOND`] in a long conversation, one held whole in
-/// memory before one streamed, else the fastest. A Q8 served at 32K is a worse coding model than a
+/// memory before one streamed, else the largest within [`NEAR_FASTEST`] of the fastest: a 1-bit
+/// file a few percent faster than a 4-bit one is no better choice. A Q8 served at 32K is a worse coding model than a
 /// Q6 served at 128K, and a quant held in memory that keeps up beats a larger one streamed.
 /// Full-precision files are references, recommended only when a repository holds nothing else.
 /// Before this machine's speed measurements exist, Q4_K-class versions, then the largest.
@@ -4121,16 +4122,19 @@ fn recommended_version<'a>(
             })
             .map(|candidate| candidate.0);
     }
+    let fastest = pool
+        .iter()
+        .filter_map(|candidate| candidate.3)
+        .fold(0.0, f64::max);
+    let keeps_up = |speed: f64| speed >= TARGET_TOKENS_PER_SECOND;
+    let near_fastest = |speed: f64| speed >= fastest * NEAR_FASTEST;
     pool.iter()
-        .filter(|candidate| candidate.3.is_some_and(|speed| speed >= TARGET_TOKENS_PER_SECOND))
+        .filter(|candidate| candidate.3.is_some_and(keeps_up))
         .max_by_key(|candidate| (candidate.4, candidate.1.group.size_bytes()))
         .or_else(|| {
-            pool.iter().max_by(|left, right| {
-                left.3
-                    .unwrap_or(0.0)
-                    .total_cmp(&right.3.unwrap_or(0.0))
-                    .then(right.1.group.size_bytes().cmp(&left.1.group.size_bytes()))
-            })
+            pool.iter()
+                .filter(|candidate| candidate.3.is_some_and(near_fastest))
+                .max_by_key(|candidate| (candidate.4, candidate.1.group.size_bytes()))
         })
         .map(|candidate| candidate.0)
 }
@@ -4161,6 +4165,10 @@ fn comparison_speed(served: &ServingProfile, residency: &ModelResidency) -> Opti
 const TARGET_TOKENS_PER_SECOND: f64 = 20.0;
 /// The depth decode speeds are compared at: a long agent conversation.
 const COMPARISON_CONTEXT_TOKENS: u32 = 50_000;
+/// The share of the fastest version's speed within which versions decode alike, so the largest of
+/// them is recommended when none reaches [`TARGET_TOKENS_PER_SECOND`]. The catalog's
+/// recommendations hold the same share.
+const NEAR_FASTEST: f64 = 0.9;
 
 /// The context a version should be served at to be recommended over one that fits only a smaller
 /// context: 64K, or the model's whole context when it is trained for less.
