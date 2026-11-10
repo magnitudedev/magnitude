@@ -130,7 +130,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
     </div>
     <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-750">
       {measuring ? <Button disabled><DownloadSimpleIcon />Download</Button> : <>
-        {picked && pickedQuant && discovered.length > 0 && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
+        {picked && pickedQuant && (discovered.length > 0 || owned.size > 0) && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
         {picked && pickedQuant
           ? <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
           : <Button onClick={onFinish}>Continue</Button>}
