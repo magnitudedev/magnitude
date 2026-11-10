@@ -5,6 +5,7 @@ import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { LabLogo, type ModelLab } from "../model-logo"
 import { Badge } from "./parts"
+import { MeasuringRecommendations } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
 import { Unrunnable, type UnrunnableFile } from "./your-models"
 import type { QuantView } from "./view"
@@ -41,7 +42,7 @@ export function WhatRuns({ families }: { families: readonly RunnableFamily[] }) 
 }
 
 export type ExploreResults =
-  | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string }
+  | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
   | { readonly _tag: "Searching" }
   | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly unrunnable: readonly UnrunnableFile[] }
   | { readonly _tag: "Failed"; readonly message: string }
@@ -53,7 +54,7 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
 }) {
   const [chosen, setExpanded] = useState<string | null | undefined>(undefined)
   const [quantChoices, setQuantChoices] = useState<Readonly<Record<string, string>>>({})
-  const listed = results._tag === "Recommended" || results._tag === "Results" ? results.models : []
+  const listed = (results._tag === "Recommended" && results.measuring === null) || results._tag === "Results" ? results.models : []
   const expanded = chosen === undefined ? (results._tag === "Recommended" ? listed[0]?.key ?? null : null) : chosen
   const card = (model: OfferedModel, note?: string) => <ExpandingModel key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
     onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
@@ -72,7 +73,7 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
       <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-5 dark:bg-slate-900/40">
         {results._tag === "Recommended" && <>
           <p className="mb-3 flex items-baseline justify-between text-xs font-medium text-slate-500"><span>Best for your machine</span><span className="font-normal">{results.machine}</span></p>
-          <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>
+          {results.measuring ? <MeasuringRecommendations {...results.measuring} /> : <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>}
         </>}
         {results._tag === "Searching" && <p className="text-[13px] text-slate-500">Searching Hugging Face…</p>}
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}

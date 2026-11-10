@@ -35,6 +35,7 @@ export interface RecommendationInputs {
 
 interface Rung {
   readonly model: CatalogLocalModel
+  readonly measured: boolean
   readonly fits: boolean
   readonly speed: Option.Option<number>
   readonly roomOnDisk: boolean
@@ -64,6 +65,7 @@ const rung = (model: CatalogLocalModel, hardware: LocalInferenceHardwareState): 
   const fits = serving._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
     model,
+    measured: serving._tag !== "Assessing" && fits?.residency.performance._tag !== "Pending",
     fits: fits !== undefined,
     speed: fits === undefined
       ? Option.none()
@@ -109,7 +111,7 @@ const recommendationOrder = Order.combine(
 /**
  * The tested models in the order they are recommended for this machine. A model's rungs are its catalog variants,
  * smallest to largest. Disabled and deprecated models are left out, except those of a family that is coming soon,
- * which are listed with no chosen rung.
+ * which are listed with no chosen rung. It is complete once every rung of a listed model has been measured.
  */
 export const projectRecommendations = (inputs: RecommendationInputs): RecommendationsState => {
   const familyStatus = new Map(inputs.families.flatMap((family) =>
@@ -129,11 +131,13 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
     const parsed = parseModelId(model.modelId)
     return parsed._tag === "Catalog" ? parsed.baseId : model.modelId
   })
+  let complete = true
   const models = Object.entries(ladders).flatMap(([base, variants]): readonly RecommendedModel[] => {
     const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
       .map((model) => rung(model, inputs.hardware))
     if (!Array.isNonEmptyReadonlyArray(ladder)) return []
     const first = ladder[0].model
+    if (!comingSoon(first) && ladder.some((candidate) => !candidate.measured)) complete = false
     const chosen = comingSoon(first) ? Option.none() : chooseRung(ladder)
     return [{
       base: base as CatalogBaseId,
@@ -146,7 +150,7 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
       meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
     }]
   })
-  return { models: Array.sort(models, recommendationOrder), families: inputs.families }
+  return { complete, models: Array.sort(models, recommendationOrder), families: inputs.families }
 }
 
 export interface RecommendationsApi {

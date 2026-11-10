@@ -1,6 +1,6 @@
 import type { ReactNode } from "react"
 import { ArrowSquareOutIcon, CheckIcon, CubeIcon, GraphicsCardIcon, HardDrivesIcon, MemoryIcon } from "@phosphor-icons/react"
-import { formatContext, formatStorageSize } from "@magnitudedev/client-common"
+import { formatContext, formatMemoryCapacity, formatStorageSize } from "@magnitudedev/client-common"
 import { cn } from "@/lib/utils"
 import { modelLabs, type ModelLab } from "../model-logo"
 import type { MachineView, PlacementTier, QuantView } from "./view"
@@ -28,9 +28,12 @@ export function LabMark({ lab, className = "size-8" }: { lab: ModelLab | undefin
 
 export const labByName = (name: string | null) => name === null ? undefined : modelLabs.find(lab => lab.name === name)
 
+/** What to say for a quant with no speed yet: it is still being measured, or it does not fit. */
+export const fitLabel = (quant: QuantView) => quant.measuring ? "Measuring…" : quant.fits ? "Speed unavailable" : "Doesn’t fit"
+
 /** An estimate, so it stays small and muted. */
 export function Speed({ quant }: { quant: QuantView }) {
-  if (!quant.fits || quant.speed === null) return <span className="text-xs text-slate-500">{quant.fits ? "Measuring…" : "Doesn’t fit"}</span>
+  if (!quant.fits || quant.speed === null) return <span className="text-xs text-slate-500">{fitLabel(quant)}</span>
   return <span title={`Estimated decode speed in a long agent conversation.${quant.phrase ? ` ${quant.phrase}.` : ""}`} className="whitespace-nowrap text-xs tabular-nums text-slate-500">~{formatSpeed(quant.speed)}</span>
 }
 
@@ -86,14 +89,14 @@ export function QuantLadder({ quants, selected, recommended, owned, limit, onSel
   return <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${quants.length}, minmax(0, 1fr))` }}>
     {quants.map(quant => {
       const active = selected === quant.key
-      return <button key={quant.key} type="button" disabled={!quant.fits} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
-        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left disabled:opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
+      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
+        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", !quant.fits && !quant.measuring && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
         <span className="flex w-full items-center justify-between gap-1 text-[13px] font-medium">{quant.bits}-bit
           {owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="w-full truncate text-[11px] text-slate-500">{quantSource(quant)}</span>
         {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
         <span className="mt-2.5 flex w-full items-baseline justify-between gap-2 tabular-nums">
-          <span className="text-[13px] font-medium">{quant.fits ? quant.speed === null ? "…" : `~${formatSpeed(quant.speed)}` : "Doesn’t fit"}</span>
+          <span className={cn("text-[13px] font-medium", quant.measuring && "font-normal text-slate-500")}>{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
           <span className="text-xs text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
         </span>
       </button>
@@ -125,9 +128,9 @@ export function MachineCard({ machine }: { machine: MachineView }) {
   const gpu = machine.gpus[machine.servingGpu]
   const several = machine.gpus.length > 1
   const parts = [
-    ...(machine.unifiedMemoryBytes !== null ? [{ icon: MemoryIcon, name: "Memory", value: formatStorageSize(machine.unifiedMemoryBytes), note: null }] : []),
-    ...(machine.unifiedMemoryBytes === null && gpu ? [{ icon: GraphicsCardIcon, name: "GPU memory", value: formatStorageSize(gpu.memoryBytes), note: several ? `GPU ${machine.servingGpu + 1} · ${gpu.name}` : null }] : []),
-    ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, name: "RAM", value: formatStorageSize(machine.ramBytes), note: null }] : []),
+    ...(machine.unifiedMemoryBytes !== null ? [{ icon: MemoryIcon, name: "Memory", value: formatMemoryCapacity(machine.unifiedMemoryBytes), note: null }] : []),
+    ...(machine.unifiedMemoryBytes === null && gpu ? [{ icon: GraphicsCardIcon, name: "GPU memory", value: formatMemoryCapacity(gpu.memoryBytes), note: several ? `GPU ${machine.servingGpu + 1} · ${gpu.name}` : null }] : []),
+    ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, name: "RAM", value: formatMemoryCapacity(machine.ramBytes), note: null }] : []),
     ...(machine.freeDiskBytes !== null ? [{ icon: HardDrivesIcon, name: "Free disk", value: formatStorageSize(machine.freeDiskBytes), note: null }] : []),
   ]
   const frame = machine.photo?.framing
@@ -163,7 +166,7 @@ export function ModelCardShell({ lab, title, note, detail, quant, active, onSele
       </span>
       <span className="flex items-center gap-4">
         <span className="grid grid-cols-[84px_64px] gap-4 text-right">
-          <span><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : "—"}</span><span className="block whitespace-nowrap text-[11px] text-slate-500">{quant.phrase ?? (quant.fits ? "Measuring…" : "Doesn’t fit")}</span></span>
+          <span><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : "—"}</span><span className="block whitespace-nowrap text-[11px] text-slate-500">{quant.phrase ?? fitLabel(quant)}</span></span>
           <span><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{formatStorageSize(quant.sizeBytes)}</span><span className="block text-[11px] text-slate-500">on disk</span></span>
         </span>
         <span className={cn("flex size-5 items-center justify-center rounded-full border", active ? "border-blue-600 bg-blue-600 text-white dark:border-blue-400 dark:bg-blue-400 dark:text-slate-925" : "border-slate-300 dark:border-slate-700")}>{active && <CheckIcon className="size-3" />}</span>

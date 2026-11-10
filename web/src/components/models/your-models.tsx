@@ -5,7 +5,7 @@ import { Button } from "../ui/button"
 import { Input } from "../ui/input"
 import { HuggingFaceLogo, LabLogo, modelLabs, type ModelLab } from "../model-logo"
 import { cn } from "@/lib/utils"
-import { ContextText, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
+import { ContextText, fitLabel, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
 import type { QuantView } from "./view"
 
 /** A model on this computer, with where it lives and what Magnitude could tell about its source. */
@@ -94,7 +94,7 @@ function Details({ model, onAddDrafter }: { model: OwnedModel; onAddDrafter: () 
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">
-    {model.quant.fits ? <PlacementBar quant={model.quant} /> : <p className="text-xs text-slate-500">Doesn’t fit on this computer</p>}
+    {model.quant.fits ? <PlacementBar quant={model.quant} /> : <p className="text-xs text-slate-500">{model.quant.measuring ? "Measuring how it runs on your machine…" : "Doesn’t fit on this computer"}</p>}
     <dl className="grid grid-cols-[80px_minmax(0,1fr)] items-center gap-x-4 gap-y-2 text-xs">
       {rows.map(([label, value]) => <Fragment key={label}><dt className="text-slate-500">{label}</dt><dd className="flex min-w-0 items-center">{value}</dd></Fragment>)}
     </dl>
@@ -145,7 +145,7 @@ export function YourModels({ models, unrunnable, action, onExploreQuants, onRemo
             <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} /></span>
             <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
             <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
-            <span className="flex justify-end" onClick={event => event.stopPropagation()}>{model.quant.fits ? action(model) : <span className="text-xs text-slate-500">Doesn’t fit</span>}</span>
+            <span className="flex justify-end" onClick={event => event.stopPropagation()}>{model.quant.fits ? action(model) : <span className="text-xs text-slate-500">{fitLabel(model.quant)}</span>}</span>
             <ModelMenu onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
           </div>
           {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onAddDrafter={() => onAddDrafter(model)} /></div>}

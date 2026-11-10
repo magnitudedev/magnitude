@@ -20,6 +20,7 @@ export interface QuantView {
   readonly sizeBytes: number
   readonly downloadBytes: number
   readonly fits: boolean
+  readonly measuring: boolean
   readonly speed: number | null
   readonly phrase: PlacementPhrase | null
   readonly placement: readonly PlacementTier[]

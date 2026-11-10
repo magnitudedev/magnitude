@@ -50,7 +50,7 @@ const speedOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>): n
 }
 
 /** One quant as this machine would run it, from its assessment. */
-export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number }, assessment: LocalModelAssessment | null, unified: boolean): QuantView => {
+export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number }, assessment: LocalModelAssessment | null, unified: boolean, measuring = false): QuantView => {
   const fits = assessment?._tag === "Fits" ? assessment : null
   return {
     key: quant.key,
@@ -61,6 +61,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     sizeBytes: quant.sizeBytes,
     downloadBytes: quant.downloadBytes,
     fits: fits !== null,
+    measuring: measuring || (fits !== null && fits.residency.performance._tag === "Pending"),
     speed: fits ? speedOf(fits) : null,
     phrase: fits ? phraseOf(fits, unified) : null,
     placement: fits ? tiersOf(fits, unified) : [],
@@ -71,7 +72,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
 
 /** A model on this computer as a quant this machine runs. */
 export const quantOf = (model: LocalModel, unified: boolean): QuantView =>
-  quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes: model.storageBytes, downloadBytes: model.storageBytes }, assessmentOf(model), unified)
+  quantView({ key: model.modelId, name: quantNameOf(model), repository: repositoryOf(model), sizeBytes: model.storageBytes, downloadBytes: model.storageBytes }, assessmentOf(model), unified, model.servingState._tag === "Assessing")
 
 const directoryOf = (path: string) => path.replace(/[\\/][^\\/]*$/, "")
 

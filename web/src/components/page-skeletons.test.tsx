@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
 import { Option } from "effect"
-import { ConnectionsSkeleton, HardwarePending, LoginSkeleton, ModelsSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { ConnectionsSkeleton, HardwarePending, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { ModelsSkeleton } from "./models/skeletons"
 import { UsageFigures } from "./serving-usage"
 import { MemoryFigures } from "./memory-breakdown"
 

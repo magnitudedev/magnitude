@@ -17,6 +17,7 @@ interface RungFixture {
   readonly storageBytes: number
   readonly tokensPerSecond?: number
   readonly fits?: boolean
+  readonly assessing?: boolean
   readonly installed?: boolean
   readonly support?: "Supported" | "Disabled"
   readonly country?: string
@@ -41,7 +42,9 @@ const rung = (fixture: RungFixture): LocalModel => {
     },
     acquisitionState: fixture.installed ? { _tag: "Installed" } : { _tag: "NotInstalled" },
     drafterWithheld: false,
-    servingState: fits
+    servingState: fixture.assessing
+      ? { _tag: "Assessing", profile: { contextLength: 131_072 } }
+      : fits
       ? {
           _tag: "Assessed",
           assessment: {
@@ -89,6 +92,14 @@ const project = (models: readonly LocalModel[], options: { freeBytes?: number; c
 }
 
 describe("recommendations", () => {
+  it("is complete only once every rung of a listed model is measured, speed included", () => {
+    const measured = rung({ id: "a:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 30 })
+    expect(project([measured]).complete).toBe(true)
+    expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, assessing: true })]).complete).toBe(false)
+    expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB })]).complete).toBe(false)
+    expect(project([measured, rung({ id: "a:gguf:q8", storageBytes: 2 * GB, fits: false })]).complete).toBe(true)
+  })
+
   it("chooses the highest rung that fits, has room and reaches 20 tok/s, listing rungs smallest first", () => {
     const { models: [model] } = project([
       rung({ id: "big:gguf:q6", storageBytes: 30 * GB, tokensPerSecond: 15 }),

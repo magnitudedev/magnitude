@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
+  formatMemoryCapacity,
   formatMemorySize,
   formatStorageSize,
   formatTransferRate,
@@ -49,5 +50,12 @@ describe("byte formatting", () => {
 
   it("formats transfer rates with decimal megabytes", () => {
     expect(formatTransferRate(12_500_000)).toBe("13 MB/s")
+  })
+
+  it("formats memory capacity in the binary units hardware is sold in", () => {
+    expect(formatMemoryCapacity(64 * 1024 ** 3)).toBe("64 GB")
+    expect(formatMemoryCapacity(24 * 1024 ** 3)).toBe("24 GB")
+    expect(formatMemoryCapacity(7.5 * 1024 ** 3)).toBe("7.5 GB")
+    expect(formatMemoryCapacity(1024 ** 4)).toBe("1 TB")
   })
 })

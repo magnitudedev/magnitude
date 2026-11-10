@@ -101,6 +101,16 @@ export const formatMemorySize = (
     rounding: options.rounding,
   })
 
+/**
+ * A memory capacity as hardware is sold: binary units named GB, so 64 GiB of RAM reads 64 GB, not 68.7 GB.
+ */
+export const formatMemoryCapacity = (bytes: number): string =>
+  formatScaledSize(bytes, {
+    base: 1024,
+    minimumUnit: "MB",
+    fractionDigits: (amount) => amount >= 10 || Number.isInteger(amount) ? 0 : 1,
+  })
+
 export const formatStorageSize = (
   bytes: number,
   options: FormatStorageSizeOptions = {},

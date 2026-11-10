@@ -69,6 +69,7 @@ interface ExploreProps {
   readonly unified: boolean
   readonly machine: string
   readonly recommended: readonly OfferedModel[]
+  readonly measuring: { readonly settled: number; readonly total: number } | null
   readonly families: readonly RunnableFamily[]
   readonly owned: ReadonlySet<string>
 }
@@ -104,6 +105,6 @@ export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
   const download = useDownload()
   return settled === ""
-    ? <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine }} download={download} />
+    ? <ExploreModal {...props} results={{ _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }} download={download} />
     : <Searched settled={settled} props={props} />
 }

@@ -20,22 +20,6 @@ export function HardwarePending({ identifying = false, startingService = false }
     <span role="status">{startingService ? "Starting Magnitude…" : identifying ? "Identifying your machine…" : "Reading hardware capabilities…"}</span>
   </div>
 }
-export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
-  return <LoadingRegion label={library ? "Loading your models" : "Loading catalog models"}>
-    <div className="grid items-start gap-3">{[0,1,2,3].map(index => <article key={index} className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850">
-      <div className="flex items-center gap-4 px-5 py-4"><Skeleton className="size-10 shrink-0" /><div className="min-w-0 flex-1"><SkeletonLine className="h-6 text-[15px]" width={index%2 ? "55%" : "40%"} /><SkeletonLine className="h-4 text-xs" width={library ? "30%" : "22%"} /></div><Skeleton className="h-8 w-36" /></div>
-      <div className={`grid gap-px border-t border-slate-200 bg-slate-200 dark:border-slate-750 dark:bg-slate-750 ${library ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4"}`}>{Array.from({ length: library ? 5 : 4 }, (_, cell) => <div key={cell} className="bg-white px-4 py-2.5 dark:bg-slate-850"><SkeletonLine className="h-6 text-[13px]" width="65%" /></div>)}</div>
-    </article>)}</div>
-  </LoadingRegion>
-}
-export function ModelsSkeleton({ startingService = false }: { startingService?: boolean }) {
-  return <>
-    <div className={pageLayout.modelHeader}><h1 className={pageLayout.pageTitle}>Models</h1><Skeleton className="h-8 w-36" /></div>
-    {startingService && <HardwarePending startingService />}
-    <div className={pageLayout.catalogToolbar}><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-28" /><Skeleton className="h-8 w-36" /></div></div>
-    <ModelCardsSkeleton library />
-  </>
-}
 export function ConnectionsSkeleton() {
   return <LoadingRegion label="Loading connections" className="mt-7 space-y-8"><SkeletonLine className="mb-4 h-5 text-sm" width="180px" /><div className={pageLayout.harnessGrid}>{Array.from({length:8},(_,index) => <article className={pageLayout.harnessCard} key={index}><div className="flex flex-wrap items-center justify-between gap-4"><div className="flex min-w-0 items-center gap-3"><Skeleton className="size-14 shrink-0 rounded-2xl" /><div><SkeletonLine className="h-7 w-32 text-lg" /><SkeletonLine className="mt-1 h-5 w-28 text-sm" /></div></div><Skeleton className="h-8 w-24" /></div></article>)}</div></LoadingRegion>
 }

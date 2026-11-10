@@ -12,17 +12,29 @@ export interface OfferedRecommendation {
   readonly model: OfferedModel
 }
 
-/** The service's recommendations for this machine as offered models, optionally only US developers', and the families it runs. */
-export function useRecommendations(usOnly: boolean, unified: boolean): { readonly ready: boolean; readonly offered: readonly OfferedRecommendation[]; readonly families: readonly RunnableFamily[] } {
+export interface RecommendationsView {
+  readonly ready: boolean
+  readonly measuring: { readonly settled: number; readonly total: number } | null
+  readonly offered: readonly OfferedRecommendation[]
+  readonly families: readonly RunnableFamily[]
+}
+
+/**
+ * The service's recommendations for this machine as offered models, optionally only US developers', and the families
+ * it runs. While any rung is still being measured the order is not final, so `measuring` says how far along it is.
+ */
+export function useRecommendations(usOnly: boolean, unified: boolean): RecommendationsView {
   const client = useAgentClient()
   const developerCountry = usOnly ? Option.some(CountryCodeSchema.make("US")) : Option.none()
   const recommendations = useAtomValue(client.Models.GetRecommendations({ developerCountry })).result
   const models = useLocalModels()
   return useMemo(() => {
-    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, offered: [], families: [] }
+    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], families: [] }
+    const assessment = models.value.preparation.assessment
     const byId = new Map<string, LocalModel>(models.value.models.map(model => [model.modelId, model]))
     return {
       ready: true,
+      measuring: recommendations.value.complete ? null : { settled: assessment.settledModels, total: assessment.totalModels },
       offered: recommendations.value.models.flatMap(recommendation => {
         const model = offeredFromRecommendation(recommendation, byId, unified)
         return model ? [{ recommendation, model }] : []

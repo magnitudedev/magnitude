@@ -2004,8 +2004,12 @@ export const RecommendedModelSchema = Schema.Struct({
 }), { message: () => "a recommendation's chosen rung is one of its rungs, and only a chosen rung meets a speed" }))
 export type RecommendedModel = typeof RecommendedModelSchema.Type
 
-/** The tested models in recommendation order, and the families Magnitude runs. */
+/**
+ * The tested models in recommendation order, and the families Magnitude runs. The order and chosen rungs are final
+ * only once `complete`: every rung has been measured on this machine, so none is still counted as not fitting.
+ */
 export const RecommendationsSchema = Schema.Struct({
+  complete: Schema.Boolean,
   models: Schema.Array(RecommendedModelSchema),
   families: Schema.Array(LocalModelFamilySchema),
 })

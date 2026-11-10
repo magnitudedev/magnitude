@@ -14,7 +14,7 @@ import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
 import { ServiceConnectionProvider } from "./service-view"
 import { App, AppShell } from "./app"
-import { ModelsSkeleton } from "./components/page-skeletons"
+import { ModelsSkeleton } from "./components/models/skeletons"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
 

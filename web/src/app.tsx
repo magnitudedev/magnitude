@@ -1,6 +1,7 @@
 import { ChatPage } from "./components/chat"
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
-import { SkeletonLine, ModelsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
+import { SkeletonLine, ConnectionsSkeleton } from "./components/page-skeletons"
+import { ModelsSkeleton } from "./components/models/skeletons"
 import { pageLayout } from "./components/page-layout"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
@@ -85,7 +86,7 @@ function ModelsPage() {
   const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").map(model => String(model.modelId)) : [])
   return <>
     <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
-    <Explore open={open} query={query} unified={unified} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} families={recommendations.families} owned={owned}
+    <Explore open={open} query={query} unified={unified} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}
       setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
   </>
