@@ -3032,6 +3032,7 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
             .into_iter()
             .collect(),
         snapshot: None,
+        downloaded_from: None,
         lineage: Default::default(),
         catalog: None,
         reach: super::Reach::Hub,
@@ -3040,7 +3041,8 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
     let offered = fixture
         .candidates
         .next_to_model(&target, None, &crate::assessment::inspection_progress::InspectionProgress::silent())
-        .await;
+        .await
+        .expect("drafters next to the model");
     assert_eq!(
         offered
             .iter()
@@ -3915,8 +3917,9 @@ async fn live_fixture_from(
 }
 
 /// What a live fixture's Hub serves beyond the standard repositories, what this computer has
-/// already read from it (repository snapshots, each at its revision), and whether it still
-/// answers once that is read, before custom models are enriched.
+/// already read from it (repository snapshots, each at its revision, and their files' headers, as
+/// inspecting a repository reads them), and whether it still answers once that is read, before
+/// custom models are enriched.
 #[derive(Default)]
 struct LiveHub {
     repositories: BTreeMap<String, StubRepository>,
@@ -3955,7 +3958,7 @@ async fn live_fixture_reaching(
         catalog.models.push(qwen_catalog_model(&models).await);
     }
     for (repository, revision) in live_hub.snapshots_read {
-        magnitude_service_models::pinned_hugging_face_repository(
+        let snapshot = magnitude_service_models::pinned_hugging_face_repository(
             &models,
             HuggingFaceRepositoryRequest {
                 repository: repository.to_owned(),
@@ -3964,6 +3967,18 @@ async fn live_fixture_reaching(
         )
         .await
         .expect("the snapshot is read");
+        for file in &snapshot.gguf_files {
+            models
+                .classify_hugging_face_gguf(
+                    &snapshot.repository,
+                    &snapshot.commit,
+                    file,
+                    &super::engine_architectures(),
+                    &[],
+                )
+                .await
+                .expect("the file is classified");
+        }
     }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
@@ -5863,6 +5878,78 @@ async fn a_models_repository_lineage_already_read_chooses_the_catalog_drafter_wh
             .recommended_drafter
             .map(|candidate| candidate.lineage),
         Some(DrafterLineage::Lineage)
+    );
+}
+
+/// An added model's drafter downloaded with it from its own repository is its automatic drafter
+/// from what is on this computer, never the catalog drafter that isn't here: with the Hub out of
+/// reach, the repository's drafters already downloaded are listed by their Hub reference, so the
+/// model serves with the drafter it was downloaded with and none is shown missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_added_models_drafter_downloaded_from_its_repository_serves_while_the_hub_is_unreachable()
+ {
+    use magnitude_service_contracts::models::{AddedModel, HuggingFaceArtifactSelector};
+    let cache = tempfile::tempdir().expect("Hugging Face cache");
+    let repository_root = cache.path().join("models--community--Llama-Finetune-GGUF");
+    let snapshot = repository_root.join("snapshots").join(commit('c'));
+    std::fs::create_dir_all(&snapshot).unwrap();
+    for (name, gguf) in [
+        ("llama-Q8_0.gguf", llama(7, Encoding::Q8_0)),
+        ("dflash-draft.gguf", dflash(HIDDEN)),
+    ] {
+        let blob = repository_root
+            .join("blobs")
+            .join(StubFile::new(name, &gguf).sha256());
+        write_sparse(&blob, &gguf);
+        std::os::unix::fs::symlink(&blob, snapshot.join(name)).unwrap();
+    }
+    std::fs::create_dir_all(repository_root.join("refs")).unwrap();
+    std::fs::write(repository_root.join("refs/main"), commit('c')).unwrap();
+    let fixture = live_fixture_reaching(
+        LocalModelsConfiguration {
+            added: vec![AddedModel {
+                repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+                path: HuggingFaceArtifactSelector::new("llama-Q8_0.gguf".to_owned()).unwrap(),
+                revision: commit('c'),
+                projector: None,
+            }],
+            ..location(
+                magnitude_service_contracts::models::ModelRootKind::HuggingFaceCache,
+                cache.path(),
+            )
+        },
+        false,
+        cpu_environment(),
+        LiveHub {
+            snapshots_read: vec![(COMMUNITY, commit('c'))],
+            reachable: false,
+            ..LiveHub::default()
+        },
+    )
+    .await;
+    let in_repository = DrafterReference::HuggingFace {
+        repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+        commit: commit('c'),
+        path: "dflash-draft.gguf".to_owned(),
+    };
+    let model = fixture
+        .rescan_until(
+            &snapshot.join("llama-Q8_0.gguf"),
+            Some((&in_repository, true)),
+            "the drafter downloaded with the added model",
+        )
+        .await;
+    assert!(matches!(
+        model.origin,
+        CustomModelOrigin::Added { .. }
+    ));
+    assert_eq!(
+        fixture
+            .resolver
+            .custom_model_fetched_drafter(&model.model_id)
+            .expect("the model is projected"),
+        None,
+        "nothing is missing to fetch"
     );
 }
 

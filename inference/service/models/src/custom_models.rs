@@ -187,6 +187,23 @@ impl DrafterContent {
     }
 }
 
+impl ManagedModelStore {
+    /// The file on this computer, in any location, holding these drafter bytes, from the copy
+    /// that takes precedence; only a copy whose inspection found it valid.
+    #[must_use]
+    pub fn installed_drafter_path(&self, content: &DrafterContent) -> Option<PathBuf> {
+        let snapshot = self.installed_packages.read().ok()?;
+        snapshot
+            .records
+            .values()
+            .filter(|record| content.held_by(record))
+            .filter(|record| matches!(record.installed.validation, PackageValidation::Valid))
+            .filter_map(|record| occurrence(self.config.root.as_path(), record))
+            .min_by_key(|occurrence| occurrence.precedence)
+            .map(|occurrence| occurrence.primary)
+    }
+}
+
 struct NoEnrichment;
 
 impl CustomModelEnrichment for NoEnrichment {
@@ -539,6 +556,23 @@ impl ModelDomainResolver {
             .unwrap_or_default())
     }
 
+    /// The drafter a custom model's download of its drafter fetches: the one its choice serves
+    /// with (under `Auto`, the recommended one) when it is not on this computer or has an update.
+    /// It is what the projection attaches, so a drafter shown missing is always the one fetched.
+    pub fn custom_model_fetched_drafter(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<Option<DrafterReference>, InventoryError> {
+        let projection = self.local_projection()?;
+        Ok(projection
+            .models
+            .into_iter()
+            .chain(projection.hidden)
+            .find(|projected| &projected.model.model_id == model_id)
+            .ok_or_else(|| InventoryError::NotFound(model_id.to_string()))?
+            .fetched_drafter)
+    }
+
     pub(crate) fn custom_serving_configuration(
         &self,
         model_id: &ModelId,
@@ -604,6 +638,7 @@ struct ProjectedModel {
     managed_packages: Vec<ModelPackageId>,
     drafter_pending: bool,
     awaited_drafter: Option<ModelPackageId>,
+    fetched_drafter: Option<DrafterReference>,
 }
 
 /// A model whose family is withheld from serving: the architecture its target declares, and the
@@ -1219,19 +1254,26 @@ impl ModelContext<'_> {
         // A drafter chosen by reference binds with the method the engine works out for it and
         // this model; until it has, the model has no drafter for now rather than none.
         let mut chosen_pending = false;
-        let drafter = match &choice {
-            DrafterChoice::None => None,
+        let (drafter, fetched_drafter) = match &choice {
+            DrafterChoice::None => (None, None),
             // The first automatic candidate on this computer now, so a recommended drafter that
             // went missing gives way to the next one that binds; with none here, the recommended
-            // one, missing, which clients offer to add.
-            DrafterChoice::Auto => automatic.next().map(|recommended| {
-                if recommended.source.is_some() {
-                    return recommended;
+            // one, missing, which clients offer to add. The recommended one is what a download
+            // fetches, so a missing drafter this attaches is always the one fetched.
+            DrafterChoice::Auto => match automatic.next() {
+                None => (None, None),
+                Some(recommended) => {
+                    let fetched = recommended.fetched();
+                    let attached = if recommended.source.is_some() {
+                        recommended
+                    } else {
+                        automatic
+                            .find(|next| next.source.is_some())
+                            .unwrap_or(recommended)
+                    };
+                    (Some(attached), fetched)
                 }
-                automatic
-                    .find(|next| next.source.is_some())
-                    .unwrap_or(recommended)
-            }),
+            },
             DrafterChoice::Reference { reference } => {
                 let located = locate_drafter(
                     reference.clone(),
@@ -1243,9 +1285,10 @@ impl ModelContext<'_> {
                 if let Some(SpeculativeDraftSource::Separate { draft }) = &located.source {
                     candidate_drafters.push(draft.id.clone());
                 }
+                let fetched = located.fetched();
                 let chosen = located.chosen(chosen_method(reference, catalog, &enriched));
                 chosen_pending = chosen.is_none();
-                chosen
+                (chosen, fetched)
             }
         };
 
@@ -1357,6 +1400,7 @@ impl ModelContext<'_> {
             candidate_drafters,
             drafter_pending,
             awaited_drafter: None,
+            fetched_drafter,
             managed_packages: group
                 .occurrences
                 .iter()
@@ -1496,6 +1540,7 @@ impl ModelContext<'_> {
             managed_packages: Vec::new(),
             drafter_pending: false,
             awaited_drafter,
+            fetched_drafter: None,
         })
     }
 }
@@ -1533,6 +1578,14 @@ impl ResolvedDrafter {
             }
         }
         self
+    }
+
+    /// The reference a download fetches for this drafter: one whose bytes are not on this
+    /// computer, or that serves with an earlier revision while its catalog model has a newer one.
+    fn fetched(&self) -> Option<DrafterReference> {
+        (matches!(self.attached.state, AttachedDrafterState::NotInstalled)
+            || self.attached.update_available)
+            .then(|| self.attached.reference.clone())
     }
 
     /// A chosen drafter as it binds when `binding` is known; one that can't be used for its own
@@ -8970,6 +9023,115 @@ mod tests {
             }),
             "the recommendation is the enumeration's until it is recomputed"
         );
+    }
+
+    /// Lists these automatic drafters, in order.
+    struct Automatic(Vec<DrafterReference>);
+
+    impl CustomModelEnrichment for Automatic {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult {
+                drafters: self
+                    .0
+                    .iter()
+                    .map(|reference| DrafterCandidate {
+                        category: DrafterCategory::NextToModel,
+                        automatic: true,
+                        ..bound(reference.clone(), SpeculativeMethod::DFlash)
+                    })
+                    .collect(),
+                ..CustomModelEnrichmentResult::default()
+            }
+        }
+    }
+
+    /// An added model's drafter downloaded with it from its own repository is attached, and only
+    /// the drafter its choice serves with that is not on this computer is ever fetched: the
+    /// recommended one under `Auto`, even while one after it serves, and the chosen reference.
+    #[tokio::test]
+    async fn an_added_models_drafter_from_its_repository_is_attached_and_a_missing_one_is_fetched() {
+        let fixture = Fixture::new().await;
+        let repository = "owner/Model-GGUF";
+        let commit = "c".repeat(40);
+        publish_managed(
+            &fixture.store,
+            repository,
+            &commit,
+            &[
+                ("Model-Q4_K_M.gguf", model_bytes("target")),
+                ("mtp.gguf", drafter_bytes("in the repository")),
+            ],
+        );
+        let id: ModelId = "hf:owner/Model-GGUF/Model-Q4_K_M.gguf".parse().unwrap();
+        let in_repository = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+            commit: commit.clone(),
+            path: "mtp.gguf".to_owned(),
+        };
+        let elsewhere = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF").unwrap(),
+            commit: "e".repeat(40),
+            path: "Model-DFlash-Q8_0.gguf".to_owned(),
+        };
+        let configuration = LocalModelsConfiguration {
+            added: vec![added(repository, "Model-Q4_K_M.gguf", &commit)],
+            ..LocalModelsConfiguration::default()
+        };
+        let attached = |listed: &LocalModelsResponse| {
+            let model = listed.models.iter().find(|model| model.model_id == id).unwrap();
+            model.drafter.as_ref().map(|drafter| (drafter.reference.clone(), drafter.state.clone()))
+        };
+
+        for (automatic, served, fetched) in [
+            (
+                vec![in_repository.clone(), elsewhere.clone()],
+                (in_repository.clone(), AttachedDrafterState::Ready),
+                None,
+            ),
+            (
+                vec![elsewhere.clone(), in_repository.clone()],
+                (in_repository.clone(), AttachedDrafterState::Ready),
+                Some(elsewhere.clone()),
+            ),
+            (
+                vec![elsewhere.clone()],
+                (elsewhere.clone(), AttachedDrafterState::NotInstalled),
+                Some(elsewhere.clone()),
+            ),
+        ] {
+            fixture
+                .resolver
+                .set_custom_model_enrichment(Arc::new(Automatic(automatic.clone())));
+            let listed = fixture.apply(configuration.clone()).await;
+            assert_eq!(attached(&listed), Some(served), "{automatic:?}");
+            assert_eq!(
+                fixture.resolver.custom_model_fetched_drafter(&id).unwrap(),
+                fetched,
+                "{automatic:?}"
+            );
+        }
+
+        fixture
+            .resolver
+            .set_custom_model_enrichment(judges(elsewhere.clone(), SpeculativeMethod::DFlash));
+        let chosen = |drafter: DrafterChoice| LocalModelsConfiguration {
+            drafters: vec![DrafterAttachment {
+                model_id: id.clone(),
+                drafter,
+            }],
+            ..configuration.clone()
+        };
+        fixture
+            .apply(chosen(DrafterChoice::Reference {
+                reference: elsewhere.clone(),
+            }))
+            .await;
+        assert_eq!(
+            fixture.resolver.custom_model_fetched_drafter(&id).unwrap(),
+            Some(elsewhere.clone())
+        );
+        fixture.apply(chosen(DrafterChoice::None)).await;
+        assert_eq!(fixture.resolver.custom_model_fetched_drafter(&id).unwrap(), None);
     }
 
     #[test]

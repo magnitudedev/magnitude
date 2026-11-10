@@ -138,6 +138,7 @@ struct DrafterTarget {
     primary: Option<PathBuf>,
     folders: Vec<DrafterFolder>,
     snapshot: Option<HuggingFaceRepositorySnapshot>,
+    downloaded_from: Option<HuggingFaceRepositorySnapshot>,
     lineage: BTreeSet<String>,
     catalog: Option<ModelId>,
     reach: Reach,
@@ -2158,6 +2159,7 @@ impl ManagedModelCandidates {
                     primary: Some(primary),
                     folders: Vec::new(),
                     snapshot: Some(snapshot),
+                    downloaded_from: None,
                     lineage,
                     catalog: None,
                     reach: Reach::Hub,
@@ -2184,6 +2186,7 @@ impl ManagedModelCandidates {
                     primary: None,
                     folders,
                     snapshot: None,
+                    downloaded_from: None,
                     lineage,
                     catalog: None,
                     reach: Reach::Hub,
@@ -2194,7 +2197,8 @@ impl ManagedModelCandidates {
 
     /// A model's target: a catalog model's release material, or a custom model's installed
     /// target package. Locally, a model from a known Hub repository has no snapshot, and the
-    /// lineage its header declares and its repository's Hub lineage already on this computer.
+    /// lineage its header declares and its repository's Hub lineage already on this computer; an
+    /// added model has the repository snapshot it was downloaded from, when that is cached.
     async fn model_target(
         &self,
         model_id: &ModelId,
@@ -2215,6 +2219,7 @@ impl ManagedModelCandidates {
                 primary: None,
                 folders: Vec::new(),
                 snapshot: None,
+                downloaded_from: None,
                 lineage: BTreeSet::new(),
                 catalog: Some(model_id.clone()),
                 reach,
@@ -2274,8 +2279,11 @@ impl ManagedModelCandidates {
         let mut lineage = self.header_lineage(&material.target, &material.headers);
         // A model from a known Hub repository takes the lineage that repository declares, at its
         // commit or else at `main`, and lists that repository's drafters; never whatever else
-        // shares its folder. Locally, the lineage is the Hub's answers already on this computer.
-        let snapshot = match &repository {
+        // shares its folder. Locally, the lineage is the Hub's answers already on this computer,
+        // and an added model lists the drafters of its repository already downloaded. A Hub pass
+        // that can't read the repository fails, to be retried, rather than answering without its
+        // drafters; a repository the Hub says isn't there has none.
+        let (snapshot, downloaded_from) = match &repository {
             Some((repository, commit)) => {
                 let revision = if is_commit(commit) {
                     commit.as_str()
@@ -2284,28 +2292,33 @@ impl ManagedModelCandidates {
                 };
                 match reach {
                     Reach::Hub => {
-                        let snapshot = self.snapshot(repository, revision).await.ok();
+                        let snapshot = match self.snapshot(repository, revision).await {
+                            Ok(snapshot) => Some(snapshot),
+                            Err(error) if transient(&error) => return Err(error),
+                            Err(_) => None,
+                        };
                         let first_hop = snapshot
                             .as_ref()
                             .map(|snapshot| snapshot.base_models.clone());
                         lineage.extend(self.lineage.hub().lineage(repository, first_hop).await);
-                        snapshot
+                        (snapshot, None)
                     }
                     Reach::Local => {
-                        let first_hop = magnitude_service_models::cached_hugging_face_repository(
+                        let cached = magnitude_service_models::cached_hugging_face_repository(
                             self.models(),
                             &HuggingFaceRepositoryRequest {
                                 repository: repository.clone(),
                                 revision: revision.to_owned(),
                             },
-                        )
-                        .map(|snapshot| snapshot.base_models);
+                        );
+                        let first_hop = cached.as_ref().map(|snapshot| snapshot.base_models.clone());
                         lineage.extend(self.lineage.hub().known_lineage(repository, first_hop));
-                        None
+                        let added = matches!(model.origin, CustomModelOrigin::Added { .. });
+                        (None, cached.filter(|_| added))
                     }
                 }
             }
-            None => None,
+            None => (None, None),
         };
         // Each place this model's own bytes are found gives its folder; never the folder of the
         // file its target package resolves to, nor of another model sharing its header.
@@ -2355,6 +2368,7 @@ impl ManagedModelCandidates {
             primary,
             folders,
             snapshot,
+            downloaded_from,
             lineage,
             catalog: None,
             reach,
@@ -2482,7 +2496,7 @@ impl ManagedModelCandidates {
             .and_then(|(matched, _)| catalog_draft_key(&matched.model));
         let mut candidates = self
             .next_to_model(&target, catalog_file.as_deref(), progress)
-            .await
+            .await?
             .into_iter()
             .map(decide)
             .collect::<Vec<_>>();
@@ -2634,34 +2648,92 @@ impl ManagedModelCandidates {
 
     /// The separate drafters in the target's own repository snapshot, or its own folder when it
     /// has no repository snapshot: GGUFs whose header declares a drafter role. The catalog
-    /// drafter's own file is left to the catalog candidate.
+    /// drafter's own file is left to the catalog candidate. Without the Hub, an added model's are
+    /// those of the repository it was downloaded from that are on this computer, classified when
+    /// it was added; the Hub pass lists the rest. A Hub read that fails fails the enumeration,
+    /// so no answer leaves out a drafter of the repository for a failure that may not recur.
     async fn next_to_model(
         &self,
         target: &DrafterTarget,
         catalog_file: Option<&str>,
         progress: &InspectionProgress,
-    ) -> Vec<DrafterCandidate> {
+    ) -> Result<Vec<DrafterCandidate>, InventoryError> {
+        let outside_catalog = |snapshot: &HuggingFaceRepositorySnapshot, path: &Path| {
+            let key = reference_key(&DrafterReference::HuggingFace {
+                repository: hugging_face_id(&snapshot.repository),
+                commit: snapshot.commit.clone(),
+                path: path_string(path),
+            });
+            catalog_file != Some(key.as_str())
+        };
         if let Some(snapshot) = &target.snapshot {
-            let Ok(classified) = self
+            let classified = match self
                 .classify_hugging_face(snapshot, &InspectionProgress::silent())
                 .await
-            else {
-                return Vec::new();
+            {
+                Ok(classified) => classified,
+                Err(error) if transient(&error) => return Err(error),
+                Err(_) => return Ok(Vec::new()),
             };
             let pending = classified
                 .into_iter()
                 .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
                 .filter(|group| group.group.files.len() == 1)
                 .map(|group| group.group.primary().path.clone())
-                .filter(|path| {
-                    let key = reference_key(&DrafterReference::HuggingFace {
-                        repository: hugging_face_id(&snapshot.repository),
-                        commit: snapshot.commit.clone(),
-                        path: path_string(path),
-                    });
-                    catalog_file != Some(key.as_str())
+                .filter(|path| outside_catalog(snapshot, path))
+                .map(|path| async move {
+                    let material = match self.hugging_face_drafter(snapshot, &path).await {
+                        Ok(material) => material,
+                        Err(error) if transient(&error) => return Err(error),
+                        Err(_) => return Ok(None),
+                    };
+                    Ok(self
+                        .hugging_face_drafter_candidate(target, snapshot, path, material)
+                        .await)
                 })
-                .map(|path| self.hugging_face_drafter_candidate(target, snapshot, path))
+                .collect::<Vec<_>>();
+            return collect_candidates(pending, progress).await;
+        }
+        if let Some(snapshot) = &target.downloaded_from {
+            let files = snapshot
+                .gguf_files
+                .iter()
+                .map(|file| CandidateGguf {
+                    path: file.path.clone(),
+                    size_bytes: file.size_bytes,
+                })
+                .collect::<Vec<_>>();
+            let pending = group_ggufs(&files)
+                .into_iter()
+                .filter(|group| group.files.len() == 1)
+                .filter_map(|group| {
+                    let file = snapshot_file(snapshot, &group.primary().path).ok()?;
+                    let (digest, classification) =
+                        self.models().cached_hugging_face_classification(
+                            &snapshot.repository,
+                            &snapshot.commit,
+                            file,
+                            &self.architectures,
+                        )?;
+                    let classified = classified_group(group, digest.clone(), classification);
+                    let path = classified.group.primary().path.clone();
+                    (matches!(classified.role, CandidateFileRole::Drafter { .. })
+                        && outside_catalog(snapshot, &path))
+                    .then_some(())?;
+                    let here = self.models().installed_drafter_path(&DrafterContent {
+                        header_digest: Some(digest),
+                        sha256: sha256_of(file).map(str::to_owned),
+                        size_bytes: file.size_bytes,
+                    })?;
+                    Some(async move {
+                        let Ok(material) = self.local_drafter(here) else {
+                            return Ok(None);
+                        };
+                        Ok(self
+                            .hugging_face_drafter_candidate(target, snapshot, path, material)
+                            .await)
+                    })
+                })
                 .collect::<Vec<_>>();
             return collect_candidates(pending, progress).await;
         }
@@ -2674,27 +2746,30 @@ impl ManagedModelCandidates {
                     .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
                     .filter(|group| group.group.files.len() == 1)
                     .filter(|group| folder.admits(&group.group.primary().path))
-                    .map(|group| {
-                        self.local_drafter_candidate(
-                            target,
-                            folder.path.join(&group.group.primary().path),
-                            group.group.size_bytes(),
-                        )
+                    .map(|group| async move {
+                        Ok(self
+                            .local_drafter_candidate(
+                                target,
+                                folder.path.join(&group.group.primary().path),
+                                group.group.size_bytes(),
+                            )
+                            .await)
                     }),
             );
         }
         collect_candidates(pending, progress).await
     }
 
-    /// A drafter file in the target's Hugging Face repository, with the engine's verdict.
+    /// A drafter file in the target's Hugging Face repository, with the engine's verdict on its
+    /// `material`: its header from the Hub, or from its copy on this computer.
     async fn hugging_face_drafter_candidate(
         &self,
         target: &DrafterTarget,
         snapshot: &HuggingFaceRepositorySnapshot,
         path: PathBuf,
+        material: DrafterMaterial,
     ) -> Option<DrafterCandidate> {
         let file = snapshot_file(snapshot, &path).ok()?;
-        let material = self.hugging_face_drafter(snapshot, &path).await.ok()?;
         let (verdict, fits) = self.drafter_verdict(target, &material).await?;
         let reference = DrafterReference::HuggingFace {
             repository: hugging_face_id(&snapshot.repository),
@@ -2930,21 +3005,51 @@ impl ManagedModelCandidates {
                     )),
                 }
             }
+            DrafterReference::HuggingFace { .. } => {
+                Ok(self.separate_drafter_package(&drafter.reference).await?.map(|draft| {
+                    (
+                        SpeculativeDraftSource::Separate { draft },
+                        drafter.method.clone(),
+                    )
+                }))
+            }
+            DrafterReference::Local { .. } => Ok(None),
+        }
+    }
+
+    /// The downloadable package of a separate drafter: a catalog model's drafter package or a
+    /// Hugging Face file. Built-in heads and a file on this computer have none.
+    async fn separate_drafter_package(
+        &self,
+        reference: &DrafterReference,
+    ) -> Result<Option<ModelPackage>, InventoryError> {
+        match reference {
+            DrafterReference::Embedded | DrafterReference::Local { .. } => Ok(None),
+            DrafterReference::Catalog { model_id } => {
+                let matched = self
+                    .lineage
+                    .variant(model_id)
+                    .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
+                Ok(match matched.model.configuration.bundle {
+                    ServableModelBundle::SpeculativeDecoding {
+                        draft_source: SpeculativeDraftSource::Separate { draft },
+                        ..
+                    } => Some(draft),
+                    ServableModelBundle::SpeculativeDecoding { .. }
+                    | ServableModelBundle::Standalone { .. } => None,
+                })
+            }
             DrafterReference::HuggingFace {
                 repository,
                 commit,
                 path,
             } => {
                 let snapshot = self.snapshot(repository.as_str(), commit).await?;
-                let draft = self
-                    .hugging_face_package(&snapshot, Path::new(path), None)
-                    .await?;
-                Ok(Some((
-                    SpeculativeDraftSource::Separate { draft },
-                    drafter.method.clone(),
-                )))
+                Ok(Some(
+                    self.hugging_face_package(&snapshot, Path::new(path), None)
+                        .await?,
+                ))
             }
-            DrafterReference::Local { .. } => Ok(None),
         }
     }
 }
@@ -2964,15 +3069,20 @@ fn drafter_input(reference: &DrafterReference) -> Option<String> {
 }
 
 impl ManagedModelCandidates {
-    /// The drafter a download fetches with a model, for `choice`: the preselected automatic one,
-    /// or the chosen reference as the engine binds it. A separate drafter already on this
-    /// computer, in any location, is used where it is and never fetched; built-in heads come with
-    /// the target.
+    /// The drafter an added model's download fetches with its target, for `choice`: the
+    /// preselected automatic one, or the chosen reference as the engine binds it. A separate
+    /// drafter already on this computer, in any location, is used where it is and never fetched;
+    /// built-in heads come with the target. Once the model is here its projection attaches the
+    /// same drafter, from the same enumeration (see `CustomModelPart::Drafter` for later fetches).
     async fn fetched_drafter(
         &self,
-        request: impl Fn(Option<String>) -> DrafterCandidatesRequest,
+        candidate: &ModelCandidate,
         choice: &DrafterChoice,
     ) -> Result<Option<CandidateDrafter>, InventoryError> {
+        let request = |other| DrafterCandidatesRequest::Candidate {
+            candidate: candidate.clone(),
+            other,
+        };
         let chosen = match choice {
             DrafterChoice::None => return Ok(None),
             DrafterChoice::Auto => self
@@ -3019,15 +3129,7 @@ impl ManagedModelCandidates {
             }),
             drafter: None,
         };
-        let drafter = self
-            .fetched_drafter(
-                |other| DrafterCandidatesRequest::Candidate {
-                    candidate: candidate.clone(),
-                    other,
-                },
-                choice,
-            )
-            .await?;
+        let drafter = self.fetched_drafter(&candidate, choice).await?;
         let drafter = match &drafter {
             Some(drafter) => self.drafter_package(drafter).await?,
             None => None,
@@ -3130,25 +3232,19 @@ impl CustomModelAcquisition for ManagedModelCandidates {
                     .update_bundle(added.ok_or_else(not_added)?, &choice)
                     .await
                     .map(Some),
+                // The drafter the model's projection attaches when it is missing, so what a model
+                // shows as missing is always what this fetches.
                 Some(CustomModelPart::Drafter) => {
-                    let drafter = self
-                        .fetched_drafter(
-                            |other| DrafterCandidatesRequest::Model {
-                                model_id: model_id.clone(),
-                                other,
-                            },
-                            &choice,
-                        )
-                        .await?;
-                    let Some(drafter) = drafter else {
+                    let resolver = self.resolver.get().ok_or_else(|| {
+                        InventoryError::NotReady("custom models are not ready yet".to_owned())
+                    })?;
+                    let Some(reference) = resolver.custom_model_fetched_drafter(&model_id)? else {
                         return Ok(None);
                     };
-                    Ok(match self.drafter_package(&drafter).await? {
-                        Some((SpeculativeDraftSource::Separate { draft }, _)) => {
-                            Some(ServableModelBundle::Standalone { package: draft })
-                        }
-                        Some((SpeculativeDraftSource::Embedded, _)) | None => None,
-                    })
+                    Ok(self
+                        .separate_drafter_package(&reference)
+                        .await?
+                        .map(|draft| ServableModelBundle::Standalone { package: draft }))
                 }
             }
         })
@@ -3253,21 +3349,26 @@ impl ModelCandidates for ManagedModelCandidates {
 // Helpers ------------------------------------------------------------------------------------
 
 /// Run drafter verdicts with bounded concurrency, keeping their order and dropping the ones that
-/// could not be assessed.
+/// could not be assessed; a check that failed to read what it needs fails them all.
 async fn collect_candidates(
-    pending: Vec<impl std::future::Future<Output = Option<DrafterCandidate>>>,
+    pending: Vec<
+        impl std::future::Future<Output = Result<Option<DrafterCandidate>, InventoryError>>,
+    >,
     progress: &InspectionProgress,
-) -> Vec<DrafterCandidate> {
+) -> Result<Vec<DrafterCandidate>, InventoryError> {
     progress.drafters_planned(pending.len());
-    futures_util::stream::iter(pending.into_iter().map(|check| async {
+    let checked = futures_util::stream::iter(pending.into_iter().map(|check| async {
         let candidate = check.await;
         progress.drafter_checked();
         candidate
     }))
     .buffered(assessment_concurrency())
-        .filter_map(|candidate| async move { candidate })
+    .collect::<Vec<_>>()
+    .await;
+    checked
+        .into_iter()
+        .filter_map(Result::transpose)
         .collect()
-        .await
 }
 
 /// Runs the versions' checks with bounded concurrency, keeping their order and reporting each
@@ -3527,6 +3628,20 @@ fn catalog_draft_key(
 
 /// A single-file Hugging Face drafter's bytes: the header digest its material was read with, its
 /// size, and its Hub SHA-256 when the Hub gives one.
+/// Whether a failure may not recur: the Hub or the disk failed to answer, or something was busy,
+/// rather than an answer that something isn't there or can't be used.
+fn transient(error: &InventoryError) -> bool {
+    match error {
+        InventoryError::Upstream(_)
+        | InventoryError::Io(_)
+        | InventoryError::NotReady(_)
+        | InventoryError::Busy(_)
+        | InventoryError::ConcurrentMutation(_) => true,
+        InventoryError::ModelOperation { retryable, .. } => *retryable,
+        _ => false,
+    }
+}
+
 fn hugging_face_drafter_content(
     file: &HuggingFaceRepositoryFile,
     material: &DrafterMaterial,
