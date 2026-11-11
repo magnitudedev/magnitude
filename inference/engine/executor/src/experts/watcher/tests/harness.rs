@@ -615,16 +615,22 @@ pub(super) fn eventually(what: &str, check: impl Fn() -> bool) {
 /// How long a wait goes between notes of what it still awaits.
 const NOTED: Duration = Duration::from_secs(10);
 
-/// Spin until `ready` gives a value, `what` naming it: however long it
-/// takes, so a loaded host's pace never decides a test's verdict. A wait
-/// unmet past each [`NOTED`] notes what it awaits, so a hang names itself
-/// beside the test runner's own report of a long-running test.
+/// How long a wait may go unmet before its test fails naming it: a wait is a
+/// poll of state the watcher publishes within milliseconds, so one unmet for
+/// this long is a hang, which would otherwise hold the read engine's pool
+/// (`POOL`) shared and starve every test that needs it alone.
+const HANG: Duration = Duration::from_secs(60);
+
+/// Spin until `ready` gives a value, `what` naming it. A wait unmet past
+/// each [`NOTED`] notes what it awaits, and past [`HANG`] fails its test
+/// naming it, so a hang reports itself in a minute.
 pub(super) fn awaited<T>(what: &str, ready: impl Fn() -> Option<T>) -> T {
-    let mut noted = Instant::now();
+    let (began, mut noted) = (Instant::now(), Instant::now());
     loop {
         if let Some(value) = ready() {
             return value;
         }
+        assert!(began.elapsed() < HANG, "hung for {HANG:?} awaiting: {what}");
         if noted.elapsed() >= NOTED {
             eprintln!("still awaiting: {what}");
             noted = Instant::now();
@@ -655,22 +661,23 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 }
 
 /// Demand reads standing in the read engine's pool ahead of a test's until
-/// it finishes them: a file of 16 MiB read whole, as many times at once as
-/// the pool has workers once the line stands, and two more, into one record
-/// nothing reads. Each
-/// read is submitted again as it ends, by the worker that ended it, before
-/// that worker takes another piece (`seismic_io::read_workers`). So a
-/// read of the line not queued has a piece on a worker, or its end runs on
-/// one, or the line's first submissions are still being made on the test's
-/// thread: at most one more than the workers. Two more always leave one
-/// queued, parked, on the volume's link, however fast the volume or late a
-/// resubmission: a read the test issues behind it at a lesser priority (a
-/// hint's, a fill's) is not taken until the test finishes the line ("Order
-/// and depth"), and one at demand waits for the reads queued as it was
-/// issued. The pool grows only as reads are submitted, to at most what
-/// their links can hold in flight, so the line stands until it is two reads
-/// longer than the pool with the line's own reads submitted; a test that
-/// queues a line holds the pool alone (`alone`).
+/// it finishes them: one piece of a file each (its volume's due read), as
+/// many at once as the pool has workers once the line stands, and two more,
+/// into one record nothing reads. Each read is submitted again as it ends,
+/// by the worker that ended it, before that worker takes another piece
+/// (`seismic_io::read_workers`). So a read of the line not queued has its
+/// piece on a worker, or its end runs on one, or the line's first
+/// submissions are still being made on the test's thread: at most one more
+/// than the workers. Two more always leave one queued, parked, on the
+/// volume's link, however fast the volume or late a resubmission: a read
+/// the test issues behind it at a lesser priority (a hint's, a fill's) is
+/// not taken until the test finishes the line ("Order and depth"), and one
+/// at demand, or hastened to it, waits for the reads queued as it was
+/// issued: at most the pool's workers and two pieces, never the line's
+/// every resubmission. The pool grows only as reads are submitted, to at
+/// most what their links can hold in flight, so the line first grows it
+/// there, and stands two reads longer than it; a test that queues a line
+/// holds the pool alone (`alone`).
 pub(super) struct Ahead {
     line: Arc<AheadLine>,
     path: std::path::PathBuf,
@@ -683,6 +690,8 @@ struct AheadLine {
     records: Mutex<Records>,
     done: std::sync::atomic::AtomicBool,
     tickets: Mutex<Vec<Ticket>>,
+    /// The bytes each read reads: its volume's due read, one piece.
+    bytes: u64,
     /// How long a read's end waits before it submits the read again.
     late: Duration,
 }
@@ -703,7 +712,7 @@ impl AheadLine {
         const REGISTERED: u8 = 1;
         const ENDED: u8 = 2;
         while !self.done.load(Ordering::Acquire) {
-            let read = Read::new(0, 0, Ahead::FILE, &self.records.lock().unwrap(), 0);
+            let read = Read::new(0, 0, self.bytes, &self.records.lock().unwrap(), 0);
             let ticket = self.source.request(vec![read], seismic_io::Want::now()).unwrap();
             let (line, state) = (self.clone(), Arc::new(AtomicU8::new(REGISTERING)));
             let ending = state.clone();
@@ -737,7 +746,25 @@ impl Ahead {
         let source = ExpertSource::open(std::slice::from_ref(&path), &urgent()).unwrap();
         let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
         let records = Records::new(sink, Self::FILE, 1).unwrap();
-        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), late });
+        // The pool grown to what its devices' links can hold in flight
+        // before the line stands, so no read a test makes grows it past the
+        // line: whole reads of the file, read ahead, queue their pieces far
+        // faster than workers take them, each submission growing the pool to
+        // the most pieces queued or in flight at once, until one grows it no
+        // further; dropped, what of them is queued is cancelled.
+        let mut growing = Vec::new();
+        loop {
+            let workers = seismic_io::read_workers();
+            let read = Read::new(0, 0, Self::FILE, &records, 0);
+            growing.push(source.request(vec![read], seismic_io::Want::undated(0.)).unwrap());
+            if seismic_io::read_workers() == workers {
+                break;
+            }
+        }
+        drop(growing);
+        let shape = seismic_io::link_shape(&seismic_io::OpenFile::open(&path).unwrap(), Some(&urgent())).unwrap();
+        let bytes = shape.due_read.min(Self::FILE);
+        let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), bytes, late });
         let mut standing = 0;
         while standing < seismic_io::read_workers() + 2 {
             line.stand();
