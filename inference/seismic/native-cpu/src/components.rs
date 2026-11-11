@@ -1140,6 +1140,9 @@ mod tests {
                     (rows * k) as f64 / best / 1e9,
                     (rows * geometry.stride) as f64 / best / 1e9
                 );
+                if !int8(representation) {
+                    continue; // floating codes take no int8 form (`forms::cpu_int8`)
+                }
                 let mut xq = vec![crate::quant::Q8Block::ZERO; crate::quant::blocks(k)];
                 crate::quant::quantize(&x, &mut xq);
                 let mut best = f64::INFINITY;
