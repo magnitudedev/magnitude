@@ -1101,6 +1101,10 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
         text: include_str!("../kernels/dense_rows.seismic").into(),
     });
     sources.push(SourceFile {
+        path: "projection.seismic".into(),
+        text: include_str!("../kernels/projection.seismic").into(),
+    });
+    sources.push(SourceFile {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });

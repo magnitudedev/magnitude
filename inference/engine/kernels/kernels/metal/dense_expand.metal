@@ -10,6 +10,7 @@
 #endif
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#include "lib/projection/operator.h"
 #if defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR)
 #include "lib/projection/gemv.h"
 #endif
@@ -73,17 +74,8 @@ typedef projection::operands<NVFP4> Operands;
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
     const auto x = Operands::rows(projection::shared_norm(in, squares), rows, uint(SEISMIC_DIM_H), globals, \
         simdgroups, sg, lane);                                                          \
-    if (TILED == 1 && projection::gemv_tile_row_serves(gate, rows) && projection::gemv_tile_row_serves(up, rows)) { \
-        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
-            projection::gemv_tile_row<packets::W0, packets::W1, true, ROWS, MAXM, LANES>( \
-                x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, simdgroups, sg, \
-                lane));                                                                 \
-        return;                                                                         \
-    }                                                                                   \
-    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
-        projection::gemv_form<packets::W0, packets::W1, true, ROWS, MAXM, LANES, (TILED == 2)>( \
-            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, \
-            simdgroups, sg, lane))
+    PROJECTION_GEMV(packets::W0, packets::W1, true, ROWS, LANES, TILED, COUNT, x, out, gate, up, rows, \
+        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H))
 
 // One row.
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
@@ -135,17 +127,8 @@ kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_OPERANDS;
     projection::Plain<activation, projection::AllRows> x{normalized,
         SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    if constexpr (MATRIX == 1) {
-        projection::gemv_matrix_paired<packets::W0, packets::W1, BATCH_PARTS>(x, out,
-            gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
-            tile, shared, simdgroups, sg, lane);
-        return;
-    }
-    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_F))
-        return;
-    projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, out,
-        gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
-        simdgroups, sg, lane);
+    PROJECTION_BATCH(packets::W0, packets::W1, true, BATCH_ROWS, BATCH_PARTS, MATRIX, x, out, gate, up,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H));
 }
 #endif
 

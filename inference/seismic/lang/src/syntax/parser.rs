@@ -216,6 +216,9 @@ impl Parser {
                 Tok::Kw(Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Kw(Kw::Lower) => decls.push(Decl::Lower(self.lower_decl()?)),
                 Tok::Kw(Kw::Native) => decls.push(Decl::Native(self.native_decl()?)),
+                Tok::Name(word) if word == "projection" => {
+                    decls.push(Decl::Projection(self.projection_decl()?))
+                }
                 Tok::Indent => {
                     return Err(self.error(
                         "unexpected indentation; declarations start at the left margin".into(),
@@ -223,7 +226,7 @@ impl Parser {
                 }
                 other => {
                     return Err(self.error(format!(
-                        "expected `const`, `fn`, `lower`, or `native`, found {}",
+                        "expected `const`, `fn`, `lower`, `native`, or `projection`, found {}",
                         other.describe()
                     )));
                 }
@@ -401,32 +404,29 @@ impl Parser {
             self.expect_newline()?;
         }
         let mut scratch = Vec::new();
-        while self.at_word("scratch") {
-            let begin = self.bump().span;
-            let name = self.binding_name()?;
-            if !self.at_word("bytes") {
-                return Err(self.error(format!(
-                    "expected `bytes (<size>)` after the scratch name, found {}",
-                    self.peek().describe()
-                )));
+        let mut project = None;
+        loop {
+            if self.at_word("scratch") {
+                scratch.push(self.native_scratch()?);
+                self.expect_newline()?;
+            } else if self.at_word("project") && project.is_none() {
+                let begin = self.bump().span;
+                let projection = self.expect_name()?;
+                let variant = self.expect_name()?;
+                self.expect_op(Op::LParen)?;
+                let weights = self.comma_list(Self::expect_name)?;
+                self.expect_op(Op::RParen)?;
+                project = Some(NativeProjectDecl {
+                    projection,
+                    variant,
+                    weights,
+                    scratch_before: scratch.len(),
+                    span: begin.to(self.prev_span()),
+                });
+                self.expect_newline()?;
+            } else {
+                break;
             }
-            self.bump();
-            self.expect_op(Op::LParen)?;
-            let bytes = self.expr()?;
-            self.expect_op(Op::RParen)?;
-            let sync = self.at_word("sync");
-            if sync {
-                self.bump();
-            }
-            let when = self.native_when()?;
-            scratch.push(NativeScratchDecl {
-                name,
-                bytes,
-                sync,
-                when,
-                span: begin.to(self.prev_span()),
-            });
-            self.expect_newline()?;
         }
         let mut launches = Vec::new();
         let mut repeat = None;
@@ -479,8 +479,145 @@ impl Parser {
             terms,
             constraint,
             scratch,
+            project,
             launches,
             repeat,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// `scratch NAME bytes (EXPR) [sync] [when CONDITION]`, before its line's end.
+    fn native_scratch(&mut self) -> PResult<NativeScratchDecl> {
+        let begin = self.bump().span;
+        let name = self.binding_name()?;
+        if !self.at_word("bytes") {
+            return Err(self.error(format!(
+                "expected `bytes (<size>)` after the scratch name, found {}",
+                self.peek().describe()
+            )));
+        }
+        self.bump();
+        self.expect_op(Op::LParen)?;
+        let bytes = self.expr()?;
+        self.expect_op(Op::RParen)?;
+        let sync = self.at_word("sync");
+        if sync {
+            self.bump();
+        }
+        let when = self.native_when()?;
+        Ok(NativeScratchDecl {
+            name,
+            bytes,
+            sync,
+            when,
+            span: begin.to(self.prev_span()),
+        })
+    }
+
+    /// An optional `for VARIANT`: the projection variant an item belongs to.
+    fn variant(&mut self) -> PResult<Option<Ident>> {
+        if !self.eat_kw(Kw::For) {
+            return Ok(None);
+        }
+        Ok(Some(self.expect_name()?))
+    }
+
+    fn gated<T>(&mut self, item: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<Gated<T>> {
+        let item = item(self)?;
+        let variant = self.variant()?;
+        Ok(Gated { item, variant })
+    }
+
+    /// `projection NAME for TARGET:` and its indented body
+    /// ([`ProjectionDecl`]).
+    fn projection_decl(&mut self) -> PResult<ProjectionDecl> {
+        let start = self.bump().span;
+        let name = self.expect_name()?;
+        self.expect_kw(Kw::For)?;
+        let target = self.expect_name()?;
+        self.expect_op(Op::Colon)?;
+        self.native_block_start("projection")?;
+        let mut terms = Vec::new();
+        while matches!(self.peek(), Tok::Kw(Kw::Let)) {
+            terms.push(self.gated(|parser| {
+                let begin = parser.bump().span;
+                let name = parser.binding_name()?;
+                parser.expect_op(Op::Assign)?;
+                let value = parser.expr()?;
+                Ok(NativeTermDecl {
+                    name,
+                    value,
+                    span: begin.to(parser.prev_span()),
+                })
+            })?);
+            self.expect_newline()?;
+        }
+        let mut params = Vec::new();
+        if self.at_word("params") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            params = self.comma_list(|parser| parser.gated(Self::native_param))?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
+        let mut constraints = Vec::new();
+        while self.eat_kw(Kw::Where) {
+            constraints.push(self.gated(Self::expr)?);
+            self.expect_newline()?;
+        }
+        let mut scratch = Vec::new();
+        loop {
+            if self.at_word("scratch") {
+                scratch.push(ProjectionScratchDecl::One(self.gated(Self::native_scratch)?));
+                self.expect_newline()?;
+            } else if self.at_word("each") {
+                self.bump();
+                let formal = self.expect_name()?;
+                if formal.name != "W" {
+                    return Err(Diagnostic::with_rule(
+                        crate::checked::DiagnosticRule::Syntax,
+                        formal.span,
+                        format!("`each` ranges over the weights, `W`, not `{}`", formal.name),
+                    ));
+                }
+                self.expect_op(Op::Colon)?;
+                self.native_block_start("each")?;
+                let mut each = Vec::new();
+                while self.at_word("scratch") {
+                    each.push(self.gated(Self::native_scratch)?);
+                    self.expect_newline()?;
+                }
+                if each.is_empty() {
+                    return Err(self.error(format!(
+                        "expected `scratch` in the `each W` block, found {}",
+                        self.peek().describe()
+                    )));
+                }
+                self.native_block_end("each")?;
+                scratch.push(ProjectionScratchDecl::Each(each));
+            } else {
+                break;
+            }
+        }
+        let mut launches = Vec::new();
+        while self.at_word("launch") {
+            launches.push(self.launch(true)?);
+        }
+        if launches.is_empty() {
+            return Err(self.error(format!(
+                "expected `launch <name>:`, found {}; a projection lists `let`, `params`, `where`, `scratch`, then one or more launches",
+                self.peek().describe()
+            )));
+        }
+        self.native_block_end("projection")?;
+        Ok(ProjectionDecl {
+            name,
+            target,
+            terms,
+            params,
+            constraints,
+            scratch,
+            launches,
             span: start.to(self.prev_span()),
         })
     }
@@ -606,11 +743,24 @@ impl Parser {
         Ok(Some(self.expr()?))
     }
 
-    /// `launch KERNEL [resident (BARRIER)] [when CONDITION]:` followed by its
-    /// indented geometry.
+    /// `launch KERNEL [before LAUNCH] [resident (BARRIER)] [when CONDITION]:`
+    /// followed by its indented geometry.
     fn native_launch(&mut self) -> PResult<NativeLaunchDecl> {
+        Ok(self.launch(false)?.launch)
+    }
+
+    /// A native launch or (`projection`) a projection's: `launch NAME [for
+    /// VARIANT] [when CONDITION]:`, its parameters each `[for VARIANT]`.
+    fn launch(&mut self, projection: bool) -> PResult<ProjectionLaunchDecl> {
         let begin = self.bump().span;
         let kernel = self.expect_name()?;
+        let variant = if projection { self.variant()? } else { None };
+        let before = if !projection && self.at_word("before") {
+            self.bump();
+            Some(self.expect_name()?)
+        } else {
+            None
+        };
         let resident = if self.at_word("resident") {
             self.bump();
             self.expect_op(Op::LParen)?;
@@ -624,10 +774,18 @@ impl Parser {
         self.expect_op(Op::Colon)?;
         self.native_block_start("launch")?;
         let mut params = Vec::new();
+        let mut param_variants = Vec::new();
         if self.at_word("params") {
             self.bump();
             self.expect_op(Op::LParen)?;
-            params = self.comma_list(Self::native_param)?;
+            for param in self.comma_list(|parser| {
+                let param = parser.native_param()?;
+                let variant = if projection { parser.variant()? } else { None };
+                Ok((param, variant))
+            })? {
+                params.push(param.0);
+                param_variants.push(param.1);
+            }
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
@@ -704,8 +862,9 @@ impl Parser {
             None
         };
         self.native_block_end("launch")?;
-        Ok(NativeLaunchDecl {
+        let launch = NativeLaunchDecl {
             kernel,
+            before,
             resident,
             when,
             params,
@@ -718,6 +877,11 @@ impl Parser {
             threads_per_threadgroup,
             shared_bytes,
             span: begin.to(self.prev_span()),
+        };
+        Ok(ProjectionLaunchDecl {
+            launch,
+            variant,
+            param_variants,
         })
     }
 
@@ -1712,6 +1876,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["PARTS", "SPARE"]
         );
+    }
+
+    #[test]
+    fn projections_and_project_lines_round_trip() {
+        let file = round_trip(
+            "projection lanes for metal:\n    let SPLITS = 1 for paired\n    let SPLITS = SPLIT for single\n    params (SPLIT in [1, 2] default 1 for single, form WIDE in [0, 1] default 0)\n    where (WIDE == 0 or each(W, form(W, INT8) == 1))\n    where K % 2 == 0 for paired\n    scratch partials bytes (SPLITS * M * N * 4) when M > 4 for single\n    each W:\n        scratch factors bytes (N * 4)\n        scratch scales bytes (N) when WIDE == 1 for paired\n    launch gemv for single when M < 2:\n        params (ROWS in [1, 2] default 1 for paired, ROWS in [2, 1] default 2 for single)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n\nnative rows for metal from \"rows.metal\":\n    where O > 0\n    scratch staged bytes (O * 4)\n    project lanes paired (gate_weight, up_weight)\n    scratch after bytes (O)\n    launch rows_stage before gemv when O > 1:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        );
+        let [Decl::Projection(projection), Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected a projection and a native implementation")
+        };
+        assert_eq!(projection.launches[0].param_variants.len(), 2);
+        let project = native.project.as_ref().expect("the native projects");
+        assert_eq!((project.scratch_before, project.weights.len()), (1, 2));
+        assert_eq!(native.launches[0].before.as_ref().map(|before| before.name.as_str()), Some("gemv"));
+        assert!(parse("native rows for metal from \"rows.metal\":\n    launch rows for single:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").is_err());
     }
 
     #[test]

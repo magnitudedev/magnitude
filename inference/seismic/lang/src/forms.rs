@@ -22,6 +22,12 @@
 //! The GPUs' forms are of packed rows, a dense weight having one path; the
 //! CPU's are of every weight, whose dense rows take its quantized
 //! activations too.
+//!
+//! A form whose producer reads every weight admits every weight and has no
+//! row here: Metal's tall GEMM (`TALL`), whose staging simdgroups decode
+//! any decoder's packets (`packets::Block`, dense rows included) into the
+//! same half tiles the default GEMM stages, so its admission is its shape
+//! guard alone (`projection.seismic`).
 
 use crate::ids::RepresentationId;
 use crate::registry::{self, BackendName, OperandRecipe, RepresentationInfo};

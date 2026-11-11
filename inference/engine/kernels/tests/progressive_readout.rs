@@ -882,6 +882,10 @@ fn module() -> CheckedModule {
             include_str!("../kernels/dense_rows.seismic"),
         ),
         (
+            "projection.seismic",
+            include_str!("../kernels/projection.seismic"),
+        ),
+        (
             "readout.seismic",
             include_str!("../kernels/readout.seismic"),
         ),
