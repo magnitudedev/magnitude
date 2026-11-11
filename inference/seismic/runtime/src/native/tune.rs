@@ -2554,8 +2554,7 @@ struct Placed<'a> {
 fn place<'a>(
     kernel: &Arc<NativePrepared>,
     points: &[PreparedPoint<'a>],
-    influence: &Influence,
-    values: &ParameterValues,
+    keyed: &dyn Fn(Vec<usize>) -> LaunchKey,
     outputs: &mut OutputPool,
     // A challenger is admitted, and its admission observed in its unit's
     // class; the defaults (none) are the reference.
@@ -2592,11 +2591,10 @@ fn place<'a>(
                 continue;
             }
             let kernel = timing.prepared().clone();
-            let key = |working| influence.key(working, values);
             if gated {
-                point.admit_before(Some(timing), &kernel, &key, deadline)?;
+                point.admit_before(Some(timing), &kernel, &keyed, deadline)?;
             } else {
-                point.observe_before(Some(timing), &kernel, &key, deadline)?;
+                point.observe_before(Some(timing), &kernel, &keyed, deadline)?;
             }
         }
         Ok(timings)
@@ -2607,7 +2605,7 @@ fn place<'a>(
     let timings = timings?;
     let keys = timings
         .iter()
-        .map(|timing| influence.key(timing.working_launches(), values))
+        .map(|timing| keyed(timing.working_launches()))
         .collect();
     Ok(Placed { timings, keys })
 }
@@ -2621,7 +2619,10 @@ struct Sampling {
 
 /// Measures configurations at the tuning points, once per point and key.
 struct PointSurveyor {
-    influence: Influence,
+    /// How a point is keyed: by the launches that work and the parameters
+    /// they read, launch-scoped ones included, as the unit's search keys its
+    /// own (a survey keys by every entry parameter: no boundary).
+    keying: Keying,
     /// Every point measured so far, by point label and key.
     measured: HashMap<(String, LaunchKey), PointMeasurement>,
     outputs: OutputPool,
@@ -2638,7 +2639,11 @@ struct PointSurveyor {
 impl PointSurveyor {
     fn new(implementation: &NativeImplementation, gated: bool) -> Self {
         Self {
-            influence: Influence::of(implementation),
+            keying: if implementation.launch_scoped() {
+                Keying::Launches(Vec::new())
+            } else {
+                Keying::Whole(Influence::of(implementation))
+            },
             measured: HashMap::new(),
             outputs: OutputPool::default(),
             gated,
@@ -2652,9 +2657,10 @@ impl PointSurveyor {
     /// a device raised as a search with `settings` raises it.
     fn measure(
         &mut self,
+        implementation: &NativeImplementation,
         kernel: &Arc<NativePrepared>,
         points: &[PreparedPoint<'_>],
-        values: &ParameterValues,
+        specialization: &NativeSpecialization,
         options: &Sampling,
         settings: &SearchSettings,
         admission: Option<&mut Observed>,
@@ -2663,8 +2669,7 @@ impl PointSurveyor {
         let Placed { timings, keys } = place(
             kernel,
             points,
-            &self.influence,
-            values,
+            &|working| self.keying.key(implementation, working, specialization),
             &mut self.outputs,
             admission,
             self.gated,
@@ -4686,9 +4691,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .as_mut()
             .expect("the surveyor serves discovery until a search takes it")
             .measure(
+                &self.implementation,
                 &ground.kernel,
                 std::slice::from_ref(&point),
-                self.default.params(),
+                &self.default,
                 &options,
                 &settings,
                 None,
@@ -7545,9 +7551,10 @@ impl Tuned<'_> {
                     Ok(kernel) => (
                         Some(kernel.artifact().0.clone()),
                         match surveyor.measure(
+                            self.formation.implementation,
                             &kernel,
                             points,
-                            specialization.params(),
+                            &specialization,
                             &options,
                             &settings,
                             Some(&mut admission),
@@ -9888,6 +9895,28 @@ mod tests {
         "        threadgroups (N, 1, 1)\n",
         "        threads_per_threadgroup (ROWS, 1, 1)\n",
     );
+
+    /// A survey measures a point once per key, so the key must tell apart
+    /// configurations that differ in a working launch's own parameters.
+    #[test]
+    fn a_survey_keys_a_point_by_the_launch_parameters_of_the_launches_that_work() {
+        let implementation = declared(
+            "    launch gemv when N < 16:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        params (TILE in [4, 8] default 4)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        );
+        let default = implementation
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .unwrap();
+        let surveyor = PointSurveyor::new(&implementation, false);
+        let key = |working: Vec<usize>, specialization: &NativeSpecialization| {
+            surveyor.keying.key(&implementation, working, specialization)
+        };
+        let rows = default.clone().with_launch_param(0, "ROWS", 2);
+        assert_ne!(key(vec![0], &default), key(vec![0], &rows));
+        // The other launch does not work there, so its parameter does not count.
+        let tile = default.clone().with_launch_param(1, "TILE", 8);
+        assert_eq!(key(vec![0], &default), key(vec![0], &tile));
+        assert_ne!(key(vec![1], &default), key(vec![1], &tile));
+    }
 
     /// What a search formed stays held whatever was formed after it: a
     /// variant is asked of the toolchain once, a later compile call asks
