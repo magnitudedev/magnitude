@@ -418,6 +418,20 @@ pub struct Device {
 }
 
 impl Device {
+    /// Declare the load's charge final: a record table formed afterwards
+    /// outside a [`TableSealLifted`] scope is an invariant violation (stops
+    /// every build), being device memory no claim covers.
+    pub fn seal_record_tables(&self) {
+        self.inner.seal_record_tables()
+    }
+
+    /// Lift the seal while the guard lives, for allocations made under a
+    /// claim after the load (a component's import and binding).
+    pub fn lift_table_seal(&self) -> TableSealLifted {
+        self.inner.lift_table_seal();
+        TableSealLifted(self.clone(), std::marker::PhantomData)
+    }
+
     pub fn same_device(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -6033,4 +6047,14 @@ pub mod dynamic;
 pub mod precision {
     pub use seismic_compiler::numerics::PolicyIdentity;
     pub use seismic_lang::precision::*;
+}
+
+/// The scope of [`Device::lift_table_seal`].
+/// It belongs to the thread that took it.
+pub struct TableSealLifted(Device, std::marker::PhantomData<*const ()>);
+
+impl Drop for TableSealLifted {
+    fn drop(&mut self) {
+        self.0.inner.restore_table_seal();
+    }
 }

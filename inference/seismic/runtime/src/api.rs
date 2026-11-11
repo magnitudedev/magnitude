@@ -788,6 +788,10 @@ pub mod device {
         /// What the device's recorded graphs hold for their census,
         /// measured on opening where the driver takes it.
         pub(crate) graph_cost: seismic_compiler::graph_cost::GraphCost,
+        /// Set once the load's charge is final: from then on a record table
+        /// formed outside a lifted scope ([`DeviceInner::lift_table_seal`])
+        /// is memory no claim covers (see `record_table`).
+        pub(crate) tables_sealed: std::sync::atomic::AtomicBool,
         /// Kernels tuning chose and formed, handed to the serving
         /// preparation of the same specialization so nothing is formed twice
         /// (`NativePrepared::hand_off`). Taken on first use.
@@ -798,7 +802,39 @@ pub mod device {
             >,
         >,
     }
+    thread_local! {
+        /// The devices whose table seal this thread has lifted, one entry per
+        /// open scope ([`DeviceInner::lift_table_seal`]).
+        static LIFTED_SEALS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     impl DeviceInner {
+        /// Declare the load's charge final: forming a record table afterwards,
+        /// outside a lifted scope, is an invariant violation.
+        pub fn seal_record_tables(&self) {
+            self.tables_sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Lift the seal until [`Self::restore_table_seal`], for allocations
+        /// made under a claim after the load (a component's import).
+        ///
+        /// The lift belongs to the calling thread: a table another thread
+        /// forms meanwhile is outside any claim and stops there as it does
+        /// anywhere ([`record_table`]).
+        pub fn lift_table_seal(&self) {
+            LIFTED_SEALS.with(|lifted| lifted.borrow_mut().push(self.seal_key()));
+        }
+        pub fn restore_table_seal(&self) {
+            LIFTED_SEALS.with(|lifted| {
+                let mut lifted = lifted.borrow_mut();
+                let at = lifted.iter().rposition(|key| *key == self.seal_key()).expect("a restored seal lift is this thread's");
+                lifted.remove(at);
+            });
+        }
+        fn seal_key(&self) -> usize {
+            std::ptr::from_ref(self) as usize
+        }
+        pub(crate) fn seal_lifted_here(&self) -> bool {
+            LIFTED_SEALS.with(|lifted| lifted.borrow().contains(&self.seal_key()))
+        }
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
             self.trace
                 .lock()
@@ -1335,6 +1371,18 @@ pub mod tensor {
         storage: &Arc<Allocation>,
         offsets: impl Iterator<Item = u64>,
     ) -> Result<Arc<Allocation>, TensorError> {
+        // A table formed after the load is sealed is device memory no claim
+        // covers: a state that must not exist, so every build stops where it
+        // is formed (every fixed record port's table is formed as its plan is
+        // bound, `bind_static`, and a grown slab's is in its allocation's
+        // charge).
+        assert!(
+            !device.tables_sealed.load(std::sync::atomic::Ordering::SeqCst)
+                || device.seal_lifted_here(),
+            "invariant violated: a record table over {} bytes of storage was formed after the load, outside any claim: {}",
+            storage.bytes(),
+            std::backtrace::Backtrace::force_capture()
+        );
         let bytes = seismic_lang::registry::record_table(
             offsets.map(|offset| device.allocation_address(storage, offset)),
         );

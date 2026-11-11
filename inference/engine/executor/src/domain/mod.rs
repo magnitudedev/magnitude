@@ -2027,6 +2027,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// its upload peak only while it runs, and its graph constants for its
     /// binding's life.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
+        // Its import and binding allocate under the claims below, tables included.
+        let _lifted = self.domain.device().lift_table_seal();
         match lane {
             ReservationLane::Head if !self.family.head_is_bound() => {
                 let loader = self

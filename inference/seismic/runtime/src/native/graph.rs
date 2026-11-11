@@ -3159,6 +3159,14 @@ impl NativeGraphPlan {
             let ordinal = port.reference.result as usize;
             self.check_binding(ordinal, tensor).map_err(CallError::Workflow)?;
             bindings.checked[ordinal] = true;
+            // A fixed record port's table is formed here, as the plan is
+            // bound, rather than at the first run that queues it, when the
+            // device's room may be spent.
+            if self.executable.port_uses[ordinal].records {
+                tensor
+                    .records()
+                    .map_err(|error| CallError::Workflow(WorkflowError::TensorView(error)))?;
+            }
         }
         self.check_disjoint(&bindings, true)?;
         Ok(BoundNativeGraphPlan {

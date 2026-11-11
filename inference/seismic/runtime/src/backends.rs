@@ -394,6 +394,7 @@ pub(crate) fn open(
         artifacts: options.artifacts,
         native: crate::native::NativeState::default(),
         graph_cost,
+        tables_sealed: std::sync::atomic::AtomicBool::new(false),
         chosen: std::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }

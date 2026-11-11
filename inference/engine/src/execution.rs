@@ -983,6 +983,9 @@ fn build_held(
     // process's report on demand (`magnitude_executor::diagnostics`).
     let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
     let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
+    // Everything the load allocates is charged: tables formed from here on are
+    // outside it (`seismic::Device::seal_record_tables`).
+    device.seal_record_tables();
     phase.enter("loaded memory report");
     report_loaded_memory(&domain, &catalog, &device).map_err(internal)?;
     phase.enter("pricing the load: its step, shrink moves and host storage's routes");
