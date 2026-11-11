@@ -142,6 +142,7 @@ impl ModelLoadPlan {
             structured,
             slots,
             ceiling: slots,
+            resident: false,
             host_slots: 0,
             host_cap: None,
             places,
@@ -187,6 +188,7 @@ impl ModelLoadPlan {
         }
         bank.slots = slots;
         bank.ceiling = ceiling;
+        bank.resident = slots == bank.widest().get();
         let bank = self.bank.as_ref().expect("the bank was just resized");
         for weight in &mut self.target {
             let Some((index, _)) = bank.layer(weight.role.scope) else {
@@ -204,11 +206,15 @@ impl ModelLoadPlan {
         Ok(self)
     }
 
-    /// The plan committing `slots` of its bank at the load, its ceiling
-    /// kept: the bank grows back to it while it serves.
+    /// The plan committing `slots` of its bank at the load, its ceiling and
+    /// its forms kept: the bank grows back to it while it serves, and the
+    /// programs planned are the load's.
     pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {
-        let ceiling = self.bank.as_ref().ok_or(PlanError::Topology("a plan without a bank has no slots"))?.ceiling;
-        self.with_bank_slots(slots, ceiling)
+        let bank = self.bank.as_ref().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
+        let (ceiling, resident) = (bank.ceiling, bank.resident);
+        let mut load = self.with_bank_slots(slots, ceiling)?;
+        load.bank.as_mut().expect("the load was just resized").resident = resident;
+        Ok(load)
     }
 
     /// The plan without its expert bank: each banked expert stack planned

@@ -68,7 +68,7 @@ pub(crate) fn checked_target_family(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<CheckedTargetFamily, GraphError> {
-    certify_target_family::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?.checked(limits)
+    certify_target_family::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?.checked()
 }
 
 /// [`checked_target_family`] of `plan`'s family and of the same target's
@@ -83,7 +83,7 @@ pub(crate) fn checked_target_and_undrafted(
     pass: PassLaunches,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
     let [target, undrafted] = certify_target_and_undrafted::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?;
-    Ok([target.checked(limits)?, undrafted.checked(limits)?])
+    Ok([target.checked()?, undrafted.checked()?])
 }
 
 /// What the load's assessment charges of the target family, from the one
@@ -104,34 +104,8 @@ pub(crate) struct CheckedTargetFamily {
     pub group_bytes: crate::planning::ByPass<u64>,
 }
 
-/// The bytes the merged experts and row table of a prompt pass over `pass`
-/// launches hold: what the load forms once for every group's passes
-/// (`SplitValues::widest` over the split layers, `PreparedTargetGraphs`),
-/// so what a larger pass size (`Holding::PassRows`) adds is the difference.
-/// None without a split layer.
-pub(crate) fn pass_buffer_bytes(
-    load: &ModelLoadPlan,
-    geometry: &Decoder,
-    limits: ResourceLimits,
-    pass: PassLaunches,
-) -> Result<u64, String> {
-    let region = magnitude_batching::row_classes(limits.max_launch_rows)
-        .last()
-        .copied()
-        .ok_or_else(|| format!("target batch row bound {} has no row class", limits.max_launch_rows))?;
-    let rows = region as u64 * pass.get().min(limits.chain_capacity.get()) as u64;
-    let (mut experts, mut table) = (0u64, 0u64);
-    for index in 0..geometry.blocks.len() {
-        if let Some(routed) = block_split(load, geometry, index, limits)? {
-            let merged = crate::operators::routed::split::Merged::of(routed, geometry, rows)?;
-            experts = experts.max(super::extents_bytes([&merged.experts])?);
-            table = table.max(super::extents_bytes([&merged.table])?);
-        }
-    }
-    experts.checked_add(table).ok_or_else(|| "pass buffer bytes overflow".to_owned())
-}
-
 pub(super) struct TargetFamilyCertificate<L = NativeGraphLayout> {
+
     pub(super) outline: FamilyOutline,
     /// How each block is served (`block_served`).
     pub(super) served: Vec<BlockServed>,
@@ -167,10 +141,17 @@ pub(super) struct TargetFamilyCertificate<L = NativeGraphLayout> {
 }
 
 impl<L: Certified> TargetFamilyCertificate<L> {
+    /// The pass budget the load holds: the launches its passes cover, the
+    /// plan's budget within the arena's cap (`group_pass_rows`). The one
+    /// answer the plan charges and the load holds.
+    fn held_pass(&self) -> crate::PassLaunches {
+        crate::PassLaunches::new(std::num::NonZeroUsize::new(self.passes.launches()).expect("a pass covers a launch"))
+    }
+
     /// What the assessment charges of it, its prompt groups of each pass
-    /// size's places up to `limits`' chain places.
-    fn checked(self, limits: ResourceLimits) -> Result<CheckedTargetFamily, GraphError> {
-        let group_bytes = crate::planning::ByPass::of(crate::PassLaunches::whole_chain(limits), |pass| {
+    /// size's places up to the pass it holds ([`Self::held_pass`]).
+    fn checked(self) -> Result<CheckedTargetFamily, GraphError> {
+        let group_bytes = crate::planning::ByPass::of(self.held_pass(), |pass| {
             self.group.group_bytes(&self.served, pass.get())
         })?;
         Ok(CheckedTargetFamily {

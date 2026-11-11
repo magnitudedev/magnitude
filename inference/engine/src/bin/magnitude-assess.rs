@@ -566,7 +566,6 @@ fn print_breakdown(
             "exact_resident_bytes": charge.exact_resident_bytes,
             "state_bytes": charge.state_bytes,
             "startup_state_bytes": charge.startup_state_bytes,
-            "loaded_state_bytes": charge.loaded_state_bytes,
             "graph_bytes": bounds.graph_bytes,
             "recorded_graph_bytes": bounds.recorded_graph_bytes,
             "startup_additional_bytes": bounds.startup_additional_bytes,

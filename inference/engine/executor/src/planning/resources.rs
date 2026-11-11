@@ -42,8 +42,8 @@ pub struct ResourceLimits {
     /// prompt's consecutive chunks run layer-major as one chain, each with
     /// its own region of the launch-row buffers and its own output slot of
     /// the chain's rotation. Every chunk of a whole-context prompt; a group
-    /// holds the places of the class granted when it opens
-    /// (`ExecutorDomain::grant_group`).
+    /// runs within the places its class claims as it opens
+    /// (`ExecutorDomain::open_group`).
     pub chain_capacity: NonZeroUsize,
     /// Conversations the load holds at once at the fit depth: the workload
     /// whose history and recurrent banks the plan charges and opportunistic
@@ -57,7 +57,7 @@ pub struct ResourceLimits {
 /// rows are a launch region's times these. It sizes the pass's merged
 /// experts and row table, which every group shares, and the pass graphs
 /// sealed at each length up to it; a group of more launches runs several
-/// passes. It is a priced holding (`domain::value::Holding::PassRows`): one
+/// passes. It is a priced holding: one
 /// launch is the least that is a pass, and each larger count is worth the
 /// prefill seconds its fewer passes save. The arena the launches' own graphs
 /// fix still bounds it (`group_pass_rows`), as do the chain's places.
@@ -98,6 +98,11 @@ impl<T> ByPass<T> {
             .map(|pass| value(pass).map(|value| (pass, value)))
             .collect::<Result<Vec<_>, E>>()
             .map(|values| Self(values.into()))
+    }
+
+    /// The ladder's last pass size: the pass the load holds.
+    pub fn most(&self) -> PassLaunches {
+        self.0.last().expect("a ladder holds one launch's pass").0
     }
 
     /// The value at `pass`, a size of the ladder.
@@ -928,13 +933,19 @@ impl StateStorePlan {
         })
     }
 
-    pub fn startup_bank_bytes(&self) -> Result<u64, String> {
-        self.bank_slab_layout()?.map_or(Ok(0), |layout| {
-            layout
-                .address_table_bytes
-                .checked_add(layout.slab_bytes)
-                .ok_or_else(|| "initial bank slab charge overflows".into())
+    /// What a history's growth beyond the rows it holds can add past their
+    /// pages: a whole slab in each stored domain, the unit the stores grow by
+    /// (`magnitude_state::StateStore::growth_claim`).
+    pub fn history_slab_bytes(&self) -> Result<u64, String> {
+        self.domains.iter().try_fold(0u64, |total, domain| {
+            total.checked_add(domain.slab_layout()?.slab_bytes).ok_or_else(|| "history slab bytes overflow".into())
         })
+    }
+
+    /// The address table and the slabs of the banks committed at
+    /// construction ([`magnitude_state::BankCapacity::startup_banks`]).
+    pub fn startup_bank_bytes(&self) -> Result<u64, String> {
+        self.bank_bytes_at_count(self.bank_capacity.startup_banks().map_err(|error| error.to_string())? as u64)
     }
 
     /// The histories of `conversations` requests at `depth` tokens each: a
@@ -1103,8 +1114,8 @@ impl ResourcePlan {
     }
 
     /// The plan, its pooled charge checked against Seismic's footprints. Whether the load fits
-    /// is decided once, by assessment before the load, and each allocation is then claimed as it
-    /// is made (the engine's startup claims), whose refusal is the typed memory shortage: the plan
+    /// is decided once, by assessment before the load, and each allocation is then admitted before
+    /// it is made (the engine's startup admissions), whose refusal is the typed memory shortage: the plan
     /// decides neither.
     pub(super) fn validate(self) -> Result<Self, String> {
         if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
@@ -1232,21 +1243,6 @@ impl StateResourcePlan {
         self.history_bytes
             .checked_add(self.recurrent_banks_bytes)
             .ok_or_else(|| "startup state bytes overflow".into())
-    }
-
-    /// The state slabs a loaded model holds before its first request: the
-    /// startup slabs and what the load's warm-up forward grows
-    /// (`magnitude_engine::execution::warm_up`: one request, one token). Its
-    /// row lands in each history domain's first slab, which holds at least
-    /// one page; its forward writes one successor bank beside the pristine
-    /// seed. Releasing the request leaves the slabs held (the stores keep a
-    /// spare at idle).
-    pub fn loaded_state_bytes(&self) -> Result<u64, String> {
-        /// The pristine seed and the warm-up forward's successor.
-        const WARM_UP_BANKS: u64 = 2;
-        self.history_bytes
-            .checked_add(self.target_state.bank_bytes_at_count(WARM_UP_BANKS)?)
-            .ok_or_else(|| "loaded state bytes overflow".into())
     }
 
     pub fn target_state(&self) -> &StateStorePlan {
@@ -1475,7 +1471,7 @@ impl ResourcePlanner {
             slots.readout,
         )?;
         // A prompt chunk's readout slots beyond the floor's: none until a
-        // group's class grants places (`ExecutorDomain::grant_group`).
+        // group's class is held (`ExecutorDomain::open_group`).
         let target_readout_chunk_graph = NativeGraphCharge::from_footprint(
             FamilyFootprint::serial(target_readout_graphs.chunk_family()),
             GraphSlots {
@@ -1529,7 +1525,7 @@ impl ResourcePlanner {
             let capacity_bytes = state.capacity_bytes;
             let required = bytes.total()?;
             let qualification_peak_bytes = crate::AttestedPrograms::qualification_peak_bytes(load)?
-                .max(load.imports().peak_bytes()?);
+                .max(load.imports().peak_bytes());
             eprintln!(
                 "resource plan domain_capacity={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
                 capacity_bytes.domain_bytes,

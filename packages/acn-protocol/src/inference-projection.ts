@@ -15,7 +15,7 @@ import {
 
 const projectInferenceResize = (resize: InferenceSchema.StreamingResize): StreamingResize =>
   resize._tag === "Shrank"
-    ? { _tag: "Shrank", cause: resize.cause, to: resize.to, by: resize.by, atUnixMs: resize.atUnixMs }
+    ? { _tag: "Shrank", to: resize.to, by: resize.by, atUnixMs: resize.atUnixMs }
     : { _tag: "Grew", from: resize.from, by: resize.by, atUnixMs: resize.atUnixMs }
 
 const projectInferenceStreaming = (

@@ -6,10 +6,7 @@ use crate::batching::{
     Demand, Draw, DrawKind, Row, RowHistory, Select, Shaping as RowShaping, Slot,
     ValidatedTargetBatch,
 };
-use crate::memory::{ClaimId, HoldingClass, MemoryHeap};
-use crate::platform::{
-    DomainReading, DomainRole, DomainThresholds, MemoryBand, READING_INTERVAL, ReleaseRate, Releasable, StoreMotion,
-};
+use crate::platform::DomainReading;
 use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
@@ -29,22 +26,21 @@ use magnitude_state::{
     TentativeAdvance,
 };
 use seismic::Tensor;
-mod borrowing;
-pub(crate) mod value;
 mod draft;
 mod family;
 mod features;
 mod head;
-mod heap;
+mod reader;
 mod holdings;
 mod serving_heap;
-pub use serving_heap::{BankGrant, BankRelease, OwnerHoldings, ServingSettlement};
+pub use serving_heap::Followed;
 mod in_flight;
 mod input;
 mod ownership;
 mod queue;
 mod reconcile;
 mod state;
+pub(crate) use state::claimed_through;
 mod target;
 mod vision;
 
@@ -54,17 +50,17 @@ pub mod fixtures;
 mod domain_tests;
 
 pub use family::{
-    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, BankCurve, Reach, Reaches, SizeStep, HostResidency,
+    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, HostResidency,
     NativeFamily,
-    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, ShrinkCause, TierFill, TrafficHold, Trip,
+    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, TierFill, TrafficHold, Trip,
 };
-pub use heap::{ClaimRefusal, DeviceHeap, MachineReading, Reclaimed, StatusReading, require_normal};
+pub use reader::{DeviceReader, LoadRoom, MachineReading, StatusReading};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
 use in_flight::{PrimingFlight, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::{MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, SlotRelease, StateShrink, StoreAllocation};
+pub use state::{MemoryChargeReconciliation, MemoryMoment, SlotRelease, StateShrink, StoreAllocation};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
     AppendedRuns, accepted_history, cached_causal_domain, indexer_history,
@@ -89,9 +85,6 @@ pub enum DomainError {
     /// A required device-memory observation failed. This is not a demand
     /// deficit: reclaiming another request cannot make the reading valid.
     Blind(String),
-    /// A domain the device uses is in the Reclaim band (the reading it was
-    /// judged on); growth waits while reclaimable holdings are released.
-    Reclaim(DomainReading),
     Input(String),
     State(magnitude_state::Error),
     Submit(crate::SubmitError),
@@ -108,6 +101,11 @@ pub enum DomainError {
         growth: u64,
         ceiling: u64,
     },
+    /// A sequence's state rows wait on preempting these sequences, admitted
+    /// after it, the latest first (`Ledger::claim`): their bytes are
+    /// reserved to it. The owner evicts them (`release_state`) and provisions
+    /// again, which completes the claim; nothing grew.
+    Preempt(Vec<RequestId>),
 }
 
 impl DomainError {
@@ -117,6 +115,24 @@ impl DomainError {
             detail: detail.into(),
         })
     }
+
+    /// A claim on `ledgers` refused as `short`: blind where its store's
+    /// reading failed, else a capacity deficit of that store, for the
+    /// owner's release order.
+    pub(crate) fn short(short: crate::memory::ledger::Short, ledgers: &crate::memory::ledger::DeviceLedgers) -> Self {
+        use crate::memory::ledger::Short;
+        match short {
+            Short::Blind { store, reason } => Self::Blind(format!("the reading of {store:?} failed: {reason}")),
+            Short::Over { store, required, over } => Self::Capacity(CapacityError {
+                resource: match store == ledgers.device().store() {
+                    true => ResourceKind::DeviceMemory,
+                    false => ResourceKind::HostStaging,
+                },
+                required,
+                available: required - over,
+            }),
+        }
+    }
 }
 
 impl std::fmt::Display for DomainError {
@@ -124,7 +140,6 @@ impl std::fmt::Display for DomainError {
         match self {
             Self::Capacity(error) => error.fmt(f),
             Self::Blind(message) => write!(f, "device memory observation unavailable: {message}"),
-            Self::Reclaim(reading) => Reclaimed(reading).fmt(f),
             Self::Input(message) => f.write_str(message),
             Self::State(error) => error.fmt(f),
             Self::Submit(error) => error.fmt(f),
@@ -139,6 +154,7 @@ impl std::fmt::Display for DomainError {
                 f,
                 "state growth of {growth} bytes beside {committed} committed exceeds the {ceiling}-byte state ceiling"
             ),
+            Self::Preempt(sequences) => write!(f, "state growth waits on preempting requests {sequences:?}"),
         }
     }
 }
@@ -167,31 +183,6 @@ impl From<crate::SubmitError> for DomainError {
         }
     }
 }
-impl From<ClaimRefusal> for DomainError {
-    fn from(refusal: ClaimRefusal) -> Self {
-        match refusal {
-            ClaimRefusal::Blind(error) => Self::Blind(error.to_string()),
-            ClaimRefusal::Reclaim(reading) => Self::Reclaim(reading),
-            ClaimRefusal::Deficit {
-                role,
-                required,
-                available,
-                ..
-            } => Self::Capacity(CapacityError {
-                resource: match role {
-                    DomainRole::Allocation => ResourceKind::DeviceMemory,
-                    DomainRole::Staging => ResourceKind::HostStaging,
-                },
-                required,
-                available,
-            }),
-            ClaimRefusal::Accounting(error) => {
-                Self::invariant(format!("memory accounting: {error:?}"))
-            }
-        }
-    }
-}
-
 impl From<magnitude_state::Error> for DomainError {
     fn from(error: magnitude_state::Error) -> Self {
         let refusal = match &error {
@@ -601,14 +592,39 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     execution: Rc<ExecutionPlan>,
     definition: Rc<ModelDefinition>,
     resources: AllocatedResources,
+    /// The arena's committed claim, taken as the domain is made and held
+    /// for the load: its graph scratch and the target graphs' bound
+    /// constants, with groups of one place. A group's places beyond it are
+    /// its own class's ([`Self::open_group`]).
+    arena: crate::memory::ledger::ArenaClaim,
+    /// What the load allocated as it started that no holding names (its
+    /// weights, tables, state and programs' storage): held for the load.
+    _recorded: Vec<crate::memory::ledger::Claim>,
+    /// Each resident sequence's committed state rows on the device's
+    /// ledger, taken as it opens, grown as it advances ([`Self::provision`])
+    /// and dropped as it closes or is evicted.
+    state_claims: BTreeMap<RequestId, state::StateClaim>,
+    /// A sequence's state rows, through a row, waiting on the preemption
+    /// the ledger named ([`DomainError::Preempt`]), completed as it
+    /// provisions again and let go with the sequence's state claim.
+    preempting: Option<(RequestId, u64, crate::memory::ledger::Preemption)>,
+    /// The state slabs grown past the load's, on the device's ledger.
+    state_slabs: state::StateSlabs,
     domain: ResourceDomain,
-    /// The device's heap, carried over from the startup claims.
-    memory: RefCell<DeviceHeap>,
+    /// The device's memory reading, carried over from the load's startup.
+    memory: RefCell<DeviceReader>,
     target_store: Rc<StateStore>,
     head_store: Option<Rc<StateStore>>,
     family: F,
     head_loader: Option<ComponentLoader<ResidentHead>>,
     vision_loader: Option<ComponentLoader<ResidentVision>>,
+    /// The claims of what the bound head allocates beside its imports: its
+    /// graph constants and its stagings beyond the floor, released as it
+    /// unbinds.
+    head_binding: Vec<crate::memory::ledger::Claim>,
+    /// The claims of the bound vision component's graph constants, released
+    /// as it unbinds.
+    vision_binding: Vec<crate::memory::ledger::Claim>,
     target: BTreeMap<RequestId, SequenceState>,
     /// The steps queued behind the last flight: the rest of a chain, with
     /// the chain under way, or one successor, with their drafter primings
@@ -633,35 +649,25 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// priced decode's prior on ([`Self::serving_rates`]); none before the
     /// bank is priced.
     workload: Option<crate::workload::WorkloadMeter>,
-    /// The service's measurement job's claim beside the model, which the
-    /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
+    /// The service's measurement job's committed claim beside the model
+    /// (`ExecutorDomain::claim_measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
-    /// The places a prompt group takes as it opens, at most its chunks
-    /// (`grant_group`): as the domain is made, the places the plan's pass
-    /// merges, whose class the plan reserves room for
-    /// (`ModelLoadPlan::group_class_pass`), one where it reserves none; then
-    /// what each serving settle
-    /// grants places beside the bank's slots and the unborn state
-    /// ([`Self::settle_memory`]). The room of the places it grants that no
-    /// group holds yet is reserved from the bank's growth
-    /// ([`Self::class_reserve`]); places held beyond it are released
-    /// between groups ([`Self::release_group_places`]).
-    places_target: std::num::NonZeroUsize,
-    /// The class's bytes beyond one place at each place count from one to
-    /// the chain's capacity (`class_ladder[p − 1]`, [`Self::class_bytes`]
-    /// from one place), read as the domain is made: what each place weighs
-    /// in the settle, and the room the target reserves.
-    class_ladder: Box<[u64]>,
-    /// The prompt's seconds at each place count from one to the chain's
-    /// capacity ([`Self::places_seconds`]), as last priced: they change
-    /// only with the load's measures, so a settle at every reading prices
-    /// them once per load, not once per reading.
-    places_prompt: RefCell<Option<std::rc::Rc<[f64]>>>,
-    /// Of the unborn workload state's room in device storage
-    /// ([`Self::unborn`]), what a settle lent the bank's growth
-    /// (`Holding::State`): the bank may hold it until a sequence claims it,
-    /// when its claim is owed and the bank's release covers it.
-    state_lent: u64,
+    /// The committed claims of the prompt-group class held beyond one
+    /// place (`AllocatedResources::group_places`), from the group's open to
+    /// its close ([`Self::open_group`], [`Self::close_group`]): its
+    /// device-side bytes on the device's ledger and its host bytes on host
+    /// RAM's. None while groups hold one place.
+    group_class: Option<state::GroupClass>,
+    /// A closed group's class's bytes, the idle graph slots its pools hold
+    /// beyond one place until they release them: cache
+    /// (`memory::ledger::CacheKind::GraphSlots`), turned from its claims as
+    /// it closed ([`Self::close_group`]): handed to the slots' release as
+    /// it begins, and freed with them as it ends
+    /// (`AllocatedResources::release_idle_slots`), or let go as a group's
+    /// class takes the slots again ([`Self::open_group`]). What claims took
+    /// of it in process releases until then ([`Self::idle_slots_taken`]).
+    idle_class: Vec<crate::memory::ledger::Cached>,
+
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
@@ -681,20 +687,12 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// ([`Self::measure_load`]); none before, so a warm-up's steps are not
     /// counted.
     measures: Option<LoadMeasures>,
-    /// The heap claim of the expert bank's running growth.
-    bank_claim: Option<GrowthClaim>,
     /// What expert bank resizes held the submitting thread.
     resize_held: ResizeHeld,
     /// A bank shrink began and its step, the next decode launch, has not
     /// launched: that launch records no graph, as every one it replays was
     /// recorded and kept as its slots were made.
     shrink_step: bool,
-    /// What the rest of the host does to memory, read by read, and what
-    /// sizes the expert bank's resizes from it.
-    pace: RefCell<MemoryPace>,
-    /// The readings of the heap's charge taken ([`Self::refresh_memory`]).
-    #[cfg(test)]
-    refreshes: std::cell::Cell<usize>,
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes and what the process held as it was decided.
@@ -703,15 +701,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// has not taken yet ([`Self::take_published_memory`]): one observed
     /// between a chain's submissions is the owner's reading too.
     unseen_reading: RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
-    /// The last serving settle's inputs and the room it stands in
-    /// (`serving_heap::SettleStands`); none before one, after a decision the
-    /// owner could not carry out, or as the load's measures change.
-    settled: Option<serving_heap::SettleStands>,
-    /// Requests served so far (`served_request`): an input of the settle.
-    requests: u64,
-    /// The serving settles run: a test's count of them.
-    #[cfg(test)]
-    settles: std::cell::Cell<u64>,
 }
 
 /// A gap between flights the domain saw: no step of the expert bank runs
@@ -768,17 +757,13 @@ pub struct LoadCosts {
     /// prior is priced on (`ExecutorDomain::serving_prior`), and a bank's
     /// growth and the drafter's worth.
     pub step: Box<DecodeStep>,
-    /// What a prompt group's submission costs the host beyond a launch
-    /// chained behind another (`ExecutorCosts::group_submission_seconds`):
-    /// what each group fewer saves a prompt (`ExecutorDomain::places_seconds`).
-    pub submission: f64,
 }
 
 impl LoadCosts {
     /// The costs of a load of `definition` planned as `planned`, as
     /// `resident` before any bank, on `costs`: its launch in each form
-    /// (`assessment::decode_step`) and its groups' submission. The one
-    /// derivation every load is priced by.
+    /// (`assessment::decode_step`). The one derivation every load is
+    /// priced by.
     pub fn of(
         definition: &magnitude_family_contracts::ModelDefinition,
         resident: &crate::ExecutionPlanDraft,
@@ -787,7 +772,6 @@ impl LoadCosts {
     ) -> Result<Self, crate::assessment::AssessmentError> {
         Ok(Self {
             step: crate::assessment::decode_step(definition, resident, planned, costs.clone())?,
-            submission: costs.group_submission_seconds(),
         })
     }
 }
@@ -931,8 +915,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
         self.measures = Some(measures);
-        *self.places_prompt.get_mut() = None;
-        self.settled = None;
         Ok(())
     }
 
@@ -957,16 +939,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The readings of the heap's charge taken so far.
-    #[cfg(test)]
-    pub(crate) fn memory_refreshes(&self) -> usize {
-        self.refreshes.get()
-    }
-
     /// The device the domain charges.
     #[cfg(test)]
     pub(crate) fn device(&self) -> &seismic::Device {
         self.domain.device()
+    }
+
+    /// The arena's committed claim beside its terms: the claim's bytes, the
+    /// plan's graph scratch and the target graphs' bound constants held now.
+    #[cfg(test)]
+    pub(crate) fn arena_terms(&self) -> (u64, u64, u64) {
+        let constants = self.family.target_constant_bytes().expect("the target's constants fit u64");
+        (self.arena.bytes(), self.execution.resources().bytes().scratch, constants)
     }
 
     /// The landings the device has converted.
@@ -1070,45 +1054,29 @@ pub struct ExpertResizes {
     pub running: bool,
 }
 
-/// The heap's claim of a running expert bank growth: the bytes it claimed of `kind` storage,
-/// of which the claim holds what the growth has not backed yet (`refresh_memory`).
-#[derive(Clone, Copy, Debug)]
-struct GrowthClaim {
-    id: ClaimId,
-    kind: crate::planning::BankTier,
-    bytes: u64,
-}
-
 /// What reads memory for the domain: the device's stores and ledgers, its
-/// heap, the memory pace, the heap claim of the bank's running growth, and
-/// whether a bank resize runs. None of the program family's, which each
-/// reading is handed its expert bank from: a chain's encoding reads memory
-/// through it while it holds the family
-/// ([`ExecutorDomain::submit_chain`]).
+/// heap, and whether a bank resize runs. None of the program family's, which each reading is handed
+/// its expert bank from: a chain's encoding reads memory through it while
+/// it holds the family ([`ExecutorDomain::submit_chain`]).
 struct MemoryProbe<'d> {
     domain: &'d ResourceDomain,
-    memory: &'d RefCell<DeviceHeap>,
-    pace: &'d RefCell<MemoryPace>,
+    memory: &'d RefCell<DeviceReader>,
+    ledgers: &'d crate::memory::ledger::DeviceLedgers,
     /// [`ExecutorDomain::unseen_reading`].
     unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
-    bank_claim: Option<&'d GrowthClaim>,
     resizing: bool,
-    /// [`ExecutorDomain::planned_unheld`], read when the probe was taken.
-    planned: u64,
 }
 
 impl<'d> MemoryProbe<'d> {
     /// The domain's probe, of its parts apart from the program family.
     fn of(
         domain: &'d ResourceDomain,
-        memory: &'d RefCell<DeviceHeap>,
-        pace: &'d RefCell<MemoryPace>,
+        memory: &'d RefCell<DeviceReader>,
+        ledgers: &'d crate::memory::ledger::DeviceLedgers,
         unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
-        bank_claim: Option<&'d GrowthClaim>,
         held: &ResizeHeld,
-        planned: u64,
     ) -> Self {
-        Self { domain, memory, pace, unseen, bank_claim, resizing: held.runs(), planned }
+        Self { domain, memory, ledgers, unseen, resizing: held.runs() }
     }
 
     /// [`ExecutorDomain::observe_memory`], beside `bank`.
@@ -1117,140 +1085,26 @@ impl<'d> MemoryProbe<'d> {
         let readings = self
             .memory
             .borrow_mut()
-            .refresh(self.planned)
+            .refresh()
             .map_err(|error| DomainError::Blind(error.to_string()))?;
-        self.settle_growth_claim(bank)?;
         Ok(readings)
     }
 
-    /// [`ExecutorDomain::refresh_memory`], beside `bank`.
-    fn account(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
-        let _rises = bank.map(|bank| bank.hold_rises());
-        self.memory.borrow_mut().account();
-        self.settle_growth_claim(bank)
-    }
-
-    /// Take what `bank`'s running growth backed out of its claim: the
-    /// charge just read holds those bytes, so the claim holds only the rest,
-    /// read under the same hold of the bank's rises
-    /// ([`ElasticBank::hold_rises`]), so a growth's bytes are counted once.
-    /// The load's holding itself is the device's charge, which Seismic
-    /// keeps; nothing here counts it again.
-    fn settle_growth_claim(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
-        if let (Some(claim), Some(bank)) = (self.bank_claim, bank) {
-            let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
-            self.memory
-                .borrow_mut()
-                .reduce_reserved(claim.id, claim.kind, rest)
-                .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
-        }
-        Ok(())
-    }
-
-    /// [`ExecutorDomain::probe_memory`], beside `bank`: a reading taken now.
-    fn probe(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
-        let readings = self.observe(bank)?;
-        let at = self.memory.borrow().now();
-        self.observed(bank, readings, || self.memory.borrow().footprint(), at)
-    }
-
-    /// [`Self::probe`] of the periodic reading published since the last
-    /// (`DeviceHeap::refresh_published`), read off this thread, its outcome
-    /// held for the owner until it takes it
-    /// ([`ExecutorDomain::take_published_memory`]): none where none was
+    /// The periodic reading published since the last
+    /// (`DeviceReader::refresh_published`), read off this thread: the reader
+    /// observes it, the device's ledgers read it
+    /// (`memory::ledger::DeviceLedgers::read`), and its outcome is held for
+    /// the owner until it takes it
+    /// ([`ExecutorDomain::take_published_memory`]). None where none was
     /// published since.
     fn probe_published(&self, bank: Option<&dyn ElasticBank>) -> Option<Result<(), DomainError>> {
         let _rises = bank.map(|bank| bank.hold_rises());
-        let (readings, footprint, at) = self.memory.borrow_mut().refresh_published(self.planned)?;
-        let observed = readings
-            .map_err(|error| DomainError::Blind(error.to_string()))
-            .and_then(|readings| {
-                self.settle_growth_claim(bank)?;
-                self.observed(bank, readings.clone(), || footprint, at).map(|()| readings)
-            });
+        let (readings, status, at) = self.memory.borrow_mut().refresh_published()?;
+        self.memory.borrow().read_ledgers(self.ledgers, &status, at);
+        let observed = readings.map_err(|error| DomainError::Blind(error.to_string()));
         let outcome = observed.as_ref().map(drop).map_err(Clone::clone);
         *self.unseen.borrow_mut() = Some(observed);
         Some(outcome)
-    }
-
-    /// The readings `readings` taken at `at`, the process's footprint then
-    /// `footprint`: the memory pace is measured from them, those taken while
-    /// no bank resize runs settled ones.
-    fn observed(&self, bank: Option<&dyn ElasticBank>, readings: Vec<DomainReading>, footprint: impl FnOnce() -> Option<u64>, at: Instant) -> Result<(), DomainError> {
-        let host = self.host_witness(&readings, footprint);
-        let releasable = bank.map(releasable).transpose()?.unwrap_or_default();
-        let release = self.memory.borrow().release_rate();
-        self.pace.borrow_mut().observe(
-            &readings,
-            &self.domain.device().ledgers().own_claims(),
-            host,
-            !self.resizing,
-            releasable,
-            release,
-            at,
-        );
-        // Every fit from the next reading on holds the line at the motion
-        // and release latency measured now.
-        let motions = self.pace.borrow().motions();
-        self.memory.borrow_mut().measure(motions.host, motions.device, motions.latency, motions.release, releasable);
-        match readings.into_iter().find(|reading| reading.band == MemoryBand::Reclaim) {
-            Some(reading) => Err(DomainError::Reclaim(reading)),
-            None => Ok(()),
-        }
-    }
-
-    /// Host RAM's witness of what the process holds resident at a probe that read
-    /// `readings` (`MemoryPace`): what the system counts the process holding
-    /// out of free memory, which falls by a release as free memory rises by
-    /// it. A Metal device's allocations are wired through its residency set,
-    /// so the host's wired pages (`seismic::HostHeld`): a released buffer
-    /// leaves the footprint at once, but its pages are free only once the
-    /// driver unwires them at its next tick (on an M4 Pro, 0.47 s after a
-    /// 138 MB slot's release free and wired memory moved together; the
-    /// first slot a reserved buffer released was not unwired within 3 s).
-    /// The count is the host's, the process's own wired size counting none
-    /// of the residency set's: another program wiring memory in the span
-    /// holds a release unseen, credited until the host takes more than it,
-    /// and one unwiring shows it early. Any other device's allocations are
-    /// pages of the process, so its footprint (`seismic::ProcessMemory`), which the
-    /// system frees as they leave it (a GB10's fell by each bank slot within
-    /// its release). None where the system reports neither.
-    fn host_witness(&self, readings: &[DomainReading], footprint: impl FnOnce() -> Option<u64>) -> Option<u64> {
-        match self.domain.device().backend() {
-            seismic::BackendName::Metal => readings
-                .iter()
-                .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
-                .and_then(|reading| reading.held)
-                .map(|held| held.wired_bytes),
-            _ => footprint(),
-        }
-    }
-
-    /// The store `kind` storage lies in.
-    fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
-        let device = self.domain.device();
-        state::storage_store(device.topology(), device.info(), kind)
-    }
-
-    /// What the process charges `store` now: its own claims there.
-    fn charged_in(&self, store: seismic::StoreId) -> u64 {
-        self.domain
-            .device()
-            .ledgers()
-            .own_claims()
-            .into_iter()
-            .filter(|(of, _)| *of == store)
-            .map(|(_, bytes)| bytes)
-            .sum()
-    }
-
-    /// What `store` is short of now: its level's shortfall
-    /// (`MemoryPace::shortfall`), against the process's charge of it now.
-    /// While the one store's bank holds borrowed room, host RAM's level
-    /// reads what the OS can obtain with it counted (`platform::Serving`):
-    /// what an ask takes of it is short like any.
-    fn shortfall(&self, store: seismic::StoreId) -> Shortfall {
-        self.pace.borrow().shortfall(store, self.charged_in(store))
     }
 
     /// What the process holds now (`MemoryMoment`).
@@ -1263,31 +1117,40 @@ impl<'d> MemoryProbe<'d> {
         }
     }
 
-    /// What the expert bank's storage is short of now, read between a
+    /// What the expert bank's store is short of now, read between a
     /// chain's submissions (`ExpertBank::release_running`): the periodic
     /// reading published since the last ([`Self::probe_published`]), taken
-    /// without waiting, and the shortfall it leaves the bank's store
-    /// ([`Self::shortfall`]: the level's, or the borrowed room the bank owes
-    /// back on displacement now or for the load's claims), with what the
-    /// process held then. None
-    /// while a bank resize runs (its advance is a boundary's, and the bank
-    /// begins no cut beside it), with no reading published since, where it is
-    /// blind (the heap holds it so, and the owner's next probe reads again),
-    /// or where nothing is short.
-    fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
+    /// without waiting, and what free room in the ledger of the store the
+    /// bank's experts lie in lacks of the speed guarantee
+    /// (`memory::ledger::Snapshot::short`) of a prompt chunk of
+    /// `chunk_rows` rows ([`chunk_bytes`]), with what the process held
+    /// then. None while a bank resize runs (its advance is a boundary's,
+    /// and the bank begins no cut beside it), with no reading published
+    /// since, where the reading is blind (it holds it so, and the owner's next
+    /// reading reads again), or where nothing is short.
+    fn running_pressure(&self, bank: &dyn ElasticBank, chunk_rows: u64) -> Option<RunningPressure> {
         if self.resizing {
             return None;
         }
         if let None | Some(Err(DomainError::Blind(_))) = self.probe_published(Some(bank)) {
             return None;
         }
-        let kind = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
-        let store = self.store_of(kind.storage())?;
-        match self.shortfall(store) {
-            Shortfall::Short(bytes) => Some(RunningPressure { bytes, held: self.moment() }),
-            Shortfall::Above | Shortfall::Covered => None,
+        let tier = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
+        let ledger = self.ledgers.of(tier);
+        match ledger.snapshot().short(chunk_bytes(ledger, chunk_rows)) {
+            0 => None,
+            bytes => Some(RunningPressure { bytes, held: self.moment() }),
         }
     }
+}
+
+/// The committed state a prompt chunk of `rows` rows grows by in `ledger`'s
+/// store at its most, from a history ending on a page boundary: what the
+/// ledger's speed guarantee keeps free for growth arriving within one
+/// reading (`memory::ledger::Snapshot::guarantee`). The size is the load's,
+/// whichever sequence grows.
+fn chunk_bytes(ledger: &crate::memory::ledger::Ledger, rows: u64) -> u64 {
+    ledger.bytes(&crate::memory::ledger::Need::StateRows { sequence: RequestId(0), from: 0, to: rows })
 }
 
 /// The time expert bank resizes held the submitting thread at flight
@@ -1398,538 +1261,9 @@ impl ResizeHeld {
     }
 }
 
-/// What the rest of the host does to each memory domain, measured from the
-/// owner's memory probes (`ExecutorDomain::probe_memory`, one every reading
-/// interval and one after each release while memory is short), and what
-/// sizes the expert bank's resizes from them.
-///
-/// Memory available to the process is its headroom and its own charge. A
-/// release drops the charge at once; the host may show it in headroom only
-/// later. The process knows its own releases exactly, and a witness says
-/// when the host shows them: a count that falls by a release as headroom
-/// rises by it, and that the rest of the host's demand for free memory moves
-/// none of, but where it wires memory itself (host RAM's,
-/// `ExecutorDomain::host_witness`; a device's own memory shows a release
-/// with its charge). What the process released that
-/// the witness has yet to drop is unseen ([`DomainPace::unseen`]), and
-/// available memory, counting it, rises only as a release shows and falls
-/// only as the host takes. So no lag makes a release answer the same
-/// pressure twice, and a release that lands in a span in which the host
-/// takes as much is seen, not credited: a shrink
-/// covers what the reading is below the planning line, plus what the host
-/// takes until the next shrink takes effect, less what is unseen and what the
-/// process released since the reading. What that covers is awaited, not
-/// released again ([`Shortfall::Covered`]), however long the host takes to
-/// show it: the pace alone decides when a release has answered its deficit,
-/// and no clock releases for it a second time. A release the witness never
-/// drops stays credited while memory is short; more taken than is credited
-/// is short past it, so pressure still escalates down the ladder to the
-/// model's unload. Where no witness is read, a
-/// release is taken as shown at the reading after it. A span across a fall
-/// of the charge measures no taking.
-///
-/// What the host takes is the rate of available memory's fall over the latest
-/// span of at least one reading interval (a probe right after a release spans
-/// too little to tell a rate from the reading's own noise).
-/// The next shrink takes effect after this one's latency, the wait for the
-/// reading after it (at most the reading interval) and its own latency, each
-/// latency the last finished release's, from its decision to its effect.
-/// Before the first, the reading interval alone: a release drops only the
-/// chunks it releases, 1–2 ms for a 38 MB slot of Qwen3.6-35B-A3B Q4 (M4
-/// Pro), against the 100 ms interval.
-///
-/// A growth needs room above the planning line for one growth step plus the
-/// reading's fluctuation in steady state ([`Fluctuation`]). A step of `s`
-/// bytes decided at a reading of headroom `h` leaves `h − s`; nothing checks
-/// it again before the next reading, and in steady state available memory
-/// falls between consecutive readings by at most the fluctuation `f`. Reclaim
-/// is headroom at or below the planning line `p`, so the step never takes the
-/// domain there iff `h − s − f > p`: `s + f` below the ceiling `h − p`. Under
-/// held pressure growth so stops short of the line by the reading's own
-/// fluctuation and does not re-enter Reclaim; once the pressure lifts, the
-/// ceiling rises by what it freed and the bank grows while a step and the
-/// fluctuation fit, to every expert where memory allows. A step's room is
-/// the free headroom's ceiling (`DomainThresholds::ceiling`), at
-/// most the headroom's: growth takes nothing it would have to displace
-/// another program's data for, and the band it must not re-enter is the
-/// headroom's.
-struct MemoryPace {
-    domains: BTreeMap<seismic::StoreId, DomainPace>,
-    /// When memory was last read; none before the first probe.
-    read: Option<Instant>,
-    /// The last finished release's latency; zero before the first.
-    latency: Duration,
-    /// The slowest finished release's rate: its bytes over its span from
-    /// decision to effect; none before one released any.
-    release: Option<ReleaseRate>,
-}
-
-/// What a load measured of the rest of the host and of its own releases
-/// ([`MemoryPace::motions`]).
-#[derive(Debug, PartialEq)]
-struct PaceMotions {
-    host: Option<StoreMotion>,
-    device: Option<StoreMotion>,
-    latency: Option<Duration>,
-    release: Option<ReleaseRate>,
-}
-
-/// One domain's pace, as of its latest probe.
-struct DomainPace {
-    role: DomainRole,
-    headroom: u64,
-    /// Which of the host's figures the reading's `untaken` read
-    /// ([`crate::platform::Shown`]).
-    basis: crate::platform::ShownBasis,
-    /// The planning and emergency reserves: the line a load reads Reclaim
-    /// at, and the headroom it must not run into.
-    thresholds: DomainThresholds,
-    charged: u64,
-    /// The reading's band: Reclaim at or below the planning line, or while
-    /// the host is in distress.
-    band: MemoryBand,
-    /// What the process released that its witness has yet to drop. None
-    /// is owed from a reading above the line.
-    unseen: u64,
-    /// What the process holds resident in the store at this reading, as its
-    /// witness reads it: what a release lowers and what backing its own
-    /// charge raises; none in a device's own memory, or where none is read.
-    witness: Option<u64>,
-    /// What the rest of the host had not taken at each witnessed probe a
-    /// span apart (`MemoryPace::observe`'s `untaken`), oldest first, back
-    /// to the first at or before the rate's window
-    /// ([`DomainPace::sustained`]); without a witness, since the charge
-    /// last changed.
-    untaken: std::collections::VecDeque<(Instant, u64)>,
-    /// The rate the rest of the host's taking sustains over the window a
-    /// margin holds a take across, in bytes a second
-    /// ([`DomainPace::sustained`]).
-    rate: f64,
-    /// Available memory's fluctuation over its readings since the domain
-    /// last left Reclaim.
-    fluctuation: Fluctuation,
-    /// Whether the domain is host RAM: its margin is host RAM's
-    /// ([`MemoryPace::margins`]).
-    host: bool,
-    /// What the reading's hard limit leaves a claim where a driver's grant
-    /// bounds the domain (Metal's working set); none where none does.
-    grant_left: Option<u64>,
-    /// The line room borrowed beyond the hold line is held within, where
-    /// the bank borrows (`platform::StoreFit::borrowable_bytes`).
-    borrowable: Option<u64>,
-    /// The spans in which the rest of the host took more than the steady
-    /// fluctuation, since `first`: another program's asks; none before
-    /// the first.
-    takes: Option<Takes>,
-    /// The domain's first probe.
-    first: Instant,
-}
-
-/// Another program's asks a domain's pace has read ([`DomainPace::takes`]):
-/// how many, and the sum of each one's rate across its span, whose mean is
-/// the rate the host's asks take memory at, which borrowed room is priced
-/// by.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Takes {
-    count: std::num::NonZeroU32,
-    rate_sum: f64,
-}
-
-impl Takes {
-    /// These asks and one more, at `rate` across its span; the first where
-    /// none was read.
-    fn with(takes: Option<Self>, rate: f64) -> Self {
-        takes.map_or(Self { count: std::num::NonZeroU32::MIN, rate_sum: rate }, |takes| Self {
-            count: takes.count.checked_add(1).expect("a load reads fewer than 2^32 asks"),
-            rate_sum: takes.rate_sum + rate,
-        })
-    }
-
-    /// The asks' mean rate across their spans.
-    fn mean(&self) -> f64 {
-        self.rate_sum / f64::from(self.count.get())
-    }
-}
-
-/// Available memory's fluctuation in steady state: the largest fall between
-/// consecutive readings while the domain's demand is unchanged (the
-/// process's charge equal at both, and no bank resize running at either,
-/// whose backed pages and charge a reading may see apart), over the readings
-/// since the domain last left Reclaim.
-///
-/// A pair across a change of the process's demand measures the process,
-/// not the host; a fall that reached the line is a change of the host's
-/// demand, which Reclaim answers with shrinks, so the steady state starts
-/// again once it is left (and growth waits for memory to stay free first,
-/// `RECOVERY_STABLE_TIME`, so its first step has the readings of that wait).
-/// A rise never takes room from a growth: a lifted pressure is not a
-/// fluctuation.
-#[derive(Clone, Copy, Default)]
-struct Fluctuation {
-    /// The latest reading's available bytes and the process's charge then,
-    /// if no bank resize ran.
-    settled: Option<(u64, u64)>,
-    largest: u64,
-}
-
-impl Fluctuation {
-    /// Fold in a reading of `available` bytes with the process charging
-    /// `charged`, `settled` if no bank resize ran.
-    fn read(&mut self, available: u64, charged: u64, settled: bool) {
-        let reading = settled.then_some((available, charged));
-        if let (Some((before, was)), Some(_)) = (self.settled, reading) {
-            if was == charged {
-                self.largest = self.largest.max(before.saturating_sub(available));
-            }
-        }
-        self.settled = reading;
-    }
-}
-
-/// What a domain's latest reading leaves a shrink to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Shortfall {
-    /// At or above the planning line.
-    Above,
-    /// Below it by no more than what the process released, which the host
-    /// has yet to show; or in Reclaim with nothing below it, the hold that
-    /// neither grows nor releases: headroom exactly at the line (no claim
-    /// may take more, and a release would only be grown back into), room
-    /// borrowed with nothing left lent (which reads at the line: a release
-    /// would be lent again and taken back), or the host in distress above
-    /// it (no measure says anything is owed).
-    Covered,
-    /// These bytes short beyond what the process released.
-    Short(u64),
-}
-
 /// The target each memory reading of the owner is traced to: what an
 /// instrument samples a load's charge against its room from.
 pub const MEMORY_TRACE: &str = "magnitude_memory_reading";
-
-impl DomainPace {
-    /// The rate the rest of the host sustains taking at `at`, where it has
-    /// not taken `now` bytes: the fall from the last of the earlier probes
-    /// `untaken` at or before `at − window` (its oldest while it reaches no
-    /// further back) to `now`, over the span since that probe or the whole
-    /// `window` where that is longer, never negative. The window is
-    /// the span a margin holds a take across (`MemoryPace::observe`): a
-    /// take that stops within it threatens what a release lands by no more
-    /// than its share of the window, and one that sustains it reads as
-    /// itself. So a transient fall, however steep across one reading span
-    /// (an import's wiring, a compiler service's burst), sets no rate of
-    /// its own past the window, while a steady take reads at its rate once
-    /// the window holds it.
-    fn sustained(untaken: &std::collections::VecDeque<(Instant, u64)>, at: Instant, now: u64, window: Duration) -> f64 {
-        let start = at.checked_sub(window);
-        let Some(&(then, was)) =
-            untaken.iter().rev().find(|(then, _)| start.is_some_and(|start| *then <= start)).or(untaken.front())
-        else {
-            return 0.0;
-        };
-        let span = window.max(at.duration_since(then));
-        was.saturating_sub(now) as f64 / span.as_secs_f64()
-    }
-}
-
-impl MemoryPace {
-    /// The pace before any probe or release.
-    fn new() -> Self {
-        Self {
-            domains: BTreeMap::new(),
-            read: None,
-            latency: Duration::ZERO,
-            release: None,
-        }
-    }
-
-
-    /// Fold in a probe of every domain, the process charging each store as
-    /// `charges` say and host RAM's witness of what it holds resident
-    /// reading `host`, `settled` if no bank resize runs, memory read every
-    /// [`READING_INTERVAL`], the load able to release `releasable` now at
-    /// `release`, read `at`.
-    ///
-    /// Each domain's take rate is the one sustained over the span its
-    /// margin holds a take across (`platform::StoreMotion::margin`): from
-    /// noticing it within a reading interval, through the first release's
-    /// latency, to the last of the bytes the load can release there
-    /// landing at the release rate.
-    fn observe(
-        &mut self,
-        readings: &[DomainReading],
-        charges: &[(seismic::StoreId, u64)],
-        host: Option<u64>,
-        settled: bool,
-        releasable: Releasable,
-        release: ReleaseRate,
-        at: Instant,
-    ) {
-        self.read = Some(at);
-        for reading in readings {
-            let charged = charges
-                .iter()
-                .filter(|(store, _)| *store == reading.domain)
-                .map(|(_, bytes)| bytes)
-                .sum::<u64>();
-            tracing::debug!(
-                target: MEMORY_TRACE,
-                store = ?reading.identity,
-                headroom = reading.headroom_bytes,
-                planning = reading.thresholds.planning_bytes,
-                charged,
-                "memory read"
-            );
-            let mut before = self.domains.remove(&reading.domain);
-            // The host's own figure, apart from every line of the load's
-            // (`platform::Shown`): a headroom derived from the load's line
-            // moves with it, and would read its motion as another program's.
-            let basis = reading.shown.basis();
-            let shown = reading.shown.bytes().saturating_add(charged);
-            let witness = host.filter(|_| reading.identity == seismic::StoreIdentity::HostRam);
-            let unseen = match (reading.band, &before) {
-                (MemoryBand::Reclaim, Some(before)) => {
-                    let owed = before.unseen + before.charged.saturating_sub(charged);
-                    // The witness's fall is what of it shows; all of it
-                    // without one.
-                    let shown = before.witness.zip(witness).map_or(owed, |(was, now)| was.saturating_sub(now));
-                    owed - shown.min(owed)
-                }
-                _ => 0,
-            };
-            // What the rest of the host has not taken, for its motion: the
-            // headroom and what the process holds there as its witness
-            // shows. A reservation is charged before its pages are backed,
-            // so the headroom falls as the process backs its own charge
-            // (an import's wiring, a bank's first fill); read against the
-            // charge, that fall is another program's take, at the rate the
-            // process backs pages. A release lowers the witness as the host
-            // frees its pages, so it moves nothing here and the history
-            // stands across it. With no witness (a device's own memory, a
-            // host that reports neither wired bytes nor a footprint) the
-            // headroom and the charge, measured as `Fluctuation::read`
-            // measures: only across spans of an unchanged charge. Such a
-            // span holds no release the host has yet to show begin, and one
-            // it shows late within it raises the headroom, so it can read a
-            // take low, never invent one; a span across which the charge
-            // changed restarts the history.
-            let host_ram = reading.identity == seismic::StoreIdentity::HostRam;
-            let untaken = witness.map_or(shown, |held| reading.shown.bytes().saturating_add(held));
-            // Readings of different figures measure no motion between them.
-            let rebased = before.as_ref().is_some_and(|before| before.basis != basis);
-            let restarts = rebased || witness.is_none() && before.as_ref().is_some_and(|before| before.charged != charged);
-            let releasable = match reading.identity {
-                seismic::StoreIdentity::HostRam => releasable.host,
-                _ => releasable.device,
-            };
-            let window =
-                READING_INTERVAL + self.latency + Duration::from_secs_f64(releasable as f64 / release.bytes_per_second());
-            let mut took = None;
-            let (untaken_at, rate) = match before.as_mut().map(|before| (before.untaken.back().copied(), before)) {
-                _ if restarts => ([(at, untaken)].into(), 0.0),
-                Some((Some((then, was)), before)) if at.duration_since(then) >= READING_INTERVAL => {
-                    let fall = was.saturating_sub(untaken);
-                    took = (fall > before.fluctuation.largest)
-                        .then(|| fall as f64 / at.duration_since(then).as_secs_f64());
-                    let rate = DomainPace::sustained(&before.untaken, at, untaken, window);
-                    let mut history = std::mem::take(&mut before.untaken);
-                    history.push_back((at, untaken));
-                    // Keep the last at or before the window's start, which
-                    // anchors its fall, and everything after it.
-                    let start = at.checked_sub(window);
-                    while history.len() > 1 && start.is_some_and(|start| history[1].0 <= start) {
-                        history.pop_front();
-                    }
-                    (history, rate)
-                }
-                Some((Some(_), before)) => (std::mem::take(&mut before.untaken), before.rate),
-                Some((None, _)) | None => ([(at, untaken)].into(), 0.0),
-            };
-            let before_takes = before.as_ref().and_then(|before| before.takes);
-            let takes = took.map_or(before_takes, |rate| Some(Takes::with(before_takes, rate)));
-            let first = before.as_ref().map_or(at, |before| before.first);
-            let fluctuation = match reading.band {
-                MemoryBand::Reclaim => Fluctuation::default(),
-                MemoryBand::Normal => {
-                    let mut fluctuation = before.map(|before| before.fluctuation).unwrap_or_default();
-                    fluctuation.read(untaken, charged, settled && !rebased);
-                    fluctuation
-                }
-            };
-            self.domains.insert(
-                reading.domain,
-                DomainPace {
-                    role: reading.role,
-                    headroom: reading.headroom_bytes,
-                    basis,
-                    thresholds: reading.thresholds,
-                    charged,
-                    band: reading.band,
-                    unseen,
-                    witness,
-                    untaken: untaken_at,
-                    rate,
-                    fluctuation,
-                    host: host_ram,
-                    grant_left: (reading.constraint == crate::platform::MemoryConstraint::Grant).then_some(reading.ceiling_bytes),
-                    borrowable: reading.borrowable_bytes,
-                    takes,
-                    first,
-                },
-            );
-        }
-    }
-
-    /// What a shrink of what is charged in `store` has to do, decided at the
-    /// latest probe with the process charging it `charged` now: that domain's
-    /// reading below the planning line, plus what the host takes until the
-    /// next shrink takes effect, less what the witness has yet to drop and
-    /// the charge dropped since this one. Only a release charged in a domain
-    /// lifts its deficit, so each holding shrinks by its own domain's; a
-    /// domain no probe observed is above. In distress above the line nothing
-    /// it holds is short: a release would only buy what no measure says is
-    /// owed, its reading already leaving out what was displaced since the
-    /// load began to serve (`HostRoom::Load`).
-    fn shortfall(&self, store: seismic::StoreId, charged: u64) -> Shortfall {
-        let Some(pace) = self.domains.get(&store) else {
-            return Shortfall::Above;
-        };
-        let below = match (pace.thresholds.planning_bytes.saturating_sub(pace.headroom), pace.band) {
-            (0, MemoryBand::Normal) => return Shortfall::Above,
-            (0, MemoryBand::Reclaim) => return Shortfall::Covered,
-            (below, _) => below,
-        };
-        let released = pace.unseen + pace.charged.saturating_sub(charged);
-        match projected(below, pace.rate, self.horizon()).saturating_sub(released) {
-            0 => Shortfall::Covered,
-            short => Shortfall::Short(short),
-        }
-    }
-
-    /// What a growth step in `store` must stay below at the latest probe,
-    /// and the margin it leaves: its domain's ceiling, whose planning line
-    /// holds the reading's fluctuation ([`Self::margin`]), and that
-    /// fluctuation; `None` before a probe of it. Each store's room is its
-    /// own: a step in host memory takes nothing of a device's.
-    fn growth_room(&self, store: seismic::StoreId) -> Option<(u64, u64)> {
-        self.domains
-            .get(&store)
-            .map(|pace| (pace.thresholds.ceiling(pace.headroom), pace.fluctuation.largest))
-    }
-
-    /// What the load measured of the rest of the host's motion
-    /// (`platform::StoreMotion`), which its reserves hold their margin at:
-    /// host RAM's, a device's own memory's (the largest of its allocation
-    /// domains'), each the steady fluctuation of available memory and the
-    /// rate the rest of the host sustains taking it at now
-    /// ([`DomainPace::sustained`]), none where no domain of it reads a take; and the last finished release's latency, none
-    /// before one. A measured motion only ever raises what was known
-    /// (`platform::MemoryReserves::measured`), whose take rate starts at
-    /// the machine's page-fill rate; and the slowest finished release's
-    /// rate, none before one, which only ever lowers what was known (the
-    /// machine's page-release rate).
-    fn motions(&self) -> PaceMotions {
-        let motion = |host: bool| {
-            self.domains
-                .values()
-                .filter(|pace| pace.host == host && (host || pace.role == DomainRole::Allocation))
-                .filter(|pace| pace.rate > 0.0)
-                .map(|pace| StoreMotion::new(pace.fluctuation.largest, pace.rate))
-                .reduce(StoreMotion::with)
-        };
-        PaceMotions {
-            host: motion(true),
-            device: motion(false),
-            latency: (self.latency > Duration::ZERO).then_some(self.latency),
-            release: self.release,
-        }
-    }
-
-    /// The room a settle of the heap grants into in `store`, the process
-    /// charging it `charged` now ([`value::Supply`]); none before a probe
-    /// of it.
-    ///
-    /// Free room is the headroom above the planning line, which holds the
-    /// measured margin; what is owed is the shortfall below it
-    /// ([`Self::shortfall`]). Borrowed room is what the host gives beyond
-    /// that by compressing other programs' data, up to the borrowing line.
-    /// Its price, in serving seconds saved per second per byte, is what
-    /// holding a byte of it costs another program: each ask it makes waits
-    /// for the byte about `1 / t` seconds, `t` the mean rate its asks took
-    /// memory at (a release hands it back at the rate the host takes it),
-    /// and asks come `takes / elapsed` times a second, so
-    /// `takes / (elapsed × t)`; zero while no ask was seen,
-    /// where borrowing harms no one. The device's hard limit is the grant
-    /// left where a grant bounds the domain. An exchange's gain is earned
-    /// over `horizon`, how long the settle's decision stands.
-    fn supply(&self, store: seismic::StoreId, charged: u64, horizon: Duration) -> Option<value::Supply> {
-        let pace = self.domains.get(&store)?;
-        let free = pace.thresholds.ceiling(pace.headroom);
-        let owed = match self.shortfall(store, charged) {
-            Shortfall::Short(bytes) => bytes,
-            Shortfall::Above | Shortfall::Covered => 0,
-        };
-        let borrowable = pace.borrowable.map_or(0, |line| pace.thresholds.ceiling(line).saturating_sub(free));
-        let elapsed = self.read.map_or(0.0, |read| read.duration_since(pace.first).as_secs_f64());
-        let borrow_price = pace.takes.map_or(0.0, |takes| {
-            f64::from(takes.count.get()) / (elapsed.max(READING_INTERVAL.as_secs_f64()) * takes.mean())
-        });
-        Some(value::Supply {
-            free,
-            owed,
-            borrowable,
-            borrow_price,
-            ceiling: pace.grant_left.unwrap_or(u64::MAX),
-            horizon,
-        })
-    }
-
-    /// `store`'s available memory's fluctuation at the latest probe, which
-    /// the reserve's margin holds; none before a probe of it.
-    fn fluctuation(&self, store: seismic::StoreId) -> u64 {
-        self.domains.get(&store).map_or(0, |pace| pace.fluctuation.largest)
-    }
-
-    /// From a shrink's decision to the next one's effect.
-    fn horizon(&self) -> Duration {
-        READING_INTERVAL + 2 * self.latency
-    }
-
-    /// A release of `bytes` finished, as `times` say: its latency, and its
-    /// rate over the span its bytes took (`ResizeTimes::releasing`) where it
-    /// released any. The margin grows its deficit for the `B / r` runs a
-    /// release of all `B` releasable bytes takes; a rate read over a wait
-    /// any release takes alike would multiply that wait by every byte of
-    /// the bank (a 20 GB bank's margin past a terabyte).
-    fn released(&mut self, bytes: u64, times: &ResizeTimes) {
-        self.latency = times.latency();
-        let seconds = times.releasing().as_secs_f64();
-        if bytes > 0 && seconds > 0.0 {
-            let rate = ReleaseRate::new(bytes as f64 / seconds);
-            self.release = Some(self.release.map_or(rate, |slowest| slowest.with(rate)));
-        }
-    }
-}
-
-/// What `bank` can release now: its slots beyond its floor, each an equal
-/// share of its records' charge in every store, host RAM's apart from the
-/// device's own memory's.
-fn releasable(bank: &dyn ElasticBank) -> Result<Releasable, DomainError> {
-    let residency = bank.residency()?;
-    let above = u128::from(residency.slots.saturating_sub(residency.floor));
-    let slots = u128::from(residency.slots.max(1));
-    let share = |bytes: u64| u64::try_from(u128::from(bytes) * above / slots).expect("a share of a charge fits its charge");
-    Ok(residency.stores.iter().fold(Releasable::default(), |releasable, (store, bytes)| match store {
-        seismic::StoreIdentity::HostRam => Releasable { host: releasable.host + share(*bytes), ..releasable },
-        _ => Releasable { device: releasable.device + share(*bytes), ..releasable },
-    }))
-}
-
-/// `deficit` bytes now, and what the host takes at `rate` bytes a second
-/// until the next shrink takes effect `horizon` from now.
-fn projected(deficit: u64, rate: f64, horizon: Duration) -> u64 {
-    deficit.saturating_add((rate * horizon.as_secs_f64()) as u64)
-}
 
 impl ExecutorDomain<NativeFamily> {
     /// What steps cost each streamed routed layer so far (requests, misses,
@@ -1952,10 +1286,15 @@ impl ExecutorDomain<NativeFamily> {
         self.family.experts_held()
     }
 
+    /// The domain over the load's native family. Its holdings of what the
+    /// load allocated as it started (`recorded`, and `constants`, the
+    /// target's binding constants it binds now) are carved from that
+    /// record; a store short of what it commits beyond it refuses it as
+    /// [`DomainError::Capacity`], a state the load matches.
     pub fn new(
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
-        memory: DeviceHeap,
+        memory: DeviceReader,
         programs: Rc<AttestedPrograms>,
         resources: AllocatedResources,
         head_loader: Option<ComponentLoader<ResidentHead>>,
@@ -1963,13 +1302,15 @@ impl ExecutorDomain<NativeFamily> {
         resident: crate::ResidentTarget,
         target_state: StoreBindings,
         head_state: Option<StoreBindings>,
-    ) -> Result<(Self, StateBindings), String> {
+        mut recorded: crate::memory::ledger::Recorded,
+        mut constants: crate::memory::ledger::Held,
+    ) -> Result<(Self, StateBindings), DomainError> {
         // A model's drafter (its draft head or separate draft) is enabled
         // only when its method drafts.
         if (head_loader.is_some() && definition.head.is_none() && definition.draft.is_none())
             || vision_loader.is_some() != definition.vision.is_some()
         {
-            return Err("component loaders differ from enabled model components".into());
+            return Err(DomainError::invariant("component loaders differ from enabled model components"));
         }
         // A draft head reading the target's history keeps no state arena.
         let keeps_history = definition.draft.is_some()
@@ -1978,10 +1319,13 @@ impl ExecutorDomain<NativeFamily> {
                 .as_ref()
                 .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Own);
         if head_state.is_some() != (head_loader.is_some() && keeps_history) {
-            return Err("head state arena differs from enabled head component".into());
+            return Err(DomainError::invariant("head state arena differs from enabled head component"));
         }
-        let family = NativeFamily::new(programs, resident, definition.decoder.clone())?;
-        Ok(Self::with_family(
+        let family = NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded)?;
+        // The family bound the target's constants.
+        constants.allocated();
+        recorded.record(constants);
+        Self::with_family(
             execution,
             definition,
             resources,
@@ -1991,7 +1335,8 @@ impl ExecutorDomain<NativeFamily> {
             head_loader,
             vision_loader,
             family,
-        ))
+            recorded,
+        )
     }
 }
 
@@ -2043,40 +1388,103 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The owner's periodic observation: the newest reading published off
-    /// its thread observed (`MemoryProbe::probe_published`) where one was
-    /// since, and the outcome of the newest one observed, here or between a
-    /// chain's submissions, that it has not taken yet; none where there is
-    /// none: its readings where it is in no Reclaim band. It waits for no
-    /// reading.
+    /// its thread observed (`MemoryProbe::probe_published`), and read by the
+    /// device's ledgers, where one was since, and the outcome of the newest
+    /// one observed, here or between a chain's submissions, that it has not
+    /// taken yet; none where there is none. Its error is only
+    /// [`DomainError::Blind`]. It waits for no reading.
     pub fn take_published_memory(&mut self) -> Option<Result<Vec<DomainReading>, DomainError>> {
         self.memory_probe().probe_published(self.family.expert_bank());
         self.unseen_reading.get_mut().take()
     }
 
-    /// Observe every domain the device uses from a reading taken now, set
-    /// Seismic's allocation ceiling from the readings, and refresh the
-    /// heap's view of the charge ([`Self::refresh_memory`]): a memory
-    /// probe's, and what waits on memory another process frees. Seismic
-    /// remains the physical charge authority; the heap only keeps the
-    /// claims. A failed observation revokes unspent
-    /// grants and leaves the heap Blind.
+    /// Whether the store a capacity deficit of `resource` lies in now holds
+    /// its `required` bytes, by its ledger's last reading, as a claim of them
+    /// is judged (`memory::ledger::Ledger::covers`): when a request blocked
+    /// on that deficit retries.
+    ///
+    /// # Panics
+    /// For a resource no store's memory is: no claim refuses with it.
+    pub fn memory_covers(&self, resource: ResourceKind, required: u64) -> bool {
+        let ledgers = self.resources.ledgers();
+        let ledger = match resource {
+            ResourceKind::DeviceMemory => ledgers.device(),
+            ResourceKind::HostStaging => ledgers.host(),
+            other => panic!("invariant violated: a memory deficit of {other:?}, which no store's ledger keeps"),
+        };
+        ledger.covers(required, seismic::Reclaim::Nothing).is_ok()
+    }
+
+    /// The owner's judgment of a reading its ledgers recorded: whether the
+    /// model unloads, since a store the device reaches, as its ledger read
+    /// it, cannot keep the speed guarantee of a prompt chunk of
+    /// `chunk_rows` rows, the running prompt chunk's (0 where none runs)
+    /// (`memory::ledger::Snapshot::unload`). Each store's reading is
+    /// traced as one `memory read` event at [`MEMORY_TRACE`], of the one
+    /// snapshot the judgment reads: its budget, committed and cache bytes,
+    /// free room, others' memory, the guarantee, and each bank holding in
+    /// the store with what it holds and its derived target
+    /// (`experts::derived::derive`, as the bank follows it).
+    pub fn memory_reading(&self, chunk_rows: u64) -> Result<bool, DomainError> {
+        let ledgers = self.resources.ledgers();
+        let device = ledgers.device();
+        let stores = std::iter::once(device).chain((ledgers.host().store() != device.store()).then(|| ledgers.host()));
+        let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
+        let targets = match (traced, self.family.expert_bank()) {
+            (true, Some(bank)) => {
+                let holdings = bank.targets(self.decode_price()?.as_ref())?;
+                crate::experts::derived::derive(ledgers, &holdings, self.in_process_growth())
+                    .into_iter()
+                    .map(|(target, slots)| crate::experts::derived::DerivedTarget {
+                        holding: target.holding,
+                        store: ledgers.of(target.tier).store(),
+                        held: target.at,
+                        target: slots,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut unload = false;
+        for ledger in stores {
+            let snapshot = ledger.snapshot();
+            let guarantee = snapshot.guarantee(chunk_bytes(ledger, chunk_rows));
+            unload |= snapshot.unload(chunk_bytes(ledger, chunk_rows));
+            if !traced {
+                continue;
+            }
+            let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
+            let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
+            tracing::debug!(
+                target: MEMORY_TRACE,
+                store = ?ledger.store(),
+                blind = snapshot.others().is_none(),
+                budget = snapshot.budget(),
+                committed = snapshot.committed(),
+                cache = snapshot.cache(),
+                bank_cache = snapshot.cache_of(crate::memory::ledger::CacheKind::Bank),
+                free = snapshot.free(),
+                others = snapshot.others().unwrap_or(0),
+                guarantee,
+                bank_slots = experts.map_or(0, |target| target.held),
+                bank_target = experts.map_or(0, |target| target.target),
+                host_slots = host.map_or(0, |target| target.held),
+                host_target = host.map_or(0, |target| target.target),
+                "memory read"
+            );
+        }
+        Ok(unload)
+    }
+
+    /// Observe every domain the device uses from a reading taken now: the
+    /// worker's report of them.
     pub fn observe_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
         self.memory_probe().observe(self.family.expert_bank())
     }
 
-    /// Refresh the heap's view of Seismic's charge after the process's own
-    /// claims and releases, reading no store: the stores and Seismic's
-    /// ceiling stand as the last observation ([`Self::observe_memory`]) or
-    /// claim read them, so the decode's own steps read nothing of the OS.
-    pub fn refresh_memory(&self) -> Result<(), DomainError> {
-        #[cfg(test)]
-        self.refreshes.set(self.refreshes.get() + 1);
-        self.memory_probe().account(self.family.expert_bank())
-    }
-
     /// What reads memory for the domain ([`MemoryProbe`]).
     fn memory_probe(&self) -> MemoryProbe<'_> {
-        MemoryProbe::of(&self.domain, &self.memory, &self.pace, &self.unseen_reading, self.bank_claim.as_ref(), &self.resize_held, self.planned_unheld())
+        MemoryProbe::of(&self.domain, &self.memory, self.resources.ledgers(), &self.unseen_reading, &self.resize_held)
     }
 
     /// Submit a chain of target launches and its spare output slot
@@ -2091,11 +1499,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         chain: Chain<crate::ValidatedTargetLaunch>,
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
-        // The family is lent to the chain, so the probe borrows the rest,
-        // the plan's unheld holdings read before it is.
-        let planned = self.planned_unheld();
-        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, &self.unseen_reading, self.bank_claim.as_ref(), &self.resize_held, planned);
-        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
+        // The family is lent to the chain, so the probe borrows the rest.
+        // The guarantee the probe keeps is of a chunk as large as the
+        // chain's largest launch.
+        let chunk_rows = chain.iter().map(|launch| launch.batch().actual_rows() as u64).max().expect("a chain is never empty");
+        let probe = MemoryProbe::of(&self.domain, &self.memory, self.resources.ledgers(), &self.unseen_reading, &self.resize_held);
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank, chunk_rows));
         self.note_running_cut();
         submitted
     }
@@ -2120,20 +1529,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The cut of the expert bank begun beside a running chain since the
     /// owner last asked, taken: the storage it resizes and what the process
-    /// held as it was decided. The owner holds it as a Reclaim shrink it
-    /// began, which a later advance finishes
+    /// held as it was decided. The owner holds it as a shrink it began,
+    /// which a later advance finishes
     /// ([`Self::advance_expert_bank`]).
     pub fn take_running_release(&mut self) -> Option<(crate::planning::BankTier, MemoryMoment)> {
         self.running_release.take()
     }
 
-    pub fn memory(&self) -> std::cell::Ref<'_, MemoryHeap> {
-        std::cell::Ref::map(self.memory.borrow(), DeviceHeap::heap)
-    }
-
     /// Bytes of the model's host-resident tables held in host RAM.
     pub fn host_table_bytes(&self) -> u64 {
-        self.memory.borrow().host_table_bytes()
+        self.execution.load().host_table_bytes().expect("invariant violated: a loaded plan sizes its host tables")
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more
@@ -2617,50 +2022,85 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Import and bind the optional component `lane` needs when it is
-    /// unbound, and whether it did.
-    fn bind_component(&mut self, lane: ReservationLane) -> Result<bool, DomainError> {
+    /// unbound, each allocation under its claim (`Self::claim_growth`): the
+    /// import's resident weights held by its loader for the import's life,
+    /// its upload peak only while it runs, and its graph constants for its
+    /// binding's life.
+    fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
         match lane {
             ReservationLane::Head if !self.family.head_is_bound() => {
-                let resident = self
+                let loader = self
                     .head_loader
                     .as_ref()
-                    .ok_or_else(|| DomainError::Input("head component is disabled".into()))?
-                    .load()
-                    .map_err(|error| DomainError::Input(error.to_string()))?;
+                    .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
+                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                let resident = self.import_component(
+                    loader,
+                    self.execution.resources().bytes().head_weights,
+                    self.execution.load().head_upload_peak_bytes(),
+                )?;
+                let mut binding = self.claim_growth(
+                    crate::memory::ledger::CommittedKind::Component,
+                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                )?;
                 self.family.bind_head(resident, &self.definition)?;
+                binding.allocated();
+                self.head_binding = binding.into_claims();
                 self.hold_bound_head()?;
-                Ok(true)
+                Ok(())
             }
             ReservationLane::Vision if !self.family.vision_is_bound() => {
-                let resident = self
+                let loader = self
                     .vision_loader
                     .as_ref()
-                    .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?
-                    .load()
-                    .map_err(|error| DomainError::Input(error.to_string()))?;
+                    .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
+                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                let resident = self.import_component(
+                    loader,
+                    self.execution.resources().bytes().vision_weights,
+                    self.execution.load().vision_upload_peak_bytes(),
+                )?;
+                let mut binding = self.claim_growth(
+                    crate::memory::ledger::CommittedKind::Component,
+                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                )?;
                 self.family.bind_vision(resident, &self.definition)?;
-                Ok(true)
+                binding.allocated();
+                self.vision_binding = binding.into_claims();
+                Ok(())
             }
-            _ => Ok(false),
+            _ => Ok(()),
         }
+    }
+
+    /// `loader`'s component, imported where it is not yet: its `resident`
+    /// bytes claimed for the import's life, kept by the loader, and its
+    /// upload `peak` (staged through host RAM where that is a store apart)
+    /// claimed only while the import runs.
+    fn import_component<T: Clone>(&self, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
+        let imported = match loader.imported() {
+            true => loader.load(),
+            false => {
+                use crate::memory::{ClaimDemand, ledger::CommittedKind};
+                let weights = self.claim_growth(CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
+                let _upload = self.claim_growth(CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
+                loader.import(weights)
+            }
+        };
+        imported.map_err(|error| DomainError::Input(error.to_string()))
     }
 
     /// Reserve capacity for one group: the front queued step's slots when
     /// the group claims it, otherwise its provisioned state, advances and
     /// launch leases.
     ///
-    /// It reads the heap's charge once, on entry. What changes the charge
-    /// later on this thread reads it again itself: each growth provisioning
-    /// grants (`grant_state_growth`, `grant_group`, `provision_output`,
-    /// `grow_vision`) once its allocation ran, and the reservation once an
-    /// import ran. Off this thread the charge only rises under the expert
-    /// bank's claim, which the heap already holds.
+    /// Each allocation it makes is claimed first by the device's ledgers
+    /// as they read last (`ExecutorDomain::claim_growth`).
     pub fn reserve(
         &mut self,
         bindings: &mut StateBindings,
         operations: &[Operation],
     ) -> Result<DomainReservation, DomainError> {
-        self.refresh_memory()?;
         let requirements = self.requirements(operations)?;
         if requirements.claim {
             let slots = self
@@ -2672,29 +2112,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             });
         }
         // Commit the selected group's numerical backing before a lazy
-        // component import. Provisioning grants the physical growth peak
-        // through the heap before any backing allocation. The owner applied
+        // component import. Provisioning admits the physical growth peak
+        // by the device's ledgers before any backing allocation. The owner applied
         // any state ceiling when it selected the group.
         self.provision(bindings, operations, None)?;
         // Provisioning may relocate a shared tail into a fresh page. Recompute
         // row demand against that layout: the next append can now fit in place.
         let requirements = self.requirements(operations)?;
-        // The import and binding of an unbound component run under one heap
-        // claim for their peak, released once Seismic's charge reflects them.
-        let claim = self
-            .component_growth(operations)?
-            .map(|(required, staged)| {
-                self.claim_device_growth(required, staged, HoldingClass::Dormant)
-            })
-            .transpose()?;
-        let imported = self.bind_component(requirements.lane).and_then(|lane| {
-            Ok(lane | (requirements.priming_banks != 0 && self.bind_component(ReservationLane::Head)?))
-        });
-        if let Some(claim) = claim {
-            self.release_claim(claim);
-        }
-        if imported? {
-            self.refresh_memory()?;
+        self.bind_component(requirements.lane)?;
+        if requirements.priming_banks != 0 {
+            self.bind_component(ReservationLane::Head)?;
         }
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
@@ -2894,13 +2321,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
         resources: AllocatedResources,
-        memory: DeviceHeap,
+        memory: DeviceReader,
         target_state: StoreBindings,
         head_state: Option<StoreBindings>,
         head_loader: Option<ComponentLoader<ResidentHead>>,
         vision_loader: Option<ComponentLoader<ResidentVision>>,
         family: F,
-    ) -> (Self, StateBindings) {
+        mut recorded: crate::memory::ledger::Recorded,
+    ) -> Result<(Self, StateBindings), DomainError> {
+        let arena = state::claim_arena(&execution, &resources, &family, &mut recorded)?;
         let id = resources.domain().clone();
         let lane_identities = ["target", "head", "vision"].map(|lane| {
             ProgramIdentity::new(format!("{id}:{lane}"))
@@ -2910,6 +2339,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             execution,
             definition,
             resources,
+            arena,
+            _recorded: recorded.into_claims(),
+            state_claims: BTreeMap::new(),
+            preempting: None,
+            state_slabs: state::StateSlabs::new(
+                target_state.committed_bytes() + head_state.as_ref().map_or(0, |state| state.committed_bytes()),
+            ),
             domain: ResourceDomain::new(id, memory.device().clone()),
             memory: RefCell::new(memory),
             target_store: Rc::clone(&target_state),
@@ -2917,6 +2353,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             family,
             head_loader,
             vision_loader,
+            head_binding: Vec::new(),
+            vision_binding: Vec::new(),
             target: BTreeMap::new(),
             queue: queue::Queue::Empty,
             head: BTreeMap::new(),
@@ -2928,36 +2366,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             planned: Vec::new(),
             workload: None,
             measurement_claim: None,
-            places_target: std::num::NonZeroUsize::MIN,
-            class_ladder: Box::new([]),
-            places_prompt: RefCell::new(None),
-            state_lent: 0,
+            group_class: None,
+            idle_class: Vec::new(),
             next_flight: 0,
             host_turn: None,
             proposed: BTreeSet::new(),
             publishing: BTreeSet::new(),
             poisoned: BTreeMap::new(),
             measures: None,
-            bank_claim: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,
-            pace: RefCell::new(MemoryPace::new()),
-            #[cfg(test)]
-            refreshes: std::cell::Cell::new(0),
             running_release: None,
             unseen_reading: RefCell::new(None),
-            settled: None,
-            requests: 0,
-            #[cfg(test)]
-            settles: std::cell::Cell::new(0),
         };
-        let mut domain = domain;
-        domain.plan_places();
         let bindings = StateBindings {
             target: target_state,
             head: head_state,
         };
-        (domain, bindings)
+        Ok((domain, bindings))
     }
 
     pub fn resource_identity(&self) -> &ResourceDomainId {

@@ -997,16 +997,33 @@ pub struct BankCapacity {
 }
 
 impl BankCapacity {
-    pub fn total(self) -> Result<usize, Error> {
+    /// This capacity, refused where it has no active or in-flight request.
+    pub fn validated(self) -> Result<Self, Error> {
         if self.active == 0 || self.in_flight == 0 {
             return Err(Error::Request(
                 "bank pool requires positive active and in-flight capacity".into(),
             ));
         }
-        self.active
-            .checked_add(self.in_flight)
-            .and_then(|value| value.checked_add(self.retained))
+        Ok(self)
+    }
+
+    pub fn total(self) -> Result<usize, Error> {
+        let this = self.validated()?;
+        this.active
+            .checked_add(this.in_flight)
+            .and_then(|value| value.checked_add(this.retained))
             .ok_or_else(|| Error::Request("bank pool capacity overflow".into()))
+    }
+
+    /// The banks a store commits at construction: the pristine seed a first
+    /// request starts from plus the successor banks one request holds in
+    /// flight (`in_flight` is the requests' successors in all), so its first
+    /// step of any kind grows no slab and the load's startup charge holds
+    /// everything its warm-up forward and first prefill allocate. Further
+    /// requests' banks grow the store by slabs the in-process guarantee covers.
+    pub fn startup_banks(self) -> Result<usize, Error> {
+        let this = self.validated()?;
+        Ok(1 + this.in_flight.div_ceil(this.active))
     }
 
     /// Writable banks plus one permanently pristine seed for new sequences.
@@ -1649,10 +1666,11 @@ impl StateStore {
         };
         let reserved_banks = bank_capacity.storage_total()?;
         // Banks of a store without recurrent components have no storage.
-        let committed_banks = if component_specs.is_empty() {
-            reserved_banks
+        let (committed_banks, startup_slabs) = if component_specs.is_empty() {
+            (reserved_banks, 0)
         } else {
-            bank_slab_banks.min(reserved_banks)
+            let slabs = bank_capacity.startup_banks()?.div_ceil(bank_slab_banks);
+            ((slabs * bank_slab_banks).min(reserved_banks), slabs)
         };
         let (banks, zero_seed) = BankPool::new(bank_capacity, committed_banks)?;
         let mut recurrent = if component_specs.is_empty() {
@@ -1672,7 +1690,9 @@ impl StateStore {
             )?)
         };
         if let Some(recurrent) = &mut recurrent {
-            recurrent.add_slab()?;
+            for _ in 0..startup_slabs {
+                recurrent.add_slab()?;
+            }
         }
         let mut history = Vec::with_capacity(stored.len());
         let mut domains = Vec::with_capacity(stored.len());
@@ -3472,6 +3492,25 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    /// A bank of more than a slab's target holds one bank per slab: the
+    /// store commits the seed's slab and the slab of the writable bank a
+    /// sequence's first step writes, so that step grows nothing.
+    #[test]
+    fn a_first_step_grows_no_bank_slab() {
+        let (store, _bindings) = StateStore::new(
+            cpu_device(),
+            64,
+            64,
+            vec![],
+            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+            BankCapacity { active: 2, in_flight: 1, retained: 0 },
+        )
+        .unwrap();
+        assert_eq!(store.bank_slab_banks(), 1);
+        assert_eq!(store.available_banks(), BankCapacity { active: 2, in_flight: 1, retained: 0 }.startup_banks().unwrap() - 1);
+        assert_eq!(store.growth_claim(&[], &[], 1).unwrap().minimum_bytes, 0);
     }
 
     #[test]

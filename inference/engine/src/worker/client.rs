@@ -760,7 +760,7 @@ mod tests {
         state.deliver(WorkerMessage::MeasurementRoom { claim: released, room: Ok(RoomAnswer::Made) }).unwrap();
         assert_eq!(second.lock().unwrap().value, None, "the released claim's answer");
         let (joined, None) = state.claim_room() else { panic!("a claim while one is pending joins it") };
-        let short = Ok(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 1 }));
+        let short = Ok(RoomAnswer::Refused(RoomRefusal::Short { bytes: 1 }));
         state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
         assert_eq!(second.lock().unwrap().value, Some(short.clone()));
         assert_eq!(joined.lock().unwrap().value, Some(short));

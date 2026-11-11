@@ -4990,12 +4990,10 @@ impl Requirements {
 /// A CPU environment whose host of `capacity` may use `budget`.
 fn budget_environment(capacity: u64, budget: u64) -> Arc<AssessmentEnvironment> {
     let catalog = seismic::Devices::discover(&[]).expect("device catalog");
-    // The planning line is the host's own (the kernel's free target) plus the margin: the
-    // margin is what of `capacity - budget` that line leaves.
-    let line = catalog.inventory().host_status().expect("host status").free_target.unwrap_or(0);
+    // The planning line is the margin: `capacity - budget`.
     let reserves =
         magnitude_executor::platform::MemoryReserves::new(magnitude_executor::platform::StoreMotion::new(
-            (capacity - budget).saturating_sub(line).saturating_sub(1),
+            (capacity - budget).saturating_sub(1),
             10.0,
         ), magnitude_executor::platform::ReleaseRate::new(1e9));
     let structure = magnitude_engine::assessment::AssessmentStructure::discover(

@@ -582,15 +582,6 @@ impl ExecutorCosts {
         }
     }
 
-    /// What a prompt group's submission costs the host beyond a launch
-    /// chained behind another: a group's first launch is submitted and
-    /// waited for (`step_round_trip_seconds`), the rest of its chain queue
-    /// back to back behind it (`step_pipelined_seconds`). What each group
-    /// fewer saves a prompt; none where a chained launch costs no less.
-    pub fn group_submission_seconds(&self) -> f64 {
-        (self.step_round_trip_seconds.value - self.step_pipelined_seconds.value).max(0.0)
-    }
-
     /// The device seconds of one call inside a sealed graph.
     pub fn launch(&self) -> f64 {
         self.launch_seconds.value

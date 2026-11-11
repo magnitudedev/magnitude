@@ -8,7 +8,6 @@ pub mod assessment;
 pub mod build_identity;
 pub mod configurations;
 pub mod device_lock;
-mod dying_process;
 pub mod hardware;
 pub mod memory_domains;
 pub mod model_store;

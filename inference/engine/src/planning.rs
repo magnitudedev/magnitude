@@ -64,8 +64,8 @@ pub(crate) fn select_load_device(
 /// Plan the manifest's model on the selected device: component selection,
 /// planned method, KV codec and resource limits resolved from the manifest,
 /// then `ExecutionPlanner::prepare`, then its expert bank under the model
-/// policy's weight cap, if any, as the plan's settle grants it on the
-/// machine's prices (`ExecutionPlanDraft::with_bank`, [`plan_banked`]).
+/// policy's weight cap, if any, beside its arena, a streamed bank at the
+/// pass the machine's prices settle ([`plan_banked`]).
 /// Opens no device and reads no payload. The draft comes with the memory
 /// charge its planning confirmed, each way of holding its experts charged
 /// as a `C` (`HeldCharge`).
@@ -109,17 +109,18 @@ pub fn plan_resident(
 
 /// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
 /// experts placed whole under the model policy's weight cap, if any, from
-/// memory alone (`ExecutionPlanDraft::placed`), reading no price and asking
-/// no measurement; else streamed through the expert bank its settle grants
-/// on the machine's prices ([`plan_prices`], `Unplaced::streamed`):
-/// the records of its kernel cache, its model store's figures.
+/// memory alone (`ExecutionPlanDraft::placed`); else streamed through the
+/// expert bank the room holds beside its arena, at the pass the machine's
+/// prices settle ([`plan_prices`], `Unplaced::streamed`).
 ///
 /// Every load, whole or streamed, is priced on its executor's costs as it
 /// serves (`execution::load_measures`), so none plans before the
 /// measurement job stored the costs' required figures: while they are
-/// pending the plan's prices are (`PlanError::Unpriced`), and the load waits
-/// for them holding nothing of the device, once per machine. Without a
-/// kernel cache nothing is measured for it, and its prices are unavailable.
+/// pending the load waits for them (`PlanError::Unpriced`), holding nothing
+/// of the device, once per machine. Without a kernel cache nothing is
+/// measured for it and its prices are unavailable: a whole plan holds
+/// without them, and a streamed one fails (`PlanError::Unpriced`, an
+/// internal error).
 pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
@@ -155,7 +156,7 @@ pub fn plan_banked<C: HeldCharge>(
 }
 
 /// The prices a plan of `definition` as `plan` (its plan before any bank)
-/// settles its holdings on (`PlanPrices`): the executor's costs and the
+/// settles its held pass on (`PlanPrices`): the executor's costs and the
 /// streamed figures `measurements` hold, and its decode on those costs in
 /// each form, `plan`'s and the banked plan's streamed form's
 /// (`assessment::decode_step`). Pending or unavailable as the measurements

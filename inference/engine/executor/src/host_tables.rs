@@ -2,23 +2,25 @@
 //!
 //! A table too large to be a device weight and read only by row gather (the
 //! Gemma per-layer embedding: 1.3–1.6 GB, 5–6 KB per token) stays in its
-//! artifact file and is read through the host page cache. Its bytes are a
-//! claim in the system-RAM domain: the pages a served model reads stay
-//! resident. Each step gathers the source bytes of every batch row's table
+//! artifact file and is read through the host page cache, the one model
+//! read that keeps what it reads there: every step gathers rows from it, so
+//! its pages are kept for the next steps rather than read from the drive
+//! each time. Its bytes are a claim in the system-RAM domain: the pages a
+//! served model reads stay resident. Each step gathers the source bytes of every batch row's table
 //! row (row m = the table row of token m) into the step's upload, in the
 //! table's source representation; the graph converts them into the resident
 //! row layout on the device.
 
 use crate::residency::Stored;
-use magnitude_artifacts::FileSource;
 use seismic::Element;
+use seismic_io::{CachePolicy, Reader, Want};
 use std::fmt;
-use std::sync::Arc;
 
 /// One table: `rows` rows of `row_bytes` source bytes each from `offset`.
 #[derive(Clone)]
 pub struct HostTable {
-    file: Arc<FileSource>,
+    /// Its artifact's reader, through the file cache.
+    reader: Reader,
     offset: u64,
     rows: u64,
     columns: u64,
@@ -84,8 +86,9 @@ impl HostTable {
         }
         let row_bytes = usize::try_from(row_bytes)
             .map_err(|_| HostTableError::Shape("a table row exceeds the host range".into()))?;
+        let reader = Reader::of(&**file, CachePolicy::Cached).map_err(|error| HostTableError::Read(error.into()))?;
         Ok(Self {
-            file: Arc::clone(file),
+            reader,
             offset,
             rows,
             columns,
@@ -138,9 +141,10 @@ impl HostTable {
                 rows: self.rows,
             });
         }
-        self.file
-            .read_into(self.offset + first * self.row_bytes as u64, out)
-            .map_err(HostTableError::Read)
+        // A step waits on the rows: due now.
+        self.reader
+            .read_at([(self.offset + first * self.row_bytes as u64, out)], Want::now())
+            .map_err(|error| HostTableError::Read(error.into()))
     }
 
     /// Copy the source bytes of `rows` (table row indices, one per batch
@@ -159,9 +163,9 @@ impl HostTable {
             .map(|&row| Ok(self.offset + self.row_index(row)? * self.row_bytes as u64))
             .collect::<Result<Vec<_>, HostTableError>>()?;
         // One request of every row, which the link reads at its depth.
-        self.file
-            .read_each(offsets.into_iter().zip(out.chunks_exact_mut(self.row_bytes)))
-            .map_err(HostTableError::Read)
+        self.reader
+            .read_at(offsets.into_iter().zip(out.chunks_exact_mut(self.row_bytes)), Want::now())
+            .map_err(|error| HostTableError::Read(error.into()))
     }
 }
 
@@ -169,7 +173,9 @@ impl HostTable {
 mod tests {
     use super::*;
     use crate::residency::StoredTensor;
+    use magnitude_artifacts::FileSource;
     use seismic::DType;
+    use std::sync::Arc;
 
     /// A 5-row, 3-column F32 table after a 16-byte prefix, whose value at
     /// (row, column) is `10·row + column`.

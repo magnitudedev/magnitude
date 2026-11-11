@@ -1,5 +1,5 @@
 //! The live page probe (`platform::PageProbe::run`), run on this machine,
-//! timed: the room above the kernel's line it read, each fill sample's
+//! timed: the room it read, each fill sample's
 //! bytes (the largest the probe's peak), whether the bound cut the fill
 //! short, both rates and the wall time. It takes host memory, so it runs
 //! with the machine otherwise idle.

@@ -1327,28 +1327,26 @@ pub struct StageRecord {
     pub promoted: bool,
 }
 
-/// What the platform lets the engine still claim in each memory domain, as
-/// read at one moment ([`TuningRoom::now`]): the availability it observes
-/// above its planning reserve, with everything held then, the search's own
+/// What the engine may still claim in each memory domain, as read at one
+/// moment ([`TuningRoom::now`]): what the device's store ledgers leave free
+/// less the speed guarantee, with everything held then, the search's own
 /// holdings among it, already taken. It is the platform's own bound on any
 /// engine claim and not the load's plan: a search holds its units' weights
 /// and its working memory together, which on a small model is more than
 /// the load will hold, and it has ended before the load begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomNow {
-    /// What may still be charged along device storage's placement: its
-    /// live ceiling (`Fit::placement`).
+    /// What may still be charged in device storage's store.
     pub device_bytes: u64,
     /// What may still be claimed of host RAM, including compilation.
     pub host_bytes: u64,
-    /// Device storage's placement includes host RAM, so the device's
-    /// charges and the host's growth share host RAM's ceiling.
+    /// Device storage lies in host RAM, so the device's charges and the
+    /// host's growth share its room.
     pub host_shared: bool,
 }
 
-/// The room a search is held to, read live while it runs: the load's heap's
-/// reading of the device's memory domains ([`crate::DeviceHeap`]), through
-/// the heap's own right to bound them, taken afresh at every decision, so a neighbour
+/// The room a search is held to, read live while it runs: the load's
+/// ledgers' ([`crate::LoadRoom`]), read afresh at every decision, so a neighbour
 /// that grows while the search runs takes its room from the search's next
 /// admission. A reading that fails reads no room: missing observations never
 /// authorize allocation.
@@ -5171,10 +5169,12 @@ fn tuned_entry(
     }
 }
 
-/// Host RAM this process may take now above the kernel's own line
-/// ([`seismic::host_room`]); none where the host cannot be read.
+/// Host RAM this process may take now without displacing anyone
+/// ([`seismic::host_room`] of [`seismic::Reclaim::Nothing`]): a compile burst
+/// or a probe is a one-off taker that must not press the host. None where
+/// the host cannot be read.
 pub(super) fn host_room() -> Option<u64> {
-    seismic::host_room().ok()
+    seismic::host_room(seismic::Reclaim::Nothing).ok()
 }
 
 /// What one thread of a wave of `threads` compiles held: how far the host's

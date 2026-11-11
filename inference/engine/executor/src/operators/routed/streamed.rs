@@ -1502,10 +1502,10 @@ pub(crate) fn streams(load: &ModelLoadPlan, scope: WeightScope) -> bool {
 }
 
 /// Whether the streamed feed-forward of `scope` has a resident form
-/// (`RunStage::Resident`): its bank can hold every expert
-/// (`ExpertBankPlan::reaches_whole`), so it can be whole.
+/// (`RunStage::Resident`): its bank was planned whole
+/// (`ExpertBankPlan::resident`), so it starts whole.
 pub(crate) fn resident_form(load: &ModelLoadPlan, scope: WeightScope) -> bool {
-    streams(load, scope) && load.expert_bank().is_some_and(ExpertBankPlan::reaches_whole)
+    streams(load, scope) && load.expert_bank().is_some_and(|bank| bank.resident)
 }
 
 impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {

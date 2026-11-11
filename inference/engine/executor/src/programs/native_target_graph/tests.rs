@@ -1120,6 +1120,42 @@ mod resource_template_tests {
             }
         }
     }
+
+    /// A plan charges exactly the pass its load holds when its pass budget
+    /// exceeds what the arena fits (memory-failures item 8): the Qwen4Exp
+    /// fixture streamed on Metal in chains of 1024 launches, more than its arena fits, its bank built
+    /// at every place (a budget of the whole chain), holds passes the arena
+    /// caps (`group_pass_rows`), and the family the plan charges holds its
+    /// prompt groups' class at those passes' places, never at a pass above
+    /// the cap.
+    #[test]
+    fn a_budget_above_the_cap_charges_the_pass_the_load_holds() {
+        use crate::planning::fixtures::{LIMITS, qwen4exp_fixture_definition_of, streamed_experts_manifest};
+        let backend = BackendName::Metal;
+        let chain = 1024;
+        let limits = ResourceLimits { chain_capacity: std::num::NonZeroUsize::new(chain).unwrap(), ..LIMITS };
+        let definition = qwen4exp_fixture_definition_of(4, 32);
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = ComponentSelection { head: false, vision: false };
+        let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
+        let host = crate::planning::HostTier::Unified;
+        let derived = ModelLoadPlan::derive(&manifest, &definition, selection, resident_layout(ExecutionPath::Native, backend), PlannedMethod::Plain, limits).unwrap();
+        let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
+        let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
+        let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent };
+        let state = ResourcePlanner::state_plan(&definition, &whole, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
+        let plan = whole.program_plan(&definition, KvCodec::Dense).unwrap();
+        let budget = whole.pass(limits);
+        let certificate =
+            certify_target_family::<seismic::NativeGraphLayout>(backend, &whole, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
+        let passes = certificate.passes;
+        let held = certificate.group.extents(&certificate.served, 1).pass_bytes().unwrap();
+        let found = format!("budget {budget:?}, {passes:?}, {held} bytes held");
+        assert!(budget.get() > passes.launches(), "setup: the budget is within the cap, so nothing here exceeds it: {found}");
+        assert!(held > 0, "setup: no block of the fixture splits, so it holds no pass buffers: {found}");
+        let checked = super::super::certify::checked_target_family(backend, &whole, &definition.decoder, &state, plan.target(), limits, budget).unwrap();
+        assert_eq!(checked.group_bytes.most().get(), passes.launches(), "{found}");
+    }
 }
 
 #[cfg(test)]

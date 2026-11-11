@@ -120,13 +120,13 @@ pub enum HostMessage {
         request_id: HostRequestId,
     },
     Observe,
-    /// Make `bytes` of device memory free beside the loaded model for the
-    /// service's measurement job, in place of any claim before: the expert
-    /// bank shrinks toward its floor until it is, answered by
-    /// `MeasurementRoom` naming `claim`, and grows nothing until
+    /// Claim `bytes` of device memory beside the loaded model for the
+    /// service's measurement job, in place of any claim before: committed
+    /// on the device's ledger, which cache yields to at once, answered by
+    /// `MeasurementRoom` naming `claim` and held until
     /// `ReleaseMeasurementRoom`.
     ClaimMeasurementRoom { claim: RoomClaimId, bytes: u64 },
-    /// The measurement job ended: the bank may grow into its room again.
+    /// The measurement job ended: its room is free again.
     ReleaseMeasurementRoom,
     /// The measurement job stored new records: price the experts again
     /// from what is stored.
@@ -303,7 +303,7 @@ mod tests {
     use crate::error::InsufficientMemory;
     use crate::options::InputModalities;
     use magnitude_executor::StoreAllocation;
-    use crate::census::{BankResize, ExpertResidency, ServingCensus, ShrinkCause};
+    use crate::census::{BankResize, ExpertResidency, ServingCensus};
 
     fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
@@ -347,7 +347,6 @@ mod tests {
                             ceiling: positive(42),
                             bytes: 13,
                             last_resize: Some(BankResize::Shrank {
-                                cause: ShrinkCause::LiveClaim,
                                 to: 40,
                                 by: positive(1),
                                 at_unix_ms: 12,

@@ -86,8 +86,6 @@ export const MemoryShortageSchema = Schema.Union(
     requiredBytes: NonNegativeSafeInteger,
     availableBytes: NonNegativeSafeInteger,
   }),
-  /** The machine was displacing other programs' memory; no byte count describes it. */
-  Schema.TaggedStruct("UnderPressure", {}),
 )
 export type MemoryShortage = typeof MemoryShortageSchema.Type
 
@@ -143,20 +141,12 @@ export const StreamingTierStatusSchema = Schema.Struct({
 export type StreamingTierStatus = typeof StreamingTierStatusSchema.Type
 
 /**
- * Why the engine shrank an expert bank's holding: memory pressure, a live claim, something worth
- * more to serving, or room for measuring this machine while the model was idle.
- */
-export const StreamingShrinkCauseSchema = Schema.Literal("reclaim", "live_claim", "rebalance", "measurement")
-export type StreamingShrinkCause = typeof StreamingShrinkCauseSchema.Type
-
-/**
  * A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs` (Unix
- * epoch milliseconds): shrunk by `by` to `to` for its cause, or grown by `by` from `from` into free
- * memory. The service's contract owns its shape: each changes its size by at least one.
+ * epoch milliseconds): shrunk by `by` to `to` as memory grew short, or grown by `by` from `from`
+ * into free memory. The service's contract owns its shape: each changes its size by at least one.
  */
 export const StreamingResizeSchema = Schema.Union(
   Schema.TaggedStruct("Shrank", {
-    cause: StreamingShrinkCauseSchema,
     to: NonNegativeSafeInteger,
     by: PositiveSafeInteger,
     atUnixMs: NonNegativeSafeInteger,

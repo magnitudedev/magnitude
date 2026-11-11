@@ -1,4 +1,4 @@
-//! A source's stream reads exactly its range into the file cache.
+//! A source's stream reads exactly its range, around the file cache.
 
 #![cfg(target_os = "linux")]
 
@@ -6,11 +6,10 @@ use std::os::fd::AsRawFd;
 
 const BLOCK: u64 = 128 * 1024;
 
-/// A source's stream reads exactly its range through the cache: an empty
-/// one nothing, a range read whole for its pages and none beside them, in
-/// order, chunk by chunk.
+/// A source's stream reads exactly its range, in order, chunk by chunk, and
+/// leaves none of the file in the cache: an empty one reads nothing.
 #[test]
-fn a_source_stream_caches_only_its_range() {
+fn a_source_stream_reads_its_range_and_caches_none() {
     let path = std::env::temp_dir().join(format!("magnitude-source-range-{}.bin", std::process::id()));
     let bytes = (0..8 * BLOCK).map(|byte| (byte / 4096) as u8).collect::<Vec<_>>();
     std::fs::write(&path, &bytes).unwrap();
@@ -33,9 +32,6 @@ fn a_source_stream_caches_only_its_range() {
         })
         .unwrap();
     assert_eq!(read, bytes[2 * BLOCK as usize..3 * BLOCK as usize]);
-    let (held, pages) = cached(2 * BLOCK, BLOCK);
-    assert_eq!(held, pages);
-    assert_eq!(cached(0, 2 * BLOCK).0, 0);
-    assert_eq!(cached(3 * BLOCK, 5 * BLOCK).0, 0);
+    assert_eq!(cached(0, 8 * BLOCK).0, 0);
     std::fs::remove_file(path).unwrap();
 }

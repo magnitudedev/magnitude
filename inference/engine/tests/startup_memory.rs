@@ -64,9 +64,8 @@ impl Window {
             *byte = 1;
         }
         let catalog = Devices::discover(&[]).unwrap();
-        let host = catalog.inventory().host_status().unwrap();
         let reserve = MemoryReserves::of_machine(None)
-            .host_thresholds(catalog.topology().host_ram(), &host)
+            .thresholds(catalog.topology().host_ram())
             .planning_bytes;
         let used = std::fs::read_to_string(group.join("memory.current"))
             .unwrap()
@@ -100,7 +99,7 @@ impl Drop for Window {
 
 #[test]
 #[ignore = "requires a real model and delegated cgroup"]
-fn zero_startup_headroom_is_memory_pressure() {
+fn zero_startup_headroom_is_insufficient_memory() {
     let resolved = model();
     let _window = Window::new(0);
     let error = match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
@@ -110,7 +109,7 @@ fn zero_startup_headroom_is_memory_pressure() {
     eprintln!("zero headroom: {error}");
     assert!(error.retryable(), "{error:?}");
     assert!(
-        matches!(error, LoadError::MemoryPressure { .. }),
+        matches!(error, LoadError::InsufficientMemory { .. }),
         "{error:?}"
     );
 }

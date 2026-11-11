@@ -185,7 +185,7 @@ export const streamingStatus = (memoryDomainIds: readonly string[]): ModelStream
       : {}),
     diskBytes: 300 * 1000 ** 2,
     tables: [{ records: 20, floorRecords: 10, ceilingRecords: 40, bytes: 126 * 1000 ** 2 }],
-    lastResize: { _tag: "Shrank", cause: "live_claim", to: 40, by: 10, atUnixMs: 1234 },
+    lastResize: { _tag: "Shrank", to: 40, by: 10, atUnixMs: 1234 },
   })
 
 /** How a load serves when its prompt groups are granted one place of eight. */

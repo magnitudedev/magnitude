@@ -95,6 +95,9 @@ pub(crate) struct StoreLedger {
     /// by asking (Vulkan's driver memory) brings them up to date, keyed by
     /// the device.
     admissions: Mutex<Vec<(AdmissionKey, Admission)>>,
+    /// What the store's bound is, where its holder keeps it as a function of
+    /// the store's claim, evaluated at each admission rather than stored.
+    bound_source: Mutex<Option<BoundSource>>,
     /// The accounts that charge it, for the hierarchy's check.
     accounts: Mutex<Vec<Weak<Account>>>,
     /// The right to bound it.
@@ -136,6 +139,10 @@ impl BoundRight {
     }
 }
 
+/// A store's bound as a function of what the store claims, read at each
+/// admission against it.
+pub(crate) type BoundSource = Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+
 /// What runs before each admission against a store.
 pub(crate) type Admission = Arc<dyn Fn() + Send + Sync>;
 
@@ -166,6 +173,7 @@ impl StoreLedger {
             state: Mutex::new(StoreState { claim: 0, bound: None }),
             deciding: Mutex::new(()),
             admissions: Mutex::new(Vec::new()),
+            bound_source: Mutex::new(None),
             accounts: Mutex::new(Vec::new()),
             right: BoundRight::new("store"),
         })
@@ -206,6 +214,22 @@ impl StoreLedger {
     /// bound refuses growth; it never revokes.
     pub(crate) fn set_bound(&self, bound: Option<u64>) {
         self.state().bound = bound;
+    }
+
+    /// Hold the store's bound to `source` of its claim, read at each
+    /// admission from now: the bound is never older than the admission it
+    /// refuses or admits.
+    pub(crate) fn set_bound_source(&self, source: BoundSource) {
+        *self.bound_source.lock().expect("store bound source lock poisoned") = Some(source);
+    }
+
+    /// The bound its source gives at the store's claim now, if it has one.
+    fn read_bound_source(&self) {
+        let source = self.bound_source.lock().expect("store bound source lock poisoned").clone();
+        if let Some(source) = source {
+            let claim = self.claim();
+            self.set_bound(source(claim));
+        }
     }
 
     /// The store's claim is the sum of its accounts' claims: checked in
@@ -1038,6 +1062,7 @@ impl Placement {
             .map(|store| store.deciding.lock().expect("store decision lock poisoned"))
             .collect::<Vec<_>>();
         for store in &stores {
+            store.read_bound_source();
             for admission in store.admissions() {
                 admission();
             }
@@ -1561,6 +1586,25 @@ mod tests {
         let _logical = placement.reserve(1).unwrap();
         let _physical = placement.physical().reserve(1).unwrap();
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A store's bound source is read at each admission, with the store's
+    /// claim then: a room that grows between admissions admits the next with
+    /// no reading in between.
+    #[test]
+    fn a_stores_bound_follows_its_source_at_each_admission() {
+        let placement = placement();
+        let room = Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let store = device_of(&placement).store.clone();
+        store.set_bound_source({
+            let room = room.clone();
+            Arc::new(move |claim| Some(claim + room.load(std::sync::atomic::Ordering::SeqCst)))
+        });
+        let first = placement.reserve(2).unwrap();
+        assert!(placement.reserve(3).is_err(), "the source's room is two bytes");
+        room.store(3, std::sync::atomic::Ordering::SeqCst);
+        let second = placement.reserve(3).expect("the room the source gives now admits it");
+        drop((first, second));
     }
 
     #[test]

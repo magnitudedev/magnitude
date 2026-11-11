@@ -42,7 +42,7 @@ use magnitude_engine::{
 use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
     platform::{
-        DeviceRequest, HostRoom, MemoryReserves, OpenedPlatform, PlatformConfig, RECOVERY_STABLE_TIME, observe_domains,
+        DeviceRequest, MemoryReserves, OpenedPlatform, PlatformConfig, RECOVERY_STABLE_TIME, observe_domains,
         open_selected, select_device,
     },
 };
@@ -182,12 +182,12 @@ pub fn load(load: Load) -> Result<(), String> {
     let beyond = sum(&[bounds.recorded_graph_bytes, bounds.device_process.bytes()?], "bytes beyond allocations")?;
     let storage_terms = json!({
         "weights": weights,
-        "state": charge.loaded_state_bytes,
+        "state": charge.startup_state_bytes,
         "graphs": bounds.graph_bytes,
         "programs": magnitude_executor::AttestedPrograms::DEVICE_BYTES,
         "beyond_allocations": beyond,
     });
-    let storage = sum(&[weights, charge.loaded_state_bytes, bounds.prepared_resource_bytes()?], "storage bytes")?;
+    let storage = sum(&[weights, charge.startup_state_bytes, bounds.prepared_resource_bytes()?], "storage bytes")?;
     let host_terms = sum(
         &[
             charge.host_table_bytes,
@@ -466,7 +466,6 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
             graph_cost: None,
             path: ExecutionPath::Native,
             artifacts: None,
-            reserves,
         },
     )
     .map_err(|error| text(&error))
@@ -1440,7 +1439,6 @@ mod tests {
             RequestError::ModelUnloaded {
                 cause: UnloadCause::Shutdown,
             },
-            RequestError::MemoryReclaim,
             RequestError::InvalidRequest { reason: "a bad prompt".into() },
         ] {
             assert_eq!(Failure::from(error.clone()), Failure::Cell(error.to_string()));

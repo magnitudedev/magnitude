@@ -15,11 +15,9 @@ use crate::{
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, ResourceDomainId,
     WeightPlan,
 };
-use magnitude_artifacts::FileSource;
 use magnitude_batching::LaunchClass;
-use seismic::{BackendName, Device, HostRegion, ReadOnlyMappedRegion, Tensor};
+use seismic::{Device, Tensor};
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PoolClass {
@@ -29,122 +27,37 @@ pub enum PoolClass {
     Import { bytes: u64 },
 }
 
-/// One plan-backed source tensor owned through import completion. On Metal it
-/// views an immutable artifact mapping; other backends own a staged upload.
+/// One plan-backed source tensor owned through import completion: an upload
+/// of the weight's source bytes, which its importer fills
+/// ([`crate::programs::native_import::fill_staged_source`]) before binding it.
 pub struct ImportWorkspaceLease {
     domain: ResourceDomainId,
     class: PoolClass,
     bytes: u64,
-    source: ImportSource,
+    upload: Tensor,
 }
 
-/// The tensor one import entry reads a weight from: a view of the mapped
-/// artifact, or an upload its importer fills.
-pub(crate) enum ImportSource {
-    Mapped(Tensor),
-    Staged(Tensor),
+/// An upload of `weight`'s source bytes on `device`, not yet written.
+///
+/// # Safety
+/// The caller fills it
+/// ([`crate::programs::native_import::fill_staged_source`]) before binding
+/// it as a kernel source.
+pub(crate) unsafe fn import_upload(weight: &WeightPlan, device: &Device) -> Result<Tensor, AllocationError> {
+    unsafe { Tensor::uninitialized(device, weight.upload, &[source_count(weight)?]) }
+        .map_err(AllocationError::Tensor)
 }
 
-impl ImportSource {
-    /// Whether `weight`'s import reads `stored` in place on `device`: the
-    /// device reads mapped pages ([`ImportWindow::serves`]), the weight is
-    /// uploaded as stored, and its bytes in the file keep its source's
-    /// alignment (a GGUF tensor starts at a multiple of its file's
-    /// `general.alignment`, any power of two; a window maps whole pages, so
-    /// its view of the bytes is aligned as their file offset is).
-    pub(crate) fn reads_in_place(
-        weight: &WeightPlan,
-        stored: &Stored,
-        device: &Device,
-    ) -> Result<bool, AllocationError> {
-        Ok(ImportWindow::serves(device)
-            && !weight.host_prepared()
-            && ReadOnlyMappedRegion::keeps_alignment(
-                weight.source,
-                &[source_count(weight)?],
-                stored.file_range().1,
-            )
-            .map_err(AllocationError::Tensor)?)
-    }
-
-    /// The source of `weight`'s import on `device`, the one way every
-    /// import takes it, a load's and a tuning unit's alike. A weight read
-    /// in place ([`Self::reads_in_place`]) is a view of `window` where one
-    /// is given: the artifact's own pages, which the process's footprint
-    /// does not count. Any other is an upload of the weight's source bytes
-    /// on the device, not yet written
-    /// ([`crate::programs::native_import::fill_staged_source`] writes it).
-    pub(crate) fn acquire(
-        weight: &WeightPlan,
-        stored: &Stored,
-        window: Option<&ImportWindow>,
-        device: &Device,
-    ) -> Result<Self, AllocationError> {
-        let count = source_count(weight)?;
-        match window {
-            Some(window) if Self::reads_in_place(weight, stored, device)? => {
-                Ok(Self::Mapped(window.tensor(stored, weight, count)?))
-            }
-            // SAFETY: the importer fills this exact tensor before binding
-            // it as a kernel source.
-            _ => unsafe { Self::upload(weight, device) }.map(Self::Staged),
-        }
-    }
-
-    /// An upload of `weight`'s source bytes on `device`, not yet written.
-    ///
-    /// # Safety
-    /// The caller fills it
-    /// ([`crate::programs::native_import::fill_staged_source`]) before
-    /// binding it as a kernel source.
-    pub(crate) unsafe fn upload(
-        weight: &WeightPlan,
-        device: &Device,
-    ) -> Result<Tensor, AllocationError> {
-        unsafe { Tensor::uninitialized(device, weight.upload, &[source_count(weight)?]) }
-            .map_err(AllocationError::Tensor)
-    }
-
-    /// An upload of `weight`'s source bytes on `device`, filled by a read of
-    /// `artifact` around the file cache: what an expert bank's stacks are
-    /// imported from, a load's or a tuning unit's: none of their bytes stay
-    /// in it.
-    pub(crate) fn uncached(
-        weight: &WeightPlan,
-        artifact: &magnitude_artifacts::gguf::GgufArtifact,
-        device: &Device,
-    ) -> Result<Tensor, String> {
-        let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
-        // SAFETY: filled here, before any entry binds it.
-        let mut upload = unsafe { Self::upload(weight, device) }.map_err(|error| error.to_string())?;
-        crate::programs::native_import::fill_staged_source(
-            &stored,
-            weight,
-            &mut upload,
-            seismic_io::CachePolicy::Uncached,
-        )
+/// An upload of `weight`'s source bytes on `device`, filled from `stored`
+/// ([`crate::programs::native_import::fill_staged_source`]): the source a
+/// weight imported outside a load's batches (an expert bank's stacks, a
+/// tuning unit's weights) is imported from.
+pub(crate) fn filled_import(weight: &WeightPlan, stored: &Stored, device: &Device) -> Result<Tensor, String> {
+    // SAFETY: filled here, before any entry binds it.
+    let mut upload = unsafe { import_upload(weight, device) }.map_err(|error| error.to_string())?;
+    crate::programs::native_import::fill_staged_source(stored, weight, &mut upload)
         .map_err(|error| error.to_string())?;
-        Ok(upload)
-    }
-
-    pub(crate) fn tensor(&self) -> &Tensor {
-        match self {
-            Self::Mapped(tensor) | Self::Staged(tensor) => tensor,
-        }
-    }
-
-    pub(crate) fn staged_mut(&mut self) -> Option<&mut Tensor> {
-        match self {
-            Self::Mapped(_) => None,
-            Self::Staged(tensor) => Some(tensor),
-        }
-    }
-
-    pub(crate) fn into_tensor(self) -> Tensor {
-        match self {
-            Self::Mapped(tensor) | Self::Staged(tensor) => tensor,
-        }
-    }
+    Ok(upload)
 }
 
 /// The elements of `weight`'s source (and of its upload).
@@ -155,123 +68,6 @@ fn source_count(weight: &WeightPlan) -> Result<u64, AllocationError> {
             detail: "weight element count overflows".into(),
         })
     })
-}
-
-/// One page-rounded artifact range charged once and shared by the source
-/// tensor views of an ordered import batch.
-pub(crate) struct ImportWindow {
-    source: Arc<FileSource>,
-    start: u64,
-    end: u64,
-    data_offset: u64,
-    region: ReadOnlyMappedRegion,
-}
-
-impl ImportWindow {
-    /// The window of exactly `stored`'s range in its artifact.
-    pub(crate) fn of(device: &Device, stored: &Stored) -> Result<Self, AllocationError> {
-        let (file, start, end) = stored_range(stored)?;
-        Self::map(device, file, start, end)
-    }
-}
-
-/// `stored`'s file and the range of it the tensor occupies.
-fn stored_range(stored: &Stored) -> Result<(Arc<FileSource>, u64, u64), AllocationError> {
-    let (file, offset, length) = stored.file_range();
-    let end = offset.checked_add(length).ok_or_else(|| {
-        AllocationError::Plan(InvariantError {
-            context: "import window",
-            detail: "source range overflows".into(),
-        })
-    })?;
-    Ok((file.clone(), offset, end))
-}
-
-impl ImportWindow {
-    /// Whether `device` reads an artifact's mapped pages in place: where it
-    /// does, a weight uploaded as stored whose bytes there keep its source's
-    /// alignment is imported from a window and nowhere else; any other is
-    /// uploaded ([`ImportSource::reads_in_place`]).
-    pub(crate) fn serves(device: &Device) -> bool {
-        cfg!(unix) && device.backend() == BackendName::Metal
-    }
-
-    /// The page-rounded range `start..end` of `source`, mapped for `device`.
-    #[cfg(unix)]
-    pub(crate) fn map(
-        device: &Device,
-        source: Arc<FileSource>,
-        start: u64,
-        end: u64,
-    ) -> Result<Self, AllocationError> {
-        let invalid = |detail: &str| {
-            AllocationError::Plan(InvariantError {
-                context: "import window",
-                detail: detail.into(),
-            })
-        };
-        if device.backend() != BackendName::Metal || end <= start {
-            return Err(invalid(
-                "a mapped window requires Metal and a nonempty range",
-            ));
-        }
-        let window = source
-            .map_window(start, end - start)
-            .map_err(|error| AllocationError::Mapping(error.to_string()))?;
-        let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8)
-            .ok_or_else(|| invalid("mapped artifact window has no address"))?;
-        // SAFETY: the window owns the immutable mapped range through every
-        // device view and every in-flight submission using it.
-        let host = unsafe { HostRegion::new(pointer, window.mapped_len(), window.clone()) };
-        let region = ReadOnlyMappedRegion::new(device, host).map_err(AllocationError::Tensor)?;
-        Ok(Self {
-            source,
-            start,
-            end,
-            data_offset: window.data_offset() as u64,
-            region,
-        })
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn map(
-        _device: &Device,
-        _source: Arc<FileSource>,
-        _start: u64,
-        _end: u64,
-    ) -> Result<Self, AllocationError> {
-        Err(AllocationError::Mapping(
-            "mapped import windows require a Unix host".into(),
-        ))
-    }
-
-    pub(crate) fn tensor(
-        &self,
-        stored: &Stored,
-        weight: &WeightPlan,
-        count: u64,
-    ) -> Result<Tensor, AllocationError> {
-        let (source, offset, length) = stored.file_range();
-        let end = offset.checked_add(length).ok_or_else(|| {
-            AllocationError::Plan(InvariantError {
-                context: "import window",
-                detail: "source range overflows".into(),
-            })
-        })?;
-        if !Arc::ptr_eq(source, &self.source) || offset < self.start || end > self.end {
-            return Err(AllocationError::Plan(InvariantError {
-                context: "import window",
-                detail: "source tensor lies outside its mapped window".into(),
-            }));
-        }
-        self.region
-            .tensor(
-                weight.source,
-                &[count],
-                self.data_offset + offset - self.start,
-            )
-            .map_err(AllocationError::Tensor)
-    }
 }
 
 impl ImportWorkspaceLease {
@@ -285,10 +81,10 @@ impl ImportWorkspaceLease {
         self.bytes
     }
     pub fn source(&self) -> &Tensor {
-        self.source.tensor()
+        &self.upload
     }
-    pub fn staged_mut(&mut self) -> Option<&mut Tensor> {
-        self.source.staged_mut()
+    pub fn upload_mut(&mut self) -> &mut Tensor {
+        &mut self.upload
     }
 }
 
@@ -311,9 +107,6 @@ pub enum AllocationError {
     /// A graph slot the device could not form, its capacity refusals (a
     /// slot's tensors) among them.
     Workflow(seismic::WorkflowError),
-    /// An artifact window the host could not map: never a capacity
-    /// refusal.
-    Mapping(String),
     /// A thread the load's storage work runs on that could not start.
     Thread(String),
     Plan(InvariantError),
@@ -324,7 +117,6 @@ impl fmt::Display for AllocationError {
         match self {
             Self::Tensor(error) => write!(formatter, "resource allocation: {error}"),
             Self::Workflow(error) => write!(formatter, "resource allocation: {error}"),
-            Self::Mapping(error) => write!(formatter, "resource allocation: {error}"),
             Self::Thread(error) => write!(formatter, "resource allocation: {error}"),
             Self::Plan(error) => error.fmt(formatter),
         }
@@ -381,9 +173,16 @@ pub struct AllocatedResources {
     head_graph: Option<NativeGraphPool>,
     vision_graph: Option<VisionGraphPool>,
     state_graph: NativeGraphPool,
-    /// The places of the prompt-group class the pools hold: at least the
-    /// floor's one.
+    /// The places of the prompt-group class the pools hold: the floor's
+    /// one, or an open group's, within the load's chain capacity.
     places: std::num::NonZeroUsize,
+    /// The launches of the pass the load holds
+    /// (`PreparedTargetGraphs::held_pass`), the places the bank's in-process
+    /// growth is sized by.
+    most_places: std::num::NonZeroUsize,
+    /// The ledgers of the stores the device reaches, which the load's
+    /// committed claims are taken from: the one handle the load holds.
+    ledgers: crate::memory::ledger::DeviceLedgers,
     /// The load's release thread, which the pools' idle slots release on.
     releases: crate::Releases,
     /// The idle slots on their way there, until a boundary finds them
@@ -391,12 +190,14 @@ pub struct AllocatedResources {
     releasing: Option<SlotsReleasing>,
 }
 
-/// Idle graph slots handed to the release thread at `began`: how many, and
-/// their release's outcome once it ends there, the bytes it released.
+/// Idle graph slots handed to the release thread at `began`: how many,
+/// their release's outcome once it ends there, the bytes it released, and
+/// the cache a closed group's idle slots held, which goes with them.
 struct SlotsReleasing {
     slots: usize,
     began: std::time::Instant,
     done: crate::storage_thread::Done<u64>,
+    _cache: Vec<crate::memory::ledger::Cached>,
 }
 
 /// Idle graph slots released off the submitting thread
@@ -512,9 +313,22 @@ impl AllocatedResources {
 
     /// The places of the prompt-group class held ([`Self::hold_class`]): a
     /// chain runs at most that many launches. The one record of it: the
-    /// family's group buffers are held with it (`grant_group`).
+    /// family's group buffers are held with it
+    /// (`ExecutorDomain::open_group`).
     pub fn group_places(&self) -> std::num::NonZeroUsize {
         self.places
+    }
+
+    /// The launches of the pass the load holds, the places the bank's
+    /// in-process growth is sized by.
+    pub fn most_places(&self) -> std::num::NonZeroUsize {
+        self.most_places
+    }
+
+    /// The ledgers of the stores the device reaches
+    /// ([`crate::memory::ledger::DeviceLedgers`]).
+    pub fn ledgers(&self) -> &crate::memory::ledger::DeviceLedgers {
+        &self.ledgers
     }
 
     /// The bytes [`Self::grow_class`] of `slots` allocates.
@@ -537,11 +351,11 @@ impl AllocatedResources {
         })
     }
 
-    /// Allocate the pools' slots of the class of `places` places, whose
-    /// pools hold `slots` (`ResourceLimits::class_slots`), to be held by
-    /// [`Self::hold_class`]. The caller holds a heap claim for
-    /// [`Self::class_bytes`] across this call. On a failure the class held
-    /// before stays, and what was allocated idles until released.
+    /// Allocate the pools' slots of the arena's class of `places` places,
+    /// whose pools hold `slots` (`ResourceLimits::class_slots`), to be held
+    /// by [`Self::hold_class`]. The caller holds a heap claim for
+    /// [`Self::class_bytes`] across this call. On a failure what was
+    /// allocated idles until released.
     pub(crate) fn grow_class(
         &mut self,
         places: std::num::NonZeroUsize,
@@ -559,6 +373,15 @@ impl AllocatedResources {
             pool.hold(slots);
         }
         self.places = grown.places;
+    }
+
+    /// Hold the floor's class of one place again: the slots beyond it idle
+    /// until released ([`Self::release_idle_slots`]).
+    pub(crate) fn release_class(&mut self) {
+        for pool in [Some(&mut self.target_graph), Some(&mut self.target_readout_chunk_graph), self.head_graph.as_mut()].into_iter().flatten() {
+            pool.hold_floor();
+        }
+        self.places = std::num::NonZeroUsize::MIN;
     }
 
     /// The pools a prompt group's class sizes, each with its slots of
@@ -582,27 +405,16 @@ impl AllocatedResources {
         .filter_map(|(pool, slots)| pool.map(|pool| (pool, slots)))
     }
 
-    /// Release every pool's free slots beyond its held class, the held
-    /// prompt-group class down to `class`'s places where given (the
-    /// places of a class whose pools hold its slots: a settle's target,
-    /// or Reclaim's floor of one place), and vision's free storage, on the
-    /// load's release thread (`Releases`), `wake` completed once they are
-    /// released: whether a release began, which a later boundary finishes
-    /// ([`Self::released_slots`]). None begins while one runs
-    /// ([`Self::releasing_slots`]).
-    pub(crate) fn release_idle_slots(
-        &mut self,
-        class: Option<(std::num::NonZeroUsize, crate::StartupSlots)>,
-        wake: crate::CompletionWake,
-    ) -> bool {
+    /// Release every pool's free slots beyond its held class, and vision's
+    /// free storage, on the load's release thread (`Releases`), `wake`
+    /// completed once they are released: whether a release began, which a
+    /// later boundary finishes ([`Self::released_slots`]). `cache`, a
+    /// closed group's idle slots' cache, is held until then, what claims
+    /// took of it included: the slots' memory exists until the release
+    /// ends. None begins while one runs ([`Self::releasing_slots`]); with no
+    /// slot idle, `cache` names no memory and is let go.
+    pub(crate) fn release_idle_slots(&mut self, cache: Vec<crate::memory::ledger::Cached>, wake: crate::CompletionWake) -> bool {
         assert!(self.releasing.is_none(), "a graph slot release begins only once the one before it finished");
-        if let Some((places, slots)) = class {
-            assert!(places <= self.places, "a class is released to no more places than it holds");
-            for (pool, slots) in self.class_pools(slots) {
-                pool.keep(slots);
-            }
-            self.places = places;
-        }
         let mut idle = IdleSlots::default();
         for pool in [
             Some(&mut self.target_graph),
@@ -625,7 +437,8 @@ impl AllocatedResources {
         }
         let began = std::time::Instant::now();
         let done = self.releases.run(wake, move || idle.release());
-        self.releasing = Some(SlotsReleasing { slots, began, done });
+        self.releasing = Some(SlotsReleasing { slots, began, done, _cache: cache });
+
         true
     }
 
@@ -663,8 +476,6 @@ impl ResourceAllocator {
     pub(crate) fn import_workspace(
         execution: &ExecutionPlan,
         weight: &WeightPlan,
-        stored: &Stored,
-        window: Option<&ImportWindow>,
         device: &Device,
         domain: ResourceDomainId,
     ) -> Result<ImportWorkspaceLease, AllocationError> {
@@ -679,23 +490,14 @@ impl ResourceAllocator {
         }
         let count = crate::planning::elements(&weight.shape)
             .ok_or_else(|| invalid("weight element count overflows"))?;
-        // A weight imported alone and read in place has a window of its own
-        // range; its source view keeps the mapping.
-        let own = match window {
-            None if ImportSource::reads_in_place(weight, stored, device)? => {
-                let (file, start, end) = stored_range(stored)?;
-                Some(ImportWindow::map(device, file, start, end)?)
-            }
-            _ => None,
-        };
-        let source = ImportSource::acquire(weight, stored, window.or(own.as_ref()), device)?;
-        let tensor = source.tensor();
-        if !tensor.belongs_to(device)
-            || tensor.element() != weight.upload
-            || tensor.extents() != [count]
-            || tensor.byte_len() != weight.source_bytes
-            || matches!(&source, ImportSource::Staged(_))
-                && tensor.storage_bytes() != weight.source_bytes
+        // SAFETY: the importer fills it before binding it
+        // (`NativeImportProgram::enqueue`, `submit`).
+        let upload = unsafe { import_upload(weight, device) }?;
+        if !upload.belongs_to(device)
+            || upload.element() != weight.upload
+            || upload.extents() != [count]
+            || upload.byte_len() != weight.source_bytes
+            || upload.storage_bytes() != weight.source_bytes
         {
             return Err(invalid(
                 "source tensor differs from the admitted import contract",
@@ -707,7 +509,7 @@ impl ResourceAllocator {
                 bytes: weight.source_bytes,
             },
             bytes: weight.source_bytes,
-            source,
+            upload,
         })
     }
 
@@ -720,6 +522,7 @@ impl ResourceAllocator {
         head_graphs: Option<&PreparedDrafterGraphs>,
         vision_graphs: Option<&PreparedVisionGraphs>,
         state_graphs: &PreparedStateCopyGraphs,
+        ledgers: &crate::memory::ledger::DeviceLedgers,
     ) -> Result<AllocatedResources, AllocationError> {
         if device.backend() != execution.device().backend()
             || device.info().name() != execution.device().name()
@@ -817,6 +620,8 @@ impl ResourceAllocator {
             vision_graph,
             state_graph,
             places: std::num::NonZeroUsize::MIN,
+            most_places: std::num::NonZeroUsize::new(target_graphs.held_pass().get()).expect("a pass covers a launch"),
+            ledgers: ledgers.clone(),
             releases: crate::Releases::start().map_err(AllocationError::Thread)?,
             releasing: None,
         };

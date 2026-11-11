@@ -1,14 +1,13 @@
-//! The one order in which the owner gives memory back: the reclaim
-//! band, a new request's residency and a group's provisioning all release
-//! through it. Every holding but live requests is priced on the memory
-//! heap's one scale (`ExecutorDomain::settle_memory`) and released the
-//! lowest rate per byte first: idle state and graph slots at nothing, the
-//! bank's slots (its borrowed tail the least of them), cached prefixes and
-//! the optional components by what each saves. Preemption follows only
-//! once nothing priced is left, and unloading the model, past it, only
-//! once every rung is exhausted (`MemoryCondition::should_unload`).
+//! The one order in which the owner gives memory back for a live claim (a
+//! new request's residency, a group's provisioning) that its holders'
+//! state cannot meet: what loses nothing first, then what a later use
+//! computes or loads again, and preemption last. The expert bank is not on
+//! it: it is cache on the ledger, which yields to a claim at once, and it
+//! follows its derived target at every boundary
+//! (`ExecutorDomain::follow_cache_targets`). Unloading the model is no rung:
+//! it happens only at a reading where the guarantee cannot be kept.
 
-/// What the owner can release.
+/// What the owner can release, in the order it releases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Rung {
     /// State backing beyond what the stores need, one spare slab kept per
@@ -17,27 +16,18 @@ pub(crate) enum Rung {
     /// Every slab no sequence or checkpoint owns, the spares too: the next
     /// growth allocates again.
     Idle,
-    /// One shrink of the expert bank toward its floor, to the size the
-    /// heap settles it at: decode reads more of its experts from storage,
-    /// and no work is lost. Priced.
-    Bank,
-    /// The retained prefix worth least: a later hit computes it again. Its
-    /// rows stay charged until the cheaper rungs, which run next, release
-    /// them. Priced.
+    /// The least recently used retained prefix: a later hit computes it
+    /// again.
     Prefix,
-    /// The idle optional component worth least per byte (drafter or
-    /// projector), once no request is resident: its next use loads it
-    /// again. Priced; one whose worth is not priced yet (a head before its
-    /// drafting is) is released only once no priced one is left, and the
-    /// rung then holds nothing priced.
+    /// The idle optional component worth least (drafter or projector), once
+    /// no request is resident: its next use loads it again.
     Optional,
     /// Eligible live requests: each replays its accepted tokens.
     Preemption,
 }
 
 impl Rung {
-    /// The rungs the heap prices, in the order a tie keeps.
-    const PRICED: [Self; 5] = [Self::Surplus, Self::Idle, Self::Bank, Self::Prefix, Self::Optional];
+    const ORDER: [Self; 5] = [Self::Surplus, Self::Idle, Self::Prefix, Self::Optional, Self::Preemption];
 }
 
 /// What one release at a rung came to.
@@ -45,71 +35,30 @@ impl Rung {
 pub(crate) enum Release {
     /// Memory was released.
     Released,
-    /// A release runs that a later flight boundary finishes, its own
-    /// ([`Pending`]): nothing costlier runs before it.
-    Pending(Pending),
-    /// A release must wait for a gap between flights (a bank resize with a
-    /// step still running), or for the records in flight to land (a shrink
-    /// of the records the host lands into, every cut of which falls below
-    /// one): nothing began, nothing costlier runs, and the next boundary
-    /// releases again.
-    Deferred,
-    /// What is short is released already and the host has yet to show it:
-    /// nothing began, nothing costlier runs, and a later reading decides
-    /// again.
-    Covered,
+    /// Idle graph slots release off the submitting thread, and a later
+    /// flight boundary finishes them: nothing costlier runs before it.
+    Pending,
     /// The rung has nothing left.
     Nothing,
 }
 
-/// A release a later flight boundary finishes, by what it releases: each
-/// finishes on its own, so the ladder waits for each apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Pending {
-    /// Idle graph slots, released off the submitting thread (the surplus
-    /// rung's).
-    Slots,
-    /// A resize of the expert bank (the bank rung's).
-    Bank,
-}
-
-/// Releases at one rung of the ladder at a time.
+/// Releases at one rung at a time.
 pub(crate) trait Releases {
     type Error;
 
     /// Release once at `rung`.
     fn release(&mut self, rung: Rung) -> Result<Release, Self::Error>;
-
-    /// The lowest rate per byte a priced rung ([`Rung::PRICED`]) holds, in
-    /// serving seconds saved a second per byte; none where it holds nothing
-    /// priced to release.
-    fn rate(&mut self, rung: Rung) -> Result<Option<f64>, Self::Error>;
 }
 
-/// The ladder now: the priced rungs by the lowest rate per byte each holds
-/// (one holding nothing priced goes last of them, a tie in their own
-/// order), then preemption.
-fn ladder<R: Releases>(releases: &mut R) -> Result<Vec<Rung>, R::Error> {
-    let mut priced = Vec::with_capacity(Rung::PRICED.len());
-    for rung in Rung::PRICED {
-        priced.push((releases.rate(rung)?.unwrap_or(f64::INFINITY), rung));
-    }
-    priced.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Ok(priced.into_iter().map(|(_, rung)| rung).chain([Rung::Preemption]).collect())
-}
-
-/// Release once, at the cheapest rung of the ladder ([`ladder`]) that
-/// releases or begins releasing anything, preemption only where `preempt`
-/// (a group's provisioning splits the group before it preempts). A caller
-/// repeats
-/// it while its need is unmet and it releases, so a costlier rung runs only
+/// Release once, at the first rung in order that releases or begins
+/// releasing anything, preemption only where `preempt` (a group's
+/// provisioning splits the group before it preempts). A caller repeats it
+/// while its need is unmet and it releases, so a costlier rung runs only
 /// once every cheaper one has nothing left, including what the costlier
 /// one's last release gave back to them (a preempted request's slabs, a
-/// dormant drafter); a pending release stops it until the release
-/// finishes. The ladder is read afresh each time: a release changes what
-/// the next byte of each holding is worth.
+/// dormant drafter); a pending release stops it until it finishes.
 pub(crate) fn release_once<R: Releases>(releases: &mut R, preempt: bool) -> Result<Release, R::Error> {
-    for rung in ladder(releases)? {
+    for rung in Rung::ORDER {
         if rung == Rung::Preemption && !preempt {
             continue;
         }
@@ -135,8 +84,6 @@ mod tests {
         gives: BTreeMap<Rung, Vec<Rung>>,
         pending: Vec<Rung>,
         released: Vec<Rung>,
-        /// Each priced rung's lowest rate per byte while it holds any.
-        rates: BTreeMap<Rung, f64>,
     }
 
     impl Releases for Fake {
@@ -153,14 +100,9 @@ mod tests {
                 *self.left.entry(given).or_default() += 1;
             }
             Ok(match self.pending.contains(&rung) {
-                true => Release::Pending(super::Pending::Bank),
+                true => Release::Pending,
                 false => Release::Released,
             })
-        }
-
-        fn rate(&mut self, rung: Rung) -> Result<Option<f64>, ()> {
-            let holds = self.left.get(&rung).is_some_and(|&left| left > 0);
-            Ok(self.rates.get(&rung).copied().filter(|_| holds))
         }
     }
 
@@ -171,69 +113,18 @@ mod tests {
         std::mem::take(&mut fake.released)
     }
 
-    /// A pending bank step stops the ladder: no prefix is evicted while it
-    /// runs, and each boundary that finishes it resumes the ladder from the
-    /// cheapest rung, so the bank reaches its floor before any prefix.
+    /// A pending slot release stops the walk: nothing costlier runs until
+    /// a later boundary finishes it.
     #[test]
-    fn a_pending_bank_step_stops_the_ladder_until_it_finishes() {
+    fn a_pending_slot_release_stops_the_walk_until_it_finishes() {
         let mut fake = Fake {
-            left: BTreeMap::from([(Rung::Prefix, 1), (Rung::Bank, 2), (Rung::Surplus, 1)]),
-            gives: BTreeMap::from([(Rung::Bank, vec![Rung::Surplus])]),
-            pending: vec![Rung::Bank],
+            left: BTreeMap::from([(Rung::Prefix, 1), (Rung::Surplus, 2)]),
+            pending: vec![Rung::Surplus],
             ..Fake::default()
         };
-        assert_eq!(drain(&mut fake, true), [Rung::Surplus, Rung::Bank]);
-        assert_eq!(drain(&mut fake, true), [Rung::Surplus, Rung::Bank]);
-        assert_eq!(drain(&mut fake, true), [Rung::Surplus, Rung::Prefix]);
-    }
-
-    /// An ask releases what loses nothing first, then the priced holding
-    /// worth least per byte: prefixes that save less a byte than the bank's
-    /// slots go before them, the bank's before prefixes worth more; and
-    /// preemption comes only once nothing priced is left.
-    #[test]
-    fn an_ask_releases_the_lowest_rate_per_byte_first_and_preempts_last() {
-        let left = || BTreeMap::from([
-            (Rung::Preemption, 1),
-            (Rung::Prefix, 2),
-            (Rung::Bank, 3),
-            (Rung::Idle, 1),
-            (Rung::Surplus, 1),
-        ]);
-        let mut cheap_prefixes = Fake {
-            left: left(),
-            rates: BTreeMap::from([(Rung::Surplus, 0.), (Rung::Idle, 0.), (Rung::Bank, 0.5), (Rung::Prefix, 0.1)]),
-            ..Fake::default()
-        };
-        assert_eq!(
-            drain(&mut cheap_prefixes, true),
-            [Rung::Surplus, Rung::Idle, Rung::Prefix, Rung::Prefix, Rung::Bank, Rung::Bank, Rung::Bank, Rung::Preemption]
-        );
-        let mut cheap_bank = Fake {
-            left: left(),
-            rates: BTreeMap::from([(Rung::Surplus, 0.), (Rung::Idle, 0.), (Rung::Bank, 0.1), (Rung::Prefix, 0.5)]),
-            ..Fake::default()
-        };
-        assert_eq!(
-            drain(&mut cheap_bank, true),
-            [Rung::Surplus, Rung::Idle, Rung::Bank, Rung::Bank, Rung::Bank, Rung::Prefix, Rung::Prefix, Rung::Preemption]
-        );
-    }
-
-    /// A bound drafter worth more per byte than the bank's slots is kept
-    /// over them, and the bank's slots worth more than a prefix over it: no
-    /// fixed order among priced rungs.
-    #[test]
-    fn priced_rungs_release_by_rate_alone() {
-        let mut fake = Fake {
-            left: BTreeMap::from([(Rung::Optional, 1), (Rung::Bank, 2), (Rung::Prefix, 1), (Rung::Preemption, 1)]),
-            rates: BTreeMap::from([(Rung::Optional, 0.9), (Rung::Bank, 0.3), (Rung::Prefix, 0.1)]),
-            ..Fake::default()
-        };
-        assert_eq!(
-            drain(&mut fake, true),
-            [Rung::Prefix, Rung::Bank, Rung::Bank, Rung::Optional, Rung::Preemption]
-        );
+        assert_eq!(drain(&mut fake, true), [Rung::Surplus]);
+        assert_eq!(drain(&mut fake, true), [Rung::Surplus]);
+        assert_eq!(drain(&mut fake, true), [Rung::Prefix]);
     }
 
     /// What a costlier release gives back to cheaper rungs is released before
@@ -267,14 +158,14 @@ mod tests {
         );
     }
 
-    /// A caller that stops short of a rung never reaches it.
+    /// A caller that stops short of preemption never reaches it.
     #[test]
     fn releasing_stops_at_the_callers_rung() {
         let mut fake = Fake {
-            left: BTreeMap::from([(Rung::Bank, 2), (Rung::Preemption, 1)]),
+            left: BTreeMap::from([(Rung::Prefix, 2), (Rung::Preemption, 1)]),
             ..Fake::default()
         };
-        assert_eq!(drain(&mut fake, false), [Rung::Bank, Rung::Bank]);
+        assert_eq!(drain(&mut fake, false), [Rung::Prefix, Rung::Prefix]);
         assert_eq!(release_once(&mut fake, true).unwrap(), Release::Released);
         assert_eq!(fake.released, [Rung::Preemption]);
     }

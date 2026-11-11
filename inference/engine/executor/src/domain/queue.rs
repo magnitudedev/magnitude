@@ -481,9 +481,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let drained = drain_steps(steps, self.measures.as_ref().and_then(|measures| measures.experts.as_ref()));
         self.target.insert(holder, joined.abort());
         let released = self.release_state(&[holder]).map(|_bytes| ()).map_err(DomainError::invariant);
-        // The first failure of both: the drained steps' fault, else the
-        // release's.
-        drained.and(released)
+        // The first failure of all: the drained steps' fault, else the
+        // release's, else the group's close.
+        drained.and(released).and_then(|()| self.close_group())
     }
 
     /// Join `request`'s finished chained chunk to its chain: held while the
@@ -505,6 +505,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.queue = Queue::Chain(chain);
             return joined.map(|()| Advance::Chained);
         }
+        // The chain's last chunk finished: its group closes.
+        self.close_group()?;
         Ok(Advance::Chain(chain.joined))
     }
 
@@ -539,8 +541,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// What runs behind `operations` once they are submitted or claimed, a
     /// function of the round's operations, the chunks the scheduler planned
     /// for it and the load. A lone prompt chunk opens a chain of the planned
-    /// chunks continuing it, within the places of the class the group holds
-    /// (`grant_group`), that the family runs in a chain; otherwise, with
+    /// chunks continuing it, a place each of the class its group holds
+    /// (`AllocatedResources::group_places`, claimed as it opened,
+    /// `open_group`), that the family runs in a chain; otherwise, with
     /// pipelining, every slot's successor of one kind queues behind it.
     pub(super) fn behind(&self, operations: &[Operation]) -> Behind {
         self.behind_within(operations, self.resources.group_places().get())
@@ -987,9 +990,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Wait for every queued step and drop it, a chain under way with them
-    /// (`Queue::drain`).
+    /// (`Queue::drain`), and close the group they ran (`close_group`).
     pub(super) fn drain_queue(&mut self) -> Result<(), DomainError> {
-        self.queue.drain(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()))
+        self.queue.drain(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()))?;
+        self.close_group()
     }
 
     /// The launch of `predicted` queued behind a step whose advances are

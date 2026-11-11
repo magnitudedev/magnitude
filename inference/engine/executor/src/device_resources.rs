@@ -26,14 +26,16 @@ pub struct ConditioningRange {
 /// non-pooled callers.
 #[derive(Clone)]
 enum TensorBacking {
-    Owned(Tensor),
+    /// A tensor the domain owns, with the claims its allocation was made
+    /// under (`memory::ledger::Held`), released as its last view drops.
+    Owned { tensor: Tensor, claims: Rc<[crate::memory::ledger::Claim]> },
     Graph(GraphOutputTensor),
 }
 
 impl TensorBacking {
     fn tensor(&self) -> &Tensor {
         match self {
-            Self::Owned(tensor) => tensor,
+            Self::Owned { tensor, .. } => tensor,
             Self::Graph(tensor) => tensor.tensor(),
         }
     }
@@ -247,7 +249,7 @@ impl FeatureRef {
         let tensors = allocations
             .iter()
             .filter_map(|allocation| match &allocation.tensor {
-                Some(TensorBacking::Owned(tensor)) => Some(tensor),
+                Some(TensorBacking::Owned { tensor, .. }) => Some(tensor),
                 _ => None,
             });
         Tensor::reclaimable_bytes(tensors).map_err(|error| ResourceError::Tensor(error.to_string()))
@@ -527,9 +529,11 @@ impl ResourceDomain {
         self.owned_features.borrow().iter().for_each(visit);
     }
 
-    pub fn publish_features(&self, tensor: Tensor) -> Result<FeatureRef, ResourceError> {
+    /// Publish `tensor` as features the domain owns, kept with `claims`,
+    /// those its allocation was made under, until its last view drops.
+    pub fn publish_features(&self, tensor: Tensor, claims: Vec<crate::memory::ledger::Claim>) -> Result<FeatureRef, ResourceError> {
         let observation = tensor.observe_storage();
-        let feature = self.publish_feature_backing(TensorBacking::Owned(tensor))?;
+        let feature = self.publish_feature_backing(TensorBacking::Owned { tensor, claims: claims.into() })?;
         let mut census = self.owned_features.borrow_mut();
         census.retain(|tensor| tensor.charged_bytes().is_some());
         census.push(observation);
@@ -568,7 +572,7 @@ impl ResourceDomain {
         tensor: Tensor,
         ranges: Vec<ConditioningRange>,
     ) -> Result<ConditioningRef, ResourceError> {
-        self.publish_conditioning_backing(TensorBacking::Owned(tensor), ranges)
+        self.publish_conditioning_backing(TensorBacking::Owned { tensor, claims: Rc::new([]) }, ranges)
     }
     fn publish_conditioning_backing(
         &self,
@@ -598,7 +602,7 @@ impl ResourceDomain {
         })
     }
     pub fn publish_logits(&self, tensor: Tensor) -> Result<LogitsRef, ResourceError> {
-        self.publish_logits_backing(TensorBacking::Owned(tensor))
+        self.publish_logits_backing(TensorBacking::Owned { tensor, claims: Rc::new([]) })
     }
     pub fn publish_graph_logits(
         &self,
@@ -704,6 +708,7 @@ mod tests {
         let feature = domain
             .publish_features(
                 Tensor::zeros(domain.device(), seismic::Element::bf16(), &[1, 32]).unwrap(),
+                Vec::new(),
             )
             .unwrap();
         let bytes = feature.allocation().tensor().unwrap().storage_bytes();

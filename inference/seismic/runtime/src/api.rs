@@ -748,6 +748,20 @@ pub mod device {
             }
             Ok(())
         }
+
+        /// Hold store `store`'s bound to `source` of the store's claim,
+        /// read at each admission against the store from now on, in place of
+        /// any value set: its holder's room as the holder stands at the
+        /// admission, never as it stood at a reading.
+        pub fn bound_by(
+            &self,
+            store: StoreId,
+            source: impl Fn(u64) -> Option<u64> + Send + Sync + 'static,
+        ) -> Result<(), LimitError> {
+            self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
+            self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound_source(Arc::new(source));
+            Ok(())
+        }
     }
 
     /// One opened executor: its immutable description, execution resources

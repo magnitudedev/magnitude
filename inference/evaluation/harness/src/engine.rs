@@ -23,7 +23,6 @@ use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use seismic::{SubmissionTrace, TracedSubmission, host_seconds};
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Rows of one prefill forward, as the service bounds them.
@@ -309,36 +308,13 @@ impl<F: ProgramFamily> MemoryHost for Unrequested<'_, F> {
 
     fn advance_epoch(&mut self) {}
 
-    fn held_prefixes(&self) -> BTreeSet<u64> {
-        BTreeSet::new()
-    }
-
-    fn evict_prefix(&mut self, _: &BTreeSet<u64>) -> bool {
-        false
-    }
-
-    fn prefix_steps(&self, _: &magnitude_scheduler::workload::WorkloadRates) -> Vec<magnitude_scheduler::prefix_cache::PrefixStep> {
-        Vec::new()
-    }
-
-    fn evict_cached_prefix(&mut self, _: u64) -> bool {
-        false
-    }
-
-    fn evict_victims(&mut self, _: &[RequestId], _: bool) -> Result<bool, DomainError> {
-        Ok(false)
-    }
-
-    fn refuse_memory_waiters(&mut self) {}
-
     fn unload(&mut self) {}
 }
 
 /// The boundary after a step, as the scheduler's owner runs it after
 /// reconciling a flight: its one memory step at `now` on the service clock
-/// (memory observed, the expert bank's resize advanced, shrinks and
-/// releases while memory is short, a growth step where owed), on the
-/// bindings the step returned.
+/// (memory read, the expert bank's resize advanced and its derived target
+/// followed), on the bindings the step returned.
 fn between_steps<F: ProgramFamily>(
     domain: &mut magnitude_executor::ExecutorDomain<F>,
     memory: &mut BetweenFlights,
@@ -346,8 +322,8 @@ fn between_steps<F: ProgramFamily>(
     now: u64,
 ) -> Result<(), String> {
     let mut host = Unrequested { domain, memory, now };
-    match between_flights(&mut host, Some(bindings)).map_err(|error| error.to_string())? {
-        true => Err("memory stayed below the reclaim reserve: the model would unload".into()),
+    match between_flights(&mut host, Some(bindings), 0).map_err(|error| error.to_string())? {
+        true => Err("the memory guarantee could not be kept: the model would unload".into()),
         false => Ok(()),
     }
 }
@@ -379,41 +355,8 @@ pub struct Step {
     pub submissions: Vec<TracedSubmission>,
 }
 
-/// A domain error as the harness reports it. A claim refused in the Reclaim
-/// band is also written as a memory record (`admission refused`) with the
-/// reading it was judged on, which `mrig` reports as the cell's outcome.
+/// A domain error as the harness reports it.
 pub fn text(error: DomainError) -> String {
-    if let DomainError::Reclaim(reading) = &error {
-        eprintln!(
-            "magnitude-harness: memory {}",
-            serde_json::json!({
-                "moment": "admission refused",
-                "store": reading.identity.to_string(),
-                "constraint": reading.constraint.to_string(),
-                "headroom_bytes": reading.headroom_bytes,
-                "planning_bytes": reading.thresholds.planning_bytes,
-                "distress": reading.distress.map(|distress| distress.to_string()),
-                "wired_bytes": reading.held.map(|held| held.wired_bytes),
-                "compressed_bytes": reading.held.map(|held| held.compressed_bytes),
-                // Most recent first, each window's pages.
-                "windows": reading.displacement.as_ref().map(|displacement| {
-                    displacement
-                        .windows
-                        .iter()
-                        .map(|window| {
-                            serde_json::json!({
-                                "ms": window.duration.as_secs_f64() * 1e3,
-                                "compressed_pages": window.compressed_pages,
-                                "decompressed_pages": window.decompressed_pages,
-                                "swapped_out_pages": window.swapped_out_pages,
-                                "swapped_in_pages": window.swapped_in_pages,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            })
-        );
-    }
     error.to_string()
 }
 

@@ -24,8 +24,6 @@ pub use payload::{TemplatePayload, TemplateSource, TokenizerPayload};
 pub use preprocessing::{
     ImageProcessor, ImageProcessorConfig, ImageResize, Resampling, MAX_IMAGES_PER_REQUEST,
 };
-#[cfg(unix)]
-pub use source::MappedWindow;
 pub use source::{FileSource, SourceReader};
 pub use support::{UnsupportedReason, WeightTypeCount};
 pub use token::TokenId;

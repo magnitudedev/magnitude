@@ -132,14 +132,10 @@ fn unopened(topology: &DeviceTopology) -> Status {
             taken: std::time::SystemTime::now(),
             host_ram: Ok(seismic::HostStatus {
                 allocatable: none,
-                obtainable: seismic::Reported::new(0, seismic::ReportedBy::MachMovablePages),
+                reclaimable: 0,
                 limits: Vec::new(),
                 limit_visibility: seismic::LimitVisibility::Complete,
-                displacement: None,
-                kernel_pressure: None,
-                free_target: None,
                 held: None,
-                displaced_bytes: None,
             }),
             volumes: Vec::new(),
             executors: topology.executors().iter().map(|executor| executor.id()).collect(),
@@ -195,7 +191,6 @@ fn main_charge(base: &AssessmentMemoryCharge, backend: BackendName) -> Assessmen
     let serving_peak = base.state_bytes + bounds.component_upload_bytes;
     AssessmentMemoryCharge {
         exact_resident_bytes: weights + base.state_bytes,
-        loaded_state_bytes: 0,
         bounds,
         serving_bytes: prepared + base.state_bytes,
         allocation_bytes: prepared + serving_peak.max(loading),
@@ -223,12 +218,11 @@ fn terms(charge: &AssessmentMemoryCharge, chain: usize, successors: usize) -> St
     let gb = |bytes: u64| bytes as f64 / 1e9;
     let bounds = &charge.bounds;
     format!(
-        "weights {:.2} state {:.2} startup {:.2} loaded {:.2} succ {successors} pools {:.3}@{chain} recorded {:.3}+{:.3}up \
+        "weights {:.2} state {:.2} startup {:.2} succ {successors} pools {:.3}@{chain} recorded {:.3}+{:.3}up \
          process {:.3} import {:.2} component {:.2} allocation {:.2}",
         gb(charge.weight_demand.checked_bytes().unwrap()),
         gb(charge.state_bytes),
         gb(charge.startup_state_bytes),
-        gb(charge.loaded_state_bytes),
         gb(bounds.graph_bytes),
         gb(bounds.recorded_graph_bytes - bounds.recorded_graph_upload_bytes),
         gb(bounds.recorded_graph_upload_bytes),
@@ -320,7 +314,7 @@ fn row(
         Ok(charge) => charge,
         Err(error) => return failed("charging whole", format!("{error:?}")),
     };
-    let (_, whole_need, whole_fits) = match room.fit(&whole, &whole_charge) {
+    let (_, whole_need, whole_fits) = match room.fit(&whole_charge) {
         Ok(fit) => need(&fit),
         Err(error) => return failed("whole's fit", error.to_string()),
     };
@@ -334,7 +328,7 @@ fn row(
     let assessment_ms = assessing.elapsed().as_secs_f64() * 1e3;
     let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None) {
         Ok(Placed::Whole(placed)) => {
-            let fits = match room.fit(placed.draft(), placed.charge()) {
+            let fits = match room.fit(placed.charge()) {
                 Ok(fit) => need(&fit).2,
                 Err(error) => return failed("placed fit", error.to_string()),
             };

@@ -576,7 +576,6 @@ pub struct HardwareStore {
     /// The capacity within process limits.
     pub allocation_capacity_bytes: u64,
     pub planning_reserve_bytes: u64,
-    pub emergency_reserve_bytes: u64,
 }
 
 /// Host RAM, memory the OS manages, with what the OS reports of it.

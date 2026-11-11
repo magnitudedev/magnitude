@@ -1696,7 +1696,6 @@ export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
 export const HardwareStore = S.Struct({
   allocation_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   capacity_basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
-  emergency_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   planning_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2093,15 +2092,12 @@ export const MemoryDomainId = S.String
 export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
 export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
 
-export const MemoryShortage = S.Union(
-  S.extend(
-    S.TaggedStruct("Blocked", {
-      availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("UnderPressure", {}), S.Record({ key: S.String, value: JsonValue })),
+export const MemoryShortage = S.extend(
+  S.TaggedStruct("Blocked", {
+    availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
 )
 export type MemoryShortage = S.Schema.Type<typeof MemoryShortage>
 export type MemoryShortageEncoded = S.Schema.Encoded<typeof MemoryShortage>
@@ -3711,7 +3707,6 @@ export const StreamingResize = S.Union(
     S.TaggedStruct("Shrank", {
       atUnixMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       by: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-      cause: S.suspend((): S.Schema<StreamingShrinkCause, StreamingShrinkCauseEncoded> => StreamingShrinkCause),
       to: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -3727,15 +3722,6 @@ export const StreamingResize = S.Union(
 )
 export type StreamingResize = S.Schema.Type<typeof StreamingResize>
 export type StreamingResizeEncoded = S.Schema.Encoded<typeof StreamingResize>
-
-export const StreamingShrinkCause = S.Union(
-  S.Literal("reclaim"),
-  S.Literal("live_claim"),
-  S.Literal("rebalance"),
-  S.Literal("measurement"),
-)
-export type StreamingShrinkCause = S.Schema.Type<typeof StreamingShrinkCause>
-export type StreamingShrinkCauseEncoded = S.Schema.Encoded<typeof StreamingShrinkCause>
 
 export const StreamingTableStatus = S.Struct({
   bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

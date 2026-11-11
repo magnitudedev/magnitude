@@ -15,14 +15,13 @@
 //! workload (measured by the owner, see
 //! [`PrefixCache::release_beyond_workload`]), and supplies victim identity:
 //! the entry worth least, never one in submitted use. An entry is worth the
-//! prefill its hits save ([`PrefixCache::held_steps`]): the tokens it holds
+//! prefill its hits save (`PrefixCache::worth`): the tokens it holds
 //! beyond the next shorter entry a hit would fall back to, times the chance a
 //! request hits it, estimated from this cache's own lookups. Every entry's
 //! marginal state is the same (`ResourcePlan::retained_entry_bytes`), so
 //! the least valuable entry is also the least valuable per byte. What an
 //! eviction releases is Seismic's charge, observed by the memory heap after
 //! the entry's state drops.
-use crate::workload::WorkloadRates;
 use magnitude_executor::ResourcePlan;
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
@@ -245,15 +244,6 @@ pub struct PrefixCache<S> {
     /// Every lookup the cache answered, hit or miss.
     lookups: u64,
     entries: Vec<CachedPrefix<S>>,
-}
-
-/// A cached entry as the memory heap prices it: its marginal state and the
-/// serving seconds a second its hits save.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PrefixStep {
-    pub id: u64,
-    pub bytes: u64,
-    pub seconds_per_second: f64,
 }
 
 impl<S> PrefixCache<S> {
@@ -486,19 +476,6 @@ impl<S> PrefixCache<S> {
         }
     }
 
-    /// Drop the entry `id` a settle of the memory heap released
-    /// ([`Self::held_steps`]): whether it was still cached without
-    /// submitted uses.
-    pub fn evict(&mut self, id: u64) -> bool {
-        match self.entries.iter().position(|entry| entry.id == id && entry.submitted == 0) {
-            Some(index) => {
-                self.entries.remove(index);
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Hold cached prefixes within the state the memory plan charges: while
     /// `occupied` (the state every holder occupies, these entries included)
     /// exceeds it, drop the entry worth least without submitted uses,
@@ -593,40 +570,6 @@ impl<S> PrefixCache<S> {
             .max()
             .unwrap_or(0);
         entry.position() - fallback
-    }
-
-    /// Every entry without submitted uses that no live request holds
-    /// (`held`: dropping one of those releases only its bank, its rows
-    /// being the holders') as the memory heap prices it, the least
-    /// valuable first: each holds `entry_bytes` of marginal state
-    /// (`ResourcePlan::retained_entry_bytes`), and saves its expected
-    /// tokens ([`Self::worth`]) at the load's prefill rate on each of its
-    /// requests.
-    pub fn held_steps(&self, entry_bytes: u64, rates: &WorkloadRates, held: &BTreeSet<u64>) -> Vec<PrefixStep> {
-        // Prefill seconds a token, times requests a second: what one token
-        // saved per request is worth a second. A load that has timed no
-        // prefill yet (one without an expert bank meters from nothing)
-        // knows no prefill speed, and a token saves nothing known.
-        let token = match rates.prefill_tokens_per_s {
-            speed if speed > 0.0 => rates.requests_per_s / speed,
-            _ => 0.0,
-        };
-        let mut steps: Vec<(PrefixStep, u64)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.submitted == 0 && !held.contains(&entry.id))
-            .map(|(index, entry)| {
-                let step = PrefixStep {
-                    id: entry.id,
-                    bytes: entry_bytes,
-                    seconds_per_second: self.worth(index) * token,
-                };
-                (step, entry.last_use)
-            })
-            .collect();
-        steps.sort_by(|a, b| a.0.seconds_per_second.total_cmp(&b.0.seconds_per_second).then(a.1.cmp(&b.1)));
-        steps.into_iter().map(|(step, _)| step).collect()
     }
 
     /// The checkpoints the plan charges the most recently cached
@@ -1157,33 +1100,6 @@ mod tests {
         assert!(retain(&mut cache, &text(64, "new"), 64, rows(200..264)));
         assert!(!referenced(100), "the newer entry no lookup hit went");
         assert!(referenced(0) && referenced(200));
-    }
-
-    /// The heap's view: entries least valuable first, each worth its
-    /// expected tokens at the load's prefill rate on each of its requests.
-    #[test]
-    fn held_steps_price_entries_least_valuable_first() {
-        let mut cache = PrefixCache::new(capacity(8));
-        let owned = text(100, "path");
-        assert!(retain(&mut cache, &owned, 64, rows(0..64)));
-        assert!(retain(&mut cache, &owned, 100, rows(0..100)));
-        let rates = WorkloadRates {
-            decode_steps_per_s: 10.0,
-            prefill_tokens_per_s: 1000.0,
-            requests_per_s: 0.5,
-            vision_uses_per_s: 0.0,
-        };
-        let steps = cache.held_steps(7, &rates, &BTreeSet::new());
-        assert_eq!(steps.len(), 2);
-        assert!(steps.iter().all(|step| step.bytes == 7));
-        // 100 saves 36 tokens beyond 64, 64 saves 64; each as likely hit as not.
-        let expected = |tokens: f64| tokens * 0.5 * 0.5 / 1000.0;
-        assert!((steps[0].seconds_per_second - expected(36.0)).abs() < 1e-12);
-        assert!((steps[1].seconds_per_second - expected(64.0)).abs() < 1e-12);
-        // An entry a live request holds is not the heap's to release.
-        let held = BTreeSet::from([steps[0].id]);
-        assert_eq!(cache.held_steps(7, &rates, &held).iter().map(|step| step.id).collect::<Vec<_>>(), [steps[1].id]);
-        assert!(cache.evict(steps[1].id) && !cache.evict(steps[1].id));
     }
 
     #[test]

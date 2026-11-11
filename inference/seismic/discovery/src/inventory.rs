@@ -2,22 +2,19 @@
 //! on request, and its status samples.
 
 use crate::gather::{self, DiscoveryError, Gathered, Natives};
-use crate::host::{self, HostSampler, HostStatus, ObservationError};
+use crate::host::{self, HostStatus, ObservationError};
 use crate::status::{self, Sample};
 use seismic_topology::{DeviceTopology, ExecutorId, Identity, Revision};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The machine as discovery last found it: the current topology revision,
-/// the native handles its status samples read, and the host's samples
-/// ([`HostSampler`]). Shared by everything in the process that reads the
-/// machine.
+/// and the native handles its status samples read. Shared by everything in
+/// the process that reads the machine.
 pub struct Inventory {
     /// The paths the inventory serves, whose volumes each revision holds.
     paths: Vec<PathBuf>,
     state: Mutex<State>,
-    /// Started by the first host reading, stopped with the inventory.
-    sampler: Mutex<Option<HostSampler>>,
 }
 
 struct State {
@@ -42,7 +39,6 @@ impl Inventory {
                 topology: Arc::new(seismic_topology::build(Revision::next(), &gathered.reports)),
                 natives: gathered.natives,
             }),
-            sampler: Mutex::new(None),
         }
     }
 
@@ -74,18 +70,10 @@ impl Inventory {
     }
 
     /// One reading of host RAM alone, taken now: the OS's availability
-    /// within this process's limits, with the displacement windows this
-    /// inventory's sampler has formed. A [`Sample`] reads host RAM the same
+    /// within this process's limits. A [`Sample`] reads host RAM the same
     /// way, so its headroom ([`crate::Status::headroom`]) and this agree.
     pub fn host_status(&self) -> Result<HostStatus, ObservationError> {
-        let mut sampler = self
-            .sampler
-            .lock()
-            .expect("inventory sampler lock poisoned");
-        if sampler.is_none() {
-            *sampler = Some(HostSampler::start()?);
-        }
-        host::status(sampler.as_ref().expect("started above"))
+        host::status()
     }
 
     /// One reading of the status of `topology`'s stores and of the grants

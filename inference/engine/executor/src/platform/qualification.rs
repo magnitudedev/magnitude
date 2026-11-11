@@ -1,4 +1,4 @@
-use super::policy::{DomainRole, Fit, HostRoom, LoadStage, MemoryPolicyError, MemoryReserves, refresh_device_ceiling};
+use super::policy::{Fit, HostRoom, MemoryPolicyError, MemoryReserves};
 use super::selection::{DeviceRequest, SelectionError, select};
 use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
@@ -17,8 +17,6 @@ pub struct PlatformConfig {
     /// What its graphs hold, as the selection read it; none to measure it
     /// on opening.
     pub graph_cost: Option<seismic::GraphCost>,
-    /// The host's threshold policy the opened device's ceiling keeps.
-    pub reserves: MemoryReserves,
 }
 
 /// The automatically selected device and its stable assessment capacity.
@@ -108,30 +106,6 @@ pub fn host_tier(
 pub struct OpenedPlatform {
     selector: ExecutorSelector,
     device: Device,
-}
-
-/// What the engine may still claim on `device` now, read from `status`:
-/// its stores and paths bounded through `bounds` as a load's
-/// (`refresh_device_ceiling`), and what is left above the planning reserve
-/// of `room`. `bounds` is the one live holder of the right to bound the
-/// device's ledgers: the device's open's own, or its load's heap's
-/// ([`crate::DeviceHeap`]), never a second beside it.
-pub(crate) fn room_now(
-    device: &Device,
-    bounds: &seismic::Bounds,
-    status: &seismic::Status,
-    reserves: &MemoryReserves,
-    room: HostRoom,
-) -> Result<crate::RoomNow, MemoryPolicyError> {
-    refresh_device_ceiling(device, bounds, status, reserves, room, 0)?;
-    let topology = device.topology();
-    let host_ram = topology.host_ram().id();
-    let fit = Fit::new(topology, status, reserves, room);
-    Ok(crate::RoomNow {
-        device_bytes: fit.placement(device.info(), Contract::DeviceOnly)?.ceiling_bytes,
-        host_bytes: fit.store(host_ram)?.ceiling_bytes,
-        host_shared: DomainRole::of(topology, device.info(), host_ram) == DomainRole::Allocation,
-    })
 }
 
 impl OpenedPlatform {
@@ -267,9 +241,7 @@ pub fn selected(
     })
 }
 
-/// Resolve the selected identity in this process's catalog, open it, set a
-/// ceiling from fresh scoped availability above the planning reserve, and
-/// enforce it in Seismic.
+/// Resolve the selected identity in this process's catalog and open it.
 /// Never substitutes another device.
 pub fn open_selected(
     catalog: &Devices,
@@ -287,12 +259,6 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    // The device opens bounded to the room read now, a load's (its heap,
-    // `DeviceHeap::open`, takes the right to bound it as this one is let
-    // go); a machine that cannot be read refuses the open.
-    let status = Devices::new(catalog.inventory().clone()).device_status(&device);
-    room_now(&device, &device.bounds(), &status, &config.reserves, HostRoom::Load(LoadStage::Loading))
-        .map_err(PlatformError::Memory)?;
     Ok(OpenedPlatform { selector, device })
 }
 
@@ -334,7 +300,6 @@ mod tests {
                     path: ExecutionPath::Native,
                     artifacts: None,
                     graph_cost: None,
-                    reserves: MemoryReserves::of_machine(None),
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

@@ -1874,7 +1874,6 @@ async fn streaming_context_overflow_uses_protocol_native_http_errors() {
 async fn engine_admission_refusals_map_to_integration_error_codes() {
     for (error, status, code) in [
         (RequestError::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
-        (RequestError::MemoryReclaim, StatusCode::SERVICE_UNAVAILABLE, "memory_pressure"),
         (
             RequestError::InsufficientMemory(magnitude_engine::error::InsufficientMemory {
                 required: 2,

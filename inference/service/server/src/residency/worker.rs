@@ -79,8 +79,7 @@ fn log_exit(pid: u32, status: ExitStatus) {
 enum ProcessState {
     Owned {
         process: BlockingProcess,
-        /// Dropping it with the owner releases the device; a stop the system refuses marks it
-        /// unretired ([`DeviceHold::unretired`]).
+        /// Dropping it with the owner releases the device.
         device: DeviceHold,
     },
     /// Its one retirer ([`EngineWorker::retire`]) holds the process and its device while it
@@ -208,8 +207,8 @@ impl EngineWorker {
 
     /// Stop the worker and return once it is reaped, the process lock held only to take the
     /// process and to put back what became of it: a reap that hangs in the driver's teardown
-    /// blocks this retirer alone. An error puts the exact owner back, its device marked
-    /// unretired. Only proof of retirement replaces it.
+    /// blocks this retirer alone. An error puts the exact owner back. Only proof of retirement
+    /// replaces it.
     fn retire(&self) -> std::io::Result<ExitStatus> {
         let (pid, mut process, device) = {
             let mut state = self.process.lock().expect("worker process lock");
@@ -224,7 +223,6 @@ impl EngineWorker {
             };
             (pid, process, device)
         };
-        device.dying(pid);
         let stopped = stop(&mut process);
         let mut state = self.process.lock().expect("worker process lock");
         let state = state.as_mut().expect(STANDS);
@@ -237,7 +235,6 @@ impl EngineWorker {
                 Ok(status)
             }
             Err(error) => {
-                device.unretired();
                 *state = ProcessState::Owned { process, device };
                 Err(error)
             }
@@ -333,7 +330,7 @@ impl JobWorker {
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
         if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
-            worker.retire(false, |_| {}).map_err(|(_, error)| error)?;
+            worker.retire(false).map_err(|(_, error)| error)?;
             return Err(error.into());
         }
         let transport = FramedTransport::new(std::io::BufReader::new(stdout), stdin);
@@ -354,20 +351,15 @@ impl JobWorker {
 
     /// Return once the process is proven gone. One that `reported` its outcome is left to exit
     /// on its own ([`reported_exit`]); any other, or one that has not exited by then, is
-    /// stopped ([`stop`]), `stopping` told its process just before. Blocking. One whose end the
-    /// system will not show comes back with why, still holding all it holds
-    /// ([`RETIREMENT_RETRY`]).
-    pub fn retire(mut self, reported: bool, stopping: impl FnOnce(u32)) -> Result<ExitStatus, (Self, std::io::Error)> {
+    /// stopped ([`stop`]). Blocking. One whose end the system will not show comes back with
+    /// why, still holding all it holds ([`RETIREMENT_RETRY`]).
+    pub fn retire(mut self, reported: bool) -> Result<ExitStatus, (Self, std::io::Error)> {
         let pid = process_id(&self.process);
         let exited = match reported {
             true => reported_exit(|| observe_exit(&mut self.process)),
             false => Ok(None),
         };
-        let stopped = |process: &mut BlockingProcess| {
-            stopping(pid);
-            stop(process)
-        };
-        let status = match exited.and_then(|exited| exited.map_or_else(|| stopped(&mut self.process), Ok)) {
+        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process), Ok)) {
             Ok(status) => status,
             Err(error) => return Err((self, error)),
         };
@@ -461,13 +453,11 @@ impl Drop for EngineWorker {
         std::thread::Builder::new()
             .name(format!("inference-worker-reap-{pid}"))
             .spawn(move || {
-                device.dying(pid);
                 let status = loop {
                     match stop(&mut process) {
                         Ok(status) => break status,
                         Err(error) => {
                             tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
-                            device.unretired();
                             std::thread::sleep(RETIREMENT_RETRY);
                         }
                     }
@@ -593,10 +583,8 @@ fn start_kill(process: &mut BlockingProcess) -> std::io::Result<()> {
     process.start_kill()
 }
 
-/// Stop `process` and return once it is reaped, however long that takes: its owner gives way
-/// meanwhile as the system reports its death (`DeviceJob::dying`). An error, a kill or a reap the
-/// system refused, is a process the system will not show gone, which its owner marks unretired
-/// (`DeviceJob::unretired`).
+/// Stop `process` and return once it is reaped, however long that takes. An error, a kill or a
+/// reap the system refused, is a process the system will not show gone.
 #[cfg(unix)]
 fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
     if let Some(status) = process.try_wait()? {

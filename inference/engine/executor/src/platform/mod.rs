@@ -10,13 +10,11 @@ mod qualification;
 mod selection;
 mod volume;
 
-pub(crate) use policy::refresh_device_ceiling;
-pub(crate) use qualification::room_now;
-pub(crate) use policy::ShownBasis;
+pub(crate) use policy::domain_readings;
 pub use policy::{
-    DemandFit, DisplacementBaseline, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, HostDistress, HostEmergency,
-    StoreMotion, HostRoom, ReleaseRate, Releasable, Releasing, LoadStage, MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves, MotionMeter, PageProbe, PlacementFit,
-    READING_INTERVAL, RECOVERY_STABLE_TIME, Recovery, Serving, Shown, StorageDemand, StoreFit, observe_domains,
+    DemandFit, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, StoreMotion, HostRoom, ReleaseRate,
+    Releasable, Releasing, MemoryConstraint, MemoryPolicyError, MemoryReserves, MotionMeter, PageProbe, PlacementFit,
+    READING_INTERVAL, RECOVERY_STABLE_TIME, Recovery, StorageDemand, StoreFit, observe_domains,
 };
 pub use volume::{VolumeReserve, VolumeReserves};
 pub use qualification::{

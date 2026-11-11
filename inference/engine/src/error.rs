@@ -214,7 +214,7 @@ impl fmt::Display for InsufficientMemory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} bytes are required but {} are available above the planning reserve",
+            "{} bytes are required but {} are available",
             self.required, self.available
         )
     }
@@ -302,20 +302,12 @@ pub enum LoadError {
     Artifact(ArtifactError),
     Unsupported(UnsupportedModel),
     Device(DeviceSelectionError),
-    /// A startup claim could not be satisfied in `store`, one of the stores
+    /// A startup allocation was not admitted in `store`, one of the stores
     /// the executor's placement charges. Retryable once memory frees.
     InsufficientMemory {
         purpose: String,
         store: StoreIdentity,
         memory: InsufficientMemory,
-    },
-    /// `store` was in the Reclaim band when the load claimed from it or
-    /// while it imported weights: its headroom was at or below the planning
-    /// reserve, or its host was in distress. No byte count describes it.
-    /// Retryable once the store recovers.
-    MemoryPressure {
-        purpose: String,
-        store: StoreIdentity,
     },
     MemoryObservationUnavailable { reason: String },
     DeviceLost { reason: String },
@@ -336,7 +328,6 @@ impl LoadError {
         matches!(
             self,
             Self::InsufficientMemory { .. }
-                | Self::MemoryPressure { .. }
                 | Self::MemoryObservationUnavailable { .. }
                 | Self::DeviceLost { .. }
                 | Self::WorkerLost { .. }
@@ -356,9 +347,6 @@ impl fmt::Display for LoadError {
                 store,
                 memory,
             } => write!(formatter, "{purpose} in {store}: {memory}"),
-            Self::MemoryPressure { purpose, store } => {
-                write!(formatter, "{purpose} in {store}: memory pressure")
-            }
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
@@ -396,9 +384,6 @@ pub enum RequestError {
     InsufficientMemory(InsufficientMemory),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
-    /// The request waited while the engine gave memory back, until only the
-    /// model's unload could make room for it (`memory_pressure`). Retryable.
-    MemoryReclaim,
     /// The model is no longer loaded.
     ModelUnloaded { cause: UnloadCause },
     /// The device cannot provision another request's numerical state. Retryable.
@@ -423,7 +408,6 @@ impl RequestError {
             self,
             Self::InsufficientMemory(_)
                 | Self::MemoryObservationUnavailable { .. }
-                | Self::MemoryReclaim
                 | Self::ModelUnloaded {
                     cause: UnloadCause::MemoryPressure
                 }
@@ -453,9 +437,6 @@ impl fmt::Display for RequestError {
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
-            Self::MemoryReclaim => formatter.write_str(
-                "memory headroom is at or below the planning reserve; reclaiming memory",
-            ),
             Self::ModelUnloaded { cause } => write!(formatter, "model unloaded: {cause}"),
             Self::Overloaded => formatter.write_str("the engine's request capacity is exhausted"),
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
@@ -527,7 +508,6 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },
-            Scheduled::MemoryReclaim => Self::MemoryReclaim,
             Scheduled::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {

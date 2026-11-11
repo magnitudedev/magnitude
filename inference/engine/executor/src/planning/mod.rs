@@ -9,13 +9,13 @@ mod capabilities;
 mod components;
 mod execution_plan;
 mod imports;
-pub(crate) use imports::{ImportBacking, ImportPlan};
+pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
 pub use prices::{PlanPrices, PlanSteps};
 pub(crate) use prices::{BankPrices, Prior};
 mod prompt_room;
-pub(crate) use prompt_room::{grouped, pass_ladder, pass_rows_curve, places_curve, routed_group_seconds, routed_prompt_seconds};
+pub(crate) use prompt_room::{pass_ladder, routed_prompt_seconds};
 mod resources;
 mod weights;
 
@@ -151,25 +151,13 @@ pub(crate) mod tests {
         );
         let imports = ImportPlan::new([&table, &ordinary]);
         // The table's source is one row. Its million stored rows must not
-        // permit the two adjacent ordinary sources to share a larger window.
-        assert_eq!(
-            imports
-                .batch([
-                    (0, ImportBacking::Mapped(0..2)),
-                    (0, ImportBacking::Mapped(2..4))
-                ])
-                .unwrap()
-                .len,
-            1
-        );
-        assert_eq!(
-            imports.peak_bytes().unwrap(),
-            ImportPlan::new([&ordinary]).peak_bytes().unwrap()
-        );
+        // permit the two adjacent ordinary sources to share a larger batch.
+        assert_eq!(imports.batch([(0, ordinary.source_bytes), (0, ordinary.source_bytes)]), Some(1));
+        assert_eq!(imports.peak_bytes(), ImportPlan::new([&ordinary]).peak_bytes());
         // Stored tables upload nothing, regardless of their stored extent.
         table.source_bytes = 0;
         table.holding = rows(super::weights::TableFill::Stored);
-        assert_eq!(ImportPlan::new([&table]).peak_bytes().unwrap(), 0);
+        assert_eq!(ImportPlan::new([&table]).peak_bytes(), 0);
     }
 
     #[test]
@@ -911,8 +899,8 @@ pub(crate) mod tests {
             let readout = programs
                 .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            // The plan prices the class of its chain places as the load holds
-            // it: the target's group buffers and the chunk family's slots.
+            // The plan's held pass, the most places a group's class claims,
+            // is the one the load's target family holds.
             let checked = crate::programs::native_target_graph::checked_target_family(
                 backend,
                 draft.load(),
@@ -920,23 +908,18 @@ pub(crate) mod tests {
                 &state,
                 draft.programs().target(),
                 limits,
-                crate::PassLaunches::whole_chain(limits),
+                draft.load().pass(limits),
             )
             .unwrap();
-            assert_eq!(target.group_bytes(3).unwrap(), *checked.group_bytes.at(crate::PassLaunches::whole_chain(limits)), "{backend:?}");
-            let ((assessed, _), chunk) = crate::programs::graph::readout::checked_readout_storage(
+            assert_eq!(target.held_pass(), checked.group_bytes.most(), "{backend:?}");
+            // The readout the plan commits is the one the load prepares.
+            let (assessed, _) = crate::programs::graph::readout::checked_readout_storage(
                 backend,
                 draft.load(),
                 &definition.decoder,
                 limits,
             )
             .unwrap();
-            let (chunk, _) = chunk.expect("a served readout has a prompt chunk's classes");
-            assert_eq!(
-                (readout.chunk_family().workspace_bytes(), readout.chunk_family().output_bytes(), readout.chunk_family().upload_bytes()),
-                (chunk.workspace, chunk.output, chunk.upload),
-                "{backend:?}"
-            );
             assert_eq!(
                 readout.family().workspace_bytes(),
                 assessed.workspace,

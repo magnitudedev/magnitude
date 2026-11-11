@@ -3,7 +3,7 @@
 //! Physical RAM, commit limit and page files remain separate. The commit
 //! figures are process-scoped ("the maximum this process can commit").
 
-use super::{HostSample, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
+use super::{HostStatus, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
 use seismic_topology::{Reported, ReportedBy};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::System::JobObjects::{
@@ -344,33 +344,21 @@ pub(super) fn pin(cpus: &[usize]) -> Result<(), String> {
     }
 }
 
-pub(super) fn sample() -> Result<HostSample, ObservationError> {
+pub(super) fn sample() -> Result<HostStatus, ObservationError> {
     let status = memory_status().map_err(ObservationError::Failed)?;
-    Ok(HostSample {
+    Ok(HostStatus {
         // Available physical memory is standby and free pages, neither of
-        // which holds another program's working set; Windows reports no
-        // larger figure trimming working sets would make available, so a
-        // load obtains what any growth may take.
+        // which holds another program's working set.
         allocatable: Reported::new(
             status.ullAvailPhys.min(status.ullAvailPageFile),
             ReportedBy::WindowsPhysicalAndCommit,
         ),
-        obtainable: Reported::new(
-            status.ullAvailPhys.min(status.ullAvailPageFile),
-            ReportedBy::WindowsPhysicalAndCommit,
-        ),
+        reclaimable: 0,
         limits: job_limits()?,
         limit_visibility: LimitVisibility::Complete,
-        kernel_pressure: None,
-        // Windows reports no free target of its memory manager.
-        free_target: None,
         held: None,
-        displaced_bytes: None,
     })
 }
-
-/// Windows counts no displacement here.
-pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = None;
 
 fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
     let process = unsafe { GetCurrentProcess() };

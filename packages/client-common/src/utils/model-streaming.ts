@@ -11,7 +11,6 @@ import {
   type ModelResidency,
   type ModelStreamingStatus,
   type StreamingResize,
-  type StreamingShrinkCause,
 } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { memoryDomainLabels } from "./hardware-memory"
@@ -65,13 +64,6 @@ export const localModelFitFacts = (model: LocalModel): readonly ModelFact[] => {
     : []
 }
 
-const SHRINK_CAUSES: Record<StreamingShrinkCause, string> = {
-  reclaim: "under memory pressure",
-  live_claim: "to make room for a request",
-  rebalance: "for memory worth more to serving",
-  measurement: "to make room for measuring this machine",
-}
-
 /** A moment with its date, so a resize days ago never reads as today's. */
 const dateTime = (unixMs: number): string =>
   new Date(unixMs).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
@@ -89,7 +81,7 @@ interface HoldingResize {
 
 /** A holding's resize as a sentence: the verb, its sizes before and after, and why. */
 const resizeSentence = ({ name, share, resize }: HoldingResize): string => resize._tag === "Shrank"
-  ? `${name} shrank from ${share(resize.to + resize.by)} to ${share(resize.to)} ${SHRINK_CAUSES[resize.cause]}`
+  ? `${name} shrank from ${share(resize.to + resize.by)} to ${share(resize.to)} as memory grew short`
   : `${name} grew from ${share(resize.from)} to ${share(resize.from + resize.by)} into free memory`
 
 /**

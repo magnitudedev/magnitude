@@ -5,13 +5,13 @@
 //! system-RAM headroom through Seismic in the service process, every 100 ms while a worker is
 //! resident and every second otherwise:
 //!
-//! - the first sample in an emergency, as fit reads the host ([`HostEmergency`]), kills the
-//!   resident worker;
 //! - one continuous second of failed observation while resident fails the worker;
-//! - an engine unload for memory pressure and a kill both release the instance as
-//!   `memory_pressure` and close load admission until the host has stayed out of distress with
-//!   headroom above the planning reserve `P` for five seconds (any failed sample restarts that
-//!   wait). Nothing reloads.
+//! - an engine unload for memory pressure releases the instance as `memory_pressure` and closes
+//!   load admission until headroom has stayed above the planning reserve `P` for five seconds
+//!   (any failed sample restarts that wait). Nothing reloads.
+//!
+//! Unloading for memory is the engine's decision alone; the service reads no host emergency or
+//! distress.
 //!
 //! It also watches the resident worker for exit and unload and publishes its census.
 
@@ -22,9 +22,7 @@ use futures_util::future::BoxFuture;
 use magnitude_engine::error::{RequestError, UnloadCause};
 use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{
-    DomainThresholds, Fit, HostDistress, HostEmergency, StoreMotion, HostRoom, MemoryReserves, MotionMeter, Recovery,
-};
+use magnitude_executor::platform::{DomainThresholds, MemoryReserves, MotionMeter, Recovery, StoreMotion};
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
 use seismic::Devices;
 use tokio::time::Instant;
@@ -33,29 +31,16 @@ use super::worker::worker_exit_code;
 use super::{ModelOperationFailure, ResidencyNotification, ResidencyNotifier, ResidencyWorker};
 use crate::memory_domains::instance_allocation;
 
-pub(crate) const RESIDENT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const RESIDENT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const MONITOR_LOSS_DEADLINE: Duration = Duration::from_secs(1);
 const CENSUS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The failure code of a load refused while memory has not recovered.
-pub const MEMORY_PRESSURE_FAILURE_CODE: &str = "memory_pressure";
-
-/// One sample of system RAM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostMemorySample {
-    /// What the OS gives a load without compressing another program's data,
-    /// within every process limit ([`HostRoom::Allocatable`]): what load
-    /// admission reopens on.
-    pub headroom_bytes: u64,
-    /// The host's distress, on a platform that reports displacement.
-    pub distress: Option<HostDistress>,
-    /// Whether host RAM is about to run out, and why.
-    pub emergency: Option<HostEmergency>,
-}
-
 pub trait HostMemoryObserver: Send + Sync + 'static {
-    fn sample(&self) -> Result<HostMemorySample, String>;
+    /// Host RAM's headroom: what the OS gives a load, within every process limit
+    /// (`HostStatus::allocatable_bytes` of `Reclaim::CleanFileCache`): what load admission
+    /// reopens on.
+    fn headroom(&self) -> Result<u64, String>;
     /// Fold in a resident load's reading of host RAM at `at`: `available` bytes beside the
     /// `charged` bytes its Seismic charge holds, both read by the worker in one observation
     /// ([`load_reading`]), so the load's own imports are never taken for another program's.
@@ -68,37 +53,26 @@ pub trait HostMemoryObserver: Send + Sync + 'static {
 /// System RAM observed through the service's own device catalog.
 pub struct SeismicHostMemory {
     catalog: Arc<Devices>,
-    reserves: MemoryReserves,
     /// Every resident load's reading of host RAM beside its charge: the host's motion, which the
     /// next load starts from.
     meter: std::sync::Mutex<MotionMeter>,
 }
 
 impl SeismicHostMemory {
-    /// Host RAM of `catalog`'s inventory, read through fit with `reserves`, its motion measured
-    /// from the reserves' own (the machine's figure, `MemoryReserves::of_machine`).
+    /// Host RAM of `catalog`'s inventory, its motion measured from `reserves`' own (the
+    /// machine's figure, `MemoryReserves::of_machine`).
     pub fn new(catalog: Arc<Devices>, reserves: MemoryReserves) -> Self {
-        Self { catalog, reserves, meter: std::sync::Mutex::new(MotionMeter::new(reserves.host_motion())) }
+        Self { catalog, meter: std::sync::Mutex::new(MotionMeter::new(reserves.host_motion())) }
     }
 }
 
 impl HostMemoryObserver for SeismicHostMemory {
-    /// Host RAM's headroom within process limits, distress and emergency, as fit reads them from
-    /// one host reading ([`seismic::Inventory::host_status`], [`Fit::host_ram`],
-    /// [`Fit::host_emergency`]): nothing of volumes, grants or opened executors is read.
-    fn sample(&self) -> Result<HostMemorySample, String> {
-        let topology = self.catalog.topology();
-        let reading = self
-            .catalog
-            .inventory()
-            .host_status()
-            .map_err(|error| error.to_string())?;
-        let host = Fit::host_ram(&topology, &reading, &self.reserves, HostRoom::Allocatable);
-        Ok(HostMemorySample {
-            headroom_bytes: host.headroom_bytes,
-            distress: host.distress,
-            emergency: Fit::host_emergency(&topology, &reading, &self.reserves),
-        })
+    /// One host reading's headroom ([`seismic::Inventory::host_status`]): nothing of volumes,
+    /// grants or opened executors is read.
+    fn headroom(&self) -> Result<u64, String> {
+        let reading = self.catalog.inventory().host_status().map_err(|error| error.to_string())?;
+        // What admits a load: a load's own action takes the clean file cache once.
+        Ok(reading.allocatable_bytes(seismic::Reclaim::CleanFileCache))
     }
 
     fn observed_load(&self, at: std::time::Instant, available: u64, charged: u64) {
@@ -137,8 +111,8 @@ struct Supervised {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
     Open,
-    /// Closed by memory pressure; open again once memory has recovered: the host has stayed out
-    /// of distress with headroom above `P` ([`Recovery`]).
+    /// Closed by memory pressure; open again once memory has recovered: headroom has stayed
+    /// above `P` ([`Recovery`]).
     Recovering(Recovery<Instant>),
 }
 
@@ -152,7 +126,7 @@ struct Inner {
     observer: Arc<dyn HostMemoryObserver>,
     thresholds: DomainThresholds,
     notifier: ResidencyNotifier,
-    /// The device's jobs, held off while memory recovers and preempted before any model.
+    /// The device's jobs, held off while memory recovers.
     device: crate::device_lock::DeviceLock,
     state: Mutex<State>,
     admission: tokio::sync::watch::Sender<bool>,
@@ -258,48 +232,13 @@ impl Inner {
     /// One supervision step at `now`: worker outcome first, then one host sample.
     fn tick(&self, now: Instant) {
         self.check_worker();
-        let sample = self.observer.sample();
+        let sample = self.observer.headroom();
         let mut state = self.lock();
         match sample {
-            Ok(HostMemorySample {
-                headroom_bytes: headroom,
-                distress,
-                emergency,
-            }) => {
+            Ok(headroom) => {
                 state.observation_failed_since = None;
-                // A job on the device gives way first: the emergency's start preempts it and
-                // holds jobs off until memory recovers. The model is spared while the job gives
-                // way, and killed once none does: the job gone, its end refused by the system, or
-                // its death shown hung, so it frees nothing.
-                if emergency.is_some() && self.device.hold_off_jobs(true) {
-                    tracing::warn!(
-                        memory.headroom_bytes = headroom,
-                        memory.emergency_bytes = self.thresholds.emergency_bytes,
-                        "preempting the device's job for host memory"
-                    );
-                    state.admission = Admission::Recovering(Recovery::new());
-                }
-                if let Some(emergency) = emergency
-                    && !self.device.job_giving_way(now.into_std(), headroom)
-                    && let Some(supervised) = state.supervised.take()
-                {
-                    tracing::warn!(
-                        memory.headroom_bytes = headroom,
-                        memory.emergency_bytes = self.thresholds.emergency_bytes,
-                        worker.pid = supervised.worker.pid(),
-                        "killing the inference worker: {emergency}"
-                    );
-                    supervised
-                        .worker
-                        .end(MEMORY_PRESSURE_FAILURE_CODE, &emergency.to_string());
-                    self.notifier.send(ResidencyNotification::ReleaseRequested {
-                        instance_id: supervised.instance_id,
-                        reason: ModelReleaseReason::MemoryPressure,
-                    });
-                    state.admission = Admission::Recovering(Recovery::new());
-                }
                 if let Admission::Recovering(recovery) = &mut state.admission {
-                    let free = headroom > self.thresholds.planning_bytes && distress.is_none();
+                    let free = headroom > self.thresholds.planning_bytes;
                     if recovery.observe(free, now, |since, now| now.duration_since(since)) {
                         state.admission = Admission::Open;
                     }
@@ -494,18 +433,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Scripted headroom (`u64::MAX` fails the observation), distress, and emergency.
-    struct ScriptedMemory(AtomicU64, Mutex<Option<HostDistress>>, Mutex<Option<HostEmergency>>);
+    /// Scripted headroom (`u64::MAX` fails the observation).
+    struct ScriptedMemory(AtomicU64);
 
     impl HostMemoryObserver for ScriptedMemory {
-        fn sample(&self) -> Result<HostMemorySample, String> {
+        fn headroom(&self) -> Result<u64, String> {
             match self.0.load(Ordering::Acquire) {
                 u64::MAX => Err("observation failed".to_owned()),
-                headroom_bytes => Ok(HostMemorySample {
-                    headroom_bytes,
-                    distress: *self.1.lock().unwrap(),
-                    emergency: *self.2.lock().unwrap(),
-                }),
+                headroom_bytes => Ok(headroom_bytes),
             }
         }
 
@@ -615,7 +550,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let memory = Arc::new(ScriptedMemory(AtomicU64::new(10 * GIB), Mutex::new(None), Mutex::new(None)));
+        let memory = Arc::new(ScriptedMemory(AtomicU64::new(10 * GIB)));
         let (sender, notifications) = tokio::sync::mpsc::unbounded_channel();
         let notifier = ResidencyNotifier {
             send: Arc::new(move |notification| {
@@ -625,10 +560,7 @@ mod tests {
         let (admission, _) = tokio::sync::watch::channel(true);
         let inner = Arc::new(Inner {
             observer: memory.clone(),
-            thresholds: DomainThresholds {
-                planning_bytes: 2 * GIB,
-                emergency_bytes: GIB,
-            },
+            thresholds: DomainThresholds { planning_bytes: 2 * GIB },
             notifier,
             device: crate::device_lock::DeviceLock::default(),
             state: Mutex::new(State {
@@ -666,24 +598,26 @@ mod tests {
         )
     }
 
+    /// An engine unload for memory pressure releases the instance as such and closes admission
+    /// until headroom has stayed above `P` for five seconds; a failed sample restarts the wait,
+    /// and nothing reloads.
     #[test]
-    fn first_sample_in_an_emergency_kills_and_gates_admission_for_five_seconds() {
+    fn engine_unload_for_memory_pressure_gates_admission_until_headroom_stays_above_p() {
         let mut fixture = fixture();
-        let worker = supervise(&fixture, Arc::default());
+        let engine = Arc::new(ScriptedEngine::default());
+        let worker = supervise(&fixture, engine.clone());
+        *engine.0.lock().unwrap() = Some(RequestError::ModelUnloaded {
+            cause: UnloadCause::MemoryPressure,
+        });
+        fixture.memory.0.store(2 * GIB, Ordering::Release);
         let start = Instant::now();
         fixture.inner.tick(start);
-        assert!(fixture.notifications.try_recv().is_err());
-
-        fixture.memory.0.store(GIB, Ordering::Release);
-        *fixture.memory.2.lock().unwrap() = Some(HostEmergency::EmergencyReserve);
-        fixture.inner.tick(start);
-        assert!(worker.terminated.load(Ordering::Acquire));
+        assert!(!worker.terminated.load(Ordering::Acquire));
         assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
         assert!(!*fixture.inner.admission.borrow());
+        assert!(fixture.inner.lock().supervised.is_none());
 
-        // Out of the emergency but not above P: still recovering.
-        *fixture.memory.2.lock().unwrap() = None;
-        fixture.memory.0.store(2 * GIB, Ordering::Release);
+        // Not above P: still recovering.
         fixture.inner.tick(start + Duration::from_secs(10));
         assert!(!*fixture.inner.admission.borrow());
         // Above P, then a failed sample restarts the five seconds.
@@ -699,140 +633,6 @@ mod tests {
         fixture.inner.tick(start + Duration::from_secs(21));
         assert!(*fixture.inner.admission.borrow());
         assert!(fixture.notifications.try_recv().is_err(), "nothing reloads");
-    }
-
-    /// In an emergency a job on the device gives way first: its start preempts the job once,
-    /// and the model is spared while the job is ending, however many ticks its reap takes, then
-    /// killed once the system refuses the job's kill or reap. Jobs stay held off until memory
-    /// recovers.
-    #[test]
-    fn an_emergency_preempts_the_devices_job_before_the_model() {
-        let mut fixture = fixture();
-        let worker = supervise(&fixture, Arc::default());
-        let device = fixture.inner.device.clone();
-        let job = device.try_job().expect("the device is free for a job");
-        let mut preemption = job.preemption();
-        let start = Instant::now();
-        fixture.memory.0.store(GIB, Ordering::Release);
-        *fixture.memory.2.lock().unwrap() = Some(HostEmergency::EmergencyReserve);
-        fixture.inner.tick(start);
-        assert!(!worker.terminated.load(Ordering::Acquire), "the model is kept while the job gives way");
-        assert!(fixture.notifications.try_recv().is_err());
-        assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_some(), "the job is preempted");
-        // The job is still being reaped: every tick of the emergency spares the model again,
-        // and preempts the job no more.
-        for tick in 1..=3 {
-            fixture.inner.tick(start + RESIDENT_SAMPLE_INTERVAL * tick);
-            assert!(!worker.terminated.load(Ordering::Acquire), "a job still being reaped spares the model");
-        }
-        assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_none(), "the job is preempted once");
-        // The system will not show the job gone: it frees nothing, and the model is killed.
-        job.unretired();
-        fixture.inner.tick(start);
-        assert!(worker.terminated.load(Ordering::Acquire), "an unretired job spares the model no more");
-        assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
-        drop(job);
-        assert!(device.try_job().is_none(), "no job starts while memory recovers");
-    }
-
-    /// A killed job spares the model as the system reports its death, on real processes. One
-    /// shown running does so however long it runs, past the bound a silent one gets. One shown
-    /// doing nothing, with the host getting nothing back, spares the model up to the bound and
-    /// is then taken for hung, whatever it still holds of the device; the model is killed, and
-    /// its reap, when it comes, still releases the device.
-    #[cfg(unix)]
-    #[test]
-    fn a_killed_job_spares_the_model_until_its_death_is_shown_hung() {
-        use crate::dying_process::{SILENCE, real};
-        let emergency = |fixture: &Fixture| {
-            fixture.memory.0.store(GIB, Ordering::Release);
-            *fixture.memory.2.lock().unwrap() = Some(HostEmergency::EmergencyReserve);
-        };
-
-        let running = real::running();
-        let fixture_running = fixture();
-        let worker = supervise(&fixture_running, Arc::default());
-        let job = fixture_running.inner.device.try_job().unwrap();
-        emergency(&fixture_running);
-        let start = Instant::now();
-        fixture_running.inner.tick(start);
-        job.dying(running.pid());
-        for look in 0..=3 {
-            fixture_running.inner.tick(start + SILENCE * look);
-            assert!(!worker.terminated.load(Ordering::Acquire), "a process shown running spares the model, look {look}");
-        }
-        running.reap();
-        drop(job);
-        fixture_running.inner.tick(start + SILENCE * 4);
-        assert!(worker.terminated.load(Ordering::Acquire), "the job gone, the emergency takes the model");
-
-        let silent = real::silent();
-        let mut fixture_silent = fixture();
-        let worker = supervise(&fixture_silent, Arc::default());
-        let device = fixture_silent.inner.device.clone();
-        let job = device.try_job().unwrap();
-        emergency(&fixture_silent);
-        let start = Instant::now();
-        fixture_silent.inner.tick(start);
-        job.dying(silent.pid());
-        fixture_silent.inner.tick(start);
-        fixture_silent.inner.tick(start + SILENCE - RESIDENT_SAMPLE_INTERVAL);
-        assert!(!worker.terminated.load(Ordering::Acquire), "silent short of the bound");
-        fixture_silent.inner.tick(start + SILENCE);
-        assert!(worker.terminated.load(Ordering::Acquire), "a death shown hung spares the model no more");
-        assert!(released_for_memory_pressure(fixture_silent.notifications.try_recv().unwrap()));
-        assert!(device.try_job().is_none(), "it still holds the device");
-        silent.reap();
-        drop(job);
-    }
-
-    #[test]
-    fn critical_kernel_pressure_kills_and_only_a_host_out_of_distress_recovers() {
-        let mut fixture = fixture();
-        let worker = supervise(&fixture, Arc::default());
-        let start = Instant::now();
-
-        // Swapping and thrashing are the engine's to answer; the guard waits.
-        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Swapping);
-        fixture.inner.tick(start);
-        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Thrashing);
-        fixture.inner.tick(start);
-        assert!(!worker.terminated.load(Ordering::Acquire));
-        assert!(*fixture.inner.admission.borrow());
-
-        // Headroom is far above the emergency reserve throughout.
-        *fixture.memory.1.lock().unwrap() = Some(HostDistress::KernelCritical);
-        *fixture.memory.2.lock().unwrap() = Some(HostEmergency::KernelCritical);
-        fixture.inner.tick(start);
-        assert!(worker.terminated.load(Ordering::Acquire));
-        assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
-        assert!(!*fixture.inner.admission.borrow());
-
-        // Distress of any kind holds admission closed however long it lasts.
-        *fixture.memory.1.lock().unwrap() = Some(HostDistress::Swapping);
-        fixture.inner.tick(start + Duration::from_secs(10));
-        fixture.inner.tick(start + Duration::from_secs(20));
-        assert!(!*fixture.inner.admission.borrow());
-        *fixture.memory.1.lock().unwrap() = None;
-        fixture.inner.tick(start + Duration::from_secs(21));
-        assert!(!*fixture.inner.admission.borrow());
-        fixture.inner.tick(start + Duration::from_secs(26));
-        assert!(*fixture.inner.admission.borrow());
-    }
-
-    #[test]
-    fn engine_unload_for_memory_pressure_is_a_memory_pressure_release() {
-        let mut fixture = fixture();
-        let engine = Arc::new(ScriptedEngine::default());
-        let worker = supervise(&fixture, engine.clone());
-        *engine.0.lock().unwrap() = Some(RequestError::ModelUnloaded {
-            cause: UnloadCause::MemoryPressure,
-        });
-        fixture.inner.tick(Instant::now());
-        assert!(!worker.terminated.load(Ordering::Acquire));
-        assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
-        assert!(!*fixture.inner.admission.borrow());
-        assert!(fixture.inner.lock().supervised.is_none());
     }
 
     #[test]

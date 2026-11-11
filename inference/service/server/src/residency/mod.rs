@@ -478,9 +478,6 @@ fn memory_shortage_message(shortage: &MemoryShortage) -> String {
         } => format!(
             "not enough memory right now: the model requires {required_bytes} bytes and {available_bytes} bytes are available"
         ),
-        MemoryShortage::UnderPressure {} => {
-            "the system is under heavy memory pressure: loading stopped to keep other programs responsive; close apps you aren't using or try again in a moment".to_owned()
-        }
     }
 }
 
@@ -1881,13 +1878,10 @@ mod tests {
 
     #[test]
     fn a_memory_shortage_keeps_its_kind_and_is_retryable() {
-        for shortage in [
-            MemoryShortage::Blocked {
-                required_bytes: 10,
-                available_bytes: 8,
-            },
-            MemoryShortage::UnderPressure {},
-        ] {
+        for shortage in [MemoryShortage::Blocked {
+            required_bytes: 10,
+            available_bytes: 8,
+        }] {
             let failure = ModelOperationFailure::MemoryShortage(shortage.clone());
             assert_eq!(failure.code(), MEMORY_SHORTAGE_FAILURE_CODE);
             assert!(failure.retryable());

@@ -1,18 +1,12 @@
 //! The measurement job's room claimed of the service owner, over the
-//! controlled domain's fake expert bank (`magnitude_executor::fixtures`): a
-//! claim the room beside the model holds is answered made at the first
-//! probe; one beyond it shrinks the bank once by what it is short, decided
-//! at a probe no resize ran across, and is made by the rows given back; one
-//! beyond what the bank holds above its floor is refused before anything
-//! shrinks. The fixture's heap reads the host's memory as first sampled,
-//! moved only by what the process itself takes and gives back
-//! (`StillHost`). Each runs on every backend discovery reports available
+//! controlled domain's fake expert bank (`magnitude_executor::fixtures`):
+//! the claim is committed memory on the device's ledger, which cache yields
+//! to at once, so it is answered as it is made: made where the model's
+//! committed memory leaves the room, refused with how short it is where it
+//! does not. Each runs on every backend discovery reports available
 //! (`bank_backends`).
 
-use magnitude_executor::{
-    fixtures::{bank_backends, bank_row, banked, TestFamily},
-    BankResize, ExecutorDomain, ExpertResidency, MeasurementRoom, ShrinkCause,
-};
+use magnitude_executor::fixtures::{bank_backends, banked, TestFamily};
 use magnitude_scheduler::{
     owner::Owner,
     protocol::{RoomAnswer, RoomGrant, RoomRefusal},
@@ -22,10 +16,6 @@ use owner_host::Host;
 use std::task::{Context, Poll, Waker};
 
 mod owner_host;
-
-/// The memory observations a claim gets to be answered within: a shrink
-/// begins at one, installs at the next and releases at the one after.
-const OBSERVATIONS: usize = 24;
 
 fn limits() -> ServiceLimits {
     ServiceLimits {
@@ -37,28 +27,10 @@ fn limits() -> ServiceLimits {
     }
 }
 
-/// The room beside the model at a probe of `domain`, and what its bank
-/// holds above its floor, read through a claim no device holds.
-fn room(domain: &mut ExecutorDomain<TestFamily>) -> (u64, u64) {
-    domain
-        .probe_memory()
-        .expect("the host's memory is in the Normal band, where no reclaim release runs");
-    let beyond = u64::MAX / 4;
-    domain.claim_measurement_room(beyond);
-    let Some(MeasurementRoom::Beyond { short, releasable }) = domain.measurement_room().unwrap() else {
-        panic!("a claim beyond the device is beyond the bank's floor")
-    };
-    domain.release_measurement_room();
-    (beyond - short, releasable)
-}
-
-/// An owner over a bank of four slots on `backend`'s device, the room
-/// beside it, what the bank holds above its floor, and the bytes of a slot.
-fn owner(backend: seismic::BackendName) -> (Host<TestFamily>, u64, u64, u64) {
-    let (mut domain, bindings) = banked(backend, 4, 4);
-    let row = bank_row(&domain);
-    let (room, releasable) = room(&mut domain);
-    (Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes)), room, releasable, row)
+/// An owner over a bank of four slots on `backend`'s device.
+fn owner(backend: seismic::BackendName) -> Host<TestFamily> {
+    let (domain, bindings) = banked(backend, 4, 4);
+    Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes))
 }
 
 fn answer(grant: &mut RoomGrant) -> Option<RoomAnswer> {
@@ -68,78 +40,29 @@ fn answer(grant: &mut RoomGrant) -> Option<RoomAnswer> {
     }
 }
 
-fn experts(host: &Host<TestFamily>) -> ExpertResidency {
-    host.owner().serving_census().unwrap().experts.expect("the load has an expert bank")
-}
-
-/// The slots a shrink for the measurement left, and the rows it gave back.
-fn shrunk(resize: &BankResize) -> (u64, u64) {
-    match *resize {
-        BankResize::Shrank { cause: ShrinkCause::Measurement, to, by, .. } => (to, by.get()),
-        other => panic!("a shrink for the measurement, not {other:?}"),
-    }
-}
-
-/// A claim the room holds is answered made at the first probe, and takes
-/// nothing of the bank.
+/// A claim the budget holds beside the model's committed memory is answered
+/// made as it is claimed, with no reading or resize waited for; released,
+/// a later claim stands on its own.
 #[test]
-fn a_claim_the_room_holds_is_answered_at_the_first_probe() {
+fn a_claim_within_the_budget_is_made_at_once() {
     for backend in bank_backends() {
-        let (mut host, room, _, _) = owner(backend);
-        let mut grant = host.owner_mut().claim_measurement_room(room);
-        host.observe();
+        let mut host = owner(backend);
+        let mut grant = host.owner_mut().claim_measurement_room(1);
         assert_eq!(answer(&mut grant), Some(RoomAnswer::Made));
-        let census = experts(&host);
-        assert_eq!((census.slots, census.last_resize), (4, None));
+        host.owner_mut().release_measurement_room();
+        let mut again = host.owner_mut().claim_measurement_room(1);
+        assert_eq!(answer(&mut again), Some(RoomAnswer::Made));
     }
 }
 
-/// A claim two rows beyond the room shrinks the bank for the measurement
-/// once, by the two rows it is short (`ExecutorDomain::shrink_expert_bank_by`:
-/// one shrink covering the claim's deficit, as every release settles to its
-/// size), and is answered made at a probe after that shrink finished: the
-/// rows the bank gave back are the room it reads.
+/// A claim past what the process may hold is refused as it is claimed,
+/// with how many bytes it is short: cache never refuses it, so only the
+/// model's committed memory can.
 #[test]
-fn a_claim_beyond_the_room_is_made_by_the_banks_shrinks() {
-    'backends: for backend in bank_backends() {
-        let (mut host, room, _, row) = owner(backend);
-        let mut grant = host.owner_mut().claim_measurement_room(room + 2 * row);
-        let mut resizes = Vec::new();
-        for observation in 0..OBSERVATIONS {
-            host.observe();
-            let census = experts(&host);
-            if let Some(resize) = census.last_resize.filter(|resize| resizes.last().map(|(_, last)| last) != Some(resize)) {
-                resizes.push((observation, resize));
-            }
-            let Some(answer) = answer(&mut grant) else {
-                continue;
-            };
-            assert_eq!(answer, RoomAnswer::Made);
-            let steps = resizes.iter().map(|(_, resize)| shrunk(resize)).collect::<Vec<_>>();
-            assert_eq!(steps, [(2, 2)], "one shrink, by the rows the claim was short");
-            let (made, _) = resizes.last().unwrap();
-            assert!(observation > *made, "answered at a probe after the last shrink finished, not across it");
-            assert_eq!(census.slots, 2);
-            continue 'backends;
-        }
-        panic!("the claim was not answered within {OBSERVATIONS} observations");
-    }
-}
-
-/// A claim short of the room by more than the bank holds above its floor
-/// is refused with why at the first probe, and nothing shrinks for it.
-#[test]
-fn a_claim_beyond_what_the_bank_can_free_is_refused_before_any_shrink() {
+fn a_claim_past_the_budget_is_refused_at_once_with_its_shortfall() {
     for backend in bank_backends() {
-        let (mut host, room, releasable, _) = owner(backend);
-        let mut grant = host.owner_mut().claim_measurement_room(room + releasable + 1);
-        host.observe();
-        let short = releasable + 1;
-        assert_eq!(
-            answer(&mut grant),
-            Some(RoomAnswer::Refused(RoomRefusal::BeyondFloor { short, releasable }))
-        );
-        let census = experts(&host);
-        assert_eq!((census.slots, census.last_resize), (4, None));
+        let mut host = owner(backend);
+        let mut grant = host.owner_mut().claim_measurement_room(u64::MAX / 4);
+        assert!(matches!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::Short { bytes })) if bytes > 0));
     }
 }

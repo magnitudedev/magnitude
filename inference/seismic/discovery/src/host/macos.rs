@@ -1,12 +1,9 @@
-//! macOS 15+: `sysctl hw.memsize`, Mach `HOST_VM_INFO64` and the kernel's
-//! memory pressure level.
+//! macOS 15+: `sysctl hw.memsize` and Mach `HOST_VM_INFO64`.
 //!
 //! macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA` against allocations, so
 //! no process memory limit applies.
 
-use super::{
-    DisplacementCounters, HostHeld, HostSample, KernelPressure, LimitVisibility, ObservationError,
-};
+use super::{HostHeld, HostStatus, LimitVisibility, ObservationError};
 use seismic_topology::{Reported, ReportedBy};
 use std::io;
 
@@ -134,50 +131,28 @@ pub(super) fn capacity() -> Result<Reported<u64>, String> {
     Ok(Reported::new(bytes, ReportedBy::MacOsMemsize))
 }
 
-/// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
-fn kernel_pressure() -> Result<KernelPressure, ObservationError> {
-    let name = "kern.memorystatus_vm_pressure_level";
-    let level = i32::from_ne_bytes(sysctl_exact(name).map_err(ObservationError::Failed)?);
-    match level {
-        1 => Ok(KernelPressure::Normal),
-        2 => Ok(KernelPressure::Warning),
-        4 => Ok(KernelPressure::Critical),
-        other => Err(ObservationError::Failed(format!(
-            "{name} reported unknown level {other}"
-        ))),
-    }
-}
-
-/// The pageout daemon's free-page target (`vm.vm_page_free_target`,
-/// XNU's `vm_page_free_target`, set at boot from RAM): the free pages the
-/// kernel reclaims toward, file pages first and then by compressing
-/// anonymous ones. `allocatable` counts free pages, so taking memory below
-/// this many free makes the kernel reclaim for it.
-fn free_target(reading: &VmReading) -> Result<u64, ObservationError> {
-    let name = "vm.vm_page_free_target";
-    let pages = sysctl_u64(name)
-        .map_err(ObservationError::Failed)?
-        .ok_or_else(|| ObservationError::Failed(format!("sysctl {name} reported no value")))?;
-    pages
-        .checked_mul(reading.page_size)
-        .ok_or_else(|| ObservationError::Failed(format!("{name} bytes overflow")))
-}
-
-/// Every page of programs' data the compressor holds, in RAM or swapped out
-/// (`vm.compressor_segment_pages_compressed`). Mach's
-/// `total_uncompressed_pages_in_compressor` is no such count: macOS 15
-/// keeps swapped segments in it, macOS 27 counts only the segments in RAM.
-fn compressed_pages() -> Result<u64, ObservationError> {
-    let name = "vm.compressor_segment_pages_compressed";
-    Ok(u64::from(u32::from_ne_bytes(
-        sysctl_exact(name).map_err(ObservationError::Failed)?,
-    )))
-}
-
-/// One Mach `HOST_VM_INFO64` reading, and the page size it counts in.
+/// One Mach `HOST_VM_INFO64` reading, the page size it counts in, and the
+/// machine's free-page target.
 pub(super) struct VmReading {
     pub(super) page_size: u64,
     pub(super) statistics: libc::vm_statistics64,
+    /// `vm.vm_page_free_target`: the free pages the pageout daemon keeps,
+    /// compressing, swapping and evicting other pages whenever free pages
+    /// fall below it.
+    pub(super) free_target: u64,
+}
+
+/// The machine's `vm.vm_page_free_target`, read once: the kernel sets it at
+/// boot from the machine's memory.
+fn free_target() -> Result<u64, ObservationError> {
+    static TARGET: std::sync::OnceLock<Result<u64, String>> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            sysctl_u64("vm.vm_page_free_target")?
+                .ok_or_else(|| "sysctl vm.vm_page_free_target reports no value".to_string())
+        })
+        .clone()
+        .map_err(ObservationError::Failed)
 }
 
 #[allow(deprecated)] // libc's Mach bindings are stable ABI; mach2 is not a dependency.
@@ -207,80 +182,52 @@ pub(super) fn vm_reading() -> Result<VmReading, ObservationError> {
     Ok(VmReading {
         page_size,
         statistics: unsafe { statistics.assume_init() },
+        free_target: free_target()?,
     })
 }
 
-pub(super) fn sample() -> Result<HostSample, ObservationError> {
+pub(super) fn sample() -> Result<HostStatus, ObservationError> {
     sample_of(&vm_reading()?)
 }
 
-/// macOS counts displacement: the Mach compressor's and swap's page
-/// counters.
-pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = Some(displacement);
-
-fn displacement() -> Result<DisplacementCounters, ObservationError> {
-    let statistics = vm_reading()?.statistics;
-    Ok(DisplacementCounters {
-        compressed_pages: statistics.compressions,
-        decompressed_pages: statistics.decompressions,
-        swapped_out_pages: statistics.swapouts,
-        swapped_in_pages: statistics.swapins,
-    })
-}
-
 /// The sample of one `HOST_VM_INFO64` reading.
-pub(super) fn sample_of(reading: &VmReading) -> Result<HostSample, ObservationError> {
+pub(super) fn sample_of(reading: &VmReading) -> Result<HostStatus, ObservationError> {
     let statistics = &reading.statistics;
-    // What can be taken without compressing or swapping a program's data:
-    // free pages, file-backed pages (clean ones are dropped, dirty ones
-    // written back to their files) and volatile purgeable pages (purged).
-    // A program's anonymous pages, on the active and inactive lists alike,
-    // leave RAM only through the compressor, so they are not available
-    // however idle. `free_count` includes speculative (read-ahead file)
-    // pages, which the external count may include too; they are left out of
-    // the free pages, so they are never counted twice and at most read-ahead
-    // is not counted.
+    // What can be taken without the OS reclaiming anything: free pages
+    // (`free_count`, which counts speculative read-ahead pages too, less
+    // `speculative_count`; vm_stat's "Pages free" is that difference
+    // already) and volatile purgeable pages (`purgeable_count`, purged at
+    // no one's cost), above the free-page target (`vm.vm_page_free_target`):
+    // macOS refills free pages up to that target by compressing, swapping
+    // and evicting other pages, so pages taken below it are never free
+    // without displacing someone (a bank that took them grew from 65 to 195
+    // slots while free pages stayed at the target, compressing a 24.7 GB
+    // program's 1.58M anonymous pages to 43k). File-backed pages
+    // (`external_page_count`) are not counted: macOS reclaims by page age
+    // across anonymous and file-backed pages alike, so taking them under
+    // pressure also compresses or swaps idle programs' anonymous pages.
     let free_pages = u64::from(statistics.free_count)
         .checked_sub(u64::from(statistics.speculative_count))
         .ok_or_else(|| {
             ObservationError::Failed("Mach speculative pages exceed free pages".into())
         })?;
-    let allocatable = free_pages
-        .checked_add(u64::from(statistics.external_page_count))
-        .and_then(|pages| pages.checked_add(u64::from(statistics.purgeable_count)))
-        .and_then(|pages| pages.checked_mul(reading.page_size))
+    let allocatable = (free_pages + u64::from(statistics.purgeable_count))
+        .saturating_sub(reading.free_target)
+        .checked_mul(reading.page_size)
         .ok_or_else(|| ObservationError::Failed("Mach allocatable overflow".into()))?;
-    // What the OS can make available by compressing other programs' data
-    // too: every page neither wired nor held by the compressor.
-    let obtainable = u64::from(statistics.free_count)
-        .checked_add(u64::from(statistics.active_count))
-        .and_then(|pages| pages.checked_add(u64::from(statistics.inactive_count)))
-        .and_then(|pages| pages.checked_mul(reading.page_size))
-        .ok_or_else(|| ObservationError::Failed("Mach obtainable overflow".into()))?;
-    let compressed = compressed_pages()?;
-    Ok(HostSample {
+    // The file-backed pages a load may count once (`Reclaim::CleanFileCache`).
+    let reclaimable = u64::from(statistics.external_page_count)
+        .checked_mul(reading.page_size)
+        .ok_or_else(|| ObservationError::Failed("Mach file-backed overflow".into()))?;
+    Ok(HostStatus {
         allocatable: Reported::new(allocatable, ReportedBy::MachAllocatablePages),
-        obtainable: Reported::new(obtainable, ReportedBy::MachMovablePages),
+        reclaimable,
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
-        kernel_pressure: Some(kernel_pressure()?),
-        free_target: Some(free_target(reading)?),
         held: Some(HostHeld {
             wired_bytes: pages_bytes(reading, statistics.wire_count, "wired")?,
             compressed_bytes: pages_bytes(reading, statistics.compressor_page_count, "compressor")?,
         }),
-        // The RAM the compressor's data would take as itself, less the RAM
-        // it occupies: what the OS freed by compressing it and swapping it
-        // out, once. macOS swaps only compressed segments, so the swap in
-        // use is already in it; added again, every byte swapped out under
-        // held pressure would read as two displaced and one freed, and the
-        // room would fall as fast as the host swaps, whatever is released.
-        displaced_bytes: Some(
-            compressed
-                .saturating_sub(u64::from(statistics.compressor_page_count))
-                .checked_mul(reading.page_size)
-                .ok_or_else(|| ObservationError::Failed("Mach displaced bytes overflow".into()))?,
-        ),
     })
 }
 

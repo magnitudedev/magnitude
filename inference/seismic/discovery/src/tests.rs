@@ -162,7 +162,6 @@ fn the_machine_is_discovered_and_sampled() {
     let sample = inventory.sample(&topology, &every);
     let host = sample.host_ram.as_ref().unwrap();
     assert!(host.allocatable.value > 0);
-    assert!(host.obtainable.value >= host.allocatable.value);
     assert_eq!(sample.volumes.len(), 1);
     assert_eq!(sample.volumes[0].0, served);
     assert!(sample.volumes[0].1.as_ref().unwrap().value > 0);

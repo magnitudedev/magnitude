@@ -260,11 +260,10 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, host_room, pin, place_process, volume_available, volume_identity, Core, DeviceNode,
-    DiscoveryError, DisplacementWindow, HostDisplacement, HostHeld, HostStatus, Inventory,
-    KernelPressure, LimitVisibility, MemoryNode, ObservationError, PciLocation, ProcessLimitKind,
-    ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus, Sample, Status,
-    DISPLACEMENT_CADENCE, DISPLACEMENT_HISTORY,
+    device_node, host_available, host_room, pin, HostAvailable, place_process, volume_available, volume_identity, Core, DeviceNode,
+    DiscoveryError, HostHeld, HostStatus, Inventory, LimitVisibility, MemoryNode, ObservationError,
+    PciLocation, ProcessLimitKind, ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy,
+    Reclaim, RuntimeStatus, Sample, Status,
 };
 pub use seismic_lang::forms::MetalPacking;
 /// Measuring work on a device (`seismic-measure`): the timing session, the

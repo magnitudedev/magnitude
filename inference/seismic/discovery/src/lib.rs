@@ -17,9 +17,8 @@ mod tests;
 
 pub use gather::DiscoveryError;
 pub use host::{
-    host_room, DisplacementWindow, HostDisplacement, HostHeld, HostStatus, KernelPressure, LimitVisibility,
-    ObservationError, ProcessLimitKind, ProcessMemoryLimit, DISPLACEMENT_CADENCE,
-    DISPLACEMENT_HISTORY,
+    host_available, host_room, HostAvailable, HostHeld, HostStatus, LimitVisibility, ObservationError,
+    ProcessLimitKind, ProcessMemoryLimit, Reclaim,
 };
 pub use inventory::Inventory;
 pub use processors::{

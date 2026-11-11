@@ -181,6 +181,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         structured: conveyor::Structured::new(8, reservation, host, groups, layers).unwrap(),
         slots,
         ceiling: slots,
+        resident: false,
         host_slots: 0,
         host_cap: None,
         places: 1,
@@ -1214,4 +1215,24 @@ fn every_placed_parts_stride_is_whole_u64s() {
         assert!(placed.layers.iter().all(|layer| rows(&layer.group_reads) % 2 == 0));
     }
     assert!(plan.place_stride(0, BankPart::FileTable).is_err(), "a part bound whole has no stride");
+}
+
+/// Item 63: a linked tier's landing rows are a committed claim at load, a
+/// request's misses and the hints' records (`landing_records`), each a
+/// record of every group as resident; unified memory lands in the bank's
+/// own records, which its floor holds.
+#[test]
+fn a_linked_tiers_landing_rows_are_its_loads_claim() {
+    let linked = beside(bank(&[37, 3], 0), HostTier::Linked(BYTES));
+    let unified = beside(bank(&[37, 3], 1), HostTier::Unified);
+    let row: u64 = linked
+        .groups()
+        .iter()
+        .map(|group| group.record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>())
+        .sum();
+    assert_eq!(
+        linked.landing().unwrap(),
+        Some(crate::memory::ledger::Need::LandingRows { tier: crate::planning::BankTier::Host, rows: linked.landing_records(), slot_bytes: row })
+    );
+    assert_eq!(unified.landing().unwrap(), None);
 }

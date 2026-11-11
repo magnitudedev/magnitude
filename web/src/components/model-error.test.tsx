@@ -18,12 +18,6 @@ describe("desktop failure presentation", () => {
     expect(html).not.toMatch(/PRIVATE|bytes|32358673408|title=|<details/)
     expect(html.match(/role="alert"/g)).toHaveLength(1)
   })
-  it("states a load stopped under pressure without any byte figure", () => {
-    const html = renderToStaticMarkup(<ModelLoadNotice failure={shortage({ _tag: "UnderPressure" })} />)
-    expect(html).toContain("Your computer is under heavy memory pressure")
-    expect(html).toContain("Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment.")
-    expect(html).not.toMatch(/PRIVATE|bytes|\d GB/)
-  })
   it("marks a failed row with a labelled amber indicator instead of an alert", () => {
     const html = renderToStaticMarkup(<ModelLoadFailureIndicator failure={memory} />)
     expect(html).toContain('aria-label="Not enough memory right now"')

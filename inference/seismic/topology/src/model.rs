@@ -109,9 +109,10 @@ pub enum ReportedBy {
     /// page neither wired nor held by the compressor: what the OS can make
     /// available, compressing other programs' data if it must.
     MachMovablePages,
-    /// macOS Mach `HOST_VM_INFO64`: free (less speculative), file-backed and
-    /// purgeable pages, what can be taken without compressing or swapping a
-    /// program's data.
+    /// macOS Mach `HOST_VM_INFO64`: free (less speculative) and purgeable
+    /// pages above `vm.vm_page_free_target`, what can be taken without the
+    /// OS reclaiming anything, so
+    /// without compressing or swapping a program's data.
     MachAllocatablePages,
     /// Windows `GlobalMemoryStatusEx`: the lesser of available physical
     /// memory and available commit.

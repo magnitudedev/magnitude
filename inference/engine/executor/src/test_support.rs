@@ -94,3 +94,36 @@ pub(crate) fn check_kernels(
     let kernels = std::path::Path::new(&manifest).join("../kernels/kernels");
     seismic_lang::source::check_beside(sources, &kernels).expect("the kernel sources check")
 }
+
+#[cfg(test)]
+/// The device the host has, selected as if the host had exactly `host_bytes`
+/// of memory free and no driver grant: the room a plan fits into is this
+/// figure, never the host's reading of the moment, so a test checks the same
+/// thing wherever it runs.
+pub(crate) fn selected_with_room(catalog: &seismic::Devices, host_bytes: u64) -> crate::platform::SelectedDevice {
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
+    let real = crate::platform::select_device(catalog, crate::ExecutionPath::Native, crate::platform::DeviceRequest::Automatic, &reserves)
+        .expect("the host has a device");
+    let mut status = real.reading.status.clone();
+    let host = status.sample.host_ram.as_mut().expect("the host reads its memory");
+    host.allocatable = seismic::Reported::new(host_bytes, host.allocatable.by);
+    host.reclaimable = 0;
+    host.limits.clear();
+    status.sample.grants.clear();
+    crate::platform::selected(&real.reading.topology, &status, &reserves, real.info, real.graph_cost)
+        .expect("a device with a fixed room is selected")
+}
+
+/// Whether `selected` is a device backend: a test that streams experts or
+/// measures a device's attention cases has nothing to run on the CPU backend
+/// (which holds no expert bank), so it passes by skipping there, but never on
+/// a build booked for a device backend ([`booked`]).
+#[cfg(test)]
+pub(crate) fn is_device_backend(selected: &crate::platform::SelectedDevice) -> bool {
+    let backend = selected.info.backend();
+    let device = backend != seismic::BackendName::Cpu;
+    if !device && booked().is_some_and(|booked| booked != seismic::BackendName::Cpu) {
+        panic!("the build was booked for {:?}, and this host selects {backend:?}", booked());
+    }
+    device
+}

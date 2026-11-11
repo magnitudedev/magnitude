@@ -25,15 +25,6 @@ pub struct Target {
     devices: Devices,
     device: Device,
     store: StoreId,
-    /// Host RAM's room as the pressed load reads it while it serves
-    /// (`HostRoom::Load`), its free headroom what the host can give
-    /// without displacing more of other programs' data than it held
-    /// displaced as this target opened, before the approach, the load
-    /// serving already. Read as allocatable alone, RAM the host freed by
-    /// swapping under the approach is room the load does not count, and a
-    /// press sized from it lands deeper below the load's line than its
-    /// deficit.
-    room: HostRoom,
 }
 
 impl Target {
@@ -49,13 +40,11 @@ impl Target {
             PressureStore::Device => unique_store(device.info().paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly)).iter().map(|path|
                 topology.access_path(*path).expect("placement belongs to topology").store()))?,
         };
-        let host = devices.status(topology, device.info().id()).sample.host_ram.map_err(|error| error.to_string())?;
-        let room = HostRoom::serving(&host, std::time::Instant::now());
-        Ok(Self { devices, device, store, room })
+        Ok(Self { devices, device, store })
     }
 
     pub fn reading(&self) -> Result<magnitude_executor::platform::DomainReading, String> {
-        observe_domains(&self.devices, &self.device, &MemoryReserves::of_machine(None), self.room)
+        observe_domains(&self.devices, &self.device, &MemoryReserves::of_machine(None))
             .map_err(|error| error.to_string())?.into_iter().find(|reading| reading.domain == self.store)
             .ok_or_else(|| "selected pressure store has no admission observation".into())
     }
@@ -64,8 +53,7 @@ impl Target {
         let reading = self.reading()?;
         // `name`: as the owner's memory readings name the store.
         Ok(json!({ "store": reading.identity, "name": format!("{:?}", reading.identity), "headroom_bytes": reading.headroom_bytes,
-            "ceiling_bytes": reading.ceiling_bytes, "planning_bytes": reading.thresholds.planning_bytes,
-            "band": format!("{:?}", reading.band) }))
+            "ceiling_bytes": reading.ceiling_bytes, "planning_bytes": reading.thresholds.planning_bytes }))
     }
 
     /// `bytes` of the selected store, host RAM's written from `seed` ([`written`]).

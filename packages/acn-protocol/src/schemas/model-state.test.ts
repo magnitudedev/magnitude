@@ -327,11 +327,11 @@ describe("LocalModelSchema invariants", () => {
     expect(Either.isLeft(decode(streamed({ _tag: "Unmeasured" }, { _tag: "Unmeasured" })))).toBe(true)
   })
 
-  it("takes a resize only as a shrink with its cause or a growth, each by at least one", () => {
+  it("takes a resize only as a shrink or a growth, each by at least one", () => {
     const decode = Schema.decodeUnknownEither(StreamingResizeSchema)
-    expect(Either.isRight(decode({ _tag: "Shrank", cause: "reclaim", to: 40, by: 1, atUnixMs: 12 }))).toBe(true)
+    expect(Either.isRight(decode({ _tag: "Shrank", to: 40, by: 1, atUnixMs: 12 }))).toBe(true)
     expect(Either.isRight(decode({ _tag: "Grew", from: 40, by: 1, atUnixMs: 12 }))).toBe(true)
-    expect(Either.isLeft(decode({ _tag: "Shrank", cause: "growth", to: 40, by: 1, atUnixMs: 12 }))).toBe(true)
+    expect(Either.isLeft(decode({ _tag: "Shrank", to: 40, by: 0, atUnixMs: 12 }))).toBe(true)
     expect(Either.isLeft(decode({ _tag: "Grew", from: 40, by: 0, atUnixMs: 12 }))).toBe(true)
   })
 

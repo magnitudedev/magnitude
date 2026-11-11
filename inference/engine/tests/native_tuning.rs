@@ -95,7 +95,6 @@ fn prepare_every_entry(
             artifacts: cache
                 .clone()
                 .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
-            reserves,
         },
     )
     .unwrap();

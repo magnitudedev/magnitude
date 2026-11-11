@@ -18,15 +18,12 @@
 //! preempted is gone ([`DeviceLock::admit_request`]): no point is timed beside a request.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::error::RequestError;
 use magnitude_engine::worker::protocol::RoomAnswer;
 use magnitude_service_contracts::models::ModelInstanceId;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
-
-use crate::dying_process::{self, DyingProcess};
 
 /// What a measurement beside an idle resident model asks of that model's worker.
 pub trait ResidentRoom: Send + Sync {
@@ -70,23 +67,11 @@ struct Sharing {
     idle: Option<IdleResident>,
     /// Counts the idle model's changes: each preempts a measurement beside it.
     idleness: u64,
-    job: Option<HeldJob>,
-    /// Host memory is short ([`DeviceLock::hold_off_jobs`]): no job starts, and a running one
-    /// gives way before any model does.
+    /// A job holds the device.
+    job: bool,
+    /// Memory is recovering ([`DeviceLock::hold_off_jobs`]): no job starts, and a running one
+    /// is preempted.
     held_off: bool,
-}
-
-/// A job holding the device, as far as host memory pressure reads it.
-#[derive(Clone, Debug)]
-enum HeldJob {
-    /// Running, or told to end by its preemption and not yet killed: its owner kills it at once.
-    Live,
-    /// Its process has been killed: it gives way as the system reports its death
-    /// ([`DyingProcess`]).
-    Dying(DyingProcess),
-    /// The system refused its kill or its reap ([`DeviceJob::unretired`]): it keeps the device
-    /// until a retry shows it gone, and gives no memory back meanwhile.
-    Unretired,
 }
 
 impl Default for DeviceLock {
@@ -143,12 +128,12 @@ impl Drop for DeviceJob {
     fn drop(&mut self) {
         match &mut self.hold {
             JobHold::Exclusive(guard) => {
-                self.sharing.send_modify(|sharing| sharing.job = None);
+                self.sharing.send_modify(|sharing| sharing.job = false);
                 drop(guard.take());
             }
             JobHold::Beside { resident } => {
                 resident.release();
-                self.sharing.send_modify(|sharing| sharing.job = None);
+                self.sharing.send_modify(|sharing| sharing.job = false);
             }
         }
         self.released
@@ -174,31 +159,6 @@ impl DeviceJob {
             JobHold::Exclusive(_) => None,
             JobHold::Beside { resident } => Some(resident),
         }
-    }
-
-    /// The system refused the job's process its kill or its reap: it keeps the device until a
-    /// retry shows it gone, and a host memory emergency spares the resident model for it no
-    /// longer ([`DeviceLock::job_giving_way`]).
-    pub fn unretired(&self) {
-        self.sharing.send_if_modified(|sharing| {
-            let marked = matches!(sharing.job, Some(HeldJob::Live | HeldJob::Dying(_)));
-            if marked {
-                sharing.job = Some(HeldJob::Unretired);
-            }
-            marked
-        });
-    }
-
-    /// The job's process `pid` is being killed: host memory pressure judges it by its death
-    /// from here on ([`DeviceLock::job_giving_way`]). One the system refused stays so: a retry
-    /// is not a death it shows. Nothing waits on this, so no one is woken.
-    pub fn dying(&self, pid: u32) {
-        self.sharing.send_if_modified(|sharing| {
-            if matches!(sharing.job, Some(HeldJob::Live)) {
-                sharing.job = Some(HeldJob::Dying(DyingProcess::new(pid)));
-            }
-            false
-        });
     }
 }
 
@@ -293,24 +253,6 @@ pub enum DeviceHold {
     Job(DeviceJob),
 }
 
-impl DeviceHold {
-    /// The system refused the worker's process its kill or its reap: a job's hold says so
-    /// ([`DeviceJob::unretired`]); a load's share is no job's.
-    pub fn unretired(&self) {
-        if let Self::Job(job) = self {
-            job.unretired();
-        }
-    }
-
-    /// The worker's process `pid` is being killed: a job's hold judges it by its death
-    /// ([`DeviceJob::dying`]); a load's share is no job's.
-    pub fn dying(&self, pid: u32) {
-        if let Self::Job(job) = self {
-            job.dying(pid);
-        }
-    }
-}
-
 impl DeviceLock {
     /// Share the device, without waiting: `None` while a job holds it.
     pub fn try_share(&self) -> Option<DeviceShare> {
@@ -338,7 +280,7 @@ impl DeviceLock {
                 return share;
             }
             // The sender lives as long as this lock.
-            let _ = sharing.wait_for(|sharing| sharing.job.is_none()).await;
+            let _ = sharing.wait_for(|sharing| !sharing.job).await;
         }
     }
 
@@ -348,7 +290,7 @@ impl DeviceLock {
     fn share_of(&self, guard: OwnedRwLockReadGuard<()>) -> Option<DeviceShare> {
         let mut shared = false;
         self.sharing.send_if_modified(|sharing| {
-            shared = sharing.job.is_none();
+            shared = !sharing.job;
             if shared {
                 sharing.shares += 1;
             }
@@ -376,50 +318,23 @@ impl DeviceLock {
     /// once the measurement's process is shown gone, which its owner waits for.
     pub async fn admit_request(&self) {
         // The sender lives as long as this lock.
-        let _ = self.sharing.subscribe().wait_for(|sharing| sharing.job.is_none()).await;
+        let _ = self.sharing.subscribe().wait_for(|sharing| !sharing.job).await;
     }
 
-    /// Hold jobs off while host memory is short (`held`), or no longer: the memory supervisor's
-    /// alone to say. Held off, no job starts, and one running is preempted at once: a job gives
-    /// way before any model does ([`Self::job_giving_way`]). Whether this call preempted a
-    /// job: only the hold's start preempts, so a job still ending from it is not preempted
-    /// again.
-    pub fn hold_off_jobs(&self, held: bool) -> bool {
+    /// Hold jobs off while memory recovers (`held`), or no longer: the memory supervisor's alone
+    /// to say. Held off, no job starts, and one running is preempted at once. Only the hold's
+    /// start preempts, so a job still ending from it is not preempted again.
+    pub fn hold_off_jobs(&self, held: bool) {
         let mut preempted = false;
         self.sharing.send_if_modified(|sharing| {
             let changed = sharing.held_off != held;
-            preempted = changed && held && sharing.job.is_some();
+            preempted = changed && held && sharing.job;
             sharing.held_off = held;
             changed
         });
         if preempted {
             self.wanted.send_modify(|wanted| *wanted += 1);
         }
-        preempted
-    }
-
-    /// Whether a job holds the device that is still giving way at `now`, the host at `headroom`:
-    /// running or about to be killed, or killed and not shown hung ([`DyingProcess`]), its kill or
-    /// reap not refused by the system ([`DeviceJob::unretired`]). While one does, host memory
-    /// pressure waits for what it frees before taking a model.
-    pub fn job_giving_way(&self, now: Instant, headroom: u64) -> bool {
-        // The look is taken outside the watch's lock, which loads and jobs take.
-        let pid = match &self.sharing.borrow().job {
-            Some(HeldJob::Live) => return true,
-            None | Some(HeldJob::Unretired) => return false,
-            Some(HeldJob::Dying(dying)) => dying.pid,
-        };
-        let look = dying_process::look(pid);
-        let mut giving_way = true;
-        self.sharing.send_if_modified(|sharing| {
-            // A job gone or refused since the look is judged at the next sample, on memory read
-            // after it.
-            if let Some(HeldJob::Dying(dying)) = &mut sharing.job {
-                giving_way = dying.giving_way(look, now, headroom);
-            }
-            false
-        });
-        giving_way
     }
 
     /// The device's changes from now on ([`DeviceChanges`]).
@@ -461,9 +376,9 @@ impl DeviceLock {
         // ends; no share starts while the write guard is held, so none starts beside it.
         let mut taken = false;
         self.sharing.send_if_modified(|sharing| {
-            taken = sharing.job.is_none() && !sharing.held_off;
+            taken = !sharing.job && !sharing.held_off;
             if taken {
-                sharing.job = Some(HeldJob::Live);
+                sharing.job = true;
             }
             taken
         });
@@ -482,9 +397,9 @@ impl DeviceLock {
         let wanted = self.wanted.subscribe();
         let mut taken = None;
         self.sharing.send_if_modified(|sharing| {
-            if let (Some(idle), 1, None, false) = (&sharing.idle, sharing.shares, &sharing.job, sharing.held_off) {
+            if let (Some(idle), 1, false, false) = (&sharing.idle, sharing.shares, sharing.job, sharing.held_off) {
                 taken = Some((Arc::clone(&idle.room), sharing.idleness));
-                sharing.job = Some(HeldJob::Live);
+                sharing.job = true;
             }
             taken.is_some()
         });

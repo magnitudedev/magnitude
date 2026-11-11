@@ -278,7 +278,6 @@ fn request_class(error: &RequestError) -> Class {
         RequestError::MemoryObservationUnavailable { .. } => {
             (unavailable, SERVER, "memory_observation_unavailable", true)
         }
-        RequestError::MemoryReclaim => (unavailable, SERVER, "memory_pressure", true),
         RequestError::ModelUnloaded {
             cause: UnloadCause::MemoryPressure,
         } => (unavailable, SERVER, "model_unloaded", true),
@@ -326,9 +325,6 @@ fn load_class(error: &LoadError) -> Class {
         ),
         LoadError::InsufficientMemory { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, SERVER, "insufficient_memory", true)
-        }
-        LoadError::MemoryPressure { .. } => {
-            (StatusCode::SERVICE_UNAVAILABLE, SERVER, "memory_pressure", true)
         }
         LoadError::MemoryObservationUnavailable { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -429,11 +425,6 @@ mod tests {
     #[test]
     fn engine_outcomes_use_the_integration_error_codes() {
         for (error, status, code) in [
-            (
-                RequestError::MemoryReclaim,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "memory_pressure",
-            ),
             (
                 RequestError::Overloaded,
                 StatusCode::SERVICE_UNAVAILABLE,

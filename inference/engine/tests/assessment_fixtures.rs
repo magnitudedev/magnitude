@@ -790,9 +790,13 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), unbounded, |_, _| {
-                Ok::<_, AssessmentError>(Ok(()))
-            })
+            .with_held_experts(
+                &definition,
+                HeldBound::of(None, draft.device().assessment_capacity_bytes()),
+                &synthetic_prices(),
+                unbounded,
+                |_, _| Ok::<_, AssessmentError>(Ok(())),
+            )
             .unwrap()
             .unwrap()
             .0
@@ -854,14 +858,14 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 }
 
 /// A 4-bit MoE on a 24 GB device holds as much of its bank as the room
-/// holds and merges its prompt passes, the plan's settle pricing each
-/// holding by what it saves: Qwen3.6 35B on the recorded RTX 3090,
-/// uncapped, planned on synthetic prices into the device's stable room
-/// beside its mandatory part, which holds one conversation's state at the
-/// model's whole 262,144-token context, and CUDA's blocks charged only the
-/// tails no allocation reuses: 240 of its 256 slots, the most that room
-/// admits that save anything on these prices (a load lends them the state
-/// no request has committed), and grows to no more than the room's 243; a
+/// holds and merges its prompt passes: Qwen3.6 35B on the recorded RTX
+/// 3090, uncapped, planned into the device's stable room beside its
+/// mandatory part (its arena among it), which holds one conversation's
+/// state at the model's whole 262,144-token context, and CUDA's blocks
+/// charged only the tails no allocation reuses: its ceiling every one of
+/// its 256 experts, structural, and its slots the most the room admits
+/// beside an arena holding a group of one place, no more than the room's
+/// 243 (a group's class beyond it is claimed as the group opens); a
 /// prompt pass covers at least 512 rows.
 #[test]
 fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
@@ -891,8 +895,8 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!(bank.slots, 240, "the bank holds the slots its room admits that save anything");
-    assert!((240..=243).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 243", bank.ceiling);
+    assert_eq!(bank.ceiling, 256, "the bank's ceiling is every expert");
+    assert!((240..=243).contains(&bank.slots), "{} slots: the bank holds the most slots the room's 243 admits", bank.slots);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
     assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
@@ -1035,13 +1039,12 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     };
 
     // The fit holds the most slots the room admits at the floor of places,
-    // and a load's settle of the fit's room on the machine's prices,
-    // confirmed by the same stable fit, holds no more (it may trade slots
-    // for prompt places); nor does a plan of half that room, as a release
-    // slower than another program's take leaves it while it serves.
+    // and a load's plan of the fit's room beside its arena, confirmed by
+    // the same stable fit, holds no more; nor does a plan of half that
+    // room, as a release slower than another program's take leaves it
+    // while it serves.
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
-    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let structure = &setup.structure;
     let stable = StableRoom {
         topology: &structure.topology,
@@ -1049,14 +1052,15 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         status: &structure.status,
         reserves: &structure.reserves,
     };
+    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let settled = |share: u64| {
         let room = |mandatory: u64| {
             let left = bound.saturating_sub(mandatory) / share;
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |candidate, charge| {
-                Ok::<_, AssessmentError>(match stable.fit(candidate, charge).unwrap().verdict {
+            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |_, charge| {
+                Ok::<_, AssessmentError>(match stable.fit(charge).unwrap().verdict {
                     AssessmentFitVerdict::Fits => Ok(()),
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
                 })

@@ -3638,6 +3638,10 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
     assert_eq!(digest(&packed[0]) != digest(&dense), vector);
 }
 
+/// The host memory a search test's device is selected with: a figure of the
+/// test's own, so its plan never depends on the host it runs on.
+const TUNING_HOST_ROOM: u64 = 16 << 30;
+
 /// A search of a streamed load forms and runs every streamed tuning case
 /// on the device, its all-defaults configuration included, over operands
 /// bound as a step binds them: the fused route (`routed_route_streamed`)
@@ -3669,13 +3673,10 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     // sized from the CPUs the process may run on.
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let selected = crate::platform::select_device(
-        &catalog,
-        crate::ExecutionPath::Native,
-        crate::platform::DeviceRequest::Automatic,
-        &crate::platform::MemoryReserves::of_machine(None),
-    )
-    .unwrap();
+    let selected = crate::test_support::selected_with_room(&catalog, TUNING_HOST_ROOM);
+    if !crate::test_support::is_device_backend(&selected) {
+        return;
+    }
     let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
     // The planning fixture (an attention block, which every backend runs)
     // three times, the later ones its first's mixer (tied), each with its
@@ -3765,7 +3766,9 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             },
         )
         .unwrap()
-        .with_bank::<crate::AssessmentMemoryCharge>(&definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
+        .streaming::<crate::AssessmentMemoryCharge>(&definition, None)
+        .unwrap()
+        .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
         .unwrap()
         .into_draft();
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
@@ -3828,13 +3831,10 @@ fn a_compressed_load_searches_its_attention_cases_on_the_device() {
     }
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let selected = crate::platform::select_device(
-        &catalog,
-        crate::ExecutionPath::Native,
-        crate::platform::DeviceRequest::Automatic,
-        &crate::platform::MemoryReserves::of_machine(None),
-    )
-    .unwrap();
+    let selected = crate::test_support::selected_with_room(&catalog, TUNING_HOST_ROOM);
+    if !crate::test_support::is_device_backend(&selected) {
+        return;
+    }
     let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
     let (definition, manifest) = compressed(CompressedForm::FullAndReuse);
     let draft = crate::ExecutionPlanner::prepare(
