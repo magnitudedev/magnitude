@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { fitPlacementPhrase, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -37,6 +37,7 @@ const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, me
   { kind: memory === "Device" ? "Device" : memory === "Unified" ? "Unified" : "Host", bytes: assessment.placement.deviceBytes },
   { kind: "Host", bytes: assessment.placement.hostBytes },
   { kind: "Disk", bytes: assessment.placement.diskBytes },
+  { kind: "Lookup", bytes: assessment.placement.lookupDiskBytes },
 ]
 
 /** The estimate at the context the speed figure stands for: the sample nearest min(50K, served). */
@@ -48,7 +49,7 @@ const speedOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>): n
 }
 
 /** One quant as this machine would run it, from its assessment. */
-export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number }, assessment: LocalModelAssessment | null, memory: ServingMemory, measuring = false): QuantView => {
+export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number; readonly drafterBytes?: number }, assessment: LocalModelAssessment | null, memory: ServingMemory, measuring = false): QuantView => {
   const fits = assessment?._tag === "Fits" ? assessment : null
   return {
     key: quant.key,
@@ -58,6 +59,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     repository: quant.repository,
     sizeBytes: quant.sizeBytes,
     downloadBytes: quant.downloadBytes,
+    drafterBytes: quant.drafterBytes ?? 0,
     fits: fits !== null,
     measuring: measuring || (fits !== null && fits.residency.performance._tag === "Pending"),
     speed: fits ? speedOf(fits) : null,
@@ -66,6 +68,19 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     servedContext: fits?.served.contextLength ?? null,
     quality: null,
   }
+}
+
+/**
+ * What a quant's download brings beside the model itself, when it brings anything: its drafter, and a vision projector
+ * the model's size leaves out; `"Includes 2.06 GB DFlash 2 drafter"`. None when it is the model alone.
+ */
+export const downloadContents = (model: Pick<OfferedModel, "drafter">, quant: Pick<QuantView, "sizeBytes" | "downloadBytes" | "drafterBytes">): string | null => {
+  const projector = quant.downloadBytes - quant.sizeBytes
+  const parts = [
+    ...(quant.drafterBytes > 0 && model.drafter ? [`${formatStorageSize(quant.drafterBytes)} ${model.drafter.method} drafter`] : []),
+    ...(projector > 0 ? [`${formatStorageSize(projector)} vision projector`] : []),
+  ]
+  return parts.length === 0 ? null : `Includes ${parts.join(" and ")}`
 }
 
 /** A transfer in progress for a model: its first download or an update. */
@@ -169,7 +184,7 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), downloadBytes: model.storageBytes + (drafter?.sizeBytes ?? 0) }))),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0 }))),
     recommended: Option.getOrNull(recommendation.chosen),
   }
 }

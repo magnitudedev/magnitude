@@ -60,7 +60,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         requiredSystemMemoryBytes: 0,
         breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
       },
-      placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
+      placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0, lookupDiskBytes: 0 },
       residency: {
         _tag: "Resident",
         performance: {

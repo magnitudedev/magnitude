@@ -66,16 +66,19 @@ pub enum Holding {
     Banked { group: usize },
 }
 
-/// A load's weights as their files store them, by where it holds them as it
-/// runs: `held` in the serving device's memory (a table read by rows among
-/// them, its rows in the OS file cache), `host` the routed experts only its
-/// host tier holds in host RAM, and `streamed` the routed experts neither
-/// holds, read from the model file as steps miss them.
+/// A load's weights as their files store them, split by where it holds them
+/// as it runs, so the four sum to the model's stored weights: `held` in the
+/// serving device's memory, `host` the routed experts only its host tier
+/// holds in host RAM, `streamed` the routed experts neither holds, read from
+/// the model file as steps miss them, and `tables` the rows of its tables read
+/// by row ([`ModelLoadPlan::unheld_table_bytes`]) that no slot holds, which
+/// steps look up a few rows at a time wherever the OS keeps the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WeightPlacement {
     pub held: u64,
     pub host: u64,
     pub streamed: u64,
+    pub tables: u64,
 }
 
 /// The rows of a streamed gathered table.
@@ -1552,21 +1555,18 @@ impl ModelLoadPlan {
         })
     }
 
-    /// The stored bytes of the model's weights the load does not hold, read
-    /// from its file as steps name them: the experts neither its expert bank
-    /// nor its host tier holds ([`super::ExpertBankPlan::unheld_bytes`]), each
-    /// streamed table's rows beyond its slots ([`WeightPlan::unheld_bytes`])
-    /// and each host table's beyond its row cache. None of a load that holds
-    /// every weight whole.
-    pub fn unheld_bytes(&self) -> Result<u64, String> {
-        let overflow = || "unheld weight bytes overflow".to_owned();
-        let experts = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::unheld_bytes)?;
-        let tables = weight_storages(self)?
+    /// The stored bytes of the rows of the load's tables read by row that
+    /// no slot holds: each streamed table's rows beyond its slots
+    /// ([`WeightPlan::unheld_bytes`]) and each host table's beyond its row
+    /// cache. None of a load that holds every table whole.
+    pub fn unheld_table_bytes(&self) -> Result<u64, String> {
+        let overflow = || "unheld table bytes overflow".to_owned();
+        let streamed = weight_storages(self)?
             .into_iter()
-            .try_fold(experts, |total, (_, weight)| total.checked_add(weight.unheld_bytes()?).ok_or_else(overflow))?;
-        self.host_tables.iter().try_fold(tables, |total, table| {
+            .try_fold(0u64, |total, (_, weight)| total.checked_add(weight.unheld_bytes()?).ok_or_else(overflow))?;
+        self.host_tables.iter().try_fold(streamed, |total, table| {
             let rows = table.shape[0];
-            (table.bytes / rows)
+            representation_bytes(table.source, &[1, table.columns()])?
                 .checked_mul(rows - crate::streamed_table::cached_rows(rows))
                 .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(overflow)
@@ -1625,20 +1625,20 @@ impl ModelLoadPlan {
                 stored = stored.checked_add(representation_bytes(weight.source, &weight.stored_shape())?).ok_or_else(overflow)?;
             }
         }
+        let host = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::host_only_bytes)?;
         for table in &self.host_tables {
             if counted.insert((table.component, table.descriptor.name.clone())) {
-                stored = stored.checked_add(representation_bytes(table.source, &table.shape)?).ok_or_else(overflow)?;
+                let rows = table.shape[0];
+                stored = representation_bytes(table.source, &[rows, table.columns()])?.checked_add(stored).ok_or_else(overflow)?;
             }
         }
-        let (host, streamed) = match &self.bank {
-            Some(bank) => (bank.host_only_bytes()?, bank.unheld_bytes()?),
-            None => (0, 0),
-        };
-        let held = stored
-            .checked_sub(host)
-            .and_then(|rest| rest.checked_sub(streamed))
+        let streamed = self.bank.as_ref().map_or(Ok(0), super::ExpertBankPlan::unheld_bytes)?;
+        let tables = self.unheld_table_bytes()?;
+        let held = [host, streamed, tables]
+            .into_iter()
+            .try_fold(stored, u64::checked_sub)
             .ok_or("a plan's tiers hold more than its weights")?;
-        Ok(WeightPlacement { held, host, streamed })
+        Ok(WeightPlacement { held, host, streamed, tables })
     }
 
     /// The host tier's slots beyond its landing reserve; none without a

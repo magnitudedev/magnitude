@@ -47,14 +47,12 @@ const decodeFamilies = Schema.decodeUnknownSync(Schema.Array(LocalModelFamilySch
 export const projectModelFamilies = (families: readonly NativeModelFamily[]): readonly LocalModelFamily[] =>
   decodeFamilies(families)
 
-/** The bytes a rung still has to download: none once it is on this computer. */
+/** The bytes a rung still has to download: its stored bytes, its catalog drafter among them unless withheld; none once it is on this computer. */
 const remainingDownloadBytes = (model: CatalogLocalModel): number => {
   switch (model.acquisitionState._tag) {
     case "NotInstalled":
     case "InstallFailed":
-      return model.storageBytes + (model.drafterWithheld
-        ? 0
-        : Option.match(model.catalogData.drafter, { onNone: () => 0, onSome: ({ sizeBytes }) => sizeBytes }))
+      return model.storageBytes
     default:
       return 0
   }

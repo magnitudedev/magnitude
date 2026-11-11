@@ -943,15 +943,17 @@ export const LocalModelMemorySchema = Schema.Struct({
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
 /**
- * Where a fitting model's weights are held as it runs, as its files store them, so the three sum to its weights:
- * `deviceBytes` in the serving device's memory (GPU memory, or unified memory on Apple silicon), `hostBytes` the routed
- * experts only a streamed model's host tier holds in host RAM, and `diskBytes` the routed experts neither holds, read
- * from the model file as needed.
+ * Where a fitting model's weights are held as it runs, as its files store them, so the four sum to its weights:
+ * `deviceBytes` in the serving device's memory (GPU memory, or unified memory on Apple silicon), `hostBytes` in host RAM
+ * beside a discrete device, `diskBytes` the routed experts neither holds, streamed from the model file as steps miss
+ * them, and `lookupDiskBytes` the rows of tables read by row (an embedding) that host RAM has no room to cache beside
+ * the model, which each token looks up a few rows of on disk.
  */
 export const LocalModelPlacementSchema = Schema.Struct({
   deviceBytes: NonNegativeSafeInteger,
   hostBytes: NonNegativeSafeInteger,
   diskBytes: NonNegativeSafeInteger,
+  lookupDiskBytes: NonNegativeSafeInteger,
 })
 export type LocalModelPlacement = typeof LocalModelPlacementSchema.Type
 

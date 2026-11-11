@@ -9587,11 +9587,12 @@
       },
       "ModelPlacement": {
         "type": "object",
-        "description": "Where a fitting model's weights are held as it runs, as its files store them, so the three sum\nto its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on\nApple silicon), a table read by rows among them; `host_bytes` the routed experts only a\nstreamed model's host tier holds, in host RAM beside a discrete device; `disk_bytes` the routed\nexperts neither holds, read from the model file as needed. What it holds beside its weights is\nits memory breakdown's.",
+        "description": "Where a fitting model's weights are held as it runs, as its files store them, so the four sum\nto its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on\nApple silicon); `host_bytes` in host RAM beside a discrete device; `disk_bytes` the routed\nexperts neither holds, streamed from the model file as steps miss them; `lookup_disk_bytes` the\nrows of tables read by row (an embedding) that host RAM has no room to cache beside the model,\nwhich each token looks up a few rows of on disk. What it holds beside its weights is its memory\nbreakdown's.",
         "required": [
           "deviceBytes",
           "hostBytes",
-          "diskBytes"
+          "diskBytes",
+          "lookupDiskBytes"
         ],
         "properties": {
           "deviceBytes": {
@@ -9605,6 +9606,11 @@
             "minimum": 0
           },
           "diskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lookupDiskBytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0

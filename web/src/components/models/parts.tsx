@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { Skeleton } from "../ui/skeleton"
-import { ArrowSquareOutIcon, CheckIcon, CubeIcon, GraphicsCardIcon, HardDrivesIcon, MemoryIcon } from "@phosphor-icons/react"
+import { ActionTooltip } from "../ui/tooltip"
+import { ArrowSquareOutIcon, CheckIcon, CubeIcon, GraphicsCardIcon, HardDrivesIcon, InfoIcon, MemoryIcon } from "@phosphor-icons/react"
 import { formatContext, formatMemoryCapacity, formatStorageSize } from "@magnitudedev/client-common"
 import { cn } from "@/lib/utils"
 import { modelLabs, type ModelLab } from "../model-logo"
@@ -50,15 +51,23 @@ const tierColor: Record<PlacementTier["kind"], string> = {
   Unified: "bg-blue-600 dark:bg-blue-400",
   Host: "bg-blue-300 dark:bg-blue-700",
   Disk: "bg-slate-300 dark:bg-slate-600",
+  Lookup: "border border-dashed border-slate-400 dark:border-slate-500",
 }
 const tierPhrase: Record<PlacementTier["kind"], string> = {
   Device: "held in GPU",
   Unified: "held in memory",
   Host: "held in RAM",
-  Disk: "read from SSD as needed",
+  Disk: "streamed from SSD",
+  Lookup: "lookup table on SSD",
+}
+const tierHint: Partial<Record<PlacementTier["kind"], string>> = {
+  Lookup: "Too large to keep in memory. Each token reads only a tiny part of it, so it barely affects speed.",
 }
 
-/** How a quant runs: what stays in fast memory, and what is read from the next tier while it runs. */
+/**
+ * How a quant runs: what stays in fast memory, what streams from the next tier while it runs, and a lookup table too
+ * large to cache, which stays on disk and costs a few rows per token.
+ */
 export function PlacementBar({ quant }: { quant: QuantView }) {
   const tiers = quant.placement.filter(tier => tier.bytes > 0)
   const total = tiers.reduce((sum, tier) => sum + tier.bytes, 0)
@@ -69,7 +78,14 @@ export function PlacementBar({ quant }: { quant: QuantView }) {
       {tiers.map(tier => <div key={tier.kind} className={cn("h-2 min-w-1 rounded-full", tierColor[tier.kind])} style={{ width: `${tier.bytes / total * 100}%` }} />)}
     </div>
     <p className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-slate-500">
-      {tiers.map(tier => <span key={tier.kind} className="inline-flex items-center gap-1.5 whitespace-nowrap"><span className={cn("size-2 rounded-full", tierColor[tier.kind])} /><span className="font-medium text-slate-700 dark:text-slate-300">{formatStorageSize(tier.bytes)}</span>{tierPhrase[tier.kind]}</span>)}
+      {tiers.map(tier => {
+        const hint = tierHint[tier.kind]
+        return <span key={tier.kind} className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          <span className={cn("size-2 rounded-full", tierColor[tier.kind], "border-solid")} />
+          <span className="font-medium text-slate-700 dark:text-slate-300">{formatStorageSize(tier.bytes)}</span>{tierPhrase[tier.kind]}
+          {hint && <ActionTooltip label={hint} trigger={<button type="button" aria-label={hint} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />}
+        </span>
+      })}
     </p>
   </div>
 }

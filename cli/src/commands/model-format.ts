@@ -256,7 +256,8 @@ export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment
       renderFields([
         [servingMemoryLabel[memory], formatMemorySize(value.placement.deviceBytes)],
         ...(memory !== "Device" || value.placement.hostBytes === 0 ? [] : [["RAM", formatMemorySize(value.placement.hostBytes)] as const]),
-        ...(value.placement.diskBytes === 0 ? [] : [["Read from disk", formatMemorySize(value.placement.diskBytes)] as const]),
+        ...(value.placement.diskBytes === 0 ? [] : [["Streamed from SSD", formatMemorySize(value.placement.diskBytes)] as const]),
+        ...(value.placement.lookupDiskBytes === 0 ? [] : [["Stays on SSD", formatMemorySize(value.placement.lookupDiskBytes)] as const]),
       ]),
       "",
       "Estimated decode speed",

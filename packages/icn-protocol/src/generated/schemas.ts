@@ -2890,6 +2890,7 @@ export const ModelPlacement = S.Struct({
   deviceBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   diskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   hostBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lookupDiskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ModelPlacement = S.Schema.Type<typeof ModelPlacement>
 export type ModelPlacementEncoded = S.Schema.Encoded<typeof ModelPlacement>

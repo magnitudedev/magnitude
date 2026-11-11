@@ -68,28 +68,43 @@ pub struct MemoryBreakdown {
 }
 
 /// How a fitting plan holds the model's weights as it runs, as its files
-/// store them, so the three sum to the weights' stored bytes: `device_bytes`
+/// store them, so the four sum to the weights' stored bytes: `device_bytes`
 /// held in the serving device's memory (GPU memory, or unified memory on
-/// Apple silicon), `host_bytes` the routed experts only a streamed plan's
-/// host tier holds, in host RAM beside a discrete device, and `disk_bytes`
-/// the routed experts neither holds, which its misses read from the model
-/// file (`ModelLoadPlan::weight_placement`). A table read by rows (an
-/// embedding, an n-gram table) is held: its rows are read from the file as
-/// they are named and stay in the OS file cache. What the plan holds beside
-/// its weights (the conversation's state, graphs, buffers) is its
-/// [`MemoryBreakdown`]'s, not its placement's.
+/// Apple silicon), `host_bytes` held in host RAM beside a discrete device,
+/// `disk_bytes` the routed experts neither holds, which its misses stream
+/// from the model file, and `lookup_disk_bytes` the rows of tables read by
+/// row (an embedding) that the OS cannot keep in host RAM beside the plan, so
+/// steps look up their few rows on disk. Rows host RAM has room for are held
+/// there, in the OS file cache (`ModelLoadPlan::weight_placement`). What the
+/// plan holds beside its weights (the conversation's state, graphs, buffers)
+/// is its [`MemoryBreakdown`]'s, not its placement's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelPlacement {
     pub device_bytes: u64,
     pub host_bytes: u64,
     pub disk_bytes: u64,
+    pub lookup_disk_bytes: u64,
 }
 
 impl ModelPlacement {
-    /// The placement of `load`'s weights.
-    pub fn of(load: &crate::ModelLoadPlan) -> Result<Self, String> {
-        let crate::WeightPlacement { held, host, streamed } = load.weight_placement()?;
-        Ok(Self { device_bytes: held, host_bytes: host, disk_bytes: streamed })
+    /// The placement of `load`'s weights in a fit of `domains`: its table
+    /// rows no slot holds go where the OS file cache holds them, in host RAM
+    /// when its remaining room takes them all (the device's memory, of
+    /// unified memory), else on disk.
+    pub fn of(load: &crate::ModelLoadPlan, domains: &[DomainFit], topology: &DeviceTopology) -> Result<Self, String> {
+        let crate::WeightPlacement { held, host, streamed, tables } = load.weight_placement()?;
+        let host_ram = domains.iter().find(|domain| {
+            topology.store(domain.domain).is_some_and(|store| matches!(store.kind(), seismic::StoreKind::HostRam))
+        });
+        let cached = host_ram.is_none_or(|domain| u64::try_from(domain.remaining_bytes).is_ok_and(|room| room >= tables));
+        let overflow = || "placement bytes overflow".to_owned();
+        Ok(match (cached, host_ram.map(|domain| domain.role)) {
+            (false, _) => Self { device_bytes: held, host_bytes: host, disk_bytes: streamed, lookup_disk_bytes: tables },
+            (true, Some(DomainRole::Allocation)) => {
+                Self { device_bytes: held.checked_add(tables).ok_or_else(overflow)?, host_bytes: host, disk_bytes: streamed, lookup_disk_bytes: 0 }
+            }
+            (true, _) => Self { device_bytes: held, host_bytes: host.checked_add(tables).ok_or_else(overflow)?, disk_bytes: streamed, lookup_disk_bytes: 0 },
+        })
     }
 }
 
@@ -615,7 +630,7 @@ pub fn assess_execution_fit(
         Ok(ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             breakdown: charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
-            placement: ModelPlacement::of(draft.load()).map_err(AssessmentError::Memory)?,
+            placement: ModelPlacement::of(draft.load(), &fit.domains, topology).map_err(AssessmentError::Memory)?,
             domains: fit.domains,
             bank: draft.load().expert_bank().cloned(),
         }))

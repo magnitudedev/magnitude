@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils"
 import { cardClass, LabMark, MachineCard, Section } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
+import { downloadContents } from "./data"
 import type { UnrunnableFile } from "./your-models"
 import type { MachineView, QuantView } from "./view"
 
@@ -132,7 +133,10 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
       {measuring ? <Button disabled><DownloadSimpleIcon />Download</Button> : <>
         {picked && pickedQuant && (discovered.length > 0 || owned.size > 0) && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
         {picked && pickedQuant
-          ? <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
+          ? <>
+            {downloadContents(picked, pickedQuant) && <span className="mr-1 text-xs text-slate-500">{downloadContents(picked, pickedQuant)}</span>}
+            <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
+          </>
           : <Button onClick={onFinish}>Continue</Button>}
       </>}
     </div>

@@ -12,7 +12,7 @@ const resident = (deviceBytes: number, hostBytes: number): LocalModelFitsAssessm
   profile: { contextLength: 32_768 },
   served: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 10 * GB, contextBytes: 2 * GB, overheadBytes: GB } },
-  placement: { deviceBytes, hostBytes, diskBytes: 0 },
+  placement: { deviceBytes, hostBytes, diskBytes: 0, lookupDiskBytes: 0 },
   residency: { _tag: "Resident", performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }] } },
 })
 

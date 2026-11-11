@@ -2784,12 +2784,13 @@ pub struct MemoryBreakdown {
     pub overhead_bytes: u64,
 }
 
-/// Where a fitting model's weights are held as it runs, as its files store them, so the three sum
+/// Where a fitting model's weights are held as it runs, as its files store them, so the four sum
 /// to its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on
-/// Apple silicon), a table read by rows among them; `host_bytes` the routed experts only a
-/// streamed model's host tier holds, in host RAM beside a discrete device; `disk_bytes` the routed
-/// experts neither holds, read from the model file as needed. What it holds beside its weights is
-/// its memory breakdown's.
+/// Apple silicon); `host_bytes` in host RAM beside a discrete device; `disk_bytes` the routed
+/// experts neither holds, streamed from the model file as steps miss them; `lookup_disk_bytes` the
+/// rows of tables read by row (an embedding) that host RAM has no room to cache beside the model,
+/// which each token looks up a few rows of on disk. What it holds beside its weights is its memory
+/// breakdown's.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2797,6 +2798,7 @@ pub struct ModelPlacement {
     pub device_bytes: u64,
     pub host_bytes: u64,
     pub disk_bytes: u64,
+    pub lookup_disk_bytes: u64,
 }
 
 /// An estimated decode speed at one context depth, in tokens per second per conversation, from

@@ -427,6 +427,7 @@ mod tests {
                 device_bytes: 50,
                 host_bytes: 0,
                 disk_bytes: 0,
+                lookup_disk_bytes: 0,
             },
             residency: ModelResidency::Resident {
                 performance: ModelPerformance::Estimated {

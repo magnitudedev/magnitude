@@ -511,6 +511,7 @@ pub(crate) fn model_assessment(
                 device_bytes: placement.device_bytes,
                 host_bytes: placement.host_bytes,
                 disk_bytes: placement.disk_bytes,
+                lookup_disk_bytes: placement.lookup_disk_bytes,
             },
             residency: model_residency(residency, &performance_depths(fit_context_tokens))?,
             projector,

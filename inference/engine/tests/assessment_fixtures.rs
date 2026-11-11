@@ -1085,18 +1085,20 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
 }
 
 /// A fit's placement is where its weights are held as they run, as stored,
-/// so every plan of the same weights places the same bytes. Qwen3.6 35B on
-/// the M4 Pro resident holds all of them in unified memory, its token table
-/// (read by rows) among them; with room for its whole weights and nothing
-/// beside them it streams, reading from disk exactly the experts its bank
-/// does not hold; on the recorded RTX 3090 with 8 GB of its device reserved,
-/// host RAM holds the experts only its host tier holds, and disk those
-/// neither holds.
+/// so every plan of the same weights places the same bytes. Qwen3.6 35B's
+/// token table is read by row: its rows beyond its slots are held in host
+/// RAM's file cache when host RAM has room left for them (unified memory on
+/// the M4 Pro, so in memory), else looked up on disk, and never counted as
+/// streamed. On the M4 Pro resident it holds everything in unified memory;
+/// with room for its whole weights and nothing beside them it streams,
+/// reading from disk exactly the experts its bank does not hold; on the
+/// recorded RTX 3090 with 8 GB of its device reserved, host RAM holds the
+/// experts only its host tier holds, and disk those neither holds.
 #[test]
 fn a_fits_placement_is_where_its_weights_are_held() {
     let scratch = Scratch::new("qwen36-placement");
     let package = qwen36_35b(&scratch);
-    let total = |fit: &ExecutionFit| fit.placement.device_bytes + fit.placement.host_bytes + fit.placement.disk_bytes;
+    let total = |fit: &ExecutionFit| fit.placement.device_bytes + fit.placement.host_bytes + fit.placement.disk_bytes + fit.placement.lookup_disk_bytes;
     // Each layer's routed experts as stored that fall in `[from, to)` of its
     // expert order, given in slots.
     let experts = |fit: &ExecutionFit, held: &dyn Fn(u64, u64) -> u64| {
@@ -1119,7 +1121,15 @@ fn a_fits_placement_is_where_its_weights_are_held() {
     };
     let whole = whole.draft();
     assert!(whole.load().target().iter().any(|weight| weight.streamed().is_some()), "the token table is streamed by rows");
-    assert_eq!((resident.placement.host_bytes, resident.placement.disk_bytes), (0, 0), "a table read by rows is held");
+    let rows = whole.load().unheld_table_bytes().unwrap();
+    assert!(rows > 0, "the token table's slots hold some of its rows");
+    // Where a fit's table rows go: RAM's file cache when its room takes them.
+    let looked_up = |fit: &ExecutionFit| {
+        let room = fit.domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap().remaining_bytes;
+        if room >= rows as i64 { 0 } else { rows }
+    };
+    assert_eq!(looked_up(&resident), 0, "unified memory has room for the table beside the model");
+    assert_eq!((resident.placement.host_bytes, resident.placement.disk_bytes, resident.placement.lookup_disk_bytes), (0, 0, 0));
 
     let allocation = resident.domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let whole_weights = whole.load().clone().unbanked().weight_bytes().unwrap();
@@ -1131,7 +1141,8 @@ fn a_fits_placement_is_where_its_weights_are_held() {
     let unheld = experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts));
     assert!(unheld > 0);
     assert_eq!(fit.placement.host_bytes, 0, "unified memory has no host tier");
-    assert_eq!(fit.placement.disk_bytes, unheld);
+    assert_eq!(fit.placement.disk_bytes, unheld, "only experts stream");
+    assert_eq!(fit.placement.lookup_disk_bytes, looked_up(&fit));
     assert_eq!(total(&fit), total(&resident));
 
     let reserves = MemoryReserves::of_machine(None).measured(None, Some(StoreMotion::new(8_000_000_000 - 1, 10.0)));
@@ -1146,7 +1157,9 @@ fn a_fits_placement_is_where_its_weights_are_held() {
     let bank = fit.bank.as_ref().unwrap();
     let tier_only = experts(&fit, &|experts, slots| bank.host_slots.min(experts).saturating_sub(slots));
     assert!(tier_only > 0, "host RAM holds experts the bank does not");
-    assert_eq!(fit.placement.host_bytes, tier_only);
+    // Beside a discrete device the table's rows are cached in host RAM or looked up on disk.
+    let cached = if fit.placement.lookup_disk_bytes == 0 { rows } else { assert_eq!(fit.placement.lookup_disk_bytes, rows); 0 };
+    assert_eq!(fit.placement.host_bytes, tier_only + cached);
     assert_eq!(fit.placement.disk_bytes, experts(&fit, &|experts, _| experts - bank.slots.max(bank.host_slots).min(experts)));
     assert_eq!(total(&fit), total(&resident));
 }

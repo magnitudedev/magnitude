@@ -4463,6 +4463,7 @@ mod tests {
                     device_bytes: 0,
                     host_bytes: 0,
                     disk_bytes: 0,
+                    lookup_disk_bytes: 0,
                 },
                 residency: magnitude_service_contracts::models::ModelResidency::Resident {
                     performance: magnitude_service_contracts::models::ModelPerformance::Pending,
