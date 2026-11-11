@@ -1084,3 +1084,37 @@ fn a_batch_takes_its_state_bytes_of_pages() {
         assert_eq!(batch_state_bytes(&layouts, context, max_advance, rows as u64).unwrap(), each);
     }
 }
+
+/// A window history occupies at most its row limit's pages and the partial
+/// page at its front however long it grows, so `batch_state_bytes` of its
+/// rows from a page boundary caps there: as a sequence advances far past
+/// its window, the pages the store holds for it never exceed that figure,
+/// and reach it once the window straddles a page boundary in flight.
+#[test]
+fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
+    let (context, window, max_advance) = (4096, 300, 16);
+    let mut bindings = windowed_store(cpu_device(), context, window, max_advance, 1024, 2);
+    let store = Rc::clone(&bindings);
+    let single = [HistoryDomainLayout::Window { rows: window, components: vec![component(1, 2)] }];
+    let row_bytes = store.history_row_bytes(WINDOW);
+    let page = store.history_page_rows(WINDOW);
+    let cap = window_pages(page, window + max_advance) * page;
+    let free = store.free_rows(WINDOW);
+    let mut state = store.create().unwrap();
+    let mut most = 0;
+    for _ in 0..context / max_advance {
+        bindings.provision(&state.demands(max_advance), 0).unwrap();
+        let advance = OwnedStateAdvance::begin(state, max_advance).ok().unwrap();
+        let through = advance.position() + max_advance;
+        let held = free - store.free_rows(WINDOW);
+        let bytes = batch_state_bytes(&single, context, max_advance, through as u64).unwrap();
+        assert!(held as u64 * row_bytes <= bytes, "{held} rows held through {through}");
+        most = most.max(held);
+        let OwnedAdvanceResolution::Committed(next) = advance.commit_all().ok().unwrap() else {
+            panic!("an attention advance commits");
+        };
+        state = next;
+    }
+    assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
+    assert_eq!(batch_state_bytes(&single, context, max_advance, context as u64).unwrap(), cap as u64 * row_bytes);
+}

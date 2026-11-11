@@ -26,7 +26,7 @@ pub use codec::{
 };
 pub use layout::{
     HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
-    banks_per_slab, history_codec, history_geometry, kv_codec_policy,
+    banks_per_slab, history_codec, history_geometry, kv_codec_policy, window_pages,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};

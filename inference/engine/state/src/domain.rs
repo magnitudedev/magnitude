@@ -178,10 +178,13 @@ impl HistoryDomainLayout {
 /// rows in place first, so its new pages, `ceil((rows - (page_rows -
 /// offset)) / page_rows)`, are never more than at offset 0's
 /// `ceil(rows / page_rows)`. A Block domain's batch is at its most blocks
-/// ([`HistoryDomainKind::most_advance_rows`]) at a boundary too. A batch
-/// takes no recurrent state: a sequence's bank is its own, whatever its
-/// rows (`recurrent_bank_bytes`). The load, the assessment and the runtime
-/// ledger read a batch's state from here.
+/// ([`HistoryDomainKind::most_advance_rows`]) at a boundary too. A Window
+/// domain's pages are capped at what its history ever occupies
+/// ([`crate::layout::window_pages`] of its row limit), since it releases the
+/// rows before its window as it slides. A batch takes no recurrent state: a
+/// sequence's bank is its own, whatever its rows (`recurrent_bank_bytes`).
+/// The load, the assessment and the runtime ledger read a batch's state, and
+/// a history's of `rows` rows from a page boundary, from here.
 pub fn batch_state_bytes(
     domains: &[HistoryDomainLayout],
     context: usize,
@@ -194,7 +197,14 @@ pub fn batch_state_bytes(
         .filter(|domain| !domain.components().is_empty())
         .try_fold(0u64, |total, domain| {
             let page_rows = domain.geometry(domains, context, max_advance)?.page_rows;
-            let taken = crate::layout::page_demand_rows(page_rows, 0, domain.kind().most_advance_rows(rows));
+            let kind = domain.kind();
+            let taken = crate::layout::page_demand_rows(page_rows, 0, kind.most_advance_rows(rows));
+            let taken = match kind {
+                HistoryDomainKind::Window { .. } => {
+                    taken.min(crate::layout::window_pages(page_rows, kind.row_limit(context, max_advance)?) * page_rows)
+                }
+                HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } | HistoryDomainKind::Block { .. } => taken,
+            };
             let row_bytes = domain.row_bytes()?;
             Ok(u64::try_from(taken)
                 .ok()

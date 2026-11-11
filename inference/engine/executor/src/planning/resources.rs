@@ -967,11 +967,18 @@ impl StateStorePlan {
                 )
                 .map_err(|_| "window rows exceed u64")?,
             };
-            // Whole pages: a history's first page may be partial once a
-            // window releases the rows before it, its last page always may.
+            // Whole pages: a Window history's are its row limit's and the
+            // partial page at its front (`window_pages`); every other
+            // history's last page may be partial.
             let page = u64::from(domain.page_rows);
-            let front = u64::from(matches!(domain.kind, HistoryDomainKind::Window { .. }));
-            let pages = (rows.max(1).div_ceil(page) + front)
+            let per = match domain.kind {
+                HistoryDomainKind::Window { .. } => {
+                    let rows = usize::try_from(rows.max(1)).map_err(|_| "window rows exceed host range")?;
+                    u64::try_from(magnitude_state::window_pages(domain.page_rows as usize, rows)).map_err(|_| "window pages exceed u64")?
+                }
+                _ => rows.max(1).div_ceil(page),
+            };
+            let pages = per
                 .checked_mul(conversations)
                 .ok_or("history page fit count overflows")?;
             let slabs = (pages * page).div_ceil(u64::from(domain.slab_rows));

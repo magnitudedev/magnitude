@@ -90,6 +90,16 @@ pub(crate) fn page_demand_rows(page_rows: usize, in_place: usize, count: usize) 
     count.saturating_sub(in_place).div_ceil(page_rows) * page_rows
 }
 
+/// The most pages a Window history occupies, its histories holding at most
+/// `row_limit` rows at once ([`crate::HistoryDomainKind::row_limit`]): it
+/// releases its rows before its window as it slides, so it holds its row
+/// limit's pages and the partial page at its front that the slide leaves,
+/// however long it grows. Plan, assessment and the ledger's claims size a
+/// window history by it.
+pub fn window_pages(page_rows: usize, row_limit: usize) -> usize {
+    row_limit.div_ceil(page_rows) + 1
+}
+
 /// Banks in one recurrent slab. A bank larger than the byte target still
 /// occupies one slab by itself.
 pub fn banks_per_slab(bank_bytes: u64) -> Result<usize, String> {
