@@ -2416,6 +2416,23 @@ impl Interval {
     fn overlaps(&self, other: &Interval) -> bool {
         self.start <= other.end && other.start <= self.end
     }
+
+    /// Whether `other` lives only while this one does.
+    fn contains(&self, other: &Interval) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
+    /// Whether the two overlap and neither contains the other: they cannot
+    /// lie on one end of a two-ended stack.
+    fn crosses(&self, other: &Interval) -> bool {
+        self.overlaps(other) && !self.contains(other) && !other.contains(self)
+    }
+
+    /// Whether it is a node's call-private scratch, which lives at its node
+    /// alone.
+    fn scratch(&self) -> bool {
+        matches!(self.key, StorageKey::NodeScratch(..))
+    }
 }
 
 /// Where tensors of `tensors`' representations and extents lie in one
@@ -2479,45 +2496,255 @@ fn liveness_floor(intervals: &[&Interval]) -> u64 {
     u64::try_from(floor).expect("live workspace bytes fit u64")
 }
 
-/// Offsets of `intervals` in one arena, and the arena's size. Largest first,
-/// each buffer takes the lowest aligned offset that overlaps no placed buffer
-/// whose lifetime overlaps its own. Ties keep the intervals' order, so the
-/// placement is deterministic.
-fn place_by_liveness(intervals: &[&Interval]) -> (Vec<u64>, u64) {
-    let mut order = (0..intervals.len()).collect::<Vec<_>>();
-    order.sort_by_key(|&index| std::cmp::Reverse(intervals[index].bytes));
-    let mut offsets = vec![0u64; intervals.len()];
-    let mut placed: Vec<usize> = Vec::with_capacity(intervals.len());
-    let mut size = 0u64;
-    for index in order {
-        let interval = intervals[index];
-        let mut occupied = placed
-            .iter()
-            .filter(|&&other| intervals[other].overlaps(interval))
-            .map(|&other| (offsets[other], offsets[other] + intervals[other].bytes))
-            .collect::<Vec<_>>();
-        occupied.sort_unstable();
-        let mut offset = 0u64;
-        for (start, end) in occupied {
-            if offset
-                .checked_add(interval.bytes)
-                .expect("native graph storage overflow")
-                <= start
-            {
-                break;
-            }
-            offset = offset.max(align_up(end, BUFFER_ALIGNMENT));
+/// A placement of an arena's buffers: each one's offset, the arena's bytes
+/// (the end of its last buffer), and the size comparisons that decided it:
+/// the guards a shape's placement holds, under which the same offsets are
+/// expressions of its buffers' sizes.
+struct Placed {
+    offsets: Vec<u64>,
+    bytes: u64,
+    guards: usize,
+}
+
+/// Two-colour `order`'s buffers (indices into `intervals`) by their
+/// crossings, in that order: each joins the ends its earlier crossing
+/// partners force, by a union-find over the parity of their ends, and one
+/// that would close an odd cycle of crossings with them is lifted. Each
+/// coloured buffer's end (0 the bottom, 1 the top), and the lifted ones in
+/// order.
+fn colour_ends(intervals: &[&Interval], order: &[usize]) -> (Vec<Option<u8>>, Vec<usize>) {
+    let mut parent = (0..intervals.len()).collect::<Vec<_>>();
+    let mut parity = vec![0u8; intervals.len()];
+    let find = |parent: &[usize], parity: &[u8], mut index: usize| {
+        let mut relative = 0u8;
+        while parent[index] != index {
+            relative ^= parity[index];
+            index = parent[index];
         }
-        offsets[index] = offset;
-        size = size.max(offset + interval.bytes);
-        placed.push(index);
+        (index, relative)
+    };
+    let mut coloured = Vec::with_capacity(order.len());
+    let mut lifted = Vec::new();
+    for &index in order {
+        let mut required: Vec<(usize, u8)> = Vec::new();
+        let mut odd = false;
+        for &other in &coloured {
+            if !intervals[index].crosses(intervals[other]) {
+                continue;
+            }
+            let (root, relative) = find(&parent, &parity, other);
+            let want = relative ^ 1;
+            match required.iter().find(|(found, _)| *found == root) {
+                Some(&(_, wanted)) if wanted != want => {
+                    odd = true;
+                    break;
+                }
+                Some(_) => {}
+                None => required.push((root, want)),
+            }
+        }
+        if odd {
+            lifted.push(index);
+            continue;
+        }
+        for (root, want) in required {
+            parent[root] = index;
+            parity[root] = want;
+        }
+        coloured.push(index);
     }
-    (offsets, size)
+    let mut ends = vec![None; intervals.len()];
+    for index in coloured {
+        ends[index] = Some(find(&parent, &parity, index).1);
+    }
+    (ends, lifted)
+}
+
+/// Place `intervals` in one arena by the two-ended rule over their
+/// lifetimes. Results, ports and locals are coloured into a bottom end and
+/// a top end so that no two buffers of one end cross ([`colour_ends`]):
+/// on each end they nest, and each buffer lies past the buffers of its end
+/// that enclose it, from the bottom up or from the top down. Node scratch,
+/// and any buffer that would close an odd cycle of crossings, lies between
+/// the ends, above everything below it at every step of its life. The
+/// arena is the most any step holds: on a graph whose crossings are
+/// two-colourable with no lifted buffer, the liveness floor of its aligned
+/// sizes, less the last buffer's pad.
+///
+/// On such a graph the rule decides from lifetimes alone, in birth order,
+/// with every lifted buffer on the bottom side: no comparison of sizes, so
+/// its offsets and arena are max/sum expressions of the sizes, under the
+/// one guard below. A graph with an odd cycle of crossings colours its
+/// buffers largest first and lifts each to the side that holds the least.
+/// Last, one guard: a placement that ends at the aligned floor
+/// ([`aligned_floor_end`]) is kept; otherwise first fit is the one other
+/// candidate, and the smaller is kept. Each of those decisions compares
+/// sizes, and is a guard.
+fn place(intervals: &[&Interval]) -> Placed {
+    /// First fit: largest first, each buffer takes the lowest aligned
+    /// offset that overlaps no placed buffer whose lifetime overlaps its
+    /// own. Ties keep the intervals' order, so the placement is
+    /// deterministic.
+    fn first_fit(intervals: &[&Interval]) -> Placed {
+        let mut order = (0..intervals.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| std::cmp::Reverse(intervals[index].bytes));
+        // An order holds as long as each neighbouring pair compares as it did.
+        let mut guards = order.len().saturating_sub(1);
+        let mut offsets = vec![0u64; intervals.len()];
+        let mut placed: Vec<usize> = Vec::with_capacity(intervals.len());
+        let mut size = 0u64;
+        for index in order {
+            let interval = intervals[index];
+            let mut occupied = placed
+                .iter()
+                .filter(|&&other| intervals[other].overlaps(interval))
+                .map(|&other| (offsets[other], offsets[other] + intervals[other].bytes))
+                .collect::<Vec<_>>();
+            occupied.sort_unstable();
+            let mut offset = 0u64;
+            for (start, end) in occupied {
+                guards += 1;
+                if offset
+                    .checked_add(interval.bytes)
+                    .expect("native graph storage overflow")
+                    <= start
+                {
+                    break;
+                }
+                offset = offset.max(align_up(end, BUFFER_ALIGNMENT));
+            }
+            offsets[index] = offset;
+            size = size.max(offset + interval.bytes);
+            placed.push(index);
+        }
+        Placed { offsets, bytes: size, guards }
+    }
+    let bytes = |index: usize| align_up(intervals[index].bytes, BUFFER_ALIGNMENT);
+    let birth = |&index: &usize| (intervals[index].start, std::cmp::Reverse(intervals[index].end), index);
+    let mut held = (0..intervals.len()).filter(|&index| !intervals[index].scratch()).collect::<Vec<_>>();
+    held.sort_by_key(birth);
+    let (mut ends, mut lifted) = colour_ends(intervals, &held);
+    let odd = !lifted.is_empty();
+    let mut guards = 0usize;
+    // Largest first, an order that holds while each neighbouring pair
+    // compares as it did: a guard per pair.
+    let largest_first = |order: &mut Vec<usize>, guards: &mut usize| {
+        order.sort_by_key(|index| (std::cmp::Reverse(intervals[*index].bytes), birth(index)));
+        *guards += order.len().saturating_sub(1);
+    };
+    if odd {
+        largest_first(&mut held, &mut guards);
+        (ends, lifted) = colour_ends(intervals, &held);
+    }
+    lifted.extend((0..intervals.len()).filter(|&index| intervals[index].scratch()));
+    match odd {
+        true => largest_first(&mut lifted, &mut guards),
+        false => lifted.sort_by_key(birth),
+    }
+    let mut steps = intervals.iter().map(|interval| interval.start).collect::<Vec<_>>();
+    steps.sort_unstable();
+    steps.dedup();
+    let lives = |index: usize, step: usize| intervals[index].start <= step && step <= intervals[index].end;
+    // What each end holds at each step, then what lies between them.
+    let mut held_at = [vec![0u64; steps.len()], vec![0u64; steps.len()]];
+    for (index, end) in ends.iter().enumerate() {
+        let Some(end) = end else { continue };
+        for (at, &step) in steps.iter().enumerate() {
+            if lives(index, step) {
+                held_at[*end as usize][at] += bytes(index);
+            }
+        }
+    }
+    let mut lifted_at = Vec::with_capacity(lifted.len());
+    for &index in &lifted {
+        let life = (0..steps.len()).filter(|&at| lives(index, steps[at])).collect::<Vec<_>>();
+        // On `side`, past everything it holds at any step of its life: the
+        // most the arena then holds over its life, and its offset.
+        let on = |side: usize| {
+            let offset = life.iter().map(|&at| held_at[side][at]).max().unwrap_or(0);
+            let most = life.iter().map(|&at| offset + bytes(index) + held_at[1 - side][at]).max().unwrap_or(0);
+            (most, offset)
+        };
+        let (side, offset) = match odd {
+            false => (0, on(0).1),
+            true => {
+                guards += 1;
+                let [bottom, top] = [on(0), on(1)];
+                match top.0 < bottom.0 {
+                    true => (1, top.1),
+                    false => (0, bottom.1),
+                }
+            }
+        };
+        for &at in &life {
+            held_at[side][at] = offset + bytes(index);
+        }
+        lifted_at.push((index, side, offset));
+    }
+    let arena = (0..steps.len()).map(|at| held_at[0][at] + held_at[1][at]).max().unwrap_or(0);
+    let mut offsets = vec![0u64; intervals.len()];
+    for (index, end) in ends.iter().enumerate() {
+        let Some(end) = *end else { continue };
+        // The buffers of its end that enclose it: an equal lifetime
+        // encloses only a later one.
+        let enclosing = (0..intervals.len())
+            .filter(|&other| {
+                other != index
+                    && ends[other] == Some(end)
+                    && intervals[other].contains(intervals[index])
+                    && (!intervals[index].contains(intervals[other]) || other < index)
+            })
+            .map(bytes)
+            .sum::<u64>();
+        offsets[index] = match end {
+            0 => enclosing,
+            _ => arena - bytes(index) - enclosing,
+        };
+    }
+    for (index, side, offset) in lifted_at {
+        offsets[index] = match side {
+            0 => offset,
+            _ => arena - offset - bytes(index),
+        };
+    }
+    let end = intervals.iter().zip(&offsets).map(|(interval, offset)| offset + interval.bytes).max().unwrap_or(0);
+    // No placement at aligned offsets ends below the floor: one that does
+    // is the rule's, and first fit is a candidate only beside one that
+    // does not, the smaller kept. Each comparison is a guard.
+    guards += 1;
+    let placed = Placed { offsets, bytes: end, guards };
+    if end <= aligned_floor_end(intervals, &steps) {
+        return placed;
+    }
+    let first_fit = first_fit(intervals);
+    let guards = placed.guards + first_fit.guards + 1;
+    match first_fit.bytes < placed.bytes {
+        true => Placed { guards, ..first_fit },
+        false => Placed { guards, ..placed },
+    }
+}
+
+/// The least end of any placement of `intervals` at aligned offsets: at
+/// each of `steps` (every start), the aligned bytes live there less the
+/// largest alignment pad among them, which the last buffer leaves unpadded.
+fn aligned_floor_end(intervals: &[&Interval], steps: &[usize]) -> u64 {
+    steps
+        .iter()
+        .map(|&step| {
+            let live = intervals.iter().filter(|interval| interval.start <= step && step <= interval.end);
+            let (bytes, pad) = live.fold((0u64, 0u64), |(bytes, pad), interval| {
+                let aligned = align_up(interval.bytes, BUFFER_ALIGNMENT);
+                (bytes + aligned, pad.max(aligned - interval.bytes))
+            });
+            bytes - pad
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Place graph storage. Results, graph locals and node scratch share one
 /// arena by lifetime (a node's scratch is live across its inputs and
-/// results, so it never aliases them), placed by [`place_by_liveness`];
+/// results, so it never aliases them), placed by [`place`];
 /// exports get their own arena; inputs the host writes go to a
 /// per-submission upload region so a later host write cannot race an
 /// earlier submission still reading them. Every buffer starts at a
@@ -2655,7 +2882,7 @@ fn plan_storage(
         .iter()
         .filter(|interval| !interval.exported)
         .collect::<Vec<_>>();
-    let (scratch_offsets, placed_bytes) = place_by_liveness(&scratch);
+    let Placed { offsets: scratch_offsets, bytes: placed_bytes, .. } = place(&scratch);
     // The placed buffers follow the reserved sync range, which a graph
     // reserves whenever it places anything.
     let reserved = if sync_cursor == 0 && placed_bytes == 0 {
@@ -5020,8 +5247,9 @@ mod liveness_placement_tests {
         }
     }
 
-    fn place(intervals: &[Interval]) -> (Vec<u64>, u64) {
-        place_by_liveness(&intervals.iter().collect::<Vec<_>>())
+    fn placed(intervals: &[Interval]) -> (Vec<u64>, u64) {
+        let placed = place(&intervals.iter().collect::<Vec<_>>());
+        (placed.offsets, placed.bytes)
     }
 
     fn floor(intervals: &[Interval]) -> u64 {
@@ -5043,9 +5271,77 @@ mod liveness_placement_tests {
     }
 
     #[test]
+    fn a_chain_alternates_between_the_ends_with_one_guard() {
+        // Each buffer read by the next node alone: a chain, which takes the
+        // most two adjacent links hold.
+        let intervals = [interval(1, 3, 256), interval(3, 5, 512), interval(5, 7, 768), interval(7, 9, 256)];
+        let placed = place(&intervals.iter().collect::<Vec<_>>());
+        assert_disjoint(&intervals, &placed.offsets);
+        assert_eq!(placed.bytes, 512 + 768);
+        // Its end against the floor, the one comparison of sizes.
+        assert_eq!(placed.guards, 1);
+    }
+
+    #[test]
+    fn an_odd_cycle_of_crossings_reaches_the_floor() {
+        // Three buffers each crossing the other two, all live at step 5.
+        let intervals = [interval(1, 5, 1024), interval(3, 7, 256), interval(5, 9, 512)];
+        let placed = place(&intervals.iter().collect::<Vec<_>>());
+        assert_disjoint(&intervals, &placed.offsets);
+        assert_eq!(placed.bytes, floor(&intervals));
+        assert!(placed.guards > 1);
+    }
+
+    /// The 8,373 distinct arenas the served catalog's outline tests place on
+    /// every backend, each line first fit's bytes for the arena and then its
+    /// buffers (`kind:start:end:bytes`, kind `P` port, `R` result, `S` node
+    /// scratch). Every arena places disjointly, never above first fit, and
+    /// under no more guards than the most any shape of the catalog holds.
+    #[test]
+    fn no_catalog_arena_places_above_first_fit() {
+        use std::io::Read;
+        const MOST_GUARDS: usize = 4_238;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(&include_bytes!("fixtures/arenas.txt.gz")[..])
+            .read_to_string(&mut text)
+            .unwrap();
+        for (row, line) in text.lines().enumerate() {
+            let mut fields = line.split(' ');
+            let first_fit = fields.next().unwrap().parse::<u64>().unwrap();
+            let intervals = fields
+                .enumerate()
+                .map(|(ordinal, field)| {
+                    let parts = field.split(':').collect::<Vec<_>>();
+                    let number = |at: usize| parts[at].parse::<u64>().unwrap();
+                    Interval {
+                        key: match parts[0] {
+                            "P" => StorageKey::Port(ordinal),
+                            "R" => StorageKey::Result(ordinal, 0),
+                            "S" => StorageKey::NodeScratch(ordinal, 0),
+                            kind => panic!("arena {row}: unknown buffer kind {kind}"),
+                        },
+                        start: number(1) as usize,
+                        end: number(2) as usize,
+                        bytes: number(3),
+                        exported: false,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let placed = place(&intervals.iter().collect::<Vec<_>>());
+            assert_disjoint(&intervals, &placed.offsets);
+            assert!(
+                placed.bytes <= first_fit,
+                "arena {row}: {} bytes above first fit's {first_fit}",
+                placed.bytes
+            );
+            assert!(placed.guards <= MOST_GUARDS, "arena {row}: {} guards", placed.guards);
+        }
+    }
+
+    #[test]
     fn buffers_with_disjoint_lifetimes_share_storage() {
         let intervals = [interval(0, 1, 1024), interval(2, 3, 1024)];
-        let (offsets, size) = place(&intervals);
+        let (offsets, size) = placed(&intervals);
         assert_eq!(offsets, vec![0, 0]);
         assert_eq!(size, 1024);
     }
@@ -5054,7 +5350,7 @@ mod liveness_placement_tests {
     fn a_shared_endpoint_is_an_overlap() {
         // A node's inputs end where its results start.
         let intervals = [interval(0, 3, 512), interval(3, 5, 512)];
-        let (offsets, size) = place(&intervals);
+        let (offsets, size) = placed(&intervals);
         assert_disjoint(&intervals, &offsets);
         assert_eq!(size, 1024);
     }
@@ -5069,7 +5365,7 @@ mod liveness_placement_tests {
             interval(0, 1, 2048),
             interval(2, 3, 4096),
         ];
-        let (offsets, size) = place(&intervals);
+        let (offsets, size) = placed(&intervals);
         assert_disjoint(&intervals, &offsets);
         assert_eq!(size, 4096);
         assert_eq!(floor(&intervals), 4096);
@@ -5084,7 +5380,7 @@ mod liveness_placement_tests {
             interval(2, 9, 256),
             interval(3, 4, 8192),
         ];
-        let (offsets, size) = place(&intervals);
+        let (offsets, size) = placed(&intervals);
         assert_disjoint(&intervals, &offsets);
         assert_eq!(size, 8192 + 256);
         assert_eq!(floor(&intervals), 8192 + 256);
@@ -5098,8 +5394,8 @@ mod liveness_placement_tests {
             interval(3, 6, 1000),
             interval(5, 7, 3000),
         ];
-        assert_eq!(place(&intervals), place(&intervals));
-        let (offsets, _) = place(&intervals);
+        assert_eq!(placed(&intervals), placed(&intervals));
+        let (offsets, _) = placed(&intervals);
         assert_disjoint(&intervals, &offsets);
         assert!(offsets.iter().all(|offset| offset % BUFFER_ALIGNMENT == 0));
     }
