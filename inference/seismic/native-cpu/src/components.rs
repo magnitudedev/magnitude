@@ -791,8 +791,10 @@ mod tests {
     /// the whole row runs within a bound of the same loop with the body
     /// inlined, for every representation and row block, on the detected tier
     /// (weights cache-resident, so call overhead is most exposed). Measured
-    /// interleaved, best of several, so host noise affects both alike.
+    /// interleaved, best of several; other load on the host still moves the
+    /// ratio, so it is timed alone on a quiet host.
     #[test]
+    #[ignore = "timed: run alone on a quiet host, `mrig test --backend cpu --timed --filter components_keep_the_throughput_of_the_inlined_body -- -p seismic-native-cpu --lib --release -- --ignored --test-threads=1`"]
     fn components_keep_the_throughput_of_the_inlined_body() {
         /// A component call may cost at most this much over the inlined body.
         /// Instances measure within a few percent of it; the bound catches a
