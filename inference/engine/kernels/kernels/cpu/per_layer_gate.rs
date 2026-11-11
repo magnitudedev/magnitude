@@ -1,4 +1,4 @@
-// per_layer_gate on CPU (contract and portable body in dense_rows.seismic).
+// per_layer_gate on CPU (contract and portable body in per_layer_gate.seismic).
 // `per_layer_gate_stage` stages each hidden row rounded to A (as F32, and its
 // q8 blocks for the INT8 variant), one work item per row.
 // `per_layer_gate_rows` gives each work item ROWS gate rows, projected

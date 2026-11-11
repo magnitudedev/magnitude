@@ -1,4 +1,4 @@
-// dense_up on CPU (contract and portable body in dense_rows.seismic).
+// dense_up on CPU (contract and portable body in feed_forward.seismic).
 // `dense_up_normalize` publishes the RMS-normalized residual row of each
 // output row (rounded to A) as F32 into scratch, one work item per row.
 // `dense_up_rows` gives each work item ROWS up weight rows, projected against

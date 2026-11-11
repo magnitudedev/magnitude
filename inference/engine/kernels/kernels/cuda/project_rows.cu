@@ -2,7 +2,7 @@
 // or explicitly selected matrix operands. GEMV retains semantic inputs;
 // small and large matrix row bands share the same operand eligibility.
 //
-// Group g of a grouped weight (grid z, `cuda_dense.seismic`) is the
+// Group g of a grouped weight (grid z, `dense.seismic`) is the
 // projection of the source columns g * K .., through weight rows g * N ..,
 // into output columns g * N ..: the same launches over its views. The staged
 // forms run one group (their declaration), so the stage launch stages group

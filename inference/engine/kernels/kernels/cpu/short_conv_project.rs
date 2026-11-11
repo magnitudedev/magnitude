@@ -1,5 +1,5 @@
 // short_conv_project on CPU (contract and portable body in
-// dense_rows.seismic). `short_conv_project_normalize` publishes each
+// short_conv.seismic). `short_conv_project_normalize` publishes each
 // RMS-normalized residual row (rounded to A) as F32 into scratch.
 // `short_conv_project_rows`: items [0, S) each own ROWS channels of the u
 // segment (B and X rows paired, u = B * X in F32), the rest ROWS channels of

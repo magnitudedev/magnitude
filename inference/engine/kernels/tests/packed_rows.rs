@@ -250,7 +250,10 @@ fn packed_entries_are_the_only_generated_target_surface() {
     let _ = gated_delta_chunk::native_for_device_with;
     let sources = [
         include_str!("../kernels/target.seismic"),
-        include_str!("../kernels/dense_rows.seismic"),
+        include_str!("../kernels/feed_forward.seismic"),
+        include_str!("../kernels/dense.seismic"),
+        include_str!("../kernels/short_conv.seismic"),
+        include_str!("../kernels/per_layer_gate.seismic"),
         include_str!("../kernels/routed.seismic"),
     ]
     .concat();

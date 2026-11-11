@@ -1097,12 +1097,12 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
     let (o, h, f) = (2, 256, 32);
     let mut sources = seismic_std::sources();
     sources.push(SourceFile {
-        path: "dense_rows.seismic".into(),
-        text: include_str!("../kernels/dense_rows.seismic").into(),
+        path: "feed_forward.seismic".into(),
+        text: include_str!("../kernels/feed_forward.seismic").into(),
     });
     sources.push(SourceFile {
-        path: "projection.seismic".into(),
-        text: include_str!("../kernels/projection.seismic").into(),
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
     });
     sources.push(SourceFile {
         path: "functions.seismic".into(),

@@ -1,4 +1,4 @@
-// dense_output on CPU (contract and portable body in dense_rows.seismic).
+// dense_output on CPU (contract and portable body in feed_forward.seismic).
 // `dense_output_stage` stages each product row as F32 in scratch, one work
 // item per row. `dense_output_rows` gives each work item ROWS down weight
 // rows, which it projects against every staged row: result = the residual row

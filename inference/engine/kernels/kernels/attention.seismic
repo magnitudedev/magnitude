@@ -97,14 +97,14 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
     return result
 
 # Metal: GEMV below BATCH_FROM rows (`gemv` for one row, `gemv_pair` for two,
-# `gemv_rows` for more, see `dense_rows.seismic`), batched GEMV to 16, GEMM beyond with
+# `gemv_rows` for more, see `dense.seismic`), batched GEMV to 16, GEMM beyond with
 # SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
 # there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
-# TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
+# TALL selects the tall GEMM past 64 rows (see `dense.seismic`): on
 # simdgroup matrices `relayout` first reorders the gated rows into
 # `fragments`, a second copy of them in whole 64-row tiles.
 # PACK selects `dense_output`'s token-packing form past 64 rows (see
-# `dense_rows.seismic`), with its launches, complete paired computation and transient
+# `dense.seismic`), with its launches, complete paired computation and transient
 # scratch, over the gated rows (the weights' factors a simdgroup per weight
 # row), for weights admitted to it (`form(OW, PACK)`); devices without the
 # packed path run the staged tile, with its results.
@@ -184,7 +184,7 @@ native attention_output for metal from "metal/attention_output.metal":
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands), both split
 # over K into 2 shares summed by `finalize` up to 128 rows (see
-# `cuda_dense.seismic`); the shared stage produces selected S8 or F16 matrix operands.
+# `dense.seismic`); the shared stage produces selected S8 or F16 matrix operands.
 # (Metal: batched GEMV class, no INT8 path.)
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
@@ -362,7 +362,7 @@ native attention_output for cpu from "cpu/attention_output.rs":
 # draft-history injection: Q/gate outputs are zero and only K/V is consumed.
 # Native backends may omit the Q/gate projection work in that mode. Each
 # segment's weight has its accumulator-scale port (QS, GS, KS, VS; see
-# `dense_rows.seismic`), as `attention_output`'s weight has OS. The
+# `dense.seismic`), as `attention_output`'s weight has OS. The
 # normalized rows are A; the results are published in Y: A where attention
 # reads them, F32 where a pooled source pools them (`pooled.seismic`).
 fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](hidden: &tensor[M, PT * D] f32,
@@ -406,9 +406,9 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
         scale_rows(value_sum, value_scale, value)
     return query, gate, key, value
 
-# Metal: TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`)
+# Metal: TALL selects the tall GEMM past 64 rows (see `dense.seismic`)
 # over rows staged in its order.
-# PACK selects the token-packing form of `dense_rows.seismic` past 64 rows for
+# PACK selects the token-packing form of `dense.seismic` past 64 rows for
 # the four segments, over the staged normalized rows, as in
 # `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
 # each weight's own factor tables in segment order, the packed tiles in

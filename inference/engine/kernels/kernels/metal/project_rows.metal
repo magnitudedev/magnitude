@@ -1,6 +1,6 @@
 // project_rows: the plain projection of the A rows `source`, published in Y
 // (the `attention_output` launch structure with a store epilogue). Group g
-// of a grouped weight (grid z, `dense_rows.seismic`) is the projection of
+// of a grouped weight (grid z, `dense.seismic`) is the projection of
 // the source columns g * K .., through weight rows g * N .., into output
 // columns g * N ..: the same launches over its views (`PROJECT_ROWS_OPERANDS`).
 #define KERNEL_W0 SEISMIC_WEIGHT

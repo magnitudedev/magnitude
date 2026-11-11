@@ -27,7 +27,7 @@
 //! row here: Metal's tall GEMM (`TALL`), whose staging simdgroups decode
 //! any decoder's packets (`packets::Block`, dense rows included) into the
 //! same half tiles the default GEMM stages, so its admission is its shape
-//! guard alone (`projection.seismic`).
+//! guard alone (`dense.seismic`).
 
 use crate::ids::RepresentationId;
 use crate::registry::{self, BackendName, OperandRecipe, RepresentationInfo};

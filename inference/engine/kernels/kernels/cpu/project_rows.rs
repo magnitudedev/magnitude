@@ -1,4 +1,4 @@
-// project_rows on CPU (contract and portable body in dense_rows.seismic).
+// project_rows on CPU (contract and portable body in dense.seismic).
 // `project_rows_stage` stages each source row's run of group g as F32 in
 // scratch (and its q8 blocks for the INT8 variant), one work item per (row,
 // group); the staged rows are group-major, G blocks of M rows. Work item

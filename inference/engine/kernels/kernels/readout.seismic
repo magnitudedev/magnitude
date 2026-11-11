@@ -78,7 +78,7 @@ fn readout_head_rows[M, O, V, D, PT, NM, WS](hidden: &tensor[M, PT * D] f32,
     return logits
 
 # Metal: rows below BATCH_FROM run the GEMV (`gemv` for one row, `gemv_pair`
-# for two, `gemv_rows` for more, see `dense_rows.seismic`). From BATCH_FROM,
+# for two, `gemv_rows` for more, see `dense.seismic`). From BATCH_FROM,
 # normalize once into activation storage. Through 16 rows, supported compressed
 # weights use the shared matrix GEMV and other formats use batched GEMV;
 # larger classes use GEMM. (CUDA: GEMV up to 8 rows, no batched launch.)
@@ -119,7 +119,7 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
 # CUDA: the GEMV up to 16 rows (`gemv` to 8, `gemv16` beyond; at O = 1 the
 # block forms its normalized row in shared memory, else `stage` forms the
 # rows), the 16-bit GEMM beyond in the K1 row bands (`gemm_small` to 64 rows,
-# `gemm` beyond; see `cuda_dense.seismic`). (Metal: GEMV, batched GEMV, GEMM
+# `gemm` beyond; see `dense.seismic`). (Metal: GEMV, batched GEMV, GEMM
 # row classes.)
 native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
     static (V, D, PT, NM, WS)

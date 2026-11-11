@@ -146,6 +146,10 @@ impl Case {
             path: "short_conv.seismic".into(),
             text: include_str!("../kernels/short_conv.seismic").into(),
         });
+        sources.push(SourceFile {
+            path: "functions.seismic".into(),
+            text: include_str!("../kernels/functions.seismic").into(),
+        });
         let module = crate::common::check(sources);
         let dtype = if activation == Element::bf16() { DType::BF16 } else { DType::F32 };
         let elements = ElementBindings::new().bind("A", registry::dense(dtype));

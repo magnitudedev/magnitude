@@ -9,7 +9,7 @@
 # slot-order sum. The shared expert's coefficient is
 # sigmoid(normalized . shared_router).
 #
-# Per-expert scale ports (every routed entry; `dense_rows.seismic` defines
+# Per-expert scale ports (every routed entry; `dense.seismic` defines
 # the convention): a stacked expert weight's second-level scales (NVFP4
 # `.scale`, one F32 per expert matrix) are `[S] f32`, S static on every
 # backend: 0 is no scale (the port is never read and the natives compile the

@@ -30,7 +30,7 @@ gated_attention_prefill_k8v4[A=f32]: f32[2,128]=rand(350) ; f32[2,32]=rand(351) 
 gated_attention_project[NW=f32,QW=f32,KW=f32,VW=f32,A=f32]: f32[2,4]=rand(105) ; f32[4]=rand(106) ; f32[4]=rand(360) ; f32[16,4]=rand(107) ; f32[4,4]=rand(108) ; f32[4,4]=rand(109) ; f32:0.000001
 attention_output[A=f32,OW=f32]: f32[2,4]=rand(120) ; f32[2,2,4]=rand(121) ; f32[4,8]=rand(124)
 
-# dense_rows.seismic: M = 3, O = 2, H = 4, F = 6.
+# feed_forward.seismic: M = 3, O = 2, H = 4, F = 6.
 dense_expand[NW=f32,GW=f32,UW=f32,A=f32]: f32[3,4]=rand(142) ; f32[4]=rand(143) ; f32[6,4]=rand(144) ; f32[6,4]=rand(145) ; i32[2]=1,2 ; f32:0.000001
 dense_output[A=f32,DW=f32]: f32[3,4]=rand(146) ; f32[2,6]=rand(147) ; f32[4,6]=rand(148) ; i32[2]=0,2
 

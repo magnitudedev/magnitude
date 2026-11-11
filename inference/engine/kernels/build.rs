@@ -147,7 +147,7 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "lib/projection/operator",
         &[BackendName::Metal],
-        "the `dense` projection's form bodies (`projection.seismic`), which only Metal's entries take so far; the other backends' entries still hold theirs",
+        "the `dense` projection's form bodies (`dense.seismic`), which only Metal's entries take so far; the other backends' entries still hold theirs",
     ),
     (
         "lib/core/arrive",

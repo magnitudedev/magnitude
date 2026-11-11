@@ -1,4 +1,4 @@
-// The bodies of the `dense` projection's forms (`projection.seismic`), once
+// The bodies of the `dense` projection's forms (`dense.seismic`), once
 // for every entry that projects: an entry's kernel states its prologue (the
 // rows `x` it projects), its epilogue (`out`) and its weights, and runs the
 // form its launch names here. A projection is `paired` (two weights, `w0`
