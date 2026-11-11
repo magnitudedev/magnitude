@@ -786,7 +786,7 @@ fn streamed_bank(shares: magnitude_executor::assessment::ExpertShares) -> Stream
         slots: shares.slots(),
         floor_slots: shares.floor(),
         cold_experts: match shares.cold() {
-            magnitude_executor::assessment::ColdSource::HostTier { .. } => ColdExperts::HostRam,
+            magnitude_executor::assessment::ColdSource::HostTier { cache_bytes, .. } => ColdExperts::HostRam { cache_bytes: *cache_bytes },
             magnitude_executor::assessment::ColdSource::File(_) => ColdExperts::Disk,
         },
     }
@@ -1154,7 +1154,7 @@ mod tests {
             64,
             192,
             std::num::NonZeroU64::new(256).unwrap(),
-            magnitude_executor::assessment::ColdSource::HostTier { slots: 256 },
+            magnitude_executor::assessment::ColdSource::HostTier { slots: 256, cache_bytes: 9_000_000_000 },
         );
         assert_eq!(
             model_residency(
@@ -1171,7 +1171,7 @@ mod tests {
                     experts: std::num::NonZeroU64::new(256).unwrap(),
                     slots: 192,
                     floor_slots: 64,
-                    cold_experts: ColdExperts::HostRam,
+                    cold_experts: ColdExperts::HostRam { cache_bytes: 9_000_000_000 },
                 }
                 .try_into()
                 .unwrap(),

@@ -882,9 +882,13 @@ export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 /**
  * Where a streamed fit keeps the experts its bank lacks: read from the model file (unified
  * memory), or in a host-RAM tier as host memory lets it grow, the rest read from the file (a
- * discrete device).
+ * discrete device). `cacheBytes` is what that tier holds past its floor: cache the load grows into
+ * free host RAM, which no memory domain's required bytes count.
  */
-export const ColdExpertsSchema = Schema.Literal("disk", "host_ram")
+export const ColdExpertsSchema = Schema.Union(
+  Schema.TaggedStruct("Disk", {}),
+  Schema.TaggedStruct("HostRam", { cacheBytes: NonNegativeSafeInteger }),
+)
 export type ColdExperts = typeof ColdExpertsSchema.Type
 
 /**

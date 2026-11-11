@@ -341,13 +341,9 @@ impl ExecutionPlanDraft {
     /// The host RAM `charge`, the draft's with its tier at its floor, leaves
     /// beside a tier of `slots`: negative where it does not fit.
     fn host_left(&self, charge: &AssessmentMemoryCharge, slots: u64) -> Result<i64, PlanError> {
-        let bank = self.bank();
-        let host_charge = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
         let FitReading { topology, status, reserves } = &self.device.reading;
         let host_ram = topology.host_ram().id();
-        let growth = host_charge(slots)?
-            .checked_sub(host_charge(0)?)
-            .ok_or(PlanError::Arithmetic("a host tier is charged less than its floor"))?;
+        let growth = self.bank().host_cache(slots).map_err(PlanError::ResourcePlanning)?;
         let fit = charge
             .clone()
             .with_weights(crate::memory::ClaimDemand { host: growth, ..Default::default() })

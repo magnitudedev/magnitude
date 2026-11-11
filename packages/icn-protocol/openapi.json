@@ -4495,12 +4495,45 @@
         "additionalProperties": false
       },
       "ColdExperts": {
-        "type": "string",
-        "description": "Where a streamed fit keeps the experts its bank lacks.",
-        "enum": [
-          "disk",
-          "host_ram"
-        ]
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Read from the model file on demand (unified memory).",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Disk"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "In a host-RAM tier as host memory lets it grow, the rest read from the model file (a\ndiscrete device). `cache_bytes` is what the tier holds past its floor: cache the load\ngrows into free host RAM, which no memory domain's required bytes count.",
+            "required": [
+              "cacheBytes",
+              "_tag"
+            ],
+            "properties": {
+              "cacheBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HostRam"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Where a streamed fit keeps the experts its bank lacks."
       },
       "CompletionFunctionCall": {
         "type": "object",

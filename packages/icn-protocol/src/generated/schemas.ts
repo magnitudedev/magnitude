@@ -885,7 +885,15 @@ export const ChunkToolCall = S.Struct({
 export type ChunkToolCall = S.Schema.Type<typeof ChunkToolCall>
 export type ChunkToolCallEncoded = S.Schema.Encoded<typeof ChunkToolCall>
 
-export const ColdExperts = S.Union(S.Literal("disk"), S.Literal("host_ram"))
+export const ColdExperts = S.Union(
+  S.extend(S.TaggedStruct("Disk", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("HostRam", {
+      cacheBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
 export type ColdExperts = S.Schema.Type<typeof ColdExperts>
 export type ColdExpertsEncoded = S.Schema.Encoded<typeof ColdExperts>
 

@@ -784,7 +784,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { shares, .. }, .. }, .. } = assessed else {
         panic!("Qwen3.6 35B fits the RTX 3090 streamed under the cap: {assessed:?}");
     };
-    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling }, "host RAM holds the tier's ceiling");
+    assert!(matches!(shares.cold(), &ColdSource::HostTier { slots, .. } if slots == ceiling), "host RAM holds the tier's ceiling");
     // A load's re-plan of the draft keeps its tier at the cap's ceiling
     // where host RAM has room for it, which is then what its fit reports the cold experts
     // lie in.
@@ -807,7 +807,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         panic!("a capped load streams");
     };
     let shares = ExpertShares::of(&bank);
-    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling });
+    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling, cache_bytes: bank.host_cache(ceiling).unwrap() });
     assert_eq!(shares.held(shares.floor()).host as u64, ceiling);
     // The host RAM the load holds beside the tier's floor: its own plan's
     // charge, which holds the tier at its floor (`with_host_tier`), not the
@@ -829,6 +829,61 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     assert!((half..=ceiling).contains(&slots), "{slots} host slots of {ceiling}");
     assert!(growth(slots) <= growth(half), "{slots} host slots grow past the room");
     assert!(slots == ceiling || growth(slots + 1) > growth(half), "{slots} host slots leave room for another");
+}
+
+/// A streamed fit's figures count each byte where the load needs it: its
+/// stores' required bytes hold the host tier at its floor, each expert
+/// counted once, and the tier's growth past it is reported apart as cache
+/// (`ColdSource::HostTier::cache_bytes`), the growth the plan chose
+/// (`ExpertBankPlan::host_cache`); required and cache together stay within
+/// the host room the plan admitted. Qwen3.6 35B on the recorded RTX 3090,
+/// uncapped, so its tier's ceiling is every expert (a weight cap bounds the
+/// tier too, and the 6,890,894,474-byte cap leaves it no growth past its
+/// floor): with room for the tier's ceiling, and with room for its floor
+/// alone, the stores require the same bytes.
+#[test]
+fn a_streamed_fit_reports_its_tier_growth_as_cache() {
+    let scratch = Scratch::new("qwen36-tier-cache");
+    let package = qwen36_35b(&scratch);
+    let assess = |reserves| {
+        let mut setup = rtx3090_setup(BackendName::Cuda, reserves, ModelPolicy::default(), standard_service_limits());
+        setup.measurements = synthetic_measurements();
+        let prepared = prepare_model_assessment(&package, &setup.structure)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"));
+        match finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"))
+        {
+            ModelAssessment::Assessed { execution: ModelExecution::Fits { fit, residency: ModelResidency::Streamed { shares, .. } }, .. } => {
+                (fit, shares)
+            }
+            assessed => panic!("Qwen3.6 35B fits the RTX 3090 streamed: {assessed:?}"),
+        }
+    };
+    let host_of = |fit: &ExecutionFit| fit.domains.iter().find(|domain| domain.role == DomainRole::Staging).cloned().unwrap();
+    let (fit, shares) = assess(MemoryReserves::of_machine(None));
+    let bank = fit.bank.as_ref().expect("a streamed fit reports its bank");
+    let &ColdSource::HostTier { slots, cache_bytes } = shares.cold() else {
+        panic!("host RAM holds a tier: {shares:?}");
+    };
+    assert_eq!(slots, bank.host_slots);
+    assert_eq!(cache_bytes, bank.host_cache(slots).unwrap(), "the cache is the growth the plan chose");
+    assert!(cache_bytes > 0, "room for the ceiling grows the tier past its floor");
+    let host = host_of(&fit);
+    assert!(
+        host.required_bytes + cache_bytes <= host.capacity_bytes - host.reserve_bytes,
+        "{} required and {cache_bytes} cache exceed the host room {}",
+        host.required_bytes,
+        host.capacity_bytes - host.reserve_bytes
+    );
+    // Room for the tier's floor alone: no cache, the same required bytes.
+    let (floor_fit, floor_shares) = assess(host_room(host.capacity_bytes, host.required_bytes));
+    assert!(
+        !matches!(floor_shares.cold(), ColdSource::HostTier { cache_bytes, .. } if *cache_bytes > 0),
+        "a host room of the floor grows no cache: {floor_shares:?}"
+    );
+    let required = |fit: &ExecutionFit| fit.domains.iter().map(|domain| (domain.role, domain.required_bytes)).collect::<Vec<_>>();
+    assert_eq!(required(&floor_fit), required(&fit), "the tier's growth is no store's required bytes");
+    assert_eq!(floor_fit.breakdown, fit.breakdown);
 }
 
 /// A load assessment shrinks to fit is the load `with_bank` plans, tier and

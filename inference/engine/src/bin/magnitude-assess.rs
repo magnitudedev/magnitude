@@ -679,7 +679,7 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
     let cold = |cold: &magnitude_executor::assessment::ColdSource| {
         use magnitude_executor::assessment::{ColdSource, FileOnly};
         match cold {
-            ColdSource::HostTier { slots } => json!({ "hostRam": { "slots": slots } }),
+            ColdSource::HostTier { slots, cache_bytes } => json!({ "hostRam": { "slots": slots, "cacheBytes": cache_bytes } }),
             ColdSource::File(FileOnly::Unified) => json!({ "file": "unified memory" }),
             ColdSource::File(FileOnly::NoHostRoom) => json!({ "file": "host memory admits no tier slot" }),
         }

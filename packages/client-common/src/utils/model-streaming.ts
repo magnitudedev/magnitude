@@ -34,10 +34,10 @@ export const localModelAllocation = (model: LocalModel): Option.Option<ModelInst
 
 const percent = (share: number): string => `${Math.round(share * 100)}%`
 
-const COLD_EXPERTS: Record<ColdExperts, string> = {
-  disk: "the rest read from disk",
-  host_ram: "the rest in system memory as it allows, else read from disk",
-}
+/** Where the experts a streamed fit's bank lacks are kept, with the system memory its tier caches. */
+const coldExpertsLabel = (cold: ColdExperts): string => cold._tag === "Disk"
+  ? "the rest read from disk"
+  : `the rest in system memory as it allows (${formatMemorySize(cold.cacheBytes)} cached), else read from disk`
 
 /**
  * A streamed fit's facts: the share of its experts this machine allows in memory and where the rest
@@ -50,7 +50,7 @@ export const fitResidencyFacts = (
   if (residency._tag === "Resident") return []
   const { bank } = residency
   return [
-    ["Experts this machine allows", `${percent(bank.slots / bank.experts)}, ${COLD_EXPERTS[bank.coldExperts]}`],
+    ["Experts this machine allows", `${percent(bank.slots / bank.experts)}, ${coldExpertsLabel(bank.coldExperts)}`],
     ["Expert floor", percent(bank.floorSlots / bank.experts)],
     ["Speed at the floor", performanceRangeSpeedLabel(residency.floorPerformance, contextLength)],
   ]

@@ -143,7 +143,11 @@ pub enum ColdSource {
     /// experts at load (inclusive of the bank's), as many as host memory
     /// admits, growing as it lets it; the rest read from the model file.
     /// The floor's speed (`floor_performance`) is priced beside it.
-    HostTier { slots: u64 },
+    /// `cache_bytes` is what the tier holds past its floor
+    /// (`ExpertBankPlan::host_cache`): cache the load grows into free host
+    /// RAM, which no store's required bytes count, as the fit charges the
+    /// tier at its floor.
+    HostTier { slots: u64, cache_bytes: u64 },
     /// The model file, read on demand.
     File(FileOnly),
 }
@@ -162,13 +166,20 @@ pub enum FileOnly {
 impl ExpertShares {
     /// The shares of a streamed `bank`, which holds fewer than every
     /// expert: its floor, its slots and where its cold experts lie.
+    /// A linked tier's cache was computed when the plan sized the tier at
+    /// its slots, so computing it again cannot fail.
     pub fn of(bank: &crate::planning::ExpertBankPlan) -> Self {
         Self::new(
             bank.floor(),
             bank.slots,
             bank.widest(),
             match bank.host() {
-                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => ColdSource::HostTier { slots: bank.host_slots },
+                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => {
+                    let cache_bytes = bank
+                        .host_cache(bank.host_slots)
+                        .expect("a planned host tier's cache was computed when the plan sized it");
+                    ColdSource::HostTier { slots: bank.host_slots, cache_bytes }
+                }
                 crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
                 crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),
             },
@@ -214,7 +225,7 @@ impl ExpertShares {
     pub fn held(&self, slots: u64) -> HeldSlots {
         let count = |value: u64| usize::try_from(value).expect("a layer's experts fit the host");
         let host = match self.cold {
-            ColdSource::HostTier { slots } => slots,
+            ColdSource::HostTier { slots, .. } => slots,
             ColdSource::File(_) => 0,
         };
         HeldSlots { slots: count(slots), host: count(host) }

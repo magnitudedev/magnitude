@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { LocalModelFitResidencySchema, type LocalModel, type StreamingResize } from "@magnitudedev/sdk"
 import { servingHardware } from "../application/fixtures/hardware"
 import { makeSetupModel, streamedFitResidency, streamedReadyResidency } from "../application/fixtures/model"
+import { formatMemorySize } from "./format-bytes"
 import {
   fitResidencyFacts,
   localModelExpertFacts,
@@ -121,8 +122,8 @@ describe("model expert facts", () => {
       ["Expert floor", "1%"],
       ["Speed at the floor", "~5 tok/s"],
     ])
-    expect(fitResidencyFacts(streamedFitResidency("host_ram"), 32_768)[0])
-      .toEqual(["Experts this machine allows", "60%, the rest in system memory as it allows, else read from disk"])
+    expect(fitResidencyFacts(streamedFitResidency({ _tag: "HostRam", cacheBytes: 9_000_000_000 }), 32_768)[0])
+      .toEqual(["Experts this machine allows", `60%, the rest in system memory as it allows (${formatMemorySize(9_000_000_000)} cached), else read from disk`])
   })
 
   it("states an unloaded streamed fit's facts, and needs no hardware for them", () => {

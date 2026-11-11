@@ -2779,13 +2779,15 @@ impl TryFrom<StreamedBankParts> for StreamedBank {
 /// Where a streamed fit keeps the experts its bank lacks.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum ColdExperts {
     /// Read from the model file on demand (unified memory).
     Disk,
     /// In a host-RAM tier as host memory lets it grow, the rest read from the model file (a
-    /// discrete device).
-    HostRam,
+    /// discrete device). `cache_bytes` is what the tier holds past its floor: cache the load
+    /// grows into free host RAM, which no memory domain's required bytes count.
+    #[serde(rename_all = "camelCase")]
+    HostRam { cache_bytes: u64 },
 }
 
 #[cfg(test)]
@@ -2815,7 +2817,7 @@ mod model_residency_tests {
             })
             .unwrap()
         };
-        let wire_bank = |cold: &str| {
+        let wire_bank = |cold: serde_json::Value| {
             serde_json::json!({ "experts": 256, "slots": 154, "floorSlots": 26, "coldExperts": cold })
         };
         for (residency, json) in [
@@ -2827,13 +2829,13 @@ mod model_residency_tests {
             ),
             (
                 ModelResidency::Streamed {
-                    bank: bank(ColdExperts::HostRam),
+                    bank: bank(ColdExperts::HostRam { cache_bytes: 9_000_000_000 }),
                     performance: estimated(20.0),
                     floor_performance: estimated(5.5),
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
-                    "bank": wire_bank("host_ram"),
+                    "bank": wire_bank(serde_json::json!({ "_tag": "HostRam", "cacheBytes": 9_000_000_000u64 })),
                     "performance": wire(20.0),
                     "floorPerformance": wire(5.5)
                 }),
@@ -2846,7 +2848,7 @@ mod model_residency_tests {
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
-                    "bank": wire_bank("disk"),
+                    "bank": wire_bank(serde_json::json!({ "_tag": "Disk" })),
                     "performance": { "_tag": "Pending" },
                     "floorPerformance": { "_tag": "Pending" }
                 }),
@@ -2861,7 +2863,7 @@ mod model_residency_tests {
         // A streamed bank holds at least its floor, and fewer than every expert.
         for (slots, floor_slots) in [(20, 26), (256, 26)] {
             assert!(serde_json::from_value::<StreamedBank>(serde_json::json!({
-                "experts": 256, "slots": slots, "floorSlots": floor_slots, "coldExperts": "disk"
+                "experts": 256, "slots": slots, "floorSlots": floor_slots, "coldExperts": { "_tag": "Disk" }
             }))
             .is_err());
         }
