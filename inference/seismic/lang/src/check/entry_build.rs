@@ -1226,6 +1226,30 @@ fn repacked(dst: &mut tensor[2, 4, 8] U, src: &tensor[4, 8] E):
             OutcomeValue::Scalar(ReferenceScalar::I32(0))
         ));
     }
+
+    /// A dimension a disjunction names zero (`V == 0` in one branch) admits
+    /// the zero shape, as `V >= 0` does; the domain still refuses what no
+    /// branch admits.
+    #[test]
+    fn a_dimension_named_zero_in_a_disjunction_admits_the_zero_shape() {
+        let module = module(
+            "fn probe[V, S](x: &tensor[V] i32, y: &tensor[S] i32) -> i32 where (V > 0 and S > 0) or (V == 0 and S == 0):\n    return i32(V) + i32(S)\n",
+        );
+        let entry = module
+            .entry(module.entry_named("probe").unwrap(), &ElementBindings::default())
+            .unwrap();
+        let run = |v: usize, s: usize| {
+            let mut interpreter = Interpreter::new(&entry);
+            let x = interpreter.add_tensor(TensorData::dense(DType::I32, vec![v], vec![0.0; v]));
+            let y = interpreter.add_tensor(TensorData::dense(DType::I32, vec![s], vec![0.0; s]));
+            interpreter
+                .run(&[Arg::Tensor(x), Arg::Tensor(y)])
+                .map(|outcome| matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::I32(sum)) if sum == (v + s) as i32))
+        };
+        assert_eq!(run(0, 0).ok(), Some(true), "the zero shape is admitted");
+        assert_eq!(run(2, 3).ok(), Some(true));
+        assert!(run(0, 3).is_err(), "a shape no branch admits is refused");
+    }
 }
 
 use super::{dimensions, ir, xfer};

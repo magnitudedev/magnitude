@@ -3,7 +3,7 @@
 
 use super::ir::{DefKind, Ownership, Predicate, WhereConjunct};
 use crate::checked::{DiagnosticRule, ElementPredicate, ElementTerm};
-use crate::expr::{AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, SymbolId};
+use crate::expr::{AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, ProgramId};
 use crate::registry::{self, BackendName};
 use crate::span::{Diagnostic, Span};
@@ -1165,9 +1165,9 @@ pub(crate) fn signature_of(
         .zip(&shape_symbols)
         .map(|(name, &symbol)| {
             let value = arena.int_symbol(symbol);
-            let admits_zero = predicates.iter().any(|conjunct: &WhereConjunct| {
-                matches!(conjunct.predicate, Predicate::NonNegative(expression) if super::prove::same(&arena, expression, value))
-            });
+            let admits_zero = predicates
+                .iter()
+                .any(|conjunct: &WhereConjunct| states_zero(&arena, conjunct.predicate, value));
             SignatureDimension {
                 name: name.clone(),
                 symbol,
@@ -1185,6 +1185,39 @@ pub(crate) fn signature_of(
         element_predicates,
         arena,
     })
+}
+
+/// Whether a lowered `where` conjunct admits `value` zero: `value >= 0`, or
+/// `value == 0` as the conjunct or in any branch of a disjunction, a
+/// declaration that states a case of zero admitting it as `>= 0` does.
+fn states_zero(arena: &ExprArena, predicate: Predicate, value: IntExpr) -> bool {
+    match predicate {
+        Predicate::NonNegative(expression) | Predicate::Zero(expression) => {
+            super::prove::same(arena, expression, value)
+        }
+        Predicate::NonZero(_) => false,
+        Predicate::Boolean(condition) => bool_states_zero(arena, condition, value),
+    }
+}
+
+fn bool_states_zero(arena: &ExprArena, condition: BoolExpr, value: IntExpr) -> bool {
+    match arena.view(condition.into()) {
+        NodeView::Binary {
+            op: crate::expr::BinaryOp::And | crate::expr::BinaryOp::Or,
+            lhs: AnyExpr::Bool(lhs),
+            rhs: AnyExpr::Bool(rhs),
+        } => bool_states_zero(arena, lhs, value) || bool_states_zero(arena, rhs, value),
+        NodeView::Cmp {
+            op: CmpOp::Eq,
+            lhs: AnyExpr::Int(lhs),
+            rhs: AnyExpr::Int(rhs),
+        } => {
+            let is_zero = |e: IntExpr| super::prove::constant(arena, e) == Some(0);
+            (super::prove::same(arena, lhs, value) && is_zero(rhs))
+                || (is_zero(lhs) && super::prove::same(arena, rhs, value))
+        }
+        _ => false,
+    }
 }
 
 /// Element parameters are implicit lexical binders wherever a tensor element
