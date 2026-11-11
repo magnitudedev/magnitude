@@ -1140,6 +1140,69 @@ mod tests {
         }
     }
 
+    /// A row whose blocks' scales are subnormal F32 (largest magnitude
+    /// about 2^-122) quantizes to codes of its stored scales, and every tier
+    /// and row block dots those codes as exactly as the F32 scale products
+    /// allow.
+    #[test]
+    fn subnormal_scales_quantize_and_dot_exactly() {
+        use crate::quant::{blocks, quantize, tests::assert_exact, Q8Block, Q8_BLOCK};
+        let k = 2 * 256 + 32 * 3;
+        let lower = 2.0f32.powi(-122);
+        let x = Placed::of(
+            &bytes(7, k)
+                .iter()
+                .map(|byte| (*byte as f32 - 128.0) / 100.0 * lower)
+                .collect::<Vec<_>>(),
+        );
+        let mut xq = vec![Q8Block::ZERO; blocks(k)];
+        quantize(&x, &mut xq);
+        assert_exact(&x, &xq);
+        assert!(xq.iter().all(|block| block.d > 0.0 && block.d < f32::MIN_POSITIVE));
+        let detected = Tier::detected().unwrap();
+        for representation in int8_elements() {
+            let (data, geometry) = rows(representation, BLOCK_ROWS, k, 11);
+            let reference = kernels_of(detected, representation);
+            // The exact dots of the codes under their scales, and the sums of
+            // their terms' magnitudes: the scale products are subnormal F32,
+            // each rounded to about 2^-10 of itself.
+            let mut exact = [0.0f64; BLOCK_ROWS];
+            let mut magnitude = [0.0f64; BLOCK_ROWS];
+            let mut decoded = vec![0.0f32; k];
+            for row in 0..BLOCK_ROWS {
+                unsafe {
+                    reference.decode(data.as_ptr().add(row * geometry.stride), &geometry, k, &mut decoded)
+                };
+                for (i, w) in decoded.iter().enumerate() {
+                    let code = xq[i / Q8_BLOCK].codes[i % Q8_BLOCK];
+                    let term = f64::from(xq[i / Q8_BLOCK].d) * f64::from(code) * f64::from(*w);
+                    exact[row] += term;
+                    magnitude[row] += term.abs();
+                }
+            }
+            for tier in detected.at_or_below() {
+                let kernels = kernels_of(tier, representation);
+                for block in ROW_BLOCKS {
+                    for first in (0..BLOCK_ROWS).step_by(block) {
+                        let mut out = vec![0.0f32; block];
+                        unsafe {
+                            kernels.dot_q8(data.as_ptr().add(first * geometry.stride), &geometry, &xq, k, &mut out)
+                        };
+                        for (r, value) in out.iter().enumerate() {
+                            let row = first + r;
+                            assert!(
+                                (f64::from(*value) - exact[row]).abs() <= 1e-2 * magnitude[row],
+                                "{representation} {tier:?} block {block} row {row}: {value} against {} (terms {})",
+                                exact[row],
+                                magnitude[row]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Whole 16-row tiles in one call (`dot_q8_tiles`) give the sums the
     /// same tier's quantized dots give eight rows at a time (the rows16
     /// projection's block), bit for bit, at the expert
