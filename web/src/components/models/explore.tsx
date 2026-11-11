@@ -6,7 +6,7 @@ import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type Ca
 import { formatStorageSize, useAgentClient, useLocalModelMutations, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
-import { onThisComputer, quantView, transferOf } from "./data"
+import { downloadContents, onThisComputer, quantView, transferOf } from "./data"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
 import { ExploreModal, type ExploreResults, type RunnableFamily } from "./explore-modal"
@@ -20,53 +20,58 @@ function useDebounced<A>(value: A, delay: number): A {
   return settled
 }
 
-const TRUSTED_PUBLISHERS = new Set(["unsloth", "bartowski", "ggml-org", "lmstudio-community"])
-
-/** Whether a repository's publisher is one people rely on for quants, or the base model's own lab. */
-const trustedPublisher = (repository: string, base: string | undefined) => {
-  const owner = repository.split("/")[0]?.toLowerCase() ?? ""
-  return TRUSTED_PUBLISHERS.has(owner) || (base !== undefined && base.split("/")[0]?.toLowerCase() === owner)
-}
-
-/** Search results grouped by the model they quantize: one offered model per base, one rung per repository's recommended quant. */
-const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: ServingMemory): readonly OfferedModel[] => {
-  const groups = new Map<string, HuggingFaceSearchResult[]>()
-  for (const result of results) {
+/**
+ * Each search result that runs here as it is on Hugging Face, in the order Hugging Face lists them (most downloaded
+ * first): one repository per row, offering the quant it recommends for this machine until it is opened.
+ */
+const offeredFromSearch = (results: readonly HuggingFaceSearchResult[], memory: ServingMemory): readonly OfferedModel[] =>
+  results.flatMap((result): OfferedModel[] => {
     // A result that doesn't run here, or that couldn't be checked, is no offer: search shows what runs.
-    if (Option.isSome(result.unsupported) || Option.isNone(result.recommended)) continue
-    const base = Option.getOrNull(result.base)
-    const key = base && base.relation === "Quantized" ? base.repository : result.repository
-    groups.set(key, [...groups.get(key) ?? [], result])
-  }
-  const models = [...groups.entries()].map(([key, members]): OfferedModel => {
-    const lead = members[0]!
-    const base = Option.getOrNull(lead.base)
-    const developer = Option.getOrNull(lead.developer)
-    // Publishers people rely on first, then the most downloaded: the order rows are listed in, and the first that
-    // fits is the one offered.
-    const ordered = [...members].sort((left, right) =>
-      Number(trustedPublisher(right.repository, base?.repository)) - Number(trustedPublisher(left.repository, base?.repository))
-        || right.downloads - left.downloads)
-    const quants = ordered.flatMap(member => Option.match(member.recommended, {
+    if (Option.isSome(result.unsupported)) return []
+    return Option.match(result.recommended, {
       onNone: () => [],
-      onSome: version => [quantView({ key: version.modelId, name: version.label, repository: member.repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes }, version.assessment, memory)],
-    }))
-    const fastest = quants.find(quant => quant.fits)
-    const first = members.flatMap(member => Option.toArray(member.recommended))[0]
-    return {
-      key,
-      catalog: false,
-      name: base && base.relation === "Quantized" ? repositoryDisplayName(base.repository) : lead.displayName,
-      lab: developer ? labForDeveloper(developer.lab) : undefined,
-      country: developer?.country ?? null,
-      fineTuneOf: base && base.relation === "Finetune" ? repositoryDisplayName(base.repository) : null,
-      drafter: null,
-      contextLimit: first && first.assessment._tag === "Fits" ? first.assessment.profile.contextLength : null,
-      quants,
-      recommended: fastest?.key ?? quants[0]?.key ?? null,
-    }
+      onSome: version => {
+        const base = Option.getOrNull(result.base)
+        const developer = Option.getOrNull(result.developer)
+        const quant = quantView({ key: version.modelId, name: version.label, repository: result.repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes }, version.assessment, memory)
+        return [{
+          key: result.repository,
+          catalog: false,
+          name: result.displayName,
+          lab: developer ? labForDeveloper(developer.lab) : undefined,
+          country: developer?.country ?? null,
+          fineTuneOf: base && base.relation === "Finetune" ? repositoryDisplayName(base.repository) : null,
+          drafter: null,
+          contextLimit: version.assessment._tag === "Fits" ? version.assessment.profile.contextLength : null,
+          quants: [quant],
+          recommended: quant.key,
+          checking: false,
+        }]
+      },
+    })
   })
-  return models
+
+/**
+ * An opened search result with every quant its repository has, smallest first, each as this machine runs it, from the service's
+ * inspection of the repository; until that is done, the quant search offered, marked as still checking. A catalog
+ * model, or one not open, is as it is.
+ */
+const useRepositoryQuants = (memory: ServingMemory) => function useOpened(model: OfferedModel, open: boolean): OfferedModel {
+  const client = useAgentClient()
+  const reference = !model.catalog && open ? model.key : null
+  const update = useAtomValue(useMemo(() => Atom.make((get) => reference === null
+    ? Result.initial()
+    : get(client.Models.StreamModelCandidateInspection({ reference })).result),
+  [client, reference]))
+  if (reference === null) return model
+  if (!Result.isSuccess(update) || update.value._tag !== "Inspected") return { ...model, checking: !Result.isFailure(update) }
+  const repository = model.key
+  const quants = update.value.inspection.versions.map(version => quantView(
+    { key: version.modelId, name: version.label, repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes },
+    Option.getOrNull(version.assessment), memory)).sort((left, right) => left.sizeBytes - right.sizeBytes)
+  if (quants.length === 0) return model
+  const recommended = update.value.inspection.versions.find(version => version.recommended)?.modelId ?? model.recommended
+  return { ...model, quants, recommended, checking: false }
 }
 
 interface ExploreProps {
@@ -86,7 +91,7 @@ interface ExploreProps {
  * A quant's Download, which says it is starting from the click until the service lists the download (this button is
  * then replaced); if nothing is listed within half a minute, the request failed and it offers Download again.
  */
-function DownloadButton({ size, disabled, start }: { size: number; disabled: boolean; start: () => void }) {
+function DownloadButton({ size, contents, disabled, start }: { size: number; contents: string | null; disabled: boolean; start: () => void }) {
   const [starting, setStarting] = useState(false)
   useEffect(() => {
     if (!starting) return
@@ -94,7 +99,10 @@ function DownloadButton({ size, disabled, start }: { size: number; disabled: boo
     return () => clearTimeout(timer)
   }, [starting])
   if (starting) return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Starting…</Button>
-  return <Button disabled={disabled} onClick={() => { setStarting(true); start() }}><DownloadSimpleIcon />Download {formatStorageSize(size)}</Button>
+  return <span className="flex items-center gap-3">
+    {contents && <span className="text-xs text-slate-500">{contents}</span>}
+    <Button disabled={disabled} onClick={() => { setStarting(true); start() }}><DownloadSimpleIcon />Download {formatStorageSize(size)}</Button>
+  </span>
 }
 
 /** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
@@ -122,7 +130,7 @@ function useDownload() {
           drafter: { _tag: "Auto" },
           force: false,
         })
-    return <DownloadButton key={quant.key} size={quant.downloadBytes} disabled={!quant.fits} start={start} />
+    return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents(model, quant)} disabled={!quant.fits} start={start} />
   }
 }
 
@@ -168,5 +176,6 @@ export function Explore(props: ExploreProps) {
     ? { _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }
     : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
     : searched
-  return <ExploreModal {...props} results={results} download={download} />
+  const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
+  return <ExploreModal {...props} results={results} download={download} useOpened={useOpened} />
 }

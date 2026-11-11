@@ -205,13 +205,7 @@ impl HuggingFaceDiscovery {
             .filter_map(std::future::ready)
             .collect::<Vec<_>>()
             .await;
-        results.sort_by_key(|result| {
-            (
-                !result.unsupported.is_empty(),
-                !names_exactly(&result.repository, query),
-                std::cmp::Reverse(result.downloads.unwrap_or(0)),
-            )
-        });
+        results.sort_by_key(|result| (!result.unsupported.is_empty(), std::cmp::Reverse(result.downloads.unwrap_or(0))));
         Ok(HuggingFaceModelSearchResults {
             results,
             next_cursor,
@@ -315,33 +309,6 @@ fn next_page_cursor(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .and_then(|link| {
             let target = link.trim().strip_prefix('<')?.split_once('>')?.0;
             reqwest::Url::parse(target).ok()?.query_pairs().find(|(key, _)| key == "cursor").map(|(_, value)| value.into_owned())
-        })
-}
-
-/// Whether a repository is exactly the query: its `owner/repository`, or its name in the same words, ignoring case, separators
-/// and a trailing `GGUF`, with or without an uploader's `Org_` prefix (`bartowski/Qwen_Qwen3.5-4B-GGUF`
-/// is exactly "Qwen3.5 4B").
-fn names_exactly(repository: &str, query: &str) -> bool {
-    if repository.eq_ignore_ascii_case(query) {
-        return true;
-    }
-    let words = |text: &str| {
-        text.to_lowercase()
-            .split(|character: char| !(character.is_alphanumeric() || character == '.'))
-            .filter(|word| !word.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    let query = words(query);
-    let name = repository.rsplit('/').next().unwrap_or(repository);
-    std::iter::once(name)
-        .chain(name.split_once('_').map(|(_, rest)| rest))
-        .any(|name| {
-            let mut name = words(name);
-            if name.last().is_some_and(|word| word == "gguf") {
-                name.pop();
-            }
-            name == query
         })
 }
 
@@ -5153,7 +5120,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_lists_exact_names_first_then_by_downloads_and_unsupported_last() {
+    async fn search_lists_results_by_downloads_and_unsupported_last() {
         let (endpoint, _) = serve_hub(|path, query| {
             let result = |id: &str, seed: char, architecture: &str, downloads: u64| {
                 serde_json::json!({
@@ -5201,10 +5168,10 @@ mod tests {
                 .map(|result| result.repository.as_str())
                 .collect::<Vec<_>>(),
             [
-                "community/Llama-8B-GGUF",
-                "bartowski/Meta_Llama-8B-GGUF",
                 "someone/Llama-8B-Uncensored-GGUF",
+                "community/Llama-8B-GGUF",
                 "other/Llama-8B-Instruct-GGUF",
+                "bartowski/Meta_Llama-8B-GGUF",
                 "unsupported/Llama-8B-GGUF",
             ]
         );

@@ -67,18 +67,27 @@ function NextPage({ onReach }: { onReach: () => void }) {
   return <div ref={ref} className="mt-2 flex justify-center"><Button variant="ghost" size="sm" onClick={onReach}>More results</Button></div>
 }
 
+/** An offered model as opened: what opening it brings (a search result's every quant) is the model it shows. */
+function OfferedCard({ model, expanded, download, useOpened, ...rest }: Omit<Parameters<typeof ExpandingModel>[0], "footer"> & {
+  download: (model: OfferedModel, quant: QuantView) => ReactNode; useOpened: (model: OfferedModel, open: boolean) => OfferedModel
+}) {
+  const opened = useOpened(model, expanded)
+  return <ExpandingModel {...rest} model={opened} expanded={expanded} footer={quant => download(opened, quant)} />
+}
+
 /** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
-export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download }: {
+export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, useOpened }: {
   open: boolean; setOpen: (open: boolean) => void; query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
+  useOpened: (model: OfferedModel, open: boolean) => OfferedModel
 }) {
   const [chosen, setExpanded] = useState<string | null | undefined>(undefined)
   const [quantChoices, setQuantChoices] = useState<Readonly<Record<string, string>>>({})
   const listed = (results._tag === "Recommended" && results.measuring === null) || results._tag === "Results" ? results.models : []
   const expanded = chosen === undefined ? (results._tag === "Recommended" ? listed[0]?.key ?? null : null) : chosen
-  const card = (model: OfferedModel, note?: string) => <ExpandingModel key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
+  const card = (model: OfferedModel, note?: string) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
     onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
-    onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} footer={quant => download(model, quant)} />
+    onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} useOpened={useOpened} />
   return <Dialog open={open} onOpenChange={value => { setOpen(value); if (!value) setExpanded(undefined) }}>
     <DialogContent className="flex h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
       <DialogTitle className="sr-only">Explore models</DialogTitle>
