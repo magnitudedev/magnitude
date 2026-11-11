@@ -2204,7 +2204,7 @@ impl StateStore {
             .try_fold(0u64, |total, (&slabs, history)| {
                 history
                     .slabs
-                    .slab_bytes()
+                    .slab_charge()
                     .checked_mul(slabs as u64)
                     .and_then(|bytes| total.checked_add(bytes))
             })
@@ -2212,7 +2212,7 @@ impl StateStore {
         let bank_bytes = backing
             .recurrent
             .as_ref()
-            .map_or(0, SlabTensor::slab_bytes)
+            .map_or(0, SlabTensor::slab_charge)
             .checked_mul(bank_slabs as u64)
             .ok_or_else(|| Error::Request("bank slab claim overflows".into()))?;
         history_bytes
@@ -3511,6 +3511,30 @@ mod tests {
         assert_eq!(store.bank_slab_banks(), 1);
         assert_eq!(store.available_banks(), BankCapacity { active: 2, in_flight: 1, retained: 0 }.startup_banks().unwrap() - 1);
         assert_eq!(store.growth_claim(&[], &[], 1).unwrap().minimum_bytes, 0);
+    }
+
+    /// A growth claims what a slab's allocation is charged, the figure the
+    /// device's bound is derived from, never a sum of its own: a record table
+    /// the allocation holds is part of it, so the claim and the allocation
+    /// cannot differ.
+    #[test]
+    fn a_slab_growth_claims_the_charge_of_a_slab_allocation() {
+        let (store, _bindings) = StateStore::new(
+            cpu_device(),
+            64,
+            64,
+            vec![],
+            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+            BankCapacity { active: 2, in_flight: 1, retained: 0 },
+        )
+        .unwrap();
+        let backing = store.backing.borrow();
+        let slabs = backing.recurrent.as_ref().expect("a store of components holds bank slabs");
+        let charged = slabs.slab_storage_observers().filter_map(|observer| observer.charged_bytes()).max().expect("a backed slab");
+        assert_eq!(slabs.slab_charge(), charged.max(slabs.slab_bytes()));
+        drop(backing);
+        // Two banks are wanted, one is committed past the seed: one slab.
+        assert_eq!(store.growth_claim(&[], &[], 2).unwrap().minimum_bytes, store.backing.borrow().recurrent.as_ref().unwrap().slab_charge());
     }
 
     #[test]
