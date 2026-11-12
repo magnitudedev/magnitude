@@ -26,14 +26,19 @@
 //! and those within 1.25 times the fastest get two more; the fastest by its
 //! median, the default, and the default's ROWS in the other form are then
 //! timed over 20 passes; `--search forms` times the default and that other
-//! form alone, `--search default` the default alone. Each printed configuration is checked against an f64 reference on 64 of its weight
+//! form alone, `--search default` the default alone. `--seconds S` times each
+//! printed configuration for about `S` seconds more first (`seismic::measure`,
+//! a `Stop::Count` of 50 ms samples), so a sampling profiler's stops fall in
+//! the timed cell, not in the seconds of setup before it: a line on stderr,
+//! `repeating ..`, marks its start. Each printed
+//! configuration is checked against an f64 reference on 64 of its weight
 //! rows (`rel_err`, the relative RMS error), and must hold every value
 //! within the int8-activation bound (`within`): half a 256-value block's
 //! quantization step times |w| per product, plus 1e-4 of the magnitude sum.
 
 use magnitude_ggml::Encoding;
 use magnitude_kernels::project_rows;
-use seismic::measure::{Pending, Work};
+use seismic::measure::{measure, Measure, Pending, Stop, Work};
 use seismic::{BackendName, Device, Element, GgufScales, NativeSpecialization, OperandRecipe, Tensor};
 
 /// Each quant: its name, encoding, and scale fields (byte offset, the code
@@ -51,6 +56,8 @@ const SHAPES: [(usize, usize); 4] = [(1024, 2048), (2048, 512), (9728, 2560), (1
 const ROWS: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, PREFILL];
 const PREFILL: usize = 512;
 const SAMPLES: usize = 20;
+/// Device seconds one sample of a `--seconds` repeat covers at least.
+const SAMPLE_SECONDS: f64 = 0.05;
 /// Weight rows the correctness check reads: eight groups of eight.
 const CHECKED: usize = 64;
 
@@ -208,6 +215,7 @@ fn main() {
     // default alone. Only the configurations timed are formed.
     let search = options.get("search").map_or("full", String::as_str).to_owned();
     assert!(matches!(search.as_str(), "full" | "forms" | "default"), "--search is full, forms or default");
+    let seconds = options.get("seconds").map(|s| s.parse::<f64>().expect("--seconds is a duration"));
     let rows: Vec<usize> = selected("rows", ROWS.iter().map(usize::to_string).collect()).iter().map(|r| r.parse().unwrap()).collect();
     let prefix = format!(
         "\"host\":\"{}\",\"cpu\":\"{}\",\"placement\":\"{}\",\"engine\":\"magnitude\",\"threads\":{threads}",
@@ -260,6 +268,14 @@ fn main() {
                 // Config `config` timed to SAMPLES passes in all, checked, and
                 // printed as `choice`.
                 let report = |choice: &str, config: (u64, u64), taken: &mut Vec<f64>| {
+                    if let Some(seconds) = seconds {
+                        // The line a profiler waits for before it samples.
+                        eprintln!("repeating {name} {shape} rows {m} for {seconds} s");
+                        // Samples of at least `SAMPLE_SECONDS` each, as many as fill `seconds`.
+                        let samples = std::num::NonZeroUsize::new((seconds / SAMPLE_SECONDS).ceil().max(1.0) as usize).unwrap();
+                        let how = Measure { stop: Stop::Count(samples), min_sample_seconds: SAMPLE_SECONDS };
+                        measure(&points[&config], &how, None).expect("a timed repeat");
+                    }
                     while taken.len() < SAMPLES {
                         taken.push(pass(config));
                     }
