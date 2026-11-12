@@ -704,6 +704,23 @@ pub enum ExpertKernels {
     },
 }
 
+impl ExpertKernels {
+    /// Whether `backend`'s routed launches of a resident layer (a held
+    /// layer's, or a whole bank's resident forms, which read its home
+    /// records) bind each expert stack as it lies and read expert `e` from
+    /// row `e * rows` of the binding, rather than through a record port's
+    /// table (`routed.seismic`: Metal's `_resident` launches list no expert
+    /// stack among their `records`, and CUDA's and the CPU's list none;
+    /// Vulkan's list every one). A binding is one buffer, which chunked
+    /// reserved storage is not (`seismic::Reservation::chunked`).
+    pub(crate) const fn bind_resident_stacks(backend: seismic::BackendName) -> bool {
+        match backend {
+            seismic::BackendName::Metal | seismic::BackendName::Cuda | seismic::BackendName::Cpu => true,
+            seismic::BackendName::Vulkan => false,
+        }
+    }
+}
+
 /// A dense expansion: gated (`dense_expand`) or up-only (`dense_up`).
 #[derive(Clone, Debug)]
 pub enum DenseExpansionKernel {
@@ -731,4 +748,38 @@ pub struct ShortConvKernels {
     pub project: NativeKernel<short_conv_project::Entry>,
     pub rows: NativeKernel<short_conv_rows::Entry>,
     pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExpertKernels;
+    use magnitude_kernels::{routed_down, routed_gate_up, routed_output, routed_up};
+    use seismic::{BackendName, RecordPort};
+
+    /// Whether any launch of `E` on `backend` binds expert stack `stack`
+    /// as it lies: lists it among no record ports.
+    fn binds<E: seismic::Entry>(backend: BackendName, stack: &str) -> bool {
+        let native = seismic::generated::native_implementation_for_backend::<E>(backend)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{backend:?} declares every routed launch"));
+        let port = RecordPort::Parameter(stack.to_owned());
+        (0..native.launches.len()).any(|launch| !native.launch_records(launch).contains(&port))
+    }
+
+    /// The stated property is what the routed launches declare, on every
+    /// backend and for every expert stack a resident layer reads.
+    #[test]
+    fn resident_stack_binding_is_what_the_routed_launches_declare() {
+        for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu] {
+            let declared = [
+                binds::<routed_gate_up::Entry>(backend, "expert_gate"),
+                binds::<routed_gate_up::Entry>(backend, "expert_up"),
+                binds::<routed_up::Entry>(backend, "expert_up"),
+                binds::<routed_down::Entry>(backend, "expert_down"),
+                binds::<routed_output::Entry>(backend, "expert_down"),
+            ];
+            let stated = ExpertKernels::bind_resident_stacks(backend);
+            assert!(declared.iter().all(|&binds| binds == stated), "{backend:?}: {declared:?}, stated {stated}");
+        }
+    }
 }

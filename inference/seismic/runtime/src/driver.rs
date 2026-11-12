@@ -10,7 +10,6 @@ use crate::api::kernel::{
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
 use crate::memory::{DeviceLedgers, MemoryCharge, MemoryReservation, Placement};
-use seismic_reservation::Forming;
 use crate::native::NativeQueue;
 use crate::resources::{AdmissionDomain, AdmittedResources, PersistentTable};
 use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
@@ -621,10 +620,8 @@ impl Resizer {
     /// chunks' buffers formed). Committing no rows, more than the
     /// reservation spans, beyond the device's single-allocation limit or
     /// fewer than a live region pins is refused, the tensor as it was.
-    /// Where the backend binds a range whole (Metal), the view's form
-    /// changes as [`Self::admit`] chooses, within the grant.
     pub fn prepare(self, committed: u64) -> Result<PreparedRecommit, RecommitRefusal> {
-        let Admitted { bytes, backing, grant, form, forming } = match self.admit(committed) {
+        let (bytes, backing, grant) = match self.admit(committed) {
             Ok(admitted) => admitted,
             Err(error) => return Err(RecommitRefusal { resizer: self, error }),
         };
@@ -634,30 +631,20 @@ impl Resizer {
             limits,
             backend,
         } = self;
-        match backend.prepare(bytes, form, forming) {
-            Ok(prepared) => {
-                // Work submitted from here on is committed with what the
-                // prepare formed in the queue's residency set; what was
-                // submitted before is read once no encoding holds a permit.
-                let before = (prepared.rebinding() == seismic_reservation::Rebinding::Beside).then(|| {
-                    let _encodings = allocation.acquire_exclusive();
-                    allocation.last_device_uses()
-                });
-                Ok(PreparedRecommit {
-                    next: Some(Next {
-                        resizer: Parts {
-                            allocation,
-                            memory,
-                            limits,
-                        },
-                        bytes,
-                        backing,
-                        grant,
-                        backend: prepared,
-                        before,
-                    }),
-                })
-            }
+        match backend.prepare(bytes) {
+            Ok(prepared) => Ok(PreparedRecommit {
+                next: Some(Next {
+                    resizer: Parts {
+                        allocation,
+                        memory,
+                        limits,
+                    },
+                    bytes,
+                    backing,
+                    grant,
+                    backend: prepared,
+                }),
+            }),
             Err((backend, error)) => Err(RecommitRefusal {
                 resizer: Parts {
                     allocation,
@@ -676,21 +663,14 @@ impl Resizer {
         Ok(self.prepare(committed)?.install()?.release())
     }
 
-    /// The bytes of `committed` rows, their backing, the grant a resize to
-    /// them needs and the view's form, admitted. The bytes are counted once
-    /// the rows are known to lie within the reservation, whose bytes were
-    /// counted. A growth is granted its new backing. A change between a
-    /// view's forms, where the backend binds a range whole, holds the next
-    /// form's buffers beside the view's from its prepare to its release,
-    /// which its device counts: the lesser form's backing more, granted for
-    /// that window. A growth to every granule takes the whole form only
-    /// where that is granted, and otherwise stays in chunks, which bind
-    /// nothing directly ([`crate::api::Tensor::bindable`]); a shrink from
-    /// the whole form, which needs no grant, forms its kept chunks beside
-    /// it where that is granted, and otherwise in its place at its install
-    /// ([`seismic_reservation::Forming::InPlace`]), which waits for all the
-    /// device work using the tensor ([`PreparedRecommit::install`]).
-    fn admit(&self, committed: u64) -> Result<Admitted, crate::api::TensorError> {
+    /// The bytes of `committed` rows, their backing and the grant a growth
+    /// to them needs, admitted; no grant for a shrink. The bytes are counted
+    /// once the rows are known to lie within the reservation, whose bytes
+    /// were counted.
+    fn admit(
+        &self,
+        committed: u64,
+    ) -> Result<(u64, u64, Option<MemoryReservation>), crate::api::TensorError> {
         let reservation = self
             .allocation
             .reservation()
@@ -703,54 +683,13 @@ impl Resizer {
             .expect("allocation charge lock poisoned");
         self.allocation.unpinned(bytes)?;
         let backing = reservation.backing(bytes)?;
-        let installed = reservation.backing(self.allocation.bytes())?;
         let growth = backing.saturating_sub(charge.bytes());
-        let beside = backing.min(installed);
-        let admitted = |grant, form, forming| Admitted { bytes, backing, grant, form, forming };
-        if self.backend.whole() {
-            if backing >= installed {
-                return Ok(admitted(None, ReservedForm::Whole, Forming::Beside));
-            }
-            // `reserve` refuses only for capacity.
-            return Ok(match reserve(&self.memory, beside) {
-                Ok(grant) => admitted(Some(grant), ReservedForm::Chunks, Forming::Beside),
-                Err(_) => admitted(None, ReservedForm::Chunks, Forming::InPlace),
-            });
-        }
         if growth == 0 {
-            return Ok(admitted(None, ReservedForm::Chunks, Forming::Beside));
+            return Ok((bytes, backing, None));
         }
         self.limits.admit_bytes(reservation.largest_allocation(backing))?;
-        if backing > installed && reservation.whole_at(backing)? {
-            if let Ok(grant) = reserve(&self.memory, growth + beside) {
-                return Ok(admitted(Some(grant), ReservedForm::Whole, Forming::Beside));
-            }
-        }
-        Ok(admitted(Some(reserve(&self.memory, growth)?), ReservedForm::Chunks, Forming::Beside))
+        Ok((bytes, backing, Some(reserve(&self.memory, growth)?)))
     }
-}
-
-/// What [`Resizer::admit`] admits.
-struct Admitted {
-    bytes: u64,
-    backing: u64,
-    /// The growth's grant, and a change of form's beside it for its window.
-    grant: Option<MemoryReservation>,
-    form: ReservedForm,
-    /// Where a change of form forms its next buffers: in place only for a
-    /// shrink from the whole form the grant cannot hold its chunks beside.
-    forming: Forming,
-}
-
-/// The form a reserved tensor's view takes where its backend binds a range
-/// whole (`seismic_metal::ViewForm`); every other backend's view is of one
-/// form, [`Self::Chunks`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReservedForm {
-    /// Its backed granules in their own buffers.
-    Chunks,
-    /// One buffer over every granule of the range.
-    Whole,
 }
 
 /// A resizer's parts but its backend's, which each step of a resize changes.
@@ -780,10 +719,6 @@ struct Next {
     backing: u64,
     grant: Option<MemoryReservation>,
     backend: crate::backends::ReservedPrepared,
-    /// Where the prepare formed what the install moves rows device work
-    /// already reaches to (`seismic_reservation::Rebinding::Beside`): the
-    /// device work submitted before, which the install waits for.
-    before: Option<DeviceUses>,
 }
 
 impl PreparedRecommit {
@@ -811,26 +746,11 @@ impl PreparedRecommit {
     /// returns once the device work submitted before its install completes,
     /// so a holder that hands a growth's new rows to device work only after
     /// its release (`magnitude_executor`'s growth joins) lets no earlier
-    /// work reach them, on any backend. A resize that moves rows device work
-    /// already reaches (Metal's change between its chunks and one buffer
-    /// over a whole range) first waits, before taking the tensor, for the
-    /// device work submitted before its prepare, which may not reach where
-    /// they move; one that forms them in place of the view's
-    /// ([`Forming::InPlace`]) waits, holding the tensor, for all the device
-    /// work using it. At a boundary between flights there is none; a resize
-    /// within a flight (a cut of a running chain) stalls there until the
-    /// running work ends, which is taken only because it happens only where
-    /// the grant refused the chunks beside the view.
+    /// work reach them, on any backend.
     pub fn install(mut self) -> Result<RecommitRelease, RecommitRefusal> {
         let next = self.next.take().expect("a resize installs once");
-        if let Some(before) = &next.before {
-            before.retire();
-        }
         let allocation = next.resizer.allocation.clone();
         let exclusive = allocation.acquire_exclusive();
-        if next.backend.rebinding() == seismic_reservation::Rebinding::InPlace {
-            allocation.last_device_uses().retire();
-        }
         let mut charge = allocation
             .charge
             .lock()
@@ -844,9 +764,8 @@ impl PreparedRecommit {
         }
         let backend = next.backend.install();
         let backing = next.backing;
-        let mut beside = next.grant;
-        if let Some(grant) = beside.as_mut() {
-            let growth = backing.saturating_sub(charge.bytes());
+        if let Some(mut grant) = next.grant {
+            let growth = backing - charge.bytes();
             grant.extend(&mut charge, growth);
         }
         allocation.bytes.store(next.bytes, Ordering::Release);
@@ -858,7 +777,6 @@ impl PreparedRecommit {
                 backing,
                 submitted,
                 backend,
-                beside,
             }),
         })
     }
@@ -894,9 +812,6 @@ struct Released {
     /// which may still use what the release frees.
     submitted: DeviceUses,
     backend: crate::backends::ReservedPending,
-    /// What a change of form's buffers held beside the view's are granted,
-    /// until the release drops the ones it retired.
-    beside: Option<MemoryReservation>,
 }
 
 impl RecommitRelease {
@@ -919,7 +834,7 @@ impl RecommitRelease {
         if charge.bytes() > released.backing {
             charge.shrink(released.backing);
         }
-        drop((charge, released.beside));
+        drop(charge);
         released.resizer.with(backend)
     }
 }
@@ -976,28 +891,18 @@ pub(crate) struct ReservedRange {
 
 impl ReservedRange {
     /// The range of `rows` records of `records` under `contract`, reserved
-    /// as `span` says (its device's reservation, as discovery reports it),
-    /// on a device whose largest native allocation is `max_allocation`: a
-    /// range past it is never bound as one buffer
-    /// (`seismic_topology::Reservation::binds_whole`).
+    /// as `span` says (its device's reservation, as discovery reports it).
     pub(crate) fn new(
         contract: seismic_topology::ReservedContract,
         span: seismic_topology::Reservation,
         records: seismic_topology::ReservedRecords,
         rows: u64,
-        max_allocation: u64,
     ) -> Self {
-        let bytes = records.record.get() * rows;
-        let mut span = span.of_records(records);
-        let whole = span.binds_whole(bytes, max_allocation);
-        if let Some(chunks) = span.chunks.as_mut() {
-            chunks.whole = whole;
-        }
         Self {
-            bytes,
+            bytes: records.record.get() * rows,
             record: records.record,
             carries: records.carries,
-            span,
+            span: span.of_records(records),
             contract,
         }
     }
@@ -1033,13 +938,6 @@ impl ReservedRange {
     /// The largest single native allocation of the range's `backing`.
     fn largest_allocation(&self, backing: u64) -> u64 {
         self.span.largest_allocation(backing)
-    }
-
-    /// Whether `backing` may be one buffer over the range: its backend binds
-    /// the range whole (`ReservationChunks::whole`, within the device's
-    /// largest allocation) and it backs every granule.
-    fn whole_at(&self, backing: u64) -> Result<bool, ExecutionError> {
-        Ok(self.span.chunks.is_some_and(|chunks| chunks.whole) && backing == self.backing(self.bytes)?)
     }
 }
 
@@ -2359,14 +2257,13 @@ mod physical_slot_tests {
             chunks: Some(seismic_topology::ReservationChunks {
                 unit: granule,
                 table: seismic_topology::Contract::Upload,
-                whole: false,
             }),
         }
     }
 
     fn split_reservation() -> ReservedRange {
         ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(4096),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(4096).unwrap()), 8, u64::MAX)
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(4096).unwrap()), 8)
     }
 
     #[test]
@@ -2420,7 +2317,7 @@ mod physical_slot_tests {
         let memory = split_memory();
         let granule = seismic_reservation::host_page().unwrap();
         let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8, u64::MAX);
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
         let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
         let service = Arc::new(seismic_cpu::Device);
         let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {
@@ -2597,7 +2494,7 @@ mod physical_slot_tests {
         let memory = split_memory();
         let granule = seismic_reservation::host_page().unwrap();
         let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8, u64::MAX);
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
         let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
         let service = Arc::new(seismic_cpu::Device);
         let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {

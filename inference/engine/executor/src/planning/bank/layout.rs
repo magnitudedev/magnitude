@@ -326,6 +326,25 @@ impl BankTier {
     }
 }
 
+/// What a device gives an expert bank: the backend its launches are, how its
+/// record tensors are reserved, and the host tier beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankSubstrate {
+    pub backend: seismic::BackendName,
+    pub reservation: seismic::Reservation,
+    pub host: HostTier,
+}
+
+impl BankSubstrate {
+    /// Whether a whole bank's resident forms can read its home records:
+    /// its backend's resident launches reach expert stacks through record
+    /// ports, or bind them to storage that is one buffer
+    /// (`native::ExpertKernels::bind_resident_stacks`).
+    pub fn reads_homes(&self) -> bool {
+        !(crate::native::ExpertKernels::bind_resident_stacks(self.backend) && self.reservation.chunked())
+    }
+}
+
 /// How a bank's misses are held on its device beside the bank, where its
 /// device storage and host RAM differ or are one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

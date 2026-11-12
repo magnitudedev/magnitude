@@ -122,7 +122,6 @@ impl Backing for Chunks {
     type View = ();
     type Change = ();
     type Retired = ();
-    type Form = ();
 
     fn granule(&self) -> usize {
         self.granule
@@ -216,13 +215,11 @@ impl Backing for Chunks {
         self.device.zero(&regions)
     }
 
-    fn form(&self, (): &()) {}
-
-    fn view(&self, _: usize, (): ()) -> Result<(), ExecutionError> {
+    fn view(&self, _: usize) -> Result<(), ExecutionError> {
         Ok(())
     }
 
-    fn change(&self, _: (usize, ()), _: usize, (): (), _: seismic_reservation::Forming) -> Result<(), ExecutionError> {
+    fn change(&self, _: usize, _: usize) -> Result<(), ExecutionError> {
         Ok(())
     }
 

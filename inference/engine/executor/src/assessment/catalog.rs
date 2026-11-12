@@ -250,8 +250,8 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, required: b
     // floor: what the most constrained streamed load holds. Experts that do
     // not stream are refused with their reason.
     let banked = match bank_reservations(&definition, backend) {
-        Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
-            load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+        Ok(substrate) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
+            load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
         })),
         // A required target that routes experts streams them on every backend
         // whose recorded device streams experts at all: only a fact of the
@@ -353,7 +353,7 @@ pub(super) fn plain_load(
 pub(super) fn bank_reservations(
     definition: &magnitude_family_contracts::ModelDefinition,
     backend: BackendName,
-) -> Result<(seismic::Reservation, crate::planning::HostTier), PlanError> {
+) -> Result<crate::planning::BankSubstrate, PlanError> {
     let recorded = recorded_reservation(backend).map_err(|why| why.to_string());
     let substrate = crate::planning::bank_substrate(
         backend,
@@ -410,7 +410,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         }
         let manifest = target_manifest(&component.path, &target, identity);
         for backend in BackendName::ALL {
-            let (reservation, host) = match bank_reservations(&definition, backend) {
+            let substrate = match bank_reservations(&definition, backend) {
                 Ok(substrate) => substrate,
                 Err(PlanError::Unstreamed(reason)) if refused_by_the_device(&reason) => continue,
                 Err(error) => panic!("{name}: its bank's substrate on {}: {error}", backend.as_str()),
@@ -418,8 +418,8 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
             let load = plain_load(&manifest, &definition, backend)
                 .unwrap_or_else(|error| panic!("{name}: its plain load plans on {}: {error}", backend.as_str()));
             let banked = load
-                .bank_floor(&definition, 1, LIMITS.flights(), reservation, host)
-                .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host))
+                .bank_floor(&definition, 1, LIMITS.flights(), substrate)
+                .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate))
                 .unwrap_or_else(|error| panic!("{name}: its bank plans on {}: {error}", backend.as_str()));
             let bank = banked.expert_bank().expect("a banked load has a bank");
             for group in bank.groups() {

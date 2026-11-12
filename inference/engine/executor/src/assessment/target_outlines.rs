@@ -85,8 +85,8 @@ fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: Back
             // Experts are banked where they stream: a model that routes
             // none, or a device that streams none, has no banked form.
             let banked = match bank_reservations(&definition, backend) {
-                Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
-                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+                Ok(substrate) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
+                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
                 })),
                 Err(PlanError::Unstreamed(reason))
                     if matches!(reason, UnstreamedExperts::Unrouted) || refused_by_the_device(&reason) =>

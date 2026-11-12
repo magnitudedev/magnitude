@@ -1,4 +1,4 @@
-use super::{BankGroup, BankLayer, BankLayers, BankSites, BankTable, ExpertBankPlan, HintWeight, HostTier, NonEmpty, RecordForm, RoutedTensor, routed_experts};
+use super::{BankGroup, BankLayer, BankLayers, BankSites, BankSubstrate, BankTable, ExpertBankPlan, HintWeight, NonEmpty, RecordForm, RoutedTensor, routed_experts};
 use super::conveyor;
 use super::records::{record_tensor, routed_layers};
 use super::table::stored_table_heads;
@@ -18,20 +18,19 @@ impl ModelLoadPlan {
         definition: &ModelDefinition,
         places: u64,
         flights: FlightDepth,
-        reservation: seismic::Reservation,
-        host: HostTier,
+        substrate: BankSubstrate,
     ) -> Result<u64, PlanError> {
-        let whole = self.clone().with_expert_bank(definition, routed_experts(definition)?, places, flights, reservation, host)?;
+        let whole = self.clone().with_expert_bank(definition, routed_experts(definition)?, places, flights, substrate)?;
         Ok(whole.bank.as_ref().expect("a banked plan holds its bank").floor())
     }
 
     /// The plan with every routed layer of the target's experts held in an
     /// expert bank of `slots` committed records per layer (at least its
     /// floor, [`ExpertBankPlan::floor`], at most the widest layer's experts)
-    /// for prompt groups of up to `places` chain
-    /// places, reserved as `reservation` says, beside the host tier `host`
-    /// holds (a bank streams only beside one): each expert stack is planned
-    /// `Banked`, its shape its group's records (their ceiling), charged its
+    /// for prompt groups of up to `places` chain places, on `substrate`:
+    /// its records reserved as its reservation says, beside the host tier
+    /// it holds (a bank streams only beside one). Each expert stack is
+    /// planned `Banked`, its shape its group's records (their ceiling), charged its
     /// committed records (and its per-expert second-level scale, which the
     /// bank holds), its values the bank's. Each stored table's slots the
     /// device can reserve are held in the bank's records too
@@ -47,9 +46,9 @@ impl ModelLoadPlan {
         slots: u64,
         places: u64,
         flights: FlightDepth,
-        reservation: seismic::Reservation,
-        host: HostTier,
+        substrate: BankSubstrate,
     ) -> Result<Self, PlanError> {
+        let BankSubstrate { backend, reservation, host } = substrate;
         if self.bank.is_some() {
             return Err(PlanError::Topology("the load plan already streams its experts"));
         }
@@ -140,6 +139,7 @@ impl ModelLoadPlan {
             .map_err(PlanError::InvalidDefinition)?;
         let bank = ExpertBankPlan {
             structured,
+            backend,
             slots,
             ceiling: slots,
             resident: false,
@@ -188,7 +188,7 @@ impl ModelLoadPlan {
         }
         bank.slots = slots;
         bank.ceiling = ceiling;
-        bank.resident = slots == bank.widest().get();
+        bank.resident = slots == bank.widest().get() && bank.substrate().reads_homes();
         let bank = self.bank.as_ref().expect("the bank was just resized");
         for weight in &mut self.target {
             let Some((index, _)) = bank.layer(weight.role.scope) else {

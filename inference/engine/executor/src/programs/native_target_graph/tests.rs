@@ -289,7 +289,11 @@ mod shared_graph_tests {
         let selection = crate::ComponentSelection { head: false, vision: false };
         let load = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
             .unwrap()
-            .with_expert_bank_at_floor(&definition, seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None }, crate::planning::HostTier::Unified)
+            .with_expert_bank_at_floor(&definition, crate::planning::BankSubstrate {
+                backend,
+                reservation: seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None },
+                host: crate::planning::HostTier::Unified,
+            })
             .unwrap();
         (definition, load)
     }
@@ -1138,10 +1142,10 @@ mod resource_template_tests {
         let manifest = streamed_experts_manifest(&definition);
         let selection = ComponentSelection { head: false, vision: false };
         let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-        let host = crate::planning::HostTier::Unified;
+        let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified };
         let derived = ModelLoadPlan::derive(&manifest, &definition, selection, resident_layout(ExecutionPath::Native, backend), PlannedMethod::Plain, limits).unwrap();
-        let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
-        let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
+        let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
+        let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent };
         let state = ResourcePlanner::state_plan(&definition, &whole, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
         let plan = whole.program_plan(&definition, KvCodec::Dense).unwrap();

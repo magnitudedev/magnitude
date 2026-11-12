@@ -203,6 +203,11 @@ impl ExpertBankPlan {
         self.structured.reservation
     }
 
+    /// What its device gives it ([`BankSubstrate`]).
+    pub fn substrate(&self) -> super::BankSubstrate {
+        super::BankSubstrate { backend: self.backend, reservation: self.structured.reservation, host: self.structured.host }
+    }
+
     /// How the host tier is held on the device (`platform::host_tier`): a
     /// bank streams only beside one, so a device without one holds its
     /// experts resident or is refused (`UnstreamedExperts::Untiered`), and

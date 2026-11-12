@@ -9,10 +9,16 @@ use magnitude_family_contracts::{ImportTransform, ModelDefinition, Operator};
 
 impl ModelLoadPlan {
     /// The plan at its bank's least slots, of one chain place.
-    pub(crate) fn with_expert_bank_at_floor(self, definition: &ModelDefinition, reservation: seismic::Reservation, host: HostTier) -> Result<Self, PlanError> {
-        let floor = self.bank_floor(definition, 1, FlightDepth::PIPELINED, reservation, host)?;
-        self.with_expert_bank(definition, floor, 1, FlightDepth::PIPELINED, reservation, host)
+    pub(crate) fn with_expert_bank_at_floor(self, definition: &ModelDefinition, substrate: BankSubstrate) -> Result<Self, PlanError> {
+        let floor = self.bank_floor(definition, 1, FlightDepth::PIPELINED, substrate)?;
+        self.with_expert_bank(definition, floor, 1, FlightDepth::PIPELINED, substrate)
     }
+}
+
+/// A CUDA device's substrate of `reservation` beside `host`: its resident
+/// launches bind expert stacks directly.
+pub(crate) fn cuda(reservation: seismic::Reservation, host: HostTier) -> BankSubstrate {
+    BankSubstrate { backend: seismic::BackendName::Cuda, reservation, host }
 }
 
 /// The fixture a partial bank streams through on the device
@@ -40,9 +46,10 @@ fn a_fixture_of_more_experts_admits_a_partial_bank() {
             let selection = crate::ComponentSelection { head: false, vision: false };
             let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
                 .unwrap();
-            let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, reservation, host).unwrap();
+            let substrate = BankSubstrate { backend, reservation, host };
+            let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, substrate).unwrap();
             [floor, experts / 2, experts].map(|slots| {
-                resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, reservation, host).unwrap().weight_bytes().unwrap()
+                resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
             })
         };
         let [floor, half, whole] = weights(128);
@@ -179,6 +186,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
     let (reservation, host) = (RESERVATION, HostTier::Linked(RESERVATION));
     ExpertBankPlan {
         structured: conveyor::Structured::new(8, reservation, host, groups, layers).unwrap(),
+        backend: seismic::BackendName::Cuda,
         slots,
         ceiling: slots,
         resident: false,
@@ -290,7 +298,7 @@ fn the_minimum_is_what_progress_holds_at_once() {
 fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
     let plan = restructured(bank(&[37, 3], 64), |reservation, host, groups| {
         *reservation = seismic::Reservation {
-            chunks: Some(seismic::ReservationChunks { unit: 16 << 10, table: seismic::Contract::DeviceOnly, whole: false }),
+            chunks: Some(seismic::ReservationChunks { unit: 16 << 10, table: seismic::Contract::DeviceOnly }),
             ..RESERVATION
         };
         *host = HostTier::Unified;
@@ -537,7 +545,7 @@ fn a_unified_bank_is_one_store_the_host_places_into() {
 /// layer's scratch view fits the region of its tensor.
 #[test]
 fn the_scratch_lender_holds_one_widest_layer_across_forms() {
-    let chunked = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 22, table: seismic::Contract::DeviceOnly, whole: false }) };
+    let chunked = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 22, table: seismic::Contract::DeviceOnly }) };
     for (groups, host, reservation) in [&[37, 2, 1][..], &[3, 1]]
         .into_iter()
         .flat_map(|groups| [HostTier::Unified, HostTier::Linked(BYTES)].map(|host| (groups, host)))
@@ -678,42 +686,6 @@ fn the_allocation_limit_bounds_each_record_tensors_commitment() {
     assert!(largest(most) <= limit && largest(most + 1) > limit);
 }
 
-/// A range its backend binds as one buffer once every granule is backed
-/// (Metal) is one native allocation then: just within the limit, a bank's
-/// slots reach every expert, so it can be whole and run resident; a byte
-/// short, its slots stop short of backing every granule of its largest
-/// range, so it is never whole and stays streamed.
-#[test]
-fn a_range_bound_whole_past_the_allocation_limit_keeps_the_bank_streamed() {
-    let plan = restructured(bank(&[37, 3], 64), |reservation, _, _| {
-        *reservation = seismic::Reservation {
-            chunks: Some(seismic::ReservationChunks { unit: 16 << 10, table: seismic::Contract::DeviceOnly, whole: true }),
-            ..RESERVATION
-        };
-    });
-    // The largest range one buffer binds: a group's records as reserved.
-    let largest = plan
-        .record_tensors()
-        .map(|(group, kind, tensor)| {
-            let held = plan.reserved_records(group, kind, tensor, crate::planning::BankTier::Bank).unwrap();
-            plan.reservation().of_records(held).backing(plan.records(group) * held.record.get()).unwrap()
-        })
-        .max()
-        .unwrap();
-    let widest = plan.widest().get();
-    assert_eq!(plan.most_slots(largest).unwrap(), widest, "within the limit every expert has a slot");
-    let short = plan.most_slots(largest - 1).unwrap();
-    assert!(short < widest, "past the limit the bank is never whole: {short} of {widest} slots");
-    // Bound in chunks alone, the same range is never one allocation.
-    let chunked = restructured(bank(&[37, 3], 64), |reservation, _, _| {
-        *reservation = seismic::Reservation {
-            chunks: Some(seismic::ReservationChunks { unit: 16 << 10, table: seismic::Contract::DeviceOnly, whole: false }),
-            ..RESERVATION
-        };
-    });
-    assert_eq!(chunked.most_slots(largest - 1).unwrap(), widest);
-}
-
 /// A bank holds a stored table's slots in records of the least rows that
 /// fill whole granules, as many as the fixed slots hold, from the floor
 /// of the most rows a step names, and no more than its rows fill whole;
@@ -738,8 +710,8 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     let fixed = resident.target().iter().find(|weight| weight.stored_in_slots()).unwrap().clone();
     assert_eq!(fixed.shape, [1, TABLE_ROWS, width]);
-    let reservation = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 14, table: seismic::Contract::DeviceOnly, whole: false }) };
-    let banked = resident.clone().with_expert_bank_at_floor(&definition, reservation, HostTier::Linked(reservation)).unwrap();
+    let reservation = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 14, table: seismic::Contract::DeviceOnly }) };
+    let banked = resident.clone().with_expert_bank_at_floor(&definition, cuda(reservation, HostTier::Linked(reservation))).unwrap();
     let [table] = &banked.expert_bank().unwrap().tables[..] else {
         panic!("the bank holds the stored table");
     };
@@ -758,7 +730,7 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     assert_eq!(held.record_table_entries().unwrap(), records);
     assert_eq!(banked.clone().unbanked().target(), resident.target());
     let unaddressed = seismic::Reservation { host_addressed: false, ..reservation };
-    let fixed_table = resident.clone().with_expert_bank_at_floor(&definition, unaddressed, HostTier::Linked(unaddressed)).unwrap();
+    let fixed_table = resident.clone().with_expert_bank_at_floor(&definition, cuda(unaddressed, HostTier::Linked(unaddressed))).unwrap();
     assert!(fixed_table.expert_bank().unwrap().tables.is_empty());
     assert_eq!(fixed_table.target().iter().find(|weight| weight.role == fixed.role), Some(&fixed));
     // A reservation that backs no granule holds no records: refused.
@@ -804,12 +776,12 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
         crate::planning::fixtures::LIMITS,
     )
     .unwrap();
-    assert!(dense.with_expert_bank_at_floor(&definition, RESERVATION, HostTier::Linked(RESERVATION)).is_ok());
+    assert!(dense.with_expert_bank_at_floor(&definition, cuda(RESERVATION, HostTier::Linked(RESERVATION))).is_ok());
     let resident =
         ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     // Byte granules: the weights follow the slots exactly.
-    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, BYTES, HostTier::Linked(BYTES)).unwrap();
-    let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, BYTES, HostTier::Linked(BYTES)).unwrap();
+    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
+    let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
     let (three, four) = (banked(floor), banked(floor + 1));
     let bank = three.expert_bank().unwrap();
     assert_eq!((bank.widest().get(), bank.selected(), bank.groups().len()), (32, 2, 1));
@@ -854,11 +826,11 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     // From its floor to every expert: a bank of every expert is whole,
     // its layers' homes its records end to end. On unified memory a
     // bank below its floor is refused.
-    assert!(resident.clone().with_expert_bank(&definition, 33, 1, FlightDepth::PIPELINED, BYTES, HostTier::Linked(BYTES)).is_err());
-    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, BYTES, HostTier::Unified);
+    assert!(resident.clone().with_expert_bank(&definition, 33, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).is_err());
+    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Unified));
     let floor = unified(32).unwrap().expert_bank().unwrap().floor();
     assert!(floor > 0 && unified(floor).is_ok() && unified(floor - 1).is_err(), "unified floor {floor}");
-    let whole = resident.clone().with_expert_bank(&definition, 32, 1, FlightDepth::PIPELINED, BYTES, HostTier::Linked(BYTES)).unwrap();
+    let whole = resident.clone().with_expert_bank(&definition, 32, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
     let bank = whole.expert_bank().unwrap();
     assert!(bank.whole() && !three.expert_bank().unwrap().whole());
     assert_eq!((bank.home(0), bank.home(1)), (0, 32));
@@ -885,7 +857,7 @@ fn a_route_predicts_only_layers_of_its_own_elements() {
     let banked = |manifest| {
         ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
             .unwrap()
-            .with_expert_bank_at_floor(&definition, BYTES, HostTier::Linked(BYTES))
+            .with_expert_bank_at_floor(&definition, cuda(BYTES, HostTier::Linked(BYTES)))
     };
     let manifest = streamed_experts_manifest(&definition);
     let plan = banked(manifest.clone()).unwrap();
@@ -940,7 +912,7 @@ fn banked_target_graphs_build_on_metal() {
         crate::planning::fixtures::LIMITS,
     )
     .unwrap()
-    .with_expert_bank_at_floor(&definition, RESERVATION, host)
+    .with_expert_bank_at_floor(&definition, BankSubstrate { backend, reservation: RESERVATION, host })
     .unwrap();
     let codec = magnitude_state::KvCodec::Dense;
     let plan = load.program_plan(&definition, codec).unwrap();
@@ -1006,7 +978,8 @@ fn a_discrete_vulkan_conveyor_lies_in_its_host_tier() {
     let manifest = streamed_experts_manifest(&definition);
     let selection = crate::ComponentSelection { head: false, vision: false };
     let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    let load = resident.with_expert_bank_at_floor(&definition, reservation, host).unwrap();
+    let substrate = BankSubstrate { backend: seismic::BackendName::Vulkan, reservation, host };
+    let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
     let bank = load.expert_bank().unwrap();
     assert!(matches!(bank.conveyor().carrier, ConveyorCarrier::HostTier(_)));
     assert!(bank.layout().unwrap().host.is_some());

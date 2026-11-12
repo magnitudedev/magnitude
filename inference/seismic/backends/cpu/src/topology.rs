@@ -30,7 +30,7 @@ fn kind_of(granule: u64) -> KindReport {
         reservation: Ok(Some(Reservation {
             granule,
             host_addressed: RESERVATIONS_HOST_ADDRESSED,
-            chunks: RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly, whole: false }),
+            chunks: RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly }),
         })),
     }
 }

@@ -3,7 +3,7 @@
 //! source plus a closed ABI; it does not construct compiler kernels, plans,
 //! schedules, or portfolios.
 
-use crate::{Binding, MetalBuffer, MetalDevice};
+use crate::{MetalBuffer, MetalDevice};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
@@ -52,7 +52,7 @@ impl DirectPipeline {
 /// One direct launch as encoded.
 pub struct DirectLaunch<'a> {
     pub pipeline: &'a DirectPipeline,
-    pub buffers: &'a [(Binding<'a>, u64)],
+    pub buffers: &'a [(&'a MetalBuffer, u64)],
     pub words: &'a [u8],
     /// Scalar-result slots, bound after the words; nothing is bound there
     /// for an entry without scalar results.
@@ -61,7 +61,7 @@ pub struct DirectLaunch<'a> {
     pub threadgroups: [u64; 3],
     /// Three 32-bit group counts an earlier launch wrote, at this offset of
     /// this buffer: dispatched as they are when the launch runs.
-    pub grid: Option<(Binding<'a>, u64)>,
+    pub grid: Option<(&'a MetalBuffer, u64)>,
     pub threads_per_threadgroup: [u64; 3],
     pub threadgroup_bytes: u64,
 }
@@ -841,8 +841,8 @@ fn encode_launch(
     launch: &DirectLaunch<'_>,
 ) {
     encoder.setComputePipelineState(&launch.pipeline.state);
-    for (index, (binding, offset)) in launch.buffers.iter().enumerate() {
-        binding.with(|buffer| unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), *offset as usize, index) });
+    for (index, (buffer, offset)) in launch.buffers.iter().enumerate() {
+        unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index) }
     }
     let zero = 0u8;
     let words = if launch.words.is_empty() {
@@ -875,13 +875,13 @@ fn encode_launch(
     match launch.grid {
         // SAFETY: the grid is three 32-bit words at a 4-byte-aligned offset
         // of one of the launch's own bindings, set above.
-        Some((binding, offset)) => binding.with(|buffer| unsafe {
+        Some((buffer, offset)) => unsafe {
             encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                buffer,
+                buffer.raw(),
                 offset as usize,
                 threads,
             )
-        }),
+        },
         None => encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: launch.threadgroups[0] as usize,

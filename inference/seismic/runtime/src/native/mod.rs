@@ -2815,8 +2815,8 @@ impl NativePrepared {
                     seismic_lang::registry::record_table_entry(bound.count),
                 ));
                 records.push((buffer, bound));
-            } else if !tensor.binds_directly() && self.bound[buffer] {
-                // Chunked storage with no one buffer: device work binds it
+            } else if tensor.chunked() && self.bound[buffer] {
+                // Chunked storage has no one buffer: device work binds it
                 // only through a record port. A host port, never bound,
                 // takes it, ordered by its packed span.
                 return Err(CallError::Workflow(crate::api::WorkflowError::ChunkedBinding {
@@ -3638,7 +3638,7 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                 }
                 typed.clear();
                 typed.extend(buffers.iter().map(|(allocation, offset)| {
-                    (crate::backends::metal_binding(allocation), *offset)
+                    (typed_buffer::<Metal, Executor>(allocation), *offset)
                 }));
                 // A grid's binding is its three words: a `&tensor[3] i32`
                 // binds with canonical strides and never as a slab

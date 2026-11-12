@@ -124,7 +124,7 @@ fn vulkan_reservation(form: crate::ReservationForm) -> Reservation {
     Reservation {
         granule: form.granule,
         host_addressed: form.host_addressed,
-        chunks: Some(ReservationChunks { unit: form.chunk_unit, table: Contract::Upload, whole: false }),
+        chunks: Some(ReservationChunks { unit: form.chunk_unit, table: Contract::Upload }),
     }
 }
 

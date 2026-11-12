@@ -274,10 +274,12 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
 /// whose first two attention blocks share one sealed graph, their streamed
 /// layers at different homes of one group
 /// (`streamed_layers_at_different_homes_share_a_graph`): every decode step
-/// runs the resident forms, each block's bound to its own layer's home
-/// records, and each layer reads its own experts, through the resident
-/// load's arithmetic, so a prompt chunk and its decode steps score bit for
-/// bit as the resident load does.
+/// runs the resident forms where they read the home records (on Metal, whose
+/// records are chunks its resident launches cannot bind, the streamed
+/// forms), each block's bound to its own layer's home records, and each
+/// layer reads its own experts, through the resident load's arithmetic, so
+/// a prompt chunk and its decode steps score bit for bit as the resident
+/// load does.
 #[test]
 fn a_whole_banks_shared_graphs_read_each_layers_own_experts() {
     let definition = qwen4exp_fixture_definition_of(4, 32);
@@ -633,9 +635,11 @@ fn scores(
         }
         drop(returned);
         // A whole bank's every launch of decode rows (its two-row prompt
-        // chunk's too) runs the resident forms; no partial one's does.
+        // chunk's too) runs the resident forms; no partial one's does, nor
+        // one on Metal, whose resident launches bind expert stacks as they
+        // lie and whose records are chunks no binding reaches.
         let resident = match banked {
-            Banked::Whole => 1 + DECODE_STEPS as u64,
+            Banked::Whole if backend != seismic::BackendName::Metal => 1 + DECODE_STEPS as u64,
             _ => 0,
         };
         assert_eq!(domain.resident_decodes(), resident, "{backend:?}: the decode steps the resident forms ran");
@@ -799,13 +803,14 @@ fn a_banked_loads_prompt_groups_score_as_resident() {
 }
 
 /// On Metal and Vulkan, a whole bank of the 128-expert fixture shrunk
-/// plateau by plateau between decode steps, then to its floor (as the release ladder
-/// shrinks it under pressure; on unified memory the kept experts' bytes
-/// move within the one store), decodes on bit for bit as the resident load
-/// does, losing no step: every step before the first shrink runs the
-/// resident forms and none after it does, each expert it dropped is a file
-/// miss from then on, each one it kept is read where the shrink moved it,
-/// from the first step after it.
+/// plateau by plateau between decode steps, then to its floor (as the
+/// release ladder shrinks it under pressure; on unified memory the kept
+/// experts' bytes move within the one store), decodes on bit for bit as the
+/// resident load does, losing no step: where the backend runs a whole
+/// bank's resident forms (Vulkan) every step before the first shrink runs
+/// them and none after it does, each expert it dropped is a file miss from
+/// then on, each one it kept is read where the shrink moved it, from the
+/// first step after it.
 /// With every stack of one form (one bank group) and with the last routed
 /// layer's in another (two groups, each shrinking its own records), and
 /// without and with lookahead.
@@ -831,7 +836,8 @@ fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
 /// recorded as its slots were made (`seismic::NativeGraphFamily::record_decode`),
 /// so a shrink with no memory left to allocate, every ledger of the device
 /// bound to what it charges, begins and completes, and its step records
-/// none.
+/// none. The steps before it ran the whole bank's resident forms; none after
+/// it does.
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
 fn a_whole_banks_shrink_step_records_no_graph() {
@@ -860,6 +866,8 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     for (store, view) in &own {
         domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
     }
+    let ran = domain.resident_decodes();
+    assert!(ran > 0, "the whole bank's steps before the shrink ran its resident forms");
     let floor = domain.expert_residency().unwrap().expect("a streamed load holds a bank").floor;
     let step = domain.shrink_expert_bank_to(&mut bindings, crate::BankHolding::Experts, floor, crate::CompletionWake::new(|| {})).unwrap();
     assert!(matches!(step, crate::BankStep::Begun(_)), "a whole bank shrinks: {step:?}");
@@ -871,6 +879,7 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let before = domain.graph_replays().recorded;
     bindings = decode(&mut domain, bindings);
     assert_eq!(domain.graph_replays().recorded, before, "the shrink's step records no graph");
+    assert_eq!(domain.resident_decodes(), ran, "no step after the shrink runs the resident forms");
     drop(bindings);
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
 }
@@ -1255,6 +1264,10 @@ fn shrunk_bank_scores_as_resident(
     groups: usize,
 ) {
     let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), manifest);
+    // The resident forms run on every backend but Metal, whose resident
+    // launches bind expert stacks as they lie and whose records are chunks
+    // no binding reaches.
+    let resident_forms = backend != seismic::BackendName::Metal;
     // Without lookahead each step's token is the host's; with it, the
     // device's selection, each step claiming the successor queued behind
     // the one before (unless a shrink orphaned it), as served decode runs.
@@ -1311,7 +1324,7 @@ fn shrunk_bank_scores_as_resident(
         // Every step before the first shrink ran the resident forms (with
         // lookahead, a successor begun then too), and none from it on: a
         // shrink begins only once every begun step has ended.
-        if matches!(banked, Banked::Whole) {
+        if matches!(banked, Banked::Whole) && resident_forms {
             let (decoded, ran) = first_shrink.expect("the whole bank shrank");
             assert!(ran >= decoded, "{test}, lookahead {lookahead}: {ran} resident runs before the first shrink, of {decoded} steps");
             assert!(lookahead || ran == decoded, "{test}: {ran} resident runs before the first shrink, of {decoded} steps");

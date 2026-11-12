@@ -57,9 +57,9 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
                     continue;
                 }
             };
-            let banked = bank_reservations(&definition, backend).ok().map(|(reservation, host)| {
-                load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
-                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+            let banked = bank_reservations(&definition, backend).ok().map(|substrate| {
+                load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
+                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
                 })
             });
             let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));

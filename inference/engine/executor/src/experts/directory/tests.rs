@@ -86,9 +86,9 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let backend = seismic::BackendName::Metal;
     let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-    let host = crate::planning::HostTier::Unified;
-    let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
-    let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
+    let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified };
+    let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
+    let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let plan = load.expert_bank().unwrap();
     let records = (0..plan.groups().len()).map(|group| plan.records(group) as usize).collect::<Vec<_>>();
     let groups = plan.layers().iter().map(|layer| layer.group).collect::<Vec<_>>();

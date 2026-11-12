@@ -22,7 +22,7 @@ pub use seismic_compiler::feedback::{
 pub use seismic_lang::checked::{
     Encoded as LaunchEncoding, NativeComparison, NativeCondition, NativeImplementation,
     NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch, NativeSpecialization,
-    NativeSpecializationError, DeviceBound, OnDevice,
+    NativeSpecializationError, DeviceBound, OnDevice, RecordPort,
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 pub use seismic_native_cpu::repack::ScaledCodeRows;
@@ -1736,13 +1736,6 @@ impl Tensor {
     /// past a reservation's committed rows.
     pub fn committed_rows(&self) -> u64 {
         self.inner.committed_rows()
-    }
-    /// Whether device work can bind this view now as a native port that
-    /// binds it directly does: always, but in chunked reserved storage only
-    /// while its backend holds one buffer over the whole range (Metal's
-    /// whole form, which a resize takes only within its grant).
-    pub fn bindable(&self) -> bool {
-        self.inner.bindable()
     }
     pub fn read_to_host(&self) -> Result<Vec<u8>, TensorError> {
         self.inner.read_to_host()

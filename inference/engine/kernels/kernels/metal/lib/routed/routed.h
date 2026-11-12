@@ -95,9 +95,9 @@ inline int choice_record(device const uchar *, device const int *, ulong, ulong,
 }
 
 // Expert `expert`'s weights of an expert-stacked weight bound as it lies,
-// `rows` rows an expert (expert e's from row e * rows): a resident layer's,
-// a held stack or a whole bank's home records, which lie so in its one
-// buffer. The base is the binding's, so the rows are one load away.
+// `rows` rows an expert (expert e's from row e * rows): a resident layer's
+// held stack, one buffer. The base is the binding's, so the rows are one
+// load away.
 template <typename W>
 inline projection::Weights<W> stack_weights(packets::weight_bytes stack, packets::Rows16 layout, int expert,
     ulong rows, uint k) {

@@ -25,7 +25,7 @@ fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
     let values = device.allocate(256, 16).unwrap();
     let launch = DirectLaunch {
         pipeline: &pipelines[0],
-        buffers: &[(seismic_metal::Binding::Buffer(&values), 0)],
+        buffers: &[(&values, 0)],
         words: &[],
         scalar_results: None,
         threadgroups: [1, 1, 1],

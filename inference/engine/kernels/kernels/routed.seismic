@@ -1401,9 +1401,10 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
     # A resident layer's (XS 0) binds its expert stacks as they lie (a held
-    # layer's stacks, or a whole bank's home records), so it reads an
-    # expert's rows from the binding's base, with plain loads, as nothing
-    # writes them while it runs.
+    # layer's stacks, or a whole bank's home records where they are one
+    # buffer: never a Metal reservation's chunks), so it reads an expert's
+    # rows from the binding's base, with plain loads, as nothing writes them
+    # while it runs.
     launch routed_gate_up_resident when XS == 0:
         records (tier_gate, tier_up)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)

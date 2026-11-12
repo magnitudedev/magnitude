@@ -15,7 +15,7 @@ use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use seismic_lang::registry::{chunk_entries, record_table_bytes, record_table_entry, RECORD_TABLE_ENTRY_BYTES};
 use std::fmt;
-use seismic_reservation::{Backing, Forming, HostRange, PageSize, Rebinding, Reserved, Resizer};
+use seismic_reservation::{Backing, HostRange, PageSize, Reserved, Resizer};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -284,26 +284,6 @@ impl Drop for WiredAllocation {
     }
 }
 
-/// What a direct launch binds at one buffer index, from an offset
-/// ([`crate::DirectLaunch::buffers`]).
-#[derive(Clone, Copy)]
-pub enum Binding<'a> {
-    Buffer(&'a MetalBuffer),
-    /// A reservation's buffer over its whole range, which exists only while
-    /// every granule is backed ([`ReservedBuffer::bind`]).
-    Reserved(&'a ReservedBuffer),
-}
-
-impl Binding<'_> {
-    /// `bind` given the Metal buffer this binds, for as long as `bind` runs.
-    pub(crate) fn with<R>(self, bind: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R) -> R {
-        match self {
-            Self::Buffer(buffer) => bind(buffer.raw()),
-            Self::Reserved(reserved) => reserved.bind(bind),
-        }
-    }
-}
-
 /// One shared-storage Metal buffer of fixed length: allocated by Metal
 /// (wired), or wrapping a read-only host mapping. Device work binds it
 /// ([`MetalBuffer::raw`]) and the host reads it; the host writes only a
@@ -388,11 +368,9 @@ impl MetalBuffer {
 }
 
 /// The committed prefix of a host address reservation, resized in place
-/// ([`MetalResizer::prepare`]): Metal buffers over its backed granules
-/// ([`GranuleView`]), which device work reaches through the reservation's
-/// record table (a [`MetalBuffer`]), and while every granule is backed also
-/// binds directly ([`Binding::Reserved`]). The host addresses the range in
-/// place.
+/// ([`MetalResizer::prepare`]): chunks, each its own Metal buffer, which
+/// device work reaches only through the reservation's record table (a
+/// [`MetalBuffer`]), never bound. The host addresses the range in place.
 #[derive(Clone)]
 pub struct ReservedBuffer {
     reservation: Arc<Reservation>,
@@ -419,39 +397,12 @@ impl ReservedBuffer {
         self.reservation.backing().table.clone()
     }
 
-    /// The GPU virtual address of byte `offset`, in the buffer holding it,
-    /// which must be backed; its address is fixed until the view changes
-    /// form ([`ChunkChange::Replace`]).
+    /// The GPU virtual address of byte `offset`, in the chunk holding it,
+    /// which must be backed; its address is fixed while it is.
     pub fn gpu_address(&self, offset: u64) -> u64 {
         let granule = self.reservation.backing().range.granule() as u64;
-        match &self.reservation.state().view {
-            GranuleView::Chunks(chunks) => chunks.buffers[(offset / granule) as usize].gpuAddress() + offset % granule,
-            GranuleView::Whole(whole) => whole.buffers[0].gpuAddress() + offset,
-        }
-    }
-
-    /// Whether device work binds it directly now: its view is the whole
-    /// form ([`GranuleView::Whole`]), which a form chosen at a resize
-    /// decides, not its backed granules alone.
-    pub fn is_whole(&self) -> bool {
-        matches!(self.reservation.state().view, GranuleView::Whole(_))
-    }
-
-    /// `bind` given the one buffer over the whole range
-    /// ([`GranuleView::Whole`]), under the reservation's lock, so no shrink
-    /// retires it meanwhile; work bound to it runs before any shrink's
-    /// release, as shrinks run only between flights.
-    ///
-    /// # Panics
-    /// Unless every granule is backed: only then is there one, and only then
-    /// does device work bind the reservation directly.
-    fn bind<R>(&self, bind: impl FnOnce(&ProtocolObject<dyn MTLBuffer>) -> R) -> R {
-        match &self.reservation.state().view {
-            GranuleView::Whole(whole) => bind(&whole.buffers[0]),
-            GranuleView::Chunks(_) => {
-                panic!("device work binds a reservation directly only while every granule is backed")
-            }
-        }
+        let chunk = &self.reservation.state().view.buffers[(offset / granule) as usize];
+        chunk.gpuAddress() + offset % granule
     }
 
     /// Write `bytes` at `offset` of the committed bytes.
@@ -515,9 +466,7 @@ pub const RESERVATIONS_HOST_ADDRESSED: bool = true;
 /// What device work reaches a reservation's backed bytes through chunks of:
 /// each chunk is its own buffer (a buffer GPU work touches is wired whole,
 /// so one buffer over the range would hold every page a release frees; M4
-/// Pro, macOS 15.7, 2026-10-27) of whole [`CHUNK_UNIT`]s. While every
-/// granule is backed one buffer over the range takes the chunks' place
-/// ([`GranuleView::Whole`]); a shrink replaces it with the chunks it keeps.
+/// Pro, macOS 15.7, 2026-10-27) of whole [`CHUNK_UNIT`]s.
 pub const RESERVATION_CHUNKS: Option<u64> = Some(CHUNK_UNIT);
 
 /// 16 KiB, the largest macOS page: every chunk's no-copy buffer starts and
@@ -525,36 +474,25 @@ pub const RESERVATION_CHUNKS: Option<u64> = Some(CHUNK_UNIT);
 const CHUNK_UNIT: u64 = 16 << 10;
 
 /// Metal's backing of a host reservation (`seismic_reservation`):
-/// granules of anonymous memory, each its own VM object, the Metal buffers
-/// over the backed ones ([`GranuleView`]), and the reservation's record
-/// table.
+/// granules of anonymous memory, each its own VM object and its own Metal
+/// buffer (a chunk), and the reservation's record table.
 ///
-/// GPU work that touches a buffer wires all of it, so one buffer over a
-/// partly backed range would hold every page a shrink frees: while a
-/// granule is unbacked each backed granule is wrapped once
-/// (`newBufferWithBytesNoCopy`) as its own buffer (a chunk) and joins the
-/// residency set, so only committed chunks are wired; device work reaches
-/// records through the table, entry `r` the device address of record `r` in
-/// its buffer (no record crosses a chunk). A growth forms only its new
-/// chunks; a shrink retires its tail chunks, dropped (leaving the set) by
-/// its release before their granules are unmapped, so device work never
-/// reads a page remapped under a live buffer.
-///
-/// Metal counts each buffer's whole length in `currentAllocatedSize`, which
-/// the device's grant is read from, and the reservation is charged its
-/// backing once: so each backed byte is in exactly one buffer. While every
-/// granule is backed that is one buffer over the range in the chunks'
-/// place, which device work also binds directly; a change between the two
-/// forms ([`ChunkChange::Replace`]) forms the next form's buffers beside
-/// device work and rewrites every table entry as it is applied.
+/// GPU work that touches a buffer wires all of it, so one buffer over the
+/// range would hold every page a shrink frees. Each chunk is wrapped once
+/// when it is backed (`newBufferWithBytesNoCopy`) and joins the residency
+/// set, so only committed chunks are wired; device work reaches records
+/// through the table, entry `r` the device address of record `r` in its
+/// chunk (no record crosses one). A growth forms only its new chunks; a
+/// shrink retires its tail chunks, dropped (leaving the set) by its release
+/// before their granules are unmapped, so device work never reads a page
+/// remapped under a live buffer.
 pub struct Granules {
     /// The host address range the granules are of.
     range: HostRange,
     device: DeviceHandle,
     residency: Arc<Residency>,
-    /// The record table, whose entries for a buffer's records are written
-    /// as device work comes to reach them through it: entries of released
-    /// granules are never read.
+    /// The record table, whose entries for a chunk's records are written as
+    /// it is formed: entries of released chunks are never read.
     table: WritableMetalBuffer,
     /// Bytes of one record, a divisor of the granule.
     record: usize,
@@ -563,145 +501,54 @@ pub struct Granules {
 unsafe impl Send for Granules {}
 unsafe impl Sync for Granules {}
 
-/// A change of a reservation's buffers.
+/// A change of a reservation's chunks: the new chunks of a growth, or the
+/// chunks a shrink keeps.
 pub enum ChunkChange {
-    /// A growth of chunks: its new chunks, their records' table entries
-    /// written, which no device work reads before the growth is installed.
     Grow(WiredAllocation),
-    /// A shrink of chunks: the chunks it keeps.
     Shrink(usize),
-    /// A change of form formed beside the view, a growth to the whole form
-    /// or a shrink from it into chunks ([`ViewForm::Whole`],
-    /// [`ViewForm::Chunks`]): the view that takes the installed one's place,
-    /// its buffers formed and wired, whose table entries its apply writes
-    /// over every record it spans.
-    Replace(GranuleView),
-    /// A shrink from the whole form into chunks over its leading granules,
-    /// formed by its apply in that form's place
-    /// (`seismic_reservation::Forming::InPlace`).
-    InPlace(usize),
-}
-
-/// The form of a reservation's view ([`GranuleView`]), which the
-/// reservation's holder chooses (`seismic_reservation::Backing::Form`): the
-/// buffers of a change between forms formed beside the view's are counted
-/// with them until its release, so the holder takes the next form's bytes
-/// once more for them, or takes the whole form not at all.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ViewForm {
-    /// A chunk over each backed granule.
-    #[default]
-    Chunks,
-    /// One buffer over the range: only over every granule, within the
-    /// device's longest buffer (`seismic_topology::Reservation::binds_whole`).
-    Whole,
-}
-
-/// The Metal buffers over a reservation's backed granules, every one in the
-/// device's residency set, each backed byte in exactly one of them.
-pub enum GranuleView {
-    /// A chunk over each backed granule, in order.
-    Chunks(WiredAllocation),
-    /// One buffer over the range, every granule backed
-    /// ([`ViewForm::Whole`]), which device work also binds directly
-    /// ([`ReservedBuffer::bind`]).
-    Whole(WiredAllocation),
 }
 
 type Reservation = Reserved<Granules>;
 pub type MetalResizer = Resizer<Granules>;
 
 impl Granules {
-    /// Whether the view over the first `granules` granules may be one
-    /// buffer over the range: they are every one, and lie within the
-    /// device's longest buffer.
-    fn whole_at(&self, granules: usize) -> bool {
-        granules > 0
-            && granules == self.range.granules()
-            && (self.range.granule() * granules) as u64 <= self.device.max_allocation_bytes()
-    }
-
-    /// The form a reservation formed with its first `granules` granules
-    /// backed takes: whole wherever it may be, as forming it holds nothing
-    /// beside it.
-    fn formed_at(&self, granules: usize) -> ViewForm {
-        match self.whole_at(granules) {
-            true => ViewForm::Whole,
-            false => ViewForm::Chunks,
-        }
-    }
-
-    /// A no-copy buffer over granules `[from, to)`.
-    fn buffer(&self, from: usize, to: usize) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, ExecutionError> {
-        let bytes = self.range.granule() * (to - from);
-        crate::pooled(|| unsafe {
-            self.device.raw().newBufferWithBytesNoCopy_length_options_deallocator(
-                NonNull::new_unchecked(self.range.at(from)).cast(),
-                bytes,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
-        })
-        // As for an allocated buffer, Metal states no reason for a buffer it
-        // does not create: the device refused it.
-        .ok_or_else(|| self.device.refused(bytes as u64))
-    }
-
-    /// The chunks over granules `[from, to)`, wired.
-    fn chunks(&self, from: usize, to: usize) -> Result<WiredAllocation, ExecutionError> {
+    /// The chunk buffers over granules `[from, to)` of `range`, wired, with
+    /// their records' table entries written.
+    fn form(&self, range: &HostRange, from: usize, to: usize) -> Result<WiredAllocation, ExecutionError> {
+        let granule = range.granule();
         let buffers = (from..to)
-            .map(|index| self.buffer(index, index + 1))
+            .map(|index| {
+                crate::pooled(|| unsafe {
+                    self.device
+                        .raw()
+                        .newBufferWithBytesNoCopy_length_options_deallocator(
+                            NonNull::new_unchecked(range.at(index)).cast(),
+                            granule,
+                            MTLResourceOptions::StorageModeShared,
+                            None,
+                        )
+                })
+                // As for an allocated buffer, Metal states no reason for a
+                // buffer it does not create: the device refused it.
+                .ok_or_else(|| self.device.refused(granule as u64))
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(WiredAllocation::wire(&self.residency, buffers))
-    }
-
-    /// The view over the first `granules` granules in `form`, wired, its
-    /// table entries unwritten.
-    ///
-    /// # Panics
-    /// Where `form` is whole over granules that may not be
-    /// ([`Self::whole_at`]): the holder chooses the whole form only where it
-    /// may be.
-    fn buffers(&self, granules: usize, form: ViewForm) -> Result<GranuleView, ExecutionError> {
-        Ok(match form {
-            ViewForm::Whole => {
-                assert!(self.whole_at(granules), "the whole form spans every granule, within the device's longest buffer");
-                GranuleView::Whole(WiredAllocation::wire(&self.residency, vec![self.buffer(0, granules)?]))
-            }
-            ViewForm::Chunks => GranuleView::Chunks(self.chunks(0, granules)?),
-        })
-    }
-
-    /// Write the table entries of the records in `buffers`: consecutive
-    /// buffers of `span` bytes each, the first the range's `first`.
-    fn write_entries(&self, first: usize, span: usize, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
         let records = self.table.len() / RECORD_TABLE_ENTRY_BYTES;
-        for (index, buffer) in (first as u64..).zip(buffers) {
-            let (start, entries) = chunk_entries(index, span as u64, self.record as u64, records, buffer.gpuAddress());
-            self.table.write_bytes(record_table_entry(start), &entries);
+        for (index, buffer) in (from as u64..to as u64).zip(&buffers) {
+            let (first, entries) = chunk_entries(index, granule as u64, self.record as u64, records, buffer.gpuAddress());
+            self.table.write_bytes(record_table_entry(first), &entries);
         }
-    }
-
-    /// Write the table entries of every record `view` spans.
-    fn write_view_entries(&self, view: &GranuleView) {
-        match view {
-            GranuleView::Chunks(chunks) => self.write_entries(0, self.range.granule(), &chunks.buffers),
-            GranuleView::Whole(whole) => {
-                self.write_entries(0, self.range.granule() * self.range.granules(), &whole.buffers)
-            }
-        }
+        Ok(WiredAllocation::wire(&self.residency, buffers))
     }
 }
 
 impl Backing for Granules {
     type Error = ExecutionError;
-    /// The buffers over the backed granules.
-    type View = GranuleView;
+    /// The chunks over the backed granules, in order.
+    type View = WiredAllocation;
     type Change = ChunkChange;
-    /// The buffers a change no longer holds: a shrink's released chunks, or
-    /// the form a change of form beside it replaced.
-    type Retired = Option<GranuleView>;
-    type Form = ViewForm;
+    /// The chunks a shrink released.
+    type Retired = Option<WiredAllocation>;
 
     fn granule(&self) -> usize {
         self.range.granule()
@@ -733,98 +580,26 @@ impl Backing for Granules {
         Ok(())
     }
 
-    /// The buffers over the first `granules` granules in `form`, wired,
-    /// their table entries written.
-    fn view(&self, granules: usize, form: ViewForm) -> Result<GranuleView, ExecutionError> {
-        let view = self.buffers(granules, form)?;
-        self.write_view_entries(&view);
-        Ok(view)
+    /// The chunks over the first `granules` granules, wired.
+    fn view(&self, granules: usize) -> Result<WiredAllocation, ExecutionError> {
+        self.form(&self.range, 0, granules)
     }
 
-    fn form(&self, view: &GranuleView) -> ViewForm {
-        match view {
-            GranuleView::Chunks(_) => ViewForm::Chunks,
-            GranuleView::Whole(_) => ViewForm::Whole,
+    /// A growth forms its new chunks; a shrink keeps the leading ones.
+    fn change(&self, installed: usize, granules: usize) -> Result<ChunkChange, ExecutionError> {
+        match granules > installed {
+            true => self.form(&self.range, installed, granules).map(ChunkChange::Grow),
+            false => Ok(ChunkChange::Shrink(granules)),
         }
     }
 
-    /// From the whole form, a shrink's kept chunks are formed beside it, or
-    /// left to the install where `forming` is in place; into it, its buffer
-    /// is formed beside the chunks. Otherwise a growth of chunks forms its
-    /// new chunks and writes their entries, and a shrink of chunks keeps the
-    /// leading ones.
-    ///
-    /// # Panics
-    /// Where `forming` is in place for anything but a shrink from the whole
-    /// form: no other change can go on serving without its next buffers
-    /// formed beside the view's.
-    fn change(
-        &self,
-        (installed, from): (usize, ViewForm),
-        granules: usize,
-        form: ViewForm,
-        forming: Forming,
-    ) -> Result<ChunkChange, ExecutionError> {
-        Ok(match (from, form, forming) {
-            (ViewForm::Whole, ViewForm::Chunks, Forming::InPlace) => ChunkChange::InPlace(granules),
-            (_, _, Forming::InPlace) => {
-                panic!("only a shrink from the whole form forms its chunks in place, not {from:?} to {form:?}")
-            }
-            (ViewForm::Whole, _, _) | (_, ViewForm::Whole, _) => ChunkChange::Replace(self.buffers(granules, form)?),
-            _ if granules > installed => {
-                let chunks = self.chunks(installed, granules)?;
-                self.write_entries(installed, self.range.granule(), &chunks.buffers);
-                ChunkChange::Grow(chunks)
-            }
-            _ => ChunkChange::Shrink(granules),
-        })
-    }
-
-    /// A change of form moves every record device work reaches through the
-    /// table to the next form's buffers.
-    fn rebinding(&self, change: &ChunkChange) -> Rebinding {
+    fn apply(&self, view: &mut WiredAllocation, change: ChunkChange) -> Option<WiredAllocation> {
         match change {
-            ChunkChange::Replace(_) => Rebinding::Beside,
-            ChunkChange::InPlace(_) => Rebinding::InPlace,
-            ChunkChange::Grow(_) | ChunkChange::Shrink(_) => Rebinding::None,
-        }
-    }
-
-    /// A growth of chunks appends them; a shrink of chunks retires its tail
-    /// chunks; a change of form beside writes its table entries and retires
-    /// the form it replaces; one in place drops the whole form's buffer
-    /// before it forms the kept chunks, so the two never count together.
-    ///
-    /// # Panics
-    /// Where Metal refuses a buffer over granules the view already held in
-    /// one buffer, past the device's limit on neither.
-    fn apply(&self, view: &mut GranuleView, change: ChunkChange) -> Option<GranuleView> {
-        fn chunks(view: &mut GranuleView) -> &mut WiredAllocation {
-            match view {
-                GranuleView::Chunks(chunks) => chunks,
-                GranuleView::Whole(_) => unreachable!("a whole view changes only by a change of form"),
-            }
-        }
-        match change {
-            ChunkChange::Grow(grown) => {
-                chunks(view).append(grown);
+            ChunkChange::Grow(chunks) => {
+                view.append(chunks);
                 None
             }
-            ChunkChange::Shrink(granules) => Some(GranuleView::Chunks(chunks(view).split_off(granules))),
-            ChunkChange::Replace(next) => {
-                self.write_view_entries(&next);
-                Some(std::mem::replace(view, next))
-            }
-            ChunkChange::InPlace(granules) => {
-                assert!(matches!(view, GranuleView::Whole(_)), "a change of form in place is from the whole form");
-                drop(std::mem::replace(view, GranuleView::Chunks(WiredAllocation::wire(&self.residency, Vec::new()))));
-                let kept = self
-                    .chunks(0, granules)
-                    .unwrap_or_else(|error| panic!("Metal refused chunks over granules it held as one buffer: {error:?}"));
-                *view = GranuleView::Chunks(kept);
-                self.write_view_entries(view);
-                None
-            }
+            ChunkChange::Shrink(granules) => Some(view.split_off(granules)),
         }
     }
 }
@@ -1025,9 +800,8 @@ impl MetalDevice {
     /// bytes of `record`-byte records in `granule`-byte granules (chunks of
     /// whole records and whole [`RESERVATION_CHUNKS`] units, none smaller
     /// than [`RESERVATION_GRANULE`]), the leading
-    /// `committed` bytes backed (in one buffer where they are every granule
-    /// and it may be, [`ViewForm::Whole`]), and its resizer, which changes
-    /// the backed prefix without moving its host address. `table` holds one device
+    /// `committed` bytes backed, and its resizer, which changes the backed
+    /// prefix without moving its host address. `table` holds one device
     /// address per record of the range, written as chunks are formed. Each
     /// chunk is a buffer: `maxBufferLength` bounds a chunk (the runtime
     /// admits it), not the address range.
@@ -1061,8 +835,7 @@ impl MetalDevice {
             table,
             record: record as usize,
         };
-        let form = backing.formed_at(committed.div_ceil(granule) as usize);
-        let (reservation, resizer) = Reserved::formed(backing, committed, form)?;
+        let (reservation, resizer) = Reserved::new(backing, committed)?;
         Ok((ReservedBuffer { reservation }, resizer))
     }
 
@@ -1324,11 +1097,9 @@ mod reserved_tests {
     }
 
     /// Reads `bytes` of a buffer as `uint4` words on the GPU: their wrapping
-    /// sum, and the GPU time of the read; through a record table, or bound
-    /// directly.
+    /// sum, and the GPU time of the read.
     struct Reader {
         pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        direct: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         output: WritableMetalBuffer,
     }
 
@@ -1345,16 +1116,6 @@ mod reserved_tests {
                      for (uint word = index; word < shape.x; word += threads)\n\
                          sum += ((device const uint4*)table[word / shape.y])[word % shape.y];\n\
                      atomic_fetch_add_explicit(output, sum.x + sum.y + sum.z + sum.w, memory_order_relaxed);\n\
-                 }\n\
-                 kernel void direct(device const uint4* data [[buffer(0)]],\n\
-                                    device atomic_uint* output [[buffer(1)]],\n\
-                                    constant uint2& shape [[buffer(2)]],\n\
-                                    uint index [[thread_position_in_grid]],\n\
-                                    uint threads [[threads_per_grid]]) {\n\
-                     uint4 sum = 0;\n\
-                     for (uint word = index; word < shape.x; word += threads)\n\
-                         sum += data[word];\n\
-                     atomic_fetch_add_explicit(output, sum.x + sum.y + sum.z + sum.w, memory_order_relaxed);\n\
                  }",
             );
             let library = device
@@ -1362,26 +1123,18 @@ mod reserved_tests {
                 .raw()
                 .newLibraryWithSource_options_error(&source, None)
                 .unwrap();
-            let pipeline = |name: &str| {
-                let function = library
-                    .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
-                    .unwrap();
-                device
-                    .handle()
-                    .raw()
-                    .newComputePipelineStateWithFunction_error(&function)
-                    .unwrap()
-            };
+            let function = library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("total"))
+                .unwrap();
+            let pipeline = device
+                .handle()
+                .raw()
+                .newComputePipelineStateWithFunction_error(&function)
+                .unwrap();
             Self {
-                pipeline: pipeline("total"),
-                direct: pipeline("direct"),
+                pipeline,
                 output: device.allocate_bytes(4).unwrap(),
             }
-        }
-
-        /// The `bytes` from `offset` of what `binding` binds, bound directly.
-        fn bound_total(&self, device: &MetalDevice, binding: Binding<'_>, offset: u64, bytes: u64) -> u32 {
-            self.read(device, &self.direct, binding, offset, [u32::try_from(bytes / 16).unwrap(), 0]).0
         }
 
         /// The first `bytes` of the `GRANULE`-byte records `table` addresses.
@@ -1391,25 +1144,13 @@ mod reserved_tests {
 
         /// The first `bytes` of the `record`-byte records `table` addresses.
         fn total_of(&self, device: &MetalDevice, table: &MetalBuffer, bytes: u64, record: u64) -> (u32, f64) {
-            let shape = [u32::try_from(bytes / 16).unwrap(), (record / 16) as u32];
-            self.read(device, &self.pipeline, Binding::Buffer(table), 0, shape)
-        }
-
-        /// Run `pipeline` over `binding` from `offset`, of `shape`.
-        fn read(
-            &self,
-            device: &MetalDevice,
-            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-            binding: Binding<'_>,
-            offset: u64,
-            shape: [u32; 2],
-        ) -> (u32, f64) {
             self.output.write_bytes(0, &[0; 4]);
+            let shape = [u32::try_from(bytes / 16).unwrap(), (record / 16) as u32];
             let command = device.queue().commandBuffer().unwrap();
             let encoder = command.computeCommandEncoder().unwrap();
-            encoder.setComputePipelineState(pipeline);
+            encoder.setComputePipelineState(&self.pipeline);
             unsafe {
-                binding.with(|buffer| encoder.setBuffer_offset_atIndex(Some(buffer), offset as usize, 0));
+                encoder.setBuffer_offset_atIndex(Some(table.raw()), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(self.output.raw()), 0, 1);
                 encoder.setBytes_length_atIndex(NonNull::from(&shape).cast(), 8, 2);
             }
@@ -1439,21 +1180,14 @@ mod reserved_tests {
 
     const GRANULE: u64 = RESERVATION_GRANULE as u64;
 
-    /// A resize to `bytes` in `form`, a change of form's buffers formed
-    /// where `forming` says, prepared.
-    fn prepare_as(resizer: MetalResizer, bytes: u64, form: ViewForm, forming: Forming) -> seismic_reservation::Prepared<Granules> {
-        resizer.prepare_as(bytes, form, forming).map_err(|(_, error)| error).unwrap()
+    /// A resize to `bytes`, prepared.
+    fn prepare(resizer: MetalResizer, bytes: u64) -> seismic_reservation::Prepared<Granules> {
+        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap()
     }
 
-    /// One resize to `bytes` in `form`, formed beside: prepared, installed,
-    /// released.
-    fn resize_as(resizer: MetalResizer, bytes: u64, form: ViewForm) -> MetalResizer {
-        prepare_as(resizer, bytes, form, Forming::Beside).install().release()
-    }
-
-    /// One resize of chunks to `bytes`.
+    /// One resize to `bytes`: prepared, installed, released.
     fn resize(resizer: MetalResizer, bytes: u64) -> MetalResizer {
-        resize_as(resizer, bytes, ViewForm::Chunks)
+        prepare(resizer, bytes).install().release()
     }
 
     fn pattern(bytes: u64) -> Vec<u8> {
@@ -1465,75 +1199,6 @@ mod reserved_tests {
         bytes.chunks_exact(4).fold(0u32, |sum, word| {
             sum.wrapping_add(u32::from_le_bytes(word.try_into().unwrap()))
         })
-    }
-
-    /// A reservation is one buffer over its range only while every granule
-    /// is backed, in its chunks' place: formed at the reservation's forming
-    /// with every granule, or by a growth to every granule in the whole
-    /// form, and replaced by the kept chunks at a shrink's install, formed
-    /// beside it before or in its place there. A growth to every granule in
-    /// chunks stays chunks. Bound directly, from any offset, it reads what
-    /// the host wrote, as the record table does in either form. The
-    /// residency set holds each backed byte once.
-    #[test]
-    fn a_reservation_binds_as_one_buffer_while_every_granule_is_backed() {
-        let device = crate::test_support::metal_device();
-        let reader = Reader::new(&device);
-        let whole = |buffer: &ReservedBuffer| matches!(buffer.reservation.state().view, GranuleView::Whole(_));
-        // Bytes the residency set wires beyond what it wired with the
-        // reservation empty, its table aside: the set does not count a
-        // small table at its length (a 64-byte table read 64 bytes short,
-        // M4 Pro).
-        let wired_now = || device.residency.lock().set.allocatedSize() as u64;
-        let reads = |buffer: &ReservedBuffer, contents: &[u8]| {
-            let bytes = contents.len() as u64;
-            assert_eq!(reader.bound_total(&device, Binding::Reserved(buffer), 0, bytes), word_total(contents));
-            let (offset, tail) = (3 * GRANULE + 4096, &contents[(3 * GRANULE + 4096) as usize..]);
-            assert_eq!(reader.bound_total(&device, Binding::Reserved(buffer), offset, tail.len() as u64), word_total(tail));
-            assert_eq!(reader.total(&device, &buffer.table(), bytes).0, word_total(contents));
-        };
-        let (buffer, resizer) = device.allocate_reserved(0, 8 * GRANULE, GRANULE, GRANULE).unwrap();
-        let others = wired_now();
-        let wired = |_: &ReservedBuffer| wired_now() - others;
-        let resizer = resize(resizer, 4 * GRANULE);
-        assert!(!whole(&buffer), "a partly backed reservation has no one buffer");
-        assert_eq!(wired(&buffer), 4 * GRANULE);
-        let resizer = resize(resizer, 8 * GRANULE);
-        assert!(!whole(&buffer), "a growth to every granule in chunks stays chunks");
-        assert_eq!(wired(&buffer), 8 * GRANULE);
-        assert_eq!(reader.total(&device, &buffer.table(), 8 * GRANULE).0, 0, "backed bytes read zero");
-        let resizer = resize_as(resize(resizer, 7 * GRANULE), 8 * GRANULE, ViewForm::Whole);
-        assert!(whole(&buffer), "the growth that backs the last granule in the whole form forms it");
-        assert_eq!(wired(&buffer), 8 * GRANULE, "the one buffer takes the chunks' place");
-        let contents = pattern(8 * GRANULE);
-        buffer.write_bytes(0, &contents);
-        reads(&buffer, &contents);
-        let pending = prepare_as(resizer, 6 * GRANULE, ViewForm::Chunks, Forming::Beside).install();
-        assert!(!whole(&buffer), "a shrink's install retires it, before its release");
-        let resizer = pending.release();
-        assert_eq!(wired(&buffer), 6 * GRANULE, "the kept chunks take its place");
-        let kept = &contents[..(6 * GRANULE) as usize];
-        assert_eq!(reader.total(&device, &buffer.table(), 6 * GRANULE).0, word_total(kept));
-        let resizer = resize_as(resizer, 8 * GRANULE, ViewForm::Whole);
-        assert!(whole(&buffer), "a growth back to every granule forms it again");
-        assert_eq!(wired(&buffer), 8 * GRANULE);
-        let contents: Vec<u8> = pattern(8 * GRANULE).into_iter().rev().collect();
-        buffer.write_bytes(0, &contents);
-        reads(&buffer, &contents);
-        let prepared = prepare_as(resizer, 5 * GRANULE, ViewForm::Chunks, Forming::InPlace);
-        assert_eq!(wired(&buffer), 8 * GRANULE, "a shrink in place forms nothing beside the one buffer");
-        let pending = prepared.install();
-        assert!(!whole(&buffer));
-        assert_eq!(wired(&buffer), 5 * GRANULE, "its install forms the kept chunks in the one buffer's place");
-        let resizer = pending.release();
-        let kept = &contents[..(5 * GRANULE) as usize];
-        assert_eq!(reader.total(&device, &buffer.table(), 5 * GRANULE).0, word_total(kept));
-        let resizer = resize_as(resizer, 8 * GRANULE, ViewForm::Whole);
-        assert!(whole(&buffer));
-        drop((buffer, resizer));
-        let (formed, resizer) = device.allocate_reserved(8 * GRANULE, 8 * GRANULE, GRANULE, GRANULE).unwrap();
-        assert!(whole(&formed), "a reservation formed with every granule backed has it");
-        drop((formed, resizer));
     }
 
     /// A reserved buffer resizes in place after GPU use: its host address
@@ -1633,13 +1298,11 @@ mod reserved_tests {
         let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
         let reader = Reader::new(&device);
         let ms = |started: Instant| started.elapsed().as_secs_f64() * 1e3;
-        // Twice the load's bytes, so a load leaves a granule unbacked and is
-        // formed as chunks.
         let granules = |chunk: u64| Granules {
-            range: HostRange::reserve(2 * TOTAL, chunk, PageSize::Host).unwrap(),
+            range: HostRange::reserve(TOTAL, chunk, PageSize::Host).unwrap(),
             device: device.handle.clone(),
             residency: device.residency.clone(),
-            table: device.allocate_bytes(record_table_bytes(2 * TOTAL / chunk).unwrap()).unwrap(),
+            table: device.allocate_bytes(record_table_bytes(TOTAL / chunk).unwrap()).unwrap(),
             record: chunk as usize,
         };
         eprintln!(
@@ -1654,7 +1317,7 @@ mod reserved_tests {
             let started = Instant::now();
             let (reservation, resizer) = Reserved::new(granules(chunk), TOTAL).unwrap();
             let load = ms(started);
-            assert!(matches!(&reservation.state().view, GranuleView::Chunks(formed) if formed.buffers.len() == chunks));
+            assert_eq!(reservation.state().view.buffers.len(), chunks);
             let table = reservation.backing().table.clone();
             let (sum, first) = reader.total_of(&device, &table, TOTAL, chunk);
             assert_eq!(sum, 0, "backed bytes read zero");
@@ -1672,8 +1335,7 @@ mod reserved_tests {
             backing.back(0, chunks).unwrap();
             let map = ms(started);
             let started = Instant::now();
-            let wired = backing.chunks(0, chunks).unwrap();
-            backing.write_entries(0, range.granule(), &wired.buffers);
+            let wired = backing.form(range, 0, chunks).unwrap();
             let form = ms(started);
             let buffers = wired.buffers.clone();
             let started = Instant::now();

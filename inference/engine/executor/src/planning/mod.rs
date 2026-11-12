@@ -30,7 +30,7 @@ pub use bank::{
     Lender,
     HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredStack,
-    growth_target, BankTier, HostTier, LayerSite, Placer,
+    growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Placer,
 };
 pub(crate) use bank::{layer_homes, releasing};
 #[cfg(test)]

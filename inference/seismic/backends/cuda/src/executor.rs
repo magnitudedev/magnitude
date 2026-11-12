@@ -275,7 +275,6 @@ impl Backing for ReservedMemory {
     type View = ();
     type Change = ();
     type Retired = ();
-    type Form = ();
 
     fn granule(&self) -> usize {
         self.granularity
@@ -343,13 +342,11 @@ impl Backing for ReservedMemory {
         self.stream.synchronize().map_err(submission_error)
     }
 
-    fn form(&self, (): &()) {}
-
-    fn view(&self, _: usize, (): ()) -> Result<(), ExecutionError> {
+    fn view(&self, _: usize) -> Result<(), ExecutionError> {
         Ok(())
     }
 
-    fn change(&self, _: (usize, ()), _: usize, (): (), _: seismic_reservation::Forming) -> Result<(), ExecutionError> {
+    fn change(&self, _: usize, _: usize) -> Result<(), ExecutionError> {
         Ok(())
     }
 

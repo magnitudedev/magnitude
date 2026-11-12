@@ -31,7 +31,7 @@ use std::num::NonZeroU64;
 use table::stored_rows;
 pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
 pub use counts::BankCounts;
-pub use layout::{BankAllocation, BankLayout, BankPart, BankTier, HostTier, PlacedAllocations, Placer};
+pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, PlacedAllocations, Placer};
 pub use records::{RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
 pub(crate) use records::layer_homes;
 pub use sizing::growth_target;
@@ -142,6 +142,8 @@ pub struct ExpertBankPlan {
     /// [`Self::host`], [`Self::groups`], [`Self::layers`]), with its conveyor
     /// and scratch ([`Self::conveyor`], [`Self::scratch`]).
     structured: conveyor::Structured,
+    /// The backend whose launches serve it ([`Self::substrate`]).
+    backend: seismic::BackendName,
     /// `S`: the committed records each routed layer adds to its group, at
     /// least the floor ([`Self::floor`], which may be none: each group then
     /// holds its least records, [`Self::least_records`]) and at most its
@@ -155,8 +157,10 @@ pub struct ExpertBankPlan {
     pub ceiling: u64,
     /// Whether the load holds its decode blocks' resident form
     /// (`RunStage::Resident`): only a bank planned whole, which starts in
-    /// it. A bank planned banked commits no bytes for a form it may never
-    /// reach, and serves banked forms whatever it grows to.
+    /// it, where those forms can read its home records
+    /// ([`BankSubstrate::reads_homes`]). A bank planned banked commits no
+    /// bytes for a form it may never reach, and serves banked forms whatever
+    /// it grows to.
     pub resident: bool,
     /// The most host slots a weight cap leaves its host tier beside the
     /// bank's weights at its ceiling (`ExecutionPlanDraft::bank_ceiling`),

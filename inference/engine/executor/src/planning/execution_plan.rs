@@ -599,7 +599,7 @@ impl ExecutionPlanDraft {
     /// whole-context prompt (`with_chain`): a group's places are granted
     /// when it opens.
     fn bank_ceiling(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Result<BankCeiling, NoBank>, PlanError> {
-        let (reservation, host) = match bank_substrate(
+        let substrate = match bank_substrate(
             self.device.backend,
             self.device.reservation.as_ref().copied().map_err(String::as_str),
             self.device.host_tier(),
@@ -615,8 +615,7 @@ impl ExecutionPlanDraft {
                 experts,
                 places,
                 self.policy.limits.flights(),
-                reservation,
-                host,
+                substrate,
             )?;
             let programs = load.program_plan(definition, self.policy.codec)?;
             Self { load, programs, ..self.clone() }.with_chain(places)
@@ -948,7 +947,7 @@ impl ExecutionPlanDraft {
                     .load
                     .clone()
                     .unbanked()
-                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.reservation(), bank.host())?
+                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.substrate())?
                     .with_bank_slots(bank.slots, bank.ceiling)?;
                 let built = load.bank.as_mut().expect("the load was just banked");
                 (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
@@ -1763,7 +1762,7 @@ pub(crate) fn bank_substrate(
     reservation: Result<Option<seismic::Reservation>, &str>,
     host: Result<Option<HostTier>, &str>,
     definition: &ModelDefinition,
-) -> Result<(seismic::Reservation, HostTier), PlanError> {
+) -> Result<super::BankSubstrate, PlanError> {
     streams_experts(backend, definition)?;
     let reservation = match reservation {
         Ok(Some(reservation)) => reservation,
@@ -1774,7 +1773,7 @@ pub(crate) fn bank_substrate(
         }
     };
     let reason = match host {
-        Ok(Some(host)) => return Ok((reservation, host)),
+        Ok(Some(host)) => return Ok(super::BankSubstrate { backend, reservation, host }),
         Ok(None) => "its backend reserves no host storage beside its device's own",
         Err(reason) => reason,
     };

@@ -371,14 +371,10 @@ impl ExpertBank {
     /// Whether the group `begin` is beginning is resident, which its
     /// resident word then holds for its fronts (`BankPart::Resident`): every
     /// streamed layer's group is whole, each expert at its home record, and
-    /// the bank holds resident forms whose home records bind directly and
-    /// are bindable (`seismic::Tensor::bindable`: on Metal, their
-    /// reservation is in its whole form, which a growth takes only where
-    /// the device grants it, so a bank holding every expert without it is
-    /// served streamed). A bank planned banked has no resident forms
-    /// (`ExpertBankPlan::resident`): grown whole, it is served streamed. A
-    /// reservation leaves the whole form only at a shrink, which this
-    /// orders as it orders the policy words.
+    /// the bank holds resident forms (`ExpertBankPlan::resident`): one
+    /// planned banked, or one whose resident launches cannot read its home
+    /// records (`BankSubstrate::reads_homes`), has none, and grown whole it
+    /// is served streamed.
     /// Residency publishes the
     /// policy words only while no step runs (`Residency::publish_policy`), under
     /// the lock `begin` reads them in, and only a shrink clears one, which
@@ -396,8 +392,7 @@ impl ExpertBank {
         for words in &self.layout.layers {
             resident &= word(&words.policy)? != 0;
         }
-        resident = resident
-            && self.homes.as_ref().is_some_and(|homes| homes.iter().all(|records| records.iter().all(|(_, home)| home.bindable())));
+        resident = resident && self.homes.is_some();
         self.layout
             .load
             .resident

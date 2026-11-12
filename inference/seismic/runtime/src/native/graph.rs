@@ -4482,7 +4482,7 @@ impl NativeGraphBindings {
                 parameter: format!("port {ordinal}"),
             });
         }
-        if self.uses[ordinal].direct && !tensor.binds_directly() {
+        if self.uses[ordinal].direct && tensor.chunked() {
             return Err(WorkflowError::ChunkedBinding {
                 parameter: format!("port {ordinal}"),
             });

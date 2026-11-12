@@ -2838,43 +2838,91 @@ fn a_refused_growth_leaves_the_reserved_tensor_unchanged() {
     }
 }
 
-/// Where a device binds a reserved range as one buffer once every granule
-/// is backed (Metal), a change between that form and chunks holds the next
-/// form's buffers beside the view's until its release, which the device
-/// counts: the resize is charged them for that window, so the ledger never
-/// passes its bound. A growth to every granule whose bound leaves no room
-/// for them stays in chunks, which bind nothing directly; a shrink from the
-/// one buffer at no headroom forms its kept chunks in its place.
+/// Chunked reserved storage, which is no one buffer, is refused where
+/// device work would bind it directly: at a native port not marked
+/// `records` (`scale_rows`), on every backend whose reservations are chunks
+/// (Metal's, Vulkan's). Its record port (`scale_records`) binds it.
 #[test]
-fn a_reserved_tensor_takes_its_whole_form_only_within_its_grant() {
+fn a_chunked_reserved_tensor_binds_only_through_a_record_port() {
     for device in reserving_devices() {
         let backend = device.backend();
         let reservation = device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves");
-        if !reservation.chunks.is_some_and(|chunks| chunks.whole) {
+        if !reservation.chunked() {
             continue;
         }
-        // 256 KiB rows, a whole number of them a granule.
-        let (rows, n) = (64u64, 1u64 << 16);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows / 2).unwrap();
-        let store = seismic::Ledger::Own(device.device_store());
-        // Room for the growth's own bytes, none for the chunks it would hold
-        // beside one buffer over the range.
-        let limit = device.device_ledger().charged + rows / 2 * n * 4;
-        device.bounds().bound(store, Some(limit)).unwrap();
-        let resizer = resizer.recommit(rows).unwrap();
-        assert_eq!(reserved.committed_rows(), rows, "{backend:?}");
-        assert!(!reserved.bindable(), "{backend:?}: a growth with no room beside its chunks stays in chunks");
-        assert!(device.device_ledger().charged <= limit, "{backend:?}");
-        device.bounds().bound(store, None).unwrap();
-        let resizer = resizer.recommit(rows - 8).unwrap().recommit(rows).unwrap();
-        assert!(reserved.bindable(), "{backend:?}: a growth with room takes the whole form");
-        let charged = device.device_ledger().charged;
-        device.bounds().bound(store, Some(charged)).unwrap();
+        let (rows, n) = (8u64, 64u64);
+        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows).unwrap();
+        let view = reserved.slice_leading(0, rows).unwrap();
+        let direct = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
+        let mut graph = device.native_graph();
+        let x = graph.port(Element::f32(), view.extents()).unwrap();
+        let scaled = graph
+            .enqueue(&direct, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: seismic::Argument::from(3.0) })
+            .unwrap()
+            .value;
+        graph.export(&scaled).unwrap();
+        let plan = graph.seal().unwrap();
+        assert!(
+            matches!(plan.bind_static(&[(&x, &view)]), Err(CallError::Workflow(seismic::WorkflowError::ChunkedBinding { .. }))),
+            "{backend:?}: a direct port refuses chunked storage"
+        );
+        drop(tripling_graph(&device, &view));
+        drop((view, reserved, resizer));
+    }
+}
+
+/// A shrink of a reserved tensor returns its pages to the host, and a
+/// regrow takes fresh ones, as the host's one available reading
+/// (`seismic::host_available`) sees them. On Metal a reservation bound as
+/// one buffer over its range kept its pages past every release until it was
+/// unmapped (M4 Pro, macOS 15.7.9, 2026-11-12: 2 GiB released of 4 GiB of
+/// written rows raised host free memory by nothing within 1 s), while its
+/// chunks return theirs within 50 ms. A measurement of the host's memory,
+/// which other processes move: run it alone, on a host with 4 GiB to spare.
+#[test]
+#[ignore = "a measurement of host memory: run alone with --ignored"]
+fn a_reserved_tensors_shrink_returns_its_pages_to_the_host() {
+    const MIB: u64 = 1 << 20;
+    // 1 MiB rows; host_available reads the kernel's live counts, read
+    // 100 ms after each change: a chunk's pages return within 50 ms.
+    let (rows, n) = (4096u64, MIB / 4);
+    let settled = || {
+        std::thread::sleep(Duration::from_millis(100));
+        seismic::host_available().expect("host memory reads").available as i64
+    };
+    // Random bytes, so the compressor takes nothing back from them.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let chunk: Vec<u8> = (0..64 * MIB / 8)
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .collect();
+    let write = |tensor: &Tensor, from: u64, to: u64| {
+        for start in (from..to).step_by(64) {
+            let end = (start + 64).min(to);
+            let mut part = tensor.slice_leading(start, end).unwrap();
+            part.write_from_host(&chunk[..((end - start) * MIB) as usize]).unwrap();
+        }
+    };
+    let gib = |bytes: i64| bytes as f64 / (1u64 << 30) as f64;
+    for device in reserving_devices() {
+        let backend = device.backend();
+        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows).unwrap();
+        write(&reserved, 0, rows);
+        let held = settled();
         let resizer = resizer.recommit(rows / 2).unwrap();
-        assert_eq!(reserved.committed_rows(), rows / 2, "{backend:?}");
-        assert!(!reserved.bindable(), "{backend:?}");
-        assert!(device.device_ledger().charged <= charged, "{backend:?}: a shrink in place is charged nothing beside");
-        device.bounds().bound(store, None).unwrap();
+        let released = settled();
+        let half = (rows / 2 * MIB) as i64;
+        eprintln!("{backend:?}: a shrink of {:.2} GiB raised host available memory {:.2} GiB", gib(half), gib(released - held));
+        assert!(released - held >= half * 9 / 10, "{backend:?}: the shrink returned {:.2} GiB of {:.2}", gib(released - held), gib(half));
+        let resizer = resizer.recommit(rows).unwrap();
+        write(&reserved, rows / 2, rows);
+        let regrown = settled();
+        eprintln!("{backend:?}: the regrow took {:.2} GiB", gib(released - regrown));
+        assert!(released - regrown >= half * 9 / 10, "{backend:?}: the regrow took {:.2} GiB of {:.2}", gib(released - regrown), gib(half));
         drop((reserved, resizer));
     }
 }
