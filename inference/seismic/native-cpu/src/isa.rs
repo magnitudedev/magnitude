@@ -24,6 +24,9 @@ pub unsafe trait Isa: Copy + Send + Sync + 'static {
     const TIER: Tier;
     /// The tier's quantized-dot mode ([`Tier::quantized_dots`]).
     const QUANTIZED_DOTS: u8 = Self::TIER.quantized_dots();
+    /// Whether the tier has AVX-512 VNNI (else its VNNI is AVX-VNNI's), as a
+    /// constant: the feature search of [`Tier::has`] must not run per dot.
+    const AVX512_VNNI: bool = Self::TIER.has("avx512vnni");
 
     /// The token, when the host has the tier's features.
     fn detect() -> Option<Self>;
@@ -66,3 +69,7 @@ macro_rules! tokens {
 
 seismic_cpu_tiers::tiers!(tokens);
 
+
+// The AVX-512 VNNI dots are the AVX-512 tier's alone; AVX-VNNI's tier takes the VEX form.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(X86V4Vnni::AVX512_VNNI && !X86V3Vnni::AVX512_VNNI);

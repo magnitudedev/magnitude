@@ -5073,7 +5073,7 @@ mod packed_x86 {
     #[inline(always)]
     pub(super) unsafe fn dpbusd<V: Vectors>(acc: __m256i, weights: __m256i, activations: __m256i) -> __m256i {
         unsafe {
-            if V::TIER.has("avx512vnni") {
+            if V::AVX512_VNNI {
                 _mm256_dpbusd_epi32(acc, weights, activations)
             } else {
                 _mm256_dpbusd_avx_epi32(acc, weights, activations)
@@ -5086,7 +5086,7 @@ mod packed_x86 {
     #[inline(always)]
     pub(super) unsafe fn dpwssd<V: Vectors>(acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
         unsafe {
-            if V::TIER.has("avx512vnni") {
+            if V::AVX512_VNNI {
                 _mm256_dpwssd_epi32(acc, a, b)
             } else {
                 _mm256_dpwssd_avx_epi32(acc, a, b)
