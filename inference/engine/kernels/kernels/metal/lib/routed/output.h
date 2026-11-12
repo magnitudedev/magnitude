@@ -36,14 +36,14 @@ template <uint ROWS, uint LANES> constexpr uint output_region() {
 }
 
 // Simdgroup `sg`'s projection: choice k = sg < K of row m (its down rows of
-// `expert_down` as bound, `choice_record`, `choice_weights`: a bank record of
-// its table or a host tier record of `tier_down` read in place, or a
-// resident layer's expert of its stack), or the shared expert (sg = K), into
+// `expert_down`, `choice_record`, `choice_weights`: a bank record of its
+// table or a host tier record of `tier_down` read in place), or the shared
+// expert (sg = K), into
 // `projected` (TILE channels from `first`; its `output_region()` floats, a
 // stage of its product while it projects).
-template <uint ROWS, uint LANES, typename STACK>
+template <uint ROWS, uint LANES>
 inline void output_project(device const uchar *expert_product, device const uchar *shared_product,
-    device const int *routes, device const int *sources, device const STACK *expert_down,
+    device const int *routes, device const int *sources, device const ulong *expert_down,
     device const ulong *tier_down, device const uchar *shared_down, ulong m, uint first, uint sg, uint lane,
     threadgroup float *projected, constant ulong *seismic_words) {
     constexpr uint TILE = output_tile<ROWS, LANES>();

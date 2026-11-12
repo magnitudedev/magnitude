@@ -709,14 +709,14 @@ impl ExpertKernels {
     /// layer's, or a whole bank's resident forms, which read its home
     /// records) bind each expert stack as it lies and read expert `e` from
     /// row `e * rows` of the binding, rather than through a record port's
-    /// table (`routed.seismic`: Metal's `_resident` launches list no expert
-    /// stack among their `records`, and CUDA's and the CPU's list none;
-    /// Vulkan's list every one). A binding is one buffer, which chunked
-    /// reserved storage is not (`seismic::Reservation::chunked`).
+    /// table (`routed.seismic`: CUDA's and the CPU's launches list no expert
+    /// stack among their `records`; Metal's and Vulkan's list every one). A
+    /// binding is one buffer, which chunked reserved storage is not
+    /// (`seismic::Reservation::chunked`).
     pub(crate) const fn bind_resident_stacks(backend: seismic::BackendName) -> bool {
         match backend {
-            seismic::BackendName::Metal | seismic::BackendName::Cuda | seismic::BackendName::Cpu => true,
-            seismic::BackendName::Vulkan => false,
+            seismic::BackendName::Cuda | seismic::BackendName::Cpu => true,
+            seismic::BackendName::Metal | seismic::BackendName::Vulkan => false,
         }
     }
 }

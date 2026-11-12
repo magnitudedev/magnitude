@@ -1,9 +1,14 @@
 // Decode expansion of up-only experts (M <= DECODE_ROWS): threadgroup row y = choice
 // (m, k), a K1 GEMV over the feature tile `x` of expert routes[m, k]'s up rows
-// (its record, `routed::decode_source`; a resident layer's, of its stack as
-// bound) with the activated epilogue
+// (its record, `routed::decode_source`; a resident layer's, its expert's
+// record) with the activated epilogue
 // A(act(A(up))). Every row of a choice with no record is zero.
 
+#ifdef SEISMIC_FORMING_ROUTED_UP_RESIDENT
+// A resident layer's: nothing lands in its records while it runs, so plain
+// loads read them.
+#define PACKETS_PLAIN_RECORDS
+#endif
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.h"
 #include "lib/projection/gemv.h"
@@ -13,13 +18,12 @@
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
 typedef projection::operands<NVFP4> Operands;
 
-// The ports, the expert stack's of element type STACK: its records' address
-// table (`ulong`), or a resident layer's stack (`uchar`).
-#define ROUTED_UP_PORTS(STACK)                                               \
+// The ports, the expert stack's: its records' address table.
+#define ROUTED_UP_PORTS                                               \
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],    \
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],              \
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],            \
-    device const STACK *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],      \
+    device const ulong *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],      \
     device const ulong *tier_up [[buffer(SEISMIC_BUFFER_TIER_UP)]],          \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],        \
     device uchar *product [[buffer(SEISMIC_RESULT_0_BUFFER)]],               \
@@ -30,8 +34,7 @@ typedef projection::operands<NVFP4> Operands;
     uint sg [[simdgroup_index_in_threadgroup]],                              \
     uint lane [[thread_index_in_simdgroup]]
 
-// The body, of either binding of the stack (`routed::choice_record`,
-// `routed::choice_weights`).
+// The body (`routed::choice_record`, `routed::choice_weights`).
 #define ROUTED_UP_BODY                                                                                                 \
     typedef routed::Act A;                                                                                             \
     const uint tile = group.x;                                                                                         \
@@ -63,15 +66,14 @@ typedef projection::operands<NVFP4> Operands;
 
 #ifdef SEISMIC_FORMING_ROUTED_UP
 template <uint ROWS, uint LANES>
-kernel void routed_up(ROUTED_UP_PORTS(ulong)) {
+kernel void routed_up(ROUTED_UP_PORTS) {
     ROUTED_UP_BODY
 }
 #endif
 #ifdef SEISMIC_FORMING_ROUTED_UP_RESIDENT
-// A resident layer's (XS 0): its stack bound as it lies, read with plain
-// loads, as nothing lands in it while it runs.
+// A resident layer's (XS 0), its records read with plain loads.
 template <uint ROWS, uint LANES>
-kernel void routed_up_resident(ROUTED_UP_PORTS(uchar)) {
+kernel void routed_up_resident(ROUTED_UP_PORTS) {
     ROUTED_UP_BODY
 }
 #endif

@@ -452,10 +452,10 @@ native routed_output for metal from "metal/routed_output.metal":
     launch routed_output when XS > 0:
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
-    # A resident layer's (XS 0) binds its expert stack as it lies, as
+    # A resident layer's (XS 0) reads its expert records with plain loads, as
     # `routed_gate_up_resident` does.
     launch routed_output_resident when XS == 0:
-        records (tier_down)
+        records (expert_down, tier_down)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
 
@@ -1400,13 +1400,13 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
-    # A resident layer's (XS 0) binds its expert stacks as they lie (a held
-    # layer's stacks, or a whole bank's home records where they are one
-    # buffer: never a Metal reservation's chunks), so it reads an expert's
-    # rows from the binding's base, with plain loads, as nothing writes them
-    # while it runs.
+    # A resident layer's (XS 0) reads its experts' records, a held layer's
+    # stack or a whole bank's homes, as the launches above do, by the
+    # expert itself (`decode_source`), with plain loads, as nothing writes
+    # them while it runs. It lists its record ports itself so that it forms
+    # its own source, which is where the plain loads are chosen.
     launch routed_gate_up_resident when XS == 0:
-        records (tier_gate, tier_up)
+        records (expert_gate, expert_up, tier_gate, tier_up)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
@@ -1478,10 +1478,10 @@ native routed_up for metal from "metal/routed_up.metal":
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
-    # A resident layer's (XS 0) binds its expert stack as it lies, as
+    # A resident layer's (XS 0) reads its expert records with plain loads, as
     # `routed_gate_up_resident` does.
     launch routed_up_resident when XS == 0:
-        records (tier_up)
+        records (expert_up, tier_up)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
@@ -1562,16 +1562,16 @@ native routed_down for metal from "metal/routed_down.metal":
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         unless (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * K, 1, 1)
-    # Each launch forms its own source, as the resident one lists its own
-    # record ports: the whole one reads its records with plain loads.
+    # Each launch forms its own source: the whole one reads its records with
+    # plain loads, as the resident one does.
     launch routed_down_whole when XS > 0:
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * K, 1, 1)
-    # A resident layer's (XS 0) binds its expert stack as it lies, as
+    # A resident layer's (XS 0) reads its expert records with plain loads, as
     # `routed_gate_up_resident` does.
     launch routed_down_resident when XS == 0:
-        records (tier_down)
+        records (expert_down, tier_down)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * K, 1, 1)
 

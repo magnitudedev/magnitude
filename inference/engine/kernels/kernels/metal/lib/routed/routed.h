@@ -8,8 +8,8 @@
 // weight a launch reads per step's source is a record port, bound as its
 // records' address table, and an expert's weights are rows 0.. of its
 // record's base (`slab::region<const uchar, packets::space>(table, record)`,
-// in the bound weights' space). A resident layer's launch binds the stack
-// itself (`choice_weights`).
+// in the bound weights' space); a resident layer's expert is its own record
+// (`decode_source`).
 
 #include <seismic/slab.h>
 #include "../projection/projection.h"
@@ -81,21 +81,14 @@ inline projection::Weights<W> weights(packets::weight_bytes base, packets::Rows1
 }
 
 // Choice (m, k)'s record (`decode_source`, `rows` source rows at strides
-// `row_stride`, `choice_stride`) of expert `expert`, by how its experts are
-// bound: as their records' address table (`ulong`), or as a resident
-// layer's stack as it lies (`uchar`: a held stack, or a whole bank's home
-// records, which lie so in its one buffer), whose choices read their
-// experts.
+// `row_stride`, `choice_stride`) of expert `expert`.
 inline int choice_record(device const ulong *, device const int *sources, ulong rows, ulong row_stride,
     ulong choice_stride, ulong m, ulong k, int expert) {
     return decode_source(sources, rows, row_stride, choice_stride, m, k, expert);
 }
-inline int choice_record(device const uchar *, device const int *, ulong, ulong, ulong, ulong, ulong, int expert) {
-    return expert;
-}
 
 // Expert `expert`'s weights of an expert-stacked weight bound as it lies,
-// `rows` rows an expert (expert e's from row e * rows): a resident layer's
+// `rows` rows an expert (expert e's from row e * rows): the fused expansion's
 // held stack, one buffer. The base is the binding's, so the rows are one
 // load away.
 template <typename W>
@@ -104,18 +97,12 @@ inline projection::Weights<W> stack_weights(packets::weight_bytes stack, packets
     return weights<W>(stack, layout, ulong(expert) * rows, k);
 }
 
-// The weights of `record` (`choice_record`, not -1), `rows` rows an expert:
-// a bank or tier record through their tables (`source_weights`), or of a
-// resident layer's stack (`stack_weights`).
+// The weights of `record` (`choice_record`, not -1): a bank or tier record
+// through their tables (`source_weights`).
 template <typename W>
 inline projection::Weights<W> choice_weights(device const ulong *bank, device const ulong *tier, int record,
     packets::Rows16 layout, ulong, uint k) {
     return weights<W>(source_weights(bank, tier, record), layout, 0, k);
-}
-template <typename W>
-inline projection::Weights<W> choice_weights(device const uchar *stack, device const ulong *, int record,
-    packets::Rows16 layout, ulong rows, uint k) {
-    return stack_weights<W>(stack, layout, record, rows, k);
 }
 
 // A plain activation prologue over rows of a [rows, columns] A tensor.

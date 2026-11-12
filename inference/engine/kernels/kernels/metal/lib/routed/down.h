@@ -38,13 +38,12 @@ template <uint ROWS, uint LANES> constexpr uint down_region() {
 
 // Simdgroup `sg`'s projection of choice k = sg of row m into `projected`
 // (TILE channels from `first`; its `down_region()` floats, a stage of its
-// product while it projects), its down rows of `expert_down` as bound
+// product while it projects), its down rows of `expert_down`
 // (`choice_record`, `choice_weights`): a bank record of its table or a host
-// tier record of `tier_down` read in place, or a resident layer's expert of
-// its stack.
-template <uint ROWS, uint LANES, typename STACK>
+// tier record of `tier_down` read in place.
+template <uint ROWS, uint LANES>
 inline void down_project(device const uchar *product, device const int *routes, device const int *sources,
-    device const STACK *expert_down, device const ulong *tier_down, ulong m, uint first, uint sg, uint lane,
+    device const ulong *expert_down, device const ulong *tier_down, ulong m, uint first, uint sg, uint lane,
     threadgroup float *projected, constant ulong *seismic_words) {
     constexpr uint TILE = down_tile<ROWS, LANES>();
     const ulong k = sg;

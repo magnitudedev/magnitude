@@ -274,12 +274,10 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
 /// whose first two attention blocks share one sealed graph, their streamed
 /// layers at different homes of one group
 /// (`streamed_layers_at_different_homes_share_a_graph`): every decode step
-/// runs the resident forms where they read the home records (on Metal, whose
-/// records are chunks its resident launches cannot bind, the streamed
-/// forms), each block's bound to its own layer's home records, and each
-/// layer reads its own experts, through the resident load's arithmetic, so
-/// a prompt chunk and its decode steps score bit for bit as the resident
-/// load does.
+/// runs the resident forms, each block's bound to its own layer's home
+/// records, and each layer reads its own experts, through the resident
+/// load's arithmetic, so a prompt chunk and its decode steps score bit for
+/// bit as the resident load does.
 #[test]
 fn a_whole_banks_shared_graphs_read_each_layers_own_experts() {
     let definition = qwen4exp_fixture_definition_of(4, 32);
@@ -635,11 +633,9 @@ fn scores(
         }
         drop(returned);
         // A whole bank's every launch of decode rows (its two-row prompt
-        // chunk's too) runs the resident forms; no partial one's does, nor
-        // one on Metal, whose resident launches bind expert stacks as they
-        // lie and whose records are chunks no binding reaches.
+        // chunk's too) runs the resident forms; no partial one's does.
         let resident = match banked {
-            Banked::Whole if backend != seismic::BackendName::Metal => 1 + DECODE_STEPS as u64,
+            Banked::Whole => 1 + DECODE_STEPS as u64,
             _ => 0,
         };
         assert_eq!(domain.resident_decodes(), resident, "{backend:?}: the decode steps the resident forms ran");
@@ -1264,10 +1260,6 @@ fn shrunk_bank_scores_as_resident(
     groups: usize,
 ) {
     let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), manifest);
-    // The resident forms run on every backend but Metal, whose resident
-    // launches bind expert stacks as they lie and whose records are chunks
-    // no binding reaches.
-    let resident_forms = backend != seismic::BackendName::Metal;
     // Without lookahead each step's token is the host's; with it, the
     // device's selection, each step claiming the successor queued behind
     // the one before (unless a shrink orphaned it), as served decode runs.
@@ -1324,7 +1316,7 @@ fn shrunk_bank_scores_as_resident(
         // Every step before the first shrink ran the resident forms (with
         // lookahead, a successor begun then too), and none from it on: a
         // shrink begins only once every begun step has ended.
-        if matches!(banked, Banked::Whole) && resident_forms {
+        if matches!(banked, Banked::Whole) {
             let (decoded, ran) = first_shrink.expect("the whole bank shrank");
             assert!(ran >= decoded, "{test}, lookahead {lookahead}: {ran} resident runs before the first shrink, of {decoded} steps");
             assert!(lookahead || ran == decoded, "{test}: {ran} resident runs before the first shrink, of {decoded} steps");
