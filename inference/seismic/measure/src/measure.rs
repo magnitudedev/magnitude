@@ -5,7 +5,7 @@
 use crate::clock::{raise_held, HeldClocks};
 use crate::deadline::{Deadline, WorkError};
 use crate::session::{Measurement, Slot, Stopping};
-use crate::statistics::Timing;
+use crate::statistics::{fewest_bounding, Timing};
 use crate::work::Work;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -19,10 +19,14 @@ pub enum Stop {
     /// Once [`Timing::resolved`] holds at `error_rate`.
     Resolved { error_rate: f64 },
     /// Once [`Timing::resolved`] holds at `error_rate`, or once sampling has
-    /// taken `seconds` of wall time, whichever comes first: at least one
-    /// sample. The budget bounds a point's time, and a median it ends before
-    /// the fewest samples that bound one has no interval.
+    /// taken `seconds` of wall time, whichever comes first (the deadline of
+    /// the point's job still ends it sooner). The budget bounds a point's
+    /// time, and a median it ends after one sample has no interval.
     Within { error_rate: f64, seconds: f64 },
+    /// As [`Stop::Within`], the budget unable to end sampling before the
+    /// fewest samples that bound the median ([`fewest_bounding`]): a point
+    /// whose figure needs an interval has one whatever a call takes.
+    Bounded { error_rate: f64, seconds: f64 },
 }
 
 /// How a point is measured: when sampling stops, and the device time a
@@ -34,6 +38,17 @@ pub struct Measure {
     pub stop: Stop,
     /// The device time a sample covers at least.
     pub min_sample_seconds: f64,
+}
+
+impl Measure {
+    /// This measurement with a [`Stop::Within`] made [`Stop::Bounded`].
+    /// Another stop is unchanged.
+    pub fn bounded(mut self) -> Self {
+        if let Stop::Within { error_rate, seconds } = self.stop {
+            self.stop = Stop::Bounded { error_rate, seconds };
+        }
+        self
+    }
 }
 
 /// Measure `work`: raised first to its sustained clock where `clocks`
@@ -70,10 +85,11 @@ fn time<W: Work>(
     let (mut stopping, error_rate) = match how.stop {
         Stop::Count(samples) => (Stopping::Count(samples.get()), None),
         Stop::Resolved { error_rate } => (Stopping::resolved(error_rate), Some(error_rate)),
-        Stop::Within {
-            error_rate,
-            seconds,
-        } => (Stopping::within(error_rate, seconds), Some(error_rate)),
+        Stop::Within { error_rate, seconds } => (Stopping::within(error_rate, seconds, 1), Some(error_rate)),
+        Stop::Bounded { error_rate, seconds } => (
+            Stopping::within(error_rate, seconds, fewest_bounding(error_rate)),
+            Some(error_rate),
+        ),
     };
     match slot.sample_alone(
         how.min_sample_seconds,
@@ -398,6 +414,26 @@ mod tests {
         let steady = measure(Fixed(Ok(1.)), &how, None).unwrap();
         assert!(steady.timing().resolved());
         assert_eq!(steady.samples.len(), 8);
+    }
+
+    /// A budget spent after one sample ends sampling there with no interval;
+    /// bounded, it cannot end it before the fewest samples that bound the
+    /// median, so whatever a call takes (here a budget of nothing) the point
+    /// has an interval; another stop is unchanged.
+    #[test]
+    fn a_bounded_budget_cannot_end_sampling_before_an_interval_exists() {
+        let within = Measure {
+            stop: Stop::Within { error_rate: 0.05, seconds: 0. },
+            min_sample_seconds: 0.,
+        };
+        let spent = measure(Fixed(Ok(1.)), &within, None).unwrap();
+        assert_eq!(spent.samples.len(), 1);
+        assert!(spent.timing().interval.is_none());
+        let bounded = measure(Fixed(Ok(1.)), &within.bounded(), None).unwrap();
+        assert_eq!(bounded.samples.len(), fewest_bounding(0.05));
+        assert!(bounded.timing().interval.is_some());
+        let counted = Measure { stop: Stop::Count(NonZeroUsize::new(3).unwrap()), min_sample_seconds: 0. };
+        assert_eq!(counted.bounded(), counted);
     }
 
     /// A stored point is loaded and neither attempted nor formed; the others
