@@ -987,15 +987,21 @@ fn measure(
             // before any clock here started, so a window opened at its start
             // would cover one step more than the device ran.
             let mut span = (f64::NAN, f64::NAN);
-            let mut cpu = (0.0, 0.0);
-            // Each thread kind's processor time, and the quota's throttling, at
-            // the window's start and end.
-            let (mut threads, mut throttling) = (None, None);
-            let (mut threads_end, mut throttling_end) = (None, None);
-            // The load's graphs recorded and updated at the window's start.
-            let mut graphs = decode.engine.graph_replays();
-            // A streamed load's per-layer expert costs at the window's ends.
-            let mut experts = None;
+            // The host's costs (process and per-thread processor time, the
+            // quota's throttling, graphs recorded and updated, a streamed
+            // load's expert costs) open together
+            // before the first measured step, with nothing queued, and close
+            // after the last: each is per step of `time.steps`. Opened after
+            // the first measured step, their reads (the thread table is a
+            // `/proc` read per thread) held the harness longer than the one
+            // step queued behind it, and the device idled inside the window.
+            let mut cpu = (process_cpu_seconds(), 0.0);
+            let threads = thread_cpu_seconds();
+            let throttling = throttled();
+            let graphs_start = decode.engine.graph_replays();
+            let (mut threads_end, mut throttling_end, mut graphs) = (None, None, None);
+            // A streamed load's per-layer expert costs at the window's start.
+            let experts = decode.engine.domain.expert_costs();
             let mut moved = None;
             // The bank after each step is the bank before the next: one reading
             // a step, and between a step's end and the next's launch nothing
@@ -1031,11 +1037,6 @@ fn measure(
                 rest = after;
                 if index == 0 {
                     span.0 = step.end;
-                    cpu.0 = process_cpu_seconds();
-                    threads = thread_cpu_seconds();
-                    throttling = throttled();
-                    graphs = decode.engine.graph_replays();
-                    experts = decode.engine.domain.expert_costs();
                 }
                 let mut summary = if decode.engine.lookahead {
                     json!({})
@@ -1068,6 +1069,7 @@ fn measure(
                     cpu.1 = process_cpu_seconds();
                     threads_end = thread_cpu_seconds();
                     throttling_end = throttled();
+                    graphs = Some(decode.engine.graph_replays().since(graphs_start));
                 }
                 expert_costs.push((decode.engine.domain.expert_costs(), rest.and_then(|rest| rest.host_slots())));
                 summaries.push(summary);
@@ -1164,7 +1166,7 @@ fn measure(
             // the rest of the tier's the device read over the link, and each
             // term of its requests' path, per step and per request.
             let served = end.site.since(&start.site);
-            let steps = (time.steps - 1) as f64;
+            let steps = time.steps as f64;
             let missed = start.layers.iter().zip(&end.layers).map(|(start, end)| end.misses - start.misses).sum::<u64>();
             let sited = start.layers.iter().zip(&end.layers).map(|(start, end)| end.sited - start.sited).sum::<u64>();
             let per_request = |duration: std::time::Duration| {
@@ -1235,18 +1237,18 @@ fn measure(
     window["unsteady"] = json!(discarded);
     // What the window's steps cost in graphs, which serving pays none of in
     // steady state: every shape it runs ran before the window.
-    window["graphs"] = graph_counts(engine.graph_replays().since(graphs), time.steps - 1);
-    window["process_cpu_ms_per_step"] = json!((cpu.1 - cpu.0) * MS / (time.steps - 1) as f64);
+    window["graphs"] = graph_counts(graphs.expect("a steady window closes at its last step"), time.steps);
+    window["process_cpu_ms_per_step"] = json!((cpu.1 - cpu.0) * MS / time.steps as f64);
     window["thread_cpu"] = match threads {
-        Some((before, after)) => thread_cpu_per_step(&before, &after, time.steps - 1),
+        Some((before, after)) => thread_cpu_per_step(&before, &after, time.steps),
         None => Value::Null,
     };
     // Whether the quota throttled the process in the window: its periods
     // throttled and the time, per step.
     window["throttled"] = match throttling {
         Some((before, after)) => json!({
-            "periods_per_step": (after.0 - before.0) as f64 / (time.steps - 1) as f64,
-            "ms_per_step": (after.1 - before.1) as f64 / 1000. / (time.steps - 1) as f64,
+            "periods_per_step": (after.0 - before.0) as f64 / time.steps as f64,
+            "ms_per_step": (after.1 - before.1) as f64 / 1000. / time.steps as f64,
         }),
         None => Value::Null,
     };
