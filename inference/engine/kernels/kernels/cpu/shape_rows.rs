@@ -28,6 +28,7 @@ fn mass(value: f32, maximum: f32) -> u64 {
 
 /// ceil(top_p * total) exactly: top_p = m * 2^-shift with m a 24-bit
 /// integer, so the product is an exact 128-bit integer.
+#[inline(always)]
 fn top_p_target(top_p: f32, total: u64) -> u64 {
     if !(top_p > 0.0) || total == 0 {
         return 0;
@@ -62,6 +63,7 @@ struct Shaping {
     frequency: f32,
 }
 
+#[inline(always)]
 fn shaping<E: Elements>(cx: &Context<'_, E>, row: usize) -> Shaping {
     let params = cx.arg_params();
     let p = |column: usize| params.get([row, column]);
@@ -76,6 +78,7 @@ fn shaping<E: Elements>(cx: &Context<'_, E>, row: usize) -> Shaping {
     }
 }
 
+#[inline(always)]
 fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (part, row) = (group[0] as usize, group[1] as usize);
     let parts = cx.param_parts() as usize;
@@ -138,6 +141,7 @@ fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     partial.copy_from_slice(&[maximum.to_bits(), u32::from(nonfinite)]);
 }
 
+#[inline(always)]
 fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let parts = cx.param_parts() as usize;

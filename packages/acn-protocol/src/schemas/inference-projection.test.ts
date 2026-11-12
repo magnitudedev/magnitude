@@ -5,7 +5,7 @@ import { projectInferenceHardware, summarizeInferenceHardware } from "./inferenc
 
 const store = (id: string) => ({
   id, total_capacity_bytes: 64, stable_capacity_bytes: 60, allocation_capacity_bytes: 64,
-  planning_reserve_bytes: 4, emergency_reserve_bytes: 1, capacity_basis: "linux_mem_total",
+  planning_reserve_bytes: 4, capacity_basis: "linux_mem_total",
 })
 const host = { store: store("system"), available_bytes: 40, current_free_bytes: 32 }
 const executor = (id: string, backend: string, paths: number[], reason?: string) => ({

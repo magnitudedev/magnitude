@@ -15,6 +15,7 @@ use lib::core::{activation, functions};
 use lib::projection::projection;
 use lib::routed::routed;
 
+#[inline(always)]
 fn routed_experts_up_grids<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let items = |extent: u64| extent.div_ceil(cx.param_rows()) as usize;
     routed::expert_grids(
@@ -27,6 +28,7 @@ fn routed_experts_up_grids<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _gro
     );
 }
 
+#[inline(always)]
 fn routed_experts_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = usize::try_from(cx.arg_first().get([0])).expect("a first row is not negative") + group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -48,6 +50,7 @@ fn routed_experts_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     projection::operand_row(&[&cx.arg_expert_up()], staged);
 }
 
+#[inline(always)]
 fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, f, t) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_f() as usize, cx.dim_t() as usize);
     let block = group[1] as usize;
@@ -77,6 +80,7 @@ fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     }
 }
 
+#[inline(always)]
 fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (f, t) = (cx.dim_f() as usize, cx.dim_t() as usize);
     let (block, lane) = (group[0] as usize / t, group[0] as usize % t);
@@ -101,6 +105,7 @@ fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
     projection::operand_row(&[&cx.arg_expert_down()], product);
 }
 
+#[inline(always)]
 fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (h, f, t, b) = (cx.dim_h() as usize, cx.dim_f() as usize, cx.dim_t() as usize, cx.dim_b() as usize);
     let block = group[1] as usize;

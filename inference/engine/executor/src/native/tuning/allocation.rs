@@ -49,6 +49,16 @@
 //! preparation order breaking ties; it never assigns an invented latency to
 //! an unknown unit.
 //!
+//! A discovery piece is admitted at the price it is ranked at
+//! ([`Unpriced::admitted`]): what the unit's own earlier points took, and
+//! for what that leaves unpriced, what discovery has taken in this load. Its
+//! unpriced operations are held to the longest operation the load completed
+//! only until discovery has run one. That bound made every pending
+//! discovery piece 2 to 3 times one unit's input build: a DeepSeek V4.1
+//! load on Metal held 18 demanded units to 22.6 to 33.9 s each after
+//! routed_gate_up's 11.29 s build, against the 0.1 to 0.9 s their
+//! discovery took, and they left the objective unsearched.
+//!
 //! A unit that can never start again leaves the work and holds nothing of
 //! it back. When nothing can start and nothing is in flight, what remains
 //! only shrinks: a unit whose next piece was refused for its bytes, with
@@ -68,8 +78,9 @@
 //! candidate wins. Resolved promotions precede further exploration; forms
 //! precede refinements within each unit only.
 //!
-//! Prices come from this load's observed operations ([`Unpriced`]); deadline
-//! admission still uses conservative forecasts and reserves. Compilation
+//! Prices come from this load's observed operations ([`Unpriced`]); a
+//! candidate's admission still holds what its unit has not observed to the
+//! longest operation completed, and reserves what is owed. Compilation
 //! effort is charged as well as device work, even when they overlap.
 //!
 //! A unit composed of other units' choices reads them as they stand when
@@ -662,11 +673,12 @@ impl Own {
 
 /// What the operations the units' quotes leave unpriced have taken in this
 /// load, by the stage of the work they were part of. A quote's unpriced
-/// operation is one the unit has not observed, and is admitted at the
-/// longest operation the load has completed ([`forecast`]): a bound, which
-/// keeps admission safe and ranks nothing. Discovery and a unit's forms
-/// are wholly unpriced (every point's and form's classes are first
-/// observed by that very work) while challengers are mostly priced, so
+/// operation is one the unit has not observed. A candidate's is admitted
+/// at the longest operation the load has completed ([`forecast`]): a
+/// bound, which ranks nothing; discovery's at what it is ranked at
+/// ([`Unpriced::admitted`]). A unit's first point and its forms are wholly
+/// unpriced (every point's and form's classes are first observed by that
+/// very work) while challengers are mostly priced, so
 /// work is ranked at what its stage's unpriced operations have taken in
 /// this load, and at the bound until its stage has run one.
 ///
@@ -711,6 +723,34 @@ impl Unpriced {
                 .priced
                 .saturating_add(Duration::from_secs_f64(price * quote.unpriced as f64)),
             None => forecast(quote, longest),
+        }
+    }
+
+    /// What work of `stage` of a unit of `kind` quoted `quote` is admitted
+    /// at ([`seismic::Quote::fits`]): a candidate's unpriced operations at
+    /// the bound, and discovery's at the price they are ranked at.
+    ///
+    /// Discovery is every unit's first work and its only way into the
+    /// objective: a unit refused it leaves the objective with its share of
+    /// the workload. A unit prices its later points from its own earlier
+    /// ones; what it leaves unpriced, its first point and the planning
+    /// after its last, is held to what discovery has taken in this load,
+    /// not to the longest operation any unit completed, which is one
+    /// unit's input build. Its pieces form nothing, each runs to its
+    /// cutoff ([`Unit::perform`]), and all of them precede candidate work,
+    /// whose pieces run where the budget ends and stay held to the bound.
+    fn admitted(
+        &self,
+        stage: Stage,
+        kind: &'static str,
+        quote: &Quote,
+        longest: Duration,
+    ) -> Duration {
+        match stage {
+            Stage::Discovery => self.expected(stage, kind, quote, longest),
+            Stage::Form | Stage::Measure | Stage::Promote | Stage::Confirm => {
+                forecast(quote, longest)
+            }
         }
     }
 
@@ -769,7 +809,7 @@ impl Report {
 }
 
 /// What work is taken to last: its price, with each unpriced operation at
-/// the longest operation completed, as in its admission.
+/// the longest operation completed, as in a candidate's admission.
 fn forecast(quote: &Quote, longest: Duration) -> Duration {
     u32::try_from(quote.unpriced)
         .ok()
@@ -983,9 +1023,12 @@ pub(crate) fn allocate<U: Unit>(
                 !barred[unit]
                     && offers.iter().any(|(offering, work)| {
                         *offering == unit
-                            && work
-                                .quote
-                                .fits(remaining.saturating_sub(owed[unit]), longest)
+                            && expected.admitted(
+                                work.stage,
+                                units[unit].kind(),
+                                &work.quote,
+                                longest,
+                            ) <= remaining.saturating_sub(owed[unit])
                     })
             })
             .collect::<Vec<_>>();
@@ -1044,8 +1087,8 @@ pub(crate) fn allocate<U: Unit>(
         let ahead = |work: &Work| work.forming != Quote::default();
         // When a new piece would be ready for the device were it started
         // now, and the device time it takes.
-        let job = |work: &Work| {
-            let whole = forecast(&work.quote, longest);
+        let job = |unit: usize, work: &Work| {
+            let whole = expected.admitted(work.stage, units[unit].kind(), &work.quote, longest);
             if ahead(work) {
                 let compile = forecast(&work.forming, longest);
                 (now.saturating_add(compile), whole.saturating_sub(compile))
@@ -1063,7 +1106,7 @@ pub(crate) fn allocate<U: Unit>(
         // has taken, ends within it.
         let fits = |unit: usize, work: &Work| {
             let mut jobs = queue.clone();
-            jobs.push(job(work));
+            jobs.push(job(unit, work));
             device_ends(now, jobs).saturating_add(owed[unit]) <= total
                 && (!ahead(work)
                     || now.saturating_add(forecast(&work.forming, longest).max(compiled)) <= total)
@@ -1084,8 +1127,8 @@ pub(crate) fn allocate<U: Unit>(
         }
         // When a piece's compile is due to start: so that the piece is
         // ready when the device is done with the pieces ready before it.
-        let due = |work: &Work| {
-            let (ready, _) = job(work);
+        let due = |unit: usize, work: &Work| {
+            let (ready, _) = job(unit, work);
             let before = queue
                 .iter()
                 .copied()
@@ -1099,13 +1142,13 @@ pub(crate) fn allocate<U: Unit>(
         let earliest = fitting
             .iter()
             .filter(|(unit, work)| ahead(work) && !crowded[*unit])
-            .map(|(_, work)| due(work))
+            .map(|(unit, work)| due(*unit, work))
             .filter(|due| *due > now)
             .min();
         let fitting = fitting
             .into_iter()
             .filter(|(_, work)| work.stage == Stage::Discovery || objective_ready)
-            .filter(|(unit, work)| !ahead(work) || (!crowded[*unit] && due(work) <= now))
+            .filter(|(unit, work)| !ahead(work) || (!crowded[*unit] && due(*unit, work) <= now))
             .filter(|(unit, _)| !alone[*unit])
             .collect::<Vec<_>>();
         let priority = |(unit, work): &(usize, Work)| {
@@ -1338,7 +1381,7 @@ pub(crate) fn allocate<U: Unit>(
             (Some((unit, work, forming)), _, _) => {
                 start(units, unit, &work);
                 workers.start(unit, forming);
-                let whole = forecast(&work.quote, longest);
+                let whole = expected.admitted(work.stage, units[unit].kind(), &work.quote, longest);
                 let compile = forecast(&work.forming, longest);
                 flights.push(Flight {
                     unit,
@@ -1601,22 +1644,22 @@ pub(crate) struct Threads<U: Unit> {
     /// The burst of compiles in flight, from the first started with none
     /// running to the last to end.
     burst: Option<Burst>,
-    /// The most a burst raised the peak of the process's footprint, for
-    /// each thread it compiled on at once ([`Workers::compile_host`]), and
-    /// no less than what the load had seen a thread's compile hold before
-    /// these workers began.
+    /// The most the host's room fell in a burst, for each thread it
+    /// compiled on at once ([`super::compile_wave_price`],
+    /// [`Workers::compile_host`]), and no less than what the load had seen
+    /// a thread's compile hold before these workers began.
     compile_host: u64,
     /// Each burst that showed a thread's compile to hold more than it was
     /// priced at: the price it was admitted on and what it held.
     mispriced: Vec<(u64, u64)>,
 }
 
-/// A burst of compiles: the process's footprint when it began, the peak of
-/// the footprint until then ([`seismic::ProcessMemory::footprint_peak`]),
+/// A burst of compiles: the host's room when it began
+/// ([`super::host_room`]), its least as any of the burst's compiles ended,
 /// and the most threads the burst compiled on at once.
 struct Burst {
-    footprint: u64,
-    peak: u64,
+    room: Option<u64>,
+    lowest: Option<u64>,
     threads: usize,
 }
 
@@ -1658,20 +1701,22 @@ impl<U: Unit> Threads<U> {
         (unit, formed, took): (usize, std::thread::Result<U::Formed>, Duration),
     ) -> (usize, U::Formed, Duration) {
         self.taken.retain(|(compiling, _)| *compiling != unit);
-        // The burst is over when its last compile ends. If the peak of the
-        // process's footprint rose in it, the peak was reached while its
-        // compiles ran, and what it rose by over the burst's start is what
-        // that many threads of compiles held at their most (with whatever
-        // else the load took meanwhile, which only prices a compile
-        // higher). A burst below the peak already kept says nothing: there
-        // is one mark for the life of the process. A burst that held more
-        // than its compiles were priced at raises the price to what it
+        // Each compile's end reads the host's room: the burst's least is
+        // what that many threads of compiles held at their most, in this
+        // process or a compiler's own (with whatever else took room
+        // meanwhile, which only prices a compile higher).
+        if let Some(burst) = &mut self.burst {
+            burst.lowest = match (burst.lowest, super::host_room()) {
+                (Some(lowest), Some(room)) => Some(lowest.min(room)),
+                (lowest, room) => lowest.or(room),
+            };
+        }
+        // The burst is over when its last compile ends. A burst that held
+        // more than its compiles were priced at raises the price to what it
         // held, and is kept as a mispricing.
         if self.taken.is_empty() {
             if let Some(burst) = self.burst.take() {
-                let peak = seismic::ProcessMemory::footprint_peak();
-                if let Some(peak) = peak.filter(|peak| *peak > burst.peak && burst.threads > 0) {
-                    let held = peak.saturating_sub(burst.footprint) / burst.threads as u64;
+                if let Some(held) = super::compile_wave_price(burst.room, burst.lowest, burst.threads) {
                     if held > self.compile_host {
                         if self.compile_host > 0 {
                             self.mispriced.push((self.compile_host, held));
@@ -1709,13 +1754,11 @@ where
 
     fn start(&mut self, unit: usize, forming: U::Forming) {
         if self.taken.is_empty() {
-            self.burst = seismic::ProcessMemory::footprint_now()
-                .zip(seismic::ProcessMemory::footprint_peak())
-                .map(|(footprint, peak)| Burst {
-                    footprint,
-                    peak,
-                    threads: 0,
-                });
+            self.burst = Some(Burst {
+                room: super::host_room(),
+                lowest: None,
+                threads: 0,
+            });
         }
         self.taken.push((unit, (self.needs)(&forming)));
         if let Some(burst) = &mut self.burst {
@@ -1801,8 +1844,9 @@ mod tests {
         /// The next challenger's compile has run.
         compiled: bool,
         promotion: Duration,
-        /// Discovery is of classes never observed: it has no price.
-        unpriced_discovery: bool,
+        /// How many operations of classes never observed each discovery
+        /// piece has: none, and it is priced at `discovery`.
+        unpriced_discovery: usize,
         slow: f64,
         interruptible: bool,
         stopped: bool,
@@ -1936,7 +1980,7 @@ mod tests {
                 discovery: SECOND,
                 measurement: SECOND,
                 promotion: SECOND * 2,
-                unpriced_discovery: false,
+                unpriced_discovery: 0,
                 slow: 1.,
                 interruptible: false,
                 stopped: false,
@@ -2089,10 +2133,10 @@ mod tests {
             if self.discovered < self.points {
                 return Some(Work {
                     stage: Stage::Discovery,
-                    quote: if self.unpriced_discovery {
+                    quote: if self.unpriced_discovery > 0 {
                         Quote {
                             priced: Duration::ZERO,
-                            unpriced: 1,
+                            unpriced: self.unpriced_discovery,
                         }
                     } else {
                         priced(self.discovery)
@@ -3163,7 +3207,7 @@ mod tests {
     #[test]
     fn unpriced_work_is_not_started_late() {
         let unit = |clock: &Fake, name, challengers: &[f64]| Synthetic {
-            unpriced_discovery: name == 1,
+            unpriced_discovery: usize::from(name == 1),
             discovery: if name == 1 { SECOND } else { SECOND * 3 },
             ..Synthetic::new(name, clock, 0.5, challengers)
         };
@@ -3194,6 +3238,40 @@ mod tests {
         assert_eq!(report.refused.len(), 1);
         assert_eq!(report.refused[0].quote.forecast(), None);
         assert_eq!(units[1].served, 1., "the unit keeps its published defaults");
+    }
+
+    /// One unit's long input build does not hold the others' discovery to
+    /// it: discovery is admitted at what discovery has taken in this load.
+    /// A first point's discovery is three unpriced operations (its build,
+    /// the defaults' measurement, and the planning after the last point).
+    /// The mandatory phase took 25 s of the 60 s budget. routed_gate_up's
+    /// discovery takes 11 s, leaving 24 s; held to that 11 s operation,
+    /// every other unit's 0.2 s discovery would need 33 s, and each would
+    /// leave the objective.
+    #[test]
+    fn a_long_build_does_not_shut_the_others_out_of_discovery() {
+        let clock = Fake::default();
+        clock.pass(SECOND * 25);
+        let mut units = (0..21)
+            .map(|name| Synthetic {
+                unpriced_discovery: 3,
+                discovery: if name == 0 {
+                    SECOND * 11
+                } else {
+                    SECOND / 5
+                },
+                ..Synthetic::new(name, &clock, 1. / 21., &[])
+            })
+            .collect::<Vec<_>>();
+        let (log, report) = run_after(&mut units, &clock, 60, SECOND);
+        assert_eq!(log.len(), 21, "{:?}", report.refused);
+        assert!(
+            units.iter().all(|unit| unit.discovered == unit.points),
+            "{:?}",
+            report.refused
+        );
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(report.overrun(), Duration::ZERO);
     }
 
     /// Unpriced operations are ranked at the bound until their stage has

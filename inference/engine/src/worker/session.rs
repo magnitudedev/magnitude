@@ -789,13 +789,13 @@ mod tests {
         assert!(matches!(began.answer(id, None), Some(WorkerMessage::Admitted { request_id }) if request_id == id));
         assert!(began.answer(id, None).is_none(), "answered once");
         // Failed after it began: admitted already, the failure is its own.
-        let failed = Publication::Failed(Scheduled::MemoryReclaim);
+        let failed = Publication::Failed(Scheduled::WorkerClosed);
         assert!(began.answer(id, Some(Some(&failed))).is_none());
 
         let (_sender, mut refused) = stream();
         assert!(matches!(
             refused.answer(id, Some(Some(&failed))),
-            Some(WorkerMessage::AdmissionRefused { error: RequestError::MemoryReclaim, .. })
+            Some(WorkerMessage::AdmissionRefused { error: RequestError::WorkerLost { .. }, .. })
         ));
 
         let (_sender, mut ended) = stream();

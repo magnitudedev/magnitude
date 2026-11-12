@@ -164,8 +164,8 @@ impl Toolchain for MetalToolchain {
         &self,
         artifact: &MetalSource,
         entries: &[ProgramEntry],
-    ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
-        crate::pooled(|| self.pipelines(&artifact.source, entries))
+    ) -> Result<Option<Vec<DirectPipeline>>, NativeCompilationError> {
+        crate::pooled(|| self.pipelines(&artifact.source, entries)).map(Some)
     }
 
     /// Metal's compiler reports nothing of a pipeline.
@@ -378,7 +378,7 @@ mod tests {
         };
         let artifact = MetalSource::decode(&toolchain.compile(&source).unwrap().0.encode()).unwrap();
         let wanted = [ProgramEntry::named("probe<4>")];
-        assert_eq!(toolchain.load(&artifact, &wanted).unwrap().len(), 1);
+        assert_eq!(toolchain.load(&artifact, &wanted).unwrap().expect("a Metal load is served").len(), 1);
         let formed = library_text(&artifact.source);
         assert_eq!(formed, library_text(&source));
         assert_ne!(

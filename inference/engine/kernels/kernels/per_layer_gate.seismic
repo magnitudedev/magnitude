@@ -1,0 +1,132 @@
+# Gemma's per-layer input gate: the gate projection of the hidden rows (the
+# F32 residual after the layer, rounded to A as a projection input), then
+# A(A(act(A(gate))) * inputs[m, layer, p]) with the layer's per-layer input
+# (`per_layer_inputs`' [M, L * P] output viewed as [M, L, P]; `activation`:
+# 1 GELU-tanh). Its projection back to D is `project_rows` into the layer's
+# `post_norm_residual`.
+fn per_layer_gate[M, D, L, P, GS](hidden: &tensor[M, D] f32, gate_weight: &tensor[P, D] GW,
+    inputs: &tensor[M, L, P] f32, layer: i32, activation: i32,
+    gate_scale: &tensor[GS] f32) -> tensor[M, P] A where GS >= 0 and GS <= 1:
+    let mut rounded = tensor[M, D] A
+    let mut gate_sum = tensor[M, P] f32
+    let mut gate = tensor[M, P] A
+    let mut activated = tensor[M, P] A
+    let mut product = tensor[M, P] A
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            rounded[row, col] = hidden[row, col]
+    linear(rounded, gate_weight, gate_sum)
+    scale_rows(gate_sum, gate_scale, gate)
+    activate(gate, activated, activation)
+    parallel for row in 0..M:
+        parallel for col in 0..P:
+            product[row, col] = f32(activated[row, col]) * inputs[row, layer, col]
+    return product
+
+# All backends: a stage launch rounds the hidden rows to A in scratch, then
+# `project_rows`' row classes over them with the activated-product epilogue
+# (the multiplier row is `inputs[m, layer]`).
+native per_layer_gate for metal from "metal/per_layer_gate.metal":
+    static (D, L, P, GS)
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5)
+    where GS <= 1
+    scratch rounded bytes (M * D * 2)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
+        threadgroups (ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch per_layer_gate_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2)
+        threadgroups (ceil_div(P, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch per_layer_gate_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(P, 64), ceil_div(M, 32), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch per_layer_gate_gemm when M > 64:
+        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
+        threadgroups (ceil_div(P, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+native per_layer_gate for vulkan from "vulkan/per_layer_gate.comp":
+    static (D, L, P, GS)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+    let GEMV_GROUPS = ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES)
+    let GEMV_THREADS = SIMDGROUPS * 32
+    let GEMV_SHARED = 256 + 32 * operands(GW) + min(8 * ceil_div(D, 32), 288) * 72
+    where SUB_M <= TILE_M and SUB_N <= TILE_N and GS <= 1
+    scratch rounded bytes (M * D * 2)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128 * operands(GW))
+    launch per_layer_gate_gemv1 when M <= 1:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch per_layer_gate_gemv2 when M == 2:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch per_layer_gate_gemv4 when M >= 3 and M <= 4:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch per_layer_gate_gemv8 when M >= 5 and M <= 8:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch per_layer_gate_gemm when M > 8:
+        threadgroups (ceil_div(P, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+# One producer rounds the hidden rows to semantic A and forms the selected
+# matrix operands; `project_rows`' row bands share that operand policy.
+native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
+    static (D, L, P, GS)
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
+    where D % 64 == 0 and GS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(GW, INT8) == 1)
+    scratch staged bytes (M * D * 2)
+    scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16
+    launch per_layer_gate_stage:
+        reads (INT8, OPERAND)
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemv when M <= 8:
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
+        threadgroups (ceil_div(ceil_div(P, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemv16 when M > 8 and M <= 16:
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
+        threadgroups (ceil_div(ceil_div(P, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch per_layer_gate_gemm_small when M > 16 and M <= 64:
+        reads (INT8, OPERAND)
+        threadgroups (ceil_div(ceil_div(P, 16), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch per_layer_gate_gemm when M > 64:
+        params (ROTATE in [2, 1, 4] default 2)
+        reads (INT8, OPERAND)
+        threadgroups (ceil_div(ceil_div(P, 16), 8), ceil_div(M, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+
+native per_layer_gate for cpu from "cpu/per_layer_gate.rs":
+    static (GS)
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
+    where GS <= 1 and (INT8 == 0 or form(GW, INT8) == 1)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch staged bytes (M * D * 4)
+    launch per_layer_gate_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch per_layer_gate_rows:
+        threadgroups (ceil_div(P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -1,5 +1,6 @@
 // Each part is summed in element order, staged `WIDTH` elements at a time
 // through the work item's shared buffer, matching the GPU kernels bit for bit.
+#[inline(always)]
 fn split_partial<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let x = cx.arg_x();
     let (parts, width) = (cx.param_parts(), cx.param_width());
@@ -24,6 +25,7 @@ fn split_partial<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     unsafe { cx.scratch_partials().slice_mut::<f32>(4 * group[0] as usize, 1)[0] = total };
 }
 
+#[inline(always)]
 fn split_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     // SAFETY: the partials launch wrote PARTS floats before this launch.
     let partials = unsafe { cx.scratch_partials().slice::<f32>(0, cx.param_parts() as usize) };

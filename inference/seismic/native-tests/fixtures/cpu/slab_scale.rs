@@ -1,3 +1,4 @@
+#[inline(always)]
 fn slab_scale<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

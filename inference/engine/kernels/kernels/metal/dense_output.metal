@@ -3,6 +3,7 @@
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#include "lib/projection/operator.h"
 #if defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR)
 #include "lib/projection/gemv.h"
 #endif
@@ -27,13 +28,13 @@ typedef projection::operands<NVFP4> Operands;
     device uchar *quantized [[buffer(SEISMIC_BUFFER_SCRATCH_QUANTIZED)]],               \
     device half *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],              \
     device half *block_sums [[buffer(SEISMIC_BUFFER_SCRATCH_BLOCK_SUMS)]],              \
-    device float *coefficients [[buffer(SEISMIC_BUFFER_SCRATCH_COEFFICIENTS)]],         \
-    device half *biases [[buffer(SEISMIC_BUFFER_SCRATCH_BIASES)]],                      \
+    device float *down_coefficients [[buffer(SEISMIC_BUFFER_SCRATCH_DOWN_COEFFICIENTS)]], \
+    device half *down_biases [[buffer(SEISMIC_BUFFER_SCRATCH_DOWN_BIASES)]],            \
     device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
     device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
-    device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
+    device half *down_factors [[buffer(SEISMIC_BUFFER_SCRATCH_DOWN_FACTORS)]],          \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
-    device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device float *down_scales [[buffer(SEISMIC_BUFFER_SCRATCH_DOWN_SCALES)]],           \
     device const float *down_scale [[buffer(SEISMIC_BUFFER_DOWN_SCALE)]],               \
     device const float *down_bound [[buffer(SEISMIC_BUFFER_DOWN_BOUND)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
@@ -58,15 +59,8 @@ typedef projection::operands<NVFP4> Operands;
     uint rows = uint(SEISMIC_DIM_O);                                                    \
     PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
     const auto x = Operands::rows(raw, rows, uint(SEISMIC_DIM_F), globals, simdgroups, sg, lane); \
-    if (TILED == 1 && projection::gemv_tile_row_serves(w, rows)) {                      \
-        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
-            projection::gemv_tile_row<packets::W0, packets::W0, false, ROWS, MAXM, LANES>( \
-                x, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane)); \
-        return;                                                                         \
-    }                                                                                   \
-    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
-        projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, (TILED == 2)>( \
-            x, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane))
+    PROJECTION_GEMV(packets::W0, packets::W0, false, ROWS, LANES, TILED, COUNT, x, out, w, w, rows, \
+        uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F))
 
 // One row.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
@@ -127,18 +121,8 @@ kernel void dense_output_batch(DENSE_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_OUTPUT_OPERANDS;
-    // The matrix GEMV (MATRIX, which the declaration admits only where it
-    // serves the weight), else the batched rows, in the first threadgroups of
-    // the launch.
-    if constexpr (MATRIX == 1) {
-        projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
-            uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane);
-        return;
-    }
-    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_H))
-        return;
-    projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(in, out, w,
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane);
+    PROJECTION_BATCH(packets::W0, packets::W0, false, BATCH_ROWS, BATCH_PARTS, MATRIX, in, out, w, w,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F));
 }
 #endif
 
@@ -216,7 +200,7 @@ kernel void dense_output_tall(DENSE_OUTPUT_ARGUMENTS,
 // The INT8 form past 64 rows: the product rows quantized per (row, 32
 // columns), the weights' block scales and biases, then the int8 tiles.
 #define DENSE_OUTPUT_INT8_SCRATCH \
-    const projection::int8_scratch scratch{quantized, row_scales, block_sums, coefficients, biases}
+    const projection::int8_scratch scratch{quantized, row_scales, block_sums, down_coefficients, down_biases}
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_QUANTIZE
 kernel void dense_output_quantize(DENSE_OUTPUT_ARGUMENTS,
@@ -265,7 +249,7 @@ kernel void dense_output_int8(DENSE_OUTPUT_ARGUMENTS,
 // packed per operand element, the weights' block scales and biases, then the
 // packed tiles.
 #define DENSE_OUTPUT_PACKING_SCRATCH \
-    const projection::packing_scratch scratch{packed, token_factors, token_scales, weight_factors, weight_scales}
+    const projection::packing_scratch scratch{packed, token_factors, token_scales, down_factors, down_scales}
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_PACK
 // RESIDUE: the operand's residue width for weights with residue bits.

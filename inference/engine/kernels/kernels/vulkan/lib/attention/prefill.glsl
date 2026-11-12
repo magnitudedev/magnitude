@@ -31,14 +31,17 @@
 // per subgroup.
 //
 // Decode rows (PREFILL_DECODE, the decode entries' grouped-query matrix form,
-// PREFILL_ROWS = 16 * SIMDS): only L2 runs, as workgroup (kv head, partition,
-// QT-row tile) of the decode's partial launch. It prepares its own query tile
-// into shared memory after the subgroup scratch ([ROWS][W + 8] f16) and its
-// fresh K/V tiles (prepared and rounded as L1 would), partition 0 appending
-// the tile's rows; the key tiles split into equal runs over PREFILL_PARTS
-// partitions, and every partition, an empty one too (denominator 0), stores
-// its partial in the decode layout ((row * KV * G + head) * PARTS + part) for
-// the decode merge.
+// PREFILL_ROWS = 16 * SIMDS): L2 runs as workgroup (kv head, partition,
+// QT-row tile) of the decode's partial launch. Unless L1 ran
+// (PREFILL_PREPARED, the entry's choice for a query group whose prepared
+// queries exceed the shared bytes), it prepares its own query tile into
+// shared memory after the subgroup scratch ([ROWS][W + 8] f16) and its fresh
+// K/V tiles (prepared and rounded as L1 would), partition 0 appending the
+// tile's rows. The key tiles, then with an index-list source (PREFILL_PICKS)
+// each row's pick tiles in row order, split into equal runs over
+// PREFILL_PARTS partitions, and every partition, an empty one too
+// (denominator 0), stores its partial in the decode layout
+// ((row * KV * G + head) * PARTS + part) for the decode merge.
 #include "history.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
@@ -62,19 +65,37 @@
 #else
 #define PREFILL_SELECTED_PASS PREFILL_SELECTED
 #endif
-// An index-list source (the entry's PREFILL_PICKS: its KS > 0) is one more
-// softmax state per (row, query head) after the key partitions'
-// (`prefill_picks`, a subgroup over the row's picks), which the merge folds
-// in, so every tile publishes partials then.
+// An index-list source (the entry's PREFILL_PICKS: its KS > 0). For prefill
+// rows it is one more softmax state per (row, query head) after the key
+// partitions' (`prefill_picks`, a subgroup over the row's picks), which the
+// merge folds in, so every tile publishes partials then. For decode rows its
+// picks are key tiles after the row's visible ones: the entry names the
+// row's PREFILL_PICK_COUNT picks (PREFILL_PICK_ROWS, [M][picks] i32, -1 for
+// none) into the PREFILL_PICK_PLANE slab table ([rows][KV][W] A,
+// PREFILL_PICK_SLAB_ROWS rows a slab), each read as key and value.
 #ifndef PREFILL_PICKS
 #define PREFILL_PICKS false
+#endif
+#ifndef PREFILL_PICK_COUNT
+#define PREFILL_PICK_COUNT 0u
+#define PREFILL_PICK_ROWS 0ul
+#define PREFILL_PICK_PLANE 0ul
+#define PREFILL_PICK_SLAB_ROWS 1ul
+#endif
+// Whether L1 (`prefill_prepare`) put the queries and fresh rows in scratch:
+// always for prefill rows; for decode rows as the entry defines it.
+#ifndef PREFILL_DECODE
+#define PREFILL_PREPARED 1
+#elif !defined(PREFILL_PREPARED)
+#define PREFILL_PREPARED 0
 #endif
 // PREFILL_ROWS, the matrix rows of a workgroup, is the entry's (and with
 // PREFILL_DECODE, PREFILL_PARTS its partitions).
 
 // The prefill entries' scratch planes ([KV][rows][G][W], [M][KV][W],
 // [M][KV][W] f16 and the tile partition counts), named by the entry: the
-// entry ABI is not this file's. Decode rows use none.
+// entry ABI is not this file's. Decode rows use the first three where L1
+// runs (PREFILL_PREPARED), and no counts.
 struct prefill_scratch {
     uint64_t queries;
     uint64_t keys;
@@ -120,8 +141,6 @@ void prefill_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane,
         attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
     }
 }
-
-#ifndef PREFILL_DECODE
 
 void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
@@ -177,7 +196,6 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     history_append(h, true, destination, kv_head, lane, k);
     history_append(h, false, destination, kv_head, lane, v);
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // L2.
@@ -201,7 +219,7 @@ void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bo
     if (historical) {
         history_stage(h, is_key, first, end, kv_head, column, w, 0u);
     } else {
-#ifdef PREFILL_DECODE
+#if !PREFILL_PREPARED
         for (uint r = SEISMIC_SUBGROUP; r < FLASH_KEYS; r += SEISMIC_SUBGROUPS) {
             const int t = first + int(r);
             float x[ATTENTION_E];
@@ -221,6 +239,40 @@ void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bo
 #endif
     }
 }
+
+#ifdef PREFILL_DECODE
+// Row `row`'s pick `pick`: its row of the pick plane, or -1 for none (also
+// past the row's picks).
+int prefill_pick(uint64_t row, uint pick) {
+    return pick < PREFILL_PICK_COUNT
+        ? element_i32_at(PREFILL_PICK_ROWS + (row * uint64_t(PREFILL_PICK_COUNT) + uint64_t(pick)) * 4ul)
+        : -1;
+}
+
+// Stages columns [column, column + w) of row `row`'s picks [pick0, pick0 +
+// 32) of one kv head as the f16 tile at shared half 0 (row pitch w + 8),
+// gathered from the pick plane; a pick of -1 stages zeros.
+void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, const uint w) {
+    const uint pieces = w / 8u;
+    const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_ACT);
+    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
+        const uint k = item / pieces;
+        const uint c = (item % pieces) * 8u;
+        const int index = prefill_pick(row, pick0 + k);
+        uvec4 bits = uvec4(0u);
+        if (index >= 0) {
+            bits = element_uvec4_at(history_address(PREFILL_PICK_PLANE, uint64_t(index), PREFILL_PICK_SLAB_ROWS,
+                uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head) + uint64_t(column + c) * ELEMENT_BYTES(ELEMENT_ACT));
+            if (ELEMENT_ACT == ELEMENT_BF16) {
+                vec4 even, odd;
+                element_split8(ELEMENT_BF16, bits, even, odd);
+                bits = element_pack8(ELEMENT_F16, even, odd);
+            }
+        }
+        seismic_shared_uvec4[(k * flash_pitch(w) + c) / 8u] = bits;
+    }
+}
+#endif
 
 // The union [lo, hi) of the tile's non-empty row intervals and the
 // intersection [common_lo, common_hi) of all its row intervals, for span
@@ -401,6 +453,78 @@ void prefill_list() {
 }
 #endif
 
+// Adds the block's scores of columns [column, column + w) of the staged K
+// tile: from L1's scratch rows (`scratch_rows`) or the workgroup's query tile
+// (`tile_half`).
+void prefill_scores_add(uint64_t scratch_rows, uint tile_half, uint column, const uint w, inout flash_scores_state scores) {
+#if PREFILL_PREPARED
+    flash_scores_add(scratch_rows + uint64_t(column) * 2ul, uint64_t(ATTENTION_W), w, 0u, scores);
+#else
+    flash_scores_add_shared(tile_half + column, ATTENTION_W + 8u, w, 0u, scores);
+#endif
+}
+
+// Where a key tile's rows come from: history, the batch's fresh rows, or (a
+// decode row's) picks.
+#define PREFILL_FROM_HISTORY 0u
+#define PREFILL_FROM_FRESH 1u
+#define PREFILL_FROM_PICKS 2u
+
+// Stages columns [column, column + w) of the key or value tile of `source`
+// whose first key is `first` (a pick tile: its first pick of row `row`).
+void prefill_stage_from(attention_history h, prefill_scratch scratch_planes, const bool is_key, uint source, int first,
+    int end, uint64_t row, uint kv_head, uint column, const uint w) {
+#ifdef PREFILL_DECODE
+    if (source == PREFILL_FROM_PICKS) {
+        prefill_stage_picks(row, uint(first), kv_head, column, w);
+        return;
+    }
+#endif
+    prefill_stage(h, scratch_planes, is_key, source == PREFILL_FROM_HISTORY, first, end, kv_head, column, w);
+}
+
+// One key tile of `source` from key `first` (rows before `end`; a pick
+// tile: from pick `first` of row `pick_row`): the block's scores, each row's
+// keys outside [row_lo, row_hi) masked unless the tile lies in every row's
+// interval (`inside`), and a pick tile's keys masked for every row but its
+// own (the lane's row is `token`) and where a pick is -1; the online
+// softmax; O += P V over the pass's output window. The whole workgroup calls
+// it.
+void prefill_absorb(attention_history h, prefill_scratch scratch_planes, uint source, int first, int end, bool inside,
+    int row_lo, int row_hi, uint64_t pick_row, uint64_t token, uint kv_head, const uint chunk, uint column0,
+    const uint width,
+    bool computes, uint64_t block_queries, uint shared_queries, uint scratch, float scale,
+    inout flash_softmax softmax, inout flash_output o) {
+    flash_scores_state scores;
+    flash_scores_clear(scores);
+    for (uint column = 0u; column < ATTENTION_W; column += chunk) {
+        barrier();
+        prefill_stage_from(h, scratch_planes, true, source, first, end, pick_row, kv_head, column, chunk);
+        barrier();
+        if (computes)
+            prefill_scores_add(block_queries, shared_queries, column, chunk, scores);
+    }
+    flash_scores_publish(scores, scratch);
+    float s[16];
+    prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
+#ifdef PREFILL_DECODE
+    if (source == PREFILL_FROM_PICKS) {
+        const uint lane_half = SEISMIC_LANE / 16u;
+        [[unroll]] for (uint j = 0u; j < 16u; ++j)
+            if (token != pick_row || prefill_pick(pick_row, uint(first) + 16u * lane_half + j) < 0)
+                s[j] = -ATTENTION_INF;
+    }
+#endif
+    const float alpha = flash_online(softmax, s);
+    const uint p_half = flash_publish_probabilities(scratch, s);
+    flash_rescale(scratch, alpha, ATTENTION_W, PREFILL_WINDOW, o);
+    barrier();
+    prefill_stage_from(h, scratch_planes, false, source, first, end, pick_row, kv_head, column0, width);
+    barrier();
+    if (computes)
+        flash_accumulate(p_half, 0u, width, width, 0u, o);
+}
+
 void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint W = ATTENTION_W, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
@@ -430,7 +554,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint chunk = min(W, FLASH_MAX_W);
     const uint width = flash_window(W, PREFILL_WINDOW);
     const uint scratch = (FLASH_KEYS * flash_pitch(chunk)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
-#ifdef PREFILL_DECODE
+#if !PREFILL_PREPARED
     // The query tile [ROWS][W + 8] f16, after every subgroup's scratch.
     const uint queries = FLASH_KEYS * flash_pitch(chunk) + 2u * SEISMIC_SUBGROUPS * FLASH_SCRATCH_FLOATS;
     for (uint i = SEISMIC_SUBGROUP; i < PREFILL_ROWS; i += SEISMIC_SUBGROUPS) {
@@ -467,7 +591,14 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #endif
 
     uint total_tiles = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
-#ifndef PREFILL_DECODE
+    // The tiles of the spans; a decode row's pick tiles follow them.
+    const uint visible_tiles = total_tiles;
+#ifdef PREFILL_DECODE
+    // Each row of the tile has its own picks, in tiles of PREFILL_KEYS.
+    const uint pick_tiles = (PREFILL_PICK_COUNT + PREFILL_KEYS - 1u) / PREFILL_KEYS;
+    if (PREFILL_PICKS)
+        total_tiles += PREFILL_QT * pick_tiles;
+#else
     // A WorkList's key tiles are its query tile's listed ones.
     if (PREFILL_SELECTED)
         total_tiles = element_u32_at(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul);
@@ -512,9 +643,14 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     // decode rows most blocks) skips the matrix products and stores nothing;
     // it runs every other step.
     const bool computes = block_row < PREFILL_QT * G && tile_first + block_row / G < rows;
-#ifndef PREFILL_DECODE
+    // The block's queries: L1's scratch rows, or the workgroup's query tile.
+#if PREFILL_PREPARED
     const uint64_t block_queries = scratch_planes.queries
         + ((uint64_t(kv_head) * padded + tile_first) * G + block_row) * W * 2ul;
+    const uint shared_queries = 0u;
+#else
+    const uint64_t block_queries = 0ul;
+    const uint shared_queries = queries + block_row * (W + 8u);
 #endif
 
     const uint64_t heads = uint64_t(KV * G);
@@ -550,7 +686,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 prefill_stage(h, scratch_planes, true, historical, first, interval.y, kv_head, column, chunk);
                 barrier();
                 if (computes)
-                    flash_scores_add(block_queries + uint64_t(column) * 2ul, uint64_t(W), chunk, 0u, scores);
+                    prefill_scores_add(block_queries, shared_queries, column, chunk, scores);
             }
             flash_scores_publish(scores, scratch);
             float s[16];
@@ -588,34 +724,25 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 attention_span(visible, fresh, token, spans, index, row_lo, row_hi);
             for (uint own = own_lo; own < own_hi; ++own) {
                 const int first = interval.x + int(own * PREFILL_KEYS);
-                flash_scores_state scores;
-                flash_scores_clear(scores);
-                for (uint column = 0u; column < W; column += chunk) {
-                    barrier();
-                    prefill_stage(h, scratch_planes, true, historical, first, interval.y, kv_head, column, chunk);
-                    barrier();
-                    if (computes) {
-#ifdef PREFILL_DECODE
-                        flash_scores_add_shared(queries + block_row * (W + 8u) + column, W + 8u, chunk, 0u, scores);
-#else
-                        flash_scores_add(block_queries + uint64_t(column) * 2ul, uint64_t(W), chunk, 0u, scores);
-#endif
-                    }
-                }
-                flash_scores_publish(scores, scratch);
                 const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
-                float s[16];
-                prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
-                const float alpha = flash_online(softmax, s);
-                const uint p_half = flash_publish_probabilities(scratch, s);
-                flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
-                barrier();
-                prefill_stage(h, scratch_planes, false, historical, first, interval.y, kv_head, column0, width);
-                barrier();
-                if (computes)
-                    flash_accumulate(p_half, 0u, width, width, 0u, o);
+                prefill_absorb(h, scratch_planes, historical ? PREFILL_FROM_HISTORY : PREFILL_FROM_FRESH, first,
+                    interval.y, inside, row_lo, row_hi, 0ul, token, kv_head, chunk, column0, width, computes,
+                    block_queries, shared_queries, scratch, scale, softmax, o);
             }
         }
+#ifdef PREFILL_DECODE
+        // The tile rows' pick tiles, after the visible tiles: each attended
+        // by its own row alone.
+        for (uint picked = max(tiles_lo, visible_tiles); PREFILL_PICKS && picked < tiles_hi; ++picked) {
+            const uint ordinal = picked - visible_tiles;
+            const uint64_t pick_row = tile_first + ordinal / pick_tiles;
+            if (pick_row >= rows)
+                break;
+            prefill_absorb(h, scratch_planes, PREFILL_FROM_PICKS, int((ordinal % pick_tiles) * PREFILL_KEYS), 0, true,
+                0, 0, pick_row, token, kv_head, chunk, column0, width, computes, block_queries, shared_queries,
+                scratch, scale, softmax, o);
+        }
+#endif
         const float maximum = softmax.maximum;
         const float denominator = flash_denominator(softmax);
         // Every subgroup of a used partition reaches here; the scratch is
@@ -749,30 +876,6 @@ void prefill_merge(prefill_scratch scratch_planes, prefill_picked picked) {
     }
 }
 
-// The output rotary (RO = 1), after every query head's output is stored:
-// workgroup (row, query head), invocation `pair` turns its pair of the
-// published row back by the row's negated angles (the portable
-// `output_rotary`), in F32, and publishes it again.
-void prefill_rotate() {
-    const uint64_t row = gl_WorkGroupID.x;
-    const uint64_t head = gl_WorkGroupID.y;
-    const uint pair = gl_LocalInvocationIndex;
-    if (pair >= ATTENTION_P)
-        return;
-    float cosine, sine;
-    rotary_turn(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul, 1ul,
-        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), 1ul, SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES), 1ul,
-        ATTENTION_AMPLITUDE_BUFFER, 1ul, pair, cosine, sine);
-    const rotary_layout pairs = ATTENTION_ROTARY;
-    const uint lo = rotary_leading(pair, pairs);
-    const uint hi = rotary_partner(lo, pairs.p, pairs.first, pairs.adjacent);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    const uint64_t row_at = (row * uint64_t(ATTENTION_KV * ATTENTION_G) + head) * ATTENTION_W;
-    const float low = element_at(ELEMENT_ACT, result, row_at + lo);
-    const float high = element_at(ELEMENT_ACT, result, row_at + hi);
-    element_put(ELEMENT_ACT, result, row_at + lo, low * cosine + high * sine);
-    element_put(ELEMENT_ACT, result, row_at + hi, high * cosine - low * sine);
-}
 #endif
 
 #ifdef PREFILL_DECODE

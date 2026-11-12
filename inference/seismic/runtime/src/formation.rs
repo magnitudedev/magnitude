@@ -27,7 +27,11 @@
 //! again. Bytes it returns were written here under a key that covers their
 //! encoding ([`Artifact::ENCODING`]), so a pointer that does not parse or
 //! an artifact that does not decode is damaged: each is reported, missed,
-//! and rewritten by the compile it causes.
+//! and rewritten by the compile it causes. A [`Load::Complete`]
+//! toolchain's platform may decline an artifact it would have to compile
+//! to load (Vulkan's pipeline cache is a hint a driver may decline): that
+//! load is a miss too, counted and reported, and its entries are compiled
+//! with the rest and stored again.
 
 use crate::artifacts::{ArtifactKey, ArtifactStore};
 use crate::native::Linear;
@@ -103,6 +107,10 @@ pub struct FormedPrograms {
     /// a compile's time where it does not.
     pub platform_loads: u64,
     pub platform_load_seconds: f64,
+    /// The stored artifacts a [`Load::Complete`] toolchain's platform
+    /// would not serve without compiling: their entries were compiled
+    /// again, and are counted in `compiles`.
+    pub load_misses: u64,
 }
 
 /// What forming a program does, known before it is formed.
@@ -110,7 +118,8 @@ pub struct FormedPrograms {
 pub(crate) enum FormationClass {
     /// No compiler of the toolchain's runs: compiles live on the device
     /// hold every requested entry, or the store keeps an artifact that
-    /// serves those they lack.
+    /// serves those they lack, unless the platform declines to load it
+    /// without compiling ([`FormedPrograms::load_misses`]).
     Kept,
     /// The toolchain compiles the entries no live compile holds.
     Compiled,
@@ -178,6 +187,8 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
     /// nanoseconds those loads took.
     platform_loads: std::sync::atomic::AtomicU64,
     platform_load_nanos: std::sync::atomic::AtomicU64,
+    /// The stored artifacts the platform would not load without compiling.
+    load_misses: std::sync::atomic::AtomicU64,
     /// What this toolchain's compiles have taken in this process, each with
     /// the entries it formed: what a compile of a source not yet compiled
     /// here is priced by.
@@ -226,6 +237,7 @@ impl<T: Toolchain> ProgramFormer<T> {
             compiles: std::sync::atomic::AtomicU64::new(0),
             platform_loads: std::sync::atomic::AtomicU64::new(0),
             platform_load_nanos: std::sync::atomic::AtomicU64::new(0),
+            load_misses: std::sync::atomic::AtomicU64::new(0),
             compiled: Mutex::new(Linear::default()),
             workers: Mutex::new(None),
         }
@@ -275,6 +287,7 @@ impl<T: Toolchain> ProgramFormer<T> {
                 self.platform_load_nanos.load(std::sync::atomic::Ordering::Relaxed),
             )
             .as_secs_f64(),
+            load_misses: self.load_misses.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -457,24 +470,35 @@ impl<T: Toolchain> ProgramFormer<T> {
         }
         let mut formed = Vec::new();
         for (kept, entries) in loads {
-            match self.artifact(&kept) {
-                Some(artifact) => {
-                    let loading = std::time::Instant::now();
-                    let program =
-                        on_compiler_stack(|| self.toolchain.load(&artifact, &entries))?;
-                    if T::LOAD == Load::PlatformCached {
-                        let took = u64::try_from(loading.elapsed().as_nanos())
-                            .expect("a load's nanoseconds fit 64 bits");
-                        self.platform_loads
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.platform_load_nanos
-                            .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    formed.push(Compile { entries, program });
+            // The store dropped the artifact: its entries are compiled
+            // with the rest.
+            let Some(artifact) = self.artifact(&kept) else {
+                compiling.extend(entries);
+                continue;
+            };
+            let loading = std::time::Instant::now();
+            let loaded = on_compiler_stack(|| self.toolchain.load(&artifact, &entries))?;
+            if T::LOAD == Load::PlatformCached {
+                let took = u64::try_from(loading.elapsed().as_nanos())
+                    .expect("a load's nanoseconds fit 64 bits");
+                self.platform_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.platform_load_nanos
+                    .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+            }
+            match loaded {
+                Some(program) => formed.push(Compile { entries, program }),
+                // The platform would not serve the artifact without
+                // compiling: its entries are compiled with the rest, and
+                // stored again.
+                None => {
+                    self.load_misses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let namespace = self.toolchain.identity().namespace;
+                    let kept = kept.as_str();
+                    eprintln!("seismic: the platform does not load the stored artifact {namespace}/{kept} without compiling; it is compiled again");
+                    compiling.extend(entries);
                 }
-                // The store dropped the artifact: its entries are compiled
-                // with the rest.
-                None => compiling.extend(entries),
             }
         }
         if !compiling.is_empty() {
@@ -574,6 +598,9 @@ mod tests {
         identity: seismic_native_target::ToolchainIdentity,
         compiles: AtomicUsize,
         entries: AtomicUsize,
+        /// Whether its platform declines every load, as a driver may
+        /// decline a pipeline cache's data.
+        misses: bool,
         /// The thread each compile and load ran on.
         threads: Mutex<Vec<Option<String>>>,
     }
@@ -640,8 +667,11 @@ mod tests {
             &self,
             artifact: &Names,
             entries: &[ProgramEntry],
-        ) -> Result<Vec<String>, NativeCompilationError> {
+        ) -> Result<Option<Vec<String>>, NativeCompilationError> {
             self.ran();
+            if self.misses {
+                return Ok(None);
+            }
             entries
                 .iter()
                 .map(|entry| {
@@ -654,7 +684,8 @@ mod tests {
                             NativeCompilationError::MalformedToolchainOutput(entry.symbol.clone())
                         })
                 })
-                .collect()
+                .collect::<Result<_, _>>()
+                .map(Some)
         }
         fn statistics(_: &Vec<String>, _: usize) -> &[seismic_native_target::ProgramStatistic] {
             &[]
@@ -662,6 +693,11 @@ mod tests {
     }
 
     fn former(store: Option<Arc<MemoryStore>>) -> ProgramFormer<Echo> {
+        former_missing(store, false)
+    }
+
+    /// A former whose toolchain's loads are all misses when `misses`.
+    fn former_missing(store: Option<Arc<MemoryStore>>, misses: bool) -> ProgramFormer<Echo> {
         ProgramFormer::new(
             Echo {
                 identity: seismic_native_target::ToolchainIdentity {
@@ -670,6 +706,7 @@ mod tests {
                 },
                 compiles: AtomicUsize::new(0),
                 entries: AtomicUsize::new(0),
+                misses,
                 threads: Mutex::default(),
             },
             store.map(|store| store as Arc<dyn ArtifactStore>),
@@ -863,6 +900,27 @@ mod tests {
         assert_eq!(compiles(&damaged), 1, "an undecodable artifact is compiled again");
         let after = former(Some(store));
         assert_eq!(class(&after, &[narrow]), (FormationClass::Kept, 0), "and its entry's pointer rewritten");
+    }
+
+    /// A stored artifact the platform will not load without compiling is a
+    /// miss, not a failure: its entries are compiled with those no artifact
+    /// holds, in one call, the miss is counted, and the artifact is stored
+    /// again, which a platform that serves it then loads.
+    #[test]
+    fn a_load_that_misses_is_compiled_and_stored_again() {
+        let store = Arc::new(MemoryStore::default());
+        let narrow = source("launch", &["k<8>"]);
+        drop(former(Some(store.clone())).form(&[narrow.clone()]).unwrap());
+        let declining = former_missing(Some(store.clone()), true);
+        assert_eq!(class(&declining, &[narrow.clone()]), (FormationClass::Kept, 0));
+        let wide = source("launch", &["k<8>", "k<16>"]);
+        drop(declining.form(&[wide.clone()]).unwrap());
+        assert_eq!((compiles(&declining), entries(&declining)), (1, 2));
+        let counted = declining.programs_formed();
+        assert_eq!((counted.compiles, counted.load_misses), (1, 1));
+        let serving = former(Some(store));
+        drop(serving.form(&[wide]).unwrap());
+        assert_eq!(compiles(&serving), 0, "the compile stored the missed entries again");
     }
 
     /// A damaged entry pointer is a miss: the entry compiles again, and

@@ -38,6 +38,20 @@ pub mod testing {
         TEST_SETUP_UNCHECKED as SETUP_UNCHECKED,
     };
 
+    /// Open executor `id` of `devices` with `options` as a device of its
+    /// own, sharing no ledger with another open: a test's, beside other
+    /// tests in one process, bounds its ledgers alone.
+    #[cfg(feature = "fixtures")]
+    pub fn open_own_ledgers(devices: &super::Devices, id: super::ExecutorId, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
+        devices.inner.open_own_ledgers(id, options).map(|inner| super::Device { inner })
+    }
+
+    /// [`open_own_ledgers`] of the first executor of `backend`.
+    #[cfg(feature = "fixtures")]
+    pub fn open_backend_own_ledgers(devices: &super::Devices, backend: BackendName, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
+        open_own_ledgers(devices, devices.inner.executor_of(backend)?, options)
+    }
+
     /// The executor a test runs `backend` on: the first available one of
     /// it in `topology`, where the runner requests `backend` or none. A
     /// test runs on each backend this names one for, and fails where it
@@ -53,6 +67,7 @@ pub mod testing {
     }
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions, MemoryStore};
+pub use seismic_runtime::api::device::Bounds;
 pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.
@@ -245,11 +260,10 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, pin, place_process, volume_available, volume_identity, Core, DeviceNode,
-    DiscoveryError, DisplacementWindow, HostDisplacement, HostHeld, HostStatus, Inventory,
-    KernelPressure, LimitVisibility, MemoryNode, ObservationError, PciLocation, ProcessLimitKind,
-    ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus, Sample, Status,
-    DISPLACEMENT_CADENCE, DISPLACEMENT_HISTORY,
+    device_node, host_available, host_room, pin, HostAvailable, place_process, volume_available, volume_identity, Core, DeviceNode,
+    DiscoveryError, HostHeld, HostStatus, Inventory, LimitVisibility, MemoryNode, ObservationError,
+    PciLocation, ProcessLimitKind, ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy,
+    Reclaim, RuntimeStatus, Sample, Status,
 };
 pub use seismic_lang::forms::MetalPacking;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
@@ -264,8 +278,8 @@ pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
-    AccessPath, AccessPathId, Availability, Contract, DeviceMemory, DeviceTopology, Diagnostic,
-    DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
+    AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, Contract, DeviceMemory, DeviceTopology,
+    Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
     Kind, KindId, KindMemory, Limits, NativeKind, Obtained, Packing, PhysicalDevice,
     PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy, Reservation,
     ReservationCharges, ReservationChunks, ReservedContract, ReservedRecords, Revision, Placing, Store, StoreId,
@@ -373,6 +387,13 @@ impl Devices {
         self.inner.status(topology, executor)
     }
 
+    /// The status of opened `device`, with what the devices of its ledger
+    /// scope hold: as [`Self::status`] reads it for every open of the
+    /// product.
+    pub fn device_status(&self, device: &Device) -> Status {
+        self.inner.device_status(&device.inner)
+    }
+
     /// What executor `id`'s recorded graphs hold for their census
     /// ([`Device::graph_cost`]): its backend measures it on opening, once
     /// per device in a process, so this opens the executor, sharing it
@@ -397,6 +418,20 @@ pub struct Device {
 }
 
 impl Device {
+    /// Declare the load's charge final: a record table formed afterwards
+    /// outside a [`TableSealLifted`] scope is an invariant violation (stops
+    /// every build), being device memory no claim covers.
+    pub fn seal_record_tables(&self) {
+        self.inner.seal_record_tables()
+    }
+
+    /// Lift the seal while the guard lives, for allocations made under a
+    /// claim after the load (a component's import and binding).
+    pub fn lift_table_seal(&self) -> TableSealLifted {
+        self.inner.lift_table_seal();
+        TableSealLifted(self.clone(), std::marker::PhantomData)
+    }
+
     pub fn same_device(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -531,10 +566,12 @@ impl Device {
     pub fn device_ledger(&self) -> DeviceLedgerView {
         self.inner.device_ledger()
     }
-    /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
-    /// revokes what is charged.
-    pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
-        self.inner.bound(ledger, bound)
+    /// The right to bound every ledger this device reaches
+    /// ([`Bounds::bound`]): one live holder per ledger. Taking it while
+    /// another holder lives panics, naming both.
+    #[track_caller]
+    pub fn bounds(&self) -> Bounds {
+        self.inner.bounds()
     }
     /// Start the high-water mark of each of the device's own ledgers again
     /// from what it charges now: the next reading is the most charged since
@@ -6010,4 +6047,14 @@ pub mod dynamic;
 pub mod precision {
     pub use seismic_compiler::numerics::PolicyIdentity;
     pub use seismic_lang::precision::*;
+}
+
+/// The scope of [`Device::lift_table_seal`].
+/// It belongs to the thread that took it.
+pub struct TableSealLifted(Device, std::marker::PhantomData<*const ()>);
+
+impl Drop for TableSealLifted {
+    fn drop(&mut self) {
+        self.0.inner.restore_table_seal();
+    }
 }

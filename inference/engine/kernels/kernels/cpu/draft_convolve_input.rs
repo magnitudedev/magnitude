@@ -4,6 +4,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn draft_convolve_input<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (groups, channels, taps) = (cx.dim_g() as usize, cx.dim_c() as usize, cx.dim_k() as usize);

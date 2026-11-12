@@ -322,6 +322,67 @@ fn grouped_project_rows_match_host_model(format: Format) {
     }
 }
 
+/// CUDA's INT8 staging (`stage_row_s8`) codes every activation group by the
+/// CPU's rule: weights that read one column each (`int8_rule::probe_blocks`)
+/// make each output its column's `d * code`, which matches the CPU's on
+/// ties, their BF16 neighbours, subnormal scales, zero and NaN groups.
+#[test]
+fn cuda_int8_activations_follow_the_cpu_rule() {
+    let Some(device) = cuda() else { return };
+    let (n, k) = (64usize, 512usize);
+    let format = Format::Q8;
+    let shape = [n as u64, k as u64];
+    let resident = format.resident();
+    let bytes = resident
+        .repack_host(format.source(), &shape, &int8_rule::probe_blocks(n, k))
+        .expect("registered GGUF -> mma16 conversion");
+    let weight = Tensor::from_host(&device, resident, &shape, &bytes).unwrap();
+    let projection = Mapped::new(
+        project_rows::native_entry_with(project_rows::Elements {
+            A: Element::bf16(),
+            W: resident,
+            Y: Element::f32(),
+        }),
+        move |_: &Device, mapping: Mapping| {
+            mapping.projection_params(
+                NativeSpecialization::new()
+                    .with_static("G", 1)
+                    .with_static("K", k as u64)
+                    .with_static("N", n as u64)
+                    .with_static("WS", 0),
+            )
+        },
+    );
+    // INT8 on the small-band GEMM (17 to 64 rows).
+    let mapping = GEMM_MAPPINGS[1];
+    assert!(mapping.quantizes(SMALL_GEMM_ROWS) && projection.admits(&device, mapping));
+    for (at, groups) in int8_rule::blocks().chunks(SMALL_GEMM_ROWS).enumerate() {
+        let rows = groups.len().max(GEMV_ROWS + 1);
+        let mut source = vec![0.0f32; rows * k];
+        for (row, group) in groups.iter().enumerate() {
+            source[row * k..row * k + int8_rule::GROUP].copy_from_slice(group);
+        }
+        let result = projection
+            .kernel(&device, mapping)
+            .call(project_rows::Args {
+                source: &bf16_tensor(&device, &[rows as u64, k as u64], &source),
+                weight: &weight,
+                weight_scale: &f32_tensor(&device, &[0], &[]),
+                weight_bound: &f32_tensor(&device, &[0], &[]),
+            })
+            .unwrap()
+            .value;
+        int8_rule::assert_codes(
+            &format!("CUDA INT8 groups {at}"),
+            groups,
+            &read_f32(&result)[..groups.len() * n],
+            n,
+            int8_rule::Grid::F32,
+            1e-6,
+        );
+    }
+}
+
 /// FNV-1a of an output's bytes: GEMM restructurings that keep the arithmetic
 /// print the same digests (compared across builds).
 fn digest(tensor: &Tensor) -> u64 {
@@ -1097,8 +1158,12 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
     let (o, h, f) = (2, 256, 32);
     let mut sources = seismic_std::sources();
     sources.push(SourceFile {
-        path: "dense_rows.seismic".into(),
-        text: include_str!("../kernels/dense_rows.seismic").into(),
+        path: "feed_forward.seismic".into(),
+        text: include_str!("../kernels/feed_forward.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
     });
     sources.push(SourceFile {
         path: "functions.seismic".into(),

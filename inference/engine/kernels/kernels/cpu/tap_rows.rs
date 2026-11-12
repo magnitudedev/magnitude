@@ -4,6 +4,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn tap_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let d = cx.dim_d() as usize;

@@ -1,4 +1,5 @@
 // One work item copies every element; `STRAY` 1 writes a wrong last one.
+#[inline(always)]
 fn stray_write<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let state = cx.arg_state();
     let x = cx.arg_x();

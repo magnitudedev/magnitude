@@ -310,7 +310,7 @@ pub fn connect_worker(
     mut progress: impl FnMut(LoadProgress),
 ) -> Result<LoadAttempt<WorkerConnection>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
-    let lost = |reason: String| LoadError::WorkerLost { reason };
+    let lost = |lost: Lost| LoadError::WorkerLost { reason: lost.reason };
     let ended = "it was ready";
     let load = load.map(|(manifest, unprepared)| HostMessage::Load {
         manifest,
@@ -323,7 +323,7 @@ pub fn connect_worker(
             WorkerMessage::Ready { ready } => break ready,
             WorkerMessage::Unprepared => return Ok(LoadAttempt::Unprepared),
             WorkerMessage::LoadFailed { error } => return Err(error),
-            _ => return Err(lost("unexpected message during load".into())),
+            _ => return Err(lost(Lost::broke("unexpected message during load"))),
         }
     };
     let state = Arc::new(Mutex::new(State::default()));
@@ -366,16 +366,16 @@ pub fn connect_worker(
 /// outcome, reporting its `LoadProgress` to `progress`. The worker exits once
 /// prepared; it never loads the model. Hosts reach this through
 /// [`super::load_prepared`] or [`super::prepare`], which also see the
-/// process ended. The outer error is a worker that reported no outcome (it
-/// was lost, or broke the protocol); the inner result is the outcome a
-/// worker reported, after which it exits on its own.
+/// process ended. The outer error is a worker that reported no outcome (its
+/// stream ended, failed, or it broke the protocol); the inner result is the
+/// outcome a worker reported, after which it exits on its own.
 pub(super) fn prepare_worker(
     transport: impl HostTransport,
     manifest: ExecutionManifest,
     mut progress: impl FnMut(LoadProgress),
-) -> Result<Result<(), LoadError>, LoadError> {
+) -> Result<Result<(), LoadError>, Lost> {
     let (mut receiver, mut sender) = transport.split();
-    let lost = |reason: String| LoadError::WorkerLost { reason };
+    let lost = |lost: Lost| lost;
     let ended = "it was prepared";
     let prepare = HostMessage::Prepare { manifest };
     handshake(&mut sender, &mut receiver, Some(prepare), ended, lost)?;
@@ -384,8 +384,24 @@ pub(super) fn prepare_worker(
             WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Prepared => return Ok(Ok(())),
             WorkerMessage::LoadFailed { error } => return Ok(Err(error)),
-            _ => return Err(lost("unexpected message during preparation".into())),
+            _ => return Err(Lost::broke("unexpected message during preparation")),
         }
+    }
+}
+
+/// How a host lost its worker: why, and whether the worker's stream ended,
+/// which a worker's ends only as its process ends, on its own.
+#[derive(Debug)]
+pub(super) struct Lost {
+    pub(super) reason: String,
+    pub(super) ended: bool,
+}
+
+impl Lost {
+    /// A worker whose stream failed or that broke the protocol: it may
+    /// still run.
+    fn broke(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), ended: false }
     }
 }
 
@@ -398,7 +414,7 @@ pub(super) fn handshake<E>(
     receiver: &mut impl MessageReceiver<WorkerMessage>,
     first: Option<HostMessage>,
     ended: &str,
-    lost: impl Fn(String) -> E,
+    lost: impl Fn(Lost) -> E,
 ) -> Result<(), E> {
     let build = EngineBuild::current();
     if let Some(first) = first {
@@ -407,14 +423,14 @@ pub(super) fn handshake<E>(
                 build: build.clone(),
             })
             .and_then(|()| sender.send(first))
-            .map_err(|error| lost(error.to_string()))?;
+            .map_err(|error| lost(Lost::broke(error.to_string())))?;
     }
     match receive(receiver, ended, &lost)? {
         WorkerMessage::Hello { build: worker } if worker == build => Ok(()),
-        WorkerMessage::Hello { build: worker } => Err(lost(format!(
+        WorkerMessage::Hello { build: worker } => Err(lost(Lost::broke(format!(
             "worker build {worker} differs from host build {build}"
-        ))),
-        _ => Err(lost("the worker did not greet the host".into())),
+        )))),
+        _ => Err(lost(Lost::broke("the worker did not greet the host"))),
     }
 }
 
@@ -423,12 +439,12 @@ pub(super) fn handshake<E>(
 pub(super) fn receive<E>(
     receiver: &mut impl MessageReceiver<WorkerMessage>,
     ended: &str,
-    lost: impl Fn(String) -> E,
+    lost: impl Fn(Lost) -> E,
 ) -> Result<WorkerMessage, E> {
     match receiver.receive() {
         Ok(Some(message)) => Ok(message),
-        Ok(None) => Err(lost(format!("the worker ended before {ended}"))),
-        Err(error) => Err(lost(error.to_string())),
+        Ok(None) => Err(lost(Lost { reason: format!("the worker ended before {ended}"), ended: true })),
+        Err(error) => Err(lost(Lost::broke(error.to_string()))),
     }
 }
 
@@ -744,7 +760,7 @@ mod tests {
         state.deliver(WorkerMessage::MeasurementRoom { claim: released, room: Ok(RoomAnswer::Made) }).unwrap();
         assert_eq!(second.lock().unwrap().value, None, "the released claim's answer");
         let (joined, None) = state.claim_room() else { panic!("a claim while one is pending joins it") };
-        let short = Ok(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 1 }));
+        let short = Ok(RoomAnswer::Refused(RoomRefusal::Short { bytes: 1 }));
         state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
         assert_eq!(second.lock().unwrap().value, Some(short.clone()));
         assert_eq!(joined.lock().unwrap().value, Some(short));

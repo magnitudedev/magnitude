@@ -2,6 +2,7 @@
 // work item per row, the row plus the blend of its four position-table rows
 // (in corner order), all F32.
 
+#[inline(always)]
 fn vision_position<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;

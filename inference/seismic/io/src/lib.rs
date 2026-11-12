@@ -123,7 +123,7 @@ pub use accounting::{Class, Totals, Waits};
 pub use destination::{Buffer, Destination};
 pub use disk::{adopt_earlier, adopt_volume, cached_pages, link_shape, probe_volume, read_cores, CachePolicy, Curve, EarlierChoice, Lone, OpenError, OpenFile, Point, Reader, Shape, Urgent, Volume, ALIGNMENT};
 pub use error::Error;
-pub use scheduler::{engine_work, read_buffers, Deadline, Ended, Ending, EngineWork, Flight, Handle, Outstanding, Panic, Range, Want};
+pub use scheduler::{engine_work, read_buffers, read_workers, Deadline, Ended, Ending, EngineWork, Flight, Handle, Outstanding, Panic, Range, Want};
 pub use waited::waited_on;
 
 #[cfg(test)]

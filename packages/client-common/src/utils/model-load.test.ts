@@ -3,7 +3,7 @@ import { Option } from "effect"
 import type { LocalInferenceHardware, ModelLoadDevice, ModelOptimizationProgress, ModelResidency } from "@magnitudedev/sdk"
 import {
   modelOptimizationPendingIdle,
-  MEMORY_PRESSURE_TITLE,
+  MEMORY_SHORTAGE_TITLE,
   describeMemoryShortage,
   describeModelLoadFailure,
   describeModelOptimization,
@@ -48,17 +48,16 @@ describe("model optimization wording", () => {
 })
 
 describe("memory shortage and stop wording", () => {
-  it("states a blocked shortage with its two figures and a load under pressure with none", () => {
+  it("states a shortage with its two figures", () => {
     const blocked = describeMemoryShortage({ _tag: "Blocked", requiredBytes: 30 * 2 ** 30, availableBytes: 24 * 2 ** 30 })
     expect(blocked).toBe("This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.")
-    expect(describeMemoryShortage({ _tag: "UnderPressure" })).not.toMatch(/\d/)
   })
 
   it("describes a shortage in the user's terms and passes any other failure's message through", () => {
     expect(describeModelLoadFailure({
       _tag: "MemoryShortage", code: "memory_shortage", message: "private bytes", retryable: true,
-      shortage: { _tag: "UnderPressure" },
-    })).toBe(`${MEMORY_PRESSURE_TITLE}. Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment.`)
+      shortage: { _tag: "Blocked", requiredBytes: 30 * 2 ** 30, availableBytes: 24 * 2 ** 30 },
+    })).toBe(`${MEMORY_SHORTAGE_TITLE}. This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.`)
     expect(describeModelLoadFailure({ code: "worker_exited", message: "the worker exited", retryable: true }))
       .toBe("the worker exited")
   })

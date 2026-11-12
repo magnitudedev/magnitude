@@ -35,10 +35,9 @@ impl Drop for TrafficHold {
 }
 
 /// A load's elastic expert bank: the one owner of the memory its
-/// experts and the stored tables it holds take, each priced by what it saves
-/// a decode step per byte (on `price`, the load's decode as the domain
-/// prices it, `ExecutorDomain::decode_price`, where it can). It shrinks toward its floor and grows
-/// toward every expert one slot at a time, and each table a record at a
+/// experts and the stored tables it holds take, each holding sized by its
+/// derived target (`ExecutorDomain::follow_cache_targets`). It shrinks toward its floor and
+/// grows toward every expert one slot at a time, and each table a record at a
 /// time. An expert resize's storage is prepared off the submitting thread,
 /// installed at a later flight boundary and its surplus released after the
 /// flight that last reached it ([`Self::advance`]), so no flight waits on
@@ -60,9 +59,8 @@ pub trait ElasticBank {
 
     /// Hold every rise of the bank's charge off the domain's thread until
     /// the guard drops: the domain holds it across one observation of
-    /// Seismic's charge and the classification read against it
-    /// (`ExecutorDomain::refresh_memory`), which then are of one state (a
-    /// release off the thread only ever lowers the charge).
+    /// memory (`ExecutorDomain::observe_memory`), which then is of one state
+    /// (a release off the thread only ever lowers the charge).
     fn hold_rises(&self) -> std::sync::MutexGuard<'_, ()>;
 
     /// Each streamed layer's host lines as the bank's load measured them
@@ -107,8 +105,9 @@ pub trait ElasticBank {
     fn resident_decodes(&self) -> u64;
 
     /// Begin a shrink of `holding` toward `to` (its slots, host slots or
-    /// table records), the size the heap's settle released it to
-    /// (`ExecutorDomain::shrink_expert_bank`), at a flight boundary: one
+    /// table records), its derived target
+    /// (`ExecutorDomain::follow_cache_targets`), at a flight
+    /// boundary: one
     /// resize. Unless a resize of its store runs or it is at `to`,
     /// `between_flights` first brings the device past every begun step (no
     /// step may run while the watcher plans; one still running defers the
@@ -119,7 +118,7 @@ pub trait ElasticBank {
     /// off this thread. `wake` is completed once the preparation ends. One
     /// resize reaches `to`, unless a cut of the records the host lands into
     /// falls below a record in flight, which stays in place: the cut stops
-    /// above it, and a later settle takes the rest.
+    /// above it, and a later follow takes the rest.
     fn shrink(
         &self,
         holding: BankHolding,
@@ -133,18 +132,19 @@ pub trait ElasticBank {
     /// read from a record the moves did not write is ever taken.
     fn carried(&self) -> Result<(), super::DomainError>;
 
-    /// Each holding's curve at its size now ([`BankCurve`]), every step
-    /// priced on `price`: the experts' slots and the host tier's host slots
-    /// by what the decode step saves (`DecodePrice::saving`), a table's
-    /// records by its curve's (`TableCurve::step_seconds`). A holding grows
-    /// at most to its ceiling and to where its misses stop falling, and
-    /// shrinks at most to its floor; the host tier offers nothing while its
-    /// backing to its planned slots runs. Without a `price` (before the
-    /// load measured its costs) a holding offers nothing and what it holds
-    /// saves nothing known. Each curve is priced only as far as `reach`
-    /// goes ([`Reach`]): a step's price is a decode step's model at two
-    /// sizes, and a decision that can move a few steps prices no others.
-    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: Reaches) -> Result<Vec<BankCurve>, super::DomainError>;
+    /// Each holding as its derived target reads it
+    /// (`experts::derived::HoldingTarget`), in the order its store's room
+    /// is shared: between its floor and the lesser of its ceiling and where
+    /// its misses stop falling on `price` (its ceiling before the load is
+    /// priced). The domain derives their targets from its ledgers
+    /// (`experts::derived::derive`).
+    fn targets(&self, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, super::DomainError>;
+
+    /// The experts' slots a shrink releasing `bytes` reaches: the shallowest
+    /// size that does, down to the floor; none at the floor. A test's way
+    /// to ask a shrink of a size.
+    #[cfg(test)]
+    fn released_to(&self, bytes: u64) -> Result<Option<u64>, super::DomainError>;
 
     /// What the load's counted decode read and ran so far, which its decode
     /// is priced on; none before it counted a step.
@@ -154,17 +154,14 @@ pub trait ElasticBank {
     /// decode is priced on.
     fn streamed_layers(&self, lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers;
 
-    /// Begin one growth of `holding` to `to`, the size the heap's settle
-    /// granted it ([`Self::curves`]), at a flight boundary, unless a resize
-    /// runs: expert slots' and host slots' storage is backed off this thread
+    /// Begin one growth of `holding` to `to`, its derived target
+    /// (`ExecutorDomain::follow_cache_targets`), at a flight boundary, unless a
+    /// resize runs, its cache taken from its store's ledger in `ledgers` first (none there, nothing
+    /// begins: [`BankStep::Deferred`]): expert slots' and host slots' storage is backed off this thread
     /// a slot at a time, each slot joining the bank as soon as it is backed,
     /// beside running steps, `wake` completed once the growth ends; table
     /// records' are backed now.
-    fn grow(&self, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, super::DomainError>;
-
-    /// What the running growth the domain began has backed so far, which Seismic charges
-    /// already: its claim holds only the rest (`ExecutorDomain::refresh_memory`).
-    fn growth_backed(&self, tier: crate::planning::BankTier) -> Result<u64, super::DomainError>;
+    fn grow(&self, ledgers: &crate::memory::ledger::DeviceLedgers, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, super::DomainError>;
 
     /// The storage `holding` lies in, which its resizes are of: each store
     /// resizes on its own ([`BankStep::Begun`]).
@@ -263,18 +260,21 @@ pub struct HostResidency {
 /// A finished resize of one of the expert bank's holdings, in its units (the
 /// experts' slots, a table's records, the host tier's host slots), at
 /// `at_unix_ms` (milliseconds since the Unix epoch): shrunk by `by` to `to`
-/// for its cause, or grown by `by` from `from` because memory stayed free and
-/// the step paid. Each changes its size by at least one.
+/// because its derived target fell below what it held
+/// (`ExecutorDomain::follow_cache_targets`), or the guarantee was short beside
+/// a running chain, or grown by `by` from `from` because memory stayed free
+/// and the step paid. Each changes its size by at least one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BankResize {
-    Shrank { cause: ShrinkCause, to: u64, by: std::num::NonZeroU64, at_unix_ms: u64 },
+    Shrank { to: u64, by: std::num::NonZeroU64, at_unix_ms: u64 },
     Grew { from: u64, by: std::num::NonZeroU64, at_unix_ms: u64 },
 }
 
 /// What a chain's encoding finds memory short of between its submissions
-/// (`ExecutorDomain::submit_chain`'s probe): the bytes the expert bank's
-/// storage is short of now (`MemoryPace::shortfall`), and what the process
-/// held as it read them.
+/// (`ExecutorDomain::submit_chain`'s probe): the bytes free room in the
+/// expert bank's store lacks of the speed guarantee now
+/// (`memory::ledger::Snapshot::short`), and what the process held as it
+/// read them.
 #[derive(Clone, Copy, Debug)]
 pub struct RunningPressure {
     pub bytes: u64,
@@ -304,21 +304,6 @@ pub enum OptionalComponent {
 
 impl OptionalComponent {
     pub const ALL: [Self; 2] = [Self::Drafter, Self::Vision];
-}
-
-/// Why the owner shrank the expert bank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ShrinkCause {
-    /// Memory fell into the Reclaim band.
-    Reclaim,
-    /// A live request's claim was short.
-    LiveClaim,
-    /// A holding worth more per byte won the memory on the heap's one
-    /// price (`ExecutorDomain::settle_memory`): a prompt's places, an
-    /// optional component, or the bank's other tier.
-    Rebalance,
-    /// The service's measurement job claimed room beside the model.
-    Measurement,
 }
 
 /// Whether the fill of the store misses land into (the host tier where
@@ -386,69 +371,6 @@ impl BankResized {
     }
 }
 
-/// One step of a bank holding's curve: the size it takes the holding to
-/// (its slots, host slots or records), the bytes of storage it backs or
-/// releases, and what holding the larger side saves a decode step, in
-/// seconds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SizeStep {
-    pub to: u64,
-    pub bytes: u64,
-    pub saves: f64,
-}
-
-/// How far a decision can move the bank's holdings, in each tier's store
-/// ([`Reach`]): what each may
-/// release of what each holds (`held`, beyond which the bank adds what its
-/// own holdings in the same store offer, which they may take from each other
-/// by exchange) and
-/// grant beyond it (`offered`). A curve ([`BankCurve`]) steps each way until
-/// its steps' bytes reach that far, the step that crosses it included, so a
-/// settle sees every step it could move and the run each joins as far as
-/// room allows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reaches {
-    /// Each tier's ([`crate::planning::BankTier::index`]).
-    pub tiers: [Reach; crate::planning::BankTier::COUNT],
-    /// Whether the tiers' storage lies in one store: only there does one
-    /// tier's release make room for another's offer by exchange.
-    pub shared: bool,
-}
-
-impl Reaches {
-    /// `reach` in every tier, the tiers in one store.
-    pub fn every(reach: Reach) -> Self {
-        Self { tiers: [reach; crate::planning::BankTier::COUNT], shared: true }
-    }
-
-    /// How far a decision can move a holding in `tier` storage.
-    pub fn of(&self, tier: crate::planning::BankTier) -> Reach {
-        self.tiers[tier.index()]
-    }
-}
-
-/// How far a decision can move a bank holding in one store, in bytes ([`Reaches`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reach {
-    pub held: u64,
-    pub offered: u64,
-}
-
-/// A bank holding's curve at its size now (`at`), in the storage it lies in
-/// (`kind`): the steps it may release, the nearest first, each to the next
-/// size that releases storage, down to its floor; and the steps it may
-/// take, the nearest first, each to the next size that backs more, up to
-/// what its misses justify. The heap values each at the load's decode
-/// steps a second ([`super::value`]).
-#[derive(Clone, Debug, PartialEq)]
-pub struct BankCurve {
-    pub holding: BankHolding,
-    pub kind: crate::planning::BankTier,
-    pub at: u64,
-    pub held: Vec<SizeStep>,
-    pub offered: Vec<SizeStep>,
-}
-
 /// What an elastic bank's owner resizes: its experts' slots, the records
 /// of the stored table `ExpertResidency::tables[table]` describes, or the
 /// host tier's host slots; the storage each lies in is its plan's
@@ -484,28 +406,10 @@ pub struct ResizeTimes {
     pub installed: std::time::Instant,
     /// The surplus storage was released: the resize took effect.
     pub released: std::time::Instant,
-}
-
-impl ResizeTimes {
-    /// The span from its decision to its effect: what the next shrink
-    /// waits before it takes effect.
-    pub fn latency(&self) -> std::time::Duration {
-        self.released - self.decided
-    }
-
-    /// The span its bytes took to release: its latency less its wait for
-    /// the steps queued on the device, which a release of any size waits
-    /// alike and the latency already holds. A shrink of one 18 MB table
-    /// waited 164 ms of its 165 ms for a gap; read over the whole span, that
-    /// is a rate of 114 MB/s where the release itself ran at 17 GB/s.
-    ///
-    /// # Panics
-    /// Where the wait outlasts the span it lies in.
-    pub fn releasing(&self) -> std::time::Duration {
-        self.latency()
-            .checked_sub(self.queued)
-            .expect("invariant violated: a resize's wait for queued steps outlasted its decision-to-effect span")
-    }
+    /// Of a host tier's or table's shrink, its release's unregistration of
+    /// host pages ([`seismic::BackingTimes::unpin`]: CUDA's, which waits for
+    /// the device's work); zero for a device bank's resize and a growth.
+    pub unpinned: std::time::Duration,
 }
 
 /// An ask's trip through the expert watcher, as the submitting thread waits
@@ -584,8 +488,9 @@ pub trait ProgramFamily: 'static {
     /// Hold a prompt group of `places` places' buffers in place of any held
     /// now; the floor's, of one place, are always held. The caller holds a
     /// heap claim for `group_demand`; a failure keeps the buffers held
-    /// before.
-    fn hold_group(&self, _places: usize) -> Result<(), crate::resources::AllocationError> {
+    /// before. Only in a gap between flights (`quiet`): the expert bank
+    /// takes a group's places only while none of its steps runs.
+    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
         Ok(())
     }
 
@@ -688,20 +593,26 @@ impl NativeFamily {
         self.resident.bank.as_ref().map(|bank| bank.held())
     }
 
+    /// The family of `resident`, its bank's memory carved from what the
+    /// load recorded allocating as it started (`ServedBank::new`).
     pub(crate) fn new(
         programs: Rc<AttestedPrograms>,
         resident: ResidentTarget,
         geometry: Decoder,
-    ) -> Result<Self, String> {
+        ledgers: &crate::memory::ledger::DeviceLedgers,
+        recorded: &mut crate::memory::ledger::Recorded,
+    ) -> Result<Self, super::DomainError> {
+        let invariant = |detail: String| super::DomainError::invariant(detail);
         let binding_constants = programs
             .target_graphs()
-            .ok_or("target graph family was not prepared")?
-            .binding_constant_bytes()?;
+            .ok_or_else(|| invariant("target graph family was not prepared".into()))?
+            .binding_constant_bytes()
+            .map_err(invariant)?;
         let target = programs
             .bind_target(resident.clone(), geometry)
-            .map_err(|error| error.to_string())?;
-        if target.constant_bytes()? != binding_constants {
-            return Err("bound target graph constants differ from the claimed charge".into());
+            .map_err(|error| invariant(error.to_string()))?;
+        if target.constant_bytes().map_err(|error| invariant(error.into()))? != binding_constants {
+            return Err(invariant("bound target graph constants differ from the claimed charge".into()));
         }
         let state = programs.bind_state();
         let bank = resident
@@ -718,11 +629,11 @@ impl NativeFamily {
                             .sublayers
                             .stored_tables()
                             .find_map(|(role, table)| (role == plan.role).then(|| table.clone()))
-                            .ok_or_else(|| format!("the bank's table {:?} was not imported", plan.role))?;
+                            .ok_or_else(|| invariant(format!("the bank's table {:?} was not imported", plan.role)))?;
                         Ok(crate::experts::HeldTable { plan: plan.clone(), table, last_resize: std::sync::Mutex::new(None) })
                     })
-                    .collect::<Result<Vec<_>, String>>()?;
-                crate::experts::ServedBank::new(bank, &programs, tables)
+                    .collect::<Result<Vec<_>, super::DomainError>>()?;
+                crate::experts::ServedBank::new(bank, &programs, tables, ledgers, recorded)
             })
             .transpose()?;
         Ok(Self {
@@ -816,11 +727,19 @@ impl ProgramFamily for NativeFamily {
         definition: &ModelDefinition,
     ) -> Result<(), String> {
         if self.vision.is_none() {
-            self.vision = Some(
-                self.programs
-                    .bind_vision(resident, definition)
-                    .map_err(|error| error.to_string())?,
-            );
+            let binding_constants = self
+                .programs
+                .vision_graphs()
+                .ok_or("vision graph family was not prepared")?
+                .binding_constant_bytes()?;
+            let vision = self
+                .programs
+                .bind_vision(resident, definition)
+                .map_err(|error| error.to_string())?;
+            if vision.constant_bytes()? != binding_constants {
+                return Err("bound vision graph constants differ from the claimed charge".into());
+            }
+            self.vision = Some(vision);
         }
         Ok(())
     }
@@ -915,7 +834,7 @@ impl ProgramFamily for NativeFamily {
     /// Hold a group's graph buffers and its places' bank words, each
     /// allocated first, so a failure of either keeps both held before; the
     /// bank's words are the steps' once the buffers are held.
-    fn hold_group(&self, places: usize) -> Result<(), crate::resources::AllocationError> {
+    fn hold_group(&self, places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
         let invariant = |detail: String| {
             crate::resources::AllocationError::Plan(crate::error::InvariantError { context: "a group's places", detail })
         };
@@ -954,7 +873,7 @@ impl ProgramFamily for NativeFamily {
     /// load's bank-served ones: their fills interleaved layer-major would
     /// place experts of several steps at once. A streamed load's chain of
     /// scratch-served chunks is one prompt group, as a load's chain of
-    /// prompt chunks is (`ExecutorDomain::grant_group`).
+    /// prompt chunks is (`ExecutorDomain::behind`).
     fn chains(&self, rows: usize) -> bool {
         self.resident.bank.is_none()
             || !crate::operators::routed::fused_graph::decodes(rows as u64)

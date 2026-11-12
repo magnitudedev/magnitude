@@ -98,7 +98,7 @@ native draft_rows for vulkan from "vulkan/draft_rows.comp":
 native draft_rows for cpu from "cpu/draft_rows.rs":
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(CW, INT8) == 1)
-    scratch quantized bytes (M * S * ceil_div(2 * D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M * S, Q8_ROWS) * Q8_ROWS * ceil_div(2 * D, Q8_VALUES) * Q8_BYTES)
     scratch joined bytes (M * S * D * 8)
     launch draft_rows_join:
         threadgroups (M * S, 1, 1)
@@ -197,7 +197,7 @@ native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (O * D * 4)
     launch readout_project_rows_stage:
         threadgroups (O, 1, 1)

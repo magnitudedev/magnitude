@@ -498,8 +498,14 @@ pub enum IntrinsicNumerics {
 /// - `Rows16`: row-major; each row holds its planes one after another, every
 ///   plane and every row 16 B-aligned, codes split into a low-4-bit plane and
 ///   a high-bit plane (`PackedRowLayout`). The Metal resident layout.
-/// - `Rows8`: eight-row tiles, with each plane interleaved by storage group
-///   across the tile. The CPU resident layout.
+/// - `Rows8`: eight-row tiles, each plane a span per storage group holding
+///   its eight rows' shares: a code plane in panel order (32-byte units of
+///   `[row][4 bytes]`, slot `s` of byte `j` a row's code of column `4s + j`
+///   of the unit's columns), so one aligned load is a step of four columns
+///   of the tile's rows; a group plane record-major (each record, a
+///   coefficient group's fields, of the eight rows in turn); a grid plane
+///   its rows' shares in turn. The CPU resident layout (`code_bit`,
+///   `packet_bit`).
 /// - `Mma16`: `Rows16` whose code-plane bytes are permuted, per 16-row tile,
 ///   into `mma.sync.m16n8k16` A-fragment order (`PackedRowLayout::code_bit`).
 ///   The CUDA resident layout.
@@ -1294,7 +1300,10 @@ impl PackedRowLayout {
     /// row `row` in code plane `plane`, for rows of `logical_extent` values.
     ///
     /// `rows16`: bit `column * bits` of the row's plane.
-    /// `rows8`: corresponding storage groups of eight rows are adjacent.
+    /// `rows8`: a codes plane's tile span of each storage group is units of
+    /// `32 / bits` columns, `[row r][4 bytes]`, byte `j` of row `r` holding
+    /// its codes of the unit's columns `4s + j` at bit `bits * s`; a grid
+    /// plane's span holds its rows' shares in turn.
     ///
     /// `mma16`: for tile `T` (stored rows `16T..16T+15`), let `V` be the
     /// concatenation, in row order, of the 16 rows' plane payloads
@@ -1341,11 +1350,20 @@ impl PackedRowLayout {
         let stride = geometry.stride;
         let offset = geometry.offsets[plane];
         match self.layout {
+            Layout::Rows8 if !grids => {
+                let group = u64::from(self.packet.group);
+                let (chunk, within) = (32 / bits, column % group);
+                let byte = self.span_byte(geometry, row, column / group, plane)
+                    + within / chunk * 32
+                    + row % 8 * 4
+                    + within % 4;
+                byte * 8 + within % chunk / 4 * bits
+            }
             Layout::Rows16 | Layout::Rows8 => {
                 let group = u64::from(self.packet.group);
                 let byte = self
                     .share_byte(geometry, row, column / group, plane)
-                    .expect("a rows16 or rows8 share is its bytes");
+                    .expect("a rows16 share, or a rows8 grid share, is its bytes");
                 byte * 8 + column % group / unit * bits
             }
             Layout::Rows32 => interleaved(
@@ -1377,13 +1395,30 @@ impl PackedRowLayout {
         }
     }
 
+    /// The first byte of storage group `packet`'s span of row plane `plane`
+    /// in the tile of stored row `row`, in the layouts whose tile keeps a
+    /// group's shares of its rows together (`rows16`, a row its tile, and
+    /// `rows8`): the spans of a tile's plane follow one another, group by
+    /// group.
+    pub fn span_byte(&self, geometry: &RowGeometry, row: u64, packet: u64, plane: usize) -> u64 {
+        let tile = self.tile_rows();
+        assert!(
+            matches!(self.layout, Layout::Rows16 | Layout::Rows8),
+            "`{}` keeps no group span",
+            self.layout.as_str()
+        );
+        row / tile * geometry.stride * tile
+            + geometry.offsets[plane] * tile
+            + packet * u64::from(self.planes[plane].bytes_per_group) * tile
+    }
+
     /// The first byte of storage group `packet`'s share of row plane
     /// `plane` of stored row `row` (its `bytes_per_group` bytes, one after
     /// another), in the layouts that keep a share's bytes together: every
-    /// plane of `rows16` and `rows8` (whose tile holds a group's shares of
-    /// its rows one after another), and the group planes of `rows32` and
-    /// `mma16`. `None` for a code plane of `rows32` or `mma16`
-    /// (`code_bit`).
+    /// plane of `rows16`, a grid plane of `rows8` (whose span holds its
+    /// rows' shares in turn), and the group planes of `rows32` and `mma16`.
+    /// `None` for the code and group planes of `rows8` and a code plane of
+    /// `rows32` or `mma16` (`code_bit`, `packet_bit`).
     pub fn share_byte(
         &self,
         geometry: &RowGeometry,
@@ -1395,12 +1430,12 @@ impl PackedRowLayout {
         let (stride, offset, tile) = (geometry.stride, geometry.offsets[plane], self.tile_rows());
         let groups = matches!(self.planes[plane].content, RowPlaneContent::Groups { .. });
         Some(match self.layout {
-            Layout::Rows16 | Layout::Rows8 => {
-                row / tile * stride * tile
-                    + offset * tile
-                    + packet * group_bytes * tile
-                    + row % tile * group_bytes
-            }
+            Layout::Rows16 => self.span_byte(geometry, row, packet, plane),
+            Layout::Rows8 if matches!(
+                self.planes[plane].content,
+                RowPlaneContent::Grids { .. } | RowPlaneContent::GridHigh { .. }
+            ) => self.span_byte(geometry, row, packet, plane) + row % tile * group_bytes,
+            Layout::Rows8 => return None,
             // A tile's group plane is `[row][plane bytes of a row]`: every
             // row's groups are contiguous, and the tile's rows follow one
             // another.
@@ -1672,6 +1707,9 @@ impl PackedRowLayout {
                 });
                 byte * 8 + u64::from(within % 8)
             }
+            RowPlaneContent::Groups { planes, .. } if self.layout == Layout::Rows8 => {
+                self.span_byte(geometry, row, packet, index) * 8 + self.record_bit(planes, row % 8, share)
+            }
             RowPlaneContent::Groups { .. } => {
                 let byte = self
                     .share_byte(geometry, row, packet, index)
@@ -1679,6 +1717,34 @@ impl PackedRowLayout {
                 byte * 8 + u64::from(share)
             }
         }
+    }
+
+    /// The bit of a `rows8` group plane's span (its `planes`' shares of a
+    /// tile's eight rows) holding share bit `share` of row `r`: each listed
+    /// plane's records (a coefficient group's fields, `fields *
+    /// entry_bits`), record by record, each of the eight rows in turn, then
+    /// the rows' bits past whole records.
+    fn record_bit(&self, planes: &[u32], r: u64, share: u32) -> u64 {
+        let mut prefix = 0u64;
+        for member in planes {
+            let plane = &self.packet.planes[*member as usize];
+            let bits = u64::from(plane.bytes_per_group) * 8;
+            let within = u64::from(share) - prefix;
+            if within < bits {
+                let width = u64::from(plane.fields * plane.entry_bits);
+                let records = u64::from(self.packet.group / plane.group);
+                let (record, bit) = (within / width, within % width);
+                let tail = bits - records * width;
+                let placed = if record < records {
+                    (record * 8 + r) * width + bit
+                } else {
+                    records * width * 8 + r * tail + bit
+                };
+                return prefix * 8 + placed;
+            }
+            prefix += bits;
+        }
+        unreachable!("a group plane's share bit lies in one of its planes")
     }
 
     /// Whether bit `bit` of packet-form plane `plane` holds information the
@@ -3104,6 +3170,17 @@ pub(crate) mod internals {
             "row layout of `{}` covers every packet plane exactly once",
             repr.name
         );
+        if layout == Layout::Rows8 {
+            for plane in &planes {
+                if let RowPlaneContent::Codes { bits, .. } = plane.content {
+                    assert!(
+                        matches!(bits, 1 | 2 | 4 | 8) && plane.bytes_per_group % 4 == 0,
+                        "`{}` rows8 code planes hold whole panel units",
+                        repr.name
+                    );
+                }
+            }
+        }
         let group_multiple = match layout {
             Layout::Rows16 | Layout::Rows8 => 1,
             Layout::Rows32 => {
@@ -5044,8 +5121,8 @@ mod tests {
     /// assembled block, the scale then a group of codes, converting under
     /// E8M0 scales (one byte, 32 codes) into mxfp8g32, under F32 scales
     /// (four bytes, 128 codes) into fp8g128, whose decoders read E4M3 bytes
-    /// 2^9 times their value under that scale; no other encoding is read
-    /// under a grid.
+    /// as their values (the profile's integers under exponent -9) under that
+    /// scale; no other encoding is read under a grid.
     #[test]
     fn f8_e4m3_is_sourced_by_its_scale_grid() {
         use crate::repr::ValueCodes;
@@ -5065,7 +5142,7 @@ mod tests {
                 let element = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
                 assert_eq!(representation_info(element).representation, resident);
                 if let Some(axes) = decode_axes(element) {
-                    assert_eq!(axes.code_exponent, -9);
+                    assert_eq!((axes.code_exponent, axes.profile().code_exponent), (0, -9));
                     let CodingAxes::Direct { codes, scale, bias, group: coded } = axes.coding else {
                         panic!("{resident} is direct");
                     };

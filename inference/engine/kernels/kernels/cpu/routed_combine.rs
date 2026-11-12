@@ -12,6 +12,7 @@ use lib::core::{activation, functions};
 use lib::projection::projection;
 use lib::routed::routed;
 
+#[inline(always)]
 fn routed_combine_stage<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -37,6 +38,7 @@ fn routed_combine_stage<L: Isa, E: Elements>(
     }
 }
 
+#[inline(always)]
 fn routed_combine_shared<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -79,6 +81,7 @@ fn routed_combine_shared<L: Isa, E: Elements>(
     }
 }
 
+#[inline(always)]
 fn routed_combine_quantize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -101,6 +104,7 @@ fn routed_combine_quantize<L: Isa, E: Elements>(
     projection::quantize(product, q8);
 }
 
+#[inline(always)]
 fn routed_combine<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

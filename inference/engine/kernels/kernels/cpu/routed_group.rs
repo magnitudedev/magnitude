@@ -5,6 +5,7 @@
 // flat (row, choice) order so every expert's rows keep that order. Tile
 // slots no choice claims are -1; blocks past `used` are left as they were.
 
+#[inline(always)]
 fn routed_group<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let (e, k, t) = (cx.dim_e() as usize, cx.dim_k() as usize, cx.dim_t() as usize);
     let (routes, counts, order, inverse, blocks, used) =

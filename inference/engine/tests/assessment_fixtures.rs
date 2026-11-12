@@ -784,15 +784,19 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { shares, .. }, .. }, .. } = assessed else {
         panic!("Qwen3.6 35B fits the RTX 3090 streamed under the cap: {assessed:?}");
     };
-    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling }, "host RAM holds the tier's ceiling");
+    assert!(matches!(shares.cold(), &ColdSource::HostTier { slots, .. } if slots == ceiling), "host RAM holds the tier's ceiling");
     // A load's re-plan of the draft keeps its tier at the cap's ceiling
     // where host RAM has room for it, which is then what its fit reports the cold experts
     // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), unbounded, |_, _| {
-                Ok::<_, AssessmentError>(Ok(()))
-            })
+            .with_held_experts(
+                &definition,
+                HeldBound::of(None, draft.device().assessment_capacity_bytes()),
+                &synthetic_prices(),
+                unbounded,
+                |_, _| Ok::<_, AssessmentError>(Ok(())),
+            )
             .unwrap()
             .unwrap()
             .0
@@ -803,7 +807,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         panic!("a capped load streams");
     };
     let shares = ExpertShares::of(&bank);
-    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling });
+    assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling, cache_bytes: bank.host_cache(ceiling).unwrap() });
     assert_eq!(shares.held(shares.floor()).host as u64, ceiling);
     // The host RAM the load holds beside the tier's floor: its own plan's
     // charge, which holds the tier at its floor (`with_host_tier`), not the
@@ -825,6 +829,61 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     assert!((half..=ceiling).contains(&slots), "{slots} host slots of {ceiling}");
     assert!(growth(slots) <= growth(half), "{slots} host slots grow past the room");
     assert!(slots == ceiling || growth(slots + 1) > growth(half), "{slots} host slots leave room for another");
+}
+
+/// A streamed fit's figures count each byte where the load needs it: its
+/// stores' required bytes hold the host tier at its floor, each expert
+/// counted once, and the tier's growth past it is reported apart as cache
+/// (`ColdSource::HostTier::cache_bytes`), the growth the plan chose
+/// (`ExpertBankPlan::host_cache`); required and cache together stay within
+/// the host room the plan admitted. Qwen3.6 35B on the recorded RTX 3090,
+/// uncapped, so its tier's ceiling is every expert (a weight cap bounds the
+/// tier too, and the 6,890,894,474-byte cap leaves it no growth past its
+/// floor): with room for the tier's ceiling, and with room for its floor
+/// alone, the stores require the same bytes.
+#[test]
+fn a_streamed_fit_reports_its_tier_growth_as_cache() {
+    let scratch = Scratch::new("qwen36-tier-cache");
+    let package = qwen36_35b(&scratch);
+    let assess = |reserves| {
+        let mut setup = rtx3090_setup(BackendName::Cuda, reserves, ModelPolicy::default(), standard_service_limits());
+        setup.measurements = synthetic_measurements();
+        let prepared = prepare_model_assessment(&package, &setup.structure)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"));
+        match finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"))
+        {
+            ModelAssessment::Assessed { execution: ModelExecution::Fits { fit, residency: ModelResidency::Streamed { shares, .. } }, .. } => {
+                (fit, shares)
+            }
+            assessed => panic!("Qwen3.6 35B fits the RTX 3090 streamed: {assessed:?}"),
+        }
+    };
+    let host_of = |fit: &ExecutionFit| fit.domains.iter().find(|domain| domain.role == DomainRole::Staging).cloned().unwrap();
+    let (fit, shares) = assess(MemoryReserves::of_machine(None));
+    let bank = fit.bank.as_ref().expect("a streamed fit reports its bank");
+    let &ColdSource::HostTier { slots, cache_bytes } = shares.cold() else {
+        panic!("host RAM holds a tier: {shares:?}");
+    };
+    assert_eq!(slots, bank.host_slots);
+    assert_eq!(cache_bytes, bank.host_cache(slots).unwrap(), "the cache is the growth the plan chose");
+    assert!(cache_bytes > 0, "room for the ceiling grows the tier past its floor");
+    let host = host_of(&fit);
+    assert!(
+        host.required_bytes + cache_bytes <= host.capacity_bytes - host.reserve_bytes,
+        "{} required and {cache_bytes} cache exceed the host room {}",
+        host.required_bytes,
+        host.capacity_bytes - host.reserve_bytes
+    );
+    // Room for the tier's floor alone: no cache, the same required bytes.
+    let (floor_fit, floor_shares) = assess(host_room(host.capacity_bytes, host.required_bytes));
+    assert!(
+        !matches!(floor_shares.cold(), ColdSource::HostTier { cache_bytes, .. } if *cache_bytes > 0),
+        "a host room of the floor grows no cache: {floor_shares:?}"
+    );
+    let required = |fit: &ExecutionFit| fit.domains.iter().map(|domain| (domain.role, domain.required_bytes)).collect::<Vec<_>>();
+    assert_eq!(required(&floor_fit), required(&fit), "the tier's growth is no store's required bytes");
+    assert_eq!(floor_fit.breakdown, fit.breakdown);
 }
 
 /// A load assessment shrinks to fit is the load `with_bank` plans, tier and
@@ -854,14 +913,14 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 }
 
 /// A 4-bit MoE on a 24 GB device holds as much of its bank as the room
-/// holds and merges its prompt passes, the plan's settle pricing each
-/// holding by what it saves: Qwen3.6 35B on the recorded RTX 3090,
-/// uncapped, planned on synthetic prices into the device's stable room
-/// beside its mandatory part, which holds one conversation's state at the
-/// model's whole 262,144-token context, and CUDA's blocks charged only the
-/// tails no allocation reuses: 240 of its 256 slots, the most that room
-/// admits that save anything on these prices (a load lends them the state
-/// no request has committed), and grows to no more than the room's 243; a
+/// holds and merges its prompt passes: Qwen3.6 35B on the recorded RTX
+/// 3090, uncapped, planned into the device's stable room beside its
+/// mandatory part (its arena among it), which holds one conversation's
+/// state at the model's whole 262,144-token context, and CUDA's blocks
+/// charged only the tails no allocation reuses: its ceiling every one of
+/// its 256 experts, structural, and its slots the most the room admits
+/// beside an arena holding a group of one place, no more than the room's
+/// 243 (a group's class beyond it is claimed as the group opens); a
 /// prompt pass covers at least 512 rows.
 #[test]
 fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
@@ -891,8 +950,8 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!(bank.slots, 240, "the bank holds the slots its room admits that save anything");
-    assert!((240..=243).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 243", bank.ceiling);
+    assert_eq!(bank.ceiling, 256, "the bank's ceiling is every expert");
+    assert!((240..=243).contains(&bank.slots), "{} slots: the bank holds the most slots the room's 243 admits", bank.slots);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
     assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
@@ -1035,13 +1094,12 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     };
 
     // The fit holds the most slots the room admits at the floor of places,
-    // and a load's settle of the fit's room on the machine's prices,
-    // confirmed by the same stable fit, holds no more (it may trade slots
-    // for prompt places); nor does a plan of half that room, as a release
-    // slower than another program's take leaves it while it serves.
+    // and a load's plan of the fit's room beside its arena, confirmed by
+    // the same stable fit, holds no more; nor does a plan of half that
+    // room, as a release slower than another program's take leaves it
+    // while it serves.
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
-    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let structure = &setup.structure;
     let stable = StableRoom {
         topology: &structure.topology,
@@ -1049,14 +1107,15 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         status: &structure.status,
         reserves: &structure.reserves,
     };
+    let prices = magnitude_engine::planning::plan_prices(&setup.measurements, draft);
     let settled = |share: u64| {
         let room = |mandatory: u64| {
             let left = bound.saturating_sub(mandatory) / share;
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |candidate, charge| {
-                Ok::<_, AssessmentError>(match stable.fit(candidate, charge).unwrap().verdict {
+            .with_held_experts(definition, HeldBound::room(bound), &prices, room, |_, charge| {
+                Ok::<_, AssessmentError>(match stable.fit(charge).unwrap().verdict {
                     AssessmentFitVerdict::Fits => Ok(()),
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
                 })

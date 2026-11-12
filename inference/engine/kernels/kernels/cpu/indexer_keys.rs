@@ -8,6 +8,7 @@ use lib::attention::attention::{self, Layout};
 use lib::core::rounding::Rounding;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn indexer_keys<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_latent_rows().get([row]);
@@ -38,7 +39,7 @@ fn indexer_keys<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
         sines,
         cx.arg_epsilon(),
         rounding,
-        rounding.map(|_| lib::core::activation::publish::<E::A> as fn(f32) -> f32),
+        rounding.map(|_| lib::core::activation::publish::<E::A>),
         prepared,
     );
     let keys = SlabTensor::from_bound(cx.arg_keys(), cx.arg_slab_rows() as usize);

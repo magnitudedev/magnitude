@@ -37,13 +37,22 @@ pub use weights::RowGeometry;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
-#[cfg(target_arch = "aarch64")]
-pub use isa::{Neon, NeonDot};
-#[cfg(target_arch = "x86_64")]
-pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
+/// Re-exports the tier tokens of this architecture, one per tier of
+/// `seismic_cpu_tiers::tiers!`.
+macro_rules! token_exports {
+    ($($token:ident $name:ident $arch:tt [$($feature:tt),*];)*) => {
+        $(
+            #[cfg(target_arch = $arch)]
+            pub use isa::$token;
+        )*
+    };
+}
 
-/// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-6");
+seismic_cpu_tiers::tiers!(token_exports);
+
+/// The version of this library's kernel code, part of every CPU
+/// implementation digest; bumped in `seismic-cpu-tiers`.
+pub use seismic_cpu_tiers::VERSION;
 
 /// A weight buffer's element as a call reads it: its storage element, that
 /// element's resolved components (which read it in its own layout, a
@@ -329,6 +338,33 @@ impl<'a> Weights<'a> {
                 self.k,
                 out,
             )
+        }
+    }
+
+    /// Whether [`Weights::dot_q8`] takes any row count in one call, not
+    /// blocks of [`Weights::row_block`] rows a call.
+    pub fn spans(&self) -> bool {
+        self.kernels.spans(&self.geometry)
+    }
+
+    /// Whether products over these weights take the tile form
+    /// ([`Weights::tile_q8`]): packed integer codes.
+    pub fn tiled(&self) -> bool {
+        self.kernels.tiled()
+    }
+
+    /// `out[a n + r] = (row first + r) · activation a` for `n = out.len() /
+    /// m` rows from `first` and the `m` activation rows quantized into the
+    /// tiles `x` ([`quant::interleave`]): each weight block decoded once for
+    /// every activation row, each output the sums [`Weights::dot_q8`] gives
+    /// its row alone, bit for bit.
+    #[inline(always)]
+    pub fn tile_q8(&self, first: usize, x: &[quant::Q8Tile], m: usize, out: &mut [f32]) {
+        let n = out.len() / m;
+        assert!(m > 0 && n * m == out.len() && first + n <= self.rows, "rows {first}..{} of {} against {m} activation rows", first + n, self.rows);
+        // SAFETY: the rows lie inside the operand (`from_raw`).
+        unsafe {
+            self.kernels.tile_q8(self.base.add(first * self.geometry.stride), &self.geometry, n, x, m, self.k, out)
         }
     }
 }

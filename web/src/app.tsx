@@ -25,12 +25,12 @@ import {
   BookOpenIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react"
+import { useEffect, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import { type ProviderModelId } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
-import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
+import { ServerSettingsFailed, type NetworkAccessChange, type NetworkBind } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
@@ -62,6 +62,7 @@ import { OnboardingScreen } from "./components/models/onboarding-screen"
 import { onThisComputer } from "./components/models/data"
 import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
+import { SidebarUpdatePill, SidebarUpdateProvider, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -142,7 +143,6 @@ function DesktopHarnessConnections({ canConnect, models, defaultModel, platform,
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
   </>
 }
-type UpdateTransfer = (typeof ApplicationUpdateState.Type)["transfer"]
 const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
 function ThemeRow() {
   const appearance = useAppearancePreference()
@@ -157,13 +157,6 @@ function ThemeRow() {
       {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
         return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
     </div>} />
-}
-/** The application that owns the service, and whether it supports a request. */
-function useApplicationOwner() {
-  const client = useAgentClient()
-  const owner = useAtomValue(client.Application.WatchApplicationOwner({})).result
-  const supports = (capability: OwnerCapability) => Result.isSuccess(owner) && owner.value.capabilities.includes(capability)
-  return { owner, supports }
 }
 function LaunchAtLoginRow() {
   const client = useAgentClient()
@@ -280,13 +273,11 @@ function NetworkAccessRows() {
 }
 function AutomaticUpdatesRow() {
   const client = useAgentClient()
-  const { owner, supports } = useApplicationOwner()
-  const observation = Result.flatMap(owner, value => Option.match(value.updates, { onNone: () => Result.initial(), onSome: updates => Result.success(updates) }))
+  const { owner, supports, observation, snapshot } = useApplicationUpdateObservation()
   const saveAutoDownload = useAtomSet(client.Application.SetApplicationAutoDownload)
   const setAutoDownload = (enabled: boolean) => saveAutoDownload({ enabled })
   const saving = useAtomValue(client.Application.SetApplicationAutoDownload)
   if (Result.isSuccess(owner) && !supports("Updates")) return null
-  const snapshot = Result.isSuccess(observation) ? observation.value : null
   const preference = snapshot?.preference
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label="Automatic updates"
@@ -301,24 +292,9 @@ function AboutRow() {
   const client = useAgentClient()
   const health = useAtomValue(client.Connection.Health({})).result
   const version = Result.isSuccess(health) ? `Magnitude ${health.value.version}` : Result.isFailure(health) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
-  const { owner, supports } = useApplicationOwner()
-  const observation = Result.flatMap(owner, value => Option.match(value.updates, { onNone: () => Result.initial(), onSome: updates => Result.success(updates) }))
-  const checkUpdate = useAtomSet(client.Application.CheckApplicationUpdate)
-  const check = () => checkUpdate({})
-  const discardUpdate = useAtomSet(client.Application.DiscardApplicationUpdate)
-  const discard = () => discardUpdate({})
-  const discarding = useAtomValue(client.Application.DiscardApplicationUpdate)
-  const downloadUpdate = useAtomSet(client.Application.DownloadApplicationUpdate)
-  const download = () => downloadUpdate({})
-  const installUpdate = useAtomSet(client.Application.InstallApplicationUpdate)
-  const disconnect = useDisconnectWarning()
-  const restart = () => disconnect.warn("Restart", () => installUpdate({}))
-  const checking = useAtomValue(client.Application.CheckApplicationUpdate)
-  const downloading = useAtomValue(client.Application.DownloadApplicationUpdate)
-  const restarting = useAtomValue(client.Application.InstallApplicationUpdate)
-  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const { observation, snapshot } = useApplicationUpdateObservation()
+  const { check, discard, download, restart, checking, downloading, restarting, discarding, pending, dialog } = useApplicationUpdateActions()
   const current: UpdateTransfer | undefined = snapshot?.transfer
-  const pending = downloading.waiting || restarting.waiting || discarding.waiting
   const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
     : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}${Option.match(current.failed, {
@@ -339,7 +315,7 @@ function AboutRow() {
       : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}>Download update</NoticeAction>
       : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
   </>
-  return <>{disconnect.dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+  return <>{dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
     children={current?._tag === "ImageAvailable" && <div className="mt-2"><CopyCommand command={`docker pull ${current.image}`} label="Copy pull command" /></div>}
     alert={hasFailure && !busy ? <ErrorNotice
       title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
@@ -388,7 +364,7 @@ export function App() {
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<AppShell page={page} navigate={navigate} platform={platform}>
+  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={page} navigate={navigate} platform={platform}>
       {page === "settings" ? <SettingsPage observation={observation} />
       : service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
@@ -398,7 +374,7 @@ export function App() {
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton startingService />)
       : page === "models" ? <ModelsPage />
       : null}
-  </AppShell></>
+  </AppShell></SidebarUpdateProvider></>
 }
 /** Shown while a browser's own retries run after its connection drops, as it does when Magnitude restarts. */
 function ReconnectingToMagnitude() {
@@ -452,18 +428,22 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
   </div>
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  const pageButton = (key: ApplicationPage) => {
+    const Icon = pageIcons[key]
+    const current = page === key
+    return <Button key={key} variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={current ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+      <Icon className="size-4 shrink-0" />{pageNames[key]}
+    </Button>
+  }
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(["models", "chat", "connections", "usage", "settings"] as const).map(key => {
-      const Icon = pageIcons[key]
-      return <Fragment key={key}>
-        {key === "settings" && <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} mt-auto h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
-          <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
-        </a>}
-        <Button variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-          <Icon className="size-4 shrink-0" />{pageNames[key]}
-        </Button>
-      </Fragment>
-    })}
+    {(["models", "chat", "connections", "usage"] as const).map(pageButton)}
+    <div className="mt-auto flex flex-col gap-2">
+      <SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} />
+      <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
+        <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
+      </a>
+      {pageButton("settings")}
+    </div>
   </nav>
 }
 /** Below `md`: a top bar that opens a navigation drawer over the page, closed by default. */
@@ -490,13 +470,15 @@ function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; 
 /** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
 function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
   const [collapsed, setCollapsed] = useState(false)
+  const updatePending = useSidebarUpdate().update._tag !== "None"
   const integratedControls = platform === "darwin" || platform === "win32"
   const sidebarWidth = collapsed ? 0 : 224
   return <>
     {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
     <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
-      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+      <button type="button" className="relative inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? (updatePending ? "Expand sidebar, update available" : "Expand sidebar") : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
         <SidebarSimpleIcon className="size-5" />
+        {collapsed && updatePending && <span data-update-dot aria-hidden="true" className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-blue-500 ring-2 ring-slate-50 dark:ring-slate-925" />}
       </button>
     </div>
     <aside aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">

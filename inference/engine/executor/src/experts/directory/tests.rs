@@ -70,7 +70,7 @@ impl Directory {
 /// ranking, as the stack feeds it once the step completed.
 fn log(directory: &Directory, sequence: Step, layer: usize, experts: &[usize]) {
     let read = RoutedRead { sequence, layer, experts: experts.to_vec(), choices: experts.len() as u64 };
-    Reuse::of(&directory.ranking).read(&read, &vec![1; experts.len()]);
+    Reuse::of(&directory.ranking).read(&read, &vec![1; experts.len()], crate::experts::reuse::Evidence::Decode);
 }
 
 /// The directory names every streamed layer's map words where the plan
@@ -687,6 +687,25 @@ fn the_one_stores_ranking_prices_its_records() {
     assert_eq!(shared(&directory), 2, "a share of the store's two records");
     directory.shrink_host(0, 1);
     assert_eq!(shared(&directory), 1, "shrunk with the store");
+}
+
+/// The one store holds each layer to its share of the records, as the
+/// ranking measures each layer's: a layer holding past its share gives its
+/// own least ranked expert back first, never another layer's less ranked
+/// one, which a pool of the group's layers by rank would take.
+#[test]
+fn the_one_store_takes_back_a_layer_past_its_share_first() {
+    let mut directory = one_store(4, 2, 16);
+    log(&directory, 1, 1, &[0]);
+    log(&directory, 2, 0, &[0]);
+    log(&directory, 3, 0, &[1]);
+    log(&directory, 4, 0, &[2]);
+    for (layer, expert) in [(1, 0), (0, 0), (0, 1), (0, 2)] {
+        let record = directory.land(layer, expert, 0).expect("a ready record");
+        directory.landed(layer, record, expert, None);
+    }
+    let victims = directory.refill_victims(1, false)[0].iter().map(|&(_, staged)| staged).collect::<Vec<_>>();
+    assert_eq!(victims, [(0, 0)], "layer 0 holds three of its share of two: its least ranked, not layer 1's");
 }
 
 /// A grown bank beside a full host tier: the tier holds more experts

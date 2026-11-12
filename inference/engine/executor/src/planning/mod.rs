@@ -9,13 +9,13 @@ mod capabilities;
 mod components;
 mod execution_plan;
 mod imports;
-pub(crate) use imports::{ImportBacking, ImportPlan};
+pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
 pub use prices::{PlanPrices, PlanSteps};
 pub(crate) use prices::{BankPrices, Prior};
 mod prompt_room;
-pub(crate) use prompt_room::{grouped, pass_ladder, pass_rows_curve, places_curve, routed_group_seconds, routed_prompt_seconds};
+pub(crate) use prompt_room::{pass_ladder, routed_prompt_seconds};
 mod resources;
 mod weights;
 
@@ -151,25 +151,13 @@ pub(crate) mod tests {
         );
         let imports = ImportPlan::new([&table, &ordinary]);
         // The table's source is one row. Its million stored rows must not
-        // permit the two adjacent ordinary sources to share a larger window.
-        assert_eq!(
-            imports
-                .batch([
-                    (0, ImportBacking::Mapped(0..2)),
-                    (0, ImportBacking::Mapped(2..4))
-                ])
-                .unwrap()
-                .len,
-            1
-        );
-        assert_eq!(
-            imports.peak_bytes().unwrap(),
-            ImportPlan::new([&ordinary]).peak_bytes().unwrap()
-        );
+        // permit the two adjacent ordinary sources to share a larger batch.
+        assert_eq!(imports.batch([(0, ordinary.source_bytes), (0, ordinary.source_bytes)]), Some(1));
+        assert_eq!(imports.peak_bytes(), ImportPlan::new([&ordinary]).peak_bytes());
         // Stored tables upload nothing, regardless of their stored extent.
         table.source_bytes = 0;
         table.holding = rows(super::weights::TableFill::Stored);
-        assert_eq!(ImportPlan::new([&table]).peak_bytes().unwrap(), 0);
+        assert_eq!(ImportPlan::new([&table]).peak_bytes(), 0);
     }
 
     #[test]
@@ -332,11 +320,22 @@ pub(crate) mod tests {
     /// engine claim, and not to what the load is planned to hold.
     #[test]
     fn a_search_is_held_to_the_room_it_is_given() {
-        struct Ceiling(std::cell::Cell<Option<Option<u64>>>);
+        struct Ceiling(std::cell::Cell<Option<(Option<u64>, u64)>>);
         impl crate::TuningObserver for Ceiling {
             fn event(&self, event: &crate::TuningEvent) {
                 if let crate::TuningEvent::Budget(budget) = event {
-                    self.0.set(Some(budget.memory.ceiling_bytes));
+                    self.0.set(Some((budget.memory.ceiling_bytes, budget.memory.began_bytes)));
+                }
+            }
+        }
+        /// A room of `.0` bytes in all on the device, whatever it charges.
+        struct Total(u64);
+        impl crate::TuningRoom for Total {
+            fn now(&self, device: &seismic::Device) -> crate::RoomNow {
+                crate::RoomNow {
+                    device_bytes: self.0.saturating_sub(device.device_ledger().charged),
+                    host_bytes: u64::MAX,
+                    host_shared: true,
                 }
             }
         }
@@ -378,11 +377,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let observer = Ceiling(std::cell::Cell::new(None));
-        let room = crate::TuningRoom {
-            device_bytes: 1 << 40,
-            host_bytes: u64::MAX,
-            host_shared: true,
-        };
+        let room = Total(1 << 40);
         crate::AttestedPrograms::search_draft(
             &draft,
             &device,
@@ -399,14 +394,113 @@ pub(crate) mod tests {
                     fresh: false,
                 },
             },
-            Some(room),
+            Some(&room),
         )
         .unwrap();
-        let ceiling = observer
+        let (ceiling, began) = observer
             .0
             .get()
             .expect("a search reports what became of its budget");
-        assert_eq!(ceiling, Some(room.device_bytes));
+        assert_eq!(ceiling, Some(room.0 - began), "held to the room, less what was charged before it began");
+    }
+
+    /// A search's room is read live: a neighbour that takes the room once
+    /// the units' mandatory work is done takes it from the search's next
+    /// admission, and the optional work it would have started is refused
+    /// for its bytes, as the room stood then. A room fixed when the search
+    /// began admitted it into memory that was gone (a Prepare worker,
+    /// ended by the system with the host's memory wired by its neighbours).
+    #[test]
+    fn a_search_admits_against_the_room_as_it_shrinks() {
+        use std::cell::{Cell, RefCell};
+        /// Whether a unit's mandatory work is done, and the domains of the
+        /// search's refusal for bytes as its budget report states them
+        /// (domain, ceiling, held), none where nothing was refused.
+        #[derive(Default)]
+        struct Search {
+            mandatory: Cell<bool>,
+            budget: RefCell<Option<Option<Vec<(&'static str, u64, u64)>>>>,
+        }
+        impl crate::TuningObserver for Search {
+            fn event(&self, event: &crate::TuningEvent) {
+                match event {
+                    crate::TuningEvent::Mandatory { .. } => self.mandatory.set(true),
+                    crate::TuningEvent::Budget(budget) => {
+                        let refused = budget.memory.no_room.as_ref().map(|refused| {
+                            refused.domains.iter().map(|room| (room.domain, room.ceiling_bytes, room.held_bytes)).collect()
+                        });
+                        *self.budget.borrow_mut() = Some(refused);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        /// All the room the platform has until the mandatory work is done,
+        /// and none after: a neighbour took it.
+        struct Taken<'a>(&'a Search);
+        impl crate::TuningRoom for Taken<'_> {
+            fn now(&self, _: &seismic::Device) -> crate::RoomNow {
+                let left = if self.0.mandatory.get() { 0 } else { 1 << 40 };
+                crate::RoomNow { device_bytes: left, host_bytes: left, host_shared: true }
+            }
+        }
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let selected = crate::platform::select_device(
+            &catalog,
+            crate::ExecutionPath::Native,
+            crate::platform::DeviceRequest::Automatic,
+            &crate::platform::MemoryReserves::of_machine(None),
+        )
+        .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
+        let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
+            .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
+        let definition = fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &selected,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            ResourceLimits {
+                max_launch_rows: 2,
+                max_launch_slots: 2,
+                max_selected_rows: 2,
+                max_drafting_slots: 2,
+                exported_logits_rows: 0,
+                max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                max_image_cells: 0,
+                lookahead: false,
+                chain_capacity: std::num::NonZeroUsize::MIN,
+                conversations: std::num::NonZeroUsize::MIN,
+            },
+        )
+        .unwrap();
+        let search = Search::default();
+        let room = Taken(&search);
+        crate::AttestedPrograms::search_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &search,
+                cache: None,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                settings: crate::TuningSettings { budget: std::time::Duration::from_secs(30), fresh: true },
+            },
+            Some(&room),
+        )
+        .unwrap();
+        assert!(search.mandatory.get(), "the units' mandatory work is done");
+        let refused = search.budget.borrow().clone().expect("a search reports what became of its budget");
+        let refused = refused.expect("the optional work is refused for the room that is gone");
+        assert!(
+            refused.iter().any(|&(domain, ceiling, held)| domain == "device" && ceiling == held),
+            "refused in the device's room as it stood then, nothing left beside what tuning held: {refused:?}"
+        );
     }
 
     /// Build actual checked Seismic graph families. The engine may choose how
@@ -805,8 +899,8 @@ pub(crate) mod tests {
             let readout = programs
                 .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            // The plan prices the class of its chain places as the load holds
-            // it: the target's group buffers and the chunk family's slots.
+            // The plan's held pass, the most places a group's class claims,
+            // is the one the load's target family holds.
             let checked = crate::programs::native_target_graph::checked_target_family(
                 backend,
                 draft.load(),
@@ -814,23 +908,18 @@ pub(crate) mod tests {
                 &state,
                 draft.programs().target(),
                 limits,
-                crate::PassLaunches::whole_chain(limits),
+                draft.load().pass(limits),
             )
             .unwrap();
-            assert_eq!(target.group_bytes(3).unwrap(), *checked.group_bytes.at(crate::PassLaunches::whole_chain(limits)), "{backend:?}");
-            let ((assessed, _), chunk) = crate::programs::graph::readout::checked_readout_storage(
+            assert_eq!(target.held_pass(), checked.group_bytes.most(), "{backend:?}");
+            // The readout the plan commits is the one the load prepares.
+            let (assessed, _) = crate::programs::graph::readout::checked_readout_storage(
                 backend,
                 draft.load(),
                 &definition.decoder,
                 limits,
             )
             .unwrap();
-            let (chunk, _) = chunk.expect("a served readout has a prompt chunk's classes");
-            assert_eq!(
-                (readout.chunk_family().workspace_bytes(), readout.chunk_family().output_bytes(), readout.chunk_family().upload_bytes()),
-                (chunk.workspace, chunk.output, chunk.upload),
-                "{backend:?}"
-            );
             assert_eq!(
                 readout.family().workspace_bytes(),
                 assessed.workspace,

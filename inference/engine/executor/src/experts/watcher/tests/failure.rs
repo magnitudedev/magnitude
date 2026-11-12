@@ -199,7 +199,7 @@ fn a_failed_steps_record_frees_only_once_its_read_ends() {
     let harness = layered("stale-read", EXPERTS, 4, 1, 1);
     // Reads queued ahead of the request's, as in
     // `a_read_slower_than_the_patience_is_a_slow_step`.
-    let ahead = Ahead::queue("stale-ahead", 16);
+    let ahead = Ahead::queue("stale-ahead");
     let failed = harness.step();
     assert!(harness.ask_at(&failed, 0, &[3]));
     eventually("the request was never served", || harness.watcher.shared().costs().layers[0].unanticipated == 1);

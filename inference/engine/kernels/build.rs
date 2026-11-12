@@ -145,9 +145,14 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
     ),
     (
+        "lib/projection/operator",
+        &[BackendName::Metal],
+        "the `dense` projection's form bodies (`dense.seismic`), which only Metal's entries take so far; the other backends' entries still hold theirs",
+    ),
+    (
         "lib/core/arrive",
-        &[BackendName::Metal, BackendName::Cuda],
-        "last-threadgroup arrival over `sync` scratch, for the GPU natives that declare sync scratch",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Cpu],
+        "last-work-item arrival over `sync` scratch, for the natives that declare sync scratch",
     ),
     (
         "lib/core/gumbel",

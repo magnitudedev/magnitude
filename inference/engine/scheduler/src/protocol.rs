@@ -33,12 +33,12 @@ pub enum WorkerCommand {
     Status { request: RequestId },
     /// The memory heap's classified holdings and standing.
     Observe,
-    /// Make `bytes` of device memory free beside the model for the
-    /// service's measurement job, in place of any claim before: the bank
-    /// shrinks toward its floor until it is, and grows nothing until the
-    /// claim is released.
+    /// Claim `bytes` of device memory beside the model for the service's
+    /// measurement job, in place of any claim before: committed on the
+    /// device's ledger, which cache yields to at once, and held until
+    /// released.
     ClaimMeasurementRoom { bytes: u64 },
-    /// The measurement job ended: the bank may grow into its room again.
+    /// The measurement job ended: its room is free again.
     ReleaseMeasurementRoom,
     /// The measurement job stored new records: price the experts again
     /// from what is stored.
@@ -57,28 +57,24 @@ pub enum RoomAnswer {
     Released,
 }
 
-/// Why a measurement room cannot be made, and by how many bytes it is short.
+/// Why a measurement room cannot be made (the ledger's refusal,
+/// `memory::ledger::Short`). Cache never refuses it: it yields to the claim
+/// at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoomRefusal {
-    /// Short by more than the expert bank holds above its floor
-    /// (`releasable`): no shrink can meet it.
-    BeyondFloor { short: u64, releasable: u64 },
-    /// The expert bank is at its floor.
-    AtFloor { short: u64 },
+    /// With the model's committed memory, it exceeds what the process may
+    /// hold by `bytes`.
+    Short { bytes: u64 },
+    /// The device's memory reading failed: no figure of it makes room.
+    Blind,
 }
 
 impl fmt::Display for RoomRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (why, short) = match self {
-            Self::BeyondFloor { short, releasable } => {
-                return write!(
-                    f,
-                    "the model holds {releasable} bytes above its floor, which leave it {short} bytes short of the measurement's room"
-                );
-            }
-            Self::AtFloor { short } => ("the expert bank is at its floor", short),
-        };
-        write!(f, "{why}, {short} bytes short of the measurement's room")
+        match self {
+            Self::Short { bytes } => write!(f, "the model's committed memory leaves the measurement's room {bytes} bytes short"),
+            Self::Blind => f.write_str("the device's memory reading failed, so no room can be made"),
+        }
     }
 }
 

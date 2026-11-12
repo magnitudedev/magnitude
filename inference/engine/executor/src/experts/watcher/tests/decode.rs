@@ -166,6 +166,14 @@ fn a_request_past_its_staging_lands_on_the_host() {
 /// it, its bytes the file's.
 #[test]
 fn a_request_reads_an_expert_its_tier_unmapped() {
+    // The tier's fill lands the lowest experts it lacks beside the requests
+    // (4, 5 and 6 once the first request's have gone): a landing before a
+    // route serves its expert from the tier, and one before the request is
+    // served keeps it, neither a miss read on demand. Its reads stand behind
+    // the line, taken only once a request hastens them, so every miss is
+    // read on demand, whatever the threads' timing.
+    let _alone = alone();
+    let ahead = Ahead::queue("kept-ahead");
     // The tier's records are short of its reserve: it keeps nothing it has
     // landed.
     let harness = lending("kept", EXPERTS, 4, 1, 8, DECODE, 7, Placer::Tier, false);
@@ -183,6 +191,7 @@ fn a_request_reads_an_expert_its_tier_unmapped() {
     step.complete().unwrap();
     let layer = harness.watcher.shared().costs().layers[0];
     assert_eq!((layer.misses, layer.unanticipated), (9, 9));
+    ahead.finish();
 }
 
 /// A tier record unmapped for the reserve is graced through its expert's

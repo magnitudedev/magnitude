@@ -6,6 +6,7 @@
 
 use lib::core::reduce;
 
+#[inline(always)]
 fn per_layer_inputs<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let chunk = cx.dim_p() as usize;

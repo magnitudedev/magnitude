@@ -47,10 +47,11 @@ pub fn corpus_path(relative: &str) -> PathBuf {
 }
 
 /// The backend's device; a missing device is a test failure, never a skip.
+/// `backend`'s device, its ledgers its own: no other test's open shares a
+/// limit or a charge with it.
 pub fn device(backend: BackendName) -> Device {
-    Devices::discover(&[])
-        .expect("device discovery")
-        .open_backend(backend)
+    let devices = Devices::discover(&[]).expect("device discovery");
+    seismic::testing::open_backend_own_ledgers(&devices, backend, Default::default())
         .unwrap_or_else(|e| panic!("{} device required: {e}", backend.as_str()))
 }
 

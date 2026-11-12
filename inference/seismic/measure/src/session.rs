@@ -621,7 +621,9 @@ pub(crate) enum Stopping {
 pub(crate) struct Resolution {
     error_rate: f64,
     next: usize,
-    budget: Option<f64>,
+    /// Seconds of wall time sampling may take, and the samples it cannot
+    /// end before.
+    budget: Option<(f64, usize)>,
 }
 
 /// What the stopping rule does once a given count of samples is read.
@@ -653,11 +655,12 @@ impl Stopping {
     }
 
     /// Sampling until the median is resolved at `error_rate` or sampling
-    /// has taken `seconds` of wall time, whichever comes first.
-    pub(crate) fn within(error_rate: f64, seconds: f64) -> Self {
+    /// has taken `seconds` of wall time with `floor` samples read, whichever
+    /// comes first.
+    pub(crate) fn within(error_rate: f64, seconds: f64, floor: usize) -> Self {
         let mut stopping = Self::resolved(error_rate);
         if let Self::Resolved(resolution) = &mut stopping {
-            resolution.budget = Some(seconds);
+            resolution.budget = Some((seconds, floor));
         }
         stopping
     }
@@ -670,7 +673,7 @@ impl Stopping {
             Self::Count(_) => After::Stops,
             // The next sample would end past the budget: nothing follows the
             // one in flight, not even the lead a reading of the rule queues.
-            Self::Resolved(resolution) if resolution.reaches(expected) => After::Stops,
+            Self::Resolved(resolution) if resolution.reaches(expected, count) => After::Stops,
             Self::Resolved(resolution) if count == resolution.next => After::Reads(resolution),
             Self::Resolved(_) => After::Continues,
         }
@@ -678,9 +681,10 @@ impl Stopping {
 }
 
 impl Resolution {
-    /// Whether sampling that has taken `seconds` reaches the budget.
-    fn reaches(&self, seconds: f64) -> bool {
-        self.budget.is_some_and(|budget| seconds >= budget)
+    /// Whether sampling that has taken `seconds` and read `samples` reaches
+    /// the budget: it is spent and the floor of samples is read.
+    fn reaches(&self, seconds: f64, samples: usize) -> bool {
+        self.budget.is_some_and(|(budget, floor)| seconds >= budget && samples >= floor)
     }
 
     /// Whether sampling stops at `samples`, a count the rule is read at,
@@ -691,7 +695,7 @@ impl Resolution {
         if samples.len() >= self.next {
             self.next = next_reading(samples.len());
         }
-        Timing::of(samples, self.error_rate).resolved() || self.reaches(seconds)
+        Timing::of(samples, self.error_rate).resolved() || self.reaches(seconds, samples.len())
     }
 }
 
@@ -1138,7 +1142,7 @@ mod tests {
         let mut slot = Slot::new(Scripted::new(0, 1., &log));
         slot.sample_alone(
             1e-3,
-            &mut Stopping::within(RATE, 0.),
+            &mut Stopping::within(RATE, 0., 1),
             None,
             Deadline::default(),
         )
@@ -1151,7 +1155,7 @@ mod tests {
         let mut slot = Slot::new(Scripted::new(0, 1e-4, &log));
         slot.sample_alone(
             1e-3,
-            &mut Stopping::within(RATE, 60.),
+            &mut Stopping::within(RATE, 60., 1),
             None,
             Deadline::default(),
         )

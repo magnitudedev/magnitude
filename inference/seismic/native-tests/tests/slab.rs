@@ -73,7 +73,12 @@ fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
     let scaled = graph
         .enqueue(
             &kernel,
-            slab_scale::WorkflowArgs { x: port.tensor().into(), slab_rows: 4, factor: 2.0, delay_ms: 0 },
+            slab_scale::WorkflowArgs {
+                x: port.tensor().into(),
+                slab_rows: seismic::Argument::from(4),
+                factor: seismic::Argument::from(2.0),
+                delay_ms: seismic::Argument::from(0),
+            },
         )
         .unwrap()
         .value;

@@ -3,6 +3,7 @@
 
 use lib::core::functions;
 
+#[inline(always)]
 fn stream_collapse<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (hidden, pre) = (cx.arg_hidden(), cx.arg_pre().row([row, 0]));

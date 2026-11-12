@@ -16,6 +16,8 @@ pub fn cuda() -> Option<Device> {
 
 #[path = "../gguf_formats/mod.rs"]
 mod gguf_formats;
+#[path = "../int8_rule/mod.rs"]
+pub mod int8_rule;
 #[path = "../mapped/mod.rs"]
 mod mapped;
 pub use gguf_formats::{Format, Rng};
@@ -338,25 +340,18 @@ pub fn admitted(mappings: &[Mapping], admits: impl Fn(Mapping) -> bool) -> Vec<M
         .collect()
 }
 
-/// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32
-/// values d = max|x| / 127 and x ~= d * rint(x / d). Returns the dequantized
-/// rows and each value's half quantization step (d / 2).
+/// INT8 quantization of rows of `k` as the INT8 path forms them, per 32
+/// values by the rule every backend shares (`int8_rule`). Returns the
+/// dequantized rows and each value's half quantization step (d / 2).
 pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f32>) {
     let mut values = vec![0.0; x.len()];
     let mut half_steps = vec![0.0; x.len()];
-    for group in (0..x.len()).step_by(32) {
-        debug_assert_eq!(group % k % 32, 0);
-        let maximum = x[group..group + 32]
-            .iter()
-            .fold(0.0f32, |acc, v| acc.max(v.abs()));
-        let d = maximum / 127.0;
-        for i in group..group + 32 {
-            values[i] = if d == 0.0 {
-                0.0
-            } else {
-                d * (x[i] / d).round_ties_even()
-            };
-            half_steps[i] = d / 2.0;
+    for group in (0..x.len()).step_by(int8_rule::GROUP) {
+        debug_assert_eq!(group % k % int8_rule::GROUP, 0);
+        let (d, codes) = int8_rule::cpu(x[group..group + int8_rule::GROUP].try_into().unwrap());
+        for (i, code) in codes.iter().enumerate() {
+            values[group + i] = d * f32::from(*code);
+            half_steps[group + i] = d / 2.0;
         }
     }
     (values, half_steps)

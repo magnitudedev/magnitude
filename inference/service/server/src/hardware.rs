@@ -310,7 +310,6 @@ fn snapshot(
             stable_capacity_bytes: reading.stable_bytes,
             allocation_capacity_bytes: reading.capacity_bytes,
             planning_reserve_bytes: reading.thresholds.planning_bytes,
-            emergency_reserve_bytes: reading.thresholds.emergency_bytes,
         };
         Ok((hardware, reading.headroom_bytes))
     };
@@ -562,7 +561,6 @@ mod tests {
                 stable_capacity_bytes: 768,
                 allocation_capacity_bytes: 1024,
                 planning_reserve_bytes: 256,
-                emergency_reserve_bytes: 64,
             },
             current_free_bytes: None,
         };

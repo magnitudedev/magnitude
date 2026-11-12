@@ -887,7 +887,7 @@ def device_costs(options, models, scratch):
         residual = loaded - context - programs - held("loaded")
         peak = max(value for _, value in sampler.samples) - baseline
         kernels = breakdown["kernels"]
-        planned = breakdown["serving_bytes"] - breakdown["state_bytes"] + breakdown["loaded_state_bytes"]
+        planned = breakdown["serving_bytes"] - breakdown["state_bytes"] + breakdown["startup_state_bytes"]
         result = {
             "model": paths, "backend": options.backend, "host": platform.node(), "os": platform.system(),
             "kernels": kernels, "idle_used_bytes": idle, "baseline_used_bytes": baseline,

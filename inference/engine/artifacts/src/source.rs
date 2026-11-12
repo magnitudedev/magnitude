@@ -3,62 +3,7 @@ use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::Path,
-    sync::Arc,
 };
-
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-
-/// A page-aligned, read-only window of one open artifact. The page-rounded
-/// mapping is exposed separately from the requested byte range so a device
-/// can wrap the mapping and address a tensor within it.
-#[cfg(unix)]
-pub struct MappedWindow {
-    _source: Arc<FileSource>,
-    pointer: std::ptr::NonNull<u8>,
-    mapped_len: usize,
-    data_offset: usize,
-    data_len: usize,
-}
-
-#[cfg(unix)]
-unsafe impl Send for MappedWindow {}
-#[cfg(unix)]
-unsafe impl Sync for MappedWindow {}
-
-#[cfg(unix)]
-impl MappedWindow {
-    pub fn data_offset(&self) -> usize {
-        self.data_offset
-    }
-    pub fn data_len(&self) -> usize {
-        self.data_len
-    }
-    pub fn mapped_len(&self) -> usize {
-        self.mapped_len
-    }
-    pub fn data(&self) -> &[u8] {
-        &self.as_ref()[self.data_offset..self.data_offset + self.data_len]
-    }
-}
-
-#[cfg(unix)]
-impl AsRef<[u8]> for MappedWindow {
-    fn as_ref(&self) -> &[u8] {
-        // The mapping is read-only, stays live through this owner, and its
-        // page-rounded length was checked against the host address domain.
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.mapped_len) }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for MappedWindow {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.pointer.as_ptr().cast(), self.mapped_len);
-        }
-    }
-}
 
 /// An open view of a regular artifact file.
 ///
@@ -66,7 +11,10 @@ impl Drop for MappedWindow {
 /// Callers must keep the file's contents unchanged while this source is in use.
 ///
 /// Every read of it is a request of its volume's link
-/// (`seismic_io::Reader`), through the file cache.
+/// (`seismic_io::Reader`), around the file cache: a model's bytes, read
+/// once into what holds them, would otherwise stay in the cache as memory
+/// taken from free pages, which macOS reclaims only beside other programs'
+/// anonymous pages.
 pub struct FileSource {
     opened: seismic_io::OpenFile,
     reader: seismic_io::Reader,
@@ -83,9 +31,8 @@ impl FileSource {
     /// resolved through links: a content-addressed store names its files by
     /// links, and a split GGUF finds its shards by that name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        // Its reads fill the cache with the ranges they name, no more.
         let opened = seismic_io::OpenFile::open(path)?;
-        let reader = seismic_io::Reader::of(&opened, seismic_io::CachePolicy::Cached)?;
+        let reader = seismic_io::Reader::of(&opened, seismic_io::CachePolicy::Uncached)?;
         Ok(Self { opened, reader })
     }
 
@@ -105,63 +52,6 @@ impl FileSource {
         Ok(self.file().metadata()?)
     }
 
-    /// Map a nonempty source range read-only. The mapping owns this open file
-    /// and may outlive path replacement or the package that created it.
-    #[cfg(unix)]
-    pub fn map_window(
-        self: &Arc<Self>,
-        offset: u64,
-        length: u64,
-    ) -> Result<Arc<MappedWindow>, Error> {
-        let end = offset
-            .checked_add(length)
-            .filter(|end| length != 0 && *end <= self.size())
-            .ok_or_else(|| {
-                Error::Invalid("mapped artifact range is empty or outside the file".into())
-            })?;
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        let page = u64::try_from(page)
-            .map_err(|_| Error::Invalid("host page size is unavailable".into()))?;
-        let mapped_start = offset / page * page;
-        let mapped_end = end
-            .checked_add(page - 1)
-            .map(|end| end / page * page)
-            .ok_or_else(|| Error::Invalid("mapped artifact range overflows".into()))?;
-        let mapped_len = usize::try_from(mapped_end - mapped_start).map_err(|_| {
-            Error::Invalid("mapped artifact range exceeds host address space".into())
-        })?;
-        let file_offset = libc::off_t::try_from(mapped_start).map_err(|_| {
-            Error::Invalid("mapped artifact offset exceeds host file domain".into())
-        })?;
-        let pointer = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                mapped_len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                self.file().as_raw_fd(),
-                file_offset,
-            )
-        };
-        if pointer == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error().into());
-        }
-        let Some(pointer) = std::ptr::NonNull::new(pointer.cast()) else {
-            unsafe { libc::munmap(std::ptr::null_mut(), mapped_len) };
-            return Err(Error::Invalid(
-                "host mapping returned a null address".into(),
-            ));
-        };
-        Ok(Arc::new(MappedWindow {
-            _source: self.clone(),
-            pointer,
-            mapped_len,
-            data_offset: usize::try_from(offset - mapped_start)
-                .expect("offset lies within mapped range"),
-            data_len: usize::try_from(length).expect("mapped length fits host address space"),
-        }))
-    }
-
     pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
         let end = offset
             .checked_add(out.len() as u64)
@@ -171,17 +61,6 @@ impl FileSource {
         }
         // A caller waits on the bytes: due now.
         Ok(self.reader.read_at([(offset, out)], seismic_io::Want::now())?)
-    }
-
-    /// Read each of `reads`' buffers from its offset, as one request a caller
-    /// waits on (`seismic_io::Reader::read_at`): the link reads them at its
-    /// depth, not one after another. Each lies inside the artifact.
-    pub fn read_each<'a>(&self, reads: impl IntoIterator<Item = (u64, &'a mut [u8])>) -> Result<(), Error> {
-        let reads = reads.into_iter().collect::<Vec<_>>();
-        if reads.iter().any(|(offset, out)| offset.checked_add(out.len() as u64).is_none_or(|end| end > self.size())) {
-            return Err(Error::Invalid("read outside artifact".into()));
-        }
-        Ok(self.reader.read_at(reads, seismic_io::Want::now())?)
     }
 
     pub fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
@@ -209,7 +88,7 @@ impl FileSource {
     /// Read the `length` bytes from `offset` in order for `want`, handing
     /// each chunk to `sink` with its offset in the
     /// range as it lands (`seismic_io::Reader::stream`): the link reads the
-    /// range at its depth, through the cache, and no more of the file.
+    /// range at its depth, and no more of the file.
     pub fn stream<E: From<io::Error>>(
         &self,
         offset: u64,

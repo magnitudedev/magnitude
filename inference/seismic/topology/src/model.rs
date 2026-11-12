@@ -109,9 +109,10 @@ pub enum ReportedBy {
     /// page neither wired nor held by the compressor: what the OS can make
     /// available, compressing other programs' data if it must.
     MachMovablePages,
-    /// macOS Mach `HOST_VM_INFO64`: free (less speculative), file-backed and
-    /// purgeable pages, what can be taken without compressing or swapping a
-    /// program's data.
+    /// macOS Mach `HOST_VM_INFO64`: free (less speculative) and purgeable
+    /// pages above `vm.vm_page_free_target`, what can be taken without the
+    /// OS reclaiming anything, so
+    /// without compressing or swapping a program's data.
     MachAllocatablePages,
     /// Windows `GlobalMemoryStatusEx`: the lesser of available physical
     /// memory and available commit.
@@ -307,7 +308,52 @@ pub enum Availability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The largest single allocation; neither capacity nor availability.
-    pub max_allocation: Reported<u64>,
+    pub max_allocation: AllocationLimit,
+}
+
+/// What bounds an executor's single allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationLimit {
+    /// The device's own bound, `bytes`, as its API reports it `by`.
+    Device { bytes: u64, by: DeviceAllocationBound },
+    /// No device bound: the host's address-size limit, `bytes` of it (the
+    /// CPU backend's).
+    AddressSpace(u64),
+}
+
+/// The API figure that reports a device's single-allocation bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAllocationBound {
+    /// `MTLDevice.maxBufferLength`.
+    MetalMaxBufferLength,
+    /// `cuDeviceTotalMem`: memory of the exposed device or partition.
+    CudaTotalMemory,
+    /// `min(maxMemoryAllocationSize, maxBufferSize)`.
+    VulkanMaxAllocation,
+}
+
+impl AllocationLimit {
+    /// The largest single allocation, in bytes.
+    pub fn bytes(&self) -> u64 {
+        match *self {
+            Self::Device { bytes, .. } | Self::AddressSpace(bytes) => bytes,
+        }
+    }
+
+    /// The limit as reported, with the figure that reported it.
+    pub fn reported(&self) -> Reported<u64> {
+        match *self {
+            Self::Device { bytes, by } => Reported::new(
+                bytes,
+                match by {
+                    DeviceAllocationBound::MetalMaxBufferLength => ReportedBy::MetalMaxBufferLength,
+                    DeviceAllocationBound::CudaTotalMemory => ReportedBy::CudaTotalMemory,
+                    DeviceAllocationBound::VulkanMaxAllocation => ReportedBy::VulkanMaxAllocation,
+                },
+            ),
+            Self::AddressSpace(bytes) => Reported::new(bytes, ReportedBy::CpuAddressSpace),
+        }
+    }
 }
 
 /// What a reserved range's records are: each `record` bytes, and the most

@@ -284,13 +284,19 @@ kernel void attention_decode_k8v4_partial(
 #endif
 }
 
-// L2: threadgroup (query head, row), one thread per column: the fixed-order
-// merge of the row's partitions (with the head's sink when SK = 1) and the
-// output gate.
+// L2: threadgroup (query head, row, 32-column group), one thread per column:
+// the fixed-order merge of the row's partitions (with the head's sink when
+// SK = 1) and the output gate. With the output rotary (RO = 1), one
+// threadgroup holds the head's whole row, which it turns back in F32 before
+// publishing it.
 kernel void attention_decode_k8v4_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
@@ -298,28 +304,15 @@ kernel void attention_decode_k8v4_merge(
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_threadgroup]]) {
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
+    constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
-    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
-        partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
-        SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
-}
-
-// The output rotary (RO = 1, `attention::output_rotary`): threadgroup (row,
-// query head), one thread per rotary pair, after every output is stored.
-kernel void attention_decode_k8v4_rotate(
-    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
-    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
-    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
-    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint pair [[thread_index_in_threadgroup]]) {
-    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
-        return;
-    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
-        group.x, group.y, pair);
+    threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
+    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, 0, ROTATED>(query, gate,
+        visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y,
+        ROTATED ? thread_index : group.z * 32 + lane, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
+        thread_index < 32, row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
 }

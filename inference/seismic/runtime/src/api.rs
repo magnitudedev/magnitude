@@ -720,6 +720,50 @@ pub mod device {
     use seismic_topology::{Contract, DeviceTopology, Executor, Placing, StoreId};
     use std::sync::Arc;
 
+    /// The right to bound every ledger an opened device reaches
+    /// (`DeviceInner::bounds`), released as it drops.
+    pub struct Bounds {
+        memory: Arc<crate::memory::DeviceLedgers>,
+        topology: Arc<DeviceTopology>,
+        _bounder: Arc<crate::memory::Bounder>,
+    }
+
+    impl Bounds {
+        /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
+        /// revokes what is charged. A store's ledger lives only while an
+        /// open device reaches it, so only a store this device reaches can
+        /// be bound.
+        pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
+            match ledger {
+                Ledger::Path(path) => {
+                    self.memory.path(path).ok_or(LimitError::ForeignPath(path))?.share.account().set_bound(bound)
+                }
+                Ledger::Own(store) => {
+                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.set_bound(bound)
+                }
+                Ledger::Store(store) => {
+                    self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
+                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound(bound)
+                }
+            }
+            Ok(())
+        }
+
+        /// Hold store `store`'s bound to `source` of the store's claim,
+        /// read at each admission against the store from now on, in place of
+        /// any value set: its holder's room as the holder stands at the
+        /// admission, never as it stood at a reading.
+        pub fn bound_by(
+            &self,
+            store: StoreId,
+            source: impl Fn(u64) -> Option<u64> + Send + Sync + 'static,
+        ) -> Result<(), LimitError> {
+            self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
+            self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound_source(Arc::new(source));
+            Ok(())
+        }
+    }
+
     /// One opened executor: its immutable description, execution resources
     /// and ledgers.
     pub struct DeviceInner {
@@ -744,6 +788,10 @@ pub mod device {
         /// What the device's recorded graphs hold for their census,
         /// measured on opening where the driver takes it.
         pub(crate) graph_cost: seismic_compiler::graph_cost::GraphCost,
+        /// Set once the load's charge is final: from then on a record table
+        /// formed outside a lifted scope ([`DeviceInner::lift_table_seal`])
+        /// is memory no claim covers (see `record_table`).
+        pub(crate) tables_sealed: std::sync::atomic::AtomicBool,
         /// Kernels tuning chose and formed, handed to the serving
         /// preparation of the same specialization so nothing is formed twice
         /// (`NativePrepared::hand_off`). Taken on first use.
@@ -754,7 +802,39 @@ pub mod device {
             >,
         >,
     }
+    thread_local! {
+        /// The devices whose table seal this thread has lifted, one entry per
+        /// open scope ([`DeviceInner::lift_table_seal`]).
+        static LIFTED_SEALS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     impl DeviceInner {
+        /// Declare the load's charge final: forming a record table afterwards,
+        /// outside a lifted scope, is an invariant violation.
+        pub fn seal_record_tables(&self) {
+            self.tables_sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Lift the seal until [`Self::restore_table_seal`], for allocations
+        /// made under a claim after the load (a component's import).
+        ///
+        /// The lift belongs to the calling thread: a table another thread
+        /// forms meanwhile is outside any claim and stops there as it does
+        /// anywhere ([`record_table`]).
+        pub fn lift_table_seal(&self) {
+            LIFTED_SEALS.with(|lifted| lifted.borrow_mut().push(self.seal_key()));
+        }
+        pub fn restore_table_seal(&self) {
+            LIFTED_SEALS.with(|lifted| {
+                let mut lifted = lifted.borrow_mut();
+                let at = lifted.iter().rposition(|key| *key == self.seal_key()).expect("a restored seal lift is this thread's");
+                lifted.remove(at);
+            });
+        }
+        fn seal_key(&self) -> usize {
+            std::ptr::from_ref(self) as usize
+        }
+        pub(crate) fn seal_lifted_here(&self) -> bool {
+            LIFTED_SEALS.with(|lifted| lifted.borrow().contains(&self.seal_key()))
+        }
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
             self.trace
                 .lock()
@@ -900,7 +980,7 @@ pub mod device {
                 .map_err(|why| unreservable(Some(why.clone())))?
                 .ok_or_else(|| unreservable(None))?;
             self.kind.allocate_reserved_tensor(
-                crate::driver::ReservedRange::new(contract, span, records, rows, self.info().limits().max_allocation.value),
+                crate::driver::ReservedRange::new(contract, span, records, rows, self.info().limits().max_allocation.bytes()),
                 committed,
                 alignment,
             )
@@ -1002,30 +1082,25 @@ pub mod device {
         pub fn device_ledger(&self) -> DeviceLedgerView {
             self.memory.device_ledger().view()
         }
-        /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
-        /// revokes what is charged. A store's ledger lives only while an
-        /// open device reaches it, so only a store this device reaches can
-        /// be bound.
-        pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
-            match ledger {
-                Ledger::Store(store) => {
-                    self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
-                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound(bound);
-                }
-                Ledger::Path(path) => self
-                    .memory
-                    .path(path)
-                    .ok_or(LimitError::ForeignPath(path))?
-                    .share
-                    .account()
-                    .set_bound(bound),
-                Ledger::Own(store) => self
-                    .memory
-                    .store(store)
-                    .ok_or(LimitError::ForeignStore(store))?
-                    .set_bound(bound),
+        /// The right to bound every ledger the device reaches: its paths'
+        /// accounts, its own ledgers, and each store's ledger, every
+        /// executor's of its scope that reaches the store. One live holder
+        /// per ledger; taking it while another holder lives panics, naming
+        /// both.
+        #[track_caller]
+        pub fn bounds(&self) -> Bounds {
+            let bounder = Arc::new(crate::memory::Bounder {
+                selector: self.info.selector(),
+                taken: std::panic::Location::caller(),
+            });
+            for path in &self.memory.paths {
+                path.share.account().right.take(&bounder);
             }
-            Ok(())
+            for (_, ledger) in &self.memory.stores {
+                ledger.right.take(&bounder);
+                ledger.store().right.take(&bounder);
+            }
+            Bounds { memory: self.memory.clone(), topology: self.topology.clone(), _bounder: bounder }
         }
         /// Start the high-water mark of each of the device's own ledgers
         /// again from what it charges now, and forget its refusals.
@@ -1296,6 +1371,18 @@ pub mod tensor {
         storage: &Arc<Allocation>,
         offsets: impl Iterator<Item = u64>,
     ) -> Result<Arc<Allocation>, TensorError> {
+        // A table formed after the load is sealed is device memory no claim
+        // covers: a state that must not exist, so every build stops where it
+        // is formed (every fixed record port's table is formed as its plan is
+        // bound, `bind_static`, and a grown slab's is in its allocation's
+        // charge).
+        assert!(
+            !device.tables_sealed.load(std::sync::atomic::Ordering::SeqCst)
+                || device.seal_lifted_here(),
+            "invariant violated: a record table over {} bytes of storage was formed after the load, outside any claim: {}",
+            storage.bytes(),
+            std::backtrace::Backtrace::force_capture()
+        );
         let bytes = seismic_lang::registry::record_table(
             offsets.map(|offset| device.allocation_address(storage, offset)),
         );

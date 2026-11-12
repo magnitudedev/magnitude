@@ -7,6 +7,7 @@
 
 const PARTS: usize = 64;
 
+#[inline(always)]
 fn token_confidence_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (part, row) = (group[0] as usize, group[1] as usize);
     let vocabulary = cx.dim_v() as usize;
@@ -21,6 +22,7 @@ fn token_confidence_partition<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
     out.copy_from_slice(&[maximum, total]);
 }
 
+#[inline(always)]
 fn token_confidence_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     // SAFETY: the partition launch wrote every pair before this launch.

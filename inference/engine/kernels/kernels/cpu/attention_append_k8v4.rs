@@ -2,6 +2,7 @@
 use lib::attention::attention::{self, Form, Layout};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     // The keys' and values' form: no queries, so no query norm or output
@@ -56,17 +57,17 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
             // SAFETY: destinations are distinct, freshly reserved history rows
             // the subsequent attention phase reads after this launch completes.
             unsafe {
-                attention::affine_encode(
+                attention::store_affine_head(
                     &keys[head * w..][..w],
-                    (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    key_codes.row_mut([destination, head, 0]),
-                    key_coefficients.row_mut([destination, head, 0]),
-                );
-                attention::affine_encode(
                     &values[head * w..][..w],
-                    (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    value_codes.row_mut([destination, head, 0]),
-                    value_coefficients.row_mut([destination, head, 0]),
+                    (
+                        (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                        (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    ),
+                    (&key_codes, &key_coefficients),
+                    (&value_codes, &value_coefficients),
+                    destination,
+                    head,
                 );
             }
         }

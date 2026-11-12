@@ -25,7 +25,7 @@ use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
-use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -127,13 +127,8 @@ impl ModelInstances {
     pub fn start(environment: ResidencyEnvironment) -> Self {
         let environment = Arc::new(environment);
         let (client, inbox) = ResidencyClient::channel();
-        // The reserves of what this process may use, as fit reads them: the kernel's own line.
-        // Without a reading, no line is known: the line the OS reports none of.
-        let topology = environment.catalog.topology();
-        let thresholds = match environment.catalog.inventory().host_status() {
-            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves, HostRoom::Allocatable).thresholds,
-            Err(_) => environment.reserves.thresholds(topology.host_ram(), 0),
-        };
+        // The reserves of what this process may use, as fit reads them.
+        let thresholds = environment.reserves.thresholds(environment.catalog.topology().host_ram());
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
             thresholds,
@@ -612,7 +607,7 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
 }
 
 /// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
-/// claim found available above the domain's reserve, or under pressure with no byte count.
+/// claim found available above the domain's reserve.
 fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailure {
     let retryable = error.retryable();
     let code = match &error {
@@ -621,9 +616,6 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
                 required_bytes: memory.required,
                 available_bytes: memory.available,
             });
-        }
-        LoadError::MemoryPressure { .. } => {
-            return ModelOperationFailure::MemoryShortage(MemoryShortage::UnderPressure {});
         }
         LoadError::WeightBound(bound) => return ModelOperationFailure::WeightBound(*bound),
         LoadError::Artifact(_) => "invalid_model_package",

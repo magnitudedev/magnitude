@@ -33,7 +33,7 @@ expert-routing = []
 # fake expert bank, for the tests of the owners above the domain, and the
 # expert watchers' stall (`starve`). Enabled only as a
 # dev-dependency; never by a served engine.
-fixtures = []
+fixtures = ["seismic/fixtures"]
 
 # The report's stacks on x86-64 Linux, unwound through the images' tables
 # without allocating (`diagnostics::stacks::cfi`).

@@ -203,7 +203,8 @@ fn specializations(device: &Device, geometry: Geometry, words: usize) -> Vec<(St
                 BackendName::Metal => base
                     .with_param("QT", query_tile)
                     .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
-                    .with_param("DIRECT", 0),
+                    .with_param("DIRECT", 0)
+                    .with_param("KEYS", 8),
                 BackendName::Vulkan => base.with_param("ROWS", 64),
                 _ => base.with_param("QT", query_tile),
             }

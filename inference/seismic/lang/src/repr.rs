@@ -1964,8 +1964,11 @@ impl OperandRecipe {
 /// bits (a grid code's entry is its whole bytes, `low`, and the rest,
 /// `high`), their values scaled by
 /// `2^code_exponent` (a floating value code is its codebook,
-/// `FloatCodeFormat::codebook`), and the `coding`: the codes with the
-/// coefficients that scale them.
+/// `FloatCodeFormat::codebook`, or an E4M3 code its exact value, under
+/// exponent 0), and the `coding`: the codes with the coefficients that
+/// scale them. A decoder folds `2^code_exponent` into its scales (and a
+/// factor's), which every scale's values take exactly
+/// (`ScaleEncoding::scales_exactly`, which `decode_axes` asserts).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeAxes {
     pub low: u32,
@@ -1976,8 +1979,9 @@ pub struct DecodeAxes {
 
 /// What a decoder's code planes hold: fields read through an
 /// interpretation, grid entries each coding `GRID_VALUES` values, or E4M3
-/// bytes, each code `2^9` times its value (an integer for every finite
-/// code, under `code_exponent` -9) and a NaN code NaN, which a decoder keeps.
+/// bytes, each code its exact value (`2^E4M3_EXPONENT` times an integer for
+/// every finite code, the profile's) and both NaN codes the registry's one
+/// NaN (`f32::NAN`, the canonical NaN its arithmetic gives).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueCodes {
     Fields(CodeInterpretation),
@@ -1986,13 +1990,17 @@ pub enum ValueCodes {
 }
 
 impl ValueCodes {
+    /// The exponent of E4M3 values' integers: each finite value is
+    /// `2^E4M3_EXPONENT` times an integer (its least subnormal is 2^-9).
+    pub const E4M3_EXPONENT: i32 = -9;
+
     /// The integer of every finite E4M3 code (`ValueCodes::E4m3`),
-    /// ascending: its value times `2^9`.
+    /// ascending: its value times `2^-E4M3_EXPONENT`.
     fn e4m3_integers() -> Vec<i32> {
         let mut codes = (0..=u8::MAX)
             .map(|raw| FloatCodeFormat::E4M3.decode(u32::from(raw)))
             .filter(|value| !value.is_nan())
-            .map(|value| (value * 512.0) as i32)
+            .map(|value| (value * 2f32.powi(-Self::E4M3_EXPONENT)) as i32)
             .collect::<Vec<_>>();
         codes.sort_unstable();
         codes.dedup();
@@ -2050,14 +2058,21 @@ impl DecodeAxes {
             }
         };
         let values = self.coding.codes();
-        let codes = match &values {
-            ValueCodes::Fields(interpretation) => interpretation.codes(self.low + self.high),
-            ValueCodes::Grid(grid) => grid.codes(),
-            ValueCodes::E4m3 => ValueCodes::e4m3_integers(),
+        // The integer codes and the power of two scaling them: E4M3's
+        // exact values are integers under their own exponent.
+        let (codes, code_exponent) = match &values {
+            ValueCodes::Fields(interpretation) => {
+                (interpretation.codes(self.low + self.high), self.code_exponent)
+            }
+            ValueCodes::Grid(grid) => (grid.codes(), self.code_exponent),
+            ValueCodes::E4m3 => (
+                ValueCodes::e4m3_integers(),
+                self.code_exponent + ValueCodes::E4M3_EXPONENT,
+            ),
         };
         Profile {
             codes: Domain::of(&codes),
-            code_exponent: self.code_exponent,
+            code_exponent,
             map: match &values {
                 ValueCodes::Grid(_) => ValueMap::Grid,
                 ValueCodes::Fields(CodeInterpretation::Table(_)) => ValueMap::Table,
@@ -2327,6 +2342,21 @@ impl ScaleEncoding {
         }
     }
 
+    /// Whether `2^exponent` times each of the encoding's finite values is
+    /// exact in F32: its least bit (`2^-24` for F16, `2^-133` for BF16,
+    /// `2^-149` for F32, `2^-127` for E8M0, `2^-9` for UE4M3) stays at or
+    /// above F32's, `2^-149`, and its greatest value below `2^128`.
+    const fn scales_exactly(self, exponent: i32) -> bool {
+        let (least, greatest) = match self {
+            Self::F16 => (-24, 15),
+            Self::BF16 => (-133, 127),
+            Self::F32 => (-149, 127),
+            Self::E8M0 => (-127, 127),
+            Self::UE4M3 => (-9, 8),
+        };
+        least + exponent >= -149 && greatest + exponent <= 127
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::F16 => "F16",
@@ -2358,9 +2388,9 @@ impl Repr {
                         exponent,
                         planes,
                     ),
-                    // An E4M3 value is 2^-9 times an integer (its smallest
-                    // subnormal is 2^-9).
-                    (FloatCodeFormat::E4M3, None) => (ValueCodes::E4m3, -9, planes),
+                    // An E4M3 code is its exact value, so a scale times it
+                    // is one product under every scale.
+                    (FloatCodeFormat::E4M3, None) => (ValueCodes::E4m3, 0, planes),
                     (_, None) => panic!("{format:?} codes are scale codes, not value codes"),
                 }
             }
@@ -2409,6 +2439,22 @@ impl Repr {
                 },
             },
         };
+        // A decoder folds the code exponent into the scales (a factor's with
+        // its own exponent, and a minimum factor's own exponent alone), each
+        // of whose values every fold must scale exactly.
+        let folds = match &coding {
+            CodingAxes::Direct { scale, .. } => vec![(*scale, code_exponent)],
+            CodingAxes::Hierarchical {
+                factor, exponent, ..
+            } => vec![(*factor, exponent + code_exponent), (*factor, *exponent)],
+        };
+        for (folded, fold) in folds {
+            assert!(
+                folded.scales_exactly(fold),
+                "2^{fold} does not scale every {} value exactly",
+                folded.name()
+            );
+        }
         DecodeAxes {
             low,
             high,

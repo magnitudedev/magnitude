@@ -287,25 +287,6 @@ fn hardlinked_components_are_rejected() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(unix)]
-#[test]
-fn mapped_window_keeps_open_source_after_path_replacement() {
-    let root = temporary_directory("mapped-window");
-    let path = root.join("source.bin");
-    let original = (0..8193).map(|n| (n % 251) as u8).collect::<Vec<_>>();
-    std::fs::write(&path, &original).unwrap();
-    let source = std::sync::Arc::new(magnitude_artifacts::FileSource::open(&path).unwrap());
-    let window = source.map_window(17, 4097).unwrap();
-    assert_eq!(window.data(), &original[17..4114]);
-    assert_eq!(window.as_ref().as_ref().as_ptr() as usize % 4096, 0);
-    assert!(window.mapped_len() >= window.data_offset() + window.data_len());
-    std::fs::write(root.join("replacement.bin"), b"replacement").unwrap();
-    std::fs::rename(root.join("replacement.bin"), &path).unwrap();
-    drop(source);
-    assert_eq!(window.data(), &original[17..4114]);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn open_source_pins_tensor_bytes_and_projector_discovery_is_unambiguous() {
     let root = temporary_directory("ownership");

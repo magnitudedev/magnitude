@@ -7,6 +7,8 @@
 mod open;
 mod resize;
 mod served;
+pub(crate) mod derived;
+pub(crate) mod cache;
 
 pub use super::watcher::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 pub(crate) use super::watcher::{ExpertStep, Recording, StepFailure, StepRoute};
@@ -40,11 +42,6 @@ pub(crate) struct HeldTable {
     pub table: Arc<crate::stored_table::StoredTable>,
     /// Its records' last finished resize ([`ElasticBank::record_resize`]).
     pub last_resize: Mutex<Option<BankResize>>,
-}
-
-/// `value` slots as the record counts them.
-fn count(value: u64) -> Result<usize, DomainError> {
-    usize::try_from(value).map_err(|_| DomainError::invariant("bank slots exceed the host"))
 }
 
 /// Write `blocks` as the first word of a list copy's `grid`, which is its
@@ -98,8 +95,8 @@ pub(crate) struct ExpertBank {
     /// of the scratch the lender lends prompt groups, its leading experts
     /// (`BankPart::Scratch`).
     scratch: Vec<RecordTensors<Tensor>>,
-    /// Each layer's home records of each routed tensor, of a bank that can
-    /// be whole (`ExpertBankPlan::reaches_whole`): the leading view of its
+    /// Each layer's home records of each routed tensor, of a bank planned
+    /// whole (`ExpertBankPlan::resident`): the leading view of its
     /// experts from its home record in its group's records, where a whole
     /// bank holds expert `e` at record `home + e`, which its resident form
     /// reads in place (`WeightPart::Home`). An unpinned view of the
@@ -146,6 +143,10 @@ pub(crate) struct ExpertBank {
     /// opened (`ExpertBankPlan::counts`): its floor, and each group's
     /// records and their charge at any slots or host slots.
     counts: Arc<crate::planning::BankCounts>,
+    /// Its cache on its stores' ledgers, which each growth's slots are
+    /// recorded allocated in as their storage is backed, on the resize
+    /// thread ([`resize::grow_by_slots`]).
+    pub(super) cache: Arc<cache::BankCache>,
     /// The record tensors the host lands file misses into, group by group
     /// ([`landed_tensors`]); none where it lands into none.
     landed: Option<Arc<[RecordTensors<Tensor>]>>,
@@ -370,10 +371,12 @@ impl ExpertBank {
     /// Whether the group `begin` is beginning is resident, which its
     /// resident word then holds for its fronts (`BankPart::Resident`): every
     /// streamed layer's group is whole, each expert at its home record, and
-    /// the home records its resident forms bind directly are bindable
-    /// (`seismic::Tensor::bindable`: on Metal, their reservation is in its
-    /// whole form, which a growth takes only where the device grants it, so
-    /// a bank holding every expert without it is served streamed). A
+    /// the bank holds resident forms whose home records bind directly and
+    /// are bindable (`seismic::Tensor::bindable`: on Metal, their
+    /// reservation is in its whole form, which a growth takes only where
+    /// the device grants it, so a bank holding every expert without it is
+    /// served streamed). A bank planned banked has no resident forms
+    /// (`ExpertBankPlan::resident`): grown whole, it is served streamed. A
     /// reservation leaves the whole form only at a shrink, which this
     /// orders as it orders the policy words.
     /// Residency publishes the
@@ -394,7 +397,7 @@ impl ExpertBank {
             resident &= word(&words.policy)? != 0;
         }
         resident = resident
-            && self.homes.iter().flatten().all(|records| records.iter().all(|(_, home)| home.bindable()));
+            && self.homes.as_ref().is_some_and(|homes| homes.iter().all(|records| records.iter().all(|(_, home)| home.bindable())));
         self.layout
             .load
             .resident
@@ -438,7 +441,7 @@ impl ExpertBank {
     }
 
     /// The home records of a banked expert stack of `role` (`Self::homes`),
-    /// of a bank that can be whole.
+    /// of a bank planned whole.
     pub fn home(&self, role: WeightRole) -> Result<&Tensor, String> {
         let kind = RoutedTensor::of(role.kind).ok_or_else(|| format!("{role:?} is no routed tensor of a record"))?;
         self.homes

@@ -158,6 +158,24 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
     }
 }
 
+/// A native load's arena claim is exactly its graph scratch and its target
+/// graphs' bound constants (the floor's group buffers and the held pass's
+/// buffers among them), with no class beyond the floor's at one place: one
+/// charge of each, none missing and none counted twice.
+#[test]
+fn a_native_loads_arena_claim_is_its_scratch_and_bound_constants() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) = fixture("arena-claim");
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu].into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (domain, _bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, true, 1, 0), Banked::Resident);
+        let (claim, scratch, constants) = domain.arena_terms();
+        assert!(constants > 0, "{backend:?}: the fixture binds constants");
+        assert_eq!(claim, scratch + constants, "{backend:?}: the arena claim of {scratch} scratch and {constants} constant bytes");
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 /// On Metal and on the CPU: a prompt chunk and a decode step of the host's
 /// tokens, then the decode step of the token the device selected, which
 /// claims the queued lookahead and reads its token rows from the selection.
@@ -838,14 +856,15 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let device = domain.device().clone();
     let own = device.ledgers().own;
     for (store, view) in &own {
-        device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+        domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
     }
-    let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
+    let floor = domain.expert_residency().unwrap().expect("a streamed load holds a bank").floor;
+    let step = domain.shrink_expert_bank_to(&mut bindings, crate::BankHolding::Experts, floor, crate::CompletionWake::new(|| {})).unwrap();
     assert!(matches!(step, crate::BankStep::Begun(_)), "a whole bank shrinks: {step:?}");
     while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
     assert!(domain.expert_bank_slots() < whole, "the bank shrank from {whole:?}");
     for (store, view) in &own {
-        device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+        domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
     }
     let before = domain.graph_replays().recorded;
     bindings = decode(&mut domain, bindings);
@@ -973,21 +992,20 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
     let test = "decode-records-no-graph";
     let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
     const FOUR: usize = DecodeSteps::REQUESTS / 2;
-    // Reclaim: a load whose experts are resident chains any prompt, so the
-    // first request's two chunks grow the prompt group's class to two
-    // places, which Reclaim's surplus rung releases to one.
+    // Reclaim: a load whose experts are resident chains any prompt, its
+    // group claiming a class of two places as it opens and freeing it as
+    // its chain closes, before Reclaim's surplus rung releases the slots.
     {
         let (mut domain, bindings, _, _) = load(catalog, &definition, &package, backend, DecodeSteps::limits(2), Banked::Resident);
         if backend == seismic::BackendName::Metal {
             assert_eq!(domain.device().graph_cost(), seismic::GraphCost::None, "Metal charges no family for its graphs");
         }
         let (mut steps, mut bindings) = DecodeSteps::open(&mut domain, bindings, 2, backend);
-        assert_eq!(domain.group_places().get(), 2, "{backend:?}: the chain grew the prompt group's class");
+        assert_eq!(domain.group_places().get(), 1, "{backend:?}: the prompt group's class is freed as its chain closes");
         bindings = steps.step(&mut domain, bindings, 1, "the first of one request", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "the first of eight", backend);
         let released = crate::domain::fixtures::shrink_settled(&mut domain, &mut bindings, magnitude_state::ShrinkPolicy::Reclaim);
-        assert_eq!(domain.group_places().get(), 1, "{backend:?}: Reclaim released the class to one place");
-        assert!(released > 0, "{backend:?}: Reclaim's surplus rung released the class's bytes and slots");
+        assert_eq!(domain.group_places().get(), 1, "{backend:?}: Reclaim holds no class");
         bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, after the surplus release", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the surplus release", backend);
         steps.assert_none(backend, &format!("a Reclaim release of {released} bytes"));
@@ -1004,14 +1022,15 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
         let device = domain.device().clone();
         let own = device.ledgers().own;
         for (store, view) in &own {
-            device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+            domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
         }
-        let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
+        let floor = domain.expert_residency().unwrap().expect("a streamed load holds a bank").floor;
+        let step = domain.shrink_expert_bank_to(&mut bindings, crate::BankHolding::Experts, floor, crate::CompletionWake::new(|| {})).unwrap();
         assert!(matches!(step, crate::BankStep::Begun(_)), "{backend:?}: a whole bank shrinks: {step:?}");
         while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
         assert!(domain.expert_bank_slots() < whole, "{backend:?}: the bank shrank from {whole:?}");
         for (store, view) in &own {
-            device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+            domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
         }
         bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, the bank shrink's step", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the bank shrink", backend);
@@ -1253,18 +1272,22 @@ fn shrunk_bank_scores_as_resident(
         // as it began.
         let mut first_shrink = None;
         for position in 2..2 + DECODE_STEPS {
-            // From a quarter of the decode, one slot's worth a step, as the
-            // release ladder shrinks it, each shrink beside the misses the
-            // last ones made land; then to the floor at once.
+            // From a quarter of the decode, one slot a step, each shrink
+            // beside the misses the last ones made land; then to the floor
+            // at once.
             let shrinking = 2 + DECODE_STEPS / 4..2 + DECODE_STEPS / 2;
             if matches!(banked, Banked::Whole) && (shrinking.contains(&position) || position == shrinking.end) {
-                let deficit = if position == shrinking.end { u64::MAX / 4 } else { 1 };
+                let residency = domain.expert_residency().unwrap().expect("a whole bank");
+                let to = match position == shrinking.end {
+                    true => residency.floor,
+                    false => residency.slots.saturating_sub(1).max(residency.floor),
+                };
                 let wake = crate::CompletionWake::new(|| {});
                 // Each shrink reaches the next physical plateau; at the
                 // floor the bank is at its limit.
                 // A step still running (a queued successor) defers it to a
                 // later boundary.
-                match domain.shrink_expert_bank_by(&mut bindings, deficit, wake).unwrap() {
+                match domain.shrink_expert_bank_to(&mut bindings, crate::BankHolding::Experts, to, wake).unwrap() {
                     crate::BankStep::Begun(_) => {
                         shrinks += 1;
                         first_shrink.get_or_insert((steps.len() as u64, domain.resident_decodes()));
@@ -2162,6 +2185,7 @@ fn load_with(
         programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
+        &crate::domain::fixtures::fixture_ledgers(&device, &execution, &seismic::Devices::discover(&[]).unwrap()),
     )
     .unwrap();
     let mut residency = ResidencyStore::new(
@@ -2173,7 +2197,7 @@ fn load_with(
     )
     .unwrap();
     let target = residency
-        .load_target(definition, package, Box::new(|_, _| Ok(())))
+        .load_target(definition, package, Box::new(|_, _| ()))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     // As the engine's load does: the drafter is imported from the store that
     // imported the target, when its first work binds it.
@@ -2187,7 +2211,21 @@ fn load_with(
     let plan = execution.resources().clone();
     let target_state = plan.allocate_target_state(device.clone()).unwrap();
     let head_state = plan.head_state().map(|state| state.allocate(device.clone()).unwrap());
-    let heap = crate::DeviceHeap::open(
+    // As the engine's load records them: the scratch and target weights it
+    // allocated, and the constants its domain binds.
+    let allocated = execution
+        .load()
+        .target_weight_demand()
+        .unwrap()
+        .checked_plus(crate::memory::ClaimDemand { device: plan.bytes().scratch, ..Default::default() })
+        .unwrap();
+    let recorded = crate::domain::fixtures::fixture_recorded(&device, resources.ledgers(), allocated);
+    let constants = crate::memory::ClaimDemand {
+        device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
+        ..Default::default()
+    };
+    let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
+    let reader = crate::DeviceReader::open(
         Rc::new(seismic::Devices::discover(&[]).unwrap()),
         reserves,
         device,
@@ -2196,7 +2234,7 @@ fn load_with(
     let (mut domain, mut bindings) = ExecutorDomain::new(
         execution,
         definition.clone(),
-        heap,
+        reader,
         programs,
         resources,
         head_loader,
@@ -2204,17 +2242,18 @@ fn load_with(
         target,
         target_state,
         head_state,
+        recorded,
+        constants,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    // As a load ends: priced on the costs it waited for, then serving, its
-    // memory read as the owner reads it before its first round.
+    // As a load ends: priced on the costs it waited for, its memory read as
+    // the owner reads it before its first round.
     let pricing = Pricing { definition: definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
     let pending = "not measured by the test";
     domain
         .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), &mut bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    domain.serve().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    domain.probe_memory().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain.observe_memory().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     (domain, bindings, pass_rows, pricing)
 }
 

@@ -1,38 +1,41 @@
 //! Host pages a discrete device reads over its link, registered granule by
-//! granule (`cuMemHostRegister`), and the device's quiet, the one time a
-//! granule is unregistered.
+//! granule (`cuMemHostRegister`), and their unregistration.
 //!
 //! `cuMemHostUnregister` waits for the device's work and holds back its copy
 //! queue meanwhile: beside a decode flight parked on a pull, a 16 MiB shrink
 //! of a registered host tier took 2.1 s and the park gave up (two RTX 3090
-//! hosts), where granules
-//! created on the host node shrank in 2.6-3.6 ms beside it. So no shrink or
-//! drop unregisters inline. It uncommits its granules at once (no device
-//! work may reach them) and hands them to its device's [`Quiet`], which
-//! unregisters and frees them, and releases their charge, once the device
-//! is quiet: no stream of the device's has incomplete work, and no work is
-//! issued meanwhile (every enqueue holds its issue lock, [`issue`]).
-//! Where the device is quiet at the shrink, as between a single load's
-//! flights, that is at once; otherwise a drainer thread waits for it. A
-//! growth takes back granules still awaiting it before backing new ones.
+//! hosts), where granules created on the host node shrank in 2.6-3.6 ms
+//! beside it. So only a release unregisters (`Backing::unback`: a shrink's,
+//! or the reservation's end), inline on its own thread, and the executor
+//! releases a host tier only between its flights (it shrinks only with the
+//! idle pipeline's state bindings and asserts no step runs; a load's drop
+//! follows its last flight). The wait delays the load's next flight, timed
+//! as [`BackingPhase::Unpin`]: with no device work running, 14 MiB in 2 MiB
+//! granules unregistered in 0.99 ms and 1 GiB in 48.3 ms, 22 GB/s (RTX 4070,
+//! driver 595.99.02). A shrink releases what a deficit owes, so returning
+//! 1 GiB to another program costs about one decode step. Another load's work on the device in the
+//! same process (tests run many) is waited for meanwhile, and a flight of
+//! it parked on a pull stalls until its park gives up; no data is at risk.
+//!
+//! No device work uses a granule a release unregisters: the runtime records
+//! each allocation's newest use per device queue as that submission's end
+//! event and waits for those before a resize's release and before the
+//! storage drops. No lock of the backend's is held across the driver call,
+//! and no enqueue takes one ([`crate::enqueue`]).
+//!
+//! What a growth backed but did not commit (a failed registration, zeroing
+//! or change, an abandoned commitment: `Backing::retract`) stays registered,
+//! charged and uncommitted, beside its flights, for the next growth to take
+//! back or the next release to unregister.
 
-use crate::driver::{Context, DriverError, Handle, NOT_READY};
-use seismic_reservation::HostRange;
-use std::collections::HashMap;
+use crate::driver::{Context, DriverError};
+use seismic_reservation::{time_backing, BackingPhase, HostRange};
 use std::ffi::c_uint;
-use std::sync::atomic::{AtomicBool, Ordering};
-pub(crate) mod issue;
-
-use issue::{Enqueue, IssueLock, Issuing};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP`: pinned for
 /// every context, mapped for the device.
 const HOST_REGISTER: c_uint = 1 | 2;
-
-/// How long the drainer waits between looks at the device's quiet.
-const DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 
 type Hold = Box<dyn seismic_compiler::executable::MemoryHold>;
 
@@ -44,190 +47,25 @@ pub(crate) fn host_pages(failure: seismic_reservation::AllocationFailure) -> Dri
     }
 }
 
-/// One device ordinal's quiet, shared by every context of the process on
-/// it (they share its primary context, and its work).
-pub(crate) struct Quiet {
-    /// Held shared by every enqueue, exclusively by a drain.
-    issue: IssueLock,
-    /// Every stream of the device's, as raw handles.
-    streams: Mutex<Vec<usize>>,
-    /// Reservations with granules awaiting unregistration.
-    pending: Mutex<Vec<Arc<Registered>>>,
-    /// Whether a drainer thread is waiting for the quiet.
-    draining: AtomicBool,
-    /// The device's fault: a drain that failed (the context would not
-    /// enter, a granule would not unregister). Its granules stay registered
-    /// and charged, and every enqueue on the device is refused with it
-    /// from then on (`Context::issuing`).
-    fault: Mutex<Option<DriverError>>,
-}
-
-impl Quiet {
-    /// Device `ordinal`'s quiet.
-    pub fn of(ordinal: i32) -> Arc<Self> {
-        static QUIETS: OnceLock<Mutex<HashMap<i32, Arc<Quiet>>>> = OnceLock::new();
-        QUIETS
-            .get_or_init(Default::default)
-            .lock()
-            .expect("device quiet registry lock is never poisoned")
-            .entry(ordinal)
-            .or_insert_with(|| {
-                Arc::new(Self {
-                    issue: IssueLock::new(),
-                    streams: Mutex::new(Vec::new()),
-                    pending: Mutex::new(Vec::new()),
-                    draining: AtomicBool::new(false),
-                    fault: Mutex::new(None),
-                })
-            })
-            .clone()
-    }
-
-    pub fn add_stream(&self, stream: Handle) {
-        self.streams().push(stream as usize);
-    }
-
-    pub fn remove_stream(&self, stream: Handle) {
-        self.streams().retain(|&known| known != stream as usize);
-    }
-
-    fn streams(&self) -> std::sync::MutexGuard<'_, Vec<usize>> {
-        self.streams.lock().expect("device stream registry lock is never poisoned")
-    }
-
-    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Registered>>> {
-        self.pending.lock().expect("pending unregistration lock is never poisoned")
-    }
-
-    /// The right to enqueue on the device through `enqueue`, refused with
-    /// its fault once it has one.
-    pub fn issuing<'a>(&'a self, enqueue: &'a Enqueue) -> Result<Issuing<'a>, DriverError> {
-        self.fault().map_or(Ok(()), Err)?;
-        Ok(self.issue.issuing(enqueue))
-    }
-
-    /// The device's fault, once a drain failed.
-    fn fault(&self) -> Option<DriverError> {
-        self.fault.lock().expect("device fault lock is never poisoned").clone()
-    }
-
-    /// Record `error` as the device's fault (the first one stands).
-    fn faulted(&self, error: DriverError) {
-        self.fault.lock().expect("device fault lock is never poisoned").get_or_insert(error);
-    }
-
-    /// `registered`'s uncommitted granules await the quiet: unregistered now
-    /// where the device is quiet, else by a drainer once it is. Once they
-    /// are queued the shrink or drop has happened: a drain that fails, now
-    /// or later, is the device's fault, which its next enqueue reports
-    /// ([`Self::issuing`]), never the shrink's.
-    fn hand(self: &Arc<Self>, registered: Arc<Registered>) {
-        {
-            let mut pending = self.pending();
-            if !pending.iter().any(|known| Arc::ptr_eq(known, &registered)) {
-                pending.push(registered);
-            }
-        }
-        match self.drain() {
-            Drained::Empty | Drained::Faulted => return,
-            Drained::Waiting if self.draining.swap(true, Ordering::AcqRel) => return,
-            Drained::Waiting => {}
-        }
-        let quiet = self.clone();
-        let started = std::thread::Builder::new().name("cuda-unregister".into()).spawn(move || loop {
-            std::thread::sleep(DRAIN_INTERVAL);
-            match quiet.drain() {
-                Drained::Waiting => {}
-                // Nothing is left to wait for: the device's fault keeps its
-                // granules registered.
-                Drained::Faulted => {
-                    quiet.draining.store(false, Ordering::Release);
-                    return;
-                }
-                Drained::Empty => {
-                    quiet.draining.store(false, Ordering::Release);
-                    // A hand after the drain found the drainer still running
-                    // and left its granules to it.
-                    if quiet.pending().is_empty() || quiet.draining.swap(true, Ordering::AcqRel) {
-                        return;
-                    }
-                }
-            }
-        });
-        if let Err(error) = started {
-            self.draining.store(false, Ordering::Release);
-            self.faulted(DriverError { operation: "unregistration drainer", code: 0, description: error.to_string() });
-        }
-    }
-
-    /// Unregister every pending granule if the device is quiet: whether
-    /// any awaits it still, or the device faulted (its granules then stay
-    /// pending, registered and charged, and its fault is recorded for its
-    /// next enqueue to report, [`Self::issuing`]).
-    fn drain(&self) -> Drained {
-        if self.fault().is_some() {
-            return Drained::Faulted;
-        }
-        let Some(_issue) = self.issue.exclusive() else {
-            return if self.pending().is_empty() { Drained::Empty } else { Drained::Waiting };
-        };
-        let mut pending = std::mem::take(&mut *self.pending());
-        let Some(first) = pending.first() else { return Drained::Empty };
-        let context = first.context.clone();
-        let quiet = (|| {
-            let _current = context.enter()?;
-            for &stream in self.streams().iter() {
-                match unsafe { (context.driver.stream_query)(stream as Handle) } {
-                    NOT_READY => return Ok(false),
-                    status => context.driver.check(status, "stream query")?,
-                }
-            }
-            Ok(true)
-        })();
-        let released = quiet.and_then(|quiet| {
-            if quiet {
-                while let Some(registered) = pending.last() {
-                    registered.release_uncommitted()?;
-                    pending.pop();
-                }
-            }
-            Ok(())
-        });
-        let mut waiting = self.pending();
-        waiting.extend(pending);
-        if let Err(error) = released {
-            self.faulted(error);
-            return Drained::Faulted;
-        }
-        if waiting.is_empty() { Drained::Empty } else { Drained::Waiting }
-    }
-}
-
-/// What a drain leaves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Drained {
-    /// No granule awaits the quiet.
-    Empty,
-    /// Granules await the quiet.
-    Waiting,
-    /// The device faulted: its granules stay registered.
-    Faulted,
-}
-
 /// A registered reservation's granules: the pages of one reserved host
 /// address range ([`HostRange`], large pages where the host has them), the
-/// leading `registered` of them backed and registered at their host
-/// addresses, the leading `committed` of those committed, and the charge
-/// of each registered granule, which falls when it is unregistered.
+/// leading `holds.len()` of them backed and registered at their host
+/// addresses, and the leading `committed` of those committed.
 pub(crate) struct Registered {
     pub range: HostRange,
     context: Arc<Context>,
     state: Mutex<State>,
+    /// Where a test parks the next unregistration, as it enters the driver
+    /// call.
+    #[cfg(all(test, target_os = "linux"))]
+    park: Mutex<Option<Park>>,
 }
 
 struct State {
     committed: usize,
-    /// One charge per registered granule.
+    /// The charge of each registered granule, committed or not, to the
+    /// reservation's account: the one store of its charge, which falls only
+    /// when the granule is unregistered.
     holds: Vec<Hold>,
 }
 
@@ -241,23 +79,26 @@ impl Registered {
             range,
             context: context.clone(),
             state: Mutex::new(State { committed: 0, holds: Vec::new() }),
+            #[cfg(all(test, target_os = "linux"))]
+            park: Mutex::new(None),
         })
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+    fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("registered granule lock is never poisoned")
     }
 
     /// Commit exactly the leading `wanted` granules. A growth takes back
-    /// registered granules awaiting unregistration first, then backs and
-    /// registers new ones, each charged by `charge` before it is backed (on
-    /// a refusal the reservation is as it was); a shrink uncommits at once
-    /// and hands the granules to the device's quiet. Precondition: no
-    /// device work reaches granules a shrink uncommits. The granules it
-    /// registered before: those from it on are newly backed host pages,
-    /// which the host gives zeroed; those before may hold earlier bytes.
+    /// registered granules first, then backs and registers new ones, each
+    /// charged by `charge` before it is backed; on a refusal the commitment
+    /// is as it was, and what it registered before the refusal stays
+    /// registered and charged. A release uncommits and unregisters every
+    /// granule past `wanted` at once (precondition: no device work uses
+    /// them, and none of the holder's runs). The granules it registered before: those from
+    /// it on are newly backed host pages, which the host gives zeroed;
+    /// those before may hold earlier bytes.
     pub fn commit(
-        self: &Arc<Self>,
+        &self,
         wanted: usize,
         charge: impl Fn() -> Result<Hold, seismic_compiler::errors::ExecutionError>,
     ) -> Result<usize, seismic_compiler::errors::ExecutionError> {
@@ -265,12 +106,8 @@ impl Registered {
         let mut state = self.state();
         let first_new = state.holds.len();
         if wanted <= state.committed {
-            let shrunk = wanted < state.committed;
             state.committed = wanted;
-            drop(state);
-            if shrunk {
-                self.context.quiet.hand(self.clone());
-            }
+            self.unregister_uncommitted(&mut state);
             return Ok(first_new);
         }
         let mut holds = Vec::new();
@@ -281,23 +118,22 @@ impl Registered {
             let driver = &self.context.driver;
             let _current = self.context.enter().map_err(failed)?;
             self.range.back(first_new, wanted).map_err(|error| failed(host_pages(error)))?;
-            let registered = seismic_reservation::time_backing(seismic_reservation::BackingPhase::Pin, || {
+            let registered = time_backing(BackingPhase::Pin, || {
                 for index in first_new..wanted {
                     let status =
                         unsafe { (driver.host_register)(self.range.at(index).cast(), self.range.granule(), HOST_REGISTER) };
                     if let Err(error) = driver.check(status, "host register") {
-                        // Leave the backing as it was: unregister and free
-                        // what this call backed.
-                        for registered in first_new..index {
-                            unsafe { (driver.host_unregister)(self.range.at(registered).cast()) };
-                        }
-                        return Err(error);
+                        return Err((index, error));
                     }
                 }
                 Ok(())
             });
-            if let Err(error) = registered {
-                self.range.unback(first_new, wanted);
+            if let Err((index, error)) = registered {
+                // What registered stays registered and charged (a growth
+                // never unregisters); the rest is unbacked.
+                self.range.unback(index, wanted);
+                holds.truncate(index - first_new);
+                state.holds.extend(holds);
                 return Err(failed(error));
             }
             state.holds.extend(holds);
@@ -312,68 +148,215 @@ impl Registered {
         self.state().holds.len()
     }
 
-    /// Unregister and free the granules past the committed ones, and
-    /// release their charge: the device is quiet ([`Quiet::drain`]). A
-    /// granule that would not unregister stays registered and charged.
-    fn release_uncommitted(&self) -> Result<(), DriverError> {
+    /// Uncommit the granules past `wanted`, keeping them registered and
+    /// charged ([`seismic_reservation::Backing::retract`]).
+    pub fn uncommit(&self, wanted: usize) {
         let mut state = self.state();
-        let driver = &self.context.driver;
-        let _current = self.context.enter()?;
-        while state.holds.len() > state.committed {
-            let index = state.holds.len() - 1;
-            unsafe { driver.check((driver.host_unregister)(self.range.at(index).cast()), "host unregister") }?;
-            self.range.unback(index, index + 1);
-            state.holds.pop();
-        }
-        Ok(())
+        state.committed = state.committed.min(wanted);
     }
 
-    /// The reservation is dropped: every granule uncommitted and handed to
-    /// the device's quiet, the range freed once the last is unregistered.
-    pub fn drop_reservation(self: &Arc<Self>) {
-        let shrunk = {
-            let mut state = self.state();
-            std::mem::replace(&mut state.committed, 0) > 0 || !state.holds.is_empty()
-        };
-        if shrunk {
-            self.context.quiet.hand(self.clone());
+    /// The reservation is dropped: every granule uncommitted and
+    /// unregistered, after its holder's last work.
+    pub fn drop_reservation(&self) {
+        let mut state = self.state();
+        state.committed = 0;
+        self.unregister_uncommitted(&mut state);
+    }
+
+    /// Unregister and free the registered granules past the committed
+    /// ones, the last first, and release each one's charge. A granule no
+    /// work uses that will not unregister is a driver fault the reservation
+    /// cannot outlive: its range would free pages the driver still pins.
+    fn unregister_uncommitted(&self, state: &mut State) {
+        if state.holds.len() == state.committed {
+            return;
         }
+        time_backing(BackingPhase::Unpin, || {
+            let driver = &self.context.driver;
+            let _current = self.context.enter().unwrap_or_else(|error| panic!("a registered host granule's context enters: {error}"));
+            while state.holds.len() > state.committed {
+                let index = state.holds.len() - 1;
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(park) = self.park.lock().expect("unregistration park lock is never poisoned").take() {
+                    park.entered.send(()).expect("the parking test waits for the unregistration");
+                    park.release.recv().expect("the parking test releases the unregistration");
+                }
+                unsafe { driver.check((driver.host_unregister)(self.range.at(index).cast()), "host unregister") }
+                    .unwrap_or_else(|error| panic!("a registered host granule no work uses unregisters: {error}"));
+                self.range.unback(index, index + 1);
+                state.holds.pop();
+            }
+        });
+    }
+
+    /// Park the next unregistration as it enters the driver call, until the
+    /// returned [`Parked`] releases it.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn park(&self) -> Parked {
+        let (entered, on_entry) = std::sync::mpsc::channel();
+        let (release, on_release) = std::sync::mpsc::channel();
+        *self.park.lock().expect("unregistration park lock is never poisoned") = Some(Park { entered, release: on_release });
+        Parked { entered: on_entry, release }
+    }
+}
+
+/// The unregistration's side of a test's park ([`Registered::park`]).
+#[cfg(all(test, target_os = "linux"))]
+struct Park {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// A test's side of a parked unregistration ([`Registered::park`]).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct Parked {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Parked {
+    /// Whether the unregistration entered the driver call within `timeout`.
+    pub fn entered(&self, timeout: std::time::Duration) -> bool {
+        self.entered.recv_timeout(timeout).is_ok()
+    }
+
+    /// Let the unregistration run.
+    pub fn release(self) {
+        self.release.send(()).expect("the parked unregistration waits for its release");
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::*;
-    use crate::RangeMemory;
+    use crate::driver::Stream;
+    use crate::{Device, RangeMemory};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    /// After a drain fault, a shrink of a registered tier still succeeds
-    /// (its granules queued), every later enqueue is refused with the
-    /// fault's reason, and the resizer's and the tier's teardown does not
-    /// panic; once the fault is cleared (here only) a drain releases what
-    /// waited.
+    /// Fill a fresh device allocation of `device`'s on `stream` and wait
+    /// for it, on a thread of its own: whether it completed within `within`.
+    /// An allocation work may still reach is never freed.
+    fn completes(device: &Device, stream: Arc<Stream>, within: Duration) -> bool {
+        const BYTES: usize = 1 << 20;
+        let buffer = device.allocate_within(BYTES as u64, 16, None).unwrap();
+        let (context, pointer) = (device.context().clone(), buffer.pointer());
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            {
+                let _current = context.enter().unwrap();
+                let status = unsafe { context.enqueue().memset_d8_async(pointer, 1, BYTES, stream.raw()) };
+                context.driver.check(status, "fill").unwrap();
+            }
+            stream.synchronize().unwrap();
+            let _ = done.send(());
+        });
+        let completed = finished.recv_timeout(within).is_ok();
+        if !completed {
+            std::mem::forget(buffer);
+        }
+        completed
+    }
+
+    /// A shrink with no device work running unregisters its granules
+    /// inline and returns with them unregistered and their pages unbacked:
+    /// the recorded case, a 16 MiB registered host tier (2.1 s beside a
+    /// parked flight), and a 1 GiB one, whose times give the unregistration
+    /// rate a whole host tier's shrink is priced by.
     #[test]
-    fn a_drain_fault_refuses_enqueues_not_shrinks() {
+    fn a_shrink_unregisters_inline() {
+        let Some((_exclusive, opened)) = crate::test_device() else { return };
+        let device = opened.service;
+        let Some(granule) = crate::reservation_granule(device.ordinal(), RangeMemory::Registered).unwrap() else {
+            return;
+        };
+        for bytes in [16u64 << 20, 1 << 30] {
+            let granules = bytes.div_ceil(granule).max(2);
+            let (tier, resizer) = device
+                .allocate_reserved(granules * granule, granules * granule, granule, RangeMemory::Registered, Arc::new(seismic_compiler::executable::Unbounded))
+                .unwrap();
+            assert_eq!(tier.reservation().unwrap().registered_granules(), Some(granules as usize));
+            let shrinking = std::time::Instant::now();
+            let resizer = resizer.prepare(granule).map_err(|(_, error)| error).unwrap().install().release();
+            let took = shrinking.elapsed();
+            let released = (granules - 1) * granule;
+            eprintln!(
+                "unregistered {released} B in {} granules of {granule} B in {took:?}: {:.2} GB/s",
+                granules - 1,
+                released as f64 / took.as_secs_f64() / 1e9
+            );
+            assert_eq!(tier.reservation().unwrap().registered_granules(), Some(1), "the shrink unregistered its granules");
+            drop(resizer);
+            drop(tier);
+        }
+    }
+
+    /// A shrink beside device work on another stream of the device returns
+    /// with its granules unregistered: the release unregisters inline, its
+    /// driver call waiting for that work (a stream held on a host word
+    /// until 200 ms on), never deferring the unregistration past it.
+    #[test]
+    fn a_shrink_beside_device_work_returns_with_its_granules_unregistered() {
+        let Some((_exclusive, opened)) = crate::test_device() else { return };
+        let device = opened.service;
+        let Some(granule) = crate::reservation_granule(device.ordinal(), RangeMemory::Registered).unwrap() else {
+            return;
+        };
+        let context = device.context().clone();
+        let account: Arc<dyn seismic_compiler::executable::MemoryAccount> = Arc::new(seismic_compiler::executable::Unbounded);
+        let word = Arc::new(crate::driver::HostMapped::new(&context, &account, 4).unwrap());
+        let held = Stream::new(&context).unwrap();
+        {
+            let _current = context.enter().unwrap();
+            // CU_STREAM_WAIT_VALUE_GEQ
+            let Some(status) = (unsafe { context.enqueue().wait_value_32(held.raw(), word.device, 1, 0) }) else {
+                return;
+            };
+            context.driver.check(status, "stream wait on a host word").unwrap();
+        }
+        let (tier, resizer) =
+            device.allocate_reserved(3 * granule, 4 * granule, granule, RangeMemory::Registered, account.clone()).unwrap();
+        let releasing = word.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            releasing.write_at(0, &1u32.to_le_bytes());
+        });
+        let resizer = resizer.prepare(granule).map_err(|(_, error)| error).unwrap().install().release();
+        assert_eq!(tier.reservation().unwrap().registered_granules(), Some(1), "the shrink returns with its granules unregistered");
+        releaser.join().unwrap();
+        held.synchronize().unwrap();
+        drop(resizer);
+        drop(tier);
+    }
+
+    /// While a shrink's unregistration is parked just before the driver
+    /// call (the test's hook), work on another stream of the device, and on
+    /// a second context of it, is issued and completes: no enqueue waits
+    /// for an unregistration, as every enqueue waited behind the device's
+    /// issue lock before. Released, the shrink ends with its granules
+    /// unregistered.
+    #[test]
+    fn work_completes_while_a_shrink_unregisters() {
         let Some((_exclusive, opened)) = crate::test_device() else { return };
         let device = opened.service;
         let Some(granule) = crate::reservation_granule(device.ordinal(), RangeMemory::Registered).unwrap() else {
             return;
         };
         let (tier, resizer) =
-            device.allocate_reserved(3 * granule, 4 * granule, granule, RangeMemory::Registered, std::sync::Arc::new(seismic_compiler::executable::Unbounded)).unwrap();
-        let quiet = device.context().quiet.clone();
-        let injected = DriverError { operation: "injected drain", code: 0, description: "an injected fault".into() };
-        quiet.faulted(injected.clone());
-        // The shrink and its release: Ok, no panic.
-        let resizer = resizer.prepare(granule).map_err(|(_, error)| error).unwrap().install().release();
-        assert_eq!(tier.reservation().unwrap().registered_granules(), Some(3), "the shrunk granules wait, registered");
-        let refused = device.context().issuing().err().expect("an enqueue after the fault is refused");
-        assert_eq!(refused, injected, "with the fault's reason");
-        // Teardown, with the fault standing.
+            device.allocate_reserved(3 * granule, 4 * granule, granule, RangeMemory::Registered, Arc::new(seismic_compiler::executable::Unbounded)).unwrap();
+        let parked = tier.reservation().unwrap().registered().unwrap().park();
+        let shrinking = std::thread::spawn(move || resizer.prepare(granule).map_err(|(_, error)| error).unwrap().install().release());
+        let prompt = Duration::from_secs(10);
+        assert!(parked.entered(prompt), "the shrink unregisters");
+        let other = Stream::new(device.context()).unwrap();
+        assert!(completes(&device, other, prompt), "work on another stream of the device completes");
+        let second = Device::open(device.ordinal(), crate::test_accounts()).unwrap();
+        let stream = second.stream().clone();
+        assert!(completes(&second, stream, prompt), "work on a second context of the device completes");
+        parked.release();
+        let resizer = shrinking.join().unwrap();
+        assert_eq!(tier.reservation().unwrap().registered_granules(), Some(1), "the shrunk granules end unregistered");
         drop(resizer);
         drop(tier);
-        // Cleared, the next drain releases what waited.
-        *quiet.fault.lock().unwrap() = None;
-        assert_eq!(quiet.drain(), Drained::Empty);
-        assert!(device.context().issuing().is_ok());
     }
 }

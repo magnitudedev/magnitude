@@ -54,51 +54,48 @@ native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
-# Metal: `routed_select`'s decode launches and parameters (so its bits,
+# Metal: `routed_select`'s decode launch and parameters (so its bits,
 # `lib/routed/selection.h`), the GEMV adding AHEAD times ceil(EN /
-# SIMDGROUPS) threadgroups, per lead, for that layer's logits; the selecting
-# threadgroup then resolves and assigns (`streaming/resolve.hpp`), or of a
-# whole layer (`routed_select_whole`) resolves its hits and writes the
-# routing record from its selecting lanes' registers; one more threadgroup
-# per lead ranks the lead's layer's rows (`select::rank`) and publishes the
-# hints into the lead's ring row (`streaming/hint.hpp`). The next layer's threadgroups follow this
-# layer's, so while nothing can be absent there
-# (`next_policy[POLICY_RESOLVED]`) the launches encoded are the ones without them.
+# SIMDGROUPS) threadgroups, per lead, for that layer's logits. The router's
+# last threadgroup to arrive selects every row, then resolves and assigns
+# (`streaming/resolve.hpp`), or of a whole layer (`routed_select_whole`)
+# resolves its hits and writes the routing record; each lead's last to
+# arrive ranks the lead's layer's rows (`select::rank`) and publishes the
+# hints into the lead's ring row (`streaming/hint.hpp`). The groups count
+# their arrivals apart and none waits for another. The leads' threadgroups
+# follow the router's, so while nothing can be absent at the next layer
+# (`next_policy[POLICY_RESOLVED]`) the launch encoded is the one without
+# them.
 native routed_select_streamed for metal from "metal/routed_select_streamed.metal":
     static (H, E, K, ES, AHEAD, EN, TM)
     params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E and EN <= 1024 and K <= EN
     scratch logits bytes ((M * E + AHEAD * M * EN) * 4)
-    launch routed_select_streamed_gemv:
+    scratch arrivals bytes (4 * (1 + AHEAD)) sync
+    launch routed_select_streamed:
         threadgroups (ceil_div(E, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS), 1, 1)
+        unless (policy[POLICY_WHOLE])
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_select_streamed_gemv:
+        shared_bytes (max(min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, (1 + 4 * M * K + POLICY_WORDS) * 4))
+    launch routed_select_streamed:
         threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
+        unless (policy[POLICY_WHOLE])
         if (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_select_streamed_select:
-        threadgroups (1 + AHEAD, 1, 1)
-        unless (policy[POLICY_WHOLE])
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_streamed_select:
-        threadgroups (1, 1, 1)
-        unless (policy[POLICY_WHOLE])
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (max(min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, (1 + 4 * M * K + POLICY_WORDS) * 4))
     launch routed_select_whole:
-        threadgroups (1 + AHEAD, 1, 1)
+        threadgroups (ceil_div(E, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS), 1, 1)
         if (policy[POLICY_WHOLE])
         unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, (1 + 4 * M * K + POLICY_WORDS) * 4))
     launch routed_select_whole:
-        threadgroups (1, 1, 1)
+        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
         if (policy[POLICY_WHOLE])
         if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, (1 + 4 * M * K + POLICY_WORDS) * 4))
 
 # Metal: one threadgroup; its threads widen the rows into the slot through
 # system-coherent stores, then, after every thread's stores
@@ -115,7 +112,7 @@ native routed_site_request for metal from "metal/routed_site_request.metal":
 native routed_down_project for metal from "metal/routed_down_project.metal":
     static (H, K, F)
     records (expert_down, tier_down)
-    where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
+    where K <= 32 and ROWS * ceil_div(ceil_div(F, 32) - (1 - min(1, LANES / 16)) * (ceil_div(F, 32) - min(ceil_div(F, 32), 256 / K)), LANES) <= 8 and 2 * ceil_div(ceil_div(F, 32), 16) <= 8
     launch routed_down_project:
         params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
@@ -135,7 +132,7 @@ native routed_down_sited for metal from "metal/routed_down_sited.metal":
 native routed_output_project for metal from "metal/routed_output_project.metal":
     static (H, K, F, S)
     records (expert_down, tier_down)
-    where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
+    where K < 32 and ROWS * ceil_div(ceil_div(max(F, S), 32) - (1 - min(1, LANES / 16)) * (ceil_div(max(F, S), 32) - min(ceil_div(max(F, S), 32), 256 / (K + 1))), LANES) <= 8
     launch routed_output_project:
         params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)

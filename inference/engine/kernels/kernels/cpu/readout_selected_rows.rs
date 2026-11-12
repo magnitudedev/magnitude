@@ -3,12 +3,13 @@
 // RMS-normalized hidden row of each output row (rounded to A) as F32 into
 // scratch, one work item per row. `readout_selected_rows_rows` gives each work
 // item ROWS selected vocabulary rows; the selected weight rows are not
-// adjacent, so each is one single-row component call per normalized row.
+// adjacent, so each is projected alone against every normalized row.
 // Logits are softcapped when `softcap` > 0.
 
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn readout_selected_rows_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -29,20 +30,14 @@ fn readout_selected_rows_normalize<L: Isa, E: Elements>(
         normalized,
     );
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(d);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(normalized, q8);
+        let tiles = projection::tiled(cx.dim_o() as usize, &[&cx.arg_weight()]);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(normalized, row, tiles, cx.scratch_quantized(), 0) };
     }
     projection::operand_row(&[&cx.arg_weight()], normalized);
 }
 
+#[inline(always)]
 fn readout_selected_rows_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -58,21 +53,15 @@ fn readout_selected_rows_rows<L: Isa, E: Elements>(
     let (weight, selected, result) = (cx.arg_weight(), cx.arg_selected(), cx.result_0());
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, o * d) };
-    let blocks = seismic::cpu::quant::blocks(d);
-    let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
-    });
+    let tiles = projection::tiled(o, &[&weight]);
+    let quantized = (cx.param_int8() == 1).then(|| unsafe { projection::quantized(cx.scratch_quantized(), 0, o, d, tiles) });
     let cap = cx.arg_softcap();
     for column in columns {
         let vocabulary = selected.get([column]) as usize;
-        for (row, x) in normalized.chunks_exact(d).enumerate() {
-            let mut logit = [0.0f32];
-            let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
-            projection::project_arithmetic(&weight, vocabulary, x, q8, &mut logit);
+        projection::project_staged_arithmetic(&weight, vocabulary..vocabulary + 1, normalized, quantized, |row, logit| {
             let logit = if cap > 0.0 { functions::softcap(cap, logit[0]) } else { logit[0] };
             // SAFETY: each work item writes its own columns of every row.
             unsafe { result.set([row, column], logit) };
-        }
+        });
     }
 }

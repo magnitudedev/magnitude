@@ -1,6 +1,7 @@
 // repeat_rows on CPU (contract and portable body in streams.seismic): one
 // work item per row, which writes its S scaled copies.
 
+#[inline(always)]
 fn repeat_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;

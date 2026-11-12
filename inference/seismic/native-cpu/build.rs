@@ -51,7 +51,7 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     // The code domain's ends, which every code component takes from here.
     let registry::profile::Domain { least, greatest } = axes.profile().codes;
     // The row component: integer codes are `PackedRows`', floating codes
-    // `FloatRows`'.
+    // (their exact values) `FloatRows`'.
     let (rows, codes) = match &axes.coding.codes() {
         ValueCodes::E4m3 => ("FloatRows", "E4m3".to_owned()),
         ValueCodes::Grid(grid) => ("PackedRows", format!(

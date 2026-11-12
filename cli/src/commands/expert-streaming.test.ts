@@ -68,7 +68,7 @@ describe("expert streaming", () => {
     expect(hardware).toContain("  Cold experts in System memory: 210 MB, 50% of its most")
     expect(hardware).toContain("  Experts on disk: 300 MB")
     expect(hardware).toContain("  N-gram table in memory: 126 MB, 50% of its most, floor 25%")
-    expect(hardware).toMatch(/ {2}Last resize: Experts shrank from 50% to 40% to make room for a request on /)
+    expect(hardware).toMatch(/ {2}Last resize: Experts shrank from 50% to 40% as memory grew short on /)
   })
 
   it("states a loaded streamed model's bank once in its detail, in place of its fit", () => {
@@ -93,7 +93,7 @@ describe("expert streaming", () => {
     const text = JSON.stringify(json)
     expect(text).toContain("\"slots\":40")
     expect(text).toContain("\"promptGroupPlaces\":{\"held\":1,\"capacity\":8}")
-    expect(text).toContain("\"cause\":\"live_claim\"")
+    expect(text).toContain("\"_tag\":\"Shrank\"")
     expect(text).not.toContain("cuda-0")
   })
 })

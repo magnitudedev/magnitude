@@ -7,6 +7,7 @@
 
 use lib::core::spans;
 
+#[inline(always)]
 fn candidate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (r, b, bu, k) = (cx.dim_r() as usize, cx.dim_b() as usize, cx.dim_bu() as usize, cx.dim_k() as usize);
@@ -63,6 +64,7 @@ struct Pool<'a> {
 
 impl Pool<'_> {
     /// Takes the units [start, end), ascending after every earlier run.
+    #[inline(always)]
     fn take(&mut self, start: usize, end: usize) {
         if start == end {
             return;
@@ -76,6 +78,7 @@ impl Pool<'_> {
         }
     }
 
+    #[inline(always)]
     fn flush(&mut self) {
         let Some((mut start, end)) = self.run.take() else {
             return;

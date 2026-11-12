@@ -2,6 +2,7 @@
 use lib::attention::attention::{self, Form, Layout};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn attention_append_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     // The keys' and values' form: no queries, so no query norm or output

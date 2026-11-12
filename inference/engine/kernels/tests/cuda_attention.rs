@@ -101,7 +101,7 @@ fn cuda_decode_reads_spans_crossing_history_slabs() {
         let kernel = cuda_decode(&device, SMALL, config);
         // A reused middle slab puts consecutive slabs at unrelated addresses.
         for reused in [false, true] {
-            let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+            let mut bound = Bound::new_with_options(&device, &case, 32, reused, Element::bf16());
             let gated = run_decode(&kernel, &mut bound, &case);
             check(
                 &format!("cuda crossing-span decode {config:?} reused={reused}"),

@@ -49,6 +49,7 @@ impl Device {
     }
     fn set_device_bound(&self, bytes: Option<u64>) -> PyResult<()> {
         self.inner
+            .bounds()
             .bound(seismic::Ledger::Own(self.inner.device_store()), bytes)
             .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
     }

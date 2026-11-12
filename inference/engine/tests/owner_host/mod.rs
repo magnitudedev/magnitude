@@ -95,6 +95,10 @@ pub struct Host<F: ProgramFamily = NativeFamily> {
     /// When the last run left a flight on the device: the device runs it in
     /// real time, so the host's clock follows real time until it completes.
     in_flight: Option<Instant>,
+    /// The clock the owner's memory readings are taken at, where its heap
+    /// reads a test's machine ([`Self::reading_memory_at`]): set to the
+    /// host's time at each run.
+    memory_clock: Option<magnitude_executor::fixtures::TestClock>,
 }
 
 impl<F: ProgramFamily> Host<F> {
@@ -107,7 +111,16 @@ impl<F: ProgramFamily> Host<F> {
             now: 0,
             due: 0,
             in_flight: None,
+            memory_clock: None,
         }
+    }
+
+    /// This host, its owner's memory read at the host's time on `clock`
+    /// (`fixtures::clock`): the one clock the owner reads memory by and the
+    /// pace measures its takes on, as the live machine's readings carry the
+    /// owner's monotonic time.
+    pub fn reading_memory_at(self, clock: magnitude_executor::fixtures::TestClock) -> Self {
+        Self { memory_clock: Some(clock), ..self }
     }
 
     pub fn owner(&self) -> &Owner<F> {
@@ -153,6 +166,9 @@ impl<F: ProgramFamily> Host<F> {
     pub fn run_at(&mut self, now: u64) -> Ran {
         assert!(now >= self.now, "the host clock moved backwards");
         self.now = now;
+        if let Some(clock) = &self.memory_clock {
+            clock.set(now);
+        }
         let mut owner = self.owner.take().expect("the owner is between runs");
         let wakes = std::mem::take(&mut *self.wakes.0.lock().unwrap());
         for (request, wake) in wakes {

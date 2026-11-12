@@ -2569,7 +2569,9 @@ dependencies = [
  "magnitude-ggml",
  "seismic",
  "seismic-build",
+ "seismic-cpu",
  "seismic-lang",
+ "seismic-native-cpu",
  "seismic-native-tests",
  "seismic-std",
 ]
@@ -4190,8 +4192,8 @@ dependencies = [
 name = "seismic-build"
 version = "0.1.0"
 dependencies = [
+ "seismic-cpu-tiers",
  "seismic-lang",
- "seismic-native-cpu",
  "seismic-std",
  "sha2 0.11.0",
 ]
@@ -4245,6 +4247,10 @@ dependencies = [
  "seismic-topology",
  "sha2 0.11.0",
 ]
+
+[[package]]
+name = "seismic-cpu-tiers"
+version = "0.1.0"
 
 [[package]]
 name = "seismic-cuda"
@@ -4323,6 +4329,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "postcard",
+ "seismic-cpu-tiers",
  "serde",
  "sha2 0.11.0",
 ]
@@ -4362,6 +4369,7 @@ name = "seismic-native-cpu"
 version = "0.1.0"
 dependencies = [
  "magnitude-ggml",
+ "seismic-cpu-tiers",
  "seismic-lang",
 ]
 
@@ -4403,6 +4411,7 @@ dependencies = [
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libc",
  "opentelemetry 0.33.0",
  "postcard",

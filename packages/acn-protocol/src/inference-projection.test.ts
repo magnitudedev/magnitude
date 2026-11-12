@@ -40,9 +40,6 @@ describe("inference residency projection", () => {
         shortage: { _tag: "Blocked", requiredBytes: 30, availableBytes: 24 },
       },
     })
-    expect(failed({ _tag: "UnderPressure" })).toMatchObject({
-      _tag: "Failed", failure: { shortage: { _tag: "UnderPressure" } },
-    })
   })
 
   it("carries where a streamed load's experts are, in the service contract's wire shape", () => {
@@ -54,14 +51,14 @@ describe("inference residency projection", () => {
       tiers: [{ memoryDomainId: "cuda-0", bytes: 300 }, { memoryDomainId: "system", bytes: 400 }],
       host: {
         memoryDomainId: "system", slots: 32, ceilingSlots: 64, bytes: 210,
-        lastResize: { _tag: "Shrank", cause: "live_claim", to: 32, by: 1, atUnixMs: 1234 },
+        lastResize: { _tag: "Shrank", to: 32, by: 1, atUnixMs: 1234 },
       },
       diskBytes: 300,
       tables: [{
         records: 40, floorRecords: 1, ceilingRecords: 42, bytes: 500,
         lastResize: { _tag: "Grew", from: 39, by: 1, atUnixMs: 1200 },
       }],
-      lastResize: { _tag: "Shrank", cause: "reclaim", to: 64, by: 2, atUnixMs: 1100 },
+      lastResize: { _tag: "Shrank", to: 64, by: 2, atUnixMs: 1100 },
     }
     const ready = projectInferenceResidency(instance({
       _tag: "Ready",
@@ -75,27 +72,6 @@ describe("inference residency projection", () => {
       device: { deviceId: "cuda:0", backend: "cuda" },
     })
     expect(Schema.decodeUnknownSync(ModelResidencySchema)(encoded)).toEqual(ready)
-  })
-
-  it("carries a measurement's shrink as its own cause", () => {
-    const streaming = {
-      experts: 256,
-      slots: 60,
-      floorSlots: 26,
-      ceilingSlots: 256,
-      tiers: [{ memoryDomainId: "system", bytes: 400 }],
-      diskBytes: 300,
-      tables: [],
-      lastResize: { _tag: "Shrank", cause: "measurement", to: 60, by: 4, atUnixMs: 1234 },
-    }
-    const ready = projectInferenceResidency(instance({
-      _tag: "Ready",
-      allocation: { contextWindowTokens: 4096, memoryDomains: [], ...serving, streaming },
-      device: { id: "cuda:0", backend: "cuda" },
-    }))
-    expect(Schema.encodeSync(ModelResidencySchema)(ready)).toMatchObject({
-      allocation: { streaming: { lastResize: { cause: "measurement" } } },
-    })
   })
 
   it("leaves a load without an expert bank without streaming status", () => {

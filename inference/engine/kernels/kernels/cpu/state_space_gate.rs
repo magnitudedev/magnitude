@@ -6,6 +6,7 @@
 use lib::core::activation;
 use seismic::cpu::math;
 
+#[inline(always)]
 fn state_space_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (row, g) = (group[0] as usize, group[1] as usize);
     let (heads, width) = (cx.dim_u() as usize, cx.dim_p() as usize);

@@ -120,9 +120,8 @@ use std::time::Instant;
 
 /// The least read size a volume's probe reads in, doubling up to the least
 /// that holds a record's widest range, at most the widest window ("A
-/// volume's curve"): the grain the pool's workers are counted in, and below
-/// which no device measured read faster or sooner (`magnitude-artifacts`'
-/// `tests/read_depth`).
+/// volume's curve"), below which no device measured read faster or sooner
+/// (`magnitude-artifacts`' `tests/read_depth`).
 pub(crate) const LEAST_READ: u64 = 128 * 1024;
 
 /// The widest window a volume's probe holds in flight: twice the widest
@@ -548,18 +547,22 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
     let record = parts.iter().sum::<u64>();
     assert!(record + ALIGNMENT * parts.len() as u64 <= file.size, "a record of {record} bytes beyond a file of {}", file.size);
     let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(urgent.bytes() as usize));
-    // Every piece of a request at once: its due depth holds it whole.
+    // Every piece of a request at once: its due depth holds it whole. The
+    // pool's workers for them are the probe's, while it runs.
     let volumes = reads
         .iter()
-        .map(|&read| VolumeReads { id: key, shape: Shape { ahead_read: read, due_read: read, ..Shape::PENDING } })
+        .map(|&read| {
+            let volume = VolumeReads { id: key, shape: Shape { ahead_read: read, due_read: read, ..Shape::PENDING } };
+            let need = scheduler::need(&volume);
+            (volume, need)
+        })
         .collect::<Vec<_>>();
-    scheduler::deepen(volumes.iter().map(|volume| volume.shape.workers()).max().expect("a read size"))?;
     let outstanding = Arc::default();
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut seconds = vec![Vec::new(); reads.len()];
     let began = Instant::now();
     while began.elapsed().as_secs_f64() < LONE_SECONDS || seconds[0].is_empty() {
-        for (volume, times) in volumes.iter().zip(&mut seconds) {
+        for ((volume, need), times) in volumes.iter().zip(&mut seconds) {
             let mut at = 0;
             let ranges = (0..urgent.records)
                 .flat_map(|_| parts.iter())
@@ -573,7 +576,7 @@ fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> 
             let started = Instant::now();
             // SAFETY: each range's bytes are its own of `sink`, which
             // nothing else touches until the request, waited on here, ends.
-            let request = unsafe { request(file, volume, &outstanding, ranges, Want::now()) }?;
+            let request = unsafe { request(file, volume, need, &outstanding, ranges, Want::now()) }?;
             match request.wait() {
                 Ended::Read { failed } => {
                     if let Some((_, error)) = failed.first() {
@@ -621,9 +624,10 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
     let parts = &urgent.parts;
     let widest = *parts.iter().max().expect("a request has a range");
     let volume = VolumeReads { id: key, shape: Shape { ahead_read: urgent.whole_range(), due_read: urgent.whole_range(), ..Shape::PENDING } };
-    scheduler::deepen(volume.shape.workers())?;
+    // The pool's workers for its ranges are the probe's, while it runs.
+    let need = scheduler::need(&volume);
     let outstanding = Arc::default();
-    let (volume, outstanding) = (&volume, &outstanding);
+    let (volume, need, outstanding) = (&volume, &need, &outstanding);
     // Where every thread reads until, once all have started; none where one
     // could not, which ends the others at once.
     let start = (Mutex::new(None::<Option<Instant>>), Condvar::new());
@@ -645,7 +649,7 @@ fn ranges_rate(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, depth: u64)
                     // SAFETY: the range's bytes are this thread's sink's,
                     // which nothing else touches until the request, waited
                     // on here, ends.
-                    match unsafe { request(file, volume, outstanding, ranges, Want::now()) }?.wait() {
+                    match unsafe { request(file, volume, need, outstanding, ranges, Want::now()) }?.wait() {
                         Ended::Read { failed } => {
                             if let Some((_, error)) = failed.first() {
                                 return Err(Error::Invalid(format!("a range line's read: {error}")));

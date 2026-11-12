@@ -1,0 +1,5 @@
+[package]
+name = "seismic-cpu-tiers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

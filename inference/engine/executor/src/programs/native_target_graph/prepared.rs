@@ -1026,6 +1026,13 @@ impl PreparedTargetGraphs {
         self.passes.rows()
     }
 
+    /// The pass budget the load holds: the launches a group's pass covers,
+    /// the plan's within the arena's cap (`group_pass_rows`), whose places
+    /// the arena's prompt-group class holds.
+    pub fn held_pass(&self) -> crate::PassLaunches {
+        crate::PassLaunches::new(std::num::NonZeroUsize::new(self.passes.launches()).expect("a pass covers a launch"))
+    }
+
     pub fn workspace_bytes(&self) -> u64 {
         self.family.workspace_bytes()
     }

@@ -5,6 +5,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn draft_confidence<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (d, r) = (cx.dim_d() as usize, cx.dim_r() as usize);

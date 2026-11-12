@@ -5,6 +5,7 @@
 
 use lib::core::{activation, reduce};
 
+#[inline(always)]
 fn ngram_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (h, s) = (cx.dim_h() as usize, cx.dim_s() as usize);

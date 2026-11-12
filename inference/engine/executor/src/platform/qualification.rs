@@ -1,4 +1,4 @@
-use super::policy::{DomainRole, Fit, HostRoom, LoadStage, MemoryPolicyError, MemoryReserves, refresh_device_ceiling};
+use super::policy::{Fit, HostRoom, MemoryPolicyError, MemoryReserves};
 use super::selection::{DeviceRequest, SelectionError, select};
 use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
@@ -17,8 +17,6 @@ pub struct PlatformConfig {
     /// What its graphs hold, as the selection read it; none to measure it
     /// on opening.
     pub graph_cost: Option<seismic::GraphCost>,
-    /// The host's threshold policy the opened device's ceiling keeps.
-    pub reserves: MemoryReserves,
 }
 
 /// The automatically selected device and its stable assessment capacity.
@@ -108,21 +106,11 @@ pub fn host_tier(
 pub struct OpenedPlatform {
     selector: ExecutorSelector,
     device: Device,
-    /// What the engine might still claim in each of the device's memory
-    /// domains when it was opened.
-    room: crate::TuningRoom,
 }
 
 impl OpenedPlatform {
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// What a search on this device is held to: what the platform let the
-    /// engine claim in each memory domain when the device was opened, its
-    /// observed availability above the planning reserve.
-    pub fn tuning_room(&self) -> crate::TuningRoom {
-        self.room
     }
 
     pub fn selector(&self) -> ExecutorSelector {
@@ -253,9 +241,7 @@ pub fn selected(
     })
 }
 
-/// Resolve the selected identity in this process's catalog, open it, set a
-/// ceiling from fresh scoped availability above the planning reserve, and
-/// enforce it in Seismic.
+/// Resolve the selected identity in this process's catalog and open it.
 /// Never substitutes another device.
 pub fn open_selected(
     catalog: &Devices,
@@ -273,31 +259,7 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    let status = catalog.status(device.topology(), device.info().id());
-    // A load opens the device: its first allocations are a load's, which
-    // may take what the OS can obtain (`DeviceHeap::open` holds the device
-    // to the same room until the load ends).
-    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Load(LoadStage::Loading), 0)
-        .map_err(PlatformError::Memory)?;
-    let topology = device.topology();
-    let host_ram = topology.host_ram().id();
-    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Load(LoadStage::Loading));
-    let room = crate::TuningRoom {
-        device_bytes: fit
-            .placement(device.info(), Contract::DeviceOnly)
-            .map_err(PlatformError::Memory)?
-            .ceiling_bytes,
-        host_bytes: fit
-            .store(host_ram)
-            .map_err(PlatformError::Memory)?
-            .ceiling_bytes,
-        host_shared: DomainRole::of(topology, device.info(), host_ram) == DomainRole::Allocation,
-    };
-    Ok(OpenedPlatform {
-        selector,
-        device,
-        room,
-    })
+    Ok(OpenedPlatform { selector, device })
 }
 
 fn enforce_phase_one(path: ExecutionPath) -> Result<(), PlatformError> {
@@ -338,7 +300,6 @@ mod tests {
                     path: ExecutionPath::Native,
                     artifacts: None,
                     graph_cost: None,
-                    reserves: MemoryReserves::of_machine(None),
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

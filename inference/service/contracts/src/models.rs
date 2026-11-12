@@ -957,33 +957,15 @@ pub struct StreamingTierStatus {
     pub bytes: u64,
 }
 
-/// Why the engine shrank an expert bank's holding.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamingShrinkCause {
-    /// Memory fell under pressure.
-    Reclaim,
-    /// A live request's claim needed the memory.
-    LiveClaim,
-    /// Something worth more to serving than the holding's slots took the
-    /// memory.
-    Rebalance,
-    /// The service's measurement of this machine needed room beside the
-    /// model while it was idle.
-    Measurement,
-}
-
 /// A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`
-/// (milliseconds since the Unix epoch): shrunk by `by` to `to`, for its cause, or grown by `by`
-/// from `from` into free memory. Each changes its size by at least one.
+/// (milliseconds since the Unix epoch): shrunk by `by` to `to` as memory grew short, or grown
+/// by `by` from `from` into free memory. Each changes its size by at least one.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum StreamingResize {
     #[serde(rename_all = "camelCase")]
     Shrank {
-        cause: StreamingShrinkCause,
         to: u64,
         #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
         by: NonZeroU64,
@@ -1054,9 +1036,9 @@ mod model_streaming_status_tests {
                 "diskBytes": 300,
                 "tables": [{
                     "records": 40, "floorRecords": 1, "ceilingRecords": 42, "bytes": 500,
-                    "lastResize": { "_tag": "Shrank", "cause": "live_claim", "to": 40, "by": 1, "atUnixMs": 1234 }
+                    "lastResize": { "_tag": "Shrank", "to": 40, "by": 1, "atUnixMs": 1234 }
                 }],
-                "lastResize": { "_tag": "Shrank", "cause": "measurement", "to": 64, "by": 8, "atUnixMs": 1100 }
+                "lastResize": { "_tag": "Shrank", "to": 64, "by": 8, "atUnixMs": 1100 }
             }
         });
         let decoded: ModelInstanceAllocation =
@@ -1065,7 +1047,7 @@ mod model_streaming_status_tests {
     }
 
     /// No value outside a bound decodes: each bounded quantity is refused out of order, a
-    /// resize that changes nothing is refused, and growth has no cause to name.
+    /// resize that changes nothing is refused, and no resize names a cause.
     #[test]
     fn values_outside_the_bounds_never_decode() {
         let status = |slots: u64, ceiling: u64| {
@@ -1090,7 +1072,7 @@ mod model_streaming_status_tests {
         for resize in [
             serde_json::json!({ "_tag": "Grew", "from": 4, "by": 0, "atUnixMs": 1 }),
             serde_json::json!({ "_tag": "Grew", "from": 4, "by": 1, "cause": "reclaim", "atUnixMs": 1 }),
-            serde_json::json!({ "_tag": "Shrank", "cause": "growth", "to": 4, "by": 1, "atUnixMs": 1 }),
+            serde_json::json!({ "_tag": "Shrank", "cause": "reclaim", "to": 4, "by": 1, "atUnixMs": 1 }),
         ] {
             assert!(serde_json::from_value::<StreamingResize>(resize).is_err());
         }
@@ -1175,9 +1157,6 @@ pub enum MemoryShortage {
         required_bytes: u64,
         available_bytes: u64,
     },
-    /// A memory domain the load uses was under pressure: at its reserve, or with other programs'
-    /// memory being displaced faster than the system absorbs. No byte count describes it.
-    UnderPressure {},
 }
 
 impl From<ModelFailure> for ModelInstanceFailure {
@@ -2882,13 +2861,15 @@ impl TryFrom<StreamedBankParts> for StreamedBank {
 /// Where a streamed fit keeps the experts its bank lacks.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum ColdExperts {
     /// Read from the model file on demand (unified memory).
     Disk,
     /// In a host-RAM tier as host memory lets it grow, the rest read from the model file (a
-    /// discrete device).
-    HostRam,
+    /// discrete device). `cache_bytes` is what the tier holds past its floor: cache the load
+    /// grows into free host RAM, which no memory domain's required bytes count.
+    #[serde(rename_all = "camelCase")]
+    HostRam { cache_bytes: u64 },
 }
 
 #[cfg(test)]
@@ -2918,7 +2899,7 @@ mod model_residency_tests {
             })
             .unwrap()
         };
-        let wire_bank = |cold: &str| {
+        let wire_bank = |cold: serde_json::Value| {
             serde_json::json!({ "experts": 256, "slots": 154, "floorSlots": 26, "coldExperts": cold })
         };
         for (residency, json) in [
@@ -2930,13 +2911,13 @@ mod model_residency_tests {
             ),
             (
                 ModelResidency::Streamed {
-                    bank: bank(ColdExperts::HostRam),
+                    bank: bank(ColdExperts::HostRam { cache_bytes: 9_000_000_000 }),
                     performance: estimated(20.0),
                     floor_performance: estimated(5.5),
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
-                    "bank": wire_bank("host_ram"),
+                    "bank": wire_bank(serde_json::json!({ "_tag": "HostRam", "cacheBytes": 9_000_000_000u64 })),
                     "performance": wire(20.0),
                     "floorPerformance": wire(5.5)
                 }),
@@ -2949,7 +2930,7 @@ mod model_residency_tests {
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
-                    "bank": wire_bank("disk"),
+                    "bank": wire_bank(serde_json::json!({ "_tag": "Disk" })),
                     "performance": { "_tag": "Pending" },
                     "floorPerformance": { "_tag": "Pending" }
                 }),
@@ -2964,7 +2945,7 @@ mod model_residency_tests {
         // A streamed bank holds at least its floor, and fewer than every expert.
         for (slots, floor_slots) in [(20, 26), (256, 26)] {
             assert!(serde_json::from_value::<StreamedBank>(serde_json::json!({
-                "experts": 256, "slots": slots, "floorSlots": floor_slots, "coldExperts": "disk"
+                "experts": 256, "slots": slots, "floorSlots": floor_slots, "coldExperts": { "_tag": "Disk" }
             }))
             .is_err());
         }

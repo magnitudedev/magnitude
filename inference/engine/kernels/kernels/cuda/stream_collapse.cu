@@ -14,5 +14,5 @@ extern "C" __global__ void stream_collapse(SEISMIC_KERNEL_PARAMS) {
     streams::collapse<STREAMS>(hidden + (u64)row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
                                SEISMIC_HIDDEN_STRIDE_2, pre + (u64)row * SEISMIC_PRE_STRIDE_0, SEISMIC_PRE_STRIDE_1,
                                result + (u64)row * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
-                               SEISMIC_DIM_H, blockDim.x);
+                               SEISMIC_DIM_H, threadIdx.x, blockDim.x);
 }

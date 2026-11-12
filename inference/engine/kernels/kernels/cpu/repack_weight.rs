@@ -3,6 +3,7 @@
 // registered conversion of its external source into a resident row layout,
 // moving codes and coefficients bit for bit.
 
+#[inline(always)]
 fn repack_weight<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (source, destination) = (cx.arg_source(), cx.result_0());
     let n = cx.dim_n() as usize;

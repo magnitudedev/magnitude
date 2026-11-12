@@ -7,7 +7,7 @@
 //! unified hierarchy. Ancestors hidden by a cgroup namespace or a container's
 //! mount are reported as such, never presumed unlimited.
 
-use super::{HostSample, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
+use super::{HostStatus, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
 use seismic_topology::{Reported, ReportedBy};
 use std::path::{Path, PathBuf};
 
@@ -184,7 +184,7 @@ fn cpu_caches(root: &Path, caches: &mut Vec<CpuCache>) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn sample() -> Result<HostSample, ObservationError> {
+pub(super) fn sample() -> Result<HostStatus, ObservationError> {
     let meminfo = read("/proc/meminfo")?;
     let mem_available_bytes = kib_field(&meminfo, "MemAvailable:").ok_or_else(|| {
         ObservationError::Unsupported(
@@ -193,46 +193,18 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
     })?;
     let mut limits = resource_limits()?;
     let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
-    Ok(HostSample {
+    Ok(HostStatus {
         // `MemAvailable` is what can be taken without swapping: page cache
-        // and reclaimable slab, not other programs' anonymous memory. Linux
-        // reports no larger figure that swapping would make available, so
-        // a load obtains what any growth may take.
+        // and reclaimable slab, not other programs' anonymous memory, less
+        // the kernel's own reserve (`totalreserve_pages`: each zone's high
+        // watermark and lowmem reserve), which kswapd reclaims toward.
         allocatable: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
-        obtainable: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
+        reclaimable: 0,
         limits,
         limit_visibility,
-        kernel_pressure: None,
-        // `MemAvailable` already leaves out the kernel's own reserve
-        // (`totalreserve_pages`: each zone's high watermark and lowmem
-        // reserve), which kswapd reclaims toward; counting the zones'
-        // watermarks again would hold the line twice.
-        free_target: Some(0),
         held: None,
-        displaced_bytes: Some(displaced_bytes(&meminfo)?),
     })
 }
-
-/// The RAM programs' swapped-out data would take, less the RAM zswap holds
-/// it in: each swapped page counted once. A page swapped out holds a swap
-/// slot whether zswap keeps it compressed in RAM or it went to the device,
-/// so the swap in use already counts zswap's pages (`Zswapped`), and less
-/// the swap cache's, which are in RAM as themselves too.
-fn displaced_bytes(meminfo: &str) -> Result<u64, ObservationError> {
-    let field = |name| {
-        kib_field(meminfo, name)
-            .ok_or_else(|| ObservationError::Failed(format!("/proc/meminfo has no {name}")))
-    };
-    let swapped = field("SwapTotal:")?.saturating_sub(field("SwapFree:")?);
-    // `Zswap` only where the kernel has zswap.
-    let zswap = kib_field(meminfo, "Zswap:").unwrap_or(0);
-    Ok(swapped.saturating_sub(field("SwapCached:")?).saturating_sub(zswap))
-}
-
-/// Linux counts no displacement here: `MemAvailable` is the kernel's
-/// estimate of what is usable without swapping, so no displacement is read
-/// beside it.
-pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = None;
 
 fn read(path: impl AsRef<Path>) -> Result<String, ObservationError> {
     let path = path.as_ref();
@@ -701,18 +673,6 @@ fn unescape(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Each swapped page is displaced once: zswap's pages and the swap
-    /// cache's hold swap slots too, so only zswap's compressed RAM comes
-    /// off the swap in use, and the swap cache's pages, in RAM as
-    /// themselves.
-    #[test]
-    fn each_swapped_page_is_displaced_once() {
-        let meminfo = "SwapCached:      100 kB\nSwapTotal:     10000 kB\nSwapFree:       6000 kB\nZswap:           500 kB\nZswapped:       2000 kB\n";
-        assert_eq!(displaced_bytes(meminfo).unwrap(), (4000 - 100 - 500) * 1024);
-        let without_zswap = "SwapCached:        0 kB\nSwapTotal:     10000 kB\nSwapFree:       6000 kB\n";
-        assert_eq!(displaced_bytes(without_zswap).unwrap(), 4000 * 1024);
-    }
 
     /// A fixture filesystem root holding `/proc/self/{cgroup,mountinfo}` and
     /// cgroup files, removed on drop.

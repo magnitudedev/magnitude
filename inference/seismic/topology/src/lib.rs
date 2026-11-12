@@ -25,9 +25,10 @@ pub use kind::{
     HostReads, Kind, KindMemory, KindReport, NativeKind, Obtained, Reach, Reserving, Unreservable,
 };
 pub use model::{
-    AccessPath, AccessPathId, Availability, DeviceMemory, DeviceTopology, Diagnostic,
-    DiagnosticSource, Executor, ExecutorId, ExecutorKind, GrantSource, Identity, KindId, Limits,
-    Packing, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Reservation,
+    AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, DeviceMemory, DeviceTopology,
+    Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, GrantSource, Identity,
+    KindId, Limits, Packing, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported,
+    ReportedBy, Reservation,
     ReservationCharges, ReservationChunks, ReservedRecords, Revision, Store, StoreId,
     StoreIdentity, StoreKind, TableCharge, TransferPath, TransferPathId, VolumeId,
 };

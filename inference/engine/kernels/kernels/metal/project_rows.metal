@@ -1,6 +1,6 @@
 // project_rows: the plain projection of the A rows `source`, published in Y
 // (the `attention_output` launch structure with a store epilogue). Group g
-// of a grouped weight (grid z, `dense_rows.seismic`) is the projection of
+// of a grouped weight (grid z, `dense.seismic`) is the projection of
 // the source columns g * K .., through weight rows g * N .., into output
 // columns g * N ..: the same launches over its views (`PROJECT_ROWS_OPERANDS`).
 #define KERNEL_W0 SEISMIC_WEIGHT
@@ -168,12 +168,19 @@ kernel void project_rows_finalize(PROJECT_ROWS_ARGUMENTS,
 #endif
 
 // The TALL form past 64 rows: the source rows in the tall GEMM's order, then
-// its tiles.
+// its tiles. Group g's source rows lie in the g-th of the fragments, one
+// group's ceil(M / 64) * 64 rows of K halves each.
+inline device uchar *group_fragments(device uchar *fragments, uint group, uint m, uint k) {
+    return fragments + ulong(group) * ((m + 63u) / 64u) * 64u * k * 2u;
+}
+
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_RELAYOUT
 kernel void project_rows_relayout(PROJECT_ROWS_ARGUMENTS,
-    uint item [[thread_position_in_grid]]) {
-    PROJECT_ROWS_OPERANDS(0u);
-    projection::tall_relayout(in, fragments, uint(SEISMIC_DIM_M), k, item);
+    uint3 position [[thread_position_in_grid]]) {
+    const uint group = PROJECT_ROWS_GROUP(position.z);
+    PROJECT_ROWS_OPERANDS(group);
+    const uint m = uint(SEISMIC_DIM_M);
+    projection::tall_relayout(in, group_fragments(fragments, group, m, k), m, k, position.x);
 }
 #endif
 
@@ -184,9 +191,12 @@ kernel void project_rows_tall(PROJECT_ROWS_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
-    PROJECT_ROWS_OPERANDS(0u);
-    projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(projection::tall_operand(in, fragments), out, w,
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile.y, tile.x, shared, sg, lane);
+    const uint group = PROJECT_ROWS_GROUP(tile.z);
+    PROJECT_ROWS_OPERANDS(group);
+    const uint m = uint(SEISMIC_DIM_M);
+    projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(
+        projection::tall_operand(in, group_fragments(fragments, group, m, k)), out, w, m, uint(SEISMIC_DIM_N), k,
+        tile.y, tile.x, shared, sg, lane);
 }
 #endif
 

@@ -158,7 +158,7 @@ const estimated = (estimatedTokensPerSecond: number) => ({
  * A streamed fit as the protocol carries it: 60% of experts in memory at ~20 tok/s, a floor of 1%
  * (the least its steps hold at once) at ~5 tok/s, the rest kept as `coldExperts` says (read from disk unless given).
  */
-export const streamedFitResidency = (coldExperts = "disk"): LocalModelFitResidency =>
+export const streamedFitResidency = (coldExperts: unknown = { _tag: "Disk" }): LocalModelFitResidency =>
   Schema.decodeUnknownSync(LocalModelFitResidencySchema)({
     _tag: "Streamed",
     bank: { experts: 100, slots: 60, floorSlots: 1, coldExperts },
@@ -185,7 +185,7 @@ export const streamingStatus = (memoryDomainIds: readonly string[]): ModelStream
       : {}),
     diskBytes: 300 * 1000 ** 2,
     tables: [{ records: 20, floorRecords: 10, ceilingRecords: 40, bytes: 126 * 1000 ** 2 }],
-    lastResize: { _tag: "Shrank", cause: "live_claim", to: 40, by: 10, atUnixMs: 1234 },
+    lastResize: { _tag: "Shrank", to: 40, by: 10, atUnixMs: 1234 },
   })
 
 /** How a load serves when its prompt groups are granted one place of eight. */

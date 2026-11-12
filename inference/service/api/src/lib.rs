@@ -2520,7 +2520,6 @@ mod tests {
                             "stable_capacity_bytes": 768,
                             "allocation_capacity_bytes": 1024,
                             "planning_reserve_bytes": 256,
-                            "emergency_reserve_bytes": 64,
                             "capacity_basis": "linux_mem_total"
                         },
                         "available_bytes": 640,

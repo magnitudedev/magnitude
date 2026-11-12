@@ -9,8 +9,9 @@
 //! stated values, then asserts that every run-owned backing was released
 //! (`charged == base`, IF §2.8) and restores the limit.
 //!
-//! Every test opens its own device, and an open creates a private memory
-//! domain, so concurrently running tests never share a limit or a charge.
+//! Every test opens its own device with its own ledgers
+//! (`seismic::testing::open_own_ledgers`), so concurrently running tests
+//! never share a limit or a charge.
 //! Budgets keep at least 4 KiB of margin for the run's own small acquisitions
 //! (failure record, scalar cells; each at most 64 bytes, IF §2.6).
 use crate::common::{device, prepare, Selection, CHECK_MEMORY_BYTES, CHECK_WORK_UNITS};
@@ -174,7 +175,7 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         .collect();
     let usage = device.device_ledger();
     let base = usage.charged;
-    device.bound(seismic::Ledger::Own(device.device_store()), Some(base + budget)).unwrap();
+    device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(base + budget)).unwrap();
     let function = module.function(entry).expect("declared entry");
     let (kernel, _) = prepare(
         &function,
@@ -235,7 +236,7 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         base,
         "{entry}: the run did not release every backing it acquired"
     );
-    device.bound(seismic::Ledger::Own(device.device_store()), usage.bound).unwrap();
+    device.bounds().bound(seismic::Ledger::Own(device.device_store()), usage.bound).unwrap();
     Run { failed, tensors }
 }
 

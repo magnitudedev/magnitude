@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { LocalModelFitResidencySchema, type LocalModel, type StreamingResize } from "@magnitudedev/sdk"
 import { servingHardware } from "../application/fixtures/hardware"
 import { makeSetupModel, streamedFitResidency, streamedReadyResidency } from "../application/fixtures/model"
+import { formatMemorySize } from "./format-bytes"
 import {
   fitResidencyFacts,
   localModelExpertFacts,
@@ -30,11 +31,6 @@ const withHoldingResizes = (
       host: Option.map(status.host, (host) => ({ ...host, lastResize: Option.fromNullable(resizes.host) })),
     }),
   }
-}
-const withExpertsResize = (memoryDomainIds: readonly string[], resize: StreamingResize) => {
-  const streamed = allocation(memoryDomainIds)
-  const status = Option.getOrThrow(streamed.streaming)
-  return { ...streamed, streaming: Option.some({ ...status, lastResize: Option.some(resize) }) }
 }
 
 /** A model whose fit is streamed (60% allowed), unloaded or loaded with an expert bank (40% held). */
@@ -64,7 +60,7 @@ describe("model serving facts", () => {
       ["N-gram table in memory", "126 MB, 50% of its most, floor 25%"],
     ])
     expect(facts[7]?.[0]).toBe("Last resize")
-    expect(facts[7]?.[1]).toMatch(/^Experts shrank from 50% to 40% to make room for a request on /)
+    expect(facts[7]?.[1]).toMatch(/^Experts shrank from 50% to 40% as memory grew short on /)
   })
 
   it("dates the last resize, so one days ago never reads as today's", () => {
@@ -81,21 +77,15 @@ describe("model serving facts", () => {
 
   it("names the table a resize changed, by its share of its most", () => {
     expect(modelServingFacts(withHoldingResizes(["system"], {
-      table: { _tag: "Shrank", cause: "reclaim", to: 20, by: 10, atUnixMs: 1234 },
-    }), discrete).at(-1)?.[1]).toMatch(/^N-gram table shrank from 75% to 50% under memory pressure on /)
+      table: { _tag: "Shrank", to: 20, by: 10, atUnixMs: 1234 },
+    }), discrete).at(-1)?.[1]).toMatch(/^N-gram table shrank from 75% to 50% as memory grew short on /)
   })
 
   it("states the latest of the holdings' last resizes", () => {
     expect(modelServingFacts(withHoldingResizes(["cuda-0"], {
-      table: { _tag: "Shrank", cause: "reclaim", to: 20, by: 10, atUnixMs: 1000 },
+      table: { _tag: "Shrank", to: 20, by: 10, atUnixMs: 1000 },
       host: { _tag: "Grew", from: 15, by: 15, atUnixMs: 2000 },
     }), discrete).at(-1)?.[1]).toMatch(/^Cold experts grew/)
-  })
-
-  it("says a shrink made room for measuring this machine", () => {
-    expect(modelServingFacts(withExpertsResize(["system"], {
-      _tag: "Shrank", cause: "measurement", to: 40, by: 10, atUnixMs: 1234,
-    }), discrete).at(-1)?.[1]).toMatch(/^Experts shrank from 50% to 40% to make room for measuring this machine on /)
   })
 
   it("names a tier in memory the GPU shares with the host as unified memory, with no cold experts", () => {
@@ -132,8 +122,8 @@ describe("model expert facts", () => {
       ["Expert floor", "1%"],
       ["Speed at the floor", "~5 tok/s"],
     ])
-    expect(fitResidencyFacts(streamedFitResidency("host_ram"), 32_768)[0])
-      .toEqual(["Experts this machine allows", "60%, the rest in system memory as it allows, else read from disk"])
+    expect(fitResidencyFacts(streamedFitResidency({ _tag: "HostRam", cacheBytes: 9_000_000_000 }), 32_768)[0])
+      .toEqual(["Experts this machine allows", `60%, the rest in system memory as it allows (${formatMemorySize(9_000_000_000)} cached), else read from disk`])
   })
 
   it("states an unloaded streamed fit's facts, and needs no hardware for them", () => {

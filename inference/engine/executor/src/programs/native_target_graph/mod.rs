@@ -18,7 +18,7 @@ mod weights;
 #[cfg(test)]
 pub(crate) use block::checked_block_graph_resources;
 pub(crate) use bound::{BankRun, BoundTargetGraphs, GroupBuffers, TokenRow, placed_banks};
-pub(crate) use certify::{CheckedTargetFamily, checked_target_and_undrafted, checked_target_family, pass_buffer_bytes};
+pub(crate) use certify::{CheckedTargetFamily, checked_target_and_undrafted, checked_target_family};
 #[cfg(test)]
 pub(crate) use certify::checked_target_family_storage;
 #[cfg(test)]

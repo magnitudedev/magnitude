@@ -321,6 +321,7 @@ fn is_cpu(device: &Device) -> bool {
     device.backend() == BackendName::Cpu
 }
 
+#[allow(dead_code)]
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
     let bytes = values

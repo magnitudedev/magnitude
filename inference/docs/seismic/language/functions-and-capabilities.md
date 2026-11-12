@@ -44,3 +44,13 @@ native default. Portable bodies and representations supply the facts for that co
 declarations carry no precision permissions or trusted descriptions of native rounding behavior.
 Empirical admission never grants compiler numerical applicability.
 
+
+A native declaration may take its consumer forms from a projection rather than state them. A
+`projection NAME for TARGET` declaration writes a backend's forms of projecting activation rows
+by weights once: each form's parameter, its admission over the weights (`each`, `any`,
+`agree`), its shape guards over the formals `M`, `K` and `N`, its scratch (per weight where it
+needs one) and its launches, with per-variant items for the `paired` and `single` variants. An
+entry's declaration takes it with one line, `project NAME VARIANT (WEIGHT, ..)`, naming its weight
+ports; the formals come from the entry's signature. The line expands into the ordinary
+declaration it stands for before checking, so checking, the tuner's parameter addresses and
+formation see exactly what the entry would have written by hand.

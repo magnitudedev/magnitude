@@ -31,8 +31,8 @@ pub struct NativeGraphPool {
     held: GraphSlots,
     /// Activations and output slots allocated now, lent or free.
     allocated: GraphSlots,
-    workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
-    output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+    workspace: FreeSlots<NativeGraphFamilySlot>,
+    output: FreeSlots<NativeGraphFamilyOutputSlot>,
 }
 
 /// Who reads a family's outputs. The host reads a selection as its step
@@ -117,7 +117,7 @@ impl NativeGraphPool {
                 .family
                 .new_slot_in(&self.arena, &self.upload_regions)
                 .map_err(super::AllocationError::Workflow)?;
-            self.workspace.borrow_mut().push(slot);
+            self.workspace.borrow_mut().push(Claimed::under_class(slot));
             self.allocated.activations += 1;
         }
         // Each launch in flight's decode graphs, recorded as the slots are
@@ -127,7 +127,8 @@ impl NativeGraphPool {
             self.family.record_decode().map_err(super::AllocationError::Tensor)?;
         }
         while self.allocated.output < slots.output {
-            self.grow_output().map_err(super::AllocationError::Tensor)?;
+            let slot = self.new_output().map_err(super::AllocationError::Tensor)?;
+            self.push_output(Claimed::under_class(slot));
         }
         Ok(())
     }
@@ -139,6 +140,12 @@ impl NativeGraphPool {
             activations: self.held.activations.max(slots.activations),
             output: self.held.output.max(slots.output),
         };
+    }
+
+    /// Hold the floor's slots alone again: those beyond idle until
+    /// released.
+    pub(crate) fn hold_floor(&mut self) {
+        self.held = self.floor;
     }
 
     pub fn domain(&self) -> &ResourceDomainId {
@@ -174,26 +181,24 @@ impl NativeGraphPool {
         self.output.borrow().len()
     }
 
-    /// Allocate one more output slot. The caller holds a heap claim for
-    /// [`Self::output_slot_bytes`] across this call.
-    pub(crate) fn grow_output(&mut self) -> Result<(), seismic::TensorError> {
-        let slot = match self.outputs {
-            Outputs::Device => self.family.new_output_slot()?,
-            Outputs::Host => self.family.new_host_output_slot()?,
-        };
-        self.output.borrow_mut().push(slot);
-        self.allocated.output += 1;
+    /// Allocate one more output slot under `held`, the claim of its
+    /// [`Self::output_slot_bytes`], kept until the slot is released.
+    pub(crate) fn grow_claimed_output(&mut self, held: crate::memory::ledger::Held) -> Result<(), seismic::TensorError> {
+        let slot = self.new_output()?;
+        self.push_output(Claimed::under(slot, held));
         Ok(())
     }
 
-    /// Hold the class of `slots` in place of the one held, never below the
-    /// floor: what [`Self::release_idle`] keeps of a class a settle or
-    /// Reclaim released.
-    pub(crate) fn keep(&mut self, slots: GraphSlots) {
-        self.held = GraphSlots {
-            activations: self.floor.activations.max(slots.activations),
-            output: self.floor.output.max(slots.output),
-        };
+    fn new_output(&self) -> Result<NativeGraphFamilyOutputSlot, seismic::TensorError> {
+        match self.outputs {
+            Outputs::Device => self.family.new_output_slot(),
+            Outputs::Host => self.family.new_host_output_slot(),
+        }
+    }
+
+    fn push_output(&mut self, slot: Claimed<NativeGraphFamilyOutputSlot>) {
+        self.output.borrow_mut().push(slot);
+        self.allocated.output += 1;
     }
 
     /// Take the free activations and output slots beyond the held class's
@@ -228,9 +233,11 @@ impl NativeGraphPool {
             required: 1,
             available: 0,
         })?;
+        let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),
             slot: Some(slot),
+            claims,
             free: self.output.clone(),
         })
     }
@@ -252,8 +259,8 @@ struct VisionGraphClass {
     family: NativeGraphFamily,
     activations: usize,
     outputs: usize,
-    workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
-    output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+    workspace: FreeSlots<NativeGraphFamilySlot>,
+    output: FreeSlots<NativeGraphFamilyOutputSlot>,
 }
 
 impl VisionGraphClass {
@@ -345,28 +352,30 @@ impl VisionGraphPool {
             .map_or(0, |class| class.output.borrow().len())
     }
 
-    /// Allocate one more activation of the class of `patch_rows`. The caller
-    /// holds a heap claim for [`Self::activation_bytes`] across this call.
-    pub(crate) fn grow_activation(&mut self, patch_rows: u64) -> Result<(), VisionGrowth> {
+    /// Allocate one more activation of the class of `patch_rows` under
+    /// `held`, the claim of its [`Self::activation_bytes`] and graphs, kept
+    /// until the activation is released.
+    pub(crate) fn grow_activation(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
         let slot = class
             .family
             .new_slot(&class.upload_regions())
             .map_err(VisionGrowth::Device)?;
-        class.workspace.borrow_mut().push(slot);
+        class.workspace.borrow_mut().push(Claimed::under(slot, held));
         class.activations += 1;
         Ok(())
     }
 
-    /// Allocate one more output slot of the class of `patch_rows`. The
-    /// caller holds a heap claim for [`Self::output_bytes`] across this call.
-    pub(crate) fn grow_output(&mut self, patch_rows: u64) -> Result<(), VisionGrowth> {
+    /// Allocate one more output slot of the class of `patch_rows` under
+    /// `held`, the claim of its [`Self::output_bytes`], kept until the slot
+    /// is released.
+    pub(crate) fn grow_output(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
         let slot = class
             .family
             .new_output_slot()
             .map_err(VisionGrowth::Device)?;
-        class.output.borrow_mut().push(slot);
+        class.output.borrow_mut().push(Claimed::under(slot, held));
         class.outputs += 1;
         Ok(())
     }
@@ -395,9 +404,11 @@ impl VisionGraphPool {
             required: 1,
             available: 0,
         })?;
+        let Claimed { slot, claims } = slot;
         Ok(NativeGraphOutputLease {
             domain: self.domain.clone(),
             slot: Some(slot),
+            claims,
             free: class.output.clone(),
         })
     }
@@ -439,8 +450,8 @@ const OVERFLOW: &str = "a graph pool's bytes overflow";
 /// release thread (`AllocatedResources::release_idle_slots`).
 #[derive(Default)]
 pub(crate) struct IdleSlots {
-    activations: Vec<NativeGraphFamilySlot>,
-    outputs: Vec<NativeGraphFamilyOutputSlot>,
+    activations: Vec<Claimed<NativeGraphFamilySlot>>,
+    outputs: Vec<Claimed<NativeGraphFamilyOutputSlot>>,
 }
 
 impl IdleSlots {
@@ -450,8 +461,40 @@ impl IdleSlots {
 
     /// Release every slot: the bytes the device is no longer charged.
     pub(crate) fn release(self) -> u64 {
-        let activations = self.activations.into_iter().map(NativeGraphFamilySlot::release);
-        activations.chain(self.outputs.into_iter().map(NativeGraphFamilyOutputSlot::release)).sum()
+        let activations = self.activations.into_iter().map(|slot| slot.release(NativeGraphFamilySlot::release));
+        activations.chain(self.outputs.into_iter().map(|slot| slot.release(NativeGraphFamilyOutputSlot::release))).sum()
+    }
+}
+
+/// A pool's free slots.
+type FreeSlots<S> = Rc<RefCell<Vec<Claimed<S>>>>;
+
+/// A slot and the claims of its storage, which go where it goes and are
+/// released with it: a slot grown one at a time holds its own; one of a
+/// held class holds none, its class's claim paying for it.
+pub(crate) struct Claimed<S> {
+    slot: S,
+    claims: Vec<crate::memory::ledger::Claim>,
+}
+
+impl<S> Claimed<S> {
+    /// A slot just allocated under `held`.
+    fn under(slot: S, mut held: crate::memory::ledger::Held) -> Self {
+        held.allocated();
+        Self { slot, claims: held.into_claims() }
+    }
+
+    /// A slot of a held class, under its class's claim.
+    fn under_class(slot: S) -> Self {
+        Self { slot, claims: Vec::new() }
+    }
+
+    /// Release the slot's storage by `release`, then its claims.
+    fn release(self, release: impl FnOnce(S) -> u64) -> u64 {
+        let Self { slot, claims } = self;
+        let released = release(slot);
+        drop(claims);
+        released
     }
 }
 
@@ -465,8 +508,8 @@ pub(crate) enum VisionGrowth {
 
 pub struct NativeGraphWorkspaceLease {
     domain: ResourceDomainId,
-    slot: Option<NativeGraphFamilySlot>,
-    free: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
+    slot: Option<Claimed<NativeGraphFamilySlot>>,
+    free: FreeSlots<NativeGraphFamilySlot>,
 }
 
 impl NativeGraphWorkspaceLease {
@@ -475,7 +518,7 @@ impl NativeGraphWorkspaceLease {
     }
 
     pub fn slot_mut(&mut self) -> &mut NativeGraphFamilySlot {
-        self.slot.as_mut().expect("graph workspace lease is live")
+        &mut self.slot.as_mut().expect("graph workspace lease is live").slot
     }
 }
 
@@ -493,7 +536,9 @@ impl Drop for NativeGraphWorkspaceLease {
 pub struct NativeGraphOutputLease {
     domain: ResourceDomainId,
     slot: Option<NativeGraphFamilyOutputSlot>,
-    free: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+    /// The slot's claims, kept while it is activated.
+    claims: Vec<crate::memory::ledger::Claim>,
+    free: FreeSlots<NativeGraphFamilyOutputSlot>,
 }
 
 impl NativeGraphOutputLease {
@@ -529,11 +574,12 @@ impl NativeGraphOutputLease {
     /// Publish a completed graph's outputs. Every exported tensor returned
     /// through this owner retains the physical output arena. Final drop
     /// recycles it into the same admitted pool.
-    pub fn publish(self, outputs: NativeGraphOutputs) -> GraphOutputOwner {
+    pub fn publish(mut self, outputs: NativeGraphOutputs) -> GraphOutputOwner {
         assert!(self.slot.is_none(), "graph output was not activated");
         GraphOutputOwner {
             claim: Rc::new(GraphOutputClaim {
                 outputs: Some(outputs),
+                claims: std::mem::take(&mut self.claims),
                 free: self.free.clone(),
             }),
         }
@@ -543,14 +589,15 @@ impl NativeGraphOutputLease {
 impl Drop for NativeGraphOutputLease {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            self.free.borrow_mut().push(slot);
+            self.free.borrow_mut().push(Claimed { slot, claims: std::mem::take(&mut self.claims) });
         }
     }
 }
 
 struct GraphOutputClaim {
     outputs: Option<NativeGraphOutputs>,
-    free: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+    claims: Vec<crate::memory::ledger::Claim>,
+    free: FreeSlots<NativeGraphFamilyOutputSlot>,
 }
 
 impl Drop for GraphOutputClaim {
@@ -561,7 +608,7 @@ impl Drop for GraphOutputClaim {
         let slot = outputs
             .recycle()
             .expect("a graph output view outlived its last ownership claim");
-        self.free.borrow_mut().push(slot);
+        self.free.borrow_mut().push(Claimed { slot, claims: std::mem::take(&mut self.claims) });
     }
 }
 
@@ -623,5 +670,27 @@ mod tests {
         assert!(super::class_bytes(u64::MAX, 2, 0, 0).is_err());
         assert!(super::class_bytes(0, 0, u64::MAX / 2 + 1, 2).is_err());
         assert!(super::class_bytes(u64::MAX, 1, 1, 1).is_err());
+    }
+
+    /// A slot a pool frees keeps its claim until the slot's storage is
+    /// released, and gives it back then: a freed vision slot leaves nothing
+    /// held on the ledger.
+    #[test]
+    fn a_freed_slots_claim_is_released_with_it() {
+        use crate::memory::{ClaimDemand, ledger::{CommittedKind, DeviceLedgers, Ledgers}};
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).expect("the CPU backend opens");
+        let shape = std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() });
+        let ledgers = DeviceLedgers::open_in(&Ledgers::new(), &device, shape);
+        let at = std::time::Instant::now();
+        for ledger in [ledgers.device(), ledgers.host()] {
+            ledger.read(|| Ok(crate::memory::ledger::Available::new(8 << 30, 8 << 30, None, at).expect("a reading")));
+        }
+        let held = ledgers.claim(&device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() }).expect("room");
+        let slot = super::Claimed::under((), held);
+        assert_eq!(ledgers.device().snapshot().allocated(), 1 << 20, "the freed slot's claim is held until its release");
+        assert_eq!(slot.release(|()| 0), 0);
+        assert_eq!(ledgers.device().snapshot().committed(), 0, "the released slot's claim is gone");
+        assert_eq!(ledgers.device().snapshot().allocated(), 0);
     }
 }

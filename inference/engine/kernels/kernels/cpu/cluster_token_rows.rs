@@ -1,3 +1,4 @@
+#[inline(always)]
 fn cluster_token_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,

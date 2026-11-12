@@ -66,16 +66,16 @@ impl Status {
     }
 
     /// What `store` has left for this process: host RAM's allocatable bytes
-    /// ([`HostStatus::allocatable`]) within every process limit; a volume's space
+    /// ([`HostStatus::allocatable_bytes`] under `reclaim`) within every process limit; a volume's space
     /// available to this process; a device memory store's capacity less the
     /// process's charges, which the OS does not report.
-    pub fn headroom(&self, store: &Store) -> Result<u64, ObservationError> {
+    pub fn headroom(&self, store: &Store, reclaim: crate::host::Reclaim) -> Result<u64, ObservationError> {
         match store.kind() {
             StoreKind::HostRam => self
                 .sample
                 .host_ram
                 .as_ref()
-                .map(HostStatus::allocatable_bytes)
+                .map(|host| host.allocatable_bytes(reclaim))
                 .map_err(Clone::clone),
             StoreKind::Volume(_) => self
                 .sample

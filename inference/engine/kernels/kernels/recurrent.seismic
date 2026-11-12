@@ -88,7 +88,7 @@ fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * 
 # beyond over tuned TILE_M x TILE_N tiles, or under TALL the tall GEMM over
 # rows staged in its order).
 # (CUDA: GEMV to 16 rows, no batched class, GEMM row bands; see below.)
-# PACK selects the token-packing form of `dense_rows.seismic` past 64 rows for
+# PACK selects the token-packing form of `dense.seismic` past 64 rows for
 # the qkv and z segments, over the staged normalized rows: one operand for
 # both segments (coded under the tighter of the two weights' packing limits),
 # each weight's own factor tables (the z weights' after the qkv weights' in
@@ -163,7 +163,7 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
 # CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; at M = 1 the block
 # forms its A row in shared memory), GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands; see
-# `cuda_dense.seismic`); one shared stage forms semantic rows or selected S8/F16 matrix operands. (Metal: batched GEMV class, no INT8 path.)
+# `dense.seismic`); one shared stage forms semantic rows or selected S8/F16 matrix operands. (Metal: batched GEMV class, no INT8 path.)
 native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
     static (H, PT, NM, NK, NV, W)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
@@ -249,7 +249,7 @@ native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
 native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * H * 4)
     launch gated_delta_project_normalize:
         threadgroups (M, 1, 1)
@@ -570,7 +570,7 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
     return (projection, convolved)
 
 # Metal: GEMV for one row, `gemv_pair` for two and `gemv_rows` up to
-# BATCH_FROM (see `dense_rows.seismic`). Batched rows stage the normalized
+# BATCH_FROM (see `dense.seismic`). Batched rows stage the normalized
 # operand with the same small-row RMS reduction, then use compressed-code
 # matrix products for supported weights and batched GEMV for other formats.
 # The qkv segment's epilogue receives every row's sum of its

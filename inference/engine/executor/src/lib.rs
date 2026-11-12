@@ -58,18 +58,19 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
+pub use experts::derived::{import_slots, in_process_growth};
 pub use stored_table::{Prefetched, TableWaits};
 pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, BankCurve, Reach, Reaches, BankGrant, BankRelease, OwnerHoldings, ServingSettlement, SizeStep, TableResidency, DeviceHeap, MachineReading, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
-    ExpertMeasures, LoadCosts, LoadMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, ShrinkCause, TierFill, DecodeStep,
-    HeadFlight, LaunchDuration, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, TableResidency, DeviceReader, LoadRoom, MachineReading, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    ExpertMeasures, LoadCosts, LoadMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, TierFill, DecodeStep,
+    HeadFlight, LaunchDuration, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
-    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,
+    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight,
 };
 pub use error::{
     CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
@@ -101,7 +102,7 @@ pub use native::{
     PinnedChoice, PointShape, QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt,
     ResolvedNumericalProfile, SEARCH_SETTINGS, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
     SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry,
-    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom,
+    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom, RoomNow,
     TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits, UnreportedTuning,
     ZeroTuningWeights, attention_points, row_points,
 };
@@ -153,7 +154,7 @@ pub fn head_admitted(definition: &magnitude_family_contracts::ModelDefinition) -
 pub use residency::{
     ComponentLoader, ImportArtifactTensor, ResidentWeight, Stored, StoredTensor, WeightImportError,
 };
-pub use residency::{MappedImportReport, ResidencyStore};
+pub use residency::{ImportReport, ResidencyStore};
 pub use storage_thread::Releases;
 pub use resident_weights::{
     ResidencyError, ResidentHead, ResidentOutput, ResidentPlanes, ResidentRoles, ResidentTarget,

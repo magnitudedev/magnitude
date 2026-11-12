@@ -156,6 +156,8 @@ type RecordsAt = fn(&ExpertBankPlan, usize, u64) -> u64;
 /// returns once the device work submitted before it completed, so no work
 /// that could not reach the slot's rows (on Metal, committed before its
 /// chunks joined the queue's residency set) can be handed them; only then
+/// `resident` records the slot's memory, which exists from its backing (a
+/// reservation backs a granule by touching or wiring every page), and
 /// `join` forms the slot's join, `post` hands it to the watcher
 /// (`Shared::join`, taken at its next pass), and `slots` holds it. A
 /// refusal ends it at the slots joined before. The installs, where the
@@ -166,6 +168,7 @@ pub(super) fn grow_by_slots<S>(
     mut resizers: Vec<Resizer>,
     (from, to): (u64, u64),
     rows: impl Fn(u64) -> Vec<u64>,
+    resident: impl Fn(u64),
     join: impl Fn(u64) -> Result<Join, String>,
     post: impl Fn(Join),
     (slots, rises): (&AtomicU64, &Mutex<()>),
@@ -212,6 +215,10 @@ pub(super) fn grow_by_slots<S>(
         if let Some(refusal) = refusal {
             return Grown { resizers, joined, cut: Cut::Refused(refusal), spent };
         }
+        // The slot's storage is resident (a reservation's granules are
+        // backed by touching or wiring every page, `seismic_reservation`):
+        // its memory exists from here, and its growth's claim says so.
+        resident(at);
         let joining = Instant::now();
         match join(at) {
             Ok(join) => post(join),
@@ -346,7 +353,7 @@ pub(super) struct Begun {
 impl Begun {
     fn times(self, prepared: Instant, installed: Instant, released: Instant) -> ResizeTimes {
         let Self { decided, queued, planned, trips, moves } = self;
-        ResizeTimes { decided, queued, planned, trips, moves, prepared, installed, released }
+        ResizeTimes { decided, queued, planned, trips, moves, prepared, installed, released, unpinned: Duration::ZERO }
     }
 }
 
@@ -470,7 +477,7 @@ impl ExpertBank {
         };
         let records: RecordsAt = ExpertBankPlan::host_records;
         let tensors = (self.host_groups(), records);
-        match self.growing(resizers, (&tier.slots, to), tensors, Joining::Landed, charged, &tier.thread, wake) {
+        match self.growing(resizers, (&tier.slots, to), tensors, Joining::Landed, (charged, crate::planning::BankCounts::host_charge), &tier.thread, wake) {
             Ok(growing) => tier.resize = resize(growing),
             Err((resizers, error)) => {
                 tier.resize = HostResize::Idle(resizers);
@@ -483,16 +490,17 @@ impl ExpertBank {
     /// Begin growing a holding's record tensors (`resizers`, each of group
     /// `groups[i]`, at `records`) from its `slots` now to `to` on its store's
     /// resize `thread` ([`grow_by_slots`]), its records charged `charged` now, each
-    /// slot joining the watcher as `joining` says as soon as every tensor
-    /// backs it; `wake` completed once it ends. Refused, the resizers
-    /// come back.
+    /// slot recorded allocated in the bank's cache at its `charge` as soon
+    /// as every tensor backs it (`BankCache::backed`), then joining the
+    /// watcher as `joining` says; `wake` completed once it ends. Refused,
+    /// the resizers come back.
     fn growing(
         &self,
         resizers: Vec<Resizer>,
         (slots, to): (&Arc<AtomicU64>, u64),
         (groups, records): (Vec<usize>, RecordsAt),
         joining: Joining,
-        charged: u64,
+        (charged, charge): (u64, fn(&crate::planning::BankCounts, u64) -> u64),
         thread: &StorageThread,
         wake: CompletionWake,
     ) -> Result<Growing, (Vec<Resizer>, DomainError)> {
@@ -513,6 +521,10 @@ impl ExpertBank {
             shared.join(Join::Growing);
         }
         let (stopping, rises) = (stop.clone(), self.rises.clone());
+        let backed = {
+            let (cache, counts) = (self.cache.clone(), self.counts.clone());
+            move |at: u64| cache.backed(charge(&counts, at))
+        };
         let join = {
             let plan = plan.clone();
             move |at: u64| -> Result<Join, String> {
@@ -537,7 +549,7 @@ impl ExpertBank {
             // The growth ends however its slots end, a panic among them too
             // (re-raised to the thread's catch): no slot joins after.
             let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                grow_by_slots(resizers, (from, to), rows, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
+                grow_by_slots(resizers, (from, to), rows, backed, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
             }));
             if lands {
                 shared.join(Join::Grown);
@@ -570,11 +582,11 @@ impl ExpertBank {
         self.watcher.shared().events().notify();
     }
 
-    /// Finish a host tier's growth once its resize thread ended it: its
-    /// outcome (grown to the host slots its slots reached, or refused
-    /// before any joined), none of its backing at open, which no domain
-    /// resize began.
-    pub(super) fn advance_host(&self) -> Result<Option<BankResized>, DomainError> {
+    /// Finish a host tier's growth, or its backing at open, once its resize
+    /// thread ended it: its outcome (grown to the host slots its slots
+    /// reached, or refused before any joined), and whether a domain resize
+    /// began it (the backing's none did, so its end is reported to none).
+    pub(super) fn advance_host(&self) -> Result<Option<(BankResized, bool)>, DomainError> {
         let Some(host) = self.host.as_ref() else {
             return Ok(None);
         };
@@ -593,35 +605,13 @@ impl ExpertBank {
                 let (planned, ceiling) = (self.plan.host_slots, tier.ceiling);
                 tracing::info!("the host tier's {kind} ended at {slots} of {planned} planned host slots ({ceiling} every expert), {spent}: {resized:?}");
                 tier.resize = HostResize::Idle(resizers);
-                Ok(reported.then_some(resized))
+                Ok(Some((resized, reported)))
+
             }
             Err(reason) => {
                 tier.resize = HostResize::Broken(reason.clone());
                 Err(DomainError::invariant(reason))
             }
-        }
-    }
-
-    /// What the growth the domain began of the holdings in `tier` storage has backed so far:
-    /// their records' charge now beyond theirs at its start; none while no growth of that store
-    /// runs. The domain's claim of the growth holds only the rest. Its charge rises only under
-    /// [`ExpertBank::hold_rises`], which its reader holds.
-    pub(super) fn growth_backed(&self, tier: BankTier) -> Result<u64, DomainError> {
-        let backed = |now: u64, from: u64| {
-            now.checked_sub(from).ok_or_else(|| DomainError::invariant("a growth lowered its records' charge"))
-        };
-        match tier {
-            BankTier::Bank => match &self.commitment().resize {
-                Resize::Growing(growing) => backed(self.charged()?, growing.charged),
-                _ => Ok(0),
-            },
-            BankTier::Host => match self.host.as_ref().map(|host| host.lock().expect("host tier")) {
-                Some(tier) => match &tier.resize {
-                    HostResize::Growing(growing) => backed(self.host_charged()?, growing.charged),
-                    _ => Ok(0),
-                },
-                None => Ok(0),
-            },
         }
     }
 
@@ -686,7 +676,10 @@ impl ExpertBank {
         };
         let to = cut.slots as u64;
         tier.slots.store(to, Ordering::Release);
-        match recommit(resizers, self.host_rows(to)) {
+        let unpinning = seismic::backing_times();
+        let recommitted = recommit(resizers, self.host_rows(to));
+        let unpinned = seismic::backing_times().since(unpinning).unpin;
+        match recommitted {
             Ok(resizers) => tier.resize = HostResize::Idle(resizers),
             Err(refusal) => {
                 let reason = shrink_refused(refusal);
@@ -694,7 +687,7 @@ impl ExpertBank {
                 return Err(DomainError::invariant(reason));
             }
         }
-        Ok(Shrinking::Begun(LandedShrink { from, to, before, after: self.host_charged()? }))
+        Ok(Shrinking::Begun(LandedShrink { unpinned, from, to, before, after: self.host_charged()? }))
     }
 
     /// Shrink the one store (where the host places), decided at `decided`
@@ -936,7 +929,7 @@ impl ExpertBank {
         };
         let records: RecordsAt = ExpertBankPlan::records_at;
         let tensors = (self.record_groups(), records);
-        match self.growing(resizers, (&commitment.slots, to), tensors, joining, charged, &self.resize_thread, wake) {
+        match self.growing(resizers, (&commitment.slots, to), tensors, joining, (charged, crate::planning::BankCounts::resident_charge), &self.resize_thread, wake) {
             Ok(growing) => commitment.resize = Resize::Growing(growing),
             Err((resizers, error)) => {
                 commitment.resize = Resize::Idle(resizers);
@@ -1062,9 +1055,7 @@ impl ExpertBank {
         let started = Instant::now();
         // The release reports to the advance that takes it: no wake.
         let wake = || CompletionWake::new(|| {});
-        // Memory is read outside the commitment's lock, which a reading's
-        // settling of a growth's claim takes (`ElasticBank::growth_backed`);
-        // only this thread leaves the resizers idle.
+        // Only this thread leaves the resizers idle.
         let short = {
             let commitment = self.commitment();
             matches!(commitment.resize, Resize::Idle(_)) && commitment.slots.load(Ordering::Acquire) > self.counts.floor()
@@ -1182,6 +1173,8 @@ pub(super) enum Shrinking<T> {
 /// A shrink of the records the host lands into, done: the slots it took them
 /// from and to, and Seismic's charge of them before and after.
 pub(super) struct LandedShrink {
+    /// Its release's unregistration of host pages.
+    pub(super) unpinned: Duration,
     pub(super) from: u64,
     pub(super) to: u64,
     pub(super) before: u64,

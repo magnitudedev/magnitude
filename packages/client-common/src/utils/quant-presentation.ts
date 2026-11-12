@@ -41,7 +41,7 @@ export type FitPlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory
  */
 export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, memory: ServingMemory): FitPlacementPhrase => {
   if (assessment.residency._tag === "Streamed") {
-    return assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
+    return assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts._tag === "Disk" ? "Streams from SSD" : "Streams from RAM"
   }
   return memory === "Device" ? "Fits in GPU" : memory === "Unified" ? "Fits in memory" : "Fits in RAM"
 }

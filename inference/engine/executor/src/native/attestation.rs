@@ -722,7 +722,7 @@ impl AttestedPrograms {
         plan: &ExecutionPlanDraft,
         device: &Device,
         tuning: TuningContext<'_>,
-        room: Option<super::tuning::TuningRoom>,
+        room: Option<&'_ dyn super::tuning::TuningRoom>,
     ) -> Result<Vec<TunedEntry>, CatalogError> {
         let limits = TuningLimits::of(plan.policy().limits(), tuning.definition);
         Self::preparation_inputs(
@@ -754,7 +754,7 @@ impl AttestedPrograms {
         method: crate::PlannedMethod,
         device: &'a Device,
         tuning: TuningContext<'a>,
-        room: Option<super::tuning::TuningRoom>,
+        room: Option<&'a dyn super::tuning::TuningRoom>,
     ) -> Result<PreparationInputs<'a>, CatalogFailure> {
         if path != ExecutionPath::Native {
             return Err(CatalogFailure::Preparation {

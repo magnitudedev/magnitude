@@ -717,10 +717,11 @@ fn attention_golden() {
                         specialization = specialization
                             .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                             .with_param("DIRECT", 0);
-                        if kind == Kind::PrefillK8V4 {
-                            specialization =
-                                specialization.with_static("L", 1).with_param("COISSUE", 0);
-                        }
+                        specialization = if kind == Kind::PrefillK8V4 {
+                            specialization.with_static("L", 1).with_param("COISSUE", 0)
+                        } else {
+                            specialization.with_param("KEYS", 8)
+                        };
                     }
                     // CUDA's prefill also splits key tiles; the goldens are
                     // one partition's walk.

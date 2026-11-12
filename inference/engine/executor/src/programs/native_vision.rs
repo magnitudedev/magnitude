@@ -14,7 +14,7 @@ use super::graph::{GraphError, draft::{Certified, GraphDraft}};
 use super::native_target_graph::{GraphWeights, PlannedWeights};
 use super::native_constants::{
     CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
-    RecordedConstant,
+    RecordedConstant, distinct_storage_bytes,
 };
 use super::{ReadySubmission, VisionProgram};
 use crate::error::PlanError;
@@ -1611,6 +1611,12 @@ impl PreparedVisionGraphs {
 
     pub fn workspace_bytes_max(&self) -> u64 {
         self.family.workspace_bytes()
+    }
+
+    /// The bytes of the distinct graph constants a binding uploads
+    /// ([`Self::bind_weights`]).
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        distinct_storage_bytes(self.variants.iter().flat_map(|variant| variant.ports.constants.iter()))
     }
 
     pub fn output_bytes_max(&self) -> u64 {

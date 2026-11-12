@@ -133,7 +133,7 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 /// launch's, and a graph the block runs once a group (`Stage::Once`, its
 /// fill and its passes) only where the launch splits at the block
 /// (`block_splits`): a class served whole, as decode is, runs none. A decode
-/// launch of a bank that can be whole runs either form of a streamed block,
+/// launch of a bank planned whole runs either form of a streamed block,
 /// as its bank is whole or not as it begins (`RunStage::Resident`): it counts
 /// both, so what is held for its every class (`decode_launch`;
 /// `LaunchGraphs::held`, and on CUDA the graphs

@@ -153,6 +153,11 @@ pub struct ExpertBankPlan {
     /// cap bounds of its weights (`ExecutionPlanDraft::with_held_experts`),
     /// the one owner of the slots' upper bound; at least `slots`.
     pub ceiling: u64,
+    /// Whether the load holds its decode blocks' resident form
+    /// (`RunStage::Resident`): only a bank planned whole, which starts in
+    /// it. A bank planned banked commits no bytes for a form it may never
+    /// reach, and serves banked forms whatever it grows to.
+    pub resident: bool,
     /// The most host slots a weight cap leaves its host tier beside the
     /// bank's weights at its ceiling (`ExecutionPlanDraft::bank_ceiling`),
     /// at most the widest layer's experts: a cap bounds every weight byte
@@ -647,6 +652,20 @@ impl ExpertBankPlan {
         self.choices() + self.hint_records()
     }
 
+    /// A linked tier's landing rows ([`Self::landing_records`]), which a
+    /// load commits beside its floor: a record of every group each, as
+    /// resident; none without a tier.
+    pub fn landing(&self) -> Result<Option<crate::memory::ledger::Need>, String> {
+        let Some(tier) = self.holding_storage(crate::BankHolding::Host) else {
+            return Ok(None);
+        };
+        let slot_bytes = self.groups().iter().try_fold(0u64, |total, group| {
+            Self::record_sum(&group.record, RecordTensor::record_bytes)
+                .and_then(|bytes| total.checked_add(bytes).ok_or_else(|| "landing row bytes overflow".to_owned()))
+        })?;
+        Ok(Some(crate::memory::ledger::Need::LandingRows { tier, rows: self.landing_records(), slot_bytes }))
+    }
+
     /// The reservation of the host tier's own records, where the bank has
     /// a tier ([`HostTier::tier`]: a linked one; unified memory has none).
     pub fn tier_reservation(&self) -> Option<seismic::Reservation> {
@@ -828,8 +847,7 @@ impl ExpertBankPlan {
         })
     }
 
-    /// Whether growth reaches every expert ([`Self::ceiling`]): only such a
-    /// bank is ever whole, each expert at its home record.
+    /// Whether growth reaches every expert ([`Self::ceiling`]).
     pub fn reaches_whole(&self) -> bool {
         self.ceiling == self.widest().get()
     }

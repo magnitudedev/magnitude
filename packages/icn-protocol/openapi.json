@@ -4550,12 +4550,45 @@
         "additionalProperties": false
       },
       "ColdExperts": {
-        "type": "string",
-        "description": "Where a streamed fit keeps the experts its bank lacks.",
-        "enum": [
-          "disk",
-          "host_ram"
-        ]
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Read from the model file on demand (unified memory).",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Disk"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "In a host-RAM tier as host memory lets it grow, the rest read from the model file (a\ndiscrete device). `cache_bytes` is what the tier holds past its floor: cache the load\ngrows into free host RAM, which no memory domain's required bytes count.",
+            "required": [
+              "cacheBytes",
+              "_tag"
+            ],
+            "properties": {
+              "cacheBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HostRam"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Where a streamed fit keeps the experts its bank lacks."
       },
       "CompletionFunctionCall": {
         "type": "object",
@@ -6484,8 +6517,7 @@
           "capacity_basis",
           "stable_capacity_bytes",
           "allocation_capacity_bytes",
-          "planning_reserve_bytes",
-          "emergency_reserve_bytes"
+          "planning_reserve_bytes"
         ],
         "properties": {
           "id": {
@@ -6513,11 +6545,6 @@
             "minimum": 0
           },
           "planning_reserve_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "emergency_reserve_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -7755,21 +7782,6 @@
                 "type": "string",
                 "enum": [
                   "Blocked"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "A memory domain the load uses was under pressure: at its reserve, or with other programs'\nmemory being displaced faster than the system absorbs. No byte count describes it.",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnderPressure"
                 ]
               }
             }
@@ -11751,16 +11763,12 @@
           {
             "type": "object",
             "required": [
-              "cause",
               "to",
               "by",
               "atUnixMs",
               "_tag"
             ],
             "properties": {
-              "cause": {
-                "$ref": "#/components/schemas/StreamingShrinkCause"
-              },
               "to": {
                 "type": "integer",
                 "format": "int64",
@@ -11817,17 +11825,7 @@
             }
           }
         ],
-        "description": "A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`\n(milliseconds since the Unix epoch): shrunk by `by` to `to`, for its cause, or grown by `by`\nfrom `from` into free memory. Each changes its size by at least one."
-      },
-      "StreamingShrinkCause": {
-        "type": "string",
-        "description": "Why the engine shrank an expert bank's holding.",
-        "enum": [
-          "reclaim",
-          "live_claim",
-          "rebalance",
-          "measurement"
-        ]
+        "description": "A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`\n(milliseconds since the Unix epoch): shrunk by `by` to `to` as memory grew short, or grown\nby `by` from `from` into free memory. Each changes its size by at least one."
       },
       "StreamingTableStatus": {
         "type": "object",

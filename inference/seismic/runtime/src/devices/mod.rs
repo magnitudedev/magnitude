@@ -63,16 +63,17 @@ impl fmt::Display for OpenError {
 }
 impl std::error::Error for OpenError {}
 
-/// A level of the ledger an opened device bounds (`Device::bound`).
+/// A level of the ledger an opened device bounds, through the one right to
+/// bound it (`Device::bounds`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ledger {
-    /// A store's ledger: every executor of the process that reaches it.
-    Store(StoreId),
     /// The account of one of the device's access paths: every open of its
     /// executor.
     Path(AccessPathId),
     /// The device's own ledger on a store it reaches.
     Own(StoreId),
+    /// A store's ledger: every executor's of the scope that reaches it.
+    Store(StoreId),
 }
 
 /// A store's ledger as an opened device reads it.

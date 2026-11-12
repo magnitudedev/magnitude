@@ -349,7 +349,14 @@ pub const STREAMING_ROWS: u64 = 8;
 /// 44: a case's picks name the rows its index-list source holds at the
 /// position its point stands for, in a plane of those rows (a result of 43
 /// timed every pick as none, of a plane of no rows).
-pub const SEARCH_VERSION: u32 = 44;
+/// 45: a discovery piece is admitted at what it is ranked at, a unit's
+/// later points priced from its own earlier ones and what that leaves
+/// unpriced from the discovery the load has run (a result of 44 held every
+/// pending piece to two or three times the longest operation any unit
+/// completed, and stored the units that then left the objective with their
+/// defaults alone: 18 demanded units of a DeepSeek V4.1 load on Metal,
+/// attention_decode among them, behind routed_gate_up's 11.29 s build).
+pub const SEARCH_VERSION: u32 = 45;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
@@ -1320,30 +1327,38 @@ pub struct StageRecord {
     pub promoted: bool,
 }
 
-/// What the platform lets the engine claim in each memory domain when the
-/// search's device is opened: the ceiling of the search
-/// ([`crate::platform::OpenedPlatform::tuning_room`]). It is the platform's
-/// own bound on any engine claim, the availability it observed above its
-/// planning reserve, and not the load's plan: a search holds its units'
-/// weights and its working memory together, which on a small model is more
-/// than the load will hold, and it has ended before the load begins.
+/// What the engine may still claim in each memory domain, as read at one
+/// moment ([`TuningRoom::now`]): what the device's store ledgers leave free
+/// less the speed guarantee, with everything held then, the search's own
+/// holdings among it, already taken. It is the platform's own bound on any
+/// engine claim and not the load's plan: a search holds its units' weights
+/// and its working memory together, which on a small model is more than
+/// the load will hold, and it has ended before the load begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TuningRoom {
-    /// What may still be charged along device storage's placement: its
-    /// live ceiling (`Fit::placement`).
+pub struct RoomNow {
+    /// What may still be charged in device storage's store.
     pub device_bytes: u64,
     /// What may still be claimed of host RAM, including compilation.
     pub host_bytes: u64,
-    /// Device storage's placement includes host RAM, so the device's
-    /// charges and the host's growth share host RAM's ceiling.
+    /// Device storage lies in host RAM, so the device's charges and the
+    /// host's growth share its room.
     pub host_shared: bool,
+}
+
+/// The room a search is held to, read live while it runs: the load's
+/// ledgers' ([`crate::LoadRoom`]), read afresh at every decision, so a neighbour
+/// that grows while the search runs takes its room from the search's next
+/// admission. A reading that fails reads no room: missing observations never
+/// authorize allocation.
+pub trait TuningRoom {
+    fn now(&self, device: &Device) -> RoomNow;
 }
 
 /// What a search held, against the ceiling it is held to.
 ///
 /// The search runs in a process of its own, before the served model's
 /// weights are loaded: everything it holds is its own. It may hold what the
-/// platform lets the engine claim ([`TuningRoom`]). A tuner given no room
+/// platform lets the engine claim ([`TuningRoom`], read as it runs). A tuner given no room
 /// has no ceiling. Work is admitted on what Seismic's ledgers count:
 /// its charges on the device ([`seismic::DeviceLedgerView::charged`]) and the
 /// host bytes of reference observations. Tuning's whole footprint, which
@@ -1354,9 +1369,9 @@ pub struct TuningRoom {
 /// peak and margin count the same bytes on every backend.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TuningMemory {
-    /// The most tuning's charges on the device may reach
-    /// ([`TuningRoom::device_bytes`]); none when the tuner was given no
-    /// room.
+    /// The most tuning's charges on the device may reach, as last read:
+    /// what it held then and the device's room then ([`RoomNow::device_bytes`]);
+    /// none when the tuner was given no room.
     pub ceiling_bytes: Option<u64>,
     /// The most tuning held as its ledgers count it: the device's
     /// high-water mark within any piece, with the host bytes of that
@@ -1377,8 +1392,9 @@ pub struct TuningMemory {
     /// already counts them.
     pub device_separate: bool,
     /// What tuning's whole footprint may grow by, where the device's memory
-    /// is the host's and the two are one domain: the device ceiling. None
-    /// where the device's memory is apart.
+    /// is the host's and the two are one domain, as last read: what it had
+    /// grown by then and host RAM's room then. None where the device's
+    /// memory is apart.
     pub footprint_ceiling_bytes: Option<u64>,
     /// The most tuning's whole footprint grew since it began, as read when
     /// each piece ended: the growth of the process's footprint, with what
@@ -1388,7 +1404,8 @@ pub struct TuningMemory {
     /// footprint passed it.
     pub footprint_margin_bytes: Option<i64>,
     /// Host RAM the platform lets the engine claim, including compiles and
-    /// process growth. Shared device placement also obeys the coupled
+    /// process growth, as last read: what the process had grown by then and
+    /// host RAM's room then. Shared device placement also obeys the coupled
     /// `footprint_ceiling_bytes`.
     pub host_ceiling_bytes: Option<u64>,
     /// The most the process's footprint had grown since tuning began: the
@@ -1421,10 +1438,10 @@ pub struct TuningMemory {
     /// ([`allocation::Unit::host_footprint`]).
     pub host_added_by_unit: Vec<(String, u64)>,
     /// The host bytes one thread of a compile holds while it runs: the
-    /// most the peak of the process's footprint rose over compiles that
-    /// ran at once, for each thread that compiled. What a compile started
-    /// ahead of its piece is admitted on
-    /// ([`allocation::Unit::compile_host`]).
+    /// most the host's room fell over compiles that ran at once
+    /// ([`compile_wave_price`]), for each thread that compiled, wherever
+    /// the compiles' memory lies. What a compile started ahead of its piece
+    /// is admitted on ([`allocation::Unit::compile_host`]).
     pub compile_host_bytes: u64,
     /// Device charges when the mandatory phase began and when it ended.
     pub began_bytes: u64,
@@ -1565,36 +1582,29 @@ impl TuningMemory {
     }
 
     /// The bytes tuning may still take in the domain the device allocates
-    /// in; none without a ceiling. Where that domain is the host's, two
-    /// readings hold at once and what is free is the lesser room: its
-    /// charges on the device, and everything it holds, the host's growth
-    /// included, each under the device's ceiling. Where the device's memory
-    /// is apart, this is the device's room alone and the host has its own
+    /// in, as `room` reads it now; none without a room. Where that domain
+    /// is the host's, what is free is the lesser of the device's room and
+    /// host RAM's, which everything tuning holds, the host's growth
+    /// included, has already taken. Where the device's memory is apart,
+    /// this is the device's room alone and the host has its own
     /// ([`TuningMemory::host_free`]). Either is held to what the runtime
-    /// lets device storage still take ([`Device::room`]: its
-    /// placement's paths, grants and stores, and its limit), so a piece the
-    /// runtime would refuse is not admitted.
-    fn free(&self, device: &Device) -> Option<u64> {
-        let charged = self
-            .ceiling_bytes
-            .map(|ceiling| ceiling.saturating_sub(self.held(device)));
-        let whole = self
-            .footprint_ceiling_bytes
-            .zip(self.held_whole(device))
-            .map(|(ceiling, held)| ceiling.saturating_sub(held));
-        let free = match (charged, whole) {
-            (Some(charged), Some(whole)) => Some(charged.min(whole)),
-            (charged, whole) => charged.or(whole),
+    /// lets device storage still take ([`Device::room`]: its placement's
+    /// paths, grants and stores, and its limit, which the reading bounds
+    /// anew), so a piece the runtime would refuse is not admitted.
+    fn free(&self, device: &Device, room: Option<RoomNow>) -> Option<u64> {
+        let room = room?;
+        let free = match room.host_shared {
+            true => room.device_bytes.min(room.host_bytes),
+            false => room.device_bytes,
         };
-        let enforced = device.room(seismic::Contract::DeviceOnly);
-        free.map(|free| free.min(enforced))
+        Some(free.min(device.room(seismic::Contract::DeviceOnly)))
     }
 
     /// The one rule by which host work shares the device's room: what host
     /// work adding `host` bytes to the process's footprint, beside device
     /// work charging `device` bytes, takes of [`Self::free`] beyond those
     /// device bytes. Where device storage's placement includes host RAM
-    /// (`TuningRoom::host_shared`), tuning's device charges and its host
+    /// (`RoomNow::host_shared`), tuning's device charges and its host
     /// growth share host RAM's ceiling (spec §2.8), which [`Self::free`]
     /// holds the whole footprint to (`footprint_ceiling_bytes`): there,
     /// where the device's allocations lie outside the process's footprint
@@ -1615,7 +1625,7 @@ impl TuningMemory {
 
     /// Whether tuning's device charges and its host growth share host
     /// RAM's ceiling: device storage's placement includes host RAM
-    /// (`TuningRoom::host_shared`).
+    /// (`RoomNow::host_shared`).
     fn shares_host_ceiling(&self) -> bool {
         self.footprint_ceiling_bytes.is_some()
     }
@@ -1630,17 +1640,15 @@ impl TuningMemory {
         Some(seismic::ProcessMemory::footprint_now()?.saturating_sub(self.process_began_bytes?))
     }
 
-    /// The host bytes tuning may still take where host RAM is a domain of
-    /// its own: the load's planned host peak less what the process's
-    /// footprint has grown by, which counts heap freed and not yet
-    /// returned. Unbounded where the device's memory is the host's, and
-    /// without a ceiling.
-    fn host_free(&self) -> allocation::HostRoom {
-        match self.host_ceiling_bytes.zip(self.host_grown()) {
+    /// The host bytes tuning may still take of host RAM, as `room` reads
+    /// it now: everything held then, heap freed and not yet returned among
+    /// it, already taken. Exceeded where none is left above the reserve;
+    /// unbounded without a room.
+    fn host_free(&self, room: Option<RoomNow>) -> allocation::HostRoom {
+        match room {
             None => allocation::HostRoom::Unbounded,
-            Some((ceiling, grown)) => ceiling
-                .checked_sub(grown)
-                .map_or(allocation::HostRoom::Exceeded, allocation::HostRoom::Free),
+            Some(RoomNow { host_bytes: 0, .. }) => allocation::HostRoom::Exceeded,
+            Some(room) => allocation::HostRoom::Free(room.host_bytes),
         }
     }
 
@@ -1676,18 +1684,30 @@ impl TuningMemory {
         }
     }
 
-    /// The bytes free under the ceiling when the optional work holds
-    /// nothing: the ceiling less what the mandatory phase left held, the
-    /// canonical programs serving takes. None without a ceiling.
-    fn capacity(&self) -> Option<u64> {
-        self.ceiling_bytes.map(|ceiling| {
-            ceiling.saturating_sub(self.mandatory_bytes.saturating_sub(self.began_bytes))
-        })
+    /// The bytes free when the optional work holds nothing, as `room`
+    /// reads it now: what is free, and what the optional work holds beyond
+    /// what the mandatory phase left held, the canonical programs serving
+    /// takes. None without a room.
+    fn capacity(&self, device: &Device, room: Option<RoomNow>) -> Option<u64> {
+        let optional = self.held(device).saturating_sub(self.mandatory_bytes.saturating_sub(self.began_bytes));
+        room.map(|room| room.device_bytes.saturating_add(optional))
+    }
+
+    /// Read `room` into the ceilings the report states: in each domain,
+    /// what tuning holds there now and what is left of it now.
+    fn read_room(&mut self, device: &Device, room: RoomNow) {
+        self.ceiling_bytes = Some(self.held(device).saturating_add(room.device_bytes));
+        self.host_ceiling_bytes = Some(self.host_grown().unwrap_or(0).saturating_add(room.host_bytes));
+        self.footprint_ceiling_bytes =
+            room.host_shared.then(|| self.held_whole(device).unwrap_or(0).saturating_add(room.host_bytes));
     }
 
     /// Record what was held at most: `within`, a piece's own high-water
     /// mark, and what is held now that it ended.
-    fn observe(&mut self, device: &Device, within: u64) {
+    fn observe(&mut self, device: &Device, within: u64, room: Option<RoomNow>) {
+        if let Some(room) = room {
+            self.read_room(device, room);
+        }
         let footprint = seismic::ProcessMemory::footprint_now();
         if footprint > self.process_peak_footprint_bytes {
             self.breakdown_peak = seismic::ProcessMemory::read();
@@ -1740,12 +1760,12 @@ impl TuningMemory {
     /// no room can be divided by its price, and compiles run one at a time.
     /// Owed work is not refused, so it is afforded one thread at the
     /// least.
-    fn compile_threads(&self, device: &Device) -> Option<usize> {
+    fn compile_threads(&self, device: &Device, room: Option<RoomNow>) -> Option<usize> {
         let price = self.compile_host_bytes;
         // Compiles are host work of no device bytes: where host RAM's
         // ceiling is shared, all their bytes take of the device's room.
-        let shared = self.free(device).filter(|_| self.shares_host_ceiling());
-        let host = match (self.host_free(), shared) {
+        let shared = self.free(device, room).filter(|_| self.shares_host_ceiling());
+        let host = match (self.host_free(room), shared) {
             (allocation::HostRoom::Free(host), Some(shared)) => {
                 allocation::HostRoom::Free(host.min(shared))
             }
@@ -1757,6 +1777,23 @@ impl TuningMemory {
             _ if price == 0 => Some(1),
             allocation::HostRoom::Free(free) => Some((free / price) as usize),
             allocation::HostRoom::Exceeded => Some(0),
+        }
+    }
+
+    /// A compile wave held `held` bytes on each of its threads: the price
+    /// the next is admitted on rises to it, a rise past a price already
+    /// set kept as a mispricing.
+    fn price_compiles(&mut self, held: u64) {
+        let priced = self.compile_host_bytes;
+        if held > priced {
+            if priced > 0 {
+                self.mispriced.push(Mispricing {
+                    kind: "compile".into(),
+                    priced_bytes: priced,
+                    added_bytes: held,
+                });
+            }
+            self.compile_host_bytes = held;
         }
     }
 
@@ -2884,7 +2921,8 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
             .memory
             .piece(unit, stage, charged_before, usage().charged);
         let within = usage().high_water;
-        tuner.memory.observe(device, within);
+        let room = tuner.room_now();
+        tuner.memory.observe(device, within, room);
         tuner.report_progress();
         Ok(longest)
     }
@@ -2967,6 +3005,9 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     /// was made.
     fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
         if tuner.memory.no_room.is_none() {
+            if let Some(room) = tuner.room_now() {
+                tuner.memory.read_room(tuner.device, room);
+            }
             tuner.memory.no_room = Some(tuner.no_room(self));
         }
         (**self).refused_for_bytes(tuner);
@@ -2985,11 +3026,11 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     }
 
     fn free(tuner: &Tuner<'a>) -> Option<u64> {
-        tuner.memory.free(tuner.device)
+        tuner.memory.free(tuner.device, tuner.room_now())
     }
 
     fn host_free(tuner: &Tuner<'a>) -> allocation::HostRoom {
-        tuner.memory.host_free()
+        tuner.memory.host_free(tuner.room_now())
     }
 
     fn shared_host_extra(tuner: &Tuner<'a>, host: u64, device: u64) -> u64 {
@@ -3005,7 +3046,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     }
 
     fn capacity(tuner: &Tuner<'a>) -> Option<u64> {
-        tuner.memory.capacity()
+        tuner.memory.capacity(tuner.device, tuner.room_now())
     }
 }
 
@@ -3237,9 +3278,10 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         // A weight no built input binds leaves; one that a point of any
         // unit still binds stays shared.
         tuner.inputs().release_unheld();
+        let room = tuner.room_now();
         tuner
             .memory
-            .observe(tuner.device, performed.memory.ledger_peak_bytes);
+            .observe(tuner.device, performed.memory.ledger_peak_bytes, room);
         // A promotion is published with the unit's record as it stands,
         // served from that instant. What a piece measures or
         // judges besides is the unit's in memory and published once, when
@@ -3521,9 +3563,10 @@ pub(crate) struct Tuner<'a> {
     /// The units whose next piece was refused for its bytes for good: their
     /// records state that stop ([`SearchStop::NoRoom`]).
     without_room: std::collections::HashSet<TuningKey>,
-    /// What the platform lets the engine claim: the ceiling of what the
-    /// search holds. None for a tuner given no room, which bounds nothing.
-    room: Option<TuningRoom>,
+    /// What the platform lets the engine claim, read live: the bound of
+    /// what the search holds. None for a tuner given no room, which bounds
+    /// nothing.
+    room: Option<&'a dyn TuningRoom>,
     /// Where each uncached unit's record is published.
     slots: HashMap<TuningKey, TuningCacheKey>,
     prepared: HashMap<TuningKey, Box<dyn CanonicalUnit>>,
@@ -3852,9 +3895,14 @@ impl<'a> Tuner<'a> {
     }
 
     /// Hold the search to `room`.
-    pub fn held_to(mut self, room: Option<TuningRoom>) -> Self {
+    pub fn held_to(mut self, room: Option<&'a dyn TuningRoom>) -> Self {
         self.room = room;
         self
+    }
+
+    /// The room the search is held to, read now; none without a room.
+    fn room_now(&self) -> Option<RoomNow> {
+        self.room.map(|room| room.now(self.device))
     }
 
     /// Publish a unit's record as it stands: derive it (`record`), store it
@@ -3917,10 +3965,8 @@ impl<'a> Tuner<'a> {
         // charges and the process's footprint are one domain under one
         // ceiling; where it is apart, host RAM is a second domain with the
         // platform's own room.
-        if let Some(room) = self.room {
-            self.memory.ceiling_bytes = Some(room.device_bytes);
-            self.memory.host_ceiling_bytes = Some(room.host_bytes);
-            self.memory.footprint_ceiling_bytes = room.host_shared.then_some(room.host_bytes);
+        if let Some(room) = self.room_now() {
+            self.memory.read_room(self.device, room);
         }
         // The units' canonical programs and the untuned entries compile
         // together on the load's worker threads: a compile needs nothing of
@@ -3960,17 +4006,6 @@ impl<'a> Tuner<'a> {
                 MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
             }
         };
-        // What the peak of the process's footprint rose by over compiles
-        // that ran on `threads` threads with nothing else running, for
-        // each thread: what one thread's compile holds. A span that stayed
-        // under the peak already kept says nothing.
-        let rose = |before: Option<u64>, peak: Option<u64>, threads: usize| {
-            before
-                .zip(peak)
-                .zip(seismic::ProcessMemory::footprint_peak())
-                .filter(|((_, peak), now)| now > peak)
-                .map(|((before, _), now)| now.saturating_sub(before) / threads as u64)
-        };
         // Without a host ceiling the canonical compiles all run at once.
         // Where the host has a ceiling of its own they run in waves. A
         // compile's memory is not known before one has run, and one unit's
@@ -3985,42 +4020,42 @@ impl<'a> Tuner<'a> {
         // What a wave freed is returned before the next reads its room, so
         // that room is what its compiles left held, as measured.
         let mut grounded = Vec::with_capacity(groundings.len());
-        if self.memory.host_ceiling_bytes.is_none() {
+        if self.room.is_none() {
             grounded.extend(workers.each(&groundings, ground));
         }
         while grounded.len() < groundings.len() {
             let observed = grounded.len();
             let threads = self
                 .memory
-                .compile_threads(self.device)
+                .compile_threads(self.device, self.room_now())
                 .map_or(1, |threads| threads.max(1))
                 .min(observed.max(1))
                 .min(groundings.len() - observed);
             let narrowed = workers.narrowed(threads);
-            let (before, peak) = (
-                seismic::ProcessMemory::footprint_now(),
-                seismic::ProcessMemory::footprint_peak(),
-            );
+            // The host's room as the wave began, and its lowest as each of
+            // the wave's compiles ended: what the compiles held wherever it
+            // lies, a toolchain's compiler service apart from this process
+            // among it.
+            let before = host_room();
+            let lowest = std::sync::atomic::AtomicU64::new(u64::MAX);
+            let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
+                let formed = ground(compile);
+                if let Some(room) = host_room() {
+                    lowest.fetch_min(room, std::sync::atomic::Ordering::Relaxed);
+                }
+                formed
+            };
             grounded.extend(workers.each(&groundings[observed..observed + threads], ground));
             drop(narrowed);
-            if let Some(held) = rose(before, peak, threads) {
-                let priced = self.memory.compile_host_bytes;
-                if held > priced {
-                    if priced > 0 {
-                        self.memory.mispriced.push(Mispricing {
-                            kind: "compile".into(),
-                            priced_bytes: priced,
-                            added_bytes: held,
-                        });
-                    }
-                    self.memory.compile_host_bytes = held;
-                }
+            let lowest = Some(lowest.into_inner()).filter(|lowest| *lowest != u64::MAX);
+            if let Some(held) = compile_wave_price(before, lowest, threads) {
+                self.memory.price_compiles(held);
             }
             self.memory.return_freed_pages();
         }
         // What the optional work is admitted against is what is held, as
         // measured, and what the mandatory phase left is stated.
-        if self.memory.host_ceiling_bytes.is_some() {
+        if self.room.is_some() {
             self.memory.host_mandatory_bytes = self.memory.host_grown();
         }
         let untuned = grounded.split_off(searching.len());
@@ -4184,7 +4219,8 @@ impl<'a> Tuner<'a> {
             .device_ledger()
             .charged;
         let ended = self.memory.ended_bytes;
-        self.memory.observe(self.device, ended);
+        let room = self.room_now();
+        self.memory.observe(self.device, ended, room);
         self.memory.process_peak_bytes = process_peak_bytes();
         // Every unit reports its record as the allocator left it published,
         // whatever became of the work: each has served a published legal
@@ -5131,6 +5167,25 @@ fn tuned_entry(
         time,
         receipt,
     }
+}
+
+/// Host RAM this process may take now without displacing anyone
+/// ([`seismic::host_room`] of [`seismic::Reclaim::Nothing`]): a compile burst
+/// or a probe is a one-off taker that must not press the host. None where
+/// the host cannot be read.
+pub(super) fn host_room() -> Option<u64> {
+    seismic::host_room(seismic::Reclaim::Nothing).ok()
+}
+
+/// What one thread of a wave of `threads` compiles held: how far the host's
+/// room fell from `before`, its reading as the wave began, to `lowest`, its
+/// least as any of the wave's compiles ended, for each thread. The fall
+/// counts the compiles' memory in any process, a toolchain's compiler
+/// service as well as this one, which the process's footprint does not.
+/// None where either reading is missing or the room did not fall.
+pub(super) fn compile_wave_price(before: Option<u64>, lowest: Option<u64>, threads: usize) -> Option<u64> {
+    let fell = before?.checked_sub(lowest?).filter(|fell| *fell > 0)?;
+    Some(fell / threads.max(1) as u64)
 }
 
 #[cfg(test)]

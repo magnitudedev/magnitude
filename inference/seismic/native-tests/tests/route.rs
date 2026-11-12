@@ -5,7 +5,7 @@
 
 use seismic::measure::{measure, Measure, Stop};
 use seismic::{
-    BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
+    AllocationLimit, BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
     InvocationError, NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome,
     RegionError, Placing, ReservationCharges, ReservedContract, Resizer, SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor,
     TensorError,
@@ -1330,12 +1330,14 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
         mandatory.disposition,
         seismic::TuningDisposition::CanonicalFallback { .. }
     ));
-    // Discovery measures the defaults one point a piece, each unpriced:
-    // its operations' classes are first observed by it.
-    for discovered in 1..=3 {
+    // Discovery measures the defaults one point a piece. The first point's
+    // build and measurement are unpriced; a later point's are priced from
+    // the unit's earlier ones, and the last's planning stays unpriced.
+    for (discovered, unpriced) in (1..=3).zip([2, 0, 1]) {
         let work = unit.next().unwrap();
         assert_eq!(work.stage, Stage::Discovery);
-        assert_eq!(work.quote.forecast(), None);
+        assert_eq!(work.quote.unpriced, unpriced);
+        assert_eq!(work.quote.priced.is_zero(), discovered == 1);
         let performed = unit.perform(&mut source, None).unwrap();
         assert!(!performed.promoted);
         assert_eq!(timed(&unit.terminal().unwrap()).len(), discovered);
@@ -2807,7 +2809,7 @@ fn a_refused_growth_leaves_the_reserved_tensor_unchanged() {
         let storage = reserved.observe_storage();
         let charge = storage.charged_bytes().unwrap();
         let limit = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(limit)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(limit)).unwrap();
         let (error, resizer) = refused(resizer, rows);
         assert!(
             matches!(
@@ -2826,7 +2828,7 @@ fn a_refused_growth_leaves_the_reserved_tensor_unchanged() {
         );
         let resizer = resizer.recommit(16).unwrap();
         assert_eq!(reserved.committed_rows(), 16, "{backend:?}");
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         resizer.recommit(rows).unwrap();
         assert_eq!(
             read_f32(&reserved.slice_leading(0, 16).unwrap()),
@@ -2858,21 +2860,21 @@ fn a_reserved_tensor_takes_its_whole_form_only_within_its_grant() {
         // Room for the growth's own bytes, none for the chunks it would hold
         // beside one buffer over the range.
         let limit = device.device_ledger().charged + rows / 2 * n * 4;
-        device.bound(store, Some(limit)).unwrap();
+        device.bounds().bound(store, Some(limit)).unwrap();
         let resizer = resizer.recommit(rows).unwrap();
         assert_eq!(reserved.committed_rows(), rows, "{backend:?}");
         assert!(!reserved.bindable(), "{backend:?}: a growth with no room beside its chunks stays in chunks");
         assert!(device.device_ledger().charged <= limit, "{backend:?}");
-        device.bound(store, None).unwrap();
+        device.bounds().bound(store, None).unwrap();
         let resizer = resizer.recommit(rows - 8).unwrap().recommit(rows).unwrap();
         assert!(reserved.bindable(), "{backend:?}: a growth with room takes the whole form");
         let charged = device.device_ledger().charged;
-        device.bound(store, Some(charged)).unwrap();
+        device.bounds().bound(store, Some(charged)).unwrap();
         let resizer = resizer.recommit(rows / 2).unwrap();
         assert_eq!(reserved.committed_rows(), rows / 2, "{backend:?}");
         assert!(!reserved.bindable(), "{backend:?}");
         assert!(device.device_ledger().charged <= charged, "{backend:?}: a shrink in place is charged nothing beside");
-        device.bound(store, None).unwrap();
+        device.bounds().bound(store, None).unwrap();
         drop((reserved, resizer));
     }
 }
@@ -2883,8 +2885,8 @@ fn a_reserved_tensor_takes_its_whole_form_only_within_its_grant() {
 /// committed bytes, a growth past the limit is refused, leaving the tensor
 /// as it was; where each chunk is its own allocation (chunked storage), the
 /// limit bounds a chunk, so a reservation of records whose chunk passes it
-/// is refused. Devices whose limit is the host's address space (the CPU
-/// backend) reserve no range that large.
+/// is refused. A limit that is the host's address space (the CPU backend's)
+/// bounds no device allocation, so there is none to exercise.
 #[test]
 fn the_allocation_limit_bounds_each_allocation_backing_a_reservation() {
     let capacity = |error: TensorError, limit: u64| {
@@ -2896,12 +2898,13 @@ fn the_allocation_limit_bounds_each_allocation_backing_a_reservation() {
     };
     for device in reserving_devices() {
         let backend = device.backend();
-        let limit = device.info().limits().max_allocation.value;
-        if limit > 1 << 40 {
-            eprintln!("{backend:?}: allocation-limit exercise requires a representable test reservation; limit={limit}");
-            assert!(std::env::var_os("SEISMIC_TEST_BACKEND").is_none(), "selected allocation limit cannot be exercised");
-            continue;
-        }
+        let limit = match device.info().limits().max_allocation {
+            AllocationLimit::Device { bytes, .. } => bytes,
+            AllocationLimit::AddressSpace(bytes) => {
+                eprintln!("{backend:?}: no device allocation bound to exercise, the host's address space ({bytes} bytes)");
+                continue;
+            }
+        };
         // 1 MiB rows, two more than the limit holds.
         let n = 1u64 << 18;
         let rows = limit / (4 * n) + 2;
@@ -3796,9 +3799,8 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         }
     }
 
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    // Its own ledgers: the test bounds them alone.
+    let device = seismic::testing::open_backend_own_ledgers(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
         .unwrap();
     let n = 64;
     let large = 8u64 << 20;
@@ -3823,7 +3825,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     unit.perform(&mut source, None).unwrap();
     // The second point's state is refused by the device's limit.
     let charged = device.device_ledger().charged;
-    device.bound(seismic::Ledger::Own(device.device_store()), Some(charged + large / 2)).unwrap();
+    device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged + large / 2)).unwrap();
     let work = unit.next().unwrap();
     assert_eq!(work.stage, Stage::Discovery);
     assert_eq!(work.footprint.unpriced, 1, "an unbuilt point has no price");
@@ -3845,7 +3847,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         work.footprint.priced
     );
     // With room for it, the same point is discovered.
-    device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+    device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }
@@ -3886,7 +3888,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
             let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = Some(x.clone());
             if self.clamp == Some(point) {
-                self.device.bound(seismic::Ledger::Own(self.device.device_store()), Some(self.device.device_ledger().charged),
+                self.device.bounds().bound(seismic::Ledger::Own(self.device.device_store()), Some(self.device.device_ledger().charged),
                 ).unwrap();
             }
             Ok(seismic::point_inputs::<split_sum::Entry>(
@@ -3898,9 +3900,8 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
         }
     }
 
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    // Its own ledgers: the test bounds them alone.
+    let device = seismic::testing::open_backend_own_ledgers(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
         .unwrap();
     let n = 64;
     let mut source = Clamping {
@@ -3939,7 +3940,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     assert!(work.footprint.priced > 0);
     // With room for it, the same point is discovered.
     source.clamp = None;
-    device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+    device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }

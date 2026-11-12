@@ -201,6 +201,26 @@ impl ExpertBankPlan {
         })
     }
 
+    /// What the host tier at `host_slots` holds past its floor: cache,
+    /// never required bytes. The plan grows the tier into the host RAM its
+    /// charge leaves, the charge holding the tier at its floor
+    /// (`ExecutionPlanDraft::with_host_tier`); the load holds exactly this
+    /// as its store's bank cache (`ServedBank::new`: a holding's charge
+    /// above its floor, the tier's floor none, from this plan's charges);
+    /// assessment reports it as the tier's cache
+    /// (`ColdSource::HostTier::cache_bytes`).
+    ///
+    /// The charge is monotone in slots by construction (each group's
+    /// records and their granule-rounded backing only rise with them, its
+    /// table fixed by its extent), so a tier charged less than its floor is
+    /// an invariant violation.
+    pub fn host_cache(&self, host_slots: u64) -> Result<u64, String> {
+        Ok(self
+            .host_charge(host_slots)?
+            .checked_sub(self.host_charge(0)?)
+            .expect("a host tier is charged less than its floor"))
+    }
+
     /// The most slots each record tensor's committed bytes keep within the
     /// device's single-allocation limit `max_allocation`, which bounds each
     /// native allocation backing them (`seismic::Reservation::most_backed`).

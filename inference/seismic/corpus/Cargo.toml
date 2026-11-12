@@ -13,7 +13,7 @@ autotests = false
 seismic-lang.workspace = true
 
 [dev-dependencies]
-seismic.workspace = true
+seismic = { workspace = true, features = ["fixtures"] }
 seismic-std.workspace = true
 
 [[test]]

@@ -83,24 +83,12 @@ enum Execution {
 }
 
 /// Whether `layout` stores every plane of a tile group-major: storage group
-/// `g`'s shares of the tile's rows `r` lie one after another, `(g * tile +
-/// r) * bytes_per_group` bytes past the plane's first share (its share of
-/// row 0's group 0). A chunk of a tile's groups is then one span of each
-/// plane, the same for every chunk but for where it starts.
+/// `g`'s shares of the tile's rows lie in one span, the plane's spans one
+/// after another (`PackedRowLayout::span_byte`). A chunk of a tile's groups
+/// is then one span of each plane, the same for every chunk but for where
+/// it starts.
 fn group_major(layout: &PackedRowLayout) -> bool {
-    let tile = layout.tile_rows();
-    let geometry = layout
-        .geometry(2 * u64::from(layout.packet.group))
-        .expect("a row's geometry");
-    (0..layout.planes.len()).all(|plane| {
-        let bytes = u64::from(layout.planes[plane].bytes_per_group);
-        let share = |row, group| layout.share_byte(&geometry, row, group, plane);
-        share(0, 0).is_some_and(|first| {
-            (0..2).all(|group| {
-                (0..tile).all(|row| share(row, group) == Some(first + (group * tile + row) * bytes))
-            })
-        })
-    })
+    matches!(layout.layout, registry::Layout::Rows16 | registry::Layout::Rows8)
 }
 
 impl RowConversion {
@@ -300,9 +288,7 @@ impl RowConversion {
         let last = first + packets >= row_packets;
         (0..layout.planes.len())
             .map(|plane| {
-                let start = layout
-                    .share_byte(&geometry, 0, first, plane)
-                    .expect("a group-major plane keeps its shares together");
+                let start = layout.span_byte(&geometry, 0, first, plane);
                 let end = if last {
                     geometry
                         .offsets

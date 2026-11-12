@@ -131,7 +131,6 @@ impl Toolchain for VulkanToolchain {
             .zip(&source.entries)
             .collect::<Vec<_>>();
         let (program, pipelines) = DirectModule::compile(&self.device, &entries)?;
-        DirectModule::serves(&self.device, &entries, &pipelines)?;
         let artifact = SpirvPipelines {
             modules: source
                 .entries
@@ -148,7 +147,7 @@ impl Toolchain for VulkanToolchain {
         &self,
         artifact: &SpirvPipelines,
         entries: &[ProgramEntry],
-    ) -> Result<DirectModule, NativeCompilationError> {
+    ) -> Result<Option<DirectModule>, NativeCompilationError> {
         let held = entries
             .iter()
             .map(|entry| {
@@ -179,10 +178,11 @@ mod tests {
 
     /// A program compiled once loads from its artifact in another
     /// toolchain on the same device without compiling: its pipelines are
-    /// created with `FAIL_ON_PIPELINE_COMPILE_REQUIRED`, which fails where
-    /// the artifact's data would not serve them.
+    /// created with `FAIL_ON_PIPELINE_COMPILE_REQUIRED`, so the load either
+    /// holds every pipeline or is a miss (the driver declined the data),
+    /// never a failure.
     #[test]
-    fn a_program_loads_from_its_artifact_without_compiling() {
+    fn a_program_loads_from_its_artifact_or_misses() {
         for description in crate::test_devices() {
             let open = || {
                 Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default())
@@ -207,7 +207,7 @@ mod tests {
             let artifact = SpirvPipelines::decode(&bytes).expect("the artifact decodes");
             VulkanToolchain::new(open())
                 .load(&artifact, &source.entries)
-                .expect("the artifact serves the program without compiling");
+                .expect("a load is served or misses");
         }
     }
 

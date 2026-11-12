@@ -4,6 +4,7 @@
 
 use lib::core::reduce;
 
+#[inline(always)]
 fn post_norm_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let d = cx.dim_d() as usize;

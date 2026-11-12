@@ -100,7 +100,7 @@ fn a_partial_tier_fills_its_records_beyond_the_reserve() {
 #[test]
 fn a_tier_is_filled_once_its_records_beyond_the_reserve_keep_experts() {
     let _alone = alone();
-    let ahead = Ahead::queue("tier-fill-ahead", 64);
+    let ahead = Ahead::queue("tier-fill-ahead");
     // Two layers' sixteen experts beside fifteen tier records, eight of them
     // the reserve.
     let harness = layered("tier-fill", EXPERTS, 12, 2, 4 + 4);

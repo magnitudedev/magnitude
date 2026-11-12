@@ -56,8 +56,10 @@ pub struct ToolchainIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Load {
     /// The artifact is everything that serves the program on this device
-    /// and driver: loading it compiles nothing, and a load that would have
-    /// to compile fails.
+    /// and driver: loading it compiles nothing. A driver may decline the
+    /// artifact's data (Vulkan's pipeline cache is a hint, never a promise),
+    /// so a load that would have to compile is a miss, which the former
+    /// compiles and stores again, as it does an artifact the store dropped.
     Complete,
     /// The artifact names the program, and loading it forms the program
     /// again through the platform's own cache of what it compiled (Metal's
@@ -117,13 +119,15 @@ pub trait Toolchain: Send + Sync {
 
     /// The program of `entries` from `artifact`, compiled of a source
     /// holding them, when no live compile holds them. For a
-    /// [`Load::Complete`] toolchain it compiles nothing: what the artifact
-    /// does not serve without compiling fails.
+    /// [`Load::Complete`] toolchain it compiles nothing: `None` where the
+    /// artifact does not serve them without compiling (a miss). A
+    /// [`Load::PlatformCached`] load forms them whatever the platform's
+    /// cache holds, so it never misses.
     fn load(
         &self,
         artifact: &Self::Artifact,
         entries: &[ProgramEntry],
-    ) -> Result<Self::Program, NativeCompilationError>;
+    ) -> Result<Option<Self::Program>, NativeCompilationError>;
 
     /// What the backend's compiler reports `program`'s entry `entry` uses
     /// ([`ProgramStatistic`]), read from the driver when the program was

@@ -10,6 +10,7 @@ use lib::recurrent::state_space::{self, StateSpace};
 use lib::recurrent::versions::Slots;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn space<'a, E: Elements>(cx: &Context<'a, E>) -> StateSpace<'a, E::A> {
     let slab_banks = cx.arg_slab_banks() as usize;
     StateSpace {
@@ -41,6 +42,7 @@ fn space<'a, E: Elements>(cx: &Context<'a, E>) -> StateSpace<'a, E::A> {
     }
 }
 
+#[inline(always)]
 fn state_space_step<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let s = space(cx);
     let head = group[0] as usize;

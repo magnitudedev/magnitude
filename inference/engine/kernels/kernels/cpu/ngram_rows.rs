@@ -9,6 +9,7 @@
 use lib::recurrent::versions::Slots;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn ngram_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let slots = Slots {
         segments: cx.arg_segments(),

@@ -185,9 +185,9 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     harness.tier_ready();
     // The landing ends past its request, so it leaves flight the moment it
     // ends, kept (`HostRecords::answering`): the reads ahead must outlast the
-    // shrink and its checks. Sixteen uncached 16 MiB reads end within tens
-    // of milliseconds on a fast disk.
-    let ahead = Ahead::queue("shrink-landing-ahead", 384);
+    // shrink and its checks, which the line holds them back for until the
+    // test finishes it (`Ahead`).
+    let ahead = Ahead::queue("shrink-landing-ahead");
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
     let step = harness.step();
@@ -233,7 +233,7 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     drop(step);
     // Enough reads ahead to outlast the shrink, as in
     // `a_host_shrink_asked_with_a_landing_in_flight_answers_at_once`.
-    let ahead = Ahead::queue("shrink-grown-ahead", 384);
+    let ahead = Ahead::queue("shrink-grown-ahead");
     let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
@@ -269,7 +269,7 @@ fn a_host_shrink_on_an_idle_load_answers_beside_a_landing_its_step_passed() {
         harness.request(&[expert]).complete().unwrap();
     }
     harness.tier_ready();
-    let ahead = Ahead::queue("shrink-idle-ahead", 16);
+    let ahead = Ahead::queue("shrink-idle-ahead");
     let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
@@ -338,14 +338,7 @@ fn a_host_tier_grows_by_its_records_alone() {
 /// The cut beside a running chain asked of `shared` (`Shared::cut_running`),
 /// once residency answers it.
 fn running_cut(shared: &Shared) -> Option<super::super::resize::RunningCut> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(answer) = shared.running_cut() {
-            return answer.expect("the cut is served");
-        }
-        assert!(Instant::now() < deadline, "residency answers a cut beside a running chain at its next turn");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    awaited("residency answering a cut beside a running chain at its next turn", || shared.running_cut()).expect("the cut is served")
 }
 
 /// A cut of the one store beside a running prompt group is answered at

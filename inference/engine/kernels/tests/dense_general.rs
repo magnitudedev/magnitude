@@ -23,8 +23,20 @@ fn module() -> CheckedModule {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         (
-            "dense_rows.seismic",
-            include_str!("../kernels/dense_rows.seismic"),
+            "feed_forward.seismic",
+            include_str!("../kernels/feed_forward.seismic"),
+        ),
+        (
+            "dense.seismic",
+            include_str!("../kernels/dense.seismic"),
+        ),
+        (
+            "short_conv.seismic",
+            include_str!("../kernels/short_conv.seismic"),
+        ),
+        (
+            "per_layer_gate.seismic",
+            include_str!("../kernels/per_layer_gate.seismic"),
         ),
         (
             "functions.seismic",

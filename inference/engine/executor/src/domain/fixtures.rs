@@ -21,7 +21,7 @@ use magnitude_state::KvCodec;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-/// The machine as a test's heap reads it: the host's sample and Seismic's
+/// The machine as a test's reader reads it: the host's sample and Seismic's
 /// runtime reading (this process's charges, the grants only an opened
 /// executor reads: a discrete CUDA device's free memory) as first read,
 /// moved only by what the fixture's own `device` charged since (`charged`,
@@ -36,36 +36,34 @@ use std::sync::{Arc, Mutex};
 /// cgroup's, a Windows job's commit) moves with the device's charges to
 /// host RAM the same way; an address-space or data-segment limit counts the
 /// reservation, which a resize keeps. The host's wired pages move with the
-/// device's charges too, as a Metal device's allocations are wired, and the
-/// process's footprint is what the device charges host RAM, each release
-/// leaving it at once. Another program's hold on a store
-/// ([`Press`]) takes its bytes of the room left there while it lasts, and,
-/// sharing the process's cgroups, of what each cgroup limit has left.
+/// device's charges too, as a Metal device's allocations are wired.
+/// Another program's hold on a store ([`Press`]) takes its bytes of the
+/// room left there while it lasts, and, sharing the process's cgroups, of
+/// what each cgroup limit has left.
 struct StillHost {
     device: Rc<seismic::Device>,
     topology: std::sync::Arc<seismic::DeviceTopology>,
     first: seismic::Status,
+    /// Host RAM's available memory as first read, which every later
+    /// reading moves as the status does ([`StatusReading::available`]).
+    host: Result<crate::memory::ledger::Available, crate::memory::ledger::Blind>,
     charged: BTreeMap<seismic::StoreId, u64>,
     pressed: Pressed,
+    clock: TestClock,
 }
 
 /// What other programs hold of each store, as a test presses it.
 type Pressed = Rc<std::cell::RefCell<BTreeMap<seismic::StoreId, u64>>>;
 
 /// Another program's hold on the store of a fixture's device storage
-/// ([`press`]), which the fixture's heap reads as the host's: the room left
-/// there falls by what it takes, and rises back as it lets go.
+/// ([`press`]), which the fixture's readings read as the machine's: the
+/// room left there falls by what it takes, and rises back as it lets go.
 pub struct Press {
     store: seismic::StoreId,
     pressed: Pressed,
 }
 
 impl Press {
-    /// The store it presses.
-    pub fn store(&self) -> seismic::StoreId {
-        self.store
-    }
-
     /// Hold `bytes` of the store from now, in place of what it held.
     pub fn take(&self, bytes: u64) {
         self.pressed.borrow_mut().insert(self.store, bytes);
@@ -83,11 +81,47 @@ pub fn press(domain: &ExecutorDomain<TestFamily>) -> Press {
     Press { store, pressed: domain.family.pressed.clone() }
 }
 
+/// The time a fixture's reader reads memory at (`StatusReading::now`): the
+/// time since the fixture opened that the test's owner reads memory at
+/// ([`Self::set`]), as the live machine's readings carry the monotonic
+/// time the owner counts. It stands still until a test moves it.
+#[derive(Clone)]
+pub struct TestClock {
+    opened: std::time::Instant,
+    since: Rc<std::cell::Cell<std::time::Duration>>,
+}
+
+impl TestClock {
+    fn new() -> Self {
+        Self { opened: std::time::Instant::now(), since: Rc::default() }
+    }
+
+    /// The owner's time now, `since_ns` since the fixture opened.
+    pub fn set(&self, since_ns: u64) {
+        self.since.set(std::time::Duration::from_nanos(since_ns));
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.opened + self.since.get()
+    }
+}
+
+/// The clock `domain`'s reader reads memory at ([`TestClock`]).
+pub fn clock(domain: &ExecutorDomain<TestFamily>) -> TestClock {
+    domain.family.clock.clone()
+}
+
 impl StillHost {
-    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed) -> Self {
-        let first = catalog.status(device.topology(), device.info().id());
+    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed, clock: TestClock) -> Self {
+        let first = catalog.device_status(&device);
+        let host = crate::memory::ledger::Available::host(clock.now());
         let charged = Self::charges(&device);
-        Self { device, topology: catalog.topology(), first, charged, pressed }
+        Self { device, topology: catalog.topology(), first, host, charged, pressed, clock }
+    }
+
+    /// What another program holds of `store` now ([`Press`]).
+    fn held(&self, store: seismic::StoreId) -> u64 {
+        self.pressed.borrow().get(&store).copied().unwrap_or(0)
     }
 
     /// What `device`'s allocations charge each store it reaches: its own
@@ -103,16 +137,11 @@ impl StatusReading for StillHost {
         let charged = |charges: &BTreeMap<seismic::StoreId, u64>, store| charges.get(&store).copied().unwrap_or(0);
         // `left` of `store`, less what the device took of it since the first
         // reading and what another program holds of it now.
-        let pressed = self.pressed.borrow();
-        let held = |store| pressed.get(&store).copied().unwrap_or(0);
-        let moved = |left: u64, store| {
-            (left + charged(&self.charged, store)).saturating_sub(charged(&now, store) + held(store))
-        };
+        let held = |store| self.held(store);
+        let moved = |left: u64, store| (left + charged(&self.charged, store)).saturating_sub(charged(&now, store) + held(store));
         // `used` of a limit on `store`, plus what the device took of it since
         // the first reading and what another program sharing it holds.
-        let used = |used: u64, store, held: u64| {
-            (used + charged(&now, store) + held).saturating_sub(charged(&self.charged, store))
-        };
+        let used = |used: u64, store, held: u64| (used + charged(&now, store) + held).saturating_sub(charged(&self.charged, store));
         let topology = &self.topology;
         let seismic::Status { mut sample, mut runtime } = self.first.clone();
         // Each store's charge then, plus what the device charged it since.
@@ -130,7 +159,6 @@ impl StatusReading for StillHost {
         if let Ok(host) = &mut sample.host_ram {
             let store = topology.host_ram().id();
             host.allocatable.value = moved(host.allocatable.value, store);
-            host.obtainable.value = moved(host.obtainable.value, store);
             if let Some(held) = &mut host.held {
                 held.wired_bytes = used(held.wired_bytes, store, 0);
             }
@@ -153,9 +181,20 @@ impl StatusReading for StillHost {
         seismic::Status { sample, runtime }
     }
 
-    /// What the device charges host RAM now.
-    fn footprint(&self) -> Option<u64> {
-        Some(Self::charges(&self.device).get(&self.topology.host_ram().id()).copied().unwrap_or(0))
+    fn now(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+
+    /// Host RAM's available memory as first read, less what the device
+    /// charged it since and what another program holds of it now: it moves
+    /// only as the test moves it, as the status does.
+    fn available(&self, at: std::time::Instant) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
+        let first = self.host.clone()?;
+        let store = self.topology.host_ram().id();
+        let charged = |charges: &BTreeMap<seismic::StoreId, u64>| charges.get(&store).copied().unwrap_or(0);
+        let available = (first.available() + charged(&self.charged)).saturating_sub(charged(&Self::charges(&self.device)) + self.held(store));
+        crate::memory::ledger::Available::new(first.total(), available.min(first.total()), None, at)
+            .map_err(|_| crate::memory::ledger::Blind("an impossible reading".into()))
     }
 }
 
@@ -269,18 +308,23 @@ pub fn fixture_of(
     device_request: platform::DeviceRequest,
 ) -> Fixture {
     let manifest = tiny_manifest(&definition);
-    fixture_over(definition, manifest, limits, control, head, device_request)
+    fixture_over(definition, manifest, limits, PlannedMethod::Plain, control, head, device_request)
 }
 
-/// [`fixture_of`] over `manifest`'s stored weights.
+/// [`fixture_of`] over `manifest`'s stored weights, planned for `method`. A
+/// method that drafts plans `definition`'s head, and its head store is the
+/// plan's (none for a head reading the target's history); `head` adds a
+/// spare head store to a load that drafts nothing.
 pub fn fixture_over(
     definition: ModelDefinition,
     manifest: PackageManifest,
     limits: ResourceLimits,
+    method: PlannedMethod,
     control: Option<PendingControl>,
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Fixture {
+    assert!(!(head && method.drafts()), "a drafted fixture's head store is its plan's");
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let reserves = platform::MemoryReserves::of_machine(None);
     let selected = platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves)
@@ -299,11 +343,11 @@ pub fn fixture_over(
         &manifest,
         &definition,
         ComponentSelection {
-            head: false,
+            head: method.drafts(),
             vision: false,
         },
         ExecutionPath::Native,
-        PlannedMethod::Plain,
+        method,
         KvCodec::Dense,
         limits,
     )
@@ -353,29 +397,32 @@ pub fn fixture_over(
             draft.programs(),
             &state,
             limits,
-            PlannedMethod::Plain,
+            method,
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
         state,
         &target_graphs,
         &target_readout_graphs,
-        None,
+        programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
     )
     .unwrap();
     let execution = Rc::new(draft.admit(resources_plan).unwrap());
     let id = ResourceDomainId::new("controlled-target-domain").unwrap();
+    let (pressed, clock) = (Pressed::default(), TestClock::new());
+    let reading = Rc::new(StillHost::of(catalog, device.clone(), pressed.clone(), clock.clone()));
     let resources = ResourceAllocator::allocate(
         &execution,
         &device,
         id,
         &target_graphs,
         &target_readout_graphs,
-        None,
+        programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
+        &fixture_ledgers(&device, &execution, &*reading),
     )
     .unwrap();
     let store = execution
@@ -383,13 +430,17 @@ pub fn fixture_over(
         .target_state()
         .allocate(device.clone())
         .unwrap();
-    let head = head.then(|| spare_head_store(device.clone()));
-    let pressed = Pressed::default();
-    ExecutorDomain::with_family(
+    let head = match method.drafts() {
+        true => execution.resources().head_state().map(|state| state.allocate(device.clone()).unwrap()),
+        false => head.then(|| spare_head_store(device.clone())),
+    };
+    let scratch = crate::memory::ClaimDemand { device: execution.resources().bytes().scratch, ..Default::default() };
+    let recorded = fixture_recorded(&device, resources.ledgers(), scratch);
+    let (domain, bindings) = ExecutorDomain::with_family(
         execution,
         definition,
         resources,
-        DeviceHeap::open(Rc::new(StillHost::of(catalog, device.clone(), pressed.clone())), reserves, device).unwrap(),
+        DeviceReader::open(reading, reserves, device).unwrap(),
         store,
         head,
         None,
@@ -401,8 +452,41 @@ pub fn fixture_over(
             waiting: usize::MAX,
             optional: None,
             pressed,
+            clock,
         },
+        recorded,
     )
+    .expect("the fixture holds its arena");
+    (domain, bindings)
+}
+
+/// What a load records allocating as it starts, as a fixture allocated it:
+/// `demand`, claimed on `ledgers` and recorded allocated.
+pub(crate) fn fixture_recorded(
+    device: &seismic::Device,
+    ledgers: &crate::memory::ledger::DeviceLedgers,
+    demand: crate::memory::ClaimDemand,
+) -> crate::memory::ledger::Recorded {
+    use crate::memory::ledger::{CommittedKind, Recorded};
+    let mut recorded = Recorded::new(ledgers);
+    let mut held = ledgers
+        .claim(device, CommittedKind::Load, demand)
+        .expect("the fixture's ledgers hold what it allocated");
+    held.allocated();
+    recorded.record(held);
+    recorded
+}
+
+/// The ledgers of the stores `device` reaches, in a scope of the test's own
+/// (no other test's claims in them), first read by `reading`, the one every
+/// later reading of the domain's is taken by: a reading after it moves
+/// others' memory only as the test moves it.
+pub(crate) fn fixture_ledgers(device: &seismic::Device, execution: &crate::ExecutionPlan, reading: &dyn StatusReading) -> crate::memory::ledger::DeviceLedgers {
+    use crate::memory::ledger::{DeviceLedgers, Ledgers, LoadShape};
+    let ledgers = DeviceLedgers::open_in(&Ledgers::new(), device, Arc::new(LoadShape::of(execution)));
+    let at = reading.now();
+    ledgers.read(device, &reading.status(device), reading.available(at), at);
+    ledgers
 }
 
 /// The backends a bank fixture is built on ([`banked`]): each discovery
@@ -448,17 +532,10 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
     };
     let (tensor, resizer) = seismic::Tensor::reserved(device, seismic::Element::bool(), &[rows, row], committed)
         .unwrap_or_else(|error| panic!("{backend:?}: the device reserves the bank: {error}"));
-    domain.family.bank = Some(FakeBank::new(tensor, resizer));
-    domain.refresh_memory().unwrap();
+    let bank = FakeBank::new(tensor, resizer);
+    bank.hold_cache(domain.resources.ledgers());
+    domain.family.bank = Some(bank);
     (domain, bindings)
-}
-
-/// A decode the fake bank counted ([`FakeBank::decode`]), and where its
-/// misses stop falling.
-#[derive(Clone, Debug)]
-pub struct FakeDecode {
-    pub live: crate::assessment::LiveDecode,
-    pub saturation: u64,
 }
 
 /// A decode of `steps` steps at the fake bank's one streamed layer of 4
@@ -466,38 +543,27 @@ pub struct FakeDecode {
 /// bank's stack: a bank of `depth` slots misses them, one of `depth + 1`
 /// none, beside the generic model counted as one step. Reads take 0.4 ms and 0.5 ms a MB ([`READ`]); an
 /// all-hit step 15 ms.
-pub fn misses_at(depth: usize, steps: u64) -> FakeDecode {
+pub fn misses_at(depth: usize, steps: u64) -> crate::assessment::LiveDecode {
     misses_by(steps, &[(depth, 4)])
 }
 
 /// [`misses_at`] with each step's reads spread over the stack: `reads` of
 /// each `(depth, reads)`, which a bank of `depth` slots misses and one of
 /// `depth + 1` hits. The misses stop falling past the deepest.
-pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> FakeDecode {
+pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> crate::assessment::LiveDecode {
     let mut misses = [0; 5];
     let mut requests = [0; 5];
     for &(depth, count) in reads {
         misses[depth] = steps * count;
         requests[depth] = steps;
     }
-    let depth = reads.iter().map(|&(depth, _)| depth).max().expect("a decode reads");
-    FakeDecode {
-        live: crate::assessment::LiveDecode {
-            layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
-            steps,
-            rows: 1.,
-            depth: 100,
-        },
-        saturation: depth as u64 + 1,
+    crate::assessment::LiveDecode {
+        layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
+        steps,
+        rows: 1.,
+        depth: 100,
     }
 }
-
-/// What a host slot of the fake bank saves a decode step, in seconds: its
-/// one streamed layer prices no tier read apart from a file read, so the
-/// fake gives each slot, a byte of upload storage, an attosecond: a holding
-/// that saves something, less per byte than any slot of device storage
-/// whose saving the price counts.
-pub const HOST_SLOT_SAVES: f64 = 1e-18;
 
 /// The fake decode's read line: 0.4 ms and 0.5 ms a MB.
 pub const READ: crate::assessment::ReadLine = match crate::assessment::ReadLine::new(4e-4, 1. / 2e9) {
@@ -530,7 +596,7 @@ pub fn shrink_settled<F: ProgramFamily>(
 /// The growth rule's inputs: the decode the fake bank counted, the
 /// fixtures' read line, and the resident step it is priced on: 15 ms at every depth, its all-hit
 /// steps' time.
-pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: FakeDecode) {
+pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: crate::assessment::LiveDecode) {
     count_decode(domain, decode);
     measure_load(domain, bindings);
 }
@@ -551,17 +617,9 @@ pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
     domain.measure_load(crate::LoadMeasures { costs: Ok(load_costs()), experts }, bindings).unwrap();
 }
 
-/// What a fixture's prompt group's submission costs beyond a chained
-/// launch: 50 µs, a host round trip's order.
-pub const SUBMISSION: f64 = 50e-6;
-
-/// A fixture's costs: a step of 15 ms in either form at every depth, and
-/// each prompt group's submission [`SUBMISSION`].
+/// A fixture's costs: a step of 15 ms in either form at every depth.
 pub fn load_costs() -> crate::LoadCosts {
-    crate::LoadCosts {
-        step: Box::new(|_, _| Ok(crate::assessment::FormSeconds { resident: 0.015, streamed: 0.015 })),
-        submission: SUBMISSION,
-    }
+    crate::LoadCosts { step: Box::new(|_, _| Ok(crate::assessment::FormSeconds { resident: 0.015, streamed: 0.015 })) }
 }
 
 /// A domain launching one-row prompt chunks in chains of up to three on
@@ -569,29 +627,6 @@ pub fn load_costs() -> crate::LoadCosts {
 /// whole, its prompt pass a whole chain's three places (`ModelLoadPlan::pass`).
 pub fn chained(device_request: platform::DeviceRequest) -> Fixture {
     fixture_of(tiny_definition(), limits(2, 3, false), None, false, device_request)
-}
-
-/// A reading of `domain`'s device store with `room` bytes of headroom, in
-/// the Normal band, the host seen taking nothing.
-pub fn with_room<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, room: u64) {
-    let store = domain.domain.device().device_store();
-    domain.pace.borrow_mut().domains.insert(store, DomainPace {
-        role: DomainRole::Allocation,
-        headroom: room,
-        thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
-        charged: 0,
-        band: MemoryBand::Normal,
-        unseen: 0,
-        witness: None,
-        untaken: Default::default(),
-        rate: 0.0,
-        fluctuation: Fluctuation::default(),
-        host: false,
-        grant_left: None,
-        borrowable: None,
-        takes: None,
-        first: std::time::Instant::now(),
-    });
 }
 
 /// The places a prompt group of four one-row chunks opened on `fixture`
@@ -638,7 +673,7 @@ pub fn bank_row(domain: &ExecutorDomain<TestFamily>) -> u64 {
 
 /// The fake bank of `domain` counted `decode`, which its growth is priced
 /// on.
-pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: FakeDecode) {
+pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: crate::assessment::LiveDecode) {
     domain.family.bank.as_mut().expect("a banked fixture").decode = Some(decode);
 }
 
@@ -838,8 +873,10 @@ pub struct TestFamily {
     /// An optional component's constants, a tensor of its own: what the
     /// optional holding classifies.
     pub(crate) optional: Option<seismic::Tensor>,
-    /// What other programs hold of each store its heap reads ([`press`]).
+    /// What other programs hold of each store its reader reads ([`press`]).
     pressed: Pressed,
+    /// The clock its reader reads memory at ([`clock`]).
+    clock: TestClock,
 }
 
 /// A fake elastic expert bank (`ElasticBank`): one reserved tensor of a row
@@ -852,7 +889,7 @@ pub struct TestFamily {
 pub struct FakeBank {
     pub(crate) tensor: seismic::Tensor,
     resize: std::sync::Mutex<Option<FakeResize>>,
-    pub(crate) decode: Option<FakeDecode>,
+    pub(crate) decode: Option<crate::assessment::LiveDecode>,
     steps: std::sync::atomic::AtomicUsize,
     /// A host tier's slots and the most it holds (none without a tier),
     /// each a byte of upload storage, and its growth's outcome until an
@@ -876,6 +913,9 @@ pub struct FakeBank {
     /// Its fill's starts and finishes ([`ElasticBank::fill_epoch`]): one,
     /// filled as it opens, until a test fills it ([`Self::fill`]).
     fills: std::sync::atomic::AtomicU64,
+    /// What its slots above the floor hold on the domain's ledger, as the
+    /// served bank's cache does.
+    cache: crate::experts::cache::BankCache,
 }
 
 enum FakeResize {
@@ -910,7 +950,18 @@ impl FakeBank {
             refuse_tier_copy: false,
             tier_copy: std::sync::Mutex::new(None),
             fills: std::sync::atomic::AtomicU64::new(1),
+            cache: Default::default(),
         }
+    }
+
+    /// Hold its slots above the floor as cache on `ledgers`, as the served
+    /// bank does at build: its bytes are the process's, never others'.
+    pub(crate) fn hold_cache(&self, ledgers: &crate::memory::ledger::DeviceLedgers) {
+        let rows = self.tensor.extents()[0];
+        let unit = (self.tensor.byte_len() / rows).max(1);
+        let above = self.slots().saturating_sub(1) * unit;
+        let cache = ledgers.of(crate::planning::BankTier::Bank).cache(crate::memory::ledger::CacheKind::Bank, above).expect("the fixture's ledger holds its bank");
+        self.cache.hold(crate::BankHolding::Experts, cache);
     }
 
     /// Start a fill (`true`) or finish it (`false`), as the bank's
@@ -1071,40 +1122,45 @@ impl ElasticBank for FakeBank {
         Ok(())
     }
 
-    /// Device slots, rows of the bank's tensor, a row a step down to one
-    /// and up to where its decode's misses stop falling (every row before
-    /// it counted one), each saving what the price says a slot more saves;
-    /// and host slots, a byte of upload storage each, up to the tier's
-    /// ceiling, each saving [`HOST_SLOT_SAVES`], as `ServedBank::curves`
-    /// steps them, each as far as `reach` goes.
-    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reaches: crate::Reaches) -> Result<Vec<crate::BankCurve>, DomainError> {
-        let reach = reaches.of(crate::planning::BankTier::Bank);
-        use crate::SizeStep;
+    /// Its slots, a row of its tensor each, from one to where its decode's
+    /// misses stop falling on `price` (every row before the load is
+    /// priced), and its host tier's, a byte of upload storage each, to its
+    /// ceiling: derived from the domain's ledgers as the served bank's are.
+    fn targets(&self, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
+        use crate::experts::derived::{BankShape, HoldingTarget};
         let rows = self.tensor.extents()[0];
-        let unit = self.tensor.byte_len() / rows;
-        let at = self.slots();
-        let bound = match price {
-            Some(_) => self.decode.as_ref().map_or(rows, |decode| rows.min(decode.saturation)).max(at),
-            None => at,
-        };
-        let step = |slots: u64| price.map_or(0., |price| price.step(crate::assessment::HeldSlots::bank(slots as usize)).total_seconds);
-        // Steps of `unit` bytes each, until they reach `bytes`.
-        let within = |bytes: u64| bytes.div_ceil(unit.max(1)) as usize;
-        let held = (1..at).rev().take(within(reach.held)).map(|to| SizeStep { to, bytes: unit, saves: step(to) - step(to + 1) }).collect();
-        let offered = (at + 1..=bound).take(within(reach.offered)).map(|to| SizeStep { to, bytes: unit, saves: step(to - 1) - step(to) }).collect();
-        let (bank, host) = (crate::planning::BankTier::Bank, crate::planning::BankTier::Host);
-        let mut curves = vec![crate::BankCurve { holding: crate::BankHolding::Experts, kind: bank, at, held, offered }];
+        let unit = (self.tensor.byte_len() / rows).max(1);
+        let bound = price.and_then(crate::assessment::DecodePrice::saturation).unwrap_or(rows);
+        let mut targets = vec![HoldingTarget {
+            holding: crate::BankHolding::Experts,
+            tier: crate::planning::BankTier::Bank,
+            at: self.slots(),
+            shape: BankShape::new(unit, 1, rows, bound),
+            charge: Box::new(move |slots| slots * unit),
+        }];
         if self.host_ceiling > 0 {
-            let at = self.host.load(std::sync::atomic::Ordering::Relaxed);
-            let bound = price.map_or(at, |_| self.host_ceiling.max(at));
-            let offered = (at + 1..=bound).take(reaches.of(host).offered as usize).map(|to| SizeStep { to, bytes: 1, saves: HOST_SLOT_SAVES }).collect();
-            curves.push(crate::BankCurve { holding: crate::BankHolding::Host, kind: host, at, held: vec![], offered });
+            targets.push(HoldingTarget {
+                holding: crate::BankHolding::Host,
+                tier: crate::planning::BankTier::Host,
+                at: self.host.load(std::sync::atomic::Ordering::Relaxed),
+                shape: BankShape::new(1, 0, self.host_ceiling, self.host_ceiling),
+                charge: Box::new(|slots| slots),
+            });
         }
-        Ok(curves)
+        Ok(targets)
+    }
+
+    /// A row a slot, down to one.
+    #[cfg(test)]
+    fn released_to(&self, bytes: u64) -> Result<Option<u64>, DomainError> {
+        let rows = self.tensor.extents()[0];
+        let unit = (self.tensor.byte_len() / rows).max(1);
+        let at = self.slots();
+        Ok((at > 1).then(|| at.saturating_sub(bytes.div_ceil(unit).max(1)).max(1)))
     }
 
     fn live(&self) -> Option<crate::assessment::LiveDecode> {
-        self.decode.as_ref().map(|decode| decode.live.clone())
+        self.decode.clone()
     }
 
     /// Its one streamed layer of 4 experts, each step routing 4, on the
@@ -1113,12 +1169,18 @@ impl ElasticBank for FakeBank {
         crate::assessment::StreamedLayers::new(vec![4], 4, std::sync::Arc::from([crate::assessment::ExpertLines::reference(1_000_000)]))
     }
 
-    fn grow(&self, holding: crate::BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
+    /// Its slots' growth takes its cache on `ledgers` first, as the served
+    /// bank's does.
+    fn grow(&self, ledgers: &crate::memory::ledger::DeviceLedgers, holding: crate::BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         if self.running() {
             return Ok(BankStep::Running);
         }
         if holding == crate::BankHolding::Host {
             let from = self.host.load(std::sync::atomic::Ordering::Relaxed);
+            let Ok(claim) = ledgers.of(crate::planning::BankTier::Host).backing(to.saturating_sub(from)) else {
+                return Ok(BankStep::Deferred);
+            };
+            self.cache.grow(holding, from, claim);
             self.host.store(to, std::sync::atomic::Ordering::Relaxed);
             let now = std::time::Instant::now();
             let zero = std::time::Duration::ZERO;
@@ -1131,18 +1193,26 @@ impl ElasticBank for FakeBank {
                 prepared: now,
                 installed: now,
                 released: now,
+                unpinned: std::time::Duration::ZERO,
             };
             let holding = crate::BankHolding::Host;
             *self.host_grown.lock().unwrap() = Some(BankResized::Grown { holding, from, to, grown: to - from, refused: None, times });
             wake.complete();
             return Ok(BankStep::Begun(crate::planning::BankTier::Host));
         }
-        self.begin(to, wake)
-    }
+        let rows = self.tensor.extents()[0];
+        let unit = (self.tensor.byte_len() / rows).max(1);
+        let bytes = to.saturating_sub(self.slots()) * unit;
+        let Ok(claim) = ledgers.of(crate::planning::BankTier::Bank).backing(bytes) else {
+            return Ok(BankStep::Deferred);
+        };
+        let from = self.charged();
+        let step = self.begin(to, wake)?;
+        if let BankStep::Begun(_) = step {
+            self.cache.grow(holding, from, claim);
+        }
 
-    /// The fake's growth backs its storage only as its advance installs it.
-    fn growth_backed(&self, _: crate::planning::BankTier) -> Result<u64, DomainError> {
-        Ok(0)
+        Ok(step)
     }
 
     fn holding_storage(&self, holding: crate::BankHolding) -> Result<crate::planning::BankTier, DomainError> {
@@ -1154,6 +1224,7 @@ impl ElasticBank for FakeBank {
 
     fn advance(&self, wake: crate::CompletionWake) -> Result<Option<BankResized>, DomainError> {
         if let Some(grown) = self.host_grown.lock().unwrap().take() {
+            self.cache.settle(&grown);
             wake.complete();
             return Ok(Some(grown));
         }
@@ -1182,6 +1253,7 @@ impl ElasticBank for FakeBank {
                     prepared: now,
                     installed: now,
                     released: now,
+                    unpinned: std::time::Duration::ZERO,
                 };
                 let finished = match after < charged {
                     true => BankResized::Shrunk {
@@ -1218,6 +1290,9 @@ impl ElasticBank for FakeBank {
             idle => (idle, None),
         };
         *resize = Some(next);
+        if let Some(finished) = &finished {
+            self.cache.settle(finished);
+        }
         wake.complete();
         Ok(finished)
     }
@@ -1317,6 +1392,19 @@ impl ProgramFamily for TestFamily {
 
     fn expert_bank(&self) -> Option<&dyn ElasticBank> {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
+    }
+
+    /// As the bank's watcher takes a group's places
+    /// (`ExpertBank::hold_places`): only between flights, an invariant
+    /// broken while a step of the bank runs.
+    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
+        match &self.bank {
+            Some(bank) if !bank.in_gap() => Err(crate::resources::AllocationError::Plan(crate::error::InvariantError {
+                context: "a group's places",
+                detail: format!("a bank resize while {} steps run", bank.steps.load(std::sync::atomic::Ordering::Relaxed)),
+            })),
+            _ => Ok(()),
+        }
     }
 
     fn prepared_program_bytes(&self) -> u64 {

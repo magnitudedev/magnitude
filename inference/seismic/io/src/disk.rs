@@ -123,6 +123,9 @@ pub enum CachePolicy {
 pub struct Reader {
     pub(crate) file: Arc<SourceFile>,
     pub(crate) volume: VolumeReads,
+    /// Its claim on the pool's workers, while any clone of it or any
+    /// request it made lives ([`scheduler::Need`]).
+    need: Arc<scheduler::Need>,
     /// Its requests made and not yet ended ([`Self::outstanding`]).
     outstanding: Arc<std::sync::atomic::AtomicUsize>,
     /// Its hold on the engine's read buffers while any clone of it lives
@@ -155,7 +158,8 @@ impl Reader {
     /// The file `source` has open, read by `policy`: its descriptor shared
     /// where cached, the same file opened again past the cache where not;
     /// read as its volume's shape for `urgent` says, whatever its policy;
-    /// starting the pool's workers it needs ("A volume's curve").
+    /// claiming the pool's workers for the reads it submits ("A volume's
+    /// curve").
     fn reading(source: &OpenFile, policy: CachePolicy, urgent: Option<&Urgent>) -> Result<Self, Error> {
         let file = source.file();
         let through = match policy {
@@ -164,9 +168,9 @@ impl Reader {
         };
         let path: Arc<Path> = source.path().into();
         let volume = VolumeReads::of(file, urgent)?;
-        scheduler::deepen(volume.shape.workers())?;
         Ok(Self {
             file: Arc::new(SourceFile { path, size: source.size(), through }),
+            need: scheduler::need(&volume),
             volume,
             outstanding: Arc::default(),
             _buffers: Arc::new(scheduler::reading()),
@@ -288,7 +292,7 @@ impl Reader {
     /// wait for those in flight.
     pub unsafe fn request(&self, ranges: Vec<Range>, want: Want) -> Result<Handle, Error> {
         // SAFETY: the caller's.
-        unsafe { scheduler::request(&self.file, &self.volume, &self.outstanding, ranges, want) }
+        unsafe { scheduler::request(&self.file, &self.volume, &self.need, &self.outstanding, ranges, want) }
     }
 }
 

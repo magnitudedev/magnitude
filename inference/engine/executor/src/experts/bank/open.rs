@@ -29,7 +29,7 @@ impl ExpertBank {
         lines: std::sync::Arc<[crate::assessment::BankLines]>,
         cpu: &crate::assessment::StoredCpuSite,
         releases: Releases,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::residency::WeightImportError> {
         // A layer whose CPU site its qualification refused serves every miss
         // over the link: never silently, and with why.
         for (layer, reason) in plan.refused_sites() {
@@ -46,13 +46,15 @@ impl ExpertBank {
         // resize keeps every binding of them, and a host tier's again in
         // pinned upload storage; the stacks' per-expert scales imported.
         let allocated = plan.layout()?.try_map(|allocation| {
-            let failed = |error: &dyn std::fmt::Display| format!("expert bank allocation failed: {error}");
-            let held = |tensor: Result<Tensor, _>| tensor.map(|tensor| (tensor, None)).map_err(|error| failed(&error));
+            use crate::residency::WeightImportError;
+            let held = |contract, tensor: Result<Tensor, seismic::TensorError>| {
+                tensor.map(|tensor| (tensor, None)).map_err(|error| WeightImportError::allocating(contract, &error))
+            };
             match allocation {
-                BankAllocation::Shared { element, extents } => held(Tensor::shared(device, *element, extents)),
-                BankAllocation::Words { element, extents } => held(Tensor::words(device, *element, extents)),
-                BankAllocation::Protocol { element, extents } => held(Tensor::protocol_words(device, *element, extents)),
-                BankAllocation::Device { element, extents } => held(Tensor::zeros(device, *element, extents)),
+                BankAllocation::Shared { element, extents } => held(seismic::Contract::Shared, Tensor::shared(device, *element, extents)),
+                BankAllocation::Words { element, extents } => held(seismic::Contract::Words, Tensor::words(device, *element, extents)),
+                BankAllocation::Protocol { element, extents } => held(seismic::Contract::Words, Tensor::protocol_words(device, *element, extents)),
+                BankAllocation::Device { element, extents } => held(seismic::Contract::DeviceOnly, Tensor::zeros(device, *element, extents)),
                 BankAllocation::Reserved {
                     contract,
                     element,
@@ -65,11 +67,9 @@ impl ExpertBank {
                     let extents = [*records, matrix[0], matrix[1]];
                     BankAllocation::reserve(device, *contract, *element, &extents, *committed, *carries)
                         .map(|(tensor, resizer)| (tensor, Some(resizer)))
-                    .map_err(|error| failed(&error))
+                        .map_err(|error| WeightImportError::allocating(contract.contract(), &error))
                 }
-                BankAllocation::Imported(scale) => crate::residency::import_scale(device, artifact, scale)
-                    .map(|tensor| (tensor, None))
-                    .map_err(|error| failed(&error)),
+                BankAllocation::Imported(scale) => crate::residency::import_scale(device, artifact, scale).map(|tensor| (tensor, None)),
             }
         })?;
         let layout = allocated.try_map(|(tensor, _)| Ok::<_, String>(tensor.clone()))?;
@@ -157,14 +157,14 @@ impl ExpertBank {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let homes = plan.reaches_whole().then(|| homes(plan, &layout)).transpose()?;
+        let homes = plan.resident.then(|| homes(plan, &layout)).transpose()?;
         let slot_maps = slot_maps(plan, &layout)?;
         // Derived once here, so no resize derives them on the step's thread.
         let deriving = std::time::Instant::now();
         let counts = Arc::new(plan.counts()?);
         tracing::info!("derived the bank's counts up to {} slots in {:.1} ms", plan.ceiling, deriving.elapsed().as_secs_f64() * 1e3);
         let floor = allocate_placed(device, plan, std::num::NonZeroU64::MIN)
-            .map_err(|error| format!("expert bank allocation failed: {error}"))?;
+            .map_err(|error| crate::residency::WeightImportError::of_allocation(seismic::Contract::Words, error))?;
         // The slots the bank commits, which its watcher's telemetry reads.
         let slots = Arc::new(AtomicU64::new(plan.slots));
         let (watcher, lines, scratch_tables) =
@@ -206,6 +206,7 @@ impl ExpertBank {
             landed,
             plan: plan.clone(),
             counts,
+            cache: Default::default(),
         };
         if plan.host_slots > 0 {
             bank.back_host().map_err(|error| format!("the host tier's backing: {error}"))?;

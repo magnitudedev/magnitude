@@ -18,8 +18,13 @@
 // backend is qualified under.
 
 use super::super::core::{activation, reduce, rounding::Rounding};
-use seismic::cpu::{math, slab::SlabTensor, Dense, F16};
-use std::ops::Range;
+use seismic::cpu::{math, slab::{SlabTensor, SlabWalk}, Dense, Element, Isa, F16, F32, U32};
+use std::{marker::PhantomData, ops::Range};
+
+/// How many keys ahead of its scoring a key's rows are prefetched: a key
+/// takes a few hundred nanoseconds on a vector tier, so two keys cover a
+/// memory access, and more would only evict.
+const PREFETCH_KEYS: usize = 2;
 
 /// Keys scored together before their values are absorbed.
 pub const BLOCK: usize = 32;
@@ -41,6 +46,7 @@ pub struct Heads {
 }
 
 impl Heads {
+    #[inline(always)]
     pub fn new(kv: u64, g: u64, p: u64, s: u64) -> Self {
         Self { kv: kv as usize, g: g as usize, p: p as usize, w: (2 * p + s) as usize }
     }
@@ -48,12 +54,14 @@ impl Heads {
     /// The geometry of an affine K8/V4 history entry, whose vectors are
     /// whole codec groups (the portable codec leaves a partial group's
     /// columns undefined); the declarations' `where` admits only those.
+    #[inline(always)]
     pub fn affine(self) -> Self {
         assert!(self.w % GROUP == 0, "affine history needs head widths of whole {GROUP}-column groups, not {}", self.w);
         self
     }
 
     /// Query heads of a row.
+    #[inline(always)]
     pub fn queries(&self) -> usize {
         self.kv * self.g
     }
@@ -61,6 +69,7 @@ impl Heads {
 
 /// The cosines and sines of a row's P rotary pairs: pair p by the row's
 /// coordinate on axis `components[p]` at `frequencies[p]`.
+#[inline(always)]
 pub fn angles(coordinates: &[i32], components: &[i32], frequencies: &[f32], cosines: &mut [f32], sines: &mut [f32]) {
     for (pair, (cosine, sine)) in cosines.iter_mut().zip(sines.iter_mut()).enumerate() {
         let angle = coordinates[components[pair] as usize] as f32 * frequencies[pair];
@@ -82,6 +91,7 @@ impl Layout {
     /// Pairs (p, p + P) over the leading 2P columns.
     pub const HALF_SPLIT_LEADING: Self = Self { adjacent: false, trailing: false };
 
+    #[inline(always)]
     pub fn new(ra: u64, rt: u64) -> Self {
         Self { adjacent: ra == 1, trailing: rt == 1 }
     }
@@ -128,6 +138,7 @@ pub struct Form {
 
 impl Form {
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn new(
         kv: u64,
         g: u64,
@@ -161,6 +172,7 @@ impl Form {
     /// The form with its prepared keys rounded as the dense entries' `KR`
     /// and four `key_*` scalars say: KR = 1 rounds by the scalars, which then
     /// name a rounding, and KR = 0 rounds nothing, the scalars naming none.
+    #[inline(always)]
     pub fn with_key_rounding(self, kr: u64, block: i32, element: i32, scale: i32, amax_floor: f32) -> Self {
         let rounding = Rounding::of(block, element, scale, amax_floor);
         assert_eq!(kr == 1, rounding.is_some(), "KR {kr} beside key rounding block {block}");
@@ -169,17 +181,20 @@ impl Form {
 
     /// Whether the row takes a value of its own: a fresh layer whose values
     /// are not its stored keys.
+    #[inline(always)]
     pub fn own_values(self) -> bool {
         self.fresh && !self.stored_key
     }
 
     /// The form over affine K8/V4 history ([`Heads::affine`]).
+    #[inline(always)]
     pub fn affine(self) -> Self {
         Self { heads: self.heads.affine(), ..self }
     }
 }
 
 /// [`angles`] with each pair's cosine and sine scaled by its amplitude.
+#[inline(always)]
 pub fn scaled_angles(
     coordinates: &[i32],
     components: &[i32],
@@ -198,6 +213,7 @@ pub fn scaled_angles(
 /// The portable `head_rotary` of one head row `x`, published to `A`:
 /// RMS-normalized in F32 with `norm` when present, its pairs (in `layout`)
 /// rotated by the row's (amplitude-scaled) `cosines` and `sines`.
+#[inline(always)]
 pub fn prepare_head<A: Dense>(
     x: &[A::Storage],
     norm: Option<&[f32]>,
@@ -207,13 +223,14 @@ pub fn prepare_head<A: Dense>(
     epsilon: f32,
     out: &mut [f32],
 ) {
-    prepare_rounded_head::<A>(x, norm, layout, cosines, sines, epsilon, None, None, out);
+    prepare_rounded_head::<A>(x, norm, layout, cosines, sines, epsilon, None, None::<fn(f32) -> f32>, out);
 }
 
 /// `values` as `hold` holds them (each value through it), or as they are
 /// without one: a rounded row's hold in its activation element
 /// (`activation::publish`), the portable `held_in_activation`.
-pub fn held(hold: Option<fn(f32) -> f32>, values: &mut [f32]) {
+#[inline(always)]
+pub fn held(hold: Option<impl Fn(f32) -> f32>, values: &mut [f32]) {
     if let Some(hold) = hold {
         values.iter_mut().for_each(|value| *value = hold(*value));
     }
@@ -224,6 +241,7 @@ pub fn held(hold: Option<fn(f32) -> f32>, values: &mut [f32]) {
 /// and, with `hold`, every value held by it after the norm (when there is
 /// one) and after the rotation, before the rounding (a stored row's BF16
 /// holds, `activation::publish` of the activation element).
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_rounded_head<A: Dense>(
     x: &[A::Storage],
@@ -233,7 +251,7 @@ pub fn prepare_rounded_head<A: Dense>(
     sines: &[f32],
     epsilon: f32,
     rounding: Option<Rounding>,
-    hold: Option<fn(f32) -> f32>,
+    hold: Option<impl Fn(f32) -> f32 + Copy>,
     out: &mut [f32],
 ) {
     let (w, p) = (x.len(), cosines.len());
@@ -265,6 +283,7 @@ pub fn prepare_rounded_head<A: Dense>(
 /// The row's amplitude-scaled (cosines, sines) for its output rotary, in
 /// `angles` (2P floats), when `form` turns its outputs back (RO = 1); none
 /// otherwise (`angles` is then empty).
+#[inline(always)]
 pub fn output_angles<'a>(
     form: Form,
     coordinates: &[i32],
@@ -285,6 +304,7 @@ pub fn output_angles<'a>(
 /// (RO = 1, ungated, so the published attended row): its pairs (in
 /// `layout`) turned back by the row's negated angles, the amplitude-scaled
 /// `cosines` and `sines` of [`scaled_angles`], in F32 and published again.
+#[inline(always)]
 pub fn output_rotary<A: Dense>(out: &mut [A::Storage], layout: Layout, cosines: &[f32], sines: &[f32]) {
     let (w, p) = (out.len(), cosines.len());
     for pair in 0..p {
@@ -296,12 +316,137 @@ pub fn output_rotary<A: Dense>(out: &mut [A::Storage], layout: Layout, cosines: 
     }
 }
 
+/// The `count` query heads from `first` of one row, prepared (the first W
+/// columns of each `query(head)`) into `queries`, W floats a head.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_queries<'q, A: Dense>(
+    form: Form,
+    first: usize,
+    count: usize,
+    query: impl Fn(usize) -> &'q [A::Storage],
+    query_norm: Option<&[f32]>,
+    cosines: &[f32],
+    sines: &[f32],
+    epsilon: f32,
+    queries: &mut [f32],
+) where
+    A::Storage: 'q,
+{
+    let w = form.heads.w;
+    for local in 0..count {
+        prepare_head::<A>(&query(first + local)[..w], query_norm, form.layout, cosines, sines, epsilon, &mut queries[local * w..][..w]);
+    }
+}
+
+/// One kv head of a layer with fresh rows, prepared from the head's `key` and
+/// `value` columns (W each; `value` is empty for stored-key values) into
+/// `keys` and `values` (W floats each): the key rounded and rotated, the
+/// value `head_norm`ed with `value_norm` when present, or the prepared key
+/// for stored-key values.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_kv_head<A: Dense>(
+    form: Form,
+    key: &[A::Storage],
+    value: &[A::Storage],
+    key_norm: Option<&[f32]>,
+    value_norm: Option<&[f32]>,
+    cosines: &[f32],
+    sines: &[f32],
+    epsilon: f32,
+    keys: &mut [f32],
+    values: &mut [f32],
+) {
+    let w = form.heads.w;
+    prepare_rounded_head::<A>(
+        &key[..w],
+        key_norm,
+        form.layout,
+        cosines,
+        sines,
+        epsilon,
+        form.key_rounding,
+        form.key_rounding.map(|_| activation::publish::<A>),
+        &mut keys[..w],
+    );
+    if form.stored_key {
+        values[..w].copy_from_slice(&keys[..w]);
+    } else {
+        prepare_head::<A>(&value[..w], value_norm, form.layout, &[], &[], epsilon, &mut values[..w]);
+    }
+}
+
+/// What one decode work item (kv head `kv_head` of row `row`) prepares itself
+/// before it attends, so no launch precedes the attend: the row's G query
+/// heads of the kv head into `queries` (W floats a head), and for a layer with
+/// fresh rows the kv head's key and value of each row it reads (`fresh`, the
+/// row's fresh span) into `keys` and `values` at row r's W floats, plus the
+/// row's own when `own_row` (its history append). `angles(r, cosines, sines)`
+/// writes row r's amplitude-scaled angles; `key(r)` and `value(r)` are batch
+/// row r's key and value rows over all kv heads (`value` empty for stored-key
+/// values). Each head is prepared by the arithmetic of [`prepare_form_row`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_group<'q, A: Dense>(
+    form: Form,
+    kv_head: usize,
+    row: usize,
+    own_row: bool,
+    fresh: Range<i32>,
+    mut angles: impl FnMut(usize, &mut [f32], &mut [f32]),
+    query: impl Fn(usize) -> &'q [A::Storage],
+    key: impl Fn(usize) -> &'q [A::Storage],
+    value: impl Fn(usize) -> &'q [A::Storage],
+    norms: (Option<&[f32]>, Option<&[f32]>, Option<&[f32]>),
+    epsilon: f32,
+    (cosines, sines): (&mut [f32], &mut [f32]),
+    queries: &mut [f32],
+    keys: &mut [f32],
+    values: &mut [f32],
+) where
+    A::Storage: 'q,
+{
+    let (g, w) = (form.heads.g, form.heads.w);
+    let (query_norm, key_norm, value_norm) = norms;
+    angles(row, cosines, sines);
+    prepare_queries::<A>(form, kv_head * g, g, query, query_norm, cosines, sines, epsilon, queries);
+    if !form.fresh {
+        return;
+    }
+    // The row's own angles are held; its rows come first so they are not
+    // computed twice.
+    let own = own_row || fresh.contains(&(row as i32));
+    let others = fresh.filter(move |&r| !(own && r as usize == row)).map(|r| r as usize);
+    let mut held = row;
+    for r in own.then_some(row).into_iter().chain(others) {
+        if r != held {
+            angles(r, cosines, sines);
+            held = r;
+        }
+        let value = if form.stored_key { &[][..] } else { &value(r)[kv_head * w..] };
+        prepare_kv_head::<A>(
+            form,
+            &key(r)[kv_head * w..],
+            value,
+            key_norm,
+            value_norm,
+            cosines,
+            sines,
+            epsilon,
+            &mut keys[r * w..],
+            &mut values[r * w..],
+        );
+    }
+}
+
 /// Prepares one row of an `attention_*` entry: its KV * G queries (the first
 /// W columns of each `query(head)`) into `queries`, and when the layer has
 /// fresh rows its KV keys into `keys` and its KV values (`head_norm`ed with
 /// `value_norm` when present, or the prepared keys for stored-key values,
 /// whose `value` is empty) into `values`, all F32 values of the activation
 /// element.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_form_row<'q, A: Dense>(
     form: Form,
@@ -320,41 +465,58 @@ pub fn prepare_form_row<'q, A: Dense>(
 {
     let w = form.heads.w;
     let (query_norm, key_norm, value_norm) = norms;
-    for head in 0..form.heads.queries() {
-        prepare_head::<A>(&query(head)[..w], query_norm, form.layout, cosines, sines, epsilon, &mut queries[head * w..][..w]);
-    }
+    prepare_queries::<A>(form, 0, form.heads.queries(), query, query_norm, cosines, sines, epsilon, queries);
     if !form.fresh {
         return;
     }
     for head in 0..form.heads.kv {
-        prepare_rounded_head::<A>(
-            &key[head * w..][..w],
+        let value = if form.stored_key { &[][..] } else { &value[head * w..] };
+        prepare_kv_head::<A>(
+            form,
+            &key[head * w..],
+            value,
             key_norm,
-            form.layout,
+            value_norm,
             cosines,
             sines,
             epsilon,
-            form.key_rounding,
-            form.key_rounding.map(|_| activation::publish::<A> as fn(f32) -> f32),
-            &mut keys[head * w..][..w],
+            &mut keys[head * w..],
+            &mut values[head * w..],
         );
-    }
-    if form.stored_key {
-        values[..form.heads.kv * w].copy_from_slice(&keys[..form.heads.kv * w]);
-        return;
-    }
-    for head in 0..form.heads.kv {
-        prepare_head::<A>(&value[head * w..][..w], value_norm, form.layout, &[], &[], epsilon, &mut values[head * w..][..w]);
     }
 }
 
-/// Appends one row's prepared keys and values ([`prepare_form_row`]) at
-/// dense history row `destination`: the key plane alone for stored-key
-/// values, whose value plane has no rows.
+/// Appends one kv head's prepared key and value (`key` and `value`, W floats
+/// each) at dense history row `destination`: the key plane alone for
+/// stored-key values, whose value plane has no rows.
 ///
 /// # Safety
 /// `destination` is a freshly reserved row no other work item of the call
 /// reads or writes.
+#[inline(always)]
+pub unsafe fn store_dense_head<A: Dense>(
+    form: Form,
+    key: &[f32],
+    value: &[f32],
+    history_key: &SlabTensor<'_, A, 3>,
+    history_value: &SlabTensor<'_, A, 3>,
+    destination: usize,
+    head: usize,
+) {
+    // SAFETY: the caller's.
+    activation::store::<A>(key, unsafe { history_key.row_mut([destination, head, 0]) });
+    if !form.stored_key {
+        // SAFETY: the caller's.
+        activation::store::<A>(value, unsafe { history_value.row_mut([destination, head, 0]) });
+    }
+}
+
+/// Appends one row's prepared keys and values ([`prepare_form_row`]) at
+/// dense history row `destination`, each kv head by [`store_dense_head`].
+///
+/// # Safety
+/// As [`store_dense_head`].
+#[inline(always)]
 pub unsafe fn store_dense_row<A: Dense>(
     form: Form,
     keys: &[f32],
@@ -366,10 +528,16 @@ pub unsafe fn store_dense_row<A: Dense>(
     let w = form.heads.w;
     for head in 0..form.heads.kv {
         // SAFETY: the caller's.
-        activation::store::<A>(&keys[head * w..][..w], unsafe { history_key.row_mut([destination, head, 0]) });
-        if !form.stored_key {
-            // SAFETY: the caller's.
-            activation::store::<A>(&values[head * w..][..w], unsafe { history_value.row_mut([destination, head, 0]) });
+        unsafe {
+            store_dense_head::<A>(
+                form,
+                &keys[head * w..][..w],
+                if form.stored_key { &[][..] } else { &values[head * w..][..w] },
+                history_key,
+                history_value,
+                destination,
+                head,
+            );
         }
     }
 }
@@ -378,6 +546,7 @@ pub unsafe fn store_dense_row<A: Dense>(
 /// running maximum is `maximum` (`exp(sink - maximum)`, the portable
 /// `attention_rows`): infinite for a head that read no key, whose output
 /// stays zero.
+#[inline(always)]
 pub fn sink_weight(sink: f32, maximum: f32) -> f32 {
     if maximum == f32::NEG_INFINITY {
         f32::INFINITY
@@ -389,6 +558,7 @@ pub fn sink_weight(sink: f32, maximum: f32) -> f32 {
 /// One query head's output stored to `A`: `accumulator / max(denominator,
 /// 1e-30)`, column c times its gate c % U (sigmoid, or softplus when
 /// `softplus`); no gates pass the row through.
+#[inline(always)]
 pub fn gate_row<A: Dense>(
     accumulator: &[f32],
     denominator: f32,
@@ -424,53 +594,96 @@ pub enum Keys {
 
 /// The number of keys a row sees: its admitted history spans, then its
 /// fresh span.
+#[inline(always)]
 pub fn total(spans: impl Iterator<Item = (i32, i32)>, fresh: (i32, i32)) -> usize {
     spans.map(|(lo, hi)| (hi - lo) as usize).sum::<usize>() + (fresh.1 - fresh.0).max(0) as usize
 }
 
-/// Calls `run(keys, first, count)` for each run of the row's key sequence
-/// (its admitted history spans in order, then its fresh span) inside
-/// `range` whose keys `selected` reads, positions counted along the
-/// sequence.
-pub fn walk(
-    spans: impl Iterator<Item = (i32, i32)>,
+/// The runs of a row's key sequence (its admitted history spans in order,
+/// then its fresh span) inside `range` whose keys `selected` reads, each
+/// `(keys, first, count)` with positions counted along the sequence. An
+/// iterator rather than a callback, so the absorb a caller runs per run
+/// inlines into its launch's tier boundary (a closure would be compiled
+/// out of line, without the tier's features).
+#[inline(always)]
+pub fn walk<S: Iterator<Item = (i32, i32)>, F: Fn(usize) -> bool>(
+    spans: S,
     fresh: (i32, i32),
     range: Range<usize>,
-    selected: impl Fn(usize) -> bool,
-    mut run: impl FnMut(Keys, usize, usize),
-) {
-    let mut position = 0usize;
-    let mut visit = |keys: Keys, lo: i32, hi: i32| {
-        let count = (hi - lo) as usize;
-        let mut start = range.start.max(position);
-        let end = range.end.min(position + count);
-        while start < end {
-            if !selected(start) {
-                start += 1;
-                continue;
+    selected: F,
+) -> Runs<S, F> {
+    Runs { spans, fresh: (fresh.1 > fresh.0).then_some(fresh), range, selected, position: 0, span: None }
+}
+
+/// The iterator of [`walk`].
+pub struct Runs<S, F> {
+    spans: S,
+    fresh: Option<(i32, i32)>,
+    range: Range<usize>,
+    selected: F,
+    /// Sequence positions before the current span.
+    position: usize,
+    /// The current span: its keys, first row, base position, and the
+    /// positions [start, end) of it still to walk.
+    span: Option<(Keys, i32, usize, usize, usize)>,
+}
+
+impl<S: Iterator<Item = (i32, i32)>, F: Fn(usize) -> bool> Iterator for Runs<S, F> {
+    type Item = (Keys, usize, usize);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((keys, lo, base, start, end)) = &mut self.span {
+                while *start < *end && !(self.selected)(*start) {
+                    *start += 1;
+                }
+                if *start < *end {
+                    let mut stop = *start + 1;
+                    while stop < *end && (self.selected)(stop) {
+                        stop += 1;
+                    }
+                    let run = (*keys, *lo as usize + (*start - *base), stop - *start);
+                    *start = stop;
+                    return Some(run);
+                }
+                self.span = None;
             }
-            let mut stop = start + 1;
-            while stop < end && selected(stop) {
-                stop += 1;
-            }
-            run(keys, lo as usize + (start - position), stop - start);
-            start = stop;
+            let (keys, (lo, hi)) = match self.spans.next() {
+                Some(span) => (Keys::History, span),
+                None => (Keys::Fresh, self.fresh.take()?),
+            };
+            let (base, count) = (self.position, (hi - lo) as usize);
+            self.position += count;
+            let (start, end) = (self.range.start.max(base), self.range.end.min(base + count));
+            self.span = Some((keys, lo, base, start, end));
         }
-        position += count;
-    };
-    for (lo, hi) in spans {
-        visit(Keys::History, lo, hi);
-    }
-    if fresh.1 > fresh.0 {
-        visit(Keys::Fresh, fresh.0, fresh.1);
     }
 }
 
 /// The keys of decode partition `partition` of a row seeing `total` keys:
 /// consecutive partitions of max(PARTITION_KEYS, ceil(total / parts)) keys.
+#[inline(always)]
 pub fn partition(total: usize, parts: usize, partition: usize) -> Range<usize> {
     let keys = PARTITION_KEYS.max(total.div_ceil(parts));
     (partition * keys).min(total)..((partition + 1) * keys).min(total)
+}
+
+/// Runs `$body` with `$tile` the query heads of the next tile, at most eight
+/// of the `$left` still to go, so a tile's lanes are registers.
+macro_rules! tile {
+    ($left:expr, $tile:ident => $body:expr) => {
+        match $left {
+            1 => { const $tile: usize = 1; $body }
+            2 => { const $tile: usize = 2; $body }
+            3 => { const $tile: usize = 3; $body }
+            4 => { const $tile: usize = 4; $body }
+            5 => { const $tile: usize = 5; $body }
+            6 => { const $tile: usize = 6; $body }
+            7 => { const $tile: usize = 7; $body }
+            _ => { const $tile: usize = 8; $body }
+        }
+    };
 }
 
 /// The online-softmax state of G query heads: maximum and denominator per
@@ -483,358 +696,868 @@ pub struct Online<'s> {
 
 impl Online<'_> {
     /// The state before any key: maximum -inf, denominator and output 0.
+    #[inline(always)]
     pub fn reset(&mut self) {
         self.maximum.fill(f32::NEG_INFINITY);
         self.denominator.fill(0.0);
         self.accumulator.fill(0.0);
     }
 
-    /// Absorbs `count` keys against the G `queries` [G][W]:
-    /// `load_key(j, out)` / `load_value(j, out)` give key and value j as F32.
-    /// Blocks of BLOCK keys are scored, then absorbed as the portable
-    /// `attention_update` absorbs a span. `scores` holds G * BLOCK values,
-    /// `row` W.
+    /// Scores key `row` (F32, its W columns) against the G `queries`
+    /// [G][W], scaled, into column `j` of the scores.
+    #[inline(always)]
+    fn score_row(&self, queries: &[f32], scale: f32, row: &[f32], scores: &mut [f32], j: usize) {
+        let w = row.len();
+        for head in 0..self.maximum.len() {
+            scores[head * BLOCK + j] = reduce::dot(&queries[head * w..][..w], row) * scale;
+        }
+    }
+
+    /// Absorbs value `row` (F32) into each head's output, weighted by its
+    /// weight in column `j` of the scores.
+    #[inline(always)]
+    fn absorb_value(&mut self, scores: &[f32], row: &[f32], j: usize) {
+        let w = row.len();
+        for head in 0..self.maximum.len() {
+            let weight = scores[head * BLOCK + j];
+            for (value, v) in self.accumulator[head * w..][..w].iter_mut().zip(row.iter()) {
+                *value = weight.mul_add(*v, *value);
+            }
+        }
+    }
+
+    /// The online-softmax step of a block of `n` scored keys: each head's
+    /// maximum grows to cover its scores, which become their weights
+    /// exp(score - maximum), and its denominator and output carry to the new
+    /// maximum, the denominator taking the weights' sum.
+    #[inline(always)]
+    fn rescale(&mut self, scores: &mut [f32], n: usize) {
+        let w = self.accumulator.len() / self.maximum.len();
+        for head in 0..self.maximum.len() {
+            let scores = &mut scores[head * BLOCK..][..n];
+            let next = self.maximum[head].max(reduce::max(scores));
+            for score in scores.iter_mut() {
+                *score = math::exp(*score - next);
+            }
+            let carry = math::exp(self.maximum[head] - next);
+            self.denominator[head] = self.denominator[head].mul_add(carry, reduce::sum(scores));
+            for value in &mut self.accumulator[head * w..][..w] {
+                *value *= carry;
+            }
+            self.maximum[head] = next;
+        }
+    }
+
+    /// The portable body's part of a run: its `count` keys from row `first`
+    /// of `key` (each F32 through `row`) scored into `block` as `keys`,
+    /// which absorbs whenever it fills ([`Online::flush_portable`]).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub fn absorb(
+    fn take_portable<K: Rows, H: Rows, F: Rows>(
         &mut self,
         queries: &[f32],
         scale: f32,
+        first: usize,
         count: usize,
         scores: &mut [f32],
         row: &mut [f32],
-        mut load_key: impl FnMut(usize, &mut [f32]),
-        mut load_value: impl FnMut(usize, &mut [f32]),
+        keys: Keys,
+        key: &K,
+        block: &mut Block<usize>,
+        values: (&H, &F),
     ) {
-        let g = self.maximum.len();
-        let w = row.len();
-        let mut first = 0;
-        while first < count {
-            let n = BLOCK.min(count - first);
-            for j in 0..n {
-                load_key(first + j, row);
-                for head in 0..g {
-                    scores[head * BLOCK + j] = reduce::dot(&queries[head * w..][..w], row) * scale;
+        for index in first..first + count {
+            key.load(index, row);
+            self.score_row(queries, scale, row, scores, block.n);
+            block.push(keys, index);
+            if block.n == BLOCK {
+                self.flush_portable(scores, row, block, values);
+            }
+        }
+    }
+
+    /// Absorbs the portable body's `block`: the online-softmax step, then
+    /// each key's value (from `history` or `fresh`, F32 through `row`) in
+    /// key order.
+    #[inline(always)]
+    fn flush_portable<H: Rows, F: Rows>(
+        &mut self,
+        scores: &mut [f32],
+        row: &mut [f32],
+        block: &mut Block<usize>,
+        (history, fresh): (&H, &F),
+    ) {
+        self.rescale(scores, block.n);
+        for j in 0..block.n {
+            if j < block.split {
+                history.load(block.values[j], row);
+            } else {
+                fresh.load(block.values[j], row);
+            }
+            self.absorb_value(scores, row, j);
+        }
+        block.clear();
+    }
+
+    /// The vector body's part of a run: [`Online::take_portable`]'s result
+    /// bits with no row through memory. A score is `reduce::dot`'s eight
+    /// lanes (column c fused into lane c % 8, in column order) combined by
+    /// its tree, for up to eight heads per decoded key chunk; each key's
+    /// value row is resolved as it is scored (its widened coefficients at
+    /// `per` floats a key in `value_coefficients`), and absorbed by
+    /// [`Online::flush_vectors`] when the block fills, with value rows `H`
+    /// for its history keys and `F` for its fresh ones.
+    ///
+    /// # Safety
+    /// The tier runs [`F8`], and the head width is whole 8-column chunks.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn take_vectors<K: Rows, R: Rows, H: Rows, F: Rows>(
+        &mut self,
+        queries: &[f32],
+        scale: f32,
+        first: usize,
+        count: usize,
+        scores: &mut [f32],
+        (key_coefficients, value_coefficients, per): (&mut [f32], &mut [f32], usize),
+        keys: Keys,
+        (key, value): (&K, &R),
+        block: &mut Block<*const u8>,
+    ) {
+        let (g, w) = (self.maximum.len(), self.accumulator.len() / self.maximum.len());
+        let (per_key, per_value) = (key.coefficients(w), value.coefficients(w));
+        let (mut key_walk, mut value_walk) = (key.walk(first), value.walk(first));
+        // Each key's rows, and its value's, are asked for PREFETCH_KEYS keys
+        // before it is scored and its value row resolved.
+        let (mut key_ahead, mut value_ahead) = (key.walk(first), value.walk(first));
+        for _ in 0..PREFETCH_KEYS.min(count) {
+            key.prefetch(&mut key_ahead, w);
+            value.prefetch(&mut value_ahead, w);
+        }
+        for ahead in PREFETCH_KEYS..PREFETCH_KEYS + count {
+            if ahead < count {
+                key.prefetch(&mut key_ahead, w);
+                value.prefetch(&mut value_ahead, w);
+            }
+            // SAFETY: the caller's tier.
+            let row = unsafe { key.next(&mut key_walk, w, &mut key_coefficients[..per_key]) };
+            let mut head = 0;
+            while head < g {
+                // SAFETY: the caller's tier; `row` holds w columns.
+                tile!(g - head, T => unsafe {
+                    score::<K, T>(queries, scale, scores, row, key_coefficients, head, block.n, w);
+                    head += T;
+                });
+            }
+            // SAFETY: the caller's tier.
+            let value_row = unsafe { value.next(&mut value_walk, w, &mut value_coefficients[block.n * per..][..per_value]) };
+            block.push(keys, value_row);
+            if block.n == BLOCK {
+                // SAFETY: the caller's tier.
+                unsafe { self.flush_vectors::<H, F>(scores, value_coefficients, per, block) };
+            }
+        }
+    }
+
+    /// Absorbs the vector body's `block`: the online-softmax step, then its
+    /// value rows into every accumulator element in key order, eight columns
+    /// of up to eight heads held in registers across the block (its history
+    /// rows, of `H`, then its fresh rows, of `F`, the same updates in order).
+    ///
+    /// # Safety
+    /// The tier runs [`F8`]; every row holds w columns, its coefficients at
+    /// `per` floats a key in `coefficients`.
+    #[inline(always)]
+    unsafe fn flush_vectors<H: Rows, F: Rows>(
+        &mut self,
+        scores: &mut [f32],
+        coefficients: &[f32],
+        per: usize,
+        block: &mut Block<*const u8>,
+    ) {
+        self.rescale(scores, block.n);
+        let (g, w) = (self.maximum.len(), self.accumulator.len() / self.maximum.len());
+        let (split, n) = (block.split, block.n);
+        let mut head = 0;
+        while head < g {
+            // SAFETY: the caller's tier; every row holds w columns, and the
+            // accumulator G * W.
+            tile!(g - head, T => unsafe {
+                values::<H, T>(self.accumulator, scores, &block.values, 0..split, coefficients, per, head, w);
+                values::<F, T>(self.accumulator, scores, &block.values, split..n, coefficients, per, head, w);
+                head += T;
+            });
+        }
+        block.clear();
+    }
+
+}
+
+
+/// The keys of a block scored but not yet absorbed: `n` of them, the
+/// first `split` history keys and the rest fresh (a row's history keys
+/// precede its fresh ones), each with its value `V`: its row's storage (the
+/// vector body) or index (the portable body).
+struct Block<V> {
+    n: usize,
+    split: usize,
+    values: [V; BLOCK],
+}
+
+impl<V: Copy> Block<V> {
+    #[inline(always)]
+    fn new(empty: V) -> Self {
+        Self { n: 0, split: 0, values: [empty; BLOCK] }
+    }
+
+    /// Appends a key of `keys` with its `value`.
+    #[inline(always)]
+    fn push(&mut self, keys: Keys, value: V) {
+        self.values[self.n] = value;
+        self.n += 1;
+        if keys == Keys::History {
+            assert_eq!(self.split + 1, self.n, "a row's history keys precede its fresh ones");
+            self.split = self.n;
+        }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        (self.n, self.split) = (0, 0);
+    }
+}
+
+/// Scores key `row` (with its widened `coefficients`) against the T query
+/// heads from `head`: `reduce::dot` lane by lane, into column `j` of their
+/// scores.
+///
+/// # Safety
+/// The tier runs [`F8`]; `row` holds w columns, `queries` (head + T) * w.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score<K: Rows, const T: usize>(
+    queries: &[f32],
+    scale: f32,
+    scores: &mut [f32],
+    row: *const u8,
+    coefficients: &[f32],
+    head: usize,
+    j: usize,
+    w: usize,
+) {
+    unsafe {
+        let mut lanes = [F8::zero(); T];
+        let chunks = w / 8;
+        for from in (0..chunks).step_by(K::GROUP_CHUNKS) {
+            let scale = K::scale(coefficients, from / K::GROUP_CHUNKS);
+            for c in from..chunks.min(from.saturating_add(K::GROUP_CHUNKS)) {
+                let key = K::chunk(row, scale, c);
+                for (t, lane) in lanes.iter_mut().enumerate() {
+                    *lane = lane.fma(F8::load(queries.as_ptr().add((head + t) * w + 8 * c)), key);
                 }
             }
-            for head in 0..g {
-                let scores = &mut scores[head * BLOCK..][..n];
-                let next = self.maximum[head].max(reduce::max(scores));
-                for score in scores.iter_mut() {
-                    *score = math::exp(*score - next);
-                }
-                let carry = math::exp(self.maximum[head] - next);
-                self.denominator[head] = self.denominator[head].mul_add(carry, reduce::sum(scores));
-                for value in &mut self.accumulator[head * w..][..w] {
-                    *value *= carry;
-                }
-                self.maximum[head] = next;
-            }
-            for j in 0..n {
-                load_value(first + j, row);
-                for head in 0..g {
-                    let weight = scores[head * BLOCK + j];
-                    for (value, v) in self.accumulator[head * w..][..w].iter_mut().zip(row.iter()) {
-                        *value = weight.mul_add(*v, *value);
-                    }
-                }
-            }
-            first += n;
+        }
+        for (t, lane) in lanes.into_iter().enumerate() {
+            scores[(head + t) * BLOCK + j] = lane.sum() * scale;
         }
     }
 }
 
-/// One history vector in affine storage: packed codes and (scale, zero)
-/// F16 pairs per GROUP columns.
-pub type AffineRow<'a> = (&'a [u32], &'a [u16]);
+/// Absorbs the block's value `rows` `keys` (their widened `coefficients`,
+/// `per` a row) into the output of the T query heads from `head`, each
+/// weighted by its score: eight columns at a time, fused in key order.
+///
+/// # Safety
+/// The tier runs [`F8`]; every row holds w columns, `accumulator`
+/// (head + T) * w.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn values<R: Rows, const T: usize>(
+    accumulator: &mut [f32],
+    scores: &[f32],
+    rows: &[*const u8],
+    keys: Range<usize>,
+    coefficients: &[f32],
+    per: usize,
+    head: usize,
+    w: usize,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let output = accumulator.as_mut_ptr();
+    for c in 0..w / 8 {
+        unsafe {
+            let mut lanes = [F8::zero(); T];
+            for (t, lane) in lanes.iter_mut().enumerate() {
+                *lane = F8::load(output.add((head + t) * w + 8 * c));
+            }
+            for j in keys.clone() {
+                let value = R::chunk(rows[j], R::scale(&coefficients[j * per..], c / R::GROUP_CHUNKS), c);
+                for (t, lane) in lanes.iter_mut().enumerate() {
+                    *lane = lane.fma(F8::splat(scores[(head + t) * BLOCK + j]), value);
+                }
+            }
+            for (t, lane) in lanes.into_iter().enumerate() {
+                lane.store(output.add((head + t) * w + 8 * c));
+            }
+        }
+    }
+}
 
-impl Online<'_> {
-    /// [`Online::absorb`] over affine K8/V4 history, with the same result
-    /// bits: keys and values decode in registers straight into the score
-    /// dots and value updates. Every score is the same eight-lane fused dot
-    /// combined by the same tree, and every accumulator element takes the
-    /// same fused updates in key order; only the loops are tiled, so no row
-    /// round-trips through memory and each accumulator block stays in
-    /// registers across a block of keys.
+/// Whether tier `L` runs [`F8`]: NEON, or an x86 tier of 256-bit vectors
+/// (AVX2, FMA and F16C).
+#[inline(always)]
+fn vectors<L: Isa>() -> bool {
+    cfg!(target_arch = "aarch64") || L::TIER.vector_bytes() >= 32
+}
+
+/// Floats of an absorb's `work` at head width `w` over `affine` history or
+/// not: a row for the portable body; a key's and a block of values'
+/// widened coefficients (w / 16 + BLOCK * w / 16) for the vector body over
+/// affine rows.
+#[inline(always)]
+pub const fn work(w: usize, affine: bool) -> usize {
+    if affine {
+        3 * w
+    } else {
+        w
+    }
+}
+
+/// The rows an absorb reads, row `index` of a run: as F32 (`load`, the
+/// portable body), or on [`F8`] tiers eight columns at a time from storage
+/// (`chunk`), each value exactly as `load` gives it.
+pub trait Rows {
+    /// The widened coefficients a row of `w` columns carries.
+    fn coefficients(&self, w: usize) -> usize;
+
+    /// Row `index` as F32 in `out` (its W columns).
+    fn load(&self, index: usize, out: &mut [f32]);
+
+    /// A walk over consecutive rows ([`Rows::next`]).
+    type Walk;
+
+    /// The walk from row `first`.
+    fn walk(&self, first: usize) -> Self::Walk;
+
+    /// The storage of `walk`'s row of `w` columns, its coefficients widened
+    /// into `coefficients`; the walk steps to the next row.
+    ///
+    /// # Safety
+    /// The tier runs [`F8`].
+    unsafe fn next(&self, walk: &mut Self::Walk, w: usize, coefficients: &mut [f32]) -> *const u8;
+
+    /// Asks for the cache lines of `walk`'s row of `w` columns ahead of
+    /// its [`Rows::next`]; the walk steps to the next row.
+    fn prefetch(&self, walk: &mut Self::Walk, w: usize);
+
+    /// The 8-column chunks one [`Rows::Scale`] covers.
+    const GROUP_CHUNKS: usize;
+
+    /// What [`Rows::chunk`] takes of a row's widened `coefficients` for
+    /// the chunks of group `group`, formed once a group.
+    type Scale: Copy;
+
+    /// # Safety
+    /// The tier runs [`F8`]; `coefficients` are a [`Rows::next`] row's, of
+    /// more than `group` groups.
+    unsafe fn scale(coefficients: &[f32], group: usize) -> Self::Scale;
+
+    /// Columns 8c..8c + 8 of a `row` with the `scale` of their group.
+    ///
+    /// # Safety
+    /// The tier runs [`F8`]; `row` is a [`Rows::next`] row of more than 8c
+    /// columns, `scale` its group's.
+    unsafe fn chunk(row: *const u8, scale: Self::Scale, c: usize) -> F8;
+}
+
+/// Rows of element `E`, row `index` at `rows(index)`.
+pub struct DenseRows<E, F>(F, PhantomData<E>);
+
+impl<E, F> DenseRows<E, F> {
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn absorb_affine<'h>(
-        &mut self,
-        queries: &[f32],
-        scale: f32,
-        count: usize,
-        scores: &mut [f32],
-        row: &mut [f32],
-        key: impl Fn(usize) -> AffineRow<'h>,
-        value: impl Fn(usize) -> AffineRow<'h>,
-    ) {
-        #[cfg(target_arch = "aarch64")]
-        affine_neon::absorb(self, queries, scale, count, scores, row, key, value);
-        #[cfg(not(target_arch = "aarch64"))]
-        self.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| {
-                let (codes, coefficients) = key(j);
-                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
-            },
-            |j, out| {
-                let (codes, coefficients) = value(j);
-                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
-            },
+    pub fn new(rows: F) -> Self {
+        Self(rows, PhantomData)
+    }
+}
+
+impl<'a, E: Dense, F: Fn(usize) -> &'a [E::Storage]> Rows for DenseRows<E, F>
+where
+    E::Storage: 'a,
+{
+    #[inline(always)]
+    fn coefficients(&self, _w: usize) -> usize {
+        0
+    }
+
+    #[inline(always)]
+    fn load(&self, index: usize, out: &mut [f32]) {
+        activation::widen::<E>(&(self.0)(index)[..out.len()], out);
+    }
+
+    type Walk = usize;
+
+    #[inline(always)]
+    fn walk(&self, first: usize) -> usize {
+        first
+    }
+
+    #[inline(always)]
+    unsafe fn next(&self, walk: &mut usize, w: usize, _coefficients: &mut [f32]) -> *const u8 {
+        let row = (self.0)(*walk);
+        assert!(row.len() >= w);
+        *walk += 1;
+        row.as_ptr().cast()
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, walk: &mut usize, w: usize) {
+        lines(&(self.0)(*walk)[..w]);
+        *walk += 1;
+    }
+
+    /// Dense rows carry no coefficients: one empty scale covers them.
+    const GROUP_CHUNKS: usize = usize::MAX;
+
+    type Scale = ();
+
+    #[inline(always)]
+    unsafe fn scale(_coefficients: &[f32], _group: usize) {}
+
+    #[inline(always)]
+    unsafe fn chunk(row: *const u8, _scale: (), c: usize) -> F8 {
+        unsafe { F8::widen::<E>(row.cast::<E::Storage>().add(8 * c)) }
+    }
+}
+
+/// The rows of kv head `head` in slab-stored history `plane`.
+#[inline(always)]
+pub fn history_rows<'a, A: Dense>(
+    plane: &SlabTensor<'a, A, 3>,
+    head: usize,
+) -> DenseRows<A, impl Fn(usize) -> &'a [A::Storage]>
+where
+    A::Storage: 'a,
+{
+    let plane = *plane;
+    DenseRows::new(move |token| plane.row([token, head, 0]))
+}
+
+/// The rows of kv head `head` in prepared batch rows `rows` ([M][KV][W]
+/// F32).
+#[inline(always)]
+pub fn batch_rows<'a>(rows: &'a [f32], kv: usize, head: usize, w: usize) -> DenseRows<F32, impl Fn(usize) -> &'a [f32]> {
+    DenseRows::new(move |token| &rows[(token * kv + head) * w..][..w])
+}
+
+/// Affine history rows of `BITS`-bit codes (8 or 4) in GROUP-column groups
+/// of kv head `head` in slab-stored history: codes in `codes`, (scale,
+/// zero) F16 pairs in `coefficients`, both of one slab size.
+pub struct AffineRows<'a, const BITS: u32, C: Element<Storage = u16>> {
+    codes: SlabTensor<'a, U32, 3>,
+    coefficients: SlabTensor<'a, C, 3>,
+    head: usize,
+}
+
+impl<const BITS: u32, C: Element<Storage = u16>> Rows for AffineRows<'_, BITS, C> {
+    #[inline(always)]
+    fn coefficients(&self, w: usize) -> usize {
+        2 * w / GROUP
+    }
+
+    #[inline(always)]
+    fn load(&self, index: usize, out: &mut [f32]) {
+        let (codes, coefficients) = (self.codes.row([index, self.head, 0]), self.coefficients.row([index, self.head, 0]));
+        affine_decode(codes, coefficients, BITS, out);
+    }
+
+    type Walk = SlabWalk;
+
+    #[inline(always)]
+    fn walk(&self, first: usize) -> SlabWalk {
+        self.codes.walk(first)
+    }
+
+    #[inline(always)]
+    unsafe fn next(&self, walk: &mut SlabWalk, w: usize, coefficients: &mut [f32]) -> *const u8 {
+        const { assert!(BITS == 8 || BITS == 4) };
+        let index = [walk.index(), self.head, 0];
+        let (codes, pairs) = (self.codes.row_at(walk, index), self.coefficients.row_at(walk, index));
+        assert!(codes.len() * 32 >= w * BITS as usize && pairs.len() >= coefficients.len());
+        // SAFETY: the caller's tier.
+        unsafe { widen_f16(&pairs[..coefficients.len()], coefficients) };
+        walk.step();
+        codes.as_ptr().cast()
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, walk: &mut SlabWalk, w: usize) {
+        let index = [walk.index(), self.head, 0];
+        lines(&self.codes.row_at(walk, index)[..w * BITS as usize / 32]);
+        lines(&self.coefficients.row_at(walk, index)[..2 * w / GROUP]);
+        walk.step();
+    }
+
+    const GROUP_CHUNKS: usize = GROUP / 8;
+
+    /// The group's (scale, zero), each in every lane.
+    type Scale = (F8, F8);
+
+    #[inline(always)]
+    unsafe fn scale(coefficients: &[f32], group: usize) -> (F8, F8) {
+        unsafe { (F8::splat(coefficients[2 * group]), F8::splat(coefficients[2 * group + 1])) }
+    }
+
+    #[inline(always)]
+    unsafe fn chunk(row: *const u8, (scale, zero): (F8, F8), c: usize) -> F8 {
+        unsafe {
+            let codes = if BITS == 8 {
+                F8::bytes(row.add(8 * c))
+            } else {
+                F8::nibbles(row.cast::<u32>().add(c).read_unaligned())
+            };
+            zero.fma(codes, scale)
+        }
+    }
+}
+
+/// One kv head's prepared key and value (`key` and `value`, W floats each)
+/// encoded into affine history row `destination`: keys at `key_bits` bits,
+/// values at `value_bits`.
+///
+/// # Safety
+/// `destination` is a freshly reserved row no other work item of the call
+/// reads or writes.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn store_affine_head<C: Element<Storage = u16>>(
+    key: &[f32],
+    value: &[f32],
+    (key_bits, value_bits): (u32, u32),
+    (key_codes, key_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, C, 3>),
+    (value_codes, value_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, C, 3>),
+    destination: usize,
+    head: usize,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        affine_encode(
+            key,
+            key_bits,
+            key_codes.row_mut([destination, head, 0]),
+            key_coefficients.row_mut([destination, head, 0]),
+        );
+        affine_encode(
+            value,
+            value_bits,
+            value_codes.row_mut([destination, head, 0]),
+            value_coefficients.row_mut([destination, head, 0]),
         );
     }
 }
 
+/// The K8/V4 rows of kv head `head` in slab-stored affine history.
+#[inline(always)]
+pub fn affine_rows<'a, const BITS: u32, C: Element<Storage = u16>>(
+    codes: &SlabTensor<'a, U32, 3>,
+    coefficients: &SlabTensor<'a, C, 3>,
+    head: usize,
+) -> AffineRows<'a, BITS, C> {
+    assert_eq!(codes.rows_per_slab(), coefficients.rows_per_slab());
+    AffineRows { codes: *codes, coefficients: *coefficients, head }
+}
+
+/// Prefetches every cache line of `row`.
+#[inline(always)]
+fn lines<T>(row: &[T]) {
+    let (at, bytes) = (row.as_ptr().cast::<u8>(), std::mem::size_of_val(row));
+    for offset in (0..bytes).step_by(64) {
+        prefetch(at.wrapping_add(offset));
+    }
+}
+
+/// F16 `values` widened into `out`, eight at a time (`Dense::widen` bit for
+/// bit).
+///
+/// # Safety
+/// The tier runs [`F8`].
+#[inline(always)]
+unsafe fn widen_f16(values: &[u16], out: &mut [f32]) {
+    assert_eq!(values.len(), out.len());
+    let chunks = values.chunks_exact(8);
+    let tail = chunks.remainder();
+    for (chunk, target) in chunks.zip(out.chunks_exact_mut(8)) {
+        // SAFETY: eight values in, eight out.
+        unsafe { F8::widen::<F16>(chunk.as_ptr()).store(target.as_mut_ptr()) };
+    }
+    if !tail.is_empty() {
+        // The tail's words gathered in one register and stored whole, which
+        // the widen's 16-byte load forwards from (a padded copy's narrow
+        // stores cannot forward).
+        let words = tail.iter().rev().fold(0u128, |words, value| words << 16 | u128::from(*value));
+        let mut widened = [0.0f32; 8];
+        // SAFETY: eight values in (the tail's, then zeros), eight out.
+        unsafe { F8::widen::<F16>((&words as *const u128).cast()).store(widened.as_mut_ptr()) };
+        let at = values.len() - tail.len();
+        out[at..].copy_from_slice(&widened[..tail.len()]);
+    }
+}
+
+pub use lanes::{prefetch, F8};
+
+/// Eight F32 lanes in one AVX2 register. Every operation needs a tier of
+/// 256-bit vectors (`vectors`).
+#[cfg(target_arch = "x86_64")]
+mod lanes {
+    use seismic::cpu::Dense;
+    use std::arch::x86_64::*;
+
+    /// Asks for the cache line holding `at` ahead of its use; never faults.
+    #[inline(always)]
+    pub fn prefetch(at: *const u8) {
+        // SAFETY: a prefetch reads nothing architecturally.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(at.cast()) }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct F8(__m256);
+
+    impl F8 {
+        #[inline(always)]
+        pub unsafe fn zero() -> Self {
+            unsafe { Self(_mm256_setzero_ps()) }
+        }
+
+        #[inline(always)]
+        pub unsafe fn splat(value: f32) -> Self {
+            unsafe { Self(_mm256_set1_ps(value)) }
+        }
+
+        #[inline(always)]
+        pub unsafe fn load(at: *const f32) -> Self {
+            unsafe { Self(_mm256_loadu_ps(at)) }
+        }
+
+        #[inline(always)]
+        pub unsafe fn store(self, at: *mut f32) {
+            unsafe { _mm256_storeu_ps(at, self.0) }
+        }
+
+        /// `self + a * b` lane by lane, fused.
+        #[inline(always)]
+        pub unsafe fn fma(self, a: Self, b: Self) -> Self {
+            unsafe { Self(_mm256_fmadd_ps(a.0, b.0, self.0)) }
+        }
+
+        /// The lanes combined by `reduce::combine`'s tree:
+        /// ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)).
+        #[inline(always)]
+        pub unsafe fn sum(self) -> f32 {
+            unsafe {
+                let pairs = _mm_add_ps(_mm256_castps256_ps128(self.0), _mm256_extractf128_ps::<1>(self.0));
+                let halves = _mm_add_ps(pairs, _mm_movehl_ps(pairs, pairs));
+                _mm_cvtss_f32(_mm_add_ss(halves, _mm_shuffle_ps::<1>(halves, halves)))
+            }
+        }
+
+        /// Eight `E` values widened.
+        #[inline(always)]
+        pub unsafe fn widen<E: Dense>(at: *const E::Storage) -> Self {
+            unsafe { Self(E::widen_x86(at)) }
+        }
+
+        /// The eight 8-bit codes at `at`.
+        #[inline(always)]
+        pub unsafe fn bytes(at: *const u8) -> Self {
+            unsafe { Self(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(at.cast())))) }
+        }
+
+        /// The eight 4-bit codes of `word`, code k at bits 4k.
+        #[inline(always)]
+        pub unsafe fn nibbles(word: u32) -> Self {
+            unsafe {
+                let shifted = _mm256_srlv_epi32(_mm256_set1_epi32(word as i32), _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28));
+                Self(_mm256_cvtepi32_ps(_mm256_and_si256(shifted, _mm256_set1_epi32(15))))
+            }
+        }
+    }
+}
+
+/// Eight F32 lanes in two NEON registers, lanes 0..4 and 4..8.
 #[cfg(target_arch = "aarch64")]
-mod affine_neon {
-    use super::{math, reduce, AffineRow, Online, BLOCK, GROUP};
-    use seismic::cpu::{Dense, F16};
+mod lanes {
+    use seismic::cpu::Dense;
     use std::arch::aarch64::*;
 
-    /// Value columns updated together.
-    const COLUMNS: usize = 16;
-
-    /// Sixteen codes as `code * scale + zero`, fused.
+    /// Asks for the cache line holding `at` ahead of its use; never faults.
     #[inline(always)]
-    unsafe fn decode16(codes: uint8x16_t, scale: float32x4_t, zero: float32x4_t) -> [float32x4_t; 4] {
-        unsafe {
-            let (low, high) = (vmovl_u8(vget_low_u8(codes)), vmovl_u8(vget_high_u8(codes)));
-            [
-                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_low_u16(low))), scale),
-                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_high_u16(low))), scale),
-                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_low_u16(high))), scale),
-                vfmaq_f32(zero, vcvtq_f32_u32(vmovl_u16(vget_high_u16(high))), scale),
-            ]
-        }
+    pub fn prefetch(at: *const u8) {
+        // SAFETY: a prefetch reads nothing architecturally.
+        unsafe { std::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly)) }
     }
 
-    /// The (scale, zero) of `group` as broadcast vectors.
-    #[inline(always)]
-    fn coefficients(pairs: &[u16], group: usize) -> (float32x4_t, float32x4_t) {
-        unsafe {
-            (
-                vdupq_n_f32(F16::widen(pairs[2 * group])),
-                vdupq_n_f32(F16::widen(pairs[2 * group + 1])),
-            )
-        }
-    }
+    #[derive(Clone, Copy)]
+    pub struct F8([float32x4_t; 2]);
 
-    /// `reduce::combine` of eight lanes held as (lanes 0..4, lanes 4..8).
-    #[inline(always)]
-    fn combine(low: float32x4_t, high: float32x4_t) -> f32 {
-        unsafe {
-            let pairs = vaddq_f32(low, high);
-            (vgetq_lane_f32(pairs, 0) + vgetq_lane_f32(pairs, 2))
-                + (vgetq_lane_f32(pairs, 1) + vgetq_lane_f32(pairs, 3))
+    impl F8 {
+        #[inline(always)]
+        pub unsafe fn zero() -> Self {
+            unsafe { Self::splat(0.0) }
         }
-    }
 
-    /// Dispatches on the query heads per key/value head, so each head's
-    /// accumulators are registers rather than a runtime-indexed array.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn absorb<'h>(
-        state: &mut Online<'_>,
-        queries: &[f32],
-        scale: f32,
-        count: usize,
-        scores: &mut [f32],
-        row: &mut [f32],
-        key: impl Fn(usize) -> AffineRow<'h>,
-        value: impl Fn(usize) -> AffineRow<'h>,
-    ) {
-        match state.maximum.len() {
-            1 => heads::<1>(state, queries, scale, count, scores, row.len(), key, value),
-            2 => heads::<2>(state, queries, scale, count, scores, row.len(), key, value),
-            4 => heads::<4>(state, queries, scale, count, scores, row.len(), key, value),
-            8 => heads::<8>(state, queries, scale, count, scores, row.len(), key, value),
-            _ => state.absorb(
-                queries,
-                scale,
-                count,
-                scores,
-                row,
-                |j, out| {
-                    let (codes, coefficients) = key(j);
-                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
-                },
-                |j, out| {
-                    let (codes, coefficients) = value(j);
-                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
-                },
-            ),
+        #[inline(always)]
+        pub unsafe fn splat(value: f32) -> Self {
+            unsafe { Self([vdupq_n_f32(value); 2]) }
         }
-    }
 
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn heads<'h, const G: usize>(
-        state: &mut Online<'_>,
-        queries: &[f32],
-        scale: f32,
-        count: usize,
-        scores: &mut [f32],
-        w: usize,
-        key: impl Fn(usize) -> AffineRow<'h>,
-        value: impl Fn(usize) -> AffineRow<'h>,
-    ) {
-        let g = G;
-        assert!(state.maximum.len() == G && w % GROUP == 0 && queries.len() >= g * w);
-        assert!(state.accumulator.len() >= g * w && scores.len() >= g * BLOCK);
-        let empty: AffineRow<'h> = (&[], &[]);
-        let mut first = 0;
-        while first < count {
-            let n = BLOCK.min(count - first);
-            for j in 0..n {
-                let (codes, pairs) = key(first + j);
-                assert!(codes.len() * 4 >= w && pairs.len() * GROUP >= 2 * w);
-                let bytes = codes.as_ptr().cast::<u8>();
-                // SAFETY: the assertions bound every code byte and query read
-                // below; the lanes follow `reduce::dot` element by element.
-                unsafe {
-                    let mut low = [vdupq_n_f32(0.0); G];
-                    let mut high = [vdupq_n_f32(0.0); G];
-                    for group in 0..w / GROUP {
-                        let (s, z) = coefficients(pairs, group);
-                        let packed = bytes.add(group * GROUP);
-                        let keys = [
-                            decode16(vld1q_u8(packed), s, z),
-                            decode16(vld1q_u8(packed.add(16)), s, z),
-                        ];
-                        for chunk in 0..GROUP / 8 {
-                            let column = group * GROUP + chunk * 8;
-                            let half = &keys[chunk / 2];
-                            let (a, b) = (half[(chunk % 2) * 2], half[(chunk % 2) * 2 + 1]);
-                            for head in 0..g {
-                                let q = queries.as_ptr().add(head * w + column);
-                                low[head] = vfmaq_f32(low[head], vld1q_f32(q), a);
-                                high[head] = vfmaq_f32(high[head], vld1q_f32(q.add(4)), b);
-                            }
-                        }
-                    }
-                    for head in 0..g {
-                        scores[head * BLOCK + j] = combine(low[head], high[head]) * scale;
-                    }
-                }
+        #[inline(always)]
+        pub unsafe fn load(at: *const f32) -> Self {
+            unsafe { Self([vld1q_f32(at), vld1q_f32(at.add(4))]) }
+        }
+
+        #[inline(always)]
+        pub unsafe fn store(self, at: *mut f32) {
+            unsafe {
+                vst1q_f32(at, self.0[0]);
+                vst1q_f32(at.add(4), self.0[1]);
             }
-            for head in 0..g {
-                let scores = &mut scores[head * BLOCK..][..n];
-                let next = state.maximum[head].max(reduce::max(scores));
-                for score in scores.iter_mut() {
-                    *score = math::exp(*score - next);
-                }
-                let carry = math::exp(state.maximum[head] - next);
-                state.denominator[head] = state.denominator[head].mul_add(carry, reduce::sum(scores));
-                for value in &mut state.accumulator[head * w..][..w] {
-                    *value *= carry;
-                }
-                state.maximum[head] = next;
+        }
+
+        /// `self + a * b` lane by lane, fused.
+        #[inline(always)]
+        pub unsafe fn fma(self, a: Self, b: Self) -> Self {
+            unsafe { Self([vfmaq_f32(self.0[0], a.0[0], b.0[0]), vfmaq_f32(self.0[1], a.0[1], b.0[1])]) }
+        }
+
+        /// The lanes combined by `reduce::combine`'s tree:
+        /// ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)).
+        #[inline(always)]
+        pub unsafe fn sum(self) -> f32 {
+            unsafe {
+                let pairs = vaddq_f32(self.0[0], self.0[1]);
+                (vgetq_lane_f32::<0>(pairs) + vgetq_lane_f32::<2>(pairs))
+                    + (vgetq_lane_f32::<1>(pairs) + vgetq_lane_f32::<3>(pairs))
             }
-            let mut rows = [empty; BLOCK];
-            for (j, row) in rows[..n].iter_mut().enumerate() {
-                *row = value(first + j);
-                assert!(row.0.len() * 8 >= w && row.1.len() * GROUP >= 2 * w);
+        }
+
+        /// Eight `E` values widened.
+        #[inline(always)]
+        pub unsafe fn widen<E: Dense>(at: *const E::Storage) -> Self {
+            unsafe { Self(E::widen_neon(at)) }
+        }
+
+        /// The eight 8-bit codes at `at`.
+        #[inline(always)]
+        pub unsafe fn bytes(at: *const u8) -> Self {
+            unsafe { Self::codes(vld1_u8(at)) }
+        }
+
+        /// The eight 4-bit codes of `word`, code k at bits 4k.
+        #[inline(always)]
+        pub unsafe fn nibbles(word: u32) -> Self {
+            unsafe {
+                let bytes = vcreate_u8(u64::from(word));
+                Self::codes(vzip1_u8(vand_u8(bytes, vdup_n_u8(15)), vshr_n_u8::<4>(bytes)))
             }
-            for column in (0..w).step_by(COLUMNS) {
-                let (group, half) = (column / GROUP, (column % GROUP) / COLUMNS);
-                // SAFETY: `column + COLUMNS <= w` inside every head's
-                // accumulator block, and every value row holds its w / 2
-                // code bytes (asserted above).
-                unsafe {
-                    let mut blocks = [[vdupq_n_f32(0.0); 4]; G];
-                    for head in 0..g {
-                        let at = state.accumulator.as_ptr().add(head * w + column);
-                        for r in 0..4 {
-                            blocks[head][r] = vld1q_f32(at.add(4 * r));
-                        }
-                    }
-                    for (j, (codes, pairs)) in rows[..n].iter().enumerate() {
-                        let (s, z) = coefficients(pairs, group);
-                        let nibbles = vld1_u8(codes.as_ptr().cast::<u8>().add(group * GROUP / 2 + half * 8));
-                        let (lo, hi) = (vand_u8(nibbles, vdup_n_u8(15)), vshr_n_u8(nibbles, 4));
-                        let decoded = decode16(vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi)), s, z);
-                        for head in 0..g {
-                            let weight = vdupq_n_f32(scores[head * BLOCK + j]);
-                            for r in 0..4 {
-                                blocks[head][r] = vfmaq_f32(blocks[head][r], decoded[r], weight);
-                            }
-                        }
-                    }
-                    for head in 0..g {
-                        let at = state.accumulator.as_mut_ptr().add(head * w + column);
-                        for r in 0..4 {
-                            vst1q_f32(at.add(4 * r), blocks[head][r]);
-                        }
-                    }
-                }
+        }
+
+        #[inline(always)]
+        unsafe fn codes(codes: uint8x8_t) -> Self {
+            unsafe {
+                let wide = vmovl_u8(codes);
+                Self([vcvtq_f32_u32(vmovl_u16(vget_low_u16(wide))), vcvtq_f32_u32(vmovl_high_u16(wide))])
             }
-            first += n;
         }
     }
 }
 
 /// Absorbs the part `range` of a row's key sequence (its admitted history
-/// `spans`, then its `fresh` span) into `state`: history rows through
-/// `history_key(token, out)` / `history_value(token, out)`, fresh rows through
-/// `fresh_key(token, out)` / `fresh_value(token, out)`. `scores` holds G *
-/// BLOCK values, `row` W.
+/// spans, then its `fresh` span) whose keys `selected` reads into `state`
+/// on tier `l`: history rows from `history` (keys, values), fresh rows
+/// from `batch`. The keys absorb in blocks of BLOCK consecutive ones from
+/// the range's start, history and fresh alike: a key's block, and so the
+/// row's reduction order, depends on its position alone, never on which
+/// keys are still fresh (how many rows share the launch) or where its spans
+/// fall. On a tier with [`F8`] vectors and a head width of whole 8-column
+/// chunks by the vector body, otherwise by the portable body over the rows'
+/// `load`, with the same result bits. `scores` holds G * BLOCK values,
+/// `work` [`work`] floats.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn attend_rows(
+pub fn attend<L: Isa, HK: Rows, HV: Rows, BK: Rows, BV: Rows>(
+    _l: L,
     state: &mut Online<'_>,
     queries: &[f32],
     scale: f32,
     scores: &mut [f32],
-    row: &mut [f32],
+    work: &mut [f32],
     spans: impl Iterator<Item = (i32, i32)>,
     fresh: (i32, i32),
     range: Range<usize>,
     selected: impl Fn(usize) -> bool,
-    mut history_key: impl FnMut(usize, &mut [f32]),
-    mut history_value: impl FnMut(usize, &mut [f32]),
-    mut fresh_key: impl FnMut(usize, &mut [f32]),
-    mut fresh_value: impl FnMut(usize, &mut [f32]),
+    history: (&HK, &HV),
+    batch: (&BK, &BV),
 ) {
-    walk(spans, fresh, range, selected, |keys, first, count| match keys {
-        Keys::History => state.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| history_key(first + j, out),
-            |j, out| history_value(first + j, out),
-        ),
-        Keys::Fresh => state.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| fresh_key(first + j, out),
-            |j, out| fresh_value(first + j, out),
-        ),
-    });
+    let (g, w) = (state.maximum.len(), state.accumulator.len() / state.maximum.len());
+    assert!(queries.len() >= g * w && scores.len() >= g * BLOCK);
+    if vectors::<L>() && w % 8 == 0 {
+        let per_key = history.0.coefficients(w).max(batch.0.coefficients(w));
+        let per = history.1.coefficients(w).max(batch.1.coefficients(w));
+        assert!(work.len() >= per_key + BLOCK * per);
+        let (key_coefficients, value_coefficients) = work.split_at_mut(per_key);
+        let mut block = Block::new(std::ptr::null());
+        for (keys, first, count) in walk(spans, fresh, range, selected) {
+            let work = (&mut *key_coefficients, &mut *value_coefficients, per);
+            // SAFETY: the tier runs F8 (`vectors`), over whole chunks.
+            unsafe {
+                match keys {
+                    Keys::History => state.take_vectors::<_, _, HV, BV>(queries, scale, first, count, scores, work, keys, history, &mut block),
+                    Keys::Fresh => state.take_vectors::<_, _, HV, BV>(queries, scale, first, count, scores, work, keys, batch, &mut block),
+                }
+            }
+        }
+        if block.n > 0 {
+            // SAFETY: as above.
+            unsafe { state.flush_vectors::<HV, BV>(scores, value_coefficients, per, &mut block) };
+        }
+    } else {
+        let row = &mut work[..w];
+        let mut block = Block::new(0);
+        for (keys, first, count) in walk(spans, fresh, range, selected) {
+            match keys {
+                Keys::History => {
+                    state.take_portable(queries, scale, first, count, scores, row, keys, history.0, &mut block, (history.1, batch.1))
+                }
+                Keys::Fresh => {
+                    state.take_portable(queries, scale, first, count, scores, row, keys, batch.0, &mut block, (history.1, batch.1))
+                }
+            }
+        }
+        if block.n > 0 {
+            state.flush_portable(scores, row, &mut block, (history.1, batch.1));
+        }
+    }
 }
 
-/// Absorbs a row's index-list picks (`selected_rows`, -1 for none), each
-/// row `load(pick, out)` of the source's one plane read as key and value,
-/// into `state` as [`attend_rows`] absorbs its keys (the portable
-/// `attention_rows`' index-list source).
+/// Absorbs a row's index-list picks (`picks`, -1 for none), each the
+/// source's row `load(pick)` of element `E` read as key and value, into
+/// `state` as [`attend`] absorbs its keys, in blocks from the start of each
+/// run of picks (the portable `attention_rows`' index-list source).
 #[inline(always)]
-pub fn attend_picks(
+#[allow(clippy::too_many_arguments)]
+pub fn attend_picks<'p, L: Isa, E: Dense>(
+    l: L,
     state: &mut Online<'_>,
     queries: &[f32],
     scale: f32,
     scores: &mut [f32],
-    row: &mut [f32],
+    work: &mut [f32],
     picks: &[i32],
-    load: impl Fn(usize, &mut [f32]),
-) {
+    load: impl Fn(usize) -> &'p [E::Storage],
+) where
+    E::Storage: 'p,
+{
     let mut first = 0;
     while first < picks.len() {
         if picks[first] < 0 {
@@ -843,16 +1566,10 @@ pub fn attend_picks(
         }
         let end = picks[first..].iter().position(|pick| *pick < 0).map_or(picks.len(), |run| first + run);
         let run = &picks[first..end];
-        // A pick is its own value.
-        state.absorb(
-            queries,
-            scale,
-            run.len(),
-            scores,
-            row,
-            |j, out| load(run[j] as usize, out),
-            |j, out| load(run[j] as usize, out),
-        );
+        // A pick is its own value; the run is one span of keys.
+        let rows = DenseRows::<E, _>::new(|j: usize| load(run[j] as usize));
+        let keys = (0, run.len() as i32);
+        attend(l, state, queries, scale, scores, work, std::iter::empty(), keys, 0..run.len(), |_| true, (&rows, &rows), (&rows, &rows));
         first = end;
     }
 }
@@ -873,51 +1590,12 @@ pub fn selected(bitmap: &[u32], block_rows: i32, ordinal: usize) -> bool {
     bitmap.get(block / 32).is_some_and(|word| word >> (block % 32) & 1 != 0)
 }
 
-/// [`attend_rows`] with affine K8/V4 history rows `history_key(token)` and
-/// `history_value(token)`, absorbed by [`Online::absorb_affine`].
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn attend_affine_rows<'h>(
-    state: &mut Online<'_>,
-    queries: &[f32],
-    scale: f32,
-    scores: &mut [f32],
-    row: &mut [f32],
-    spans: impl Iterator<Item = (i32, i32)>,
-    fresh: (i32, i32),
-    range: Range<usize>,
-    history_key: impl Fn(usize) -> AffineRow<'h>,
-    history_value: impl Fn(usize) -> AffineRow<'h>,
-    mut fresh_key: impl FnMut(usize, &mut [f32]),
-    mut fresh_value: impl FnMut(usize, &mut [f32]),
-) {
-    walk(spans, fresh, range, |_| true, |keys, first, count| match keys {
-        Keys::History => state.absorb_affine(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j| history_key(first + j),
-            |j| history_value(first + j),
-        ),
-        Keys::Fresh => state.absorb(
-            queries,
-            scale,
-            count,
-            scores,
-            row,
-            |j, out| fresh_key(first + j, out),
-            |j, out| fresh_value(first + j, out),
-        ),
-    });
-}
-
 /// Merges the partial states of one query head over its `parts` partitions
 /// in partition order: partition `part` has output `partial(part)`, maximum
 /// `maximum(part)` and denominator `denominator(part)`; an empty partition
 /// (maximum -inf) contributes nothing. Writes the unnormalized output and
 /// returns the denominator.
+#[inline(always)]
 pub fn merge<'p>(
     parts: usize,
     maximum: impl Fn(usize) -> f32,

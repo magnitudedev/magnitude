@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 magnitude-family-contracts = { path = "../families/contracts" }
 seismic.workspace = true
+
+[dev-dependencies]
+seismic = { workspace = true, features = ["fixtures"] }

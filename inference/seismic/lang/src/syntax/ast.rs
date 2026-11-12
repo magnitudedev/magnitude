@@ -154,6 +154,7 @@ pub enum Decl {
     Fn(FnDecl),
     Lower(LowerDecl),
     Native(NativeDecl),
+    Projection(ProjectionDecl),
 }
 
 impl Decl {
@@ -162,6 +163,7 @@ impl Decl {
             Decl::Fn(f) => &f.name,
             Decl::Lower(l) => &l.name,
             Decl::Native(n) => &n.function,
+            Decl::Projection(p) => &p.name,
         }
     }
 
@@ -170,6 +172,7 @@ impl Decl {
             Decl::Fn(f) => f.span,
             Decl::Lower(l) => l.span,
             Decl::Native(n) => n.span,
+            Decl::Projection(p) => p.span,
         }
     }
 }
@@ -184,7 +187,9 @@ impl Decl {
 ///     let NAME = EXPR
 ///     where CONDITION
 ///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
-///     launch KERNEL [when CONDITION]:
+///     project PROJECTION VARIANT (WEIGHT, ..)
+///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
+///     launch KERNEL [before LAUNCH] [when CONDITION]:
 ///         params ([arithmetic] [form] NAME in [V, ..] default DEFAULT, ..)
 ///         where CONDITION
 ///         reads (PARAMETER, ..)
@@ -202,6 +207,12 @@ impl Decl {
 /// property the target backend provides. A `DEFAULT` is `EXPR`, `least
 /// where CONDITION` or `greatest where CONDITION`, over the device, the
 /// static dimensions and the bound elements.
+///
+/// `project` splices a projection's forms in (`crate::projection`): its
+/// parameters after the declaration's, its conditions after its `where`,
+/// its scratch at the line, and its launches in their order, each launch of
+/// the declaration's own before the projection launch it names
+/// (`before LAUNCH`) or after them all.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDecl {
     pub function: Ident,
@@ -222,10 +233,82 @@ pub struct NativeDecl {
     /// The `where` condition restricting admissible configurations.
     pub constraint: Option<Expr>,
     pub scratch: Vec<NativeScratchDecl>,
+    /// The projection whose forms the declaration takes; checking reads the
+    /// declaration only once it is expanded, which leaves this `None`.
+    pub project: Option<NativeProjectDecl>,
     /// Every launch in dispatch order, those of the `repeat` block included.
     pub launches: Vec<NativeLaunchDecl>,
     pub repeat: Option<NativeRepeatDecl>,
     pub span: Span,
+}
+
+/// `project PROJECTION VARIANT (WEIGHT, ..)`: the entry's projection of its
+/// weight ports, by the named projection's `VARIANT` (`paired`: two weights
+/// one activation row serves, `single`: one).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeProjectDecl {
+    pub projection: Ident,
+    pub variant: Ident,
+    pub weights: Vec<Ident>,
+    /// The declaration's scratch buffers before the line: the projection's
+    /// follow them, and its later ones follow the projection's.
+    pub scratch_before: usize,
+    pub span: Span,
+}
+
+/// One consumer projection for a backend: the forms of projecting
+/// activation rows by weights, written once over formals an entry binds
+/// with `project` (`crate::projection`).
+///
+/// ```text
+/// projection NAME for TARGET:
+///     let NAME = EXPR [for VARIANT]
+///     params ([arithmetic] [form] NAME in [V, ..] default DEFAULT [for VARIANT], ..)
+///     where CONDITION [for VARIANT]
+///     scratch NAME bytes (EXPR) [sync] [when CONDITION] [for VARIANT]
+///     each W:
+///         scratch NAME bytes (EXPR) [sync] [when CONDITION] [for VARIANT]
+///     launch NAME [for VARIANT] [when CONDITION]:
+///         params (.. [for VARIANT], ..)
+///         ..
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionDecl {
+    pub name: Ident,
+    pub target: Ident,
+    /// Named expressions over the formals, in order.
+    pub terms: Vec<Gated<NativeTermDecl>>,
+    pub params: Vec<Gated<NativeParamDecl>>,
+    /// The `where` lines, conjoined in order.
+    pub constraints: Vec<Gated<Expr>>,
+    pub scratch: Vec<ProjectionScratchDecl>,
+    pub launches: Vec<ProjectionLaunchDecl>,
+    pub span: Span,
+}
+
+/// A projection item and the variant it belongs to (`for VARIANT`); `None`
+/// belongs to every variant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gated<T> {
+    pub item: T,
+    pub variant: Option<Ident>,
+}
+
+/// A projection's scratch: one buffer, or (`each W:`) buffers per weight,
+/// named `<stem>_<name>` for each weight port `<stem>_weight`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectionScratchDecl {
+    One(Gated<NativeScratchDecl>),
+    Each(Vec<Gated<NativeScratchDecl>>),
+}
+
+/// A projection launch, named `<entry>_<name>` in the entry it expands
+/// into; `param_variants` gates its `params` one for one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionLaunchDecl {
+    pub launch: NativeLaunchDecl,
+    pub variant: Option<Ident>,
+    pub param_variants: Vec<Option<Ident>>,
 }
 
 /// `let NAME = EXPR`: a name for a natural-number expression over entry
@@ -324,6 +407,9 @@ pub struct NativeConditionDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeLaunchDecl {
     pub kernel: Ident,
+    /// `before LAUNCH`: in a declaration that projects, the projection
+    /// launch this launch dispatches before.
+    pub before: Option<Ident>,
     /// `resident (BARRIER)`: every threadgroup of the launch is co-resident,
     /// its grid the backend's (`RESIDENT`, at most `threadgroups`' first
     /// axis), and its threadgroups meet at grid barriers held in the `sync`

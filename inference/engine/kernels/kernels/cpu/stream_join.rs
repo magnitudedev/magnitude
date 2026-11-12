@@ -4,6 +4,7 @@
 
 use lib::core::functions;
 
+#[inline(always)]
 fn stream_join<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (h, streams, inject_width) = (cx.dim_h() as usize, cx.dim_sn() as usize, cx.dim_in() as usize);

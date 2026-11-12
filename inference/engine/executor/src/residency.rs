@@ -7,11 +7,9 @@
 use crate::device_table::{
     DeviceTable, KeptRows, ResidentTable, StoredRows, TileRun, TileSource,
 };
-use crate::domain::ClaimRefusal;
-use crate::planning::{ImportBacking, ImportPlan};
+use crate::planning::ImportPlan;
 use crate::programs::ProgramSubmission;
 use crate::programs::native_import::NativeImportProgram;
-use crate::resources::{ImportSource, ImportWindow};
 use crate::stored_table::StoredTable;
 use crate::{
     AllocationError, ExecutionPlan, ImportLaunchInputs, ImportProgram, InvariantError,
@@ -42,13 +40,14 @@ pub enum WeightImportError {
     Read(seismic_io::Error),
     Invalid(String),
     Device(String),
+    /// An allocation in `contract` storage its store had no room for: it
+    /// needed `required` bytes where `available` were left.
+    Refused { contract: seismic::Contract, required: u64, available: u64 },
     Allocation(AllocationError),
     Attestation(crate::CatalogError),
     Submit(SubmitError),
     Completion(crate::DeviceError),
     Invariant(InvariantError),
-    /// The import's observer refused to let it continue.
-    Refused(ClaimRefusal),
 }
 
 impl fmt::Display for WeightImportError {
@@ -58,12 +57,14 @@ impl fmt::Display for WeightImportError {
             Self::Read(error) => write!(formatter, "weight source: {error}"),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Device(message) => write!(formatter, "weight device import: {message}"),
+            Self::Refused { contract, required, available } => {
+                write!(formatter, "{contract:?} storage requires {required} bytes; {available} bytes available")
+            }
             Self::Allocation(error) => error.fmt(formatter),
             Self::Attestation(error) => error.fmt(formatter),
             Self::Submit(error) => error.fmt(formatter),
             Self::Completion(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
-            Self::Refused(refusal) => write!(formatter, "weight import halted: {refusal}"),
         }
     }
 }
@@ -78,8 +79,7 @@ impl std::error::Error for WeightImportError {
             Self::Submit(error) => Some(error),
             Self::Completion(error) => Some(error),
             Self::Invariant(error) => Some(error),
-            Self::Refused(refusal) => Some(refusal),
-            Self::Invalid(_) | Self::Device(_) => None,
+            Self::Invalid(_) | Self::Device(_) | Self::Refused { .. } => None,
         }
     }
 }
@@ -93,6 +93,41 @@ impl From<seismic_io::Error> for WeightImportError {
 impl From<ArtifactError> for WeightImportError {
     fn from(error: ArtifactError) -> Self {
         Self::Artifact(error)
+    }
+}
+
+impl From<String> for WeightImportError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for WeightImportError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+impl WeightImportError {
+    /// A tensor allocation in `contract` storage that failed: refused for
+    /// room where the device's ledger refused it (its capacity refusal),
+    /// else the device's failure.
+    pub(crate) fn allocating(contract: seismic::Contract, error: &seismic::TensorError) -> Self {
+        match error {
+            seismic::TensorError::Execution(execution) => match execution.capacity_refusal() {
+                Some((required, available)) => Self::Refused { contract, required, available },
+                None => Self::Device(error.to_string()),
+            },
+            error => Self::Device(error.to_string()),
+        }
+    }
+
+    /// [`Self::allocating`] of a resource allocation in `contract` storage.
+    pub(crate) fn of_allocation(contract: seismic::Contract, error: AllocationError) -> Self {
+        match error {
+            AllocationError::Tensor(error) => Self::allocating(contract, &error),
+            error => Self::Allocation(error),
+        }
     }
 }
 
@@ -474,10 +509,7 @@ struct OrderedImport {
     plan: WeightPlan,
     source: Arc<FileSource>,
     offset: u64,
-    backing: ImportBacking,
     target: DType,
-    /// The streamed tensors of its file lying before it ([`streamed_before`]).
-    streamed_before: usize,
 }
 
 impl OrderedImport {
@@ -485,22 +517,7 @@ impl OrderedImport {
         artifact: &GgufArtifact,
         weights: &[WeightPlan],
         activation: DType,
-        device: &Device,
     ) -> Result<Vec<Self>, WeightImportError> {
-        // The streamed tables and banked expert stacks: the load reads only
-        // the rows and experts steps name, never the whole tensor.
-        let mut streamed = Vec::new();
-        for plan in weights
-            .iter()
-            .filter(|plan| !plan.placed_on_host() && plan.holding != crate::Holding::Whole)
-        {
-            let tensor = ImportArtifactTensor::from_gguf(artifact, &plan.descriptor)?;
-            let (source, offset, length) = tensor.stored().file_range();
-            let end = offset
-                .checked_add(length)
-                .ok_or_else(|| invalid("source range overflows"))?;
-            streamed.push((source.path().to_owned(), offset, end));
-        }
         let mut seen = HashSet::<WeightStorageIdentity>::new();
         let mut ordered = Vec::new();
         // A host-placed weight takes no import entry (`import_progressive`).
@@ -515,28 +532,16 @@ impl OrderedImport {
                 continue;
             }
             let tensor = ImportArtifactTensor::from_gguf(artifact, &plan.descriptor)?;
-            let (source, offset, length) = tensor.stored().file_range();
-            let end = offset
-                .checked_add(length)
-                .ok_or_else(|| invalid("source range overflows"))?;
-            let backing = if ImportSource::reads_in_place(plan, tensor.stored(), device)
-                .map_err(WeightImportError::Allocation)?
-            {
-                ImportBacking::Mapped(offset..end)
-            } else {
-                ImportBacking::Staged(plan.source_bytes)
-            };
+            let (source, offset, _) = tensor.stored().file_range();
             ordered.push(OrderedImport {
                 plan: plan.clone(),
                 source: source.clone(),
                 offset,
-                backing,
                 target: plan.resident.dtype().unwrap_or(activation),
-                streamed_before: streamed_before(&source.path().to_owned(), offset, &streamed),
             });
         }
         // A split component's tensors live in several files: order each
-        // file's tensors contiguously so windows coalesce within a file.
+        // file's tensors contiguously, read in file order.
         ordered.sort_by(|left, right| {
             left.source
                 .path()
@@ -546,42 +551,28 @@ impl OrderedImport {
         Ok(ordered)
     }
 
-    /// What every import of one batch shares: its file, and the streamed
-    /// tensors of that file before it, so no batch's window spans one.
-    fn run(&self) -> (*const FileSource, usize) {
-        (Arc::as_ptr(&self.source), self.streamed_before)
+    /// What every import of one batch shares: its file.
+    fn file(&self) -> *const FileSource {
+        Arc::as_ptr(&self.source)
     }
 }
 
-/// How many of `streamed`, each a tensor's file and byte range, lie in
-/// `file` before `offset`. Imports batch only with imports of the same count
-/// ([`OrderedImport::run`]): a window is mapped whole, faulting every page it
-/// spans into the file cache, so no window spans the bytes of a streamed
-/// table or a banked expert stack, which the load reads only uncached.
-fn streamed_before<F: PartialEq>(file: &F, offset: u64, streamed: &[(F, u64, u64)]) -> usize {
-    streamed
-        .iter()
-        .filter(|(of, _, end)| of == file && *end <= offset)
-        .count()
-}
-
-/// Coarse host costs of the most recent mapped component import. The caller
+/// Coarse host costs of the most recent batched component import. The caller
 /// can use these alongside its total import duration to identify work outside
-/// mapping, preparation, submission, waiting, and publication.
+/// preparation (the sources' reads among it), submission, waiting, and
+/// publication.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct MappedImportReport {
-    pub windows: usize,
+pub struct ImportReport {
+    pub batches: usize,
     pub weights: usize,
-    pub mapping: Duration,
     pub preparing: Duration,
     pub submitting: Duration,
     pub waiting: Duration,
     pub publishing: Duration,
 }
 
-/// Observes a component import in resident bytes: completed, then total. A
-/// refusal halts the import before its next weight.
-pub type ImportObserver = Box<dyn FnMut(u64, u64) -> Result<(), ClaimRefusal>>;
+/// Observes a component import in resident bytes: completed, then total.
+pub type ImportObserver = Box<dyn FnMut(u64, u64)>;
 
 /// The resident bytes of the component import in progress and where they are
 /// reported.
@@ -678,7 +669,7 @@ pub struct ResidencyStore {
     /// Whose import the store makes now: the target's until an optional
     /// component's loader takes it.
     importer: Importer,
-    mapped_import: MappedImportReport,
+    import_report: ImportReport,
     import_progress: Option<ImportProgress>,
     /// Where the rows steps name of streamed tables are kept, when they are.
     kept_table_rows: Option<std::path::PathBuf>,
@@ -711,7 +702,7 @@ impl ResidencyStore {
             domain,
             resident: Imports::default(),
             importer: Importer::Target,
-            mapped_import: MappedImportReport::default(),
+            import_report: ImportReport::default(),
             import_progress: None,
             kept_table_rows: None,
             cpu_site: Default::default(),
@@ -739,8 +730,7 @@ impl ResidencyStore {
                 .completed
                 .saturating_add(storage_bytes)
                 .min(progress.total);
-            (progress.observer)(progress.completed, progress.total)
-                .map_err(WeightImportError::Refused)?;
+            (progress.observer)(progress.completed, progress.total);
         }
         Ok(())
     }
@@ -768,8 +758,8 @@ impl ResidencyStore {
         self.resident.clone()
     }
 
-    pub fn mapped_import_report(&self) -> MappedImportReport {
-        self.mapped_import
+    pub fn import_report(&self) -> ImportReport {
+        self.import_report
     }
 
     /// Keep the rows steps name of this store's streamed tables in
@@ -997,14 +987,14 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`HostLines::of_bank`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone())
-            .map_err(invalid)?;
+        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone())?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
         if plan.whole() {
             bank.import_whole(&mut |weight, records| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
-                let source = crate::resources::ImportSource::uncached(weight, artifact, &self.device)?;
+                let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+                let source = crate::resources::filled_import(weight, &stored, &self.device)?;
                 crate::programs::native_import::import_into(&entry, &source, records, None)
                     .map_err(|error| error.to_string())
             })
@@ -1065,7 +1055,7 @@ impl ResidencyStore {
         let bytes = crate::import_transforms::upload_bytes(&planned, stored, bytes)
             .map_err(invalid)?;
         let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
-            .map_err(|error| WeightImportError::Device(error.to_string()))?;
+            .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))?;
         let weight = ResidentWeight {
             descriptor: descriptor.clone(),
             tensor,
@@ -1109,7 +1099,7 @@ impl ResidencyStore {
             return Ok(weight);
         }
         let (key, descriptor, scale, launch, mut program) =
-            match self.prepare_gguf(artifact, descriptor, target, None)? {
+            match self.prepare_gguf(artifact, descriptor, target)? {
                 ImportPreparation::Resident(weight) => return Ok(weight),
                 ImportPreparation::Pending {
                     key,
@@ -1141,7 +1131,6 @@ impl ResidencyStore {
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
         target: DType,
-        window: Option<&ImportWindow>,
     ) -> Result<ImportPreparation, WeightImportError> {
         let planned = self
             .execution
@@ -1230,18 +1219,16 @@ impl ResidencyStore {
         } else {
             Tensor::zeros(&self.device, planned.resident, &planned.shape)
         }
-        .map_err(|error| WeightImportError::Device(error.to_string()))?;
+        .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))?;
         let destination = ResidentWeightSlot::new(&planned, &self.device, tensor)
             .map_err(WeightImportError::Invariant)?;
         let workspace = ResourceAllocator::import_workspace(
             &self.execution,
             &planned,
-            stored,
-            window,
             &self.device,
             self.domain.clone(),
         )
-        .map_err(WeightImportError::Allocation)?;
+        .map_err(|error| WeightImportError::of_allocation(seismic::Contract::DeviceOnly, error))?;
         let launch = ValidatedImportLaunch::new(
             ImportLaunchInputs::new(planned.clone(), source, workspace, destination),
             &self.domain,
@@ -1297,7 +1284,8 @@ impl ResidencyStore {
     }
 
     /// Import one component in source-file order. Whole adjacent tensors
-    /// share a mapped window and one ordered native submission. Semantic
+    /// share one ordered native submission, their staged sources together
+    /// within the import bound. Semantic
     /// assembly below then reads the completed weights from the sole cache.
     fn preload_component(
         &mut self,
@@ -1308,47 +1296,30 @@ impl ResidencyStore {
         if self.device.backend() != seismic::BackendName::Metal || weights.is_empty() {
             return Ok(());
         }
-        let ordered = OrderedImport::of(artifact, weights, activation, &self.device)?;
-        // The same source bound drives admission and window construction.
-        // Whole streamed tables and banked expert stacks never enlarge this
-        // bound: only their slots (or no upload at all) are source storage.
+        let ordered = OrderedImport::of(artifact, weights, activation)?;
+        // The same source bound drives admission and batching. Whole
+        // streamed tables and banked expert stacks never enlarge this bound:
+        // only their slots (or no upload at all) are source storage.
         let imports = ImportPlan::new(weights.iter());
-        let mut report = MappedImportReport::default();
+        let mut report = ImportReport::default();
         // Measurement only: timed Metal encoders change the device path, so
         // these numbers attribute work but are not production load timings.
-        let trace_window = std::env::var("MAGNITUDE_TRACE_IMPORT_WINDOW")
+        let trace_batch = std::env::var("MAGNITUDE_TRACE_IMPORT_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok());
         let mut first = 0;
         while first < ordered.len() {
-            let source = ordered[first].source.clone();
-            let batch_plan = imports
-                .batch(
-                    ordered[first..]
-                        .iter()
-                        .map(|item| (item.run(), item.backing.clone())),
-                )
+            let batch_len = imports
+                .batch(ordered[first..].iter().map(|item| (item.file(), item.plan.source_bytes)))
                 .expect("the remaining import sources are nonempty");
-            let last = first + batch_plan.len;
-            let mapping = Instant::now();
-            let window = batch_plan
-                .mapping
-                .map(|range| ImportWindow::map(&self.device, source, range.start, range.end))
-                .transpose()
-                .map_err(WeightImportError::Allocation)?;
-            report.mapping += mapping.elapsed();
-            report.windows += 1;
+            let last = first + batch_len;
+            report.batches += 1;
             let mut batch = NativeTensorBatch::new(&self.device);
             let mut pending = Vec::new();
             let mut traced_weights = Vec::new();
             let preparing = Instant::now();
             for item in &ordered[first..last] {
-                match self.prepare_gguf(
-                    artifact,
-                    &item.plan.descriptor,
-                    item.target,
-                    window.as_ref(),
-                )? {
+                match self.prepare_gguf(artifact, &item.plan.descriptor, item.target)? {
                     ImportPreparation::Resident(_) => {}
                     ImportPreparation::Pending {
                         key,
@@ -1360,7 +1331,7 @@ impl ResidencyStore {
                         let launch = program
                             .enqueue(&mut batch, launch)
                             .map_err(|(error, _)| WeightImportError::Submit(error))?;
-                        if trace_window == Some(report.windows - 1) {
+                        if trace_batch == Some(report.batches - 1) {
                             traced_weights.push((
                                 item.plan.descriptor.name.clone(),
                                 item.plan.source.name().to_owned(),
@@ -1374,7 +1345,7 @@ impl ResidencyStore {
             report.preparing += preparing.elapsed();
             if !pending.is_empty() {
                 report.weights += pending.len();
-                let trace = if trace_window == Some(report.windows - 1) {
+                let trace = if trace_batch == Some(report.batches - 1) {
                     match self.device.trace_submissions(TraceDetail::Launches) {
                         Ok(trace) => Some(trace),
                         Err(error) => {
@@ -1400,7 +1371,7 @@ impl ResidencyStore {
                 if let Some(trace) = trace {
                     match trace.collect() {
                         Ok(submissions) => {
-                            report_timed_import(report.windows - 1, &traced_weights, &submissions)
+                            report_timed_import(report.batches - 1, &traced_weights, &submissions)
                         }
                         Err(error) => eprintln!("magnitude-engine: import trace failed: {error}"),
                     }
@@ -1425,7 +1396,7 @@ impl ResidencyStore {
             }
             first = last;
         }
-        self.mapped_import = report;
+        self.import_report = report;
         Ok(())
     }
 
@@ -1452,7 +1423,7 @@ impl ResidencyStore {
             .chain([bank])
             .sum::<Result<u64, String>>()
             .map_err(crate::ResidencyError::Invalid)?;
-        observer(0, total).map_err(WeightImportError::Refused)?;
+        observer(0, total);
         self.import_progress = Some(ImportProgress {
             completed: 0,
             total,
@@ -1471,8 +1442,7 @@ impl ResidencyStore {
             .take()
             .expect("the target import owns its progress");
         if target.is_ok() && progress.completed < progress.total {
-            (progress.observer)(progress.total, progress.total)
-                .map_err(WeightImportError::Refused)?;
+            (progress.observer)(progress.total, progress.total);
         }
         target
     }
@@ -1545,13 +1515,13 @@ pub(crate) fn import_scale(
         values.repeat(extent)
     };
     Tensor::from_host(device, Element::f32(), &[scale.extent], &bytes)
-        .map_err(|error| WeightImportError::Device(error.to_string()))
+        .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))
 }
 
 /// Attribution only. Timed encoders add overhead, and one import entry has
 /// one launch today. Keep a mismatch diagnostic rather than affecting load.
 fn report_timed_import(
-    window: usize,
+    batch: usize,
     weights: &[(String, String, u64)],
     submissions: &[TracedSubmission],
 ) {
@@ -1561,7 +1531,7 @@ fn report_timed_import(
         .collect::<Vec<_>>();
     if launches.len() != weights.len() {
         eprintln!(
-            "magnitude-engine: timed import window {window}: {} launches for {} weights",
+            "magnitude-engine: timed import batch {batch}: {} launches for {} weights",
             launches.len(),
             weights.len()
         );
@@ -1577,7 +1547,7 @@ fn report_timed_import(
         entry.2 += seconds;
         slowest.push((seconds, name, format, bytes));
     }
-    eprintln!("magnitude-engine: timed import window {window} (measurement encoders)");
+    eprintln!("magnitude-engine: timed import batch {batch} (measurement encoders)");
     for (format, (count, bytes, seconds)) in by_format {
         eprintln!(
             "magnitude-engine: import format={format} weights={count} source_bytes={bytes} device_ms={:.3}",
@@ -1609,6 +1579,9 @@ pub struct ComponentLoader<T: Clone> {
     package: std::sync::Arc<magnitude_artifacts::Package>,
     import: ComponentImport<T>,
     cached: RefCell<Option<Result<T, Rc<crate::ResidencyError>>>>,
+    /// The claims of the imports the component brought into its cache,
+    /// released as they are ([`Self::unload`]).
+    claims: RefCell<Vec<crate::memory::ledger::Claim>>,
 }
 
 impl<T: Clone> ComponentLoader<T> {
@@ -1632,6 +1605,7 @@ impl<T: Clone> ComponentLoader<T> {
         }
         let store = self.store.borrow();
         store.resident.release(store.importer);
+        self.claims.borrow_mut().clear();
     }
 
     fn new(
@@ -1648,7 +1622,26 @@ impl<T: Clone> ComponentLoader<T> {
             package,
             import,
             cached: RefCell::new(None),
+            claims: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Whether the component is imported ([`Self::import`]).
+    pub fn imported(&self) -> bool {
+        matches!(&*self.cached.borrow(), Some(Ok(_)))
+    }
+
+    /// Import the component under `held`, the claims of the bytes its
+    /// import brings into its cache, kept until [`Self::unload`]. An attempt
+    /// made before is returned as it ended, `held` released.
+    pub fn import(&self, mut held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
+        assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
+        let imported = self.load();
+        if imported.is_ok() {
+            held.allocated();
+            *self.claims.borrow_mut() = held.into_claims();
+        }
+        imported
     }
 
     pub fn load(&self) -> Result<T, Rc<crate::ResidencyError>> {
@@ -1702,6 +1695,15 @@ impl ComponentLoader<crate::ResidentHead> {
 }
 
 impl ComponentLoader<crate::ResidentVision> {
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        self.store
+            .borrow()
+            .programs
+            .vision_graphs()
+            .ok_or("vision graph family was not prepared")?
+            .binding_constant_bytes()
+    }
+
     pub fn vision(
         store: ResidencyStore,
         definition: Rc<magnitude_family_contracts::ModelDefinition>,
@@ -1816,8 +1818,6 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 mod tests {
     use super::*;
 
-    type Span = (u8, u64, u64);
-
     /// A reserved stored table the bank shrinks after its import is read
     /// at what its slots are charged then: the importer's bytes fall with
     /// the slots' charge, never above it.
@@ -1861,219 +1861,6 @@ mod tests {
         assert_eq!(imports.bytes(Importer::Target), Ok(weight.storage_bytes()));
         drop((imports, weight, table));
         std::fs::remove_file(path).unwrap();
-    }
-
-    /// `plan`'s target tensors as the import orders them: its imported and
-    /// its streamed spans in `manifest`'s one file.
-    fn import_spans(
-        plan: &crate::ModelLoadPlan,
-        manifest: &magnitude_artifacts::PackageManifest,
-    ) -> (Vec<Span>, Vec<Span>) {
-        let span = |weight: &WeightPlan| {
-            let tensor = manifest
-                .target
-                .tensors
-                .iter()
-                .find(|tensor| tensor.name == weight.descriptor.name)
-                .unwrap();
-            (0, tensor.offset, tensor.offset + tensor.nbytes)
-        };
-        let mut seen = HashSet::new();
-        let held = plan.target().iter().filter(|weight| !weight.placed_on_host());
-        let mut imported = held
-            .clone()
-            .filter(|weight| weight.holding == crate::Holding::Whole)
-            .filter(|weight| seen.insert(weight.storage_identity()))
-            .map(span)
-            .collect::<Vec<_>>();
-        imported.sort();
-        let streamed = held
-            .filter(|weight| weight.holding != crate::Holding::Whole)
-            .map(span)
-            .collect();
-        (imported, streamed)
-    }
-
-    /// The batches of `imported`, each read in place, under `plan`'s import
-    /// bound, each import keyed by `key` of its span.
-    fn import_batches<K: PartialEq>(
-        plan: &crate::ModelLoadPlan,
-        imported: &[Span],
-        key: impl Fn(&Span) -> K,
-    ) -> Vec<std::ops::Range<usize>> {
-        let imports = plan.imports();
-        let mut batches = Vec::new();
-        let mut first = 0;
-        while first < imported.len() {
-            let batch = imports
-                .batch(imported[first..].iter().map(|span| (key(span), ImportBacking::Mapped(span.1..span.2))))
-                .unwrap();
-            batches.push(first..first + batch.len);
-            first += batch.len;
-        }
-        batches
-    }
-
-    /// A load that streams nothing batches as its import bound alone
-    /// batches it: no streamed tensor cuts a window.
-    #[test]
-    fn a_resident_load_keeps_its_windows() {
-        use crate::planning::fixtures::{fixture_definition, fixture_manifest};
-        let definition = fixture_definition();
-        let manifest = fixture_manifest(&definition);
-        let selection = crate::ComponentSelection {
-            head: false,
-            vision: false,
-        };
-        let plan =
-            crate::ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-                .unwrap();
-        let (imported, streamed) = import_spans(&plan, &manifest);
-        assert!(streamed.is_empty());
-        let coalesced = import_batches(&plan, &imported, |span| span.0);
-        assert!(coalesced.len() < imported.len(), "the fixture shares windows");
-        let run = |span: &Span| (span.0, streamed_before(&span.0, span.1, &streamed));
-        assert_eq!(import_batches(&plan, &imported, run), coalesced);
-    }
-
-    /// A banked load's windows cover only the tensors it imports: none
-    /// spans a banked expert stack's or a streamed table's bytes.
-    #[test]
-    fn no_window_spans_a_streamed_tensor() {
-        use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
-        let definition = qwen4exp_fixture_definition();
-        let manifest = streamed_experts_manifest(&definition);
-        let selection = crate::ComponentSelection {
-            head: false,
-            vision: false,
-        };
-        let plan =
-            crate::ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-                .unwrap()
-                .with_expert_bank_at_floor(
-                    &definition,
-                    seismic::Reservation {
-                        granule: 1,
-                        host_addressed: true,
-                        chunks: None,
-                    },
-                    crate::planning::HostTier::Unified,
-                )
-                .unwrap();
-        let (imported, streamed) = import_spans(&plan, &manifest);
-        assert!(plan.target().iter().any(|weight| weight.banked().is_some()));
-        assert!(plan.target().iter().any(|weight| weight.streamed().is_some()));
-        let run = |span: &Span| (span.0, streamed_before(&span.0, span.1, &streamed));
-        let windows = import_batches(&plan, &imported, run);
-        assert_eq!(windows.iter().map(ExactSizeIterator::len).sum::<usize>(), imported.len());
-        for window in windows {
-            let start = imported[window.start].1;
-            let end = imported[window].iter().map(|span| span.2).max().unwrap();
-            for (_, from, to) in &streamed {
-                assert!(*to <= start || *from >= end, "window {start}..{end} spans {from}..{to}");
-            }
-        }
-    }
-
-    /// Uses the real shard headers and the production source ordering, without
-    /// allocating resident weights or reading the sparse tensor payloads.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn catalog_flash_next_import_windows_fit_the_admitted_peak() {
-        use magnitude_artifacts::{Package, catalog_headers::ComponentRole};
-        use magnitude_family_common::headers;
-        use magnitude_family_contracts::ModelFamily;
-        use magnitude_family_qwen4exp::Qwen4ExpFamily;
-
-        let devices = seismic::Devices::discover(&[]).unwrap();
-        let device = crate::test_support::open_backend(&devices, seismic::BackendName::Metal).unwrap();
-        for model in [
-            "qwen3.8-flash-next:gguf:q4",
-            "qwen3.8-flash-next:gguf:q2",
-        ] {
-            let component = headers::index()
-                .iter()
-                .find(|component| {
-                    component.model == model && component.role == ComponentRole::Target
-                })
-                .unwrap();
-            let package =
-                Package::open_without_projector(component.file(&headers::root())).unwrap();
-            let definition = Qwen4ExpFamily
-                .inspect(package.target().directory(), None, package.identity())
-                .unwrap();
-            let load = crate::ModelLoadPlan::derive(
-                &package.manifest(),
-                &definition,
-                crate::ComponentSelection {
-                    head: false,
-                    vision: false,
-                },
-                crate::resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Metal),
-                crate::PlannedMethod::Plain,
-                crate::planning::fixtures::LIMITS,
-            )
-            .unwrap();
-            let imports = ImportPlan::new(load.target());
-            let peak = imports.peak_bytes().unwrap();
-            let ordered =
-                OrderedImport::of(package.target(), load.target(), DType::BF16, &device).unwrap();
-            // Demonstrate the actual regression's precondition: a streamed
-            // tensor's file extent exceeds the admitted import source peak.
-            assert!(
-                load.target()
-                    .iter()
-                    .filter(|weight| weight.streamed().is_some())
-                    .any(|weight| {
-                        weight
-                            .upload
-                            .canonical_byte_len(&weight.stored_shape())
-                            .unwrap()
-                            > peak
-                    })
-            );
-            let mut first = 0;
-            let mut windows = 0;
-            let mut largest = 0;
-            while first < ordered.len() {
-                let batch = imports
-                    .batch(
-                        ordered[first..]
-                            .iter()
-                            .map(|item| (item.run(), item.backing.clone())),
-                    )
-                    .unwrap();
-                let last = first + batch.len;
-                let staged = ordered[first..last]
-                    .iter()
-                    .map(|item| match item.backing {
-                        ImportBacking::Staged(bytes) => bytes,
-                        ImportBacking::Mapped(_) => 0,
-                    })
-                    .sum::<u64>();
-                let mapped = batch.mapping.map_or(0, |range| {
-                    let source = &ordered[first].source;
-                    let window = source
-                        .map_window(range.start, range.end - range.start)
-                        .unwrap();
-                    // Exercise Metal's mapping of precisely the scheduled
-                    // span too; no tensor payload is touched.
-                    ImportWindow::map(&device, source.clone(), range.start, range.end).unwrap();
-                    window.mapped_len() as u64
-                });
-                assert!(
-                    mapped + staged <= peak,
-                    "{model}: {mapped} mapped + {staged} staged > {peak}"
-                );
-                largest = largest.max(mapped + staged);
-                windows += 1;
-                first = last;
-            }
-            eprintln!(
-                "{model}: {} weights, {windows} batches, largest source backing {largest}, admitted {peak}",
-                ordered.len()
-            );
-        }
     }
 
     #[test]
@@ -2147,5 +1934,26 @@ mod tests {
         assert_eq!(imports.bytes(Importer::Head), Ok(0));
         assert_eq!(imports.bytes(Importer::Target), Ok(owned[0]));
         assert!(imports.get(&weight("embedding", 64).0).is_some(), "the target's imports stay resident");
+    }
+
+    /// An allocation its store has no room for is refused for room, in the
+    /// storage it was made in, never a device failure: a CPU device whose
+    /// store Seismic bounds to what it claims refuses a 1 MiB weight.
+    #[test]
+    fn an_allocation_without_room_is_refused_for_room() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).unwrap();
+        let bounds = device.bounds();
+        for view in device.ledgers().stores {
+            bounds.bound(seismic::Ledger::Store(view.store), Some(view.claim)).unwrap();
+        }
+        let error = Tensor::zeros(&device, Element::bool(), &[1 << 20]).expect_err("a store with no room refuses");
+        assert!(
+            matches!(
+                WeightImportError::allocating(seismic::Contract::DeviceOnly, &error),
+                WeightImportError::Refused { contract: seismic::Contract::DeviceOnly, required, .. } if required >= 1 << 20
+            ),
+            "{error}"
+        );
     }
 }

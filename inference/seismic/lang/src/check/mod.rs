@@ -997,6 +997,9 @@ pub(crate) fn check_closed<E>(
             }
         }
     }
+    for (file, diagnostic) in crate::projection::expand(&mut parsed) {
+        parse_diagnostics.push(SourceDiagnostic::located(&sources.files()[file], diagnostic));
+    }
     if let Some(diagnostics) = Diagnostics::new(parse_diagnostics) {
         return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }

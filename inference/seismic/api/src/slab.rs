@@ -123,6 +123,9 @@ pub struct SlabTensor {
     aliases: Vec<u64>,
     offsets: Vec<u64>,
     slab_bytes: u64,
+    /// The most a slab's allocation has been charged, kept past the slab
+    /// being freed ([`Self::slab_charge`]).
+    charged_seen: u64,
     slabs: Vec<Option<Slab>>,
     addresses: Ordinary,
     region_tables: Vec<Ordinary>,
@@ -182,6 +185,7 @@ impl SlabTensor {
                 .collect(),
             offsets,
             slab_bytes: bytes,
+            charged_seen: 0,
             slabs: Vec::new(),
             addresses: table,
             region_tables,
@@ -226,6 +230,20 @@ impl SlabTensor {
 
     pub fn slab_bytes(&self) -> u64 {
         self.slab_bytes
+    }
+
+    /// What one more slab allocation will be charged: the most a slab's
+    /// allocation has been charged, its record tables included (the
+    /// allocation's own accounting, which the device's bound is derived from;
+    /// the tables follow the compiled graphs, never the layout), kept after
+    /// the slab is freed so a regrowth claims what the slab was charged, and
+    /// never less than the slab's bytes. A claim for a slab's growth takes
+    /// this figure and no sum of its own.
+    pub fn slab_charge(&self) -> u64 {
+        self.slab_storage_observers()
+            .filter_map(|observer| observer.charged_bytes())
+            .fold(self.charged_seen, u64::max)
+            .max(self.slab_bytes)
     }
 
     /// The fixed address table plus currently backed slab allocations.
@@ -396,6 +414,7 @@ impl SlabTensor {
         let Some(slab) = self.slabs.get_mut(index).and_then(Option::take) else {
             return Ok(None);
         };
+        self.charged_seen = self.charged_seen.max(slab.observe_storage().charged_bytes().unwrap_or(0));
         if let Err(error) = self.publish_addresses() {
             self.slabs[index] = Some(slab);
             return Err(error);

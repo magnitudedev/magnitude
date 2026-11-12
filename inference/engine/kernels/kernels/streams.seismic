@@ -421,30 +421,75 @@ native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
 
-# Metal, CUDA and Vulkan: one threadgroup per row reduces its squares and every mix
-# in fixed order; its first thread forms the coefficients, and every thread
-# mixes the input columns.
+# The threadgroups a Sinkhorn mix site's decode row is split across
+# (`stream_mix_sinkhorn`, Metal, CUDA and Vulkan): enough that a row's
+# function matrix streams through many cores, few enough that each
+# threadgroup's slice stays long. On M4 Pro at one decode row of DeepSeek
+# V4.1's sites (timed, µs a site at 16 / 32 / 64 / 128 / 1 threadgroups):
+# 42.6 / 42.6 / 43.7 / 45.0 / 89.2, and with the comb formed across the
+# threadgroup 27.2 / 28.5 / 30.8 / 32.6 / 92.2; 16 is the fastest measured.
+# At 16, 8 decode rows (128 threadgroups) take 36.5 µs against one row's
+# 28.5.
+const SINKHORN_SPLIT = 16
+
+# The rows a Sinkhorn mix site's prefill tile holds (`stream_mix_sinkhorn`,
+# Metal, CUDA and Vulkan): each of a tile's function columns is read once
+# for all its rows, two rows a simdgroup (warp, subgroup) of eight.
+const SINKHORN_TILE = 16
+
+# Metal, CUDA and Vulkan: at every row count SINKHORN_SPLIT threadgroups a
+# row tile each reduce a contiguous slice of its rows' columns into the
+# scratch and mix their share of the input, and a second launch sums each
+# row's partials in slice order and forms the coefficients: each mix a sum
+# of the same S * H products in a fixed order. A decode row is a tile of its
+# own, its function matrix streaming through many cores; prefill rows
+# (M > DECODE_ROWS) take tiles of SINKHORN_TILE rows that read each function
+# column once a tile. Vulkan declares its group memory: the slice sums, the
+# prefill tiles' staged columns, and the finishing launch's sums and comb.
 native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
     static (H, S)
     where S <= 8
-    launch stream_mix_sinkhorn:
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tiles when M > DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_finish:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
     static (H, S)
     where S <= 8
-    launch stream_mix_sinkhorn:
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tiles when M > DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_finish:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_mix_sinkhorn for vulkan from "vulkan/stream_mix_sinkhorn.comp":
     static (H, S)
     where S <= 8
-    launch stream_mix_sinkhorn:
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 + (2 + S) * S) * 8 * 4)
+    launch stream_mix_sinkhorn_tiles when M > DECODE_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (((1 + (2 + S) * S) * 8 + (2 + S) * S * (6144 / ((2 + S) * S) / 32 * 32)) * 4)
+    launch stream_mix_sinkhorn_finish:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (8 * 4)
+        shared_bytes ((1 + (2 + S) * S + S * S) * 4)
 
 # CPU: one work item per row, which forms its coefficients in place (to 8
 # streams) and mixes its input row.

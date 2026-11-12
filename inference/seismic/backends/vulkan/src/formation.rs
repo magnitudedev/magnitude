@@ -179,9 +179,7 @@ impl DirectModule {
     /// The pipelines of `entries`, each from its sealed SPIR-V with its
     /// constants (the workgroup size, ids 0..3, then the rest), as the
     /// driver compiled them, and their pipeline cache data, which
-    /// [`DirectModule::load`] creates them from without compiling. That
-    /// the data serves such a load is not proven here: the toolchain proves
-    /// it for every compile, before its artifact is stored. A
+    /// [`DirectModule::load`] may create them from without compiling. A
     /// pipeline-creation failure is a toolchain failure. Every pipeline's
     /// statistics are read from the driver, here and on a load alike, so
     /// the artifact carries none.
@@ -189,61 +187,45 @@ impl DirectModule {
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
     ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
-        let (mut module, data) = Self::created(device, entries, &[], vk::PipelineCreateFlags::empty())?;
+        let (mut module, data) = Self::created(device, entries, &[], vk::PipelineCreateFlags::empty())?
+            .expect("a creation that may compile never reports that it would have to");
         module.read_statistics()?;
         Ok((module, data))
     }
 
     /// The pipelines of `entries` from `pipelines`, the data
-    /// [`DirectModule::compile`] made of them on this device and driver.
-    /// Nothing is compiled: a pipeline the data does not hold fails
-    /// (`FAIL_ON_PIPELINE_COMPILE_REQUIRED`).
+    /// [`DirectModule::compile`] made of them on this device and driver,
+    /// or `None` where the driver does not serve one of them from it
+    /// without compiling (`FAIL_ON_PIPELINE_COMPILE_REQUIRED`): the
+    /// pipeline cache is a hint the driver may decline, so a declined load
+    /// is a miss, never a failure.
     pub(crate) fn load(
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
         pipelines: &[u8],
-    ) -> Result<Self, NativeCompilationError> {
-        let mut module = Self::loaded(device, entries, pipelines)?;
-        module.read_statistics()?;
-        Ok(module)
-    }
-
-    /// Whether `pipelines` serves a load of `entries` without compiling:
-    /// the load's pipelines are created and destroyed, and their
-    /// statistics, which the compile that made the data read, are not
-    /// read again.
-    pub(crate) fn serves(
-        device: &Device,
-        entries: &[(&[u32], &ProgramEntry)],
-        pipelines: &[u8],
-    ) -> Result<(), NativeCompilationError> {
-        Self::loaded(device, entries, pipelines).map(drop)
-    }
-
-    /// The pipelines of `entries` from `pipelines`, their statistics not
-    /// yet read.
-    fn loaded(
-        device: &Device,
-        entries: &[(&[u32], &ProgramEntry)],
-        pipelines: &[u8],
-    ) -> Result<Self, NativeCompilationError> {
-        Self::created(
+    ) -> Result<Option<Self>, NativeCompilationError> {
+        let Some((mut module, _)) = Self::created(
             device,
             entries,
             pipelines,
             vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED,
-        )
-        .map(|(module, _)| module)
+        )?
+        else {
+            return Ok(None);
+        };
+        module.read_statistics()?;
+        Ok(Some(module))
     }
 
     /// The pipelines of `entries`, created in a cache that starts as
-    /// `kept`, and what the cache then holds.
+    /// `kept`, and what the cache then holds; `None` where `flags` forbid
+    /// compiling and a pipeline would need it.
     fn created(
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
         kept: &[u8],
         flags: vk::PipelineCreateFlags,
-    ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
+    ) -> Result<Option<(Self, Vec<u8>)>, NativeCompilationError> {
         let mut module = Self {
             device: device.clone(),
             pipelines: Vec::with_capacity(entries.len()),
@@ -257,21 +239,25 @@ impl DirectModule {
             )
         }
         .map_err(|error| toolchain(format!("vkCreatePipelineCache failed: {error}")))?;
-        let created = module.create(cache, entries, flags);
-        let data = created.and_then(|()| {
-            unsafe { vulkan.get_pipeline_cache_data(cache) }
+        let created = module.create(cache, entries, flags).and_then(|served| {
+            served
+                .then(|| unsafe { vulkan.get_pipeline_cache_data(cache) })
+                .transpose()
                 .map_err(|error| toolchain(format!("vkGetPipelineCacheData failed: {error}")))
         });
         unsafe { vulkan.destroy_pipeline_cache(cache, None) };
-        Ok((module, data?))
+        Ok(created?.map(|data| (module, data)))
     }
 
+    /// Create every pipeline of `entries` in order; `false`, with the
+    /// pipelines created so far held for the module to destroy, at the
+    /// first that `flags` forbid compiling and that would need it.
     fn create(
         &mut self,
         cache: vk::PipelineCache,
         entries: &[(&[u32], &ProgramEntry)],
         flags: vk::PipelineCreateFlags,
-    ) -> Result<(), NativeCompilationError> {
+    ) -> Result<bool, NativeCompilationError> {
         let device = self.device.clone();
         for (words, entry) in entries {
             // The `OpFmaKHR` binding follows validation, which the linked
@@ -283,9 +269,12 @@ impl DirectModule {
             } else {
                 self.pipeline(cache, words, entry, flags)?
             };
+            let Some(pipeline) = pipeline else {
+                return Ok(false);
+            };
             self.pipelines.push(pipeline);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn pipeline(
@@ -294,7 +283,7 @@ impl DirectModule {
         words: &[u32],
         entry: &ProgramEntry,
         flags: vk::PipelineCreateFlags,
-    ) -> Result<vk::Pipeline, NativeCompilationError> {
+    ) -> Result<Option<vk::Pipeline>, NativeCompilationError> {
         let threads = entry.group_size.ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(format!(
                 "`{}` carries no workgroup size",
@@ -361,11 +350,8 @@ impl DirectModule {
         // `PIPELINE_COMPILE_REQUIRED` is a success code: the pipeline
         // returned with it is null, and nothing was compiled.
         match created {
-            Ok(pipelines) if pipelines[0] != vk::Pipeline::null() => Ok(pipelines[0]),
-            Ok(_) | Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) => Err(toolchain(format!(
-                "the kept pipeline of `{}` does not serve it without compiling",
-                entry.symbol
-            ))),
+            Ok(pipelines) if pipelines[0] != vk::Pipeline::null() => Ok(Some(pipelines[0])),
+            Ok(_) | Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) => Ok(None),
             Err((_, error)) => Err(toolchain(format!(
                 "vkCreateComputePipelines of `{}` failed: {error}",
                 entry.symbol

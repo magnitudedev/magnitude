@@ -152,9 +152,14 @@ impl Dense for F16 {
     #[inline(always)]
     unsafe fn widen_x86(values: *const u16) -> std::arch::x86_64::__m256 {
         use std::arch::x86_64::*;
+        // A function, not a closure: a closure would not take the caller's
+        // features, and its intrinsic would compile as a call.
+        #[inline(always)]
+        unsafe fn word(bits: u32) -> __m256i {
+            unsafe { _mm256_set1_epi32(bits as i32) }
+        }
         unsafe {
             let value = _mm256_cvtepu16_epi32(_mm_loadu_si128(values.cast()));
-            let word = |bits: u32| _mm256_set1_epi32(bits as i32);
             let magnitude = _mm256_slli_epi32::<13>(_mm256_and_si256(value, word(0x7fff)));
             let exponent = _mm256_and_si256(magnitude, word(0x0f80_0000));
             let normal = _mm256_add_epi32(magnitude, word(0x3800_0000));
@@ -300,24 +305,34 @@ pub fn f32_to_f16(value: f32) -> u16 {
 /// `encoding` filled with finite values, small floats and scale codes, a few
 /// moderate codes or, with `every_code`, every finite code (E8M0's
 /// subnormal scales included, UE4M3's with and without its ignored sign
-/// bit).
+/// bit) and among the floats their extremes of least magnitude: the least
+/// and the greatest subnormal and the least normal exponent under a full
+/// mantissa, every fourth field.
 #[cfg(test)]
 pub(crate) fn finite_scales(plane: &mut [u8], encoding: seismic_lang::registry::ScaleEncoding, every_code: bool) {
     use seismic_lang::registry::ScaleEncoding;
+    let extreme = |i: usize| every_code && i % 4 == 3;
     match encoding {
         ScaleEncoding::F16 | ScaleEncoding::BF16 => {
             for (i, field) in plane.chunks_exact_mut(2).enumerate() {
                 let value = 0.002 * (i % 5 + 1) as f32;
-                field.copy_from_slice(&if encoding == ScaleEncoding::F16 {
-                    f32_to_f16(value).to_le_bytes()
-                } else {
-                    f32_to_bf16(value).to_le_bytes()
-                });
+                let bits = match (extreme(i), encoding == ScaleEncoding::F16) {
+                    (true, true) => [0x0001, 0x03ff, 0x07ff][i / 4 % 3],
+                    (true, false) => [0x0001, 0x007f, 0x00ff][i / 4 % 3],
+                    (false, true) => f32_to_f16(value),
+                    (false, false) => f32_to_bf16(value),
+                };
+                field.copy_from_slice(&bits.to_le_bytes());
             }
         }
         ScaleEncoding::F32 => {
             for (i, field) in plane.chunks_exact_mut(4).enumerate() {
-                field.copy_from_slice(&(0.0004 * (i % 3 + 1) as f32).to_le_bytes());
+                let value = if extreme(i) {
+                    f32::from_bits([0x0000_0001, 0x007f_ffff, 0x00ff_ffff][i / 4 % 3])
+                } else {
+                    0.0004 * (i % 3 + 1) as f32
+                };
+                field.copy_from_slice(&value.to_le_bytes());
             }
         }
         // Every exponent but the NaN code 0xff, or 2^(e - 127) for e in
@@ -373,12 +388,12 @@ mod tests {
                     if !std::arch::is_x86_feature_detected!("avx2") {
                         return;
                     }
-                    unsafe {
-                        std::arch::x86_64::_mm256_storeu_ps(
-                            widened.as_mut_ptr(),
-                            E::widen_x86(chunk.as_ptr()),
-                        )
-                    };
+                    // Inside a tier boundary, as the kernels take it.
+                    #[target_feature(enable = "avx2")]
+                    unsafe fn widen8<E: Dense<Storage = u16>>(values: *const u16, out: *mut f32) {
+                        unsafe { std::arch::x86_64::_mm256_storeu_ps(out, E::widen_x86(values)) }
+                    }
+                    unsafe { widen8::<E>(chunk.as_ptr(), widened.as_mut_ptr()) };
                 }
                 #[cfg(target_arch = "aarch64")]
                 unsafe {

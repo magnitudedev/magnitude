@@ -9,17 +9,26 @@
 namespace routed {
 
 // The product packets a simdgroup of the decode down projections stages at
-// once (`project_channels`), of SIMDGROUPS side by side, at LANES lanes a
-// row. At 16 or 32 lanes none: one or two lane groups read each packet of
-// the product, so a lane loads its own packets straight into registers, and
-// a stage would buy no load while its round trip through threadgroup memory
-// lengthens every launch. Below 16 lanes, several lane groups share each
-// packet and a lane would hold several: their share of 16 KB of threadgroup
-// memory, at most COLUMN_PACKETS.
-template <uint SIMDGROUPS, uint LANES, uint COLUMN_PACKETS>
+// once (`project_channels`), of SIMDGROUPS side by side, at LANES lanes over
+// a row of COLUMN_PACKETS: its share of 16 KB of threadgroup memory, at most
+// the row, or none. Below 16 lanes always: several lane groups share each
+// packet and a lane would hold several. At 32 lanes never: one lane group
+// reads each packet once, straight into registers. At 16 lanes, where both
+// lane groups read the whole row, only where AT_16 (`routed_down`, the one
+// projection where it is measured) and a lane would hold more than 2
+// packets of the row: past that the staged form is faster at every timed
+// shape, at or below it slower; why is open, as it reads neither ROWS nor
+// the format, which the gain also depends on. On M4 Pro, routed_down at
+// ROWS 1 LANES 16, MXFP4, timed, µs a launch unstaged / staged: 3.5 packets
+// a lane (LFM2) 75.7 / 63.2, 3.6 (Nemotron Lightning) 121.7 / 90.8, 4.5
+// (DeepSeek V4.1) 270.2 / 202.9, 5.25 (Nemotron Super) 381.5 / 250.3; 1.4
+// (Gemma 4 26B) 57.9 / 68.1 and 2 (Laguna) 116.7 / 152.0. Each entry's
+// declaration bounds the weight packets a lane then holds (routed.seismic).
+template <uint SIMDGROUPS, uint LANES, uint COLUMN_PACKETS, bool AT_16>
 constexpr uint stage_packets() {
     constexpr uint SHARE = 16384u / (SIMDGROUPS * 64u);
-    return LANES >= 16u ? 0u : COLUMN_PACKETS < SHARE ? COLUMN_PACKETS : SHARE;
+    constexpr bool STAGED = LANES < 16u || (AT_16 && LANES == 16u && (COLUMN_PACKETS + 15u) / 16u > 2u);
+    return !STAGED ? 0u : COLUMN_PACKETS < SHARE ? COLUMN_PACKETS : SHARE;
 }
 
 // A simdgroup's region of threadgroup memory, in floats: its stage of STAGE

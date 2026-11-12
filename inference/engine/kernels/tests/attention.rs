@@ -55,25 +55,23 @@ fn history_slabs(
     case: &Case,
     slab_rows: u32,
     reuse_middle: bool,
+    element: Element,
 ) -> [(SlabTensor, Tensor); 2] {
     let (rows, kv, width) = (case.history_rows, case.geometry.kv, case.geometry.w());
     let slab_rows = u64::from(slab_rows);
-    let row_bytes = kv * width * 2;
+    let row_bytes = kv * width * stored_bytes(element, &[0.0]).len();
     let mut tensors = [&case.history_key, &case.history_value].map(|values| {
         let slabs = SlabTensor::new(
             device,
             slab_rows,
             rows as u64,
             vec![SlabRegion {
-                element: Element::bf16(),
+                element,
                 row_shape: vec![kv as u64, width as u64],
             }],
         )
         .unwrap();
-        let bytes = values
-            .iter()
-            .flat_map(|value| bf16_bits(*value).to_le_bytes())
-            .collect::<Vec<_>>();
+        let bytes = stored_bytes(element, values);
         (slabs, bytes)
     });
     for index in 0..(rows as u64).div_ceil(slab_rows) {
@@ -122,26 +120,33 @@ impl Bound {
     }
 
     fn new_with_slab_rows(device: &Device, case: &Case, slab_rows: u32) -> Self {
-        Self::new_with_options(device, case, slab_rows, false)
+        Self::new_with_options(device, case, slab_rows, false, Element::bf16())
     }
 
     fn new_with_reused_slab_rows(device: &Device, case: &Case, slab_rows: u32) -> Self {
-        Self::new_with_options(device, case, slab_rows, true)
+        Self::new_with_options(device, case, slab_rows, true, Element::bf16())
     }
 
-    fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> Self {
+    /// The case's tensors with its activations and history stored in
+    /// `element`.
+    fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool, element: Element) -> Self {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows, case.geometry.w());
         let [
             (history_key_slabs, history_key),
             (history_value_slabs, history_value),
-        ] = history_slabs(device, case, slab_rows, reuse_middle);
-        let (selected_rows, selected) = no_picks(device, m, kv, w);
+        ] = history_slabs(device, case, slab_rows, reuse_middle, element);
+        let (selected_rows, _) = no_picks(device, m, kv, w);
+        let stored = |shape: &[usize], values: &[f32]| {
+            let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
+            Tensor::from_host(device, element, &shape, &stored_bytes(element, values)).unwrap()
+        };
+        let selected = stored(&[0, kv, w], &[]);
         Self {
-            query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
-            gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
-            key: bf16_tensor(device, &[1, m, kv * w], &case.key),
-            value: bf16_tensor(device, &[1, m, kv * w], &case.value),
+            query: stored(&[m, kv * g, 2 * w], &case.query_gate),
+            gate: stored(&[m, kv * g, 0], &[]),
+            key: stored(&[1, m, kv * w], &case.key),
+            value: stored(&[1, m, kv * w], &case.value),
             query_norm: f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: f32_tensor(device, &[0, w], &[]),
@@ -165,6 +170,17 @@ impl Bound {
             history_value,
             slab_rows,
         }
+    }
+}
+
+/// `values` as `element` (BF16, F16 or F32) stores them, little-endian.
+fn stored_bytes(element: Element, values: &[f32]) -> Vec<u8> {
+    use seismic_lang::{registry::f16_bits, types::DType};
+    match element.dtype() {
+        Some(DType::BF16) => values.iter().flat_map(|value| bf16_bits(*value).to_le_bytes()).collect(),
+        Some(DType::F16) => values.iter().flat_map(|value| f16_bits(*value).to_le_bytes()).collect(),
+        Some(DType::F32) => values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        other => panic!("no dense test storage for {other:?}"),
     }
 }
 
@@ -353,6 +369,7 @@ fn prefill_specializations_on(
                     specialization
                         .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                         .with_param("DIRECT", direct)
+                        .with_param("KEYS", 8)
                 } else {
                     specialization
                 },
@@ -365,9 +382,18 @@ fn decode_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_decode::Entry> {
+    decode_kernel_in(device, specialization, Element::bf16())
+}
+
+/// [`decode_kernel`] with activations and history in `element`.
+fn decode_kernel_in(
+    device: &Device,
+    specialization: &NativeSpecialization,
+    element: Element,
+) -> seismic::NativeKernel<attention_decode::Entry> {
     // Without sinks (`attention_family.rs` covers them); every parameter a
     // case leaves unpinned at its declared default.
-    let entry = attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    let entry = attention_decode::native_entry_with(attention_decode::Elements { A: element });
     let specialization = declared::declared_at(
         device,
         &entry,
@@ -788,7 +814,7 @@ fn attention_reads_spans_crossing_history_slabs() {
             decode_specializations_on(&device, SMALL, &[(32, 16, 4), (64, 8, 8), (128, 32, 4)])
         {
             for reused in [false, true] {
-                let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+                let mut bound = Bound::new_with_options(&device, &case, 32, reused, Element::bf16());
                 let gated = run_decode(&decode_kernel(&device, &specialization), &mut bound, &case);
                 check(
                     &format!("crossing-span decode {config} reused={reused}"),
@@ -1191,4 +1217,45 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
         })
         // No key rounding.
         .with_static("KR", 0)
+}
+
+/// One kv head of twelve query heads (a tile of eight, then four).
+const WIDE_GROUP: Geometry = Geometry { kv: 1, g: 12, p: 16, s: 32 };
+/// LFM2.5-2.6B's attention: eight kv heads of four query heads, 64 columns.
+const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
+
+/// The CPU's vector tier against its portable tier, bit for bit: x86-64-v2
+/// runs the portable body (over rows widened into scratch,
+/// the body every x86 tier ran before the vector body), the detected tier
+/// the vector body. Dense decode at each activation element, PARTS 1, 8 and
+/// 16, histories of 17, 77 and 1000 keys (none a whole number of 32-key
+/// blocks), and query groups of 2, 4 and 12.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn cpu_vector_tier_matches_portable_tier() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for (geometry, base) in [(SMALL, 5), (WIDE_GROUP, 65), (LFM, 988)] {
+        let case = Case::new(geometry, base as usize + 64, 2, &decode_rows(base), 31);
+        for element in [Element::bf16(), Element::f16(), Element::f32()] {
+            for parts in [1, 8, 16] {
+                let run = |tier: u64| {
+                    let specialization = cpu_statics(geometry).with_param("PARTS", parts).with_param("cpu.tier", tier);
+                    let kernel = decode_kernel_in(&device, &specialization, element);
+                    let mut bound = Bound::new_with_options(&device, &case, 48, false, element);
+                    run_decode(&kernel, &mut bound, &case).read_to_host().unwrap()
+                };
+                // Tier 0 is the detected tier; 1 names x86-64-v2.
+                assert!(
+                    run(0) == run(1),
+                    "KV {} G {} W {} {element:?} PARTS {parts}: the vector tier differs from the portable tier",
+                    geometry.kv,
+                    geometry.g,
+                    geometry.w()
+                );
+            }
+        }
+    }
 }

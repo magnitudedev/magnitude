@@ -1,6 +1,7 @@
 // vision_clamp on CPU (contract and portable body in vision.seismic): one work
 // item per row, each value clamped to [minimum, maximum] and published to A.
 
+#[inline(always)]
 fn vision_clamp<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let n = cx.dim_n() as usize;

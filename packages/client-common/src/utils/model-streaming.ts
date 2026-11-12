@@ -11,7 +11,6 @@ import {
   type ModelResidency,
   type ModelStreamingStatus,
   type StreamingResize,
-  type StreamingShrinkCause,
 } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { memoryDomainLabels } from "./hardware-memory"
@@ -35,10 +34,10 @@ export const localModelAllocation = (model: LocalModel): Option.Option<ModelInst
 
 const percent = (share: number): string => `${Math.round(share * 100)}%`
 
-const COLD_EXPERTS: Record<ColdExperts, string> = {
-  disk: "the rest read from disk",
-  host_ram: "the rest in system memory as it allows, else read from disk",
-}
+/** Where the experts a streamed fit's bank lacks are kept, with the system memory its tier caches. */
+const coldExpertsLabel = (cold: ColdExperts): string => cold._tag === "Disk"
+  ? "the rest read from disk"
+  : `the rest in system memory as it allows (${formatMemorySize(cold.cacheBytes)} cached), else read from disk`
 
 /**
  * A streamed fit's facts: the share of its experts this machine allows in memory and where the rest
@@ -51,7 +50,7 @@ export const fitResidencyFacts = (
   if (residency._tag === "Resident") return []
   const { bank } = residency
   return [
-    ["Experts this machine allows", `${percent(bank.slots / bank.experts)}, ${COLD_EXPERTS[bank.coldExperts]}`],
+    ["Experts this machine allows", `${percent(bank.slots / bank.experts)}, ${coldExpertsLabel(bank.coldExperts)}`],
     ["Expert floor", percent(bank.floorSlots / bank.experts)],
     ["Speed at the floor", performanceRangeSpeedLabel(residency.floorPerformance, contextLength)],
   ]
@@ -63,13 +62,6 @@ export const localModelFitFacts = (model: LocalModel): readonly ModelFact[] => {
   return serving?._tag === "Assessed" && serving.assessment._tag === "Fits"
     ? fitResidencyFacts(serving.assessment.residency, serving.assessment.served.contextLength)
     : []
-}
-
-const SHRINK_CAUSES: Record<StreamingShrinkCause, string> = {
-  reclaim: "under memory pressure",
-  live_claim: "to make room for a request",
-  rebalance: "for memory worth more to serving",
-  measurement: "to make room for measuring this machine",
 }
 
 /** A moment with its date, so a resize days ago never reads as today's. */
@@ -89,7 +81,7 @@ interface HoldingResize {
 
 /** A holding's resize as a sentence: the verb, its sizes before and after, and why. */
 const resizeSentence = ({ name, share, resize }: HoldingResize): string => resize._tag === "Shrank"
-  ? `${name} shrank from ${share(resize.to + resize.by)} to ${share(resize.to)} ${SHRINK_CAUSES[resize.cause]}`
+  ? `${name} shrank from ${share(resize.to + resize.by)} to ${share(resize.to)} as memory grew short`
   : `${name} grew from ${share(resize.from)} to ${share(resize.from + resize.by)} into free memory`
 
 /**

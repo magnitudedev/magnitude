@@ -81,6 +81,7 @@ impl Printer {
                 self.out.push_str(":\n");
                 self.block(&l.body);
             }
+            Decl::Projection(p) => self.projection(p),
             Decl::Native(n) => {
                 let escaped = n.source.replace('\\', "\\\\").replace('"', "\\\"");
                 let _ = write!(
@@ -97,7 +98,7 @@ impl Printer {
                 }
                 if !n.params.is_empty() {
                     self.indent();
-                    self.native_params(&n.params);
+                    self.native_params(&n.params, &[]);
                 }
                 if !n.elements.is_empty() {
                     self.indent();
@@ -124,19 +125,16 @@ impl Printer {
                     self.expr(constraint, 0);
                     self.out.push('\n');
                 }
-                for scratch in &n.scratch {
+                for (ordinal, scratch) in n.scratch.iter().enumerate() {
+                    if let Some(project) = n.project.as_ref().filter(|p| p.scratch_before == ordinal) {
+                        self.project(project);
+                    }
                     self.indent();
-                    let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
-                    self.expr(&scratch.bytes, 0);
-                    self.out.push(')');
-                    if scratch.sync {
-                        self.out.push_str(" sync");
-                    }
-                    if let Some(when) = &scratch.when {
-                        self.out.push_str(" when ");
-                        self.expr(when, 0);
-                    }
+                    self.native_scratch(scratch);
                     self.out.push('\n');
+                }
+                if let Some(project) = n.project.as_ref().filter(|p| p.scratch_before == n.scratch.len()) {
+                    self.project(project);
                 }
                 for (ordinal, launch) in n.launches.iter().enumerate() {
                     let repeat = n.repeat.as_ref();
@@ -147,69 +145,7 @@ impl Printer {
                         self.out.push_str("):\n");
                         self.level += 1;
                     }
-                    self.indent();
-                    let _ = write!(self.out, "launch {}", launch.kernel.name);
-                    if let Some(barrier) = &launch.resident {
-                        let _ = write!(self.out, " resident ({})", barrier.name);
-                    }
-                    if let Some(when) = &launch.when {
-                        self.out.push_str(" when ");
-                        self.expr(when, 0);
-                    }
-                    self.out.push_str(":\n");
-                    self.level += 1;
-                    if !launch.params.is_empty() {
-                        self.indent();
-                        self.native_params(&launch.params);
-                    }
-                    if let Some(constraint) = &launch.constraint {
-                        self.indent();
-                        self.out.push_str("where ");
-                        self.expr(constraint, 0);
-                        self.out.push('\n');
-                    }
-                    if !launch.reads.is_empty() {
-                        self.indent();
-                        self.out.push_str("reads (");
-                        self.list(&launch.reads, |p, name| p.out.push_str(&name.name));
-                        self.out.push_str(")\n");
-                    }
-                    if let Some(records) = &launch.records {
-                        self.records(records);
-                    }
-                    self.indent();
-                    self.out.push_str("threadgroups (");
-                    self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
-                    self.out.push_str(")\n");
-                    if let Some(grid) = &launch.grid {
-                        self.indent();
-                        self.out.push_str("grid (");
-                        self.out.push_str(&grid.name);
-                        self.out.push_str(")\n");
-                    }
-                    for condition in &launch.conditions {
-                        self.indent();
-                        self.out.push_str(condition.encoded.keyword());
-                        self.out.push_str(" (");
-                        self.out.push_str(&condition.word.name);
-                        if let Some(index) = &condition.index {
-                            self.out.push('[');
-                            self.expr(index, 0);
-                            self.out.push(']');
-                        }
-                        self.out.push_str(")\n");
-                    }
-                    self.indent();
-                    self.out.push_str("threads_per_threadgroup (");
-                    self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
-                    self.out.push_str(")\n");
-                    if let Some(bytes) = &launch.shared_bytes {
-                        self.indent();
-                        self.out.push_str("shared_bytes (");
-                        self.expr(bytes, 0);
-                        self.out.push_str(")\n");
-                    }
-                    self.level -= 1;
+                    self.launch(launch, None, &[]);
                     if repeat.is_some_and(|repeat| repeat.first + repeat.launches == ordinal + 1) {
                         self.level -= 1;
                     }
@@ -219,9 +155,159 @@ impl Printer {
         }
     }
 
-    fn native_params(&mut self, params: &[NativeParamDecl]) {
+    fn launch(&mut self, launch: &NativeLaunchDecl, variant: Option<&Ident>, variants: &[Option<Ident>]) {
+        self.indent();
+        let _ = write!(self.out, "launch {}", launch.kernel.name);
+        if let Some(variant) = variant {
+            let _ = write!(self.out, " for {}", variant.name);
+        }
+        if let Some(before) = &launch.before {
+            let _ = write!(self.out, " before {}", before.name);
+        }
+        if let Some(barrier) = &launch.resident {
+            let _ = write!(self.out, " resident ({})", barrier.name);
+        }
+        if let Some(when) = &launch.when {
+            self.out.push_str(" when ");
+            self.expr(when, 0);
+        }
+        self.out.push_str(":\n");
+        self.level += 1;
+        if !launch.params.is_empty() {
+            self.indent();
+            self.native_params(&launch.params, variants);
+        }
+        if let Some(constraint) = &launch.constraint {
+            self.indent();
+            self.out.push_str("where ");
+            self.expr(constraint, 0);
+            self.out.push('\n');
+        }
+        if !launch.reads.is_empty() {
+            self.indent();
+            self.out.push_str("reads (");
+            self.list(&launch.reads, |p, name| p.out.push_str(&name.name));
+            self.out.push_str(")\n");
+        }
+        if let Some(records) = &launch.records {
+            self.records(records);
+        }
+        self.indent();
+        self.out.push_str("threadgroups (");
+        self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
+        self.out.push_str(")\n");
+        if let Some(grid) = &launch.grid {
+            self.indent();
+            self.out.push_str("grid (");
+            self.out.push_str(&grid.name);
+            self.out.push_str(")\n");
+        }
+        for condition in &launch.conditions {
+            self.indent();
+            self.out.push_str(condition.encoded.keyword());
+            self.out.push_str(" (");
+            self.out.push_str(&condition.word.name);
+            if let Some(index) = &condition.index {
+                self.out.push('[');
+                self.expr(index, 0);
+                self.out.push(']');
+            }
+            self.out.push_str(")\n");
+        }
+        self.indent();
+        self.out.push_str("threads_per_threadgroup (");
+        self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
+        self.out.push_str(")\n");
+        if let Some(bytes) = &launch.shared_bytes {
+            self.indent();
+            self.out.push_str("shared_bytes (");
+            self.expr(bytes, 0);
+            self.out.push_str(")\n");
+        }
+        self.level -= 1;
+    }
+
+    fn native_scratch(&mut self, scratch: &NativeScratchDecl) {
+        let _ = write!(self.out, "scratch {} bytes (", scratch.name.name);
+        self.expr(&scratch.bytes, 0);
+        self.out.push(')');
+        if scratch.sync {
+            self.out.push_str(" sync");
+        }
+        if let Some(when) = &scratch.when {
+            self.out.push_str(" when ");
+            self.expr(when, 0);
+        }
+    }
+
+    fn variant(&mut self, variant: &Option<Ident>) {
+        if let Some(variant) = variant {
+            let _ = write!(self.out, " for {}", variant.name);
+        }
+    }
+
+    fn project(&mut self, project: &NativeProjectDecl) {
+        self.indent();
+        let _ = write!(self.out, "project {} {} (", project.projection.name, project.variant.name);
+        self.names(&project.weights);
+        self.out.push_str(")\n");
+    }
+
+    fn projection(&mut self, p: &ProjectionDecl) {
+        let _ = writeln!(self.out, "projection {} for {}:", p.name.name, p.target.name);
+        self.level += 1;
+        for term in &p.terms {
+            self.indent();
+            let _ = write!(self.out, "let {} = ", term.item.name.name);
+            self.expr(&term.item.value, 0);
+            self.variant(&term.variant);
+            self.out.push('\n');
+        }
+        if !p.params.is_empty() {
+            self.indent();
+            let params = p.params.iter().map(|param| param.item.clone()).collect::<Vec<_>>();
+            let variants = p.params.iter().map(|param| param.variant.clone()).collect::<Vec<_>>();
+            self.native_params(&params, &variants);
+        }
+        for constraint in &p.constraints {
+            self.indent();
+            self.out.push_str("where ");
+            self.expr(&constraint.item, 0);
+            self.variant(&constraint.variant);
+            self.out.push('\n');
+        }
+        for scratch in &p.scratch {
+            match scratch {
+                ProjectionScratchDecl::One(one) => {
+                    self.indent();
+                    self.native_scratch(&one.item);
+                    self.variant(&one.variant);
+                    self.out.push('\n');
+                }
+                ProjectionScratchDecl::Each(each) => {
+                    self.indent();
+                    self.out.push_str("each W:\n");
+                    self.level += 1;
+                    for one in each {
+                        self.indent();
+                        self.native_scratch(&one.item);
+                        self.variant(&one.variant);
+                        self.out.push('\n');
+                    }
+                    self.level -= 1;
+                }
+            }
+        }
+        for launch in &p.launches {
+            self.launch(&launch.launch, launch.variant.as_ref(), &launch.param_variants);
+        }
+        self.level -= 1;
+    }
+
+    fn native_params(&mut self, params: &[NativeParamDecl], variants: &[Option<Ident>]) {
         self.out.push_str("params (");
-        self.list(params, |p, param| {
+        let gated = params.iter().enumerate().collect::<Vec<_>>();
+        self.list(&gated, |p, &(ordinal, param)| {
             if param.arithmetic {
                 p.out.push_str("arithmetic ");
             }
@@ -245,6 +331,9 @@ impl Printer {
                     p.out.push_str("greatest where ");
                     p.expr(condition, 0);
                 }
+            }
+            if let Some(variant) = variants.get(ordinal) {
+                p.variant(variant);
             }
         });
         self.out.push_str(")\n");

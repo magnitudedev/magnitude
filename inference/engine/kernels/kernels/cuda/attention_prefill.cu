@@ -58,21 +58,21 @@ extern "C" __global__ void __launch_bounds__(256) attention_prefill_prepare(SEIS
             PREFILL_LIST_CAPACITY                                                                           \
     }
 
-// The attend grid's key partitions (its z extent, attention.seismic). An
-// index-list source's state (KS > 0) is the partition after them.
-#define PREFILL_PARTS                                                                     \
-    max(1ull, (static_cast<unsigned long long>(SEISMIC_TUNE_SPLIT_GROUPS) + PREFILL_LIST_TILES * SEISMIC_DIM_KV - 1) / \
-                  (PREFILL_LIST_TILES * SEISMIC_DIM_KV))
-#define PREFILL_PICKED(records, width)                                                    \
-    (attention::prefill::PICKS ? (records) + PREFILL_PARTS * SEISMIC_DIM_M * SEISMIC_DIM_KV * attention::G * (width) \
-                        : nullptr)
 #define SPLIT()                                                                           \
     attention::prefill::Split {                                                           \
         reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),          \
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),    \
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS)), \
-            PREFILL_PICKED(reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)), attention::W), \
-            PREFILL_PICKED(reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)), 2) \
+            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS)) \
+    }
+
+// The index-list source (KS > 0): each row's picks of the selected plane,
+// scanned by `attend` after the fresh span.
+#define PICKED()                                                                               \
+    attention::prefill::Picked {                                                               \
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS)),              \
+            SEISMIC_SELECTED_ROWS_STRIDE_0, SEISMIC_SELECTED_ROWS_STRIDE_1,                    \
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED)),    \
+            SEISMIC_PARAM_SELECTED_SLAB_ROWS, SEISMIC_SELECTED_STRIDE_0, SEISMIC_SELECTED_STRIDE_1 \
     }
 
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
@@ -85,27 +85,7 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
                                       SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SPLIT()},
         attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
                                 static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)},
-        SELECTION());
-}
-
-// The index-list source (KS > 0, `attention::prefill::picked`): block (row,
-// query head), one warp, after L1 put the queries; its state is the
-// partition after the key partitions' (`PREFILL_PICKED`).
-extern "C" __global__ void attention_prefill_picks(SEISMIC_KERNEL_PARAMS) {
-    const attention::Inputs in = ATTENTION_INPUTS();
-    const auto *rows = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS));
-    const auto *selected = reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED));
-    const attention::u64 row = blockIdx.x;
-    attention::prefill::picked<attention::prefill::Operands<attention::DenseHistory>>(
-        reinterpret_cast<const attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES)), SPLIT(),
-        [&](int pick) { return rows[row * SEISMIC_SELECTED_ROWS_STRIDE_0 + pick * SEISMIC_SELECTED_ROWS_STRIDE_1]; },
-        static_cast<int>(SEISMIC_DIM_KS),
-        [&](int picked, int kv) -> const attention::u8 * {
-            return slab::row(selected, picked, SEISMIC_PARAM_SELECTED_SLAB_ROWS,
-                             SEISMIC_SELECTED_STRIDE_0 * attention::Act::bytes)
-                + static_cast<attention::u64>(kv) * SEISMIC_SELECTED_STRIDE_1 * attention::Act::bytes;
-        },
-        in.scale * attention::LOG2E, row, static_cast<int>(blockIdx.y), static_cast<int>(threadIdx.x));
+        SELECTION(), PICKED());
 }
 
 extern "C" __global__ void attention_prefill_merge(SEISMIC_KERNEL_PARAMS) {

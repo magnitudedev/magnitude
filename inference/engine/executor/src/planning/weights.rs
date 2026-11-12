@@ -1591,15 +1591,6 @@ impl ModelLoadPlan {
         self.bank.as_ref().map_or(crate::PassLaunches::whole_chain(limits), |bank| bank.pass)
     }
 
-    /// The pass whose prompt group's class the plan leaves room for
-    /// (`AssessmentMemoryCharge::with_group_class`): its bank's, where it
-    /// merges several launches, which a group's places merge, the class of
-    /// those places and no more. The room is the class's from the plan on:
-    /// no growth of the bank takes it (`ExecutorDomain::class_reserve`).
-    pub fn group_class_pass(&self) -> Option<crate::PassLaunches> {
-        self.bank.as_ref().map(|bank| bank.pass).filter(|&pass| pass > crate::PassLaunches::FLOOR)
-    }
-
     /// Every weight byte the load holds, wherever it lies (what a weight
     /// cap bounds): each component's, the expert bank's, and its host
     /// tier's slots. The tier's landing reserve (the tier at no slots) is
@@ -1642,10 +1633,9 @@ impl ModelLoadPlan {
     }
 
     /// The host tier's slots beyond its landing reserve; none without a
-    /// tier. A fit charges the tier at that reserve, and the tier grows to
-    /// its slots into the host memory the fit leaves
-    /// (`ExecutionPlanDraft::with_host_tier`).
+    /// tier.
     pub fn host_tier_bytes(&self) -> Result<u64, String> {
+
         let Some(bank) = self.bank.as_ref().filter(|bank| bank.host_ceiling().is_some()) else {
             return Ok(0);
         };
@@ -1715,16 +1705,33 @@ impl ModelLoadPlan {
     }
 
     /// Peak upload backing while the target component is imported.
-    pub fn target_upload_peak_bytes(&self) -> Result<u64, String> {
+    pub fn target_upload_peak_bytes(&self) -> u64 {
         super::ImportPlan::new(self.target.iter()).peak_bytes()
     }
 
+    /// The target's weights as its import claims them, held for the load:
+    /// each target weight allocation in the storage it lies in, and a
+    /// linked host tier backed to its load-time slots past the floor its
+    /// layout commits (`ExpertBank::back_host`), which backs after the
+    /// import ([`Self::host_tier_bytes`]).
+    pub fn target_weight_demand(&self) -> Result<ClaimDemand, String> {
+        let weights = self.weight_demands()?[0];
+        Ok(ClaimDemand { host: weights.host.checked_add(self.host_tier_bytes()?).ok_or("target import demand overflows")?, ..weights })
+    }
+
+    /// The target import's uploads: device storage staged through host
+    /// RAM, held while the target imports.
+    pub fn target_upload_demand(&self) -> Result<ClaimDemand, String> {
+        let upload = self.target_upload_peak_bytes();
+        Ok(ClaimDemand { device: upload, staged: upload, ..ClaimDemand::default() })
+    }
+
     /// Peak upload allocation while importing a lazy optional component.
-    pub fn head_upload_peak_bytes(&self) -> Result<u64, String> {
+    pub fn head_upload_peak_bytes(&self) -> u64 {
         super::ImportPlan::new(self.head.iter().flatten()).peak_bytes()
     }
 
-    pub fn vision_upload_peak_bytes(&self) -> Result<u64, String> {
+    pub fn vision_upload_peak_bytes(&self) -> u64 {
         super::ImportPlan::new(self.vision.iter().flatten()).peak_bytes()
     }
 }
@@ -3681,7 +3688,7 @@ mod stored_table_tests {
                     ROWS * stored_row,
                 );
                 assert_eq!(
-                    super::super::ImportPlan::new(out.iter()).peak_bytes().unwrap(),
+                    super::super::ImportPlan::new(out.iter()).peak_bytes(),
                     0,
                 );
             }

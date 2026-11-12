@@ -3662,11 +3662,41 @@ inline ulong int8_scale_at(uint m, uint g, uint groups) {
     return (ulong(m / 32u) * groups + g) * 32u + ((m >> 2) & 3u) * 8u + ((m >> 4) & 1u) * 4u + (m & 3u);
 }
 
+// A 32-column block's scale: its largest magnitude / 127 rounded to nearest
+// F16 (the scale the fold stores), or where that is subnormal (below 2^-14),
+// rounded up onto the F16 grid, so `peak / d <= 127` and `d` is zero only for
+// an all-zero block. The CPU's rule on F16's grid (`quant.rs`).
+inline float int8_scale_of(float peak) {
+    const half stored = half(peak / 127.0f);
+    const float d = float(stored);
+    // `d * 127` is exact: 18 bits.
+    if (d < 0x1p-14f && d * 127.0f < peak)
+        return float(as_type<half>(ushort(as_type<ushort>(stored) + 1u)));
+    return d;
+}
+
+// The code of `x` under `d`, a scale of `int8_scale_of`: the exact quotient
+// rounded once, half away from zero; NaN and a zero scale code 0. The
+// quotient picks the candidate and the code's two boundaries decide it
+// exactly: (2n +- 1) d / 2 is at most 19 bits, so exact in F32.
+inline int int8_code_of(float x, float d) {
+    const float a = metal::abs(x);
+    const float quotient = a / d;
+    if (!(quotient < 255.0f))
+        return 0;
+    int n = int(quotient + 0.5f);
+    if (a >= float(2 * n + 1) * d * 0.5f)
+        ++n;
+    else if (a < float(2 * n - 1) * d * 0.5f)
+        --n;
+    return x < 0.0f ? -n : n;
+}
+
 // The activation pass: one threadgroup of 256 threads per row; a thread takes
 // 8 columns at a time, four neighbouring lanes one 32-column block. The block
-// is scaled by its largest magnitude / 127 (rounded to F16, the scale the
-// fold uses), rounded to nearest and stored in fragment order. Rows at or
-// past `m_rows` are zero.
+// is scaled by `int8_scale_of` of its largest magnitude, coded by
+// `int8_code_of` and stored in fragment order. Rows at or past `m_rows` are
+// zero.
 template <bool INTERLEAVED, typename In>
 inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uint m_rows, uint columns, uint m,
     uint thread_index, uint lane, float inverse) {
@@ -3682,10 +3712,11 @@ inline void int8_quantize(thread const In &in, thread const int8_scratch &s, uin
         float peak = metal::max(metal::max(peaks.x, peaks.y), metal::max(peaks.z, peaks.w));
         peak = metal::max(peak, simd_shuffle_xor(peak, ushort(1)));
         peak = metal::max(peak, simd_shuffle_xor(peak, ushort(2)));
-        const float scale = float(half(peak / 127.0f));
-        const float reciprocal = scale > 0.0f ? 1.0f / scale : 0.0f;
-        const int4 qa = metal::clamp(int4(metal::rint(a * reciprocal)), -127, 127);
-        const int4 qb = metal::clamp(int4(metal::rint(b * reciprocal)), -127, 127);
+        const float scale = int8_scale_of(peak);
+        const int4 qa = int4(int8_code_of(a.x, scale), int8_code_of(a.y, scale), int8_code_of(a.z, scale),
+            int8_code_of(a.w, scale));
+        const int4 qb = int4(int8_code_of(b.x, scale), int8_code_of(b.y, scale), int8_code_of(b.z, scale),
+            int8_code_of(b.w, scale));
         // The chunk's eight columns are one lane's of the block (column
         // class `first / 2`); its fragment holds them as two fours.
         const char4 low = INTERLEAVED ? char4(int4(qa.x, qa.z, qb.x, qb.z)) : char4(qa);

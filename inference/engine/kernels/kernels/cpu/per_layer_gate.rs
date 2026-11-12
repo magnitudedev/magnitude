@@ -1,4 +1,4 @@
-// per_layer_gate on CPU (contract and portable body in dense_rows.seismic).
+// per_layer_gate on CPU (contract and portable body in per_layer_gate.seismic).
 // `per_layer_gate_stage` stages each hidden row rounded to A (as F32, and its
 // q8 blocks for the INT8 variant), one work item per row.
 // `per_layer_gate_rows` gives each work item ROWS gate rows, projected
@@ -8,6 +8,7 @@
 use lib::core::{activation, functions};
 use lib::projection::projection;
 
+#[inline(always)]
 fn per_layer_gate_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let d = cx.dim_d() as usize;
@@ -17,20 +18,13 @@ fn per_layer_gate_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
         *target = activation::publish::<E::A>(*hidden);
     }
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(d);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(staged, row, projection::tiled(cx.dim_m() as usize, &[&cx.arg_gate_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(&[&cx.arg_gate_weight()], staged);
 }
 
+#[inline(always)]
 fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, d, p) = (cx.dim_m() as usize, cx.dim_d() as usize, cx.dim_p() as usize);
     let rows = projection::item_rows(group[0], cx.param_rows(), p);
@@ -39,9 +33,9 @@ fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     let scale = if cx.dim_gs() == 0 { 1.0 } else { cx.arg_gate_scale().get([0]) };
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * d) };
-    let blocks = seismic::cpu::quant::blocks(d);
-    let quantized = (cx.param_int8() == 1)
-        .then(|| unsafe { cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * blocks) });
+    let quantized = (cx.param_int8() == 1).then(|| unsafe {
+        projection::quantized(cx.scratch_quantized(), 0, m, d, projection::tiled(m, &[&cx.arg_gate_weight()]))
+    });
     projection::project_staged_arithmetic(&cx.arg_gate_weight(), rows.clone(), staged, quantized, |row, gate| {
         let multiplier = inputs.span([row, layer, rows.start], rows.len());
         // SAFETY: each work item writes its own columns of every row.

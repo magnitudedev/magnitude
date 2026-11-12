@@ -18,13 +18,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
-use magnitude_executor::platform::{HostEmergency, MemoryReserves};
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_api::{AppState, app};
 use magnitude_service_contracts::HardwareProvider;
 use magnitude_service_contracts::models::{
@@ -42,45 +41,13 @@ use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
-use magnitude_service_server::residency::supervisor::{
-    HostMemoryObserver, HostMemorySample, SeismicHostMemory,
-};
+use magnitude_service_server::residency::supervisor::SeismicHostMemory;
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
 use tower::ServiceExt as _;
 
 const POLL: Duration = Duration::from_millis(20);
-const NO_OVERRIDE: u64 = u64::MAX;
-
-/// Seismic's host headroom, or a scripted value while one is set.
-struct ScriptedHostMemory {
-    seismic: SeismicHostMemory,
-    headroom: AtomicU64,
-}
-
-impl HostMemoryObserver for ScriptedHostMemory {
-    fn sample(&self) -> Result<HostMemorySample, String> {
-        let sample = self.seismic.sample()?;
-        Ok(match self.headroom.load(Ordering::Acquire) {
-            NO_OVERRIDE => sample,
-            // A scripted shortage is an emergency.
-            headroom_bytes => HostMemorySample {
-                headroom_bytes,
-                emergency: Some(HostEmergency::EmergencyReserve),
-                ..sample
-            },
-        })
-    }
-
-    fn observed_load(&self, at: std::time::Instant, available: u64, charged: u64) {
-        self.seismic.observed_load(at, available, charged);
-    }
-
-    fn motion(&self) -> magnitude_executor::platform::StoreMotion {
-        self.seismic.motion()
-    }
-}
 
 fn flag(arguments: &[String], name: &str) -> String {
     arguments
@@ -131,10 +98,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     } = open_served_store(config).await?;
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
-    let host_memory = Arc::new(ScriptedHostMemory {
-        seismic: SeismicHostMemory::new(catalog.clone(), reserves),
-        headroom: AtomicU64::new(NO_OVERRIDE),
-    });
+    let host_memory = Arc::new(SeismicHostMemory::new(catalog.clone(), reserves));
     let serving = ServingDevice::select(&catalog)?;
     let configurations = Arc::new(ResolvedConfigurations::new(
         inventory.clone(),
@@ -497,45 +461,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         "crash        {:>7.3} s  instance failed: {code}",
         started.elapsed().as_secs_f64()
     );
-
-    // Memory pressure: the first sample at the emergency reserve kills the worker; the next load
-    // waits until headroom has stayed above the planning reserve for five seconds.
-    let pressured = main.instances.ensure_resident(&first).await?;
-    let worker = worker_pid().expect("ready worker");
-    let started = Instant::now();
-    host_memory.headroom.store(0, Ordering::Release);
-    wait_for(&main.instances, |instance| {
-        instance.id == pressured.id
-            && instance.lifecycle
-                == ModelInstanceLifecycle::Stopped {
-                    reason: ModelReleaseReason::MemoryPressure,
-                }
-    })
-    .await;
-    assert!(!alive(worker), "the pressured worker still runs");
-    println!(
-        "pressure     {:>7.3} s  killed, released as memory_pressure",
-        started.elapsed().as_secs_f64()
-    );
-    let reload = tokio::spawn({
-        let instances = main.instances.clone();
-        let first = first.clone();
-        async move { instances.ensure_resident(&first).await }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let released = Instant::now();
-    host_memory.headroom.store(NO_OVERRIDE, Ordering::Release);
-    let reloaded = reload.await??;
-    let gated = released.elapsed();
-    assert!(
-        gated >= Duration::from_secs(5),
-        "admission reopened after {gated:?}"
-    );
-    println!(
-        "admission    {:>7.3} s  after headroom recovered (load included)",
-        gated.as_secs_f64()
-    );
-    main.instances.stop_instance(reloaded.id).await?;
 
     // Idle: an unleased ready instance is released after its idle timeout.
     let idle = harness(Duration::from_secs(2), "idle");

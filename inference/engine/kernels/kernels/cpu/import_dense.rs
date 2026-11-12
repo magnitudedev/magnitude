@@ -2,6 +2,7 @@
 // work item converts 16 of the B * N rows of the [B, N, K] view: it decodes
 // a source row exactly to F32 and stores each value rounded once to U.
 
+#[inline(always)]
 fn import_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (n, k) = (cx.dim_n() as usize, cx.dim_k() as usize);
     let total = cx.dim_b() as usize * n;

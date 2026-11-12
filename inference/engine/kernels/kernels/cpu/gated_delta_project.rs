@@ -9,6 +9,7 @@
 use lib::core::activation;
 use lib::projection::projection;
 
+#[inline(always)]
 fn gated_delta_project_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -28,16 +29,8 @@ fn gated_delta_project_normalize<L: Isa, E: Elements>(
         normalized,
     );
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(h);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(normalized, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_m() as usize, &[&cx.arg_qkv_weight(), &cx.arg_gate_weight(), &cx.arg_alpha_weight(), &cx.arg_beta_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(
         &[
@@ -50,6 +43,7 @@ fn gated_delta_project_normalize<L: Isa, E: Elements>(
     );
 }
 
+#[inline(always)]
 fn gated_delta_project_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -74,14 +68,12 @@ fn gated_delta_project_rows<L: Isa, E: Elements>(
     let result = cx.result_0();
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * h) };
-    let blocks = seismic::cpu::quant::blocks(h);
     // The alpha and beta segments project exactly under either arithmetic:
     // they set the recurrence's decay and write strength, where activation
     // rounding compounds over the whole sequence, and they are two of the
     // projection's (2 NK + 2 NV) W + 2 NV rows.
     let quantized = (cx.param_int8() == 1 && segment < 2).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
+        projection::quantized(cx.scratch_quantized(), 0, m, h, projection::tiled(m, &[&cx.arg_qkv_weight(), &cx.arg_gate_weight(), &cx.arg_alpha_weight(), &cx.arg_beta_weight()]))
     });
     projection::project_staged_arithmetic(
         &weights,

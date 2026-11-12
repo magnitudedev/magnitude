@@ -52,13 +52,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
     /// into free banks changes no bindings; growing one orphans the queued
-    /// steps first.
+    /// steps first. Admission: refused, changing nothing, where the device's
+    /// ledger cannot hold a row of the sequence beside what is committed
+    /// (`Ledger::admit`); opened, the sequence holds its state claim.
     pub fn open_state(
         &mut self,
         bindings: &mut StateBindings,
         request: RequestId,
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
+        use crate::memory::ledger::Need;
+        let ledgers = self.resources.ledgers();
+        ledgers
+            .device()
+            .admit(&Need::StateRows { sequence: request, from: 0, to: 1 })
+            .map_err(|short| DomainError::short(short, ledgers))?;
         self.orphan_queue(bindings)?;
         let installed = self
             .input
@@ -78,6 +86,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => self.fresh_state(bindings)?,
         };
         let position = target.position();
+        let claim = ledger_claim(self.resources.ledgers().device(), request)?;
+        self.state_claims.insert(request, super::state::StateClaim { claim, through: position as u64 });
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
@@ -228,6 +238,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
+        self.drop_state_claim(request);
+        self.settle_state_slabs();
         self.poisoned.remove(&request);
         Ok(())
     }
@@ -304,7 +316,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             self.target.remove(request);
             self.head.remove(request);
+            self.drop_state_claim(*request);
         }
+        self.settle_state_slabs();
         Ok(bytes)
     }
 
@@ -328,6 +342,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
                 .ok_or("idle reclaim byte count overflow")?;
         }
+        self.settle_state_slabs();
         Ok(bytes)
     }
+}
+
+/// A sequence's state claim as it opens: none of its rows yet, which every
+/// ledger holds (no take, no preemption), grown as it advances.
+fn ledger_claim(ledger: &crate::memory::ledger::Ledger, sequence: RequestId) -> Result<crate::memory::ledger::Claim, DomainError> {
+    ledger
+        .claim(crate::memory::ledger::Need::StateRows { sequence, from: 0, to: 0 })
+        .map_err(|refused| DomainError::invariant(format!("a sequence's empty state claim was refused: {refused:?}")))
 }

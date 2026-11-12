@@ -8,6 +8,7 @@ mod command;
 mod compile;
 pub mod direct;
 mod driver;
+mod enqueue;
 mod executor;
 mod graph_cost;
 pub mod model;

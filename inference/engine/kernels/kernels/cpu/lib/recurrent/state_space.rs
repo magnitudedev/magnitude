@@ -189,6 +189,7 @@ impl<'a, A: Dense> StateSpace<'a, A> {
     /// C - 1 raw rows before its publication row, then the raw rows of its
     /// tape): its x channels, and its group's B and C channels when it leads
     /// the group. A bit-exact copy.
+    #[inline(always)]
     pub fn publish_window(&self, slot: &Slot, head: usize) {
         let (p, n) = (self.head_width, self.state_width);
         let group = self.group_of(head);
@@ -209,6 +210,7 @@ impl<'a, A: Dense> StateSpace<'a, A> {
 
     /// Zeroes state rows `rows` of head `head` in the mixed rows no slot
     /// covers.
+    #[inline(always)]
     pub fn zero_uncovered(&self, head: usize, rows: Range<usize>) {
         for row in self.slots.covered_end()..self.rows {
             // SAFETY: each work item writes its own state rows of the head.
@@ -236,6 +238,7 @@ impl<'a, A: Dense> StateSpace<'a, A> {
     /// the rows after it recorded in the successor's tape. The work item of
     /// the head's first state rows records the decay and, when the head leads
     /// its group, B.
+    #[inline(always)]
     pub fn advance<P: Prologue>(&self, slot: &Slot, head: usize, rows: Range<usize>, state: &mut [f32], prologue: &mut P) {
         let n = self.state_width;
         let group = self.group_of(head);
@@ -317,6 +320,7 @@ pub struct Fused<'r, 'a, A: Dense> {
 
 impl<'r, 'a, A: Dense> Fused<'r, 'a, A> {
     /// Over `buffers` of at least `2 * N + rows.len()` floats.
+    #[inline(always)]
     pub fn new(space: &'r StateSpace<'a, A>, slot: Slot, head: usize, rows: Range<usize>, buffers: &'r mut [f32]) -> Self {
         let n = space.state_width;
         let (b, rest) = buffers.split_at_mut(n);
@@ -358,6 +362,7 @@ pub struct Staged<'s> {
 }
 
 impl<'s> Staged<'s> {
+    #[inline(always)]
     pub fn new<A: Dense>(space: &StateSpace<'_, A>, staged: &'s [f32], head: usize, rows: Range<usize>) -> Self {
         let group = space.group_of(head);
         let x = head * space.head_width;

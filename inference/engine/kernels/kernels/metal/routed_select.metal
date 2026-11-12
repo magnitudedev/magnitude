@@ -1,16 +1,18 @@
-// General expert selection for M rows in four launches (the `routed_route`
-// structure without the shared-expert column):
+// General expert selection for M rows (the `routed_route` structure without
+// the shared-expert column):
 //   routed_select_stage (M > DECODE_ROWS, one threadgroup per row): the row's RMS and
 //     its two normalized forms, published once: `normalized` (norm, the
 //     experts' input) and the router input (router_norm) into scratch.
-//   routed_select_gemv (M <= DECODE_ROWS): the router logits (`lib/routed/router.h`),
-//     one simdgroup per logit column over the router input each threadgroup
-//     forms from RMS partials of its own; threadgroup 0 publishes
-//     `normalized`.
+//   routed_select_gemv (M <= DECODE_ROWS, the decode's one launch): the
+//     router logits (`lib/routed/router.h`), one simdgroup per logit column
+//     over the router input each threadgroup forms from RMS partials of its
+//     own; threadgroup 0 publishes `normalized`; the last threadgroup to
+//     arrive (`arrivals`, sync scratch) selects every row.
 //   routed_select_gemm (M > DECODE_ROWS): the logits tiles of `lib/routed/logits.h`
 //     over the staged router input.
-//   routed_select_select (one simdgroup per row): scores, biased ranking,
-//     single-pass top-K (`lib/routed/select.h`), normalization, scales.
+//   routed_select_select (M > DECODE_ROWS, one simdgroup per row): scores,
+//     biased ranking, single-pass top-K (`lib/routed/select.h`),
+//     normalization, scales.
 // The decode launches' bodies are `lib/routed/selection.h`'s, which
 // `routed_select_streamed` shares.
 // Every logit accumulates over the hidden axis in the same order for every
@@ -50,17 +52,23 @@ kernel void routed_select_stage(
     }
 }
 
-// M <= DECODE_ROWS, one launch before the selection: the threadgroup computes its rows'
-// RMS inverses (in the stage launch's order); threadgroup 0 publishes the
-// normalized rows; each threadgroup then forms the logits of SIMDGROUPS
-// router rows over the router input (`routing::Gemv`).
+// M <= DECODE_ROWS, the whole selection in one launch: the threadgroup
+// computes its rows' RMS inverses (in the stage launch's order); threadgroup
+// 0 publishes the normalized rows; each threadgroup then forms the logits of
+// SIMDGROUPS router rows over the router input (`routing::Gemv`); the last
+// to arrive selects every row, a simdgroup a row.
 kernel void routed_select_gemv(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
     device const uchar *router_norm [[buffer(SEISMIC_BUFFER_ROUTER_NORM)]],
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
+    device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
+    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
+    device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
+    device float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint group [[threadgroup_position_in_grid]],
@@ -69,11 +77,17 @@ kernel void routed_select_gemv(
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * select_simdgroups];
     threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
+    threadgroup uint last;
     decode_inverses(residual, parts, inverses, seismic_words, simd, lane, tid);
     if (group == 0)
         publish_normalized(residual, norm, normalized, inverses, seismic_words, tid);
     select_columns(residual, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, logits, inverses, group, shared,
         seismic_words, simd, lane);
+    if (!arrive::last(arrivals, (uint(SEISMIC_DIM_E) + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS, &last,
+            tid))
+        return;
+    for (uint row = simd; row < uint(SEISMIC_DIM_M); row += SEISMIC_TUNE_SIMDGROUPS)
+        select_row(row, logits, bias, expert_scale, routes, weights, seismic_words, lane);
 }
 
 // M > DECODE_ROWS: the logits tiles (`lib/routed/logits.h`) over the staged router

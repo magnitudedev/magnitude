@@ -1,5 +1,6 @@
 // Both launches sum in element order, like the GPU kernels: the staged one
 // through the work item's shared buffer, the mirrored one through scratch.
+#[inline(always)]
 fn gated_staged<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], shared: &mut [u8]) {
     let n = cx.dim_n() as usize;
     let x = cx.arg_x();
@@ -14,6 +15,7 @@ fn gated_staged<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3
     unsafe { cx.result_0().set([0], total) };
 }
 
+#[inline(always)]
 fn gated_mirrored<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let n = cx.dim_n() as usize;
     let x = cx.arg_x();

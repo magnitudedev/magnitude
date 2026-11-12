@@ -1555,27 +1555,21 @@ pub enum NativeParameterRole {
     Workers { launch: u32 },
     /// Seismic-owned, on CPU devices: the instruction-set tier the
     /// implementation runs at. `0` is the device's detected tier; `t` is the
-    /// tier of [`NativeParameterRole::TIERS`] ordinal `t - 1`.
+    /// tier of stable id `t` (`seismic_cpu_tiers::Tier::id`).
     Tier,
-}
-
-impl NativeParameterRole {
-    /// The tiers a `Tier` parameter value names, by ordinal from 1.
-    pub const TIERS: [&'static str; 6] =
-        ["x86v2", "x86v3", "x86v4", "x86v4vnni", "neon", "neondot"];
 }
 
 impl NativeParameter {
     /// The Seismic-owned parameters a CPU device adds to an implementation
     /// with `launches` launches: one participant count per launch (every
     /// participant, then each power of two below `participants`), then the
-    /// tier (the detected one, then each tier in `lower`, by
-    /// [`NativeParameterRole::TIERS`] name). Their names contain `.`, which no
+    /// tier (the detected one, then each tier in `lower`, by its stable id).
+    /// Their names contain `.`, which no
     /// declared parameter name can.
     pub fn cpu_parameters(
         launches: usize,
         participants: usize,
-        lower: &[&str],
+        lower: &[seismic_cpu_tiers::Tier],
     ) -> Vec<NativeParameter> {
         let counts = std::iter::once(0)
             .chain(
@@ -1585,14 +1579,7 @@ impl NativeParameter {
             )
             .collect::<Vec<_>>();
         let tiers = std::iter::once(0)
-            .chain(lower.iter().map(|tier| {
-                NativeParameterRole::TIERS
-                    .iter()
-                    .position(|known| known == tier)
-                    .expect("a CPU tier is one of NativeParameterRole::TIERS")
-                    as u64
-                    + 1
-            }))
+            .chain(lower.iter().map(|tier| tier.id()))
             .collect();
         (0..launches)
             .map(|launch| NativeParameter {

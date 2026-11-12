@@ -30,6 +30,7 @@ pub mod native_name;
 pub mod native_parameter;
 pub mod native_source;
 pub mod precision;
+mod projection;
 pub mod reference_math;
 pub(crate) mod repr;
 pub mod span;

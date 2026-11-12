@@ -44,6 +44,7 @@ members = [
   "seismic/lang",
   "seismic/ir",
   "seismic/native-target",
+  "seismic/cpu-tiers",
   "seismic/native-cpu",
   "seismic/estimator/core",
   "seismic/estimator/metal",
@@ -82,6 +83,7 @@ default-members = [
   "seismic/lang",
   "seismic/ir",
   "seismic/native-target",
+  "seismic/cpu-tiers",
   "seismic/native-cpu",
   "seismic/estimator/core",
   "seismic/estimator/metal",
@@ -114,6 +116,7 @@ seismic-measure = { path = "seismic/measure" }
 seismic-estimator-metal = { path = "seismic/estimator/metal" }
 seismic-ir = { path = "seismic/ir" }
 seismic-native-target = { path = "seismic/native-target" }
+seismic-cpu-tiers = { path = "seismic/cpu-tiers" }
 seismic-native-cpu = { path = "seismic/native-cpu" }
 seismic-native-tests = { path = "seismic/native-tests" }
 seismic-estimator = { path = "seismic/estimator/core" }

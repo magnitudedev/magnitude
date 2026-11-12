@@ -1,5 +1,5 @@
-//! One-shot native weight import. The mapped or staged source and resident
-//! destination are already allocated from the admitted plan before submit.
+//! One-shot native weight import. The staged source and resident destination
+//! are already allocated from the admitted plan before submit.
 
 use super::{ImportProgram, ReadySubmission};
 use crate::{
@@ -7,7 +7,7 @@ use crate::{
     ValidatedImportLaunch, WeightStorageIdentity, native::AttestedImport,
 };
 use magnitude_kernels::{import_dense, packing_bound, repack_weight};
-use seismic_io::{CachePolicy, Reader, Want};
+use seismic_io::Want;
 use seismic::{NativeKernel, NativeTensorBatch, Tensor};
 
 pub struct NativeImportProgram {
@@ -36,9 +36,7 @@ impl NativeImportProgram {
                     detail: "launch destination differs from the attested weight slot".into(),
                 }));
             }
-            if let Some(upload) = workspace.staged_mut() {
-                fill_staged_source(core.source().stored(), core.plan(), upload, CachePolicy::Cached)?;
-            }
+            fill_staged_source(core.source().stored(), core.plan(), workspace.upload_mut())?;
             let (resident, bound) = destination.parts_mut();
             enqueue_into(&self.handle, batch, workspace.source(), resident, bound)
         })();
@@ -64,9 +62,7 @@ impl ImportProgram for NativeImportProgram {
                     detail: "launch destination differs from the attested weight slot".into(),
                 }));
             }
-            if let Some(upload) = workspace.staged_mut() {
-                fill_staged_source(core.source().stored(), core.plan(), upload, CachePolicy::Cached)?;
-            }
+            fill_staged_source(core.source().stored(), core.plan(), workspace.upload_mut())?;
             let (resident, bound) = destination.parts_mut();
             import_into(&self.handle, workspace.source(), resident, bound)
         })();
@@ -78,70 +74,53 @@ impl ImportProgram for NativeImportProgram {
     }
 }
 
+/// Stream `stored`'s range of its artifact, each chunk to `sink` with its
+/// offset in the range as it lands: one stream on its volume's link, around
+/// the file cache (`FileSource::stream`, a load's: no deadline).
+fn stream_stored(
+    stored: &Stored,
+    sink: &mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let (source, offset, length) = stored.file_range();
+    source.stream(offset, length, Want::undated(0.), sink)
+}
+
 /// Write a staged upload from its stored source, the one way every import
-/// does: one stream of the stored range on its volume's link
-/// (`seismic_io::Reader::stream`, a load's: no deadline), each chunk written
-/// into the upload as it lands, or, where the host prepares the bytes, the
-/// range gathered whole and transformed. `policy` says how the stored range
-/// is read: through the file cache as a resident load imports, or around it
-/// as a streamed load reads its experts, so none of its pages stay cached.
+/// does: each chunk of the stored range written into the upload as it lands
+/// ([`stream_stored`]), or, where the host prepares the bytes, the range
+/// gathered whole and transformed.
 pub(crate) fn fill_staged_source(
     stored: &Stored,
     plan: &crate::WeightPlan,
     upload: &mut Tensor,
-    policy: CachePolicy,
 ) -> Result<(), SubmitError> {
     let transfer = |error: String| SubmitError::Device(DeviceError::Transfer(error));
-    let (source, offset, length) = stored.file_range();
-    let uncached = match policy {
-        CachePolicy::Cached => None,
-        CachePolicy::Uncached => Some(Reader::of(&**source, CachePolicy::Uncached).map_err(|error| transfer(error.to_string()))?),
-    };
-    let stream = |sink: &mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>| match &uncached {
-        None => source.stream(offset, length, Want::undated(0.), sink),
-        Some(reader) => reader.stream(offset, length, Want::undated(0.), sink),
-    };
     if plan.host_prepared() {
-        let length = usize::try_from(length).map_err(|_| transfer("stored tensor exceeds the host address range".into()))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|error| transfer(format!("stored tensor of {length} bytes: {error}")))?;
-        stream(&mut |_, chunk| Ok(bytes.extend_from_slice(chunk))).map_err(|error| transfer(error.to_string()))?;
+        let bytes = stored_source_bytes(stored)?;
         let bytes = crate::import_transforms::upload_bytes(plan, stored, bytes).map_err(transfer)?;
         if upload.byte_len() != bytes.len() as u64 {
             return Err(transfer("transformed source byte length differs from its tensor".into()));
         }
         return upload.write_from_host(&bytes).map_err(|error| transfer(error.to_string()));
     }
-    if upload.byte_len() != length {
+    if upload.byte_len() != stored.file_range().2 {
         return Err(transfer("staged source byte length differs from its tensor".into()));
     }
-    upload.write_chunks(|write| stream(write)).map_err(|error| transfer(error.to_string()))
+    upload.write_chunks(|write| stream_stored(stored, write)).map_err(|error| transfer(error.to_string()))
 }
 
-/// The artifact bytes of one stored source tensor.
+/// The artifact bytes of one stored source tensor ([`stream_stored`]).
 pub(crate) fn stored_source_bytes(stored: &Stored) -> Result<Vec<u8>, SubmitError> {
-    match stored {
-        Stored::Dense(tensor) => tensor
-            .read()
-            .map_err(|error| SubmitError::Device(DeviceError::Transfer(error.to_string()))),
-        Stored::GgmlBlocks {
-            source,
-            offset,
-            nbytes,
-            ..
-        } => {
-            let length = usize::try_from(*nbytes).map_err(|_| {
-                SubmitError::Device(DeviceError::Transfer(
-                    "source weight exceeds host address range".into(),
-                ))
-            })?;
-            source
-                .read(*offset, length)
-                .map_err(|error| SubmitError::Device(DeviceError::Transfer(error.to_string())))
-        }
-    }
+    let transfer = |error: String| SubmitError::Device(DeviceError::Transfer(error));
+    let length = usize::try_from(stored.file_range().2)
+        .map_err(|_| transfer("stored tensor exceeds the host address range".into()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|error| transfer(format!("stored tensor of {length} bytes: {error}")))?;
+    stream_stored(stored, &mut |_, chunk| Ok(bytes.extend_from_slice(chunk)))
+        .map_err(|error| transfer(error.to_string()))?;
+    Ok(bytes)
 }
 
 /// Run one import from an uploaded source tensor into its resident
@@ -340,14 +319,14 @@ mod tests {
         // SAFETY: fill_staged_source writes every physical upload byte.
         let mut upload =
             unsafe { Tensor::uninitialized(&device, Element::f32(), &[rows]) }.unwrap();
-        fill_staged_source(&stored, &plan(Vec::new()), &mut upload, CachePolicy::Cached).unwrap();
+        fill_staged_source(&stored, &plan(Vec::new()), &mut upload).unwrap();
         assert_eq!(upload.read_to_host().unwrap(), values);
 
         // A transformed weight uploads the host's transformed bytes: swapping
         // adjacent elements swaps each pair of words.
         let swap =
             vec![magnitude_family_contracts::ImportTransform::PermuteRows { order: vec![1, 0] }];
-        fill_staged_source(&stored, &plan(swap), &mut upload, CachePolicy::Cached).unwrap();
+        fill_staged_source(&stored, &plan(swap), &mut upload).unwrap();
         let swapped = values
             .chunks(8)
             .flat_map(|pair| pair[4..].iter().chain(&pair[..4]).copied())
@@ -415,81 +394,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn packed_import_reads_a_mapped_artifact_window() {
-        use magnitude_artifacts::FileSource;
-        use seismic::{HostRegion, ReadOnlyMappedRegion};
-        use std::{fs, sync::Arc};
-
-        let catalog = seismic::Devices::discover(&[]).unwrap();
-        // Only a host with Metal runs it.
-        if !crate::test_support::available(&catalog, BackendName::Metal) {
-            return;
-        }
-        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
-        let source_element = Element::named("gguf_q5_k").unwrap();
-        let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
-        let shape = [17_u64, 512];
-        let bytes = (0..17 * 2 * 176)
-            .map(|index: usize| (index as u8).wrapping_mul(29).wrapping_add(7))
-            .collect::<Vec<_>>();
-        let path = std::env::temp_dir().join(format!(
-            "magnitude-mapped-import-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut artifact = vec![0; 32];
-        artifact.extend_from_slice(&bytes);
-        fs::write(&path, artifact).unwrap();
-        let file = Arc::new(FileSource::open(&path).unwrap());
-        fs::remove_file(&path).unwrap();
-        let window = file.map_window(32, bytes.len() as u64).unwrap();
-        let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8).unwrap();
-        let host = unsafe { HostRegion::new(pointer, window.mapped_len(), window.clone()) };
-        let region = ReadOnlyMappedRegion::new(&device, host).unwrap();
-        let mut source = region
-            .tensor(source_element, &[17 * 512], window.data_offset() as u64)
-            .unwrap();
-        assert!(source.write_from_host(&bytes).is_err());
-        drop(region);
-        drop(window);
-        drop(file);
-        // SAFETY: the packed import writes every resident byte before readback.
-        let resident = unsafe { Tensor::uninitialized(&device, resident_element, &shape) }.unwrap();
-        let kernel = repack_weight::native_for_device_with(
-            &device,
-            repack_weight::Elements {
-                E: source_element,
-                U: resident_element,
-            },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap();
-        let repack = AttestedImport::Repack {
-            repack: kernel,
-            bound: None,
-        };
-        import_into(&repack, &source, &resident, None).unwrap();
-        assert_eq!(
-            resident.read_to_host().unwrap(),
-            resident_element
-                .repack_host(source_element, &shape, &bytes)
-                .unwrap()
-        );
-    }
-
     /// A GGUF whose `general.alignment` is 1 can place a tensor at an odd
     /// file offset, off its source packets' declared alignment: its import
-    /// uploads it rather than viewing the mapped pages, and converts it
-    /// exactly.
+    /// reads it around the file cache all the same and converts it exactly.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_source_off_its_alignment_in_the_file_is_uploaded() {
-        use crate::resources::{ImportSource, ImportWindow};
+    fn a_source_off_its_alignment_in_the_file_imports_exactly() {
         use magnitude_artifacts::gguf::{Encoding, GgufArtifact};
         use std::fs;
 
@@ -573,10 +483,7 @@ mod tests {
             bound: 0,
             holding: crate::Holding::Whole,
         };
-        let window = ImportWindow::of(&device, &stored).unwrap();
-        let mut source = ImportSource::acquire(&weight, &stored, Some(&window), &device).unwrap();
-        let upload = source.staged_mut().expect("the source is uploaded");
-        fill_staged_source(&stored, &weight, upload, CachePolicy::Cached).unwrap();
+        let source = crate::resources::filled_import(&weight, &stored, &device).unwrap();
         // SAFETY: the packed import writes every resident byte before readback.
         let resident = unsafe { Tensor::uninitialized(&device, resident_element, &shape) }.unwrap();
         let kernel = repack_weight::native_for_device_with(
@@ -592,7 +499,7 @@ mod tests {
             repack: kernel,
             bound: None,
         };
-        import_into(&repack, source.tensor(), &resident, None).unwrap();
+        import_into(&repack, &source, &resident, None).unwrap();
         assert_eq!(
             resident.read_to_host().unwrap(),
             resident_element
@@ -603,11 +510,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn mapped_packed_and_dense_imports_share_one_native_batch() {
-        use magnitude_artifacts::FileSource;
-        use seismic::{HostRegion, ReadOnlyMappedRegion};
-        use std::{fs, sync::Arc};
-
+    fn packed_and_dense_imports_share_one_native_batch() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         // Only a host with Metal runs it.
         if !crate::test_support::available(&catalog, BackendName::Metal) {
@@ -624,36 +527,8 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let path = std::env::temp_dir().join(format!(
-            "magnitude-batched-import-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        let mut artifact = vec![0; 32];
-        artifact.extend_from_slice(&packed_bytes);
-        artifact.extend_from_slice(&dense_bytes);
-        fs::write(&path, artifact).unwrap();
-        let file = Arc::new(FileSource::open(&path).unwrap());
-        fs::remove_file(&path).unwrap();
-        let window = file
-            .map_window(32, (packed_bytes.len() + dense_bytes.len()) as u64)
-            .unwrap();
-        let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8).unwrap();
-        let host = unsafe { HostRegion::new(pointer, window.mapped_len(), window.clone()) };
-        let region = ReadOnlyMappedRegion::new(&device, host).unwrap();
-        let packed = region
-            .tensor(packed_element, &[17 * 512], window.data_offset() as u64)
-            .unwrap();
-        let dense = region
-            .tensor(
-                dense_element,
-                &[4],
-                (window.data_offset() + packed_bytes.len()) as u64,
-            )
-            .unwrap();
+        let packed = Tensor::from_host(&device, packed_element, &[17 * 512], &packed_bytes).unwrap();
+        let dense = Tensor::from_host(&device, dense_element, &[4], &dense_bytes).unwrap();
         // SAFETY: both import entries write their complete physical results.
         let packed_result =
             unsafe { Tensor::uninitialized(&device, resident_element, &[17, 512]) }.unwrap();
@@ -696,9 +571,6 @@ mod tests {
             None,
         )
         .unwrap();
-        drop(region);
-        drop(window);
-        drop(file);
         batch.submit().unwrap().wait().unwrap();
         assert_eq!(
             packed_result.read_to_host().unwrap(),

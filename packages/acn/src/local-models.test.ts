@@ -238,7 +238,7 @@ describe("automatic assessment projection", () => {
               placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0, lookupDiskBytes: 0 },
               residency: {
                 _tag: "Streamed",
-                bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+                bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: { _tag: "Disk" } },
                 performance: { _tag: "Pending" },
                 floorPerformance: { _tag: "Pending" },
               },
@@ -255,7 +255,7 @@ describe("automatic assessment projection", () => {
       : undefined
     expect(fits?.residency).toEqual({
       _tag: "Streamed",
-      bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+      bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: { _tag: "Disk" } },
       performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
       floorPerformance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
     })

@@ -124,7 +124,7 @@ def expert_banks(samples: list[dict], banks_of: dict[str, Callable[[dict], dict 
     its engine's observation (``banks_of``, by target: ``Adapter.expert_bank``): its experts'
     slots at the first and last sample and their range, its floor and ceiling, the resizes seen
     of each of its holdings (its experts, each table, its host tier: each sample shows each
-    holding's last, its ``last_resize``) by cause, and the most recent across them. Passes without a bank
+    holding's last, its ``last_resize``) by kind, and the most recent across them. Passes without a bank
     are left out."""
     passes = defaultdict(list)
     for sample in samples:
@@ -151,7 +151,7 @@ def expert_banks(samples: list[dict], banks_of: dict[str, Callable[[dict], dict 
             "max_slots": max(slots),
             "floor": experts[-1]["floor"],
             "ceiling": experts[-1]["ceiling"],
-            "resizes": {holding: dict(Counter(resize["cause"] for resize in resizes.values()))
+            "resizes": {holding: dict(Counter(resize["kind"] for resize in resizes.values()))
                         for holding, resizes in sorted(seen.items())},
             "latest_resize": None if latest is None else {"holding": latest[0], **latest[1]},
         })
@@ -169,14 +169,14 @@ def _holdings(bank: dict) -> list[tuple[str, dict]]:
 
 
 def _resize(resize: dict) -> dict:
-    """A resize as the census states it (``BankResize``: ``Shrank`` by ``by`` to ``to`` for its
-    cause, or ``Grew`` by ``by`` from ``from``), as its cause, its size before and after, and when
-    it took effect; a growth's cause is ``Growth``."""
+    """A resize as the census states it (``BankResize``: ``Shrank`` by ``by`` to ``to``, or
+    ``Grew`` by ``by`` from ``from``), as its kind (``Shrank`` or ``Grew``), its size before and
+    after, and when it took effect."""
     ((kind, fields),) = resize.items()
     if kind == "Shrank":
-        return {"cause": fields["cause"], "from": fields["to"] + fields["by"], "to": fields["to"],
+        return {"kind": kind, "from": fields["to"] + fields["by"], "to": fields["to"],
                 "at_unix_ms": fields["at_unix_ms"]}
-    return {"cause": "Growth", "from": fields["from"], "to": fields["from"] + fields["by"],
+    return {"kind": kind, "from": fields["from"], "to": fields["from"] + fields["by"],
             "at_unix_ms": fields["at_unix_ms"]}
 
 
@@ -302,12 +302,12 @@ def markdown(summary: dict) -> str:
         ]
         for bank in summary["expert_banks"]:
             resizes = "; ".join(
-                f"{holding} " + ", ".join(f"{cause} {count}" for cause, count in sorted(causes.items()))
-                for holding, causes in bank["resizes"].items()
+                f"{holding} " + ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items()))
+                for holding, kinds in bank["resizes"].items()
             ) or "none"
             latest = bank["latest_resize"]
             last = ("none" if latest is None else
-                    f"{latest['holding']} {latest['cause']} {latest['from']} → {latest['to']}")
+                    f"{latest['holding']} {latest['kind']} {latest['from']} → {latest['to']}")
             lines.append(
                 f"| {bank['target']} | {bank['label']} | {bank['first_slots']} → {bank['last_slots']} | "
                 f"{bank['min_slots']}–{bank['max_slots']} | {bank['floor']} | {bank['ceiling']} | {resizes} "

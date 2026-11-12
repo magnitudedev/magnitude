@@ -4,6 +4,7 @@
 
 use lib::core::activation;
 
+#[inline(always)]
 fn corrector_factors<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (nodes, width) = (cx.dim_n() as usize, cx.dim_h() as usize);

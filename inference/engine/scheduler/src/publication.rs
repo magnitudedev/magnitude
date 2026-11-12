@@ -50,10 +50,6 @@ pub enum RequestError {
     /// the model's artifact; other requests continue.
     WeightRead(WeightReadError),
     WorkerClosed,
-    /// The request waited, never resident, while memory stayed at or below
-    /// its planning reserve, until only the model's unload could make room
-    /// for it. Retryable.
-    MemoryReclaim,
     ModelUnloaded { cause: ModelUnloadCause },
 }
 
@@ -71,9 +67,6 @@ impl std::fmt::Display for RequestError {
             Self::Invariant(error) => error.fmt(formatter),
             Self::WeightRead(error) => error.fmt(formatter),
             Self::WorkerClosed => formatter.write_str("the execution worker closed"),
-            Self::MemoryReclaim => formatter.write_str(
-                "memory headroom stayed at or below the planning reserve with nothing left to release",
-            ),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => formatter.write_str("model unloaded due to memory pressure"),
@@ -613,8 +606,8 @@ mod tests {
         assert!(receiver.began(), "a later residency changes nothing");
 
         let (sender, mut receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
-        sender.fail(RequestError::MemoryReclaim);
-        assert_eq!(next(&mut receiver), Some(Publication::Failed(RequestError::MemoryReclaim)));
+        sender.fail(RequestError::WorkerClosed);
+        assert_eq!(next(&mut receiver), Some(Publication::Failed(RequestError::WorkerClosed)));
         assert!(!receiver.began(), "refused before it began");
     }
 

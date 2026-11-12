@@ -9,6 +9,7 @@ use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
 
+#[inline(always)]
 fn routed_gate_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -30,6 +31,7 @@ fn routed_gate_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
     projection::operand_row(&[&cx.arg_expert_gate(), &cx.arg_expert_up()], staged);
 }
 
+#[inline(always)]
 fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, k, f) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_k() as usize, cx.dim_f() as usize);
     let rows = projection::item_rows(group[0], cx.param_rows(), f);

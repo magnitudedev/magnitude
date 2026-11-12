@@ -16,7 +16,7 @@ pub use advance::{
 pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryReads,
-    HistorySource, produced_domain,
+    HistorySource, batch_state_bytes, produced_domain,
 };
 
 pub use codec::{
@@ -26,7 +26,7 @@ pub use codec::{
 };
 pub use layout::{
     HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
-    banks_per_slab, history_codec, history_geometry, kv_codec_policy,
+    banks_per_slab, history_codec, history_geometry, kv_codec_policy, window_pages,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};
@@ -997,16 +997,33 @@ pub struct BankCapacity {
 }
 
 impl BankCapacity {
-    pub fn total(self) -> Result<usize, Error> {
+    /// This capacity, refused where it has no active or in-flight request.
+    pub fn validated(self) -> Result<Self, Error> {
         if self.active == 0 || self.in_flight == 0 {
             return Err(Error::Request(
                 "bank pool requires positive active and in-flight capacity".into(),
             ));
         }
-        self.active
-            .checked_add(self.in_flight)
-            .and_then(|value| value.checked_add(self.retained))
+        Ok(self)
+    }
+
+    pub fn total(self) -> Result<usize, Error> {
+        let this = self.validated()?;
+        this.active
+            .checked_add(this.in_flight)
+            .and_then(|value| value.checked_add(this.retained))
             .ok_or_else(|| Error::Request("bank pool capacity overflow".into()))
+    }
+
+    /// The banks a store commits at construction: the pristine seed a first
+    /// request starts from plus the successor banks one request holds in
+    /// flight (`in_flight` is the requests' successors in all), so its first
+    /// step of any kind grows no slab and the load's startup charge holds
+    /// everything its warm-up forward and first prefill allocate. Further
+    /// requests' banks grow the store by slabs the in-process guarantee covers.
+    pub fn startup_banks(self) -> Result<usize, Error> {
+        let this = self.validated()?;
+        Ok(1 + this.in_flight.div_ceil(this.active))
     }
 
     /// Writable banks plus one permanently pristine seed for new sequences.
@@ -1649,10 +1666,11 @@ impl StateStore {
         };
         let reserved_banks = bank_capacity.storage_total()?;
         // Banks of a store without recurrent components have no storage.
-        let committed_banks = if component_specs.is_empty() {
-            reserved_banks
+        let (committed_banks, startup_slabs) = if component_specs.is_empty() {
+            (reserved_banks, 0)
         } else {
-            bank_slab_banks.min(reserved_banks)
+            let slabs = bank_capacity.startup_banks()?.div_ceil(bank_slab_banks);
+            ((slabs * bank_slab_banks).min(reserved_banks), slabs)
         };
         let (banks, zero_seed) = BankPool::new(bank_capacity, committed_banks)?;
         let mut recurrent = if component_specs.is_empty() {
@@ -1672,7 +1690,9 @@ impl StateStore {
             )?)
         };
         if let Some(recurrent) = &mut recurrent {
-            recurrent.add_slab()?;
+            for _ in 0..startup_slabs {
+                recurrent.add_slab()?;
+            }
         }
         let mut history = Vec::with_capacity(stored.len());
         let mut domains = Vec::with_capacity(stored.len());
@@ -2184,7 +2204,7 @@ impl StateStore {
             .try_fold(0u64, |total, (&slabs, history)| {
                 history
                     .slabs
-                    .slab_bytes()
+                    .slab_charge()
                     .checked_mul(slabs as u64)
                     .and_then(|bytes| total.checked_add(bytes))
             })
@@ -2192,7 +2212,7 @@ impl StateStore {
         let bank_bytes = backing
             .recurrent
             .as_ref()
-            .map_or(0, SlabTensor::slab_bytes)
+            .map_or(0, SlabTensor::slab_charge)
             .checked_mul(bank_slabs as u64)
             .ok_or_else(|| Error::Request("bank slab claim overflows".into()))?;
         history_bytes
@@ -2913,10 +2933,7 @@ impl StateStore {
     /// rounded up to whole pages.
     fn page_demand(&self, domain: HistoryDomainId, end: Option<usize>, count: usize) -> usize {
         let domain = &self.domains[domain.0];
-        count
-            .saturating_sub(domain.arena.borrow().in_place(end))
-            .div_ceil(domain.page_rows)
-            * domain.page_rows
+        layout::page_demand_rows(domain.page_rows, domain.arena.borrow().in_place(end), count)
     }
 
     /// Reserve `counts[domain]` rows in every stored domain (see
@@ -3443,9 +3460,15 @@ mod tests {
         )
     }
 
+    /// `backend`'s device of `catalog`, its ledgers its own: a test bounds
+    /// them alone beside the process's other tests.
+    fn own_device(catalog: &seismic::Devices, backend: BackendName) -> Result<Device, seismic::OpenError> {
+        seismic::testing::open_backend_own_ledgers(catalog, backend, Default::default())
+    }
+
     fn cpu_device() -> Rc<Device> {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-        Rc::new(catalog.open_backend(BackendName::Cpu).expect("the CPU backend opens"))
+        Rc::new(own_device(&catalog, BackendName::Cpu).expect("the CPU backend opens"))
     }
 
     fn bank_view(store: &StateStore, bank: usize) -> Tensor {
@@ -3469,6 +3492,49 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    /// A bank of more than a slab's target holds one bank per slab: the
+    /// store commits the seed's slab and the slab of the writable bank a
+    /// sequence's first step writes, so that step grows nothing.
+    #[test]
+    fn a_first_step_grows_no_bank_slab() {
+        let (store, _bindings) = StateStore::new(
+            cpu_device(),
+            64,
+            64,
+            vec![],
+            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+            BankCapacity { active: 2, in_flight: 1, retained: 0 },
+        )
+        .unwrap();
+        assert_eq!(store.bank_slab_banks(), 1);
+        assert_eq!(store.available_banks(), BankCapacity { active: 2, in_flight: 1, retained: 0 }.startup_banks().unwrap() - 1);
+        assert_eq!(store.growth_claim(&[], &[], 1).unwrap().minimum_bytes, 0);
+    }
+
+    /// A growth claims what a slab's allocation is charged, the figure the
+    /// device's bound is derived from, never a sum of its own: a record table
+    /// the allocation holds is part of it, so the claim and the allocation
+    /// cannot differ.
+    #[test]
+    fn a_slab_growth_claims_the_charge_of_a_slab_allocation() {
+        let (store, _bindings) = StateStore::new(
+            cpu_device(),
+            64,
+            64,
+            vec![],
+            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+            BankCapacity { active: 2, in_flight: 1, retained: 0 },
+        )
+        .unwrap();
+        let backing = store.backing.borrow();
+        let slabs = backing.recurrent.as_ref().expect("a store of components holds bank slabs");
+        let charged = slabs.slab_storage_observers().filter_map(|observer| observer.charged_bytes()).max().expect("a backed slab");
+        assert_eq!(slabs.slab_charge(), charged.max(slabs.slab_bytes()));
+        drop(backing);
+        // Two banks are wanted, one is committed past the seed: one slab.
+        assert_eq!(store.growth_claim(&[], &[], 2).unwrap().minimum_bytes, store.backing.borrow().recurrent.as_ref().unwrap().slab_charge());
     }
 
     #[test]
@@ -3688,12 +3754,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_reclaim_compacts_partial_final_history_and_bank_slabs() {
-        let device = Rc::new(
-            seismic::Devices::discover(&[])
-                .unwrap()
-                .open_backend(BackendName::Metal)
-                .unwrap(),
-        );
+        let device = Rc::new(own_device(&seismic::Devices::discover(&[]).unwrap(), BackendName::Metal).unwrap());
         reclaim_compacts_partial_final_history_and_bank_slabs_on(device);
     }
 
@@ -3811,9 +3872,9 @@ mod tests {
             .unwrap();
         let slab_bytes = store.history_slabs().slab_bytes();
         let charged = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(store.compactions().history_rows, 1);
         assert_eq!(sparse.ranges(), vec![(moved, 1)]);
         assert!(store.history_slabs().slab(1).is_none());
@@ -5447,7 +5508,7 @@ mod tests {
         assert!(claim.preferred_bytes >= claim.minimum_bytes);
         assert!(claim.minimum_bytes > 0);
         let previous_limit = device.device_ledger().bound;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(charged() + claim.minimum_bytes - 1),
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged() + claim.minimum_bytes - 1),
         ).unwrap();
         assert!(matches!(
             store.provision_with_growth(&demand, &[], 8, GrowthChoice::Minimum),
@@ -5457,7 +5518,7 @@ mod tests {
         ));
         assert_eq!(committed_extent(&store).0, rows);
         assert_eq!(state.history_ranges(TOKEN), [(0, 1000)]);
-        device.bound(seismic::Ledger::Own(device.device_store()), previous_limit).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), previous_limit).unwrap();
         store.provision(&demand, 8).unwrap();
         let (rows, banks) = committed_extent(&store);
         assert!(rows >= 11000 && rows <= 16384, "committed {rows} rows");
@@ -5516,14 +5577,14 @@ mod tests {
             .write_from_host(&encoded)
             .unwrap();
         let baseline = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(baseline)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(baseline)).unwrap();
         assert!(matches!(
             store.add_history_slabs(TOKEN, 1),
             Err(Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(committed_extent(&store).0, store.history_slab_rows(TOKEN));
         assert_eq!(device.device_ledger().charged, baseline);
         assert_eq!(
@@ -5574,7 +5635,7 @@ mod tests {
             store.growth_claim(&demand, &[], 4).unwrap().minimum_bytes,
             history_bytes + bank_bytes
         );
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(baseline + history_bytes + bank_bytes - 1),
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(baseline + history_bytes + bank_bytes - 1),
         ).unwrap();
         assert!(matches!(
             store.provision_with_growth(&demand, &[], 4, GrowthChoice::Minimum),
@@ -5582,7 +5643,7 @@ mod tests {
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(committed_extent(&store), committed);
         assert_eq!(device.device_ledger().charged, baseline);
         assert_eq!(store.arena().borrow().backed, BTreeSet::from([0]));
@@ -5853,9 +5914,9 @@ mod tests {
         assert_eq!(occupied, 256 + 50 + 20);
         // Reclaim copies only into space held by the store and succeeds when
         // the device refuses all new allocations.
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(before.1)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(before.1)).unwrap();
         let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert!(released > 0);
         assert!(committed_extent(&store).0 <= before.0);
         assert!(device.device_ledger().charged < before.1);
@@ -5891,7 +5952,7 @@ mod tests {
             BackendName::Cuda,
             BackendName::Vulkan,
         ] {
-            let Ok(device) = catalog.open_backend(backend) else {
+            let Ok(device) = own_device(&catalog, backend) else {
                 continue;
             };
             let device = Rc::new(device);
@@ -5921,9 +5982,9 @@ mod tests {
                 .unwrap();
             let slab_bytes = store.history_slabs().slab_bytes();
             let charged = device.device_ledger().charged;
-            device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+            device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
             assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
-            device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+            device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
             assert_eq!(committed_extent(&store).0, slab_rows);
             assert_eq!(store.compactions().history_rows, 1);
             let moved = high.ranges()[0].0;
@@ -5949,7 +6010,7 @@ mod tests {
             BackendName::Cuda,
             BackendName::Vulkan,
         ] {
-            let Ok(device) = catalog.open_backend(backend) else {
+            let Ok(device) = own_device(&catalog, backend) else {
                 continue;
             };
             let device = Rc::new(device);
@@ -6019,9 +6080,9 @@ mod tests {
             // Bank 9 lies beyond the four kept banks; lower banks are free.
             let generation = store.bank_placement_generation();
             // Compaction and release use only already held storage.
-            device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+            device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
             let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
-            device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+            device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
             assert!(released > 0);
             assert_eq!(committed_extent(&store).1, 4);
             let after = placed();
@@ -6079,9 +6140,9 @@ mod tests {
             .unwrap()
             .slab_bytes();
         let charged = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(high.index(), 8);
         assert_eq!(store.available_banks(), 3);
         assert_eq!(
@@ -6149,9 +6210,9 @@ mod tests {
             .unwrap()
             .slab_bytes();
         let charged = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(high.index(), 1);
         assert_eq!(committed_extent(&store).1, 4);
         assert_eq!(store.compactions().banks, 1);
@@ -6206,9 +6267,9 @@ mod tests {
             .unwrap()
             .slab_bytes();
         let charged = device.device_ledger().charged;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
         assert_eq!(sparse.index(), 11);
         assert_eq!(store.compactions().banks, 1);
         assert!(

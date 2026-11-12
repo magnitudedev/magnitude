@@ -3,6 +3,7 @@
 // the elements in turn, so a round is shorter than a GPU thread's), then
 // the sum with the pace's bias and whether the generator's whole last state
 // is `0xFFFFFFFF`, which it never is (as `metal/paced.metal` says).
+#[inline(always)]
 fn paced<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let state = cx.arg_state();
     let x = cx.arg_x();

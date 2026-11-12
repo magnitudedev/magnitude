@@ -993,10 +993,15 @@ fn vulkan_matrix_configurations(
     configs
         .iter()
         .filter(|(_, simds)| {
+            // The K tile and subgroup scratch, then the query tile unless
+            // the group's queries alone exceed the shared bytes (they come
+            // from the prepare launch).
+            let tiles = 64 * (w.min(256) + 8) + simds * 2048;
             form.g as u64 <= simds * 16
                 && (w <= 64 || w % 64 == 0)
                 && (w <= 256 || w % 256 == 0)
-                && 64 * (w.min(256) + 8) + simds * 2048 + simds * 16 * (w + 8) * 2 <= 32768
+                && tiles <= 32768
+                && (form.g as u64 * w * 2 > 32768 || tiles + simds * 16 * (w + 8) * 2 <= 32768)
         })
         .map(|&(parts, simds)| {
             vec![
@@ -1047,17 +1052,69 @@ fn cuda_matrix_configurations(
 
 /// The head groups Metal's decode declares at `form`'s query group: the
 /// smallest declared HEADS holding the whole group, and for the matrix form,
-/// where no form holds the whole group (its prepared queries, G * W * 2
-/// bytes, over 32768), each smaller one of at least 8 dividing it.
+/// where no form holds the whole group (the matrix form's prepared queries,
+/// G * W * 2 bytes, over 32768, and the shared-tile form past its limit at
+/// KEYS 8), each smaller one of at least 8 dividing it.
 fn metal_decode_heads(form: Form) -> (u64, Vec<u64>) {
     let (g, w) = (form.g as u64, form.w() as u64);
     let declared = [1u64, 2, 4, 8, 16, 32, 64, 128];
     let whole = *declared.iter().find(|&&heads| heads >= g).unwrap();
     let split = declared
         .into_iter()
-        .filter(|&heads| heads >= 8 && heads < g && g % heads == 0 && g * w * 2 > 32768)
+        .filter(|&heads| {
+            heads >= 8 && heads < g && g % heads == 0 && g * w * 2 > 32768 && !metal_shared_fits(form, 8)
+        })
         .collect();
     (whole, split)
+}
+
+/// Whether Metal's shared-tile decode form (MATRIX 2) holds `form`'s whole
+/// query group at `keys` keys a tile: ceil(G / 8) row blocks by
+/// max(1, W / 128) column slices of whole 32-column groups, at most 32
+/// simdgroups, its key and value tiles and score exchange within the
+/// declaration's threadgroup bytes.
+/// The smallest declared Metal prefill HEADS holding all of a kv head's
+/// query heads (at most 16).
+fn metal_prefill_heads(form: Form) -> u64 {
+    (form.g.next_power_of_two() as u64).min(16)
+}
+
+fn metal_shared_fits(form: Form, keys: u64) -> bool {
+    let (g, w) = (form.g as u64, form.w() as u64);
+    let (blocks, cols) = (g.div_ceil(8), (w / 128).max(1));
+    let exchange = if cols > 1 { cols * blocks * 8 * keys * 4 } else { 0 };
+    w % cols == 0
+        && (w / cols) % 32 == 0
+        && blocks * cols <= 32
+        && 4 * keys * (w + 8) + exchange <= 32768
+}
+
+/// Metal's shared-tile decode configurations admissible at `form`, from
+/// (span, parts, keys): the first that fits of each (span, parts).
+fn metal_shared_configurations(
+    form: Form,
+    configs: &[(u64, u64, u64)],
+) -> Vec<Vec<(&'static str, u64)>> {
+    let (whole, _) = metal_decode_heads(form);
+    let mut admitted: Vec<Vec<(&'static str, u64)>> = Vec::new();
+    for &(span, parts, keys) in configs {
+        if !metal_shared_fits(form, keys)
+            || admitted.iter().any(|config| config[..2] == [("SPAN", span), ("PARTS", parts)])
+        {
+            continue;
+        }
+        admitted.push(vec![
+            ("SPAN", span),
+            ("PARTS", parts),
+            ("SIMDS", 4),
+            ("SLICES", 1),
+            ("MATRIX", 2),
+            ("KEYS", keys),
+            ("TOKENS", 1),
+            ("HEADS", whole),
+        ]);
+    }
+    admitted
 }
 
 /// Whether Metal's vector decode form fits `form`'s query group at `simds`
@@ -1168,35 +1225,42 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                 form,
                 &[(32, 16, 4, 16), (64, 8, 2, 8)],
             ));
+            configurations.extend(metal_shared_configurations(
+                form,
+                &[(32, 16, 8), (64, 8, 16), (64, 8, 8)],
+            ));
             configurations
         }
         (BackendName::Metal, false) => {
-            // The smallest declared HEADS holding all of a kv head's query heads.
-            let heads = (form.g.next_power_of_two() as u64).min(16);
+            let heads = metal_prefill_heads(form);
             vec![
                 vec![
                     ("QT", 16),
                     ("HEADS", heads),
                     ("SPLIT_GROUPS", 256),
                     ("DIRECT", 0),
+                    ("KEYS", 8),
                 ],
                 vec![
                     ("QT", 8),
                     ("HEADS", heads),
                     ("SPLIT_GROUPS", 1),
                     ("DIRECT", 0),
+                    ("KEYS", 8),
                 ],
                 vec![
                     ("QT", 16),
                     ("HEADS", heads),
                     ("SPLIT_GROUPS", 256),
                     ("DIRECT", 1),
+                    ("KEYS", 8),
                 ],
                 vec![
                     ("QT", 16),
                     ("HEADS", heads),
                     ("SPLIT_GROUPS", 1),
                     ("DIRECT", 1),
+                    ("KEYS", 8),
                 ],
             ]
         }
@@ -1301,16 +1365,46 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
 
 /// [`configurations`] that can hold `case`: an index-list source runs in
 /// Metal's fragment prefill form alone (its declaration refuses DIRECT), and
-/// in Metal's matrix decode form at one row a threadgroup.
+/// in Metal's matrix decode forms at one row a threadgroup; Vulkan's decode
+/// holds the forms past the base form in its matrix form alone.
 fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&'static str, u64)>> {
+    if !decode && case.picks > 0 && device.backend() == BackendName::Metal {
+        // A prefill with picks attends in the shared tile: attend's
+        // parameters fixed, at each KEYS the tile admits.
+        return [8u64, 16, 32]
+            .into_iter()
+            .filter(|&keys| metal_shared_fits(case.form, keys))
+            .map(|keys| {
+                vec![
+                    ("QT", 16),
+                    ("HEADS", metal_prefill_heads(case.form)),
+                    ("SPLIT_GROUPS", 256),
+                    ("DIRECT", 0),
+                    ("KEYS", keys),
+                ]
+            })
+            .collect();
+    }
     let metal_decode = decode && device.backend() == BackendName::Metal;
+    let vulkan_decode = decode && device.backend() == BackendName::Vulkan;
+    let form = case.form;
+    let extended = form.query_norm != form.norm
+        || form.rotary.adjacent
+        || form.rotary.trailing
+        || form.rotary.inverse_output
+        || form.stored_key
+        || case.key_rounding.is_some()
+        || case.picks > 0;
     configurations(device, decode, case.form)
         .into_iter()
         .filter(|config| {
             case.picks == 0
                 || !(config.contains(&("DIRECT", 1))
-                    || (metal_decode && !(config.contains(&("MATRIX", 1)) && config.contains(&("TOKENS", 1)))))
+                    || (metal_decode
+                        && !((config.contains(&("MATRIX", 1)) || config.contains(&("MATRIX", 2)))
+                            && config.contains(&("TOKENS", 1)))))
         })
+        .filter(|config| !vulkan_decode || !extended || config.contains(&("MATRIX", 1)))
         .collect()
 }
 
@@ -2198,12 +2292,11 @@ fn prefill_natives_match_portable_body() {
 
 // ---------------------------------------------------------------------------
 // Rotary layouts, the output rotary and a query norm apart from the key norm
-// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal and by the CUDA and
-// Vulkan prefill entries, refused by their decode declarations.
+// (`RA`, `RT`, `RO`, `NQ`): computed on CPU, Metal and Vulkan and by the CUDA
+// prefill entry, refused by CUDA's decode declaration.
 
-/// The backends whose decode entry refuses these forms: CUDA's and
-/// Vulkan's.
-const DECODE_REFUSALS: &[BackendName] = &[BackendName::Cuda, BackendName::Vulkan];
+/// The backends whose decode entry refuses these forms: CUDA's.
+const DECODE_REFUSALS: &[BackendName] = &[BackendName::Cuda];
 
 /// The backends whose `decode` entry refuses these forms; every prefill
 /// entry and dense append holds them.
@@ -2316,10 +2409,13 @@ const V41: Form = Form {
 };
 
 /// Metal's matrix decode splits a query group into head groups only where
-/// no form holds the group whole: V4.1's G = 64 at W = 512 admits HEADS 8,
-/// and the group-16 layers that decoded whole before the split existed
-/// (Muse, Nemotron's Bolt draft, the G16 forms at W = 128 and 512) admit
-/// none, so their grid and tuning space stay one group a kv head.
+/// no form holds the group whole. V4.1's G = 64 at W = 512, past the matrix
+/// form's bytes, is held whole by the shared-tile form (32 simdgroups), so it
+/// admits no split; a group of 128 at W = 512 (64 simdgroups) is past both
+/// and admits HEADS 8. The group-16 layers that decoded whole before the
+/// split existed (Muse, Nemotron's Bolt draft, the G16 forms at W = 128 and
+/// 512) admit none, so their grid and tuning space stay one group a kv head;
+/// the shared-tile form holds each of these groups.
 #[test]
 fn metal_decode_splits_only_groups_it_cannot_hold_whole() {
     let entry =
@@ -2328,12 +2424,13 @@ fn metal_decode_splits_only_groups_it_cannot_hold_whole() {
         .into_iter()
         .filter(|device| device.backend() == BackendName::Metal)
     {
-        for (name, form, split) in [
-            ("v41", V41, true),
-            ("muse", MUSE, false),
-            ("bolt draft", BOLT_DRAFT, false),
-            ("column sigmoid", COLUMN_SIGMOID, false),
-            ("wide g16", WIDE_G16, false),
+        for (name, form, split, shared) in [
+            ("v41", V41, false, true),
+            ("v41 group 128", Form { g: 128, ..V41 }, true, false),
+            ("muse", MUSE, false, true),
+            ("bolt draft", BOLT_DRAFT, false, true),
+            ("column sigmoid", COLUMN_SIGMOID, false, true),
+            ("wide g16", WIDE_G16, false, true),
         ] {
             // The matrix form at the tests' first configuration.
             let matrix = [
@@ -2350,17 +2447,23 @@ fn metal_decode_splits_only_groups_it_cannot_hold_whole() {
                 statics(&device, form, 0).with_static("KR", 0).with_static("KS", 0),
                 |s, (n, v)| s.with_param(n, v),
             );
-            let valid = |heads| {
-                entry
-                    .specialization_valid(&device, &matrix.clone().with_param("HEADS", heads))
-                    .unwrap()
+            let valid = |specialization: NativeSpecialization| {
+                entry.specialization_valid(&device, &specialization).unwrap()
             };
-            assert_eq!(valid(8), split, "{name}: HEADS 8");
+            assert_eq!(valid(matrix.clone().with_param("HEADS", 8)), split, "{name}: HEADS 8");
             assert_eq!(
                 metal_decode_heads(form).1.contains(&8),
                 split,
                 "{name}: the test's head groups"
             );
+            let whole = metal_decode_heads(form).0;
+            let tiled = matrix
+                .clone()
+                .with_param("MATRIX", 2)
+                .with_param("KEYS", 8)
+                .with_param("HEADS", whole);
+            assert_eq!(valid(tiled), shared, "{name}: the shared-tile form");
+            assert_eq!(metal_shared_fits(form, 8), shared, "{name}: the test's shared-tile bound");
         }
     }
 }
@@ -2508,10 +2611,10 @@ fn v41_host_model_matches_reference() {
     }
 }
 
-/// At V4.1's shapes the CPU and Metal natives equal the F32 reference: the
-/// decode entry on both (Metal's matrix form in head groups of 8), prefill
-/// rows on both, and on CUDA and Vulkan, whose decode declarations refuse
-/// the forms.
+/// At V4.1's shapes the CPU, Metal and Vulkan natives equal the F32
+/// reference: the decode entry on each (Metal's matrix form in head groups
+/// of 8, Vulkan's with its queries from its prepare launch), prefill rows on
+/// each, and on CUDA, whose decode declaration refuses the forms.
 #[test]
 fn v41_natives_match_reference() {
     for (name, decode, case) in v41_cases() {
@@ -2643,17 +2746,17 @@ fn bits(values: &[f32]) -> Vec<u32> {
 
 /// Attention over the one key plane equals the same inputs over two planes
 /// whose values are the prepared keys, bit for bit, on every configuration
-/// of the CPU and Metal entries and the CUDA and Vulkan prefill entries: the
-/// result, and the key plane the row's keys are appended to. The two-plane
-/// run's value plane ends equal to its key plane. The CUDA and Vulkan decode
-/// entries refuse every stored-key form.
+/// of the CPU, Metal and Vulkan entries (Vulkan's decode in its matrix form)
+/// and the CUDA prefill entry: the result, and the key plane the row's keys
+/// are appended to. The two-plane run's value plane ends equal to its key
+/// plane. The CUDA decode entry refuses every stored-key form.
 #[test]
 fn stored_key_attention_equals_key_valued_planes() {
     let mut failures = Vec::new();
     for (name, decode, case) in stored_key_cases() {
         for device in devices() {
             let backend = device.backend();
-            for config in configurations(&device, decode, case.form) {
+            for config in case_configurations(&device, decode, &case) {
                 let specialization = |form| {
                     config
                         .iter()
@@ -2862,10 +2965,10 @@ fn two_source_host_model_matches_reference() {
     }
 }
 
-/// The CPU and Metal natives of the two-source form equal the host model at
-/// the small shapes and the F32 reference at V4.1's: the decode entry on
-/// CPU and Metal (its matrix form), the prefill entry (decode rows too) on
-/// every backend; the other decode declarations refuse it.
+/// The natives of the two-source form equal the host model at the small
+/// shapes and the F32 reference at V4.1's: the decode entry on CPU, Metal
+/// and Vulkan (their matrix forms), the prefill entry (decode rows too) on
+/// every backend; CUDA's decode declaration refuses it.
 #[test]
 fn two_source_natives_match_reference() {
     for (name, decode, case) in small_two_source_cases() {
@@ -2880,6 +2983,26 @@ fn two_source_natives_match_reference() {
         if decode {
             check_natives_against(name, true, &case, new_form_refusals(true), true, &expected);
         }
+        check_natives_against(name, false, &case, new_form_refusals(false), true, &expected);
+    }
+}
+
+/// The prefill entry with picks (KS > 0, Metal's shared-tile rows) equals
+/// the F32 reference at V4.1's shape: window prefill rows with 512 picks a
+/// row, and the same rows naming only their first 100 picks (the rest -1),
+/// as a row whose pool holds fewer rows than KS lists them.
+#[test]
+fn v41_prefill_with_picks_matches_reference() {
+    let (_, _, full) = two_source_cases().into_iter().nth(1).unwrap();
+    let mut short = full.clone();
+    for (index, pick) in short.selected_rows.iter_mut().enumerate() {
+        if index % short.picks >= 100 {
+            *pick = -1;
+        }
+    }
+    for (name, case) in [("v41 prefill with picks", full), ("v41 prefill with fewer picks than KS", short)] {
+        let host = case.expected();
+        let expected = (case.v41_reference(), host.1, host.2);
         check_natives_against(name, false, &case, new_form_refusals(false), true, &expected);
     }
 }
@@ -2904,7 +3027,7 @@ fn two_source_without_picks_equals_one_source() {
         let expected = one_source.expected();
         for device in devices() {
             let backend = device.backend();
-            if !matches!(backend, BackendName::Cpu | BackendName::Metal) {
+            if !matches!(backend, BackendName::Cpu | BackendName::Metal | BackendName::Vulkan) {
                 continue;
             }
             // The decode rows through both entries.
@@ -2983,8 +3106,8 @@ fn small_key_rounding_cases() -> Vec<(&'static str, bool, Case)> {
 /// with the independent rounding model, and their appended keys lie on the
 /// rounding's grid; the holds move some rounded key. The natives and the
 /// dense appends store the host model's rounded keys, and the natives'
-/// results are the host model's over the keys they stored; the CUDA and
-/// Vulkan decode declarations refuse the form.
+/// results are the host model's over the keys they stored; the CUDA decode
+/// declaration refuses the form.
 #[test]
 fn key_rounding_matches_portable_body() {
     let (mut failures, mut moved) = (Vec::new(), 0);
@@ -3114,4 +3237,585 @@ fn v41_compressed_natives_round_and_attend() {
         }
     }
     assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The widest verify block: a verification pass's rows.
+const VERIFY_ROWS: usize = 16;
+
+/// The rows of a verify block of `width` rows ending where a VERIFY_ROWS-row
+/// block after `history` rows ends: block row j, the widest block's row
+/// i = VERIFY_ROWS - width + j, sees the history before the block, [0,
+/// history + VERIFY_ROWS - width), and the block's fresh rows 0..=j,
+/// appending at history + i.
+fn verify_rows(history: i32, width: usize) -> Vec<Row> {
+    let first = VERIFY_ROWS - width;
+    (0..width)
+        .map(|j| {
+            let i = (first + j) as i32;
+            Row {
+                spans: vec![(0, history + first as i32)],
+                fresh: (0, j as i32 + 1),
+                destination: history + i,
+                position: history + i,
+            }
+        })
+        .collect()
+}
+
+impl Case {
+    /// The verify block of `width` rows ending where this widest block
+    /// (`verify_rows`) ends, over `history`: each row's inputs, picks and
+    /// coordinates are the widest block's same row's, and the history holds
+    /// the rows the widest block appended (`history_key`, `history_value`).
+    fn narrowed(&self, history: i32, width: usize, history_key: &[f32], history_value: &[f32]) -> Self {
+        assert_eq!(self.rows, VERIFY_ROWS);
+        let first = VERIFY_ROWS - width;
+        let mut case = Self::new(
+            self.form,
+            self.history_rows,
+            verify_rows(history, width),
+            self.slab_rows,
+            1.0,
+            self.scale,
+            0,
+        );
+        let rows = |values: &[f32]| {
+            let per = values.len() / VERIFY_ROWS;
+            values[first * per..].to_vec()
+        };
+        case.query = rows(&self.query);
+        case.gate = rows(&self.gate);
+        case.key = rows(&self.key);
+        case.value = rows(&self.value);
+        case.query_norm = self.query_norm.clone();
+        case.key_norm = self.key_norm.clone();
+        case.value_norm = self.value_norm.clone();
+        case.sinks = self.sinks.clone();
+        case.components = self.components.clone();
+        case.frequencies = self.frequencies.clone();
+        case.amplitudes = self.amplitudes.clone();
+        case.history_key = history_key.to_vec();
+        case.history_value = history_value.to_vec();
+        case.epsilon = self.epsilon;
+        case.picks = self.picks;
+        case.selected_rows = self.selected_rows[first * self.picks..].to_vec();
+        case.selected = self.selected.clone();
+        case.selected_slab_rows = self.selected_slab_rows;
+        case.key_rounding = self.key_rounding;
+        case
+    }
+}
+
+/// A decode row's result on Metal and the CPU is bit for bit the same at
+/// verify widths 1, 2, 4, 8 and 16 under one specialization: the same row
+/// over the same history, its earlier block rows fresh keys at the wider
+/// widths and history rows (as the widest launch appended them) at the
+/// narrower. So its reduction order is set by key positions alone, and a
+/// prepared fresh key and value equal the appended ones bit for bit (the
+/// narrower widths read as history what the wider attend fresh). Every
+/// configuration that holds one row a work item is checked, over a history
+/// crossing slabs: Muse (Metal's vector, matrix and shared-tile forms), and
+/// V4.1's compressed layer small and at its shape (picks, rounded keys,
+/// sinks, stored-key values, the output rotary). The re-appended rows equal
+/// the widest launch's.
+#[test]
+fn decode_rows_are_the_same_at_every_verify_width() {
+    let history = 300;
+    let scale = 1.0 / (512f32).sqrt();
+    let cases = [
+        ("muse", Case::new(MUSE, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, 0.125, 110)),
+        (
+            "small v41",
+            Case::new(SMALL_V41, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, 0.125, 111)
+                .with_theta(1.0e4)
+                .with_sinks(112)
+                .with_picks(48, 1000, 256, 113)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+        (
+            "v41",
+            Case::new(V41, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, scale, 114)
+                .with_theta(1.0e4)
+                .with_sinks(115)
+                .with_picks(64, 1000, 256, 116)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for device in devices()
+        .into_iter()
+        .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Cpu))
+    {
+        for (name, case) in &cases {
+            // Row tiles of several rows (TOKENS > 1) share tiles across rows.
+            for config in case_configurations(&device, true, case)
+                .into_iter()
+                .filter(|config| config.iter().all(|&(name, value)| name != "TOKENS" || value == 1))
+            {
+                let specialization = config
+                    .iter()
+                    .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
+                let label = format!("{name} {:?} {config:?}", device.backend());
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let widest = run(&device, true, &specialization, case)
+                        .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
+                    let row = case.form.heads() * case.form.w();
+                    for width in [8usize, 4, 2, 1] {
+                        let narrow = case.narrowed(history, width, &widest.1, &widest.2);
+                        let actual = run(&device, true, &specialization, &narrow)
+                            .unwrap_or_else(|error| panic!("{label} width {width}: {error}"));
+                        assert_eq!(
+                            bits(&actual.0),
+                            bits(&widest.0[(VERIFY_ROWS - width) * row..]),
+                            "{label}: width {width}'s rows differ from width {VERIFY_ROWS}'s"
+                        );
+                        assert_eq!(bits(&actual.1), bits(&widest.1), "{label} width {width}: key plane");
+                        assert_eq!(bits(&actual.2), bits(&widest.2), "{label} width {width}: value plane");
+                    }
+                }));
+                if outcome.is_err() {
+                    failures.push(label);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The time of `attention_decode` on Metal at DeepSeek V4.1 Flash's decode
+/// shape as its compressed layers serve it: one row (M = 1), its 64 query
+/// heads over one 512-wide kv head, sinks, its window keys rounded
+/// (KR = 1), reading the 128-row sliding window before its fresh row at
+/// 32768 and 512 picks (KS = 512) spread evenly over the 8192 rows its
+/// source pools at 4 tokens a row, as the executor's tuning case picks
+/// them. The history holds all 32768 rows, so the picks' addresses spread
+/// as served; it is one slab, which the window reads as one span. Picks run
+/// in the matrix forms alone; the whole group is held by the shared-tile
+/// form (MATRIX 2), whose default the entry names first. It is timed at
+/// KEYS 8 over PARTS 8, 16 and 32 (the partitions split the row's 641 keys,
+/// window, fresh row and picks, into at least SPAN 32 each), KEYS 16 printed
+/// inadmissible (49664 threadgroup bytes), and at the default once more
+/// with gate_function -1: the launches, the append and nothing else, the
+/// call's launch floor. Each configuration is timed as the default of its
+/// own survey, its every parameter fixed: the survey's domain is that one
+/// configuration, the formed default its only program. It prints each one's
+/// median device seconds a call and, as context, the rate at which it reads
+/// its logical bytes (each window row, pick and the fresh row once).
+#[test]
+#[ignore = "times attention_decode at V4.1's decode shape on Metal; run it by name under a timed hold"]
+fn attention_decode_at_deepseek_v41_decode_shape_times() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
+    let row = Row {
+        spans: vec![((context - window) as i32, context as i32)],
+        fresh: (0, 1),
+        destination: context as i32,
+        position: context as i32,
+    };
+    let mut case = Case::new(V41, context + 1, vec![row], context + 1, 1.0, 1.0 / (512f32).sqrt(), 100)
+        .with_theta(1.0e4)
+        .with_sinks(101)
+        .with_picks(picks, pooled, pooled, 102)
+        .with_key_rounding(KEY_ROUNDING);
+    case.selected_rows = (0..picks).map(|pick| (pick * pooled / picks) as i32).collect();
+    let bytes = (window + picks + 1) * V41.kv * V41.w() * 2;
+    let entry =
+        attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    let statics = statics(&device, V41, case.sink_rows())
+        .with_static("KR", 1)
+        .with_static("KS", picks as u64);
+    println!(
+        "attention_decode v41 m1 default: {:?}",
+        entry
+            .default_specialization(&device, &statics)
+            .unwrap()
+            .map(|default| default.params().clone())
+    );
+    let gate_function = i32::from(case.form.softplus);
+    for (parts, keys, gate_function) in [
+        (16, 8, gate_function),
+        (8, 8, gate_function),
+        (32, 8, gate_function),
+        (16, 16, gate_function),
+        (16, 8, -1),
+    ] {
+        let name = format!("shared PARTS {parts} KEYS {keys} gate_function {gate_function}");
+        let configuration = [
+            ("SPAN", 32),
+            ("PARTS", parts),
+            ("SIMDS", 4),
+            ("SLICES", 1),
+            ("MATRIX", 2),
+            ("KEYS", keys),
+            ("TOKENS", 1),
+            ("HEADS", 64),
+        ]
+        .into_iter()
+        .fold(statics.clone(), |s, (n, v)| s.with_param(n, v));
+        if !entry.specialization_valid(&device, &configuration).unwrap() {
+            println!("attention_decode v41 m1 {name}: inadmissible");
+            continue;
+        }
+        let mut bound = Bound::new(&device, &case);
+        let mut pristine = (
+            bound.history_key.clone(),
+            bound.history_key.read_to_host().unwrap(),
+        );
+        let initialize: seismic::TuningInitializer<'_> =
+            Box::new(move || pristine.0.write_from_host(&pristine.1));
+        let rounding = case.rounding_scalars();
+        let point = seismic::TuningPoint {
+            label: "m1".into(),
+            weight: 1.0,
+            class: None,
+            cost: 1.0,
+            workload: seismic::WorkloadRotation::All,
+            rotation: vec![attention_decode::Args {
+                query: &bound.query,
+                gate: &bound.gate,
+                key: &bound.key,
+                value: &bound.value,
+                query_norm: &bound.query_norm,
+                key_norm: &bound.key_norm,
+                value_norm: &bound.value_norm,
+                sinks: &bound.sinks,
+                rotary_components: &bound.components,
+                rotary_frequencies: &bound.frequencies,
+                rotary_amplitudes: &bound.amplitudes,
+                coordinates: &bound.coordinates,
+                visible: &bound.visible,
+                fresh: &bound.fresh,
+                destinations: &bound.destinations,
+                selected_rows: &bound.selected_rows,
+                selected: &bound.selected,
+                history_key: &mut bound.history_key,
+                history_value: &mut bound.history_value,
+                form: &bound.form,
+                epsilon: case.epsilon,
+                scale: case.scale,
+                gate_function,
+                slab_rows: case.slab_rows as u32,
+                selected_slab_rows: case.selected_slab_rows as u32,
+                key_block: rounding.block,
+                key_element: rounding.element,
+                key_scale: rounding.scale,
+                key_amax_floor: rounding.amax_floor,
+            }],
+            initialize: Some(initialize),
+            written: Default::default(),
+        };
+        let result = attention_decode::native_tune_with(
+            &device,
+            attention_decode::Elements { A: Element::bf16() },
+            &configuration,
+            vec![point],
+            seismic::NumericalRequirement::RoundingSteps {
+                alpha: 8.,
+                activation: Some(seismic::DType::BF16),
+            },
+            seismic::Strategy::Survey(seismic::SurveyPlan {
+                samples: 15,
+                min_sample_seconds: 0.001,
+                domains: Default::default(),
+            }),
+        )
+        .unwrap();
+        let [record] = &result.configurations[..] else {
+            panic!("{name}: a fixed configuration surveys itself alone");
+        };
+        let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+            println!("attention_decode v41 m1 {name}: not measured: {:?}", record.outcome);
+            continue;
+        };
+        let median = points[0].median_seconds;
+        println!(
+            "attention_decode v41 m1 {name}: {:.1} us a call; {bytes} bytes read at {:.1} GB/s",
+            median * 1e6,
+            bytes as f64 / median / 1e9
+        );
+    }
+}
+
+/// The time of `attention_prefill` on Metal at DeepSeek V4.1 Flash's prefill
+/// shape for a layer with picks: a 2048-token prompt's rows (M = 2048) from
+/// position 0, each over its window of up to 128 of the prompt's own rows
+/// (fresh, KR = 1) and KS = 512 picks of a 2048-row pooled plane (every
+/// seventh -1), 64 query heads over one 512-wide kv head with sinks: the
+/// prepare launch appending the rows, then one shared-tile threadgroup per
+/// row publishing it. The configuration is timed as the default of its own
+/// survey with every parameter fixed (KEYS 8, the one V4.1's 512-wide head
+/// admits), so the survey's domain is that one configuration. It prints the
+/// median device seconds a call and the rate of its useful arithmetic
+/// (4 · 64 · 512 FLOP a row-key).
+#[test]
+#[ignore = "times attention_prefill with picks at V4.1's prefill shape on Metal; run it by name under a timed hold"]
+fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let (rows, window, picks, pooled) = (2048usize, 128i32, 512usize, 2048usize);
+    let case = Case::new(V41, 64 + rows, window_rows(rows, 0, window), 4096, 1.0, 1.0 / (512f32).sqrt(), 110)
+        .with_theta(1.0e4)
+        .with_sinks(111)
+        .with_picks(picks, pooled, pooled, 112)
+        .with_key_rounding(KEY_ROUNDING);
+    let keys: usize = (0..rows)
+        .map(|r| r.min(window as usize - 1) + 1 + (0..picks).filter(|pick| (r + pick) % 7 != 3).count())
+        .sum();
+    let entry =
+        attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() });
+    let configuration = [("QT", 16), ("HEADS", 16), ("SPLIT_GROUPS", 256), ("DIRECT", 0), ("KEYS", 8)]
+        .into_iter()
+        .fold(
+            statics(&device, V41, case.sink_rows())
+                .with_static("B", 0)
+                .with_static("KR", 1)
+                .with_static("KS", picks as u64),
+            |s, (n, v)| s.with_param(n, v),
+        );
+    assert!(
+        entry.specialization_valid(&device, &configuration).unwrap(),
+        "V4.1's picks layer is admitted at KEYS 8"
+    );
+    let mut bound = Bound::new(&device, &case);
+    let mut pristine = (
+        bound.history_key.clone(),
+        bound.history_key.read_to_host().unwrap(),
+    );
+    let initialize: seismic::TuningInitializer<'_> =
+        Box::new(move || pristine.0.write_from_host(&pristine.1));
+    let rounding = case.rounding_scalars();
+    let point = seismic::TuningPoint {
+        label: "m2048".into(),
+        weight: 1.0,
+        class: None,
+        cost: 1.0,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![attention_prefill::Args {
+            query: &bound.query,
+            gate: &bound.gate,
+            key: &bound.key,
+            value: &bound.value,
+            query_norm: &bound.query_norm,
+            key_norm: &bound.key_norm,
+            value_norm: &bound.value_norm,
+            sinks: &bound.sinks,
+            rotary_components: &bound.components,
+            rotary_frequencies: &bound.frequencies,
+            rotary_amplitudes: &bound.amplitudes,
+            coordinates: &bound.coordinates,
+            visible: &bound.visible,
+            fresh: &bound.fresh,
+            destinations: &bound.destinations,
+            selection: &bound.selection,
+            block_slots: &bound.block_slots,
+            selected_rows: &bound.selected_rows,
+            selected: &bound.selected,
+            history_key: &mut bound.history_key,
+            history_value: &mut bound.history_value,
+            form: &bound.form,
+            epsilon: case.epsilon,
+            scale: case.scale,
+            gate_function: i32::from(case.form.softplus),
+            slab_rows: case.slab_rows as u32,
+            selected_slab_rows: case.selected_slab_rows as u32,
+            key_block: rounding.block,
+            key_element: rounding.element,
+            key_scale: rounding.scale,
+            key_amax_floor: rounding.amax_floor,
+        }],
+        initialize: Some(initialize),
+        written: Default::default(),
+    };
+    let result = attention_prefill::native_tune_with(
+        &device,
+        attention_prefill::Elements { A: Element::bf16() },
+        &configuration,
+        vec![point],
+        seismic::NumericalRequirement::RoundingSteps {
+            alpha: 8.,
+            activation: Some(seismic::DType::BF16),
+        },
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 15,
+            min_sample_seconds: 0.001,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    let [record] = &result.configurations[..] else {
+        panic!("a fixed configuration surveys itself alone");
+    };
+    let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+        panic!("the configuration is measured: {:?}", record.outcome);
+    };
+    let median = points[0].median_seconds;
+    let flops = (keys * 4 * 64 * 512) as f64;
+    println!(
+        "attention_prefill v41 picks m{rows} shared KEYS 8: {:.3} ms a call, {:.2} TFLOPS of its {keys} row-keys",
+        median * 1e3,
+        flops / median / 1e12
+    );
+}
+
+/// The time of DeepSeek V4.1 Flash's decode attention on Vulkan at its
+/// decode shape as its compressed layers serve it: one row (M = 1), its 64
+/// query heads over one 512-wide kv head, sinks, its window keys rounded
+/// (KR = 1), reading the 128-row sliding window before its fresh row at
+/// 32768 and 512 picks (KS = 512) spread evenly over the 8192 rows its
+/// source pools at 4 tokens a row (the shape of Metal's
+/// `attention_decode_at_deepseek_v41_decode_shape_times`). It times both
+/// entries that can serve the row: `attention_prefill` at M = 1, which
+/// served it while the decode entry refused V4.1's forms (its picks one
+/// subgroup per query head), and `attention_decode`'s matrix form (picks as
+/// key tiles, queries from its prepare launch). Each configuration is timed
+/// as the default of its own survey, its every parameter fixed. It prints
+/// each entry's default, then each configuration's median device seconds a
+/// call and, as context, the rate at which it reads its logical bytes (each
+/// window row, pick and the fresh row once).
+#[test]
+#[ignore = "times V4.1's decode attention on Vulkan; run it by name under a timed hold"]
+fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Vulkan)
+    else {
+        return;
+    };
+    let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
+    let row = Row {
+        spans: vec![((context - window) as i32, context as i32)],
+        fresh: (0, 1),
+        destination: context as i32,
+        position: context as i32,
+    };
+    let mut case = Case::new(V41, context + 1, vec![row], context + 1, 1.0, 1.0 / (512f32).sqrt(), 100)
+        .with_theta(1.0e4)
+        .with_sinks(101)
+        .with_picks(picks, pooled, pooled, 102)
+        .with_key_rounding(KEY_ROUNDING);
+    case.selected_rows = (0..picks).map(|pick| (pick * pooled / picks) as i32).collect();
+    let bytes = (window + picks + 1) * V41.kv * V41.w() * 2;
+    let statics = statics(&device, V41, case.sink_rows())
+        .with_static("KR", 1)
+        .with_static("KS", picks as u64);
+    let rounding = case.rounding_scalars();
+    // Surveys `$module` at `$configuration` alone and prints its median.
+    macro_rules! time {
+        ($module:ident, $name:expr, $configuration:expr $(, $extra:ident)*) => {{
+            let entry = $module::native_entry_with($module::Elements { A: Element::bf16() });
+            let configuration = $configuration;
+            if !entry.specialization_valid(&device, &configuration).unwrap() {
+                println!("{} v41 m1 {}: inadmissible", stringify!($module), $name);
+            } else {
+                let mut bound = Bound::new(&device, &case);
+                let mut pristine = (bound.history_key.clone(), bound.history_key.read_to_host().unwrap());
+                let initialize: seismic::TuningInitializer<'_> =
+                    Box::new(move || pristine.0.write_from_host(&pristine.1));
+                let point = seismic::TuningPoint {
+                    label: "m1".into(),
+                    weight: 1.0,
+                    class: None,
+                    cost: 1.0,
+                    workload: seismic::WorkloadRotation::All,
+                    rotation: vec![$module::Args {
+                        $($extra: &bound.$extra,)*
+                        query: &bound.query,
+                        gate: &bound.gate,
+                        key: &bound.key,
+                        value: &bound.value,
+                        query_norm: &bound.query_norm,
+                        key_norm: &bound.key_norm,
+                        value_norm: &bound.value_norm,
+                        sinks: &bound.sinks,
+                        rotary_components: &bound.components,
+                        rotary_frequencies: &bound.frequencies,
+                        rotary_amplitudes: &bound.amplitudes,
+                        coordinates: &bound.coordinates,
+                        visible: &bound.visible,
+                        fresh: &bound.fresh,
+                        destinations: &bound.destinations,
+                        selected_rows: &bound.selected_rows,
+                        selected: &bound.selected,
+                        history_key: &mut bound.history_key,
+                        history_value: &mut bound.history_value,
+                        form: &bound.form,
+                        epsilon: case.epsilon,
+                        scale: case.scale,
+                        gate_function: i32::from(case.form.softplus),
+                        slab_rows: case.slab_rows as u32,
+                        selected_slab_rows: case.selected_slab_rows as u32,
+                        key_block: rounding.block,
+                        key_element: rounding.element,
+                        key_scale: rounding.scale,
+                        key_amax_floor: rounding.amax_floor,
+                    }],
+                    initialize: Some(initialize),
+                    written: Default::default(),
+                };
+                let result = $module::native_tune_with(
+                    &device,
+                    $module::Elements { A: Element::bf16() },
+                    &configuration,
+                    vec![point],
+                    seismic::NumericalRequirement::RoundingSteps { alpha: 8., activation: Some(seismic::DType::BF16) },
+                    seismic::Strategy::Survey(seismic::SurveyPlan {
+                        samples: 15,
+                        min_sample_seconds: 0.001,
+                        domains: Default::default(),
+                    }),
+                )
+                .unwrap();
+                let [record] = &result.configurations[..] else {
+                    panic!("{}: a fixed configuration surveys itself alone", $name);
+                };
+                let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+                    panic!("{}: the default is measured", $name);
+                };
+                let median = points[0].median_seconds;
+                println!(
+                    "{} v41 m1 {}: {:.1} us a call; {bytes} bytes read at {:.1} GB/s",
+                    stringify!($module),
+                    $name,
+                    median * 1e6,
+                    bytes as f64 / median / 1e9
+                );
+            }
+        }};
+    }
+    let prefill_statics = statics.clone().with_static("B", 0);
+    println!(
+        "attention_prefill v41 m1 default: {:?}",
+        attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() })
+            .default_specialization(&device, &prefill_statics)
+            .unwrap()
+            .map(|default| default.params().clone())
+    );
+    for (rows, split) in [(64, 256), (64, 512), (128, 256)] {
+        let configuration = [("ROWS", rows), ("SPLIT_GROUPS", split)]
+            .into_iter()
+            .fold(prefill_statics.clone(), |s, (n, v)| s.with_param(n, v));
+        time!(attention_prefill, format!("ROWS {rows} SPLIT_GROUPS {split}"), configuration, selection, block_slots);
+    }
+    println!(
+        "attention_decode v41 m1 default: {:?}",
+        attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() })
+            .default_specialization(&device, &statics)
+            .unwrap()
+            .map(|default| default.params().clone())
+    );
+    for parts in [16, 32, 64, 128] {
+        let configuration = [("SPAN", 32), ("PARTS", parts), ("SIMDS", 4), ("SLICES", 1), ("MATRIX", 1)]
+            .into_iter()
+            .fold(statics.clone(), |s, (n, v)| s.with_param(n, v));
+        time!(attention_decode, format!("matrix SIMDS 4 PARTS {parts}"), configuration);
+    }
 }

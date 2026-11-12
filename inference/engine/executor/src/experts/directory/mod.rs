@@ -528,6 +528,8 @@ impl Directory {
         for layer in (0..groups.len()).filter(|&layer| groups[layer] == group) {
             ranking.resize(layer, share(kept, &groups, group));
         }
+        // The group's victims were prepared at the shares before.
+        self.host[group].unprepare();
     }
 
     /// Group `group` keeps `records` of its records free or releasing from
@@ -762,13 +764,21 @@ impl Directory {
         }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].claim_demand((layer, expert), demand, rank, read, park)
+        let shares = self.store_shares(&reuse);
+        self.host[group].claim_demand((layer, expert), demand, rank, shares, read, park)
     }
 
     /// The posted read of `layer`'s `expert`, which no record took, ended
     /// unlanded or was never made ([`HostRecords::unposted`]).
     pub fn unposted(&mut self, layer: usize, expert: usize) {
         self.tier(layer).unposted((layer, expert));
+    }
+
+    /// The shares the host records hold each layer to (`Reuse::shares`):
+    /// the one store's records are the bank's, whose shares the ranking
+    /// measures; a host tier beside the bank's records holds none.
+    fn store_shares<'a>(&self, reuse: &'a Reuse) -> Option<&'a [usize]> {
+        (self.placer == crate::planning::Placer::Bank).then(|| reuse.shares())
     }
 
     /// Prepare `layer`'s group's demand victims, `depth` of them
@@ -782,7 +792,8 @@ impl Directory {
         }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].prepare_demand(rank, depth, sequence);
+        let shares = self.store_shares(&reuse);
+        self.host[group].prepare_demand(rank, shares, depth, sequence);
     }
 
     /// `layer`'s `expert` landed whole into tier record `record`, read at
@@ -820,7 +831,7 @@ impl Directory {
     pub fn refill_victims(&self, reserve: usize, lent: bool) -> Vec<Vec<(u32, Staged)>> {
         let reuse = self.reuse_now();
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host.iter().map(|records| records.refill_victims(reserve, rank, lent)).collect()
+        self.host.iter().map(|records| records.refill_victims(reserve, rank, self.store_shares(&reuse), lent)).collect()
     }
 
     /// Unmap each group's `victims` ([`HostRecords::refill`]), under the
@@ -1210,7 +1221,8 @@ impl Directory {
         }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].shrink(records, rank).into_iter().map(|(from, to)| (HostRecord(from), HostRecord(to))).collect()
+        let shares = self.store_shares(&reuse);
+        self.host[group].shrink(records, rank, shares).into_iter().map(|(from, to)| (HostRecord(from), HostRecord(to))).collect()
     }
 
     /// The fewest records group `group`'s one store may be cut to beside

@@ -5,6 +5,7 @@
 
 use lib::vision::vision;
 
+#[inline(always)]
 fn vision_norm<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (g, h) = (cx.dim_g() as usize, cx.dim_h() as usize);

@@ -869,32 +869,35 @@ template <u32 ID> struct Table {
 };
 
 // E4M3 bytes (`registry::ValueCodes::E4m3`), read from a step's slots
-// (`P::slots`) as their values v: the registry's integer code 2^9 v under
-// exponent -9 is v under exponent 0 (`CodeExponentOf`), which both 16-bit
-// operands hold exactly (E4M3's values, 2^-9 .. 448 with three mantissa
-// bits, lie in F16's and BF16's), where F16 cannot hold 2^9 v past 2^7. A
-// code's sign is kept on a zero; a NaN code (S.1111.111) is NaN. No int8
-// form takes them (`forms::cuda_int8`), so they have no s8 bytes.
+// (`P::slots`) as their exact values v, which both 16-bit operands hold
+// exactly (E4M3's values, 2^-9 .. 448 with three mantissa bits, lie in
+// F16's and BF16's). A code's sign is kept on a zero; both NaN codes
+// (S.1111.111) are the registry's one NaN, 0x7fc00000 (an operand's quiet
+// NaN, which widens to it). No int8 form takes them (`forms::cuda_int8`),
+// so they have no s8 bytes.
 struct E4M3 {
     template <int BITS> static constexpr bool READS = BITS == 8;
     // v: an E4M3 code's magnitude is the UE4M3 value of its bits
-    // (`UE4M3Scale::decode`, which ignores the sign bit), under its sign.
+    // (`UE4M3Scale::decode`, which ignores the sign bit), under its sign but
+    // a NaN code's.
     __device__ static __forceinline__ float value(u32 code) {
-        return __uint_as_float(__float_as_uint(UE4M3Scale::decode(code)) | ((code & 0x80u) << 24));
+        const float magnitude = UE4M3Scale::decode(code);
+        return (code & 0x7Fu) == 0x7Fu ? magnitude
+                                       : __uint_as_float(__float_as_uint(magnitude) | ((code & 0x80u) << 24));
     }
     // The codes in bits 0..7 and 16..23 of `pair` (its other bits ignored)
     // as an O pair. A code's magnitude bits (e e e e m m m) at the operand's
     // low exponent bits and top mantissa bits read v 2^(7 - bias), for e = 0
     // the operand's subnormal, so one exact scaling by 2^(bias - 7) forms v;
-    // its sign bit is the operand's, and a NaN code's operand takes a quiet
-    // NaN's exponent and top mantissa bit.
+    // its sign bit is the operand's but a NaN code's, and a NaN code's
+    // operand takes a positive quiet NaN's exponent and top mantissa bit.
     template <class O> __device__ static __forceinline__ u32 operands(u32 pair) {
         constexpr u32 FACTOR = O::BIAS_POWER - (7u << O::MANTISSA);
         constexpr u32 QUIET_NAN = 0x7FFFu & ~((1u << (O::MANTISSA - 1)) - 1u);
         const u32 magnitude = pair & 0x007F007Fu;
         const u32 nan = ((magnitude + 0x00010001u) >> 7) & 0x00010001u;
-        return O::scale(magnitude << (O::MANTISSA - 3), FACTOR * 0x00010001u) | ((pair & 0x00800080u) << 8) |
-               nan * QUIET_NAN;
+        return O::scale(magnitude << (O::MANTISSA - 3), FACTOR * 0x00010001u) |
+               (((pair & 0x00800080u) << 8) & ~(nan * 0x8000u)) | nan * QUIET_NAN;
     }
     // Register i: slots i (low half) and 4 + i, byte i of `low` and `high`.
     template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
@@ -2474,17 +2477,6 @@ template <int OFFSET, u32 TABLE> struct CodesOf<SEISMIC_CODES_TABLE, OFFSET, TAB
 template <int OFFSET, u32 TABLE> struct CodesOf<SEISMIC_CODES_ODD, OFFSET, TABLE> { typedef Odd<(u32)OFFSET> type; };
 template <int OFFSET, u32 TABLE> struct CodesOf<SEISMIC_CODES_E4M3, OFFSET, TABLE> { typedef E4M3 type; };
 
-// The code exponent a decoder's scales carry (`_CODES_EXPONENT`, the
-// registry's), but E4M3's: its interpretation reads each registry code
-// 2^9 v as v (`E4M3`), so its scales carry none.
-template <u32 CODES, int CODE_EXPONENT> struct CodeExponentOf {
-    static constexpr int value = CODE_EXPONENT;
-};
-template <int CODE_EXPONENT> struct CodeExponentOf<SEISMIC_CODES_E4M3, CODE_EXPONENT> {
-    static_assert(CODE_EXPONENT == -9, "E4M3's registry codes are 2^9 times their values");
-    static constexpr int value = 0;
-};
-
 template <u32 SCALE> struct ScaleOf;
 template <> struct ScaleOf<SEISMIC_SCALE_F16> { typedef F16Scale type; };
 template <> struct ScaleOf<SEISMIC_SCALE_BF16> { typedef BF16Scale type; };
@@ -2613,7 +2605,7 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
                             ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),                    \
                             ELEMENT_CAT(P, _LOGICAL_GROUP), ELEMENT_CAT(P, _COEFF_FACTOR_GROUP),               \
                             ELEMENT_CAT(P, _COEFF_EXPONENT),                                                   \
-                            packets::CodeExponentOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODES_EXPONENT)>::value, \
+                            ELEMENT_CAT(P, _CODES_EXPONENT),                                                   \
                             ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_LOCAL_SCALE_BITS),        \
                             ELEMENT_CAT(P, _COEFF_LOCAL),                                                      \
                             ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET), ELEMENT_CAT(P, _COEFF_CARRIED),                \

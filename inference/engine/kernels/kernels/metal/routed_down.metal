@@ -8,6 +8,8 @@
 #define PACKETS_PLAIN_RECORDS
 #endif
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
+// Staged at 16 lanes too, past 2 packets a lane (`routed::stage_packets`).
+#define ROUTED_DOWN_STAGES_AT_16
 #include "lib/routed/down.h"
 #include "lib/routed/down_sum.h"
 

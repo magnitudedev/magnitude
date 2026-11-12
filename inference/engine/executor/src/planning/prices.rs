@@ -1,4 +1,4 @@
-//! What the plan's settle prices its holdings with (`domain::value`): the
+//! What the plan prices its holdings with: the
 //! generic prior assessment estimates with, from the model's headers and
 //! the machine's standing figures alone (`ExecutorCosts`,
 //! `StreamedFigures`), never live data or recorded data of a model. A bank
@@ -104,8 +104,8 @@ pub(crate) struct Prior {
     launch_rows: u32,
     prefill_launches: u64,
     prefill_depth: u32,
-    /// The rows of one launch's region of a prompt pass
-    /// (`pass_buffer_bytes`'s widest row class).
+    /// The rows of one launch's region of a prompt pass: the widest row
+    /// class of a launch.
     pub(crate) region_rows: u64,
 }
 

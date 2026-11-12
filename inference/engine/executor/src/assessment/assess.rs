@@ -12,7 +12,6 @@ use super::executor_costs::ExecutorCosts;
 use super::launches::Declarations;
 use super::misses::HeldSlots;
 use super::AssessmentError;
-use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
@@ -186,7 +185,11 @@ pub enum ColdSource {
     /// experts at load (inclusive of the bank's), as many as host memory
     /// admits, growing as it lets it; the rest read from the model file.
     /// The floor's speed (`floor_performance`) is priced beside it.
-    HostTier { slots: u64 },
+    /// `cache_bytes` is what the tier holds past its floor
+    /// (`ExpertBankPlan::host_cache`): cache the load grows into free host
+    /// RAM, which no store's required bytes count, as the fit charges the
+    /// tier at its floor.
+    HostTier { slots: u64, cache_bytes: u64 },
     /// The model file, read on demand.
     File(FileOnly),
 }
@@ -205,13 +208,20 @@ pub enum FileOnly {
 impl ExpertShares {
     /// The shares of a streamed `bank`, which holds fewer than every
     /// expert: its floor, its slots and where its cold experts lie.
+    /// A linked tier's cache was computed when the plan sized the tier at
+    /// its slots, so computing it again cannot fail.
     pub fn of(bank: &crate::planning::ExpertBankPlan) -> Self {
         Self::new(
             bank.floor(),
             bank.slots,
             bank.widest(),
             match bank.host() {
-                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => ColdSource::HostTier { slots: bank.host_slots },
+                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => {
+                    let cache_bytes = bank
+                        .host_cache(bank.host_slots)
+                        .expect("a planned host tier's cache was computed when the plan sized it");
+                    ColdSource::HostTier { slots: bank.host_slots, cache_bytes }
+                }
                 crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
                 crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),
             },
@@ -257,7 +267,7 @@ impl ExpertShares {
     pub fn held(&self, slots: u64) -> HeldSlots {
         let count = |value: u64| usize::try_from(value).expect("a layer's experts fit the host");
         let host = match self.cold {
-            ColdSource::HostTier { slots } => slots,
+            ColdSource::HostTier { slots, .. } => slots,
             ColdSource::File(_) => 0,
         };
         HeldSlots { slots: count(slots), host: count(host) }
@@ -451,6 +461,27 @@ impl StructuralCharge {
         .map(|(structure, ())| structure)
     }
 
+    /// The structure of `draft`'s charge, a draft that differs from this
+    /// structure's only in its pass (`ModelLoadPlan::pass`): its target
+    /// family certified at that pass beside everything else as it is
+    /// (`AssessmentGraphResourceBounds::at_pass`), which no pass moves.
+    pub fn at_pass(&self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
+        let policy = draft.policy();
+        let graph = self
+            .graph
+            .at_pass(
+                definition,
+                draft.load(),
+                &state_plan(definition, draft)?,
+                policy.method(),
+                policy.codec(),
+                policy.limits(),
+                draft.device().backend(),
+            )
+            .map_err(AssessmentError::Graph)?;
+        Ok(Self { graph, host_process: self.host_process, device_process: self.device_process })
+    }
+
     /// The structure of `draft`'s charge with the graph bounds `graph`
     /// derives from its state plan, and what else `graph` gives.
     fn with_graph<T>(
@@ -483,9 +514,9 @@ impl StructuralCharge {
         let policy = draft.policy();
         let state = state_plan(definition, draft)?;
         let state_bytes = || -> Result<_, String> {
-            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?, state.loaded_state_bytes()?))
+            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?))
         };
-        let (workload_state_bytes, startup_state_bytes, loaded_state_bytes) =
+        let (workload_state_bytes, startup_state_bytes) =
             state_bytes().map_err(AssessmentError::Memory)?;
         let terms = AssessmentMemoryTerms::derive(
             definition,
@@ -510,8 +541,7 @@ impl StructuralCharge {
                     bounds,
                     workload_state_bytes,
                     startup_state_bytes,
-                    loaded_state_bytes,
-                    group_class(draft, &self.graph)?,
+                    self.graph.target.group_bytes.most(),
                 )
             })
             .map_err(AssessmentError::Memory)
@@ -533,38 +563,6 @@ fn state_plan(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Resul
         },
     )
     .map_err(AssessmentError::Plan)
-}
-
-/// What a prompt group's class holds beyond the floor's
-/// (`AssessmentMemoryCharge::group_class`) at the places each pass size of
-/// `draft`'s ladder merges, up to its chain places, as a group opening
-/// grants it (`ExecutorDomain::grant_group`, `ExecutorFamily::group_demand`):
-/// the graph pools', graphs' and target buffers' (`graph`), the bank's
-/// placed words of its places and each streamed table's stagings beyond
-/// the floor's.
-fn group_class(
-    draft: &ExecutionPlanDraft,
-    graph: &crate::AssessmentGraphResourceBounds,
-) -> Result<crate::planning::ByPass<ClaimDemand>, String> {
-    let limits = draft.policy().limits();
-    crate::planning::ByPass::of(crate::PassLaunches::whole_chain(limits), |pass| {
-        let places = pass.get();
-        let pools = graph.group_class(limits, draft.device().graph_cost(), pass)?;
-        let bank = match (draft.load().expert_bank(), places) {
-            (Some(bank), 2..) => bank.placed_demand(
-                u64::try_from(places).ok().and_then(std::num::NonZeroU64::new).ok_or("a pass's places exceed u64")?,
-            )?,
-            _ => ClaimDemand::default(),
-        };
-        let stagings = draft.load().weights().try_fold(0u64, |bytes, weight| {
-            let grown = weight.staging_bytes(places)?.checked_sub(weight.staging_bytes(1)?);
-            grown.and_then(|grown| bytes.checked_add(grown)).ok_or_else(|| "a group's stagings overflow".to_owned())
-        })?;
-        pools
-            .checked_plus(bank)
-            .and_then(|demand| demand.checked_plus(ClaimDemand { device: stagings, ..Default::default() }))
-            .ok_or_else(|| "a prompt group's class overflows".to_owned())
-    })
 }
 
 /// The plain decode step's demand of `definition` planned as `draft`,
@@ -623,7 +621,7 @@ pub fn assess_execution_fit(
     let charged = |form: &crate::HeldForm, draft: ExecutionPlanDraft| -> Result<_, AssessmentError> {
         let draft = draft.with_graph_pricing(pricing);
         let charge = form.structure.charge(definition, &draft)?;
-        let fit = room.fit(&draft, &charge)?;
+        let fit = room.fit(&charge)?;
         Ok((draft, charge, fit))
     };
     let fits = |draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge, fit: crate::AssessmentFit| -> Result<_, AssessmentError> {

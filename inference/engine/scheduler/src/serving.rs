@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingCensus {
-    /// The places of the prompt-group class held now (`grant_group`).
+    /// The places of the prompt-group class held now: one, or an open
+    /// group's (`ExecutorDomain::open_group`).
     pub group_places: std::num::NonZeroUsize,
     /// The most places a prompt group may take: the load's chain capacity.
     pub group_capacity: std::num::NonZeroUsize,

@@ -5,11 +5,11 @@
 //! name. Assessments, hardware snapshots, merged worker observations and
 //! instance allocations share these names.
 
-use magnitude_engine::census::{AllocationCensus, BankResize, ExpertResidency, ShrinkCause};
+use magnitude_engine::census::{AllocationCensus, BankResize, ExpertResidency};
 use magnitude_service_contracts::MemoryDomainId;
 use magnitude_service_contracts::models::{
     ModelInstanceAllocation, ModelInstanceMemoryDomain, ModelStreamingStatus, ModelStreamingStatusParts, OutOfBounds,
-    PromptGroupPlacesParts, StreamingHostStatusParts, StreamingResize, StreamingShrinkCause, StreamingTableStatusParts,
+    PromptGroupPlacesParts, StreamingHostStatusParts, StreamingResize, StreamingTableStatusParts,
     StreamingTierStatus,
 };
 use seismic::{DeviceTopology, StoreId, StoreIdentity};
@@ -119,17 +119,7 @@ fn streaming_status(residency: &ExpertResidency) -> Result<ModelStreamingStatus,
 /// A holding's finished resize on the contract, as the engine's census states it.
 fn streaming_resize(resize: &BankResize) -> StreamingResize {
     match *resize {
-        BankResize::Shrank { cause, to, by, at_unix_ms } => StreamingResize::Shrank {
-            cause: match cause {
-                ShrinkCause::Reclaim => StreamingShrinkCause::Reclaim,
-                ShrinkCause::LiveClaim => StreamingShrinkCause::LiveClaim,
-                ShrinkCause::Rebalance => StreamingShrinkCause::Rebalance,
-                ShrinkCause::Measurement => StreamingShrinkCause::Measurement,
-            },
-            to,
-            by,
-            at_unix_ms,
-        },
+        BankResize::Shrank { to, by, at_unix_ms } => StreamingResize::Shrank { to, by, at_unix_ms },
         BankResize::Grew { from, by, at_unix_ms } => StreamingResize::Grew { from, by, at_unix_ms },
     }
 }
@@ -141,7 +131,7 @@ mod tests {
 
     /// The allocation states what the engine's census says of how it serves:
     /// its prompt groups' places, and its bank's slots, stores by name, disk
-    /// bytes and last resize with its cause.
+    /// bytes and last resize.
     #[test]
     fn an_allocation_states_the_engines_serving_census() {
         let device = seismic::StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([3; 16]));
@@ -172,14 +162,12 @@ mod tests {
                         ceiling: positive(42),
                         bytes: 500,
                         last_resize: Some(BankResize::Shrank {
-                            cause: ShrinkCause::Reclaim,
                             to: 40,
                             by: positive(1),
                             at_unix_ms: 12,
                         }),
                     }],
                     last_resize: Some(BankResize::Shrank {
-                        cause: ShrinkCause::Measurement,
                         to: 64,
                         by: positive(8),
                         at_unix_ms: 10,
@@ -211,9 +199,9 @@ mod tests {
                     "diskBytes": 900,
                     "tables": [{
                         "records": 40, "floorRecords": 1, "ceilingRecords": 42, "bytes": 500,
-                        "lastResize": { "_tag": "Shrank", "cause": "reclaim", "to": 40, "by": 1, "atUnixMs": 12 },
+                        "lastResize": { "_tag": "Shrank", "to": 40, "by": 1, "atUnixMs": 12 },
                     }],
-                    "lastResize": { "_tag": "Shrank", "cause": "measurement", "to": 64, "by": 8, "atUnixMs": 10 },
+                    "lastResize": { "_tag": "Shrank", "to": 64, "by": 8, "atUnixMs": 10 },
                 },
             })
         );

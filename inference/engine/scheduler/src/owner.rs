@@ -17,26 +17,25 @@ use super::{
     },
     prefix_cache::{
         CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
-        PrefixRetention, PrefixStep,
+        PrefixRetention,
     },
-    protocol::{RequestSnapshot, RoomGrant, RoomGranter, RoomRefusal, WorkerReply},
+    protocol::{RequestSnapshot, RoomGrant, RoomRefusal, WorkerReply},
     publication::{
         CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
         RequestError, ServiceCapacityError,
     },
-    release::{self, Pending, Release, Releases, Rung},
+    release::{self, Release, Releases, Rung},
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
     worker::Wakes,
-    workload::WorkloadRates,
 };
 use magnitude_executor::{
-    BankResize, BankResized, BankStep, BankTier, DomainError, OwnerHoldings, LoadMeasures, InvariantError, MeasurementRoom,
+    BankResize, BankResized, BankStep, BankTier, DomainError, Followed, LoadMeasures, InvariantError,
     MemoryChargeReconciliation, MemoryMoment, NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
-    ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, SlotRelease, StateBindings, SubmitError,
-    SubmitFailure, WorkKind, platform::DomainRole,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, SlotRelease, StateBindings, SubmitError,
+    SubmitFailure, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
@@ -371,8 +370,10 @@ enum Wait {
         required: u64,
         available: u64,
     },
-    /// Blind or Reclaim.
-    Memory,
+    /// The ledger named sequences to preempt that cannot be evicted now,
+    /// or the reading is blind: it retries once the epoch moves (an
+    /// eviction, a release, a request ending).
+    Memory { at: AvailabilityEpoch },
 }
 
 enum Stage {
@@ -543,10 +544,6 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             context: "device memory observation",
             detail: message,
         }),
-        error @ DomainError::Reclaim(_) => RequestError::Invariant(InvariantError {
-            context: "memory reclaim",
-            detail: error.to_string(),
-        }),
         DomainError::Input(error) => RequestError::Input(error),
         DomainError::State(error) => RequestError::State(error),
         DomainError::Device(error) | DomainError::Submit(SubmitError::Device(error)) => {
@@ -558,6 +555,10 @@ fn classify_domain_error(error: DomainError) -> RequestError {
         DomainError::WeightRead(error) => RequestError::WeightRead(error),
         error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
             context: "state ceiling",
+            detail: error.to_string(),
+        }),
+        error @ DomainError::Preempt(_) => RequestError::Invariant(InvariantError {
+            context: "state preemption",
             detail: error.to_string(),
         }),
     }
@@ -590,9 +591,8 @@ pub enum Status {
     AwaitingCompletion,
     OutputBlocked,
     Preempted,
-    /// It never ran, and waits for the release ladder to make room in
-    /// memory; it is refused (`RequestError::MemoryReclaim`) once only the
-    /// model's unload could.
+    /// It never ran, and waits on memory: the sequences the ledger named
+    /// for preemption to be evicted, or a reading that is not blind.
     MemoryBlocked,
     CapacityBlocked { required: u64, available: u64 },
     Terminal(FinishReason),
@@ -660,207 +660,10 @@ pub struct Ran {
     pub unload: bool,
 }
 
-/// How long Reclaim may persist after releases are exhausted, and how long
-/// observations may fail continuously, before the model unloads.
-const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
-
-/// How often the owner observes memory without another reason to run, in
-/// nanoseconds: the interval a load's reserves hold the host's motion over
+/// How often the owner reads memory without another reason to run, in
+/// nanoseconds: the interval the machine's reader publishes readings at
 /// ([`magnitude_executor::platform::READING_INTERVAL`]).
 const OBSERVATION_INTERVAL_NS: u64 = magnitude_executor::platform::READING_INTERVAL.as_nanos() as u64;
-
-/// One probe of every domain the loaded model uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryObservation {
-    /// Every domain's headroom is above its planning reserve.
-    Normal,
-    /// Some domain's headroom is at or below its planning reserve.
-    Reclaim,
-    /// A required observation failed.
-    Blind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryCondition {
-    Normal,
-    /// Admission and growth pause while releases run. `since` starts the
-    /// unload clock: when the band was entered, restarted whenever a release
-    /// frees memory, so the model unloads once Reclaim persists for
-    /// [`MEMORY_ESCALATION_NS`] after releases are exhausted.
-    Reclaim {
-        since: u64,
-    },
-    /// Observations have failed continuously since `since`.
-    Blind {
-        since: u64,
-    },
-}
-
-impl MemoryCondition {
-    fn observe(self, observation: MemoryObservation, now: u64) -> Self {
-        match observation {
-            MemoryObservation::Normal => Self::Normal,
-            MemoryObservation::Reclaim => match self {
-                Self::Reclaim { since } => Self::Reclaim { since },
-                _ => Self::Reclaim { since: now },
-            },
-            MemoryObservation::Blind => match self {
-                // One continuous escalation interval of Blind is Reclaim
-                // whose unload clock has already expired.
-                Self::Blind { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS => {
-                    Self::Reclaim { since }
-                }
-                Self::Blind { since } => Self::Blind { since },
-                Self::Reclaim { since } => Self::Reclaim { since },
-                Self::Normal => Self::Blind { since: now },
-            },
-        }
-    }
-
-    /// A release freed memory at `now`: releases are not exhausted yet.
-    fn released(self, now: u64) -> Self {
-        match self {
-            Self::Reclaim { .. } => Self::Reclaim { since: now },
-            other => other,
-        }
-    }
-
-    fn should_unload(self, now: u64) -> bool {
-        matches!(self, Self::Reclaim { since } if now.saturating_sub(since) >= MEMORY_ESCALATION_NS)
-    }
-}
-
-/// What of the release ladder is still in motion between flight
-/// boundaries. Only once nothing is are requests waiting on memory refused,
-/// or the model unloaded, for memory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Ladder {
-    /// Reclaim was observed while a flight held the bindings; its releases
-    /// run once they return.
-    owed: bool,
-    /// The releases running that a later flight boundary finishes: the
-    /// ladder resumes once none is.
-    pending: Pendings,
-    /// A release waits for a gap between flights or for the records in
-    /// flight to land (a bank shrink deferred, `BankStep::Deferred`): the
-    /// next boundary tries it again.
-    deferred: bool,
-    /// The last release found what is short released already, the host yet
-    /// to show it (`Release::Covered`): the next reading decides again.
-    covered: bool,
-}
-
-/// Which releases the ladder waits for a later flight boundary to finish,
-/// each kind's apart ([`Pending`]): each finish clears its own alone.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Pendings {
-    slots: bool,
-    bank: bool,
-}
-
-impl Pendings {
-    fn of(&mut self, pending: Pending) -> &mut bool {
-        match pending {
-            Pending::Slots => &mut self.slots,
-            Pending::Bank => &mut self.bank,
-        }
-    }
-
-    fn any(self) -> bool {
-        self.slots || self.bank
-    }
-}
-
-impl Ladder {
-    /// Take what one release at a rung came to.
-    fn released(&mut self, release: Release) {
-        if let Release::Pending(pending) = release {
-            *self.pending.of(pending) = true;
-        }
-        self.deferred |= release == Release::Deferred;
-        self.covered |= release == Release::Covered;
-    }
-
-    /// Whether nothing of the ladder is in motion.
-    fn settled(&self) -> bool {
-        !self.owed && !self.pending.any() && !self.deferred && !self.covered
-    }
-
-    /// A walk down the rungs begins: what it finds covered is its own.
-    fn walk(&mut self) {
-        self.covered = false;
-    }
-
-    /// Whether the model unloads: Reclaim in `condition` outlasted the clock
-    /// at `now` with nothing of the ladder in motion.
-    fn unload_due(&self, condition: MemoryCondition, now: u64) -> bool {
-        self.settled() && condition.should_unload(now)
-    }
-
-    /// At a flight boundary: whether a release was deferred to it, which is
-    /// tried again now.
-    fn retry_deferred(&mut self) -> bool {
-        std::mem::take(&mut self.deferred)
-    }
-}
-
-/// Whether the measurement room's claim is owed a decision: memory was
-/// probed with no resize of the expert bank under way, and none has
-/// finished since. A probe while a flight holds the bindings stays owed
-/// until they return.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RoomOwed(bool);
-
-impl RoomOwed {
-    /// Memory was probed, a resize of the bank `resizing` or not.
-    fn probed(&mut self, resizing: bool) {
-        self.0 = !resizing;
-    }
-
-    /// A resize finished: the probe before it no longer reads the room.
-    fn resized(&mut self) {
-        self.0 = false;
-    }
-
-    /// Whether the decision is taken now, where the claim can be decided
-    /// (`ready`): it is owed no longer.
-    fn take(&mut self, ready: bool) -> bool {
-        ready && std::mem::take(&mut self.0)
-    }
-}
-
-/// The measurement job's claim of room beside the model, until it is
-/// answered (`Owner::claim_measurement_room`).
-struct RoomClaim(RoomGranter);
-
-impl RoomClaim {
-    /// Decide the claim at a probe no resize ran across, where it stands at
-    /// `standing`: made, it is answered; short beyond what the bank holds
-    /// above its floor, it is answered with why before anything shrinks;
-    /// short within it, the bank shrinks by the rest through `shrink`, and
-    /// the claim waits for a later probe to read what that freed, unless the
-    /// shrink finds the bank at its floor, which answers it with why. The
-    /// claim, while it waits.
-    fn decide<E>(
-        self,
-        standing: MeasurementRoom,
-        shrink: impl FnOnce(u64) -> Result<BankStep, E>,
-    ) -> Result<Option<Self>, E> {
-        let answer = match standing {
-            MeasurementRoom::Made => Ok(()),
-            // Unread, or made with the bank's own traffic still running:
-            // the claim waits for the next observation.
-            MeasurementRoom::Unread | MeasurementRoom::Draining => return Ok(Some(self)),
-            MeasurementRoom::Beyond { short, releasable } => Err(RoomRefusal::BeyondFloor { short, releasable }),
-            MeasurementRoom::Short(short) => match shrink(short)? {
-                BankStep::Begun(_) | BankStep::Running | BankStep::Deferred => return Ok(Some(self)),
-                BankStep::AtLimit => Err(RoomRefusal::AtFloor { short }),
-            },
-        };
-        self.0.answer(answer);
-        Ok(None)
-    }
-}
 
 /// A running expert bank resize: what the process held when it began, and
 /// why it began.
@@ -870,11 +673,11 @@ struct BankBegun {
     cause: BankBegunFor,
 }
 
-/// Why an expert bank resize began: a shrink, for its cause, or a growth
-/// into free memory.
+/// Why an expert bank resize began: a shrink to the bank's derived target,
+/// or a growth into free memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BankBegunFor {
-    Shrink(ShrinkCause),
+    Shrink,
     Growth,
 }
 
@@ -884,7 +687,7 @@ impl BankBegunFor {
     fn finished(self, from: u64, to: u64, at_unix_ms: u64) -> Result<BankResize, String> {
         let by = |less: u64, more: u64| more.checked_sub(less).and_then(NonZeroU64::new);
         match self {
-            Self::Shrink(cause) => by(to, from).map(|by| BankResize::Shrank { cause, to, by, at_unix_ms }),
+            Self::Shrink => by(to, from).map(|by| BankResize::Shrank { to, by, at_unix_ms }),
             Self::Growth => by(from, to).map(|by| BankResize::Grew { from, by, at_unix_ms }),
         }
         .ok_or_else(|| format!("a resize begun for {self:?} went from {from} to {to}"))
@@ -929,7 +732,7 @@ enum Provisioned {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MemoryDeficit {
-    role: DomainRole,
+    resource: ResourceKind,
     required: u64,
 }
 
@@ -949,31 +752,16 @@ struct Service<F: ProgramFamily> {
 }
 
 /// What a loaded model's owner holds of its memory between flights
-/// ([`between_flights`]): its condition, the release ladder's motion, the
-/// expert bank's running and finished resizes, and when it observes next.
+/// ([`between_flights`]): the deficits capacity-blocked requests wait on,
+/// the expert bank's running resizes, the load's newly stored measures, and
+/// when it reads memory next.
 pub struct BetweenFlights {
-    condition: MemoryCondition,
-    /// Per domain role, the least memory a capacity-blocked request still
-    /// needs from that domain's ceiling after every release was exhausted.
+    /// Per store's memory, the least a capacity-blocked request still needs
+    /// there.
     deficits: Vec<MemoryDeficit>,
-    /// What of the release ladder is still in motion.
-    ladder: Ladder,
-    /// Memory was observed while a flight held the bindings: the heap is
-    /// settled once they return.
-    settle_owed: bool,
-    /// The last growth a settle granted that began nothing, as (holding,
-    /// store, from, to): a settle granting the same is not tried again
-    /// until it differs, as its rate per byte moves with the meter at
-    /// every reading while what it would claim does not.
-    declined: Option<(magnitude_executor::BankHolding, BankTier, u64, u64)>,
-    /// Whether the measurement room's claim is owed a decision.
-    room_owed: RoomOwed,
     /// Each store's running expert bank resize this owner began: the stores
     /// resize on their own (`BankStep::Begun`).
     bank_began: [Option<BankBegun>; BankTier::COUNT],
-    /// The measurement job's room claimed of the domain and not yet
-    /// answered ([`Owner::claim_measurement_room`]).
-    measurement_room: Option<RoomClaim>,
     /// Costs the executor stored since the load was priced, which price it
     /// from the next flight boundary on ([`Owner::measure_load`]).
     measures: Option<LoadMeasures>,
@@ -981,11 +769,6 @@ pub struct BetweenFlights {
 }
 
 impl BetweenFlights {
-    /// Whether an expert bank resize this owner began runs in any store.
-    fn resizing(&self) -> bool {
-        self.bank_began.iter().any(Option::is_some)
-    }
-
     /// A resize of `tier` storage began, as `begun`: the bank begins none of
     /// a store while one of it runs.
     fn bank_begun(&mut self, tier: BankTier, begun: BankBegun) -> Result<(), String> {
@@ -998,27 +781,16 @@ impl BetweenFlights {
         }
     }
 
-    /// A load's memory as it opens: Normal, nothing in motion, observed at
-    /// its first boundary.
+    /// A load's memory as it opens: nothing in motion, read at its first
+    /// boundary.
     pub fn new() -> Self {
-        Self {
-            condition: MemoryCondition::Normal,
-            deficits: Vec::new(),
-            ladder: Ladder::default(),
-            settle_owed: false,
-            declined: None,
-            room_owed: RoomOwed::default(),
-            bank_began: [None; BankTier::COUNT],
-            measurement_room: None,
-            measures: None,
-            next_observation: 0,
-        }
+        Self { deficits: Vec::new(), bank_began: [None; BankTier::COUNT], measures: None, next_observation: 0 }
     }
 }
 
 /// What [`between_flights`] runs on: the loaded model's domain and the
-/// owner's memory, the service clock and its completion wakes, and what it
-/// does to the requests its owner holds (none, below the scheduler): the
+/// owner's memory, the service clock and its completion wakes, and the
+/// model's unload (below the scheduler, an instrument has no requests): the
 /// one owner of the between-flight memory step is that function, and a host
 /// gives it only these.
 pub trait MemoryHost {
@@ -1030,24 +802,7 @@ pub trait MemoryHost {
     fn completion(&self) -> magnitude_executor::CompletionWake;
     /// An availability change: what waits on one retries.
     fn advance_epoch(&mut self);
-    /// Evict the least recently used retained prefix: whether one was.
-    /// The cached entries live requests hold, which the prefix rung
-    /// releases last.
-    fn held_prefixes(&self) -> BTreeSet<u64>;
-    fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool;
-    /// The cached prefixes the heap may release, with their bytes and what
-    /// their hits save a second at `rates`, the least valuable first
-    /// (`PrefixCache::held_steps`).
-    fn prefix_steps(&self, rates: &WorkloadRates) -> Vec<PrefixStep>;
-    /// Evict the cached prefix `id` a settle released: whether it was still
-    /// cached and unused.
-    fn evict_cached_prefix(&mut self, id: u64) -> bool;
-    /// Preempt eligible live requests, sparing `spared`, and with
-    /// `resident_slot` those that free no bytes: whether any was.
-    fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError>;
-    /// Refuse every request waiting on memory to become resident.
-    fn refuse_memory_waiters(&mut self);
-    /// Unload the model for memory pressure: every request is terminated.
+    /// Unload the model for memory: every request is terminated.
     fn unload(&mut self);
 }
 
@@ -1228,22 +983,28 @@ impl<F: ProgramFamily> Owner<F> {
         self.service.prefix_cache.len()
     }
 
-    /// Claim `bytes` of device memory beside the model for the service's
+    /// Claim `bytes` of memory beside the model for the service's
     /// measurement job, in place of any claim before, which is released
-    /// (`ExecutorDomain::claim_measurement_room`): at flight boundaries the
-    /// bank shrinks toward its floor until the room is made, and the grant
-    /// is answered then, or once the floor leaves it short.
+    /// (`ExecutorDomain::claim_measurement_room`): a committed claim on the
+    /// device's ledger, which cache yields to at once, so it is answered
+    /// now, refused only where the model's committed memory leaves it short
+    /// or the device's memory reading failed.
     pub fn claim_measurement_room(&mut self, bytes: u64) -> RoomGrant {
-        self.service.domain.claim_measurement_room(bytes);
         let (granter, grant) = RoomGrant::new();
-        self.service.memory.measurement_room = Some(RoomClaim(granter));
+        let claimed = self.service.domain.claim_measurement_room(bytes);
+        granter.answer(claimed.map_err(|short| match short {
+            magnitude_executor::memory::ledger::Short::Over { over, .. } => RoomRefusal::Short { bytes: over },
+            magnitude_executor::memory::ledger::Short::Blind { store, reason } => {
+                tracing::warn!(?store, %reason, "a measurement room is refused: the memory reading failed");
+                RoomRefusal::Blind
+            }
+        }));
         grant
     }
 
-    /// The measurement job ended: its claim, answered or not, is released.
+    /// The measurement job ended: its claim is released.
     pub fn release_measurement_room(&mut self) {
         self.service.domain.release_measurement_room();
-        self.service.memory.measurement_room = None;
     }
 
     /// Price the load by `measures` from the next flight boundary on
@@ -1361,15 +1122,6 @@ impl<F: ProgramFamily> Service<F> {
             return Err(AdmissionError::invariant("admission")(
                 "a cache point must be an exact boundary inside the prompt".into(),
             ));
-        }
-        // A request arriving in Reclaim waits while the ladder gives memory
-        // back: it is refused only once the ladder's next release would be
-        // the model's unload (`MemoryStep::release_for_reclaim`).
-        match self.domain.probe_memory() {
-            Err(error @ DomainError::Reclaim(_)) => self.refused_for_memory(&error),
-            observed => {
-                observed.map_err(AdmissionError::from)?;
-            }
         }
         let id = RequestId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
@@ -1558,9 +1310,8 @@ impl<F: ProgramFamily> Service<F> {
                     available,
                 };
             }
-            Some(Wait::Memory) if self.waits_on_memory(request) => return Status::MemoryBlocked,
-            Some(Wait::Memory) => return Status::Preempted,
-            None if self.waits_on_memory(request) => return Status::MemoryBlocked,
+            Some(Wait::Memory { .. }) if self.waits_on_memory(request) => return Status::MemoryBlocked,
+            Some(Wait::Memory { .. }) => return Status::Preempted,
             None => {}
         }
         match &request.state {
@@ -1717,7 +1468,7 @@ impl<F: ProgramFamily> Service<F> {
                     if submitted || !active.flight.completion().is_complete() {
                         // The round's members end with a fatal error, not
                         // dropped with the round.
-                        unload |= match self.observe(None) {
+                        unload |= match self.observe(None, round.rows as u64) {
                             Ok(unload) => unload,
                             Err(error) => return Err((Some(round.members), error)),
                         };
@@ -1732,7 +1483,7 @@ impl<F: ProgramFamily> Service<F> {
                 }
                 Pipeline::Idle(mut bindings) => {
                     unload |= self
-                        .observe(Some(&mut bindings))
+                        .observe(Some(&mut bindings), 0)
                         .map_err(|error| (None, error))?;
                     // Unloading terminated every request: nothing is left to
                     // select, and observing again would decide it again.
@@ -1774,71 +1525,59 @@ impl<F: ProgramFamily> Service<F> {
 /// The owner's memory between flights, on what a host gives it
 /// ([`MemoryHost`]): every host takes these, and none has its own.
 trait MemoryStep: MemoryHost + Sized {
-    /// Observe memory when due. Reclaim releases need the bindings; while a
-    /// flight holds them they are owed until it completes. Returns whether
-    /// memory escalation decided to unload, after terminating every request.
-    /// This is the owner's own work, which serves no request: no launch is
-    /// charged the time it takes (`ExecutorDomain::owner_worked`).
-    fn observe(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
+    /// The memory step at a flight boundary, or while a flight holds the
+    /// bindings (none here); `chunk_rows` the rows of the batch in flight,
+    /// whose state growth the guarantee covers. Returns whether the model
+    /// unloaded, after terminating every request. This is the owner's own
+    /// work, which serves no request: no launch is charged the time it takes
+    /// (`ExecutorDomain::owner_worked`).
+    fn observe(&mut self, bindings: Option<&mut StateBindings>, chunk_rows: u64) -> Result<bool, RequestError> {
         let began = std::time::Instant::now();
-        let observed = self.observe_memory(bindings);
+        let observed = self.observe_memory(bindings, chunk_rows);
         self.domain().owner_worked(began.elapsed());
         observed
     }
 
-    fn observe_memory(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
-        let memory = |error: String| invariant("memory observation")(error);
+    fn observe_memory(&mut self, bindings: Option<&mut StateBindings>, chunk_rows: u64) -> Result<bool, RequestError> {
         let now = self.now();
-        // A reading is taken off this thread and published
+        // A reading is taken off this thread and published, and recorded in
+        // the device's ledgers as it is taken
         // (`ExecutorDomain::take_published_memory`): one is looked for once
         // an interval has passed, and none waited for, so no reading sits
         // between a step and the next however long either takes.
-        let published = match now >= self.memory().next_observation {
+        let read = match now >= self.memory().next_observation {
             true => {
                 self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
                 self.domain().take_published_memory()
             }
             false => None,
         };
-        if let Some(published) = published {
-            let resizing = self.memory().resizing();
-            self.memory().room_owed.probed(resizing);
-            let readings = published.as_ref().ok().cloned();
-            let observation = memory_observation(published.map(drop)).map_err(memory)?;
-            let next = self.memory().condition.observe(observation, now);
-            self.enter_memory_condition(next);
-            // Each reading may settle the heap afresh: its supply holds the
-            // reserve derived from the host's measured motion, so what it
-            // grants is room no wait would make safer. The settle runs only
-            // where the reading moved its inputs (`ExecutorDomain::settle_memory`).
-            self.memory().settle_owed = observation == MemoryObservation::Normal;
-            if !matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
-                self.memory().ladder.owed = false;
-                self.memory().ladder.covered = false;
-                if let (MemoryObservation::Normal, Some(readings)) = (observation, readings) {
-                    self.reopen_memory_deficits(&readings);
-                }
-            } else if observation == MemoryObservation::Reclaim {
-                // Releases are measured against a fresh reading; a Blind
-                // escalation has none, so it goes straight to the unload
-                // decision.
-                self.memory().ladder.owed = true;
+        let readings = match read {
+            None => None,
+            Some(Ok(readings)) => Some(readings),
+            // Blind: the ledger's snapshot unloads below.
+            Some(Err(DomainError::Blind(reason))) => {
+                tracing::warn!(%reason, "the memory reading failed");
+                Some(Vec::new())
             }
+            Some(Err(error)) => return Err(classify_domain_error(error)),
+        };
+        if readings.is_some() {
+            self.reopen_memory_deficits();
         }
         // A cut of the expert bank a chain's encoding began beside its
-        // running steps, memory found short between its submissions
-        // (`ExecutorDomain::take_running_release`), is a Reclaim shrink this
-        // owner holds as begun: the advance that finishes it reports it as
-        // any.
+        // running steps, the guarantee found short between its submissions
+        // (`ExecutorDomain::take_running_release`), is a shrink this owner
+        // holds as begun: the advance that finishes it reports it as any.
         if let Some((tier, held)) = self.domain().take_running_release() {
-            let begun = BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Reclaim) };
+            let begun = BankBegun { held, cause: BankBegunFor::Shrink };
             self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
         }
-        let mut bindings = bindings;
         // A flight boundary: newly stored costs price the load first, so
-        // every decision past it is made on them; the expert bank's resize
-        // advances, and a finished one frees what waited on it.
-        if let Some(bindings) = bindings.as_deref_mut() {
+        // every decision past it is made on them; the expert bank's and the
+        // graph slots' releases advance, and the bank follows its target,
+        // derived from the ledgers afresh.
+        if let Some(bindings) = bindings {
             // A refusal (the device would not take the tier copy's grid) is a device
             // fault the load ends on, the experts still priced as before.
             if let Some(measures) = self.memory().measures.take() {
@@ -1846,244 +1585,58 @@ trait MemoryStep: MemoryHost + Sized {
             }
             self.advance_expert_bank()?;
             self.advance_slot_release()?;
-            // A release deferred for want of a gap is tried again at this
-            // boundary: what waited on it retries, and a Reclaim release is
-            // owed again.
-            if self.memory().ladder.retry_deferred() {
-                self.advance_epoch();
-                let reclaim = matches!(self.memory().condition, MemoryCondition::Reclaim { .. });
-                self.memory().ladder.owed |= reclaim;
-            }
+            self.follow_cache_targets(bindings)?;
         }
-        // The measurement job's claim takes its room through the bank's
-        // shrink toward its floor, read at a probe no resize ran across
-        // (`room_owed`), so each shrink is seen before the next is decided:
-        // answered once the room is made, or once the floor leaves it short.
-        // A shrink deferred while a chain is under way waits for the next
-        // probe.
-        let ready = !self.memory().resizing() && bindings.is_some();
-        let deciding = match self.memory().room_owed.take(ready) {
-            true => self.domain().measurement_room().map_err(classify_domain_error)?,
-            false => None,
-        };
-        if let (Some(standing), Some(bindings), Some(claim)) =
-            (deciding, bindings.as_deref_mut(), deciding.and_then(|_| self.memory().measurement_room.take()))
-        {
-            let mut began = None;
-            let wake = self.completion();
-            let domain = self.domain();
-            let waiting = claim.decide(standing, |bytes| {
-                let before = domain.memory_moment();
-                let step = domain.shrink_expert_bank_by(bindings, bytes, wake);
-                let step = step.map_err(classify_domain_error)?;
-                if let BankStep::Begun(tier) = step {
-                    began = Some((tier, before));
-                }
-                Ok(step)
-            })?;
-            self.memory().measurement_room = waiting;
-            if let Some((tier, held)) = began {
-                let begun = BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Measurement) };
-                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
-            }
-        }
-        // Every release changes bindings, so it waits for a chain under way
-        // to end: the chain's device work is done when its first chunk
-        // finishes, and its holder claims the rest first (`chain_holder`).
-        let releasable = self.memory().ladder.owed && self.domain().chain_holder().is_none();
-        if let (true, Some(bindings)) = (releasable, bindings.as_deref_mut()) {
-            self.memory().ladder.owed = false;
-            if self.release_for_reclaim(bindings)? {
-                let now = self.now();
-                self.memory().condition = self.memory().condition.released(now);
-                let after = memory_observation(self.domain().probe_memory()).map_err(memory)?;
-                let next = self.memory().condition.observe(after, now);
-                self.enter_memory_condition(next);
-            }
-        }
-        if let (true, Some(bindings)) = (self.memory().settle_owed, bindings) {
-            self.memory().settle_owed = false;
-            self.settle_memory(bindings)?;
-        }
-        // Unloading is the last step of the release order, past the ladder's
-        // last rung (`release::Rung`): while a flight holds the bindings, the
-        // releases owed to it have not run yet, while one is pending it has
-        // not finished, and one deferred for a gap is tried again at the next
-        // boundary, so the decision waits for them. What the host has yet to
-        // show released is awaited, never released again: only a reading,
-        // the witness's fall or more taken than is credited, moves the
-        // ladder past it (`MemoryPace`).
-        let now = self.now();
-        let condition = self.memory().condition;
-        if self.memory().ladder.unload_due(condition, now) {
+        // The model unloads at the reading where the guarantee cannot be
+        // kept, or the reading failed (`ExecutorDomain::memory_reading`),
+        // each store's reading traced as it is judged.
+        if readings.is_some() && self.domain().memory_reading(chunk_rows).map_err(classify_domain_error)? {
             self.unload();
             return Ok(true);
         }
         Ok(false)
     }
 
-    /// A group refused because memory is in the Reclaim band, or could not
-    /// be observed, is a memory observation: enter its condition now. A
-    /// memory wait ends only when memory is Normal again, so without this the
-    /// refused request would be selected again at once, within the same run,
-    /// before the next timed observation could see the band.
-    fn refused_for_memory(&mut self, error: &DomainError) {
-        let observation = match error {
-            DomainError::Reclaim(_) => MemoryObservation::Reclaim,
-            DomainError::Blind(_) => MemoryObservation::Blind,
-            _ => return,
-        };
-        let next = self.memory().condition.observe(observation, self.now());
-        self.enter_memory_condition(next);
-        if matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
-            self.memory().ladder.owed = true;
-        }
-    }
-
-    /// Enter `next`. Memory returning to Normal is an availability change,
-    /// and it ends every memory wait.
-    fn enter_memory_condition(&mut self, next: MemoryCondition) {
-        let memory = self.memory();
-        let recovered = memory.condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
-        if std::mem::discriminant(&memory.condition) != std::mem::discriminant(&next) {
-            tracing::warn!(from = ?memory.condition, to = ?next, "memory condition changed");
-        }
-        memory.condition = next;
-        if recovered {
-            self.advance_epoch();
-        }
-    }
-
     /// A request blocked on a memory deficit waits for an availability
-    /// change. Memory another process frees is one: advance the epoch once a
-    /// deficit's domain ceiling covers it, so blocked work retries.
-    fn reopen_memory_deficits(&mut self, readings: &[magnitude_executor::platform::DomainReading]) {
-        if self.memory().deficits.is_empty() {
-            return;
-        }
-        let deficits = &mut self.memory().deficits;
+    /// change. Memory another process frees is one: advance the epoch once
+    /// the deficit's store, by its ledger's reading, holds what it needs
+    /// (`ExecutorDomain::memory_covers`), so blocked work retries.
+    fn reopen_memory_deficits(&mut self) {
+        let mut deficits = std::mem::take(&mut self.memory().deficits);
         let before = deficits.len();
-        deficits.retain(|deficit| {
-            !readings.iter().any(|reading| {
-                reading.role == deficit.role && reading.ceiling_bytes >= deficit.required
-            })
-        });
-        if deficits.len() != before {
+        deficits.retain(|deficit| !self.domain().memory_covers(deficit.resource, deficit.required));
+        let reopened = deficits.len() != before;
+        self.memory().deficits = deficits;
+        if reopened {
             self.advance_epoch();
         }
     }
 
-    /// Settle the memory heap (`ExecutorDomain::settle_memory`) on
-    /// `bindings` and apply it: the prefixes it released evicted, the idle
-    /// optional components it released unbound, then the prompt-group
-    /// places held beyond the target it settled, else one bank resize: its
-    /// least valuable release first (what it gives back is what the
-    /// settle's growths and places are paid with), else its most valuable
-    /// growth, each to its settled size; the rest settle again at the next
-    /// reading. While memory is Normal and no blocked request waits on
-    /// memory (what is free is theirs first), and no resize runs (one begun
-    /// decides the next). A grant's claim refused in Reclaim or blind is
-    /// the memory observation it is.
-    fn settle_memory(&mut self, bindings: &mut StateBindings) -> Result<(), RequestError> {
-        if self.memory().condition != MemoryCondition::Normal
-            || !self.memory().deficits.is_empty()
-            || self.memory().resizing()
-        {
-            return Ok(());
-        }
-        let rates = self.domain().serving_rates().map_err(classify_domain_error)?;
-        let prefixes = rates.map_or_else(Vec::new, |rates| self.prefix_steps(&rates));
-        let owner = OwnerHoldings { prefixes: prefixes.iter().map(|step| (step.bytes, step.seconds_per_second)).collect() };
-        let settled = self.domain().settle_memory(&owner).map_err(classify_domain_error)?;
-        // The settle releases the least valuable first, in the order given.
-        for step in &prefixes[..settled.prefixes] {
-            self.evict_cached_prefix(step.id);
-        }
-        if !settled.optional.is_empty() {
-            self.domain()
-                .release_idle_optional_components(bindings, &settled.optional)
-                .map_err(invariant("optional component release"))?;
-        }
-        if settled.prefixes > 0 || !settled.optional.is_empty() {
-            self.advance_epoch();
-        }
-        // Places the settle released are given back first, between groups:
-        // their room is what its growths may be paid with.
-        if settled.places_released {
-            let wake = self.completion();
-            let (released, slots) = self.domain().release_group_places(wake).map_err(classify_domain_error)?;
-            tracing::info!(released, ?slots, "prompt places release settled");
-            return Ok(());
-        }
-        // What the process holds as a resize begins, read only for one.
-        if let Some(release) = settled.releases.first().copied() {
-            let magnitude_executor::BankRelease { holding, to, per_byte } = release;
-            let (before, wake) = (self.domain().memory_moment(), self.completion());
-            // A shrink deferred (a chain under way, a step still running)
-            // is settled again at the next reading.
-            let step = self.domain().shrink_expert_bank_to(bindings, holding, to, wake).map_err(classify_domain_error)?;
-            tracing::info!(?holding, to, per_byte, ?step, "expert bank release settled");
-            if matches!(step, BankStep::Deferred | BankStep::Running) {
-                self.domain().settle_again();
-            }
-            // A holding worth more per byte won the bank's memory.
-            if let BankStep::Begun(tier) = step {
-                let begun = BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::Rebalance) };
-                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
-            }
-            return Ok(());
-        }
-        let Some(grant) = settled.grants.first().copied() else {
-            return Ok(());
-        };
-        let tried = Some((grant.holding, grant.kind, grant.from, grant.to));
-        if self.memory().declined == tried {
-            return Ok(());
-        }
-        self.memory().declined = tried;
+    /// Follow the expert bank's derived target
+    /// (`ExecutorDomain::follow_cache_targets`): a resize it begins is held as
+    /// begun, a growth as one and a shrink as the target's. One deferred or
+    /// running is followed again at the next boundary, which derives afresh.
+    fn follow_cache_targets(&mut self, bindings: &mut StateBindings) -> Result<(), RequestError> {
         let (before, wake) = (self.domain().memory_moment(), self.completion());
-        let decided = |outcome: &dyn std::fmt::Display| {
-            let magnitude_executor::BankGrant { holding, kind, from, to, bytes, borrowed, per_byte } = grant;
-            tracing::info!(?holding, ?kind, from, to, bytes, borrowed, per_byte, %outcome, "expert bank growth settled");
+        let followed = self.domain().follow_cache_targets(bindings, wake).map_err(classify_domain_error)?;
+        let (tier, cause) = match followed {
+            Followed::Grew(BankStep::Begun(tier)) => (tier, BankBegunFor::Growth),
+            Followed::Shrank(BankStep::Begun(tier)) => (tier, BankBegunFor::Shrink),
+            Followed::Holds | Followed::ReleasingSlots | Followed::Grew(_) | Followed::Shrank(_) => return Ok(()),
         };
-        match self.domain().grow_expert_bank(&grant, wake) {
-            Ok(BankStep::Begun(tier)) => {
-                decided(&"begun");
-                self.memory().declined = None;
-                let begun = BankBegun { held: before, cause: BankBegunFor::Growth };
-                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
-            }
-            Ok(step) => decided(&format_args!("{step:?}")),
-            // Sized within what the claim admitted, a refusal is the
-            // machine's change since: the next reading settles afresh.
-            Err(DomainError::Capacity(refusal)) => decided(&format_args!(
-                "refused: {} bytes required, {} available",
-                refusal.required, refusal.available
-            )),
-            Err(error @ (DomainError::Reclaim(_) | DomainError::Blind(_))) => {
-                decided(&format_args!("refused: {error}"));
-                self.refused_for_memory(&error);
-            }
-            Err(error) => return Err(classify_domain_error(error)),
-        }
-        Ok(())
+        self.memory().bank_begun(tier, BankBegun { held: before, cause }).map_err(invariant("expert bank"))
     }
 
     /// At a flight boundary, finish the idle graph slots' release off the
     /// submitting thread (`ExecutorDomain::advance_slot_release`), recorded
     /// with the slots and how long the release thread took. It freed
-    /// memory, so the reclaim clock restarts and what waited on memory may
-    /// retry. One the ladder waited for (its surplus rung began it, or found
-    /// the idle policy's running) is the surplus rung's: the ladder resumes
-    /// while memory is short. Any other is the idle policy's alone.
+    /// memory, so what waited on memory may retry.
     fn advance_slot_release(&mut self) -> Result<(), RequestError> {
         let Some(released) = self.domain().advance_slot_release().map_err(classify_domain_error)? else {
             return Ok(());
         };
-        let laddered = std::mem::take(&mut self.memory().ladder.pending.slots);
         let after = self.domain().memory_moment();
         tracing::info!(
-            by = if laddered { "the surplus rung" } else { "the idle policy" },
             slots = released.slots,
             released = released.bytes,
             release_micros = released.released.duration_since(released.began).as_micros() as u64,
@@ -2092,29 +1645,21 @@ trait MemoryStep: MemoryHost + Sized {
             footprint_after = after.footprint,
             "graph slots released"
         );
-        let now = self.now();
-        self.memory().condition = self.memory().condition.released(now);
         self.advance_epoch();
-        if laddered && matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
-            self.memory().ladder.owed = true;
-        }
         Ok(())
     }
 
     /// At a flight boundary, advance the expert bank's resize
     /// (`ExecutorDomain::advance_expert_bank`). A finished one is recorded as
-    /// a release is (a shrink as the bank rung's, a growth as memory grown):
-    /// how long it held this thread, the bank's slots after it, and what the
-    /// process held when it began and now. A finished shrink freed memory:
-    /// the reclaim clock restarts, what waited on memory may retry, and the
-    /// ladder resumes while memory is short.
+    /// a release is (a shrink as memory released, a growth as memory
+    /// grown): how long it held this thread, the bank's slots after it, and
+    /// what the process held when it began and now. A finished shrink freed
+    /// memory: what waited on memory may retry.
     fn advance_expert_bank(&mut self) -> Result<(), RequestError> {
         let wake = self.completion();
         let Some((finished, held)) = self.domain().advance_expert_bank(wake).map_err(classify_domain_error)? else {
             return Ok(());
         };
-        self.memory().ladder.pending.bank = false;
-        self.memory().room_owed.resized();
         let after = self.domain().memory_moment();
         let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
         let BankBegun { held: before, cause } = self.memory().bank_began[tier.index()]
@@ -2141,7 +1686,6 @@ trait MemoryStep: MemoryHost + Sized {
             BankResized::Shrunk { holding, from, to, released, times } => {
                 self.domain().record_expert_resize(holding, resized(from, to)?);
                 tracing::info!(
-                    rung = ?Rung::Bank,
                     micros,
                     begun_micros,
                     advances,
@@ -2162,6 +1706,7 @@ trait MemoryStep: MemoryHost + Sized {
                     deciding_micros = times.decided.duration_since(held.started).as_micros() as u64,
                     queued_micros = times.queued.as_micros() as u64,
                     planned_micros = times.planned.as_micros() as u64,
+                    unpinned_micros = times.unpinned.as_micros() as u64,
                     plan_picked_micros = times.trips[0].picked.as_micros() as u64,
                     plan_served_micros = times.trips[0].served.as_micros() as u64,
                     commit_picked_micros = times.trips[1].picked.as_micros() as u64,
@@ -2173,8 +1718,6 @@ trait MemoryStep: MemoryHost + Sized {
                     released_before = before_now(times.released),
                     "memory released"
                 );
-                let now = self.now();
-                self.memory().condition = self.memory().condition.released(now);
                 self.advance_epoch();
             }
             // A growth's `prepared` is when its first slot joined and
@@ -2220,114 +1763,44 @@ trait MemoryStep: MemoryHost + Sized {
                 tracing::warn!(?holding, at, %refusal, "the expert bank's storage refused a growth")
             }
         }
-        if matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
-            self.memory().ladder.owed = true;
-        }
         Ok(())
     }
 
-    /// Whether a fresh reading is still in the Reclaim band. A failed reading
-    /// cannot measure a release, so it stops releasing.
-    fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
-        Ok(memory_observation(self.domain().probe_memory())
-            .map_err(invariant("memory observation"))?
-            == MemoryObservation::Reclaim)
-    }
-
-    /// Release once at the cheapest rung that releases anything, preemption
-    /// only where `preempt` ([`release::release_once`]): whether it released now;
-    /// preemption spares `spared`, and with `resident_slot` takes requests
-    /// that free no bytes, since what is short is a resident slot. A pending
-    /// release (a bank resize) is recorded: no costlier rung runs, and the
-    /// model is not unloaded, before the boundary that finishes it.
-    fn release_once(
-        &mut self,
-        bindings: &mut StateBindings,
-        cause: ReleaseCause,
-        preempt: bool,
-        held: &BTreeSet<u64>,
-        spared: &[RequestId],
-        resident_slot: bool,
-    ) -> Result<bool, DomainError> {
-        let release = release::release_once(
-            &mut Releasing {
-                host: self,
-                bindings,
-                cause,
-                held,
-                spared,
-                resident_slot,
-                began: None,
-                slots_began: false,
-            },
-            preempt,
-        )?;
-        self.memory().ladder.released(release);
-        Ok(release == Release::Released)
-    }
-
-    /// Release down the whole ladder until every domain is back above its
-    /// planning reserve, or a release is pending. Preempted requests replay
-    /// only after the band is Normal again, so no victim is chosen twice.
-    /// Returns whether anything was released. With the ladder exhausted and
-    /// memory still short, the next release would be the model's unload:
-    /// every request waiting on memory to become resident is refused.
-    fn release_for_reclaim(&mut self, bindings: &mut StateBindings) -> Result<bool, RequestError> {
-        let mut released = false;
-        self.memory().ladder.walk();
-        let held = self.held_prefixes();
-        while self.reclaim_needed()?
-            && self
-                .release_once(bindings, ReleaseCause::Reclaim, true, &held, &[], false)
-                .map_err(classify_domain_error)?
-        {
-            released = true;
-        }
-        if released {
-            self.advance_epoch();
-        }
-        if self.memory().ladder.settled() && self.reclaim_needed()? {
-            self.refuse_memory_waiters();
-        }
-        Ok(released)
-    }
 }
 
 impl<H: MemoryHost> MemoryStep for H {}
 
 /// The owner's memory step at a flight boundary, `bindings` there where no
-/// flight holds them: memory observed when due (and growth owed once it has
-/// stayed free), the expert bank's running resize advanced, a prompt's
-/// places and the measurement job's claim taken through the bank's shrink,
-/// the release ladder run while memory is short, a growth step of the bank
-/// begun where owed, and the model unloaded once Reclaim outlasts every
-/// release. Whether it unloaded. The one step every host runs: the owner at
-/// each of its boundaries, and an instrument that drives the domain below
-/// the scheduler at each of its own.
+/// flight holds them, `chunk_rows` the rows of the batch in flight: memory
+/// read when due, the expert bank's running resize advanced and its derived
+/// target followed, and the model unloaded at the reading where the
+/// guarantee cannot be kept. Whether it unloaded. The one step every host
+/// runs: the owner at each of its boundaries, and an instrument that drives
+/// the domain below the scheduler at each of its own.
 pub fn between_flights<H: MemoryHost>(
     host: &mut H,
     bindings: Option<&mut StateBindings>,
+    chunk_rows: u64,
 ) -> Result<bool, RequestError> {
-    host.observe(bindings)
+    host.observe(bindings, chunk_rows)
 }
 
 impl<F: ProgramFamily> Service<F> {
-    /// Record that blocked work needs `required` bytes from `role`'s domain,
-    /// keeping the least requirement per role so the earliest retry is kept.
+    /// Record that blocked work needs `required` bytes of `resource`, a
+    /// store's memory, keeping the least requirement per store so the
+    /// earliest retry is kept.
     fn record_memory_deficit(&mut self, resource: ResourceKind, required: u64) {
-        let role = match resource {
-            ResourceKind::DeviceMemory => DomainRole::Allocation,
-            ResourceKind::HostStaging => DomainRole::Staging,
-            _ => return,
-        };
+        if !matches!(resource, ResourceKind::DeviceMemory | ResourceKind::HostStaging) {
+            return;
+        }
         match self
             .memory
             .deficits
             .iter_mut()
-            .find(|deficit| deficit.role == role)
+            .find(|deficit| deficit.resource == resource)
         {
             Some(deficit) => deficit.required = deficit.required.min(required),
-            None => self.memory.deficits.push(MemoryDeficit { role, required }),
+            None => self.memory.deficits.push(MemoryDeficit { resource, required }),
         }
     }
 
@@ -2352,44 +1825,17 @@ impl<F: ProgramFamily> Service<F> {
     /// make room for it.
     fn waits_on_memory(&self, request: &Request) -> bool {
         request.record.preemption_debt == 0
-            && matches!(&request.state, State::Between(_, Stage::NonResident(wait @ (None | Some(Wait::Memory))))
-                if wait.is_some() || matches!(self.memory.condition, MemoryCondition::Reclaim { .. }))
+            && matches!(&request.state, State::Between(_, Stage::NonResident(Some(Wait::Memory { .. }))))
     }
 
-    /// Refuse every request waiting on memory to become resident: it never
-    /// was, and only the model's unload could make room for it.
-    fn refuse_memory_waiters(&mut self) {
-        let waiting = self
-            .requests
-            .iter()
-            .filter(|(_, request)| self.waits_on_memory(request))
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        for id in waiting {
-            let Request { mut record, state } = self.requests.remove(&id).expect("waiting request");
-            let mut generation = state.terminate(false);
-            Self::fail_generation(&mut record, &mut generation, RequestError::MemoryReclaim);
-            self.requests.insert(
-                id,
-                Request {
-                    record,
-                    state: State::Between(generation, Stage::Ready),
-                },
-            );
-        }
-    }
-
-    /// When nothing can move the epoch (no flight: this runs in `Idle`, no
-    /// request waits on its host or on memory, and memory is Normal), every
-    /// capacity wait ends in its typed error. Returns whether any did.
+    /// When nothing can move the epoch (no flight: this runs in `Idle`, and
+    /// no request waits on its host or on memory), every capacity wait ends
+    /// in its typed error. Returns whether any did.
     fn fail_capacity_waiters(&mut self) -> bool {
-        if self.memory.condition != MemoryCondition::Normal {
-            return false;
-        }
         let independent = self.requests.values().any(|request| {
             request.state.generation().finish_reason().is_some()
                 || matches!(request.state, State::Between(_, Stage::AwaitingCredit))
-                || request.state.wait() == Some(Wait::Memory)
+                || matches!(request.state.wait(), Some(Wait::Memory { .. }))
         });
         if independent {
             return false;
@@ -2437,11 +1883,9 @@ impl<F: ProgramFamily> Service<F> {
     /// End the waits that have ended, then take the requests selection can
     /// start out of the map.
     fn candidates(&mut self) -> BTreeMap<RequestId, (Record, Candidate)> {
-        let memory_normal = self.memory.condition == MemoryCondition::Normal;
         let epoch = self.epoch;
         let ended_wait = |wait: Option<Wait>| match wait {
-            Some(Wait::Capacity { at, .. }) => epoch.changed_since(at),
-            Some(Wait::Memory) => memory_normal,
+            Some(Wait::Capacity { at, .. } | Wait::Memory { at }) => epoch.changed_since(at),
             None => true,
         };
         let awaiting = self
@@ -2472,10 +1916,8 @@ impl<F: ProgramFamily> Service<F> {
                     generation.finish_reason().is_none()
                         || owes_reconciliation(&request.record, generation)
                 }
-                State::Between(_, Stage::NonResident(wait)) => memory_normal && ended_wait(*wait),
-                State::Between(_, Stage::Pending(_, wait)) | State::Parked(_, _, wait) => {
-                    ended_wait(*wait)
-                }
+                State::Between(_, Stage::NonResident(wait) | Stage::Pending(_, wait))
+                | State::Parked(_, _, wait) => ended_wait(*wait),
                 State::Between(_, Stage::AwaitingPrefix { .. } | Stage::AwaitingCredit) => false,
             })
             .map(|(&id, _)| id)
@@ -2927,8 +2369,8 @@ impl<F: ProgramFamily> Service<F> {
                 let wait = self.capacity_wait(error.resource, error.required, error.available);
                 return Ok(Residency::Waiting(generation, wait));
             }
-            Err(DomainError::Reclaim(_) | DomainError::Blind(_)) => {
-                return Ok(Residency::Waiting(generation, Wait::Memory));
+            Err(DomainError::Blind(_)) => {
+                return Ok(Residency::Waiting(generation, Wait::Memory { at: self.epoch }));
             }
             Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
             Err(error) => {
@@ -2976,7 +2418,7 @@ impl<F: ProgramFamily> Service<F> {
         let mut current = self.open_capacity(bindings, requirements);
         let held = self.held_entries(None);
         while matches!(current, Err(DomainError::Capacity(_)))
-            && self.release_once(bindings, ReleaseCause::LiveClaim, true, &held, &[], true)?
+            && self.release_once(bindings, true, &held, &[], true)?
         {
             current = self.open_capacity(bindings, requirements);
         }
@@ -3092,9 +2534,9 @@ impl<F: ProgramFamily> Service<F> {
                 Err(SubmitFailure::Refused(error, returned)) => {
                     bindings = returned;
                     match error {
-                        DomainError::Blind(_) | DomainError::Reclaim(_) => {
-                            self.refused_for_memory(&error);
-                            self.park(&mut round, group_, Wait::Memory);
+                        DomainError::Blind(_) => {
+                            let wait = Wait::Memory { at: self.epoch };
+                            self.park(&mut round, group_, wait);
                         }
                         DomainError::Input(error) => {
                             let requests = group_
@@ -3145,9 +2587,18 @@ impl<F: ProgramFamily> Service<F> {
             self.prefix_cache.release_unspared(&held);
             current = self.fits(bindings, round, &group_);
         }
+        // The ledger named the sequences whose state the group's rows
+        // preempt: evicted, the group provisions again, which completes its
+        // claim; any it cannot evict now leaves the group waiting on memory.
+        if let Err(DomainError::Preempt(sequences)) = &current {
+            let sequences = sequences.clone();
+            if self.evict_named(round, &sequences).map_err(classify_domain_error)? {
+                current = self.fits(bindings, round, &group_);
+            }
+        }
         while short(&current)
             && self
-                .release_once(bindings, ReleaseCause::LiveClaim, false, &held, &[], false)
+                .release_once(bindings, false, &held, &[], false)
                 .map_err(classify_domain_error)?
         {
             current = self.fits(bindings, round, &group_);
@@ -3160,7 +2611,7 @@ impl<F: ProgramFamily> Service<F> {
             let selected = round.members.keys().copied().collect::<Vec<_>>();
             while short(&current)
                 && self
-                    .release_once(bindings, ReleaseCause::LiveClaim, true, &held, &selected, false)
+                    .release_once(bindings, true, &held, &selected, false)
                     .map_err(classify_domain_error)?
             {
                 current = self.fits(bindings, round, &group_);
@@ -3168,10 +2619,7 @@ impl<F: ProgramFamily> Service<F> {
         }
         match current {
             Ok(()) => Ok(Provisioned::Fits(group_)),
-            Err(error @ (DomainError::Blind(_) | DomainError::Reclaim(_))) => {
-                self.refused_for_memory(&error);
-                Ok(Provisioned::Short(group_, Wait::Memory))
-            }
+            Err(DomainError::Blind(_) | DomainError::Preempt(_)) => Ok(Provisioned::Short(group_, Wait::Memory { at: self.epoch })),
             Err(DomainError::Capacity(deficit)) => {
                 let wait = self.capacity_wait(deficit.resource, deficit.required, deficit.available);
                 Ok(Provisioned::Short(group_, wait))
@@ -3210,7 +2658,7 @@ impl<F: ProgramFamily> Service<F> {
             .iter()
             .map(Operation::request)
             .collect::<BTreeSet<_>>();
-        if wait == Wait::Memory {
+        if matches!(wait, Wait::Memory { .. }) {
             tracing::info!(
                 requests = ?requests,
                 rows = group_.operations().iter().map(Operation::row_count).sum::<usize>(),
@@ -3295,7 +2743,7 @@ impl<F: ProgramFamily> Service<F> {
             }
         };
         self.epoch.advance();
-        if let Err(error) = self.observe(Some(&mut bindings)) {
+        if let Err(error) = self.observe(Some(&mut bindings), round.rows as u64) {
             return Err((Some(round.members), error));
         }
         self.publish_members(&mut round);
@@ -3921,98 +3369,82 @@ impl<F: ProgramFamily> Service<F> {
             if !release_resident_slot && released == 0 && method_bytes == 0 {
                 continue;
             }
-            for id in set {
-                let Request { mut record, state } = self.requests.remove(&id).expect("victim");
-                let State::Between(mut generation, _) = state else {
-                    unreachable!("victims are between rounds")
-                };
-                record.protected_until = Some(generation.accepted_position());
-                record.preemption_debt = record.preemption_debt.saturating_add(1);
-                generation.evicted().map_err(release_invariant("preemption"))?;
-                self.requests.insert(
-                    id,
-                    Request {
-                        record,
-                        state: State::Between(generation, Stage::NonResident(None)),
-                    },
-                );
-            }
-            self.epoch.advance();
+            self.evicted(set)?;
             return Ok(true);
         }
         Ok(false)
     }
+
+    /// Evict exactly `sequences`, the ledger's preemption of them
+    /// (`DomainError::Preempt`): only where each is resident between rounds
+    /// and outside `round`, else none of them. Whether they were evicted.
+    fn evict_named(&mut self, round: &Round, sequences: &[RequestId]) -> Result<bool, DomainError> {
+        let evictable = sequences.iter().all(|id| {
+            !round.members.contains_key(id)
+                && self.requests.get(id).is_some_and(|request| {
+                    matches!(&request.state, State::Between(generation, Stage::Ready | Stage::AwaitingCredit)
+                        if generation.is_resident())
+                })
+        });
+        if !evictable {
+            return Ok(false);
+        }
+        self.domain.release_state(sequences).map_err(release_invariant("preemption"))?;
+        self.evicted(sequences.to_vec())?;
+        Ok(true)
+    }
+
+    /// Mark `set`, whose state was just released, evicted: each waits
+    /// non-resident, protected up to what it accepted, a preemption owed.
+    fn evicted(&mut self, set: Vec<RequestId>) -> Result<(), DomainError> {
+        for id in set {
+            let Request { mut record, state } = self.requests.remove(&id).expect("victim");
+            let State::Between(mut generation, _) = state else {
+                unreachable!("victims are between rounds")
+            };
+            record.protected_until = Some(generation.accepted_position());
+            record.preemption_debt = record.preemption_debt.saturating_add(1);
+            generation.evicted().map_err(release_invariant("preemption"))?;
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Between(generation, Stage::NonResident(None)),
+                },
+            );
+        }
+        self.epoch.advance();
+        Ok(())
+    }
 }
 
-/// The owner's releases, between flights: the bindings every one of them
-/// changes are here.
-struct Releasing<'a, H: MemoryHost> {
-    host: &'a mut H,
+/// The owner's releases for a live claim, between flights: the bindings
+/// every one of them changes are here.
+struct Releasing<'a, F: ProgramFamily> {
+    service: &'a mut Service<F>,
     bindings: &'a mut StateBindings,
-    cause: ReleaseCause,
     held: &'a BTreeSet<u64>,
     spared: &'a [RequestId],
     resident_slot: bool,
-    /// The store a bank shrink this release began is of.
-    began: Option<BankTier>,
     /// This release began releasing idle graph slots off the submitting
     /// thread: it is recorded as one that released now.
     slots_began: bool,
 }
 
-/// Why the owner releases memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReleaseCause {
-    /// Memory is in the Reclaim band.
-    Reclaim,
-    /// A live request's claim is short.
-    LiveClaim,
-}
-
-impl ReleaseCause {
-    /// The cause of an expert bank shrink this release begins.
-    fn shrink(self) -> BankBegunFor {
-        BankBegunFor::Shrink(match self {
-            Self::Reclaim => ShrinkCause::Reclaim,
-            Self::LiveClaim => ShrinkCause::LiveClaim,
-        })
-    }
-}
-
-impl<H: MemoryHost> Releases for Releasing<'_, H> {
+impl<F: ProgramFamily> Releases for Releasing<'_, F> {
     type Error = DomainError;
 
-    /// Each release is recorded: its rung, how long it took, the bank's
-    /// slots after it, and what the process held on each side of it (a bank
-    /// step's when it finishes, `MemoryStep::advance_expert_bank`).
+    /// Each release is recorded: its rung, how long it took, and what the
+    /// process held on each side of it.
     fn release(&mut self, rung: Rung) -> Result<Release, DomainError> {
-        let before = self.host.domain().memory_moment();
-        // The bank decision's deficits, before this release can change
-        // memory: what the release is attributed to.
-        let mut deficit = |holding| {
-            let domain = self.host.domain();
-            domain
-                .expert_bank_plan()
-                .and_then(|bank| bank.holding_storage(holding))
-                .map_or(0, |kind| domain.expert_reclaim_deficit(kind.storage()))
-        };
-        let device_deficit = deficit(magnitude_executor::BankHolding::Experts);
-        let host_deficit = deficit(magnitude_executor::BankHolding::Host);
+        let before = self.service.domain.memory_moment();
         let started = std::time::Instant::now();
         let released = self.release_at(rung)?;
-        if let Some(tier) = self.began.take() {
-            let begun = BankBegun { held: before, cause: self.cause.shrink() };
-            self.host.memory().bank_begun(tier, begun).map_err(release_invariant("expert bank"))?;
-        }
         if released == Release::Released || std::mem::take(&mut self.slots_began) {
-            let domain = self.host.domain();
+            let domain = &self.service.domain;
             let after = domain.memory_moment();
-            // Unread values are absent fields.
             tracing::info!(
                 rung = ?rung,
-                cause = ?self.cause,
-                reclaim_device_deficit_bytes = device_deficit,
-                reclaim_host_deficit_bytes = host_deficit,
                 micros = started.elapsed().as_micros() as u64,
                 bank_slots = domain.expert_bank_slots(),
                 group_places = domain.group_places(),
@@ -4027,82 +3459,63 @@ impl<H: MemoryHost> Releases for Releasing<'_, H> {
         }
         Ok(released)
     }
-
-    /// Idle state and graph slots save nothing; the bank's, the cached
-    /// prefixes' and the bound optional components' lowest held rate per
-    /// byte at the load's serving rates (`ExecutorDomain::bank_release_rate`,
-    /// `PrefixCache::held_steps`, `ExecutorDomain::lowest_optional`). An
-    /// optional component whose worth is unknown holds nothing priced: the
-    /// rung goes last of the priced ones.
-    fn rate(&mut self, rung: Rung) -> Result<Option<f64>, DomainError> {
-        match rung {
-            Rung::Surplus | Rung::Idle => Ok(Some(0.)),
-            Rung::Bank => self.host.domain().bank_release_rate(),
-            Rung::Optional => Ok(self.host.domain().lowest_optional()?.and_then(|(_, per_byte)| per_byte)),
-            Rung::Prefix => Ok(self.host.domain().serving_rates()?.and_then(|rates| {
-                self.host
-                    .prefix_steps(&rates)
-                    .first()
-                    .map(|step| step.seconds_per_second / step.bytes.max(1) as f64)
-            })),
-            Rung::Preemption => unreachable!("the ladder rates only its priced rungs"),
-        }
-    }
 }
 
-impl<H: MemoryHost> Releasing<'_, H> {
+impl<F: ProgramFamily> Releasing<'_, F> {
     fn release_at(&mut self, rung: Rung) -> Result<Release, DomainError> {
         let released = |released: bool| match released {
             true => Release::Released,
             false => Release::Nothing,
         };
+        let service = &mut *self.service;
         Ok(match rung {
             // Idle graph slots release off this thread: a later boundary
             // finishes them, and nothing costlier runs before it.
             Rung::Surplus => {
-                let wake = self.host.completion();
-                let shrunk = self.host.domain().shrink_state(self.bindings, ShrinkPolicy::Reclaim, wake)?;
+                let wake = service.wakes.completion();
+                let shrunk = service.domain.shrink_state(self.bindings, ShrinkPolicy::Reclaim, wake)?;
                 self.slots_began = shrunk.slots == SlotRelease::Began;
                 match shrunk.slots {
-                    SlotRelease::Began | SlotRelease::Running => Release::Pending(Pending::Slots),
+                    SlotRelease::Began | SlotRelease::Running => Release::Pending,
                     SlotRelease::None => released(shrunk.released != 0),
                 }
             }
             Rung::Idle => released(
-                self.host
-                    .domain()
-                    .reclaim_idle(self.bindings)
-                    .map_err(release_invariant("idle state release"))?
-                    != 0,
+                service.domain.reclaim_idle(self.bindings).map_err(release_invariant("idle state release"))? != 0,
             ),
-            Rung::Bank if self.host.domain().expert_reclaim_covered() => Release::Covered,
-            // A step begun, or a resize running, releases at a later flight
-            // boundary; the bank's floor releases nothing.
-            Rung::Bank => {
-                let wake = self.host.completion();
-                match self.host.domain().shrink_expert_bank(self.bindings, wake)? {
-                    BankStep::Begun(tier) => {
-                        self.began = Some(tier);
-                        Release::Pending(Pending::Bank)
-                    }
-                    BankStep::Running => Release::Pending(Pending::Bank),
-                    BankStep::Deferred => Release::Deferred,
-                    BankStep::AtLimit => Release::Nothing,
-                }
-            }
-            Rung::Prefix => released(self.host.evict_prefix(self.held)),
-            Rung::Optional => match self.host.domain().lowest_optional()? {
+            Rung::Prefix => released(service.prefix_cache.evict_one(self.held)),
+            Rung::Optional => match service.domain.lowest_optional()? {
                 Some((component, _)) => released(
-                    self.host
-                        .domain()
+                    service
+                        .domain
                         .release_idle_optional_components(self.bindings, &[component])
                         .map_err(release_invariant("optional component release"))?
                         != 0,
                 ),
                 None => Release::Nothing,
             },
-            Rung::Preemption => released(self.host.evict_victims(self.spared, self.resident_slot)?),
+            Rung::Preemption => released(service.evict_victims(self.spared, self.resident_slot)?),
         })
+    }
+}
+
+impl<F: ProgramFamily> Service<F> {
+    /// Release once at the first rung that releases anything, preemption
+    /// only where `preempt` ([`release::release_once`]): whether it
+    /// released now; preemption spares `spared`, and with `resident_slot`
+    /// takes requests that free no bytes, since what is short is a resident
+    /// slot. A pending release (idle graph slots) releases nothing now: what
+    /// waits on it retries once a boundary finishes it.
+    fn release_once(
+        &mut self,
+        bindings: &mut StateBindings,
+        preempt: bool,
+        held: &BTreeSet<u64>,
+        spared: &[RequestId],
+        resident_slot: bool,
+    ) -> Result<bool, DomainError> {
+        let mut releasing = Releasing { service: self, bindings, held, spared, resident_slot, slots_began: false };
+        Ok(release::release_once(&mut releasing, preempt)? == Release::Released)
     }
 }
 
@@ -4129,32 +3542,8 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
         self.epoch.advance();
     }
 
-    fn held_prefixes(&self) -> BTreeSet<u64> {
-        self.held_entries(None)
-    }
-
-    fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool {
-        self.prefix_cache.evict_one(held)
-    }
-
-    fn prefix_steps(&self, rates: &WorkloadRates) -> Vec<PrefixStep> {
-        self.prefix_cache.held_steps(self.domain.retained_entry_bytes(), rates, &self.held_entries(None))
-    }
-
-    fn evict_cached_prefix(&mut self, id: u64) -> bool {
-        self.prefix_cache.evict(id)
-    }
-
-    fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError> {
-        Service::evict_victims(self, spared, resident_slot)
-    }
-
-    fn refuse_memory_waiters(&mut self) {
-        Service::refuse_memory_waiters(self)
-    }
-
     fn unload(&mut self) {
-        tracing::error!(requests = self.requests.len(), "unloading the model: memory stayed below the reclaim reserve");
+        tracing::error!(requests = self.requests.len(), "unloading the model: the memory guarantee cannot be kept");
         self.terminalize_all(
             RequestError::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
@@ -4174,15 +3563,6 @@ enum Selected {
 enum Residency {
     Resident(Generation, Vec<Operation>),
     Waiting(Generation, Wait),
-}
-
-fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
-    match result {
-        Ok(()) => Ok(MemoryObservation::Normal),
-        Err(DomainError::Reclaim(_)) => Ok(MemoryObservation::Reclaim),
-        Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -4276,64 +3656,6 @@ mod branch_plan_tests {
             branches,
             BTreeSet::from([3000, 5800, 5800 + MIN_BRANCH_GAIN])
         );
-    }
-}
-
-#[cfg(test)]
-mod memory_condition_tests {
-    use super::{MEMORY_ESCALATION_NS, MemoryCondition, MemoryObservation};
-
-    #[test]
-    fn continuous_blind_escalates_to_immediately_eligible_reclaim() {
-        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
-        assert_eq!(blind, MemoryCondition::Blind { since: 7 });
-        let before = blind.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS - 1);
-        assert_eq!(before, blind);
-        assert!(!before.should_unload(7 + MEMORY_ESCALATION_NS - 1));
-        let escalated = before.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
-        assert_eq!(escalated, MemoryCondition::Reclaim { since: 7 });
-        assert!(escalated.should_unload(7 + MEMORY_ESCALATION_NS));
-    }
-
-    #[test]
-    fn interrupted_blind_restarts_its_interval() {
-        let blind = MemoryCondition::Normal.observe(MemoryObservation::Blind, 7);
-        let normal = blind.observe(MemoryObservation::Normal, 8);
-        assert_eq!(normal, MemoryCondition::Normal);
-        let renewed = normal.observe(MemoryObservation::Blind, 7 + MEMORY_ESCALATION_NS);
-        assert_eq!(
-            renewed,
-            MemoryCondition::Blind {
-                since: 7 + MEMORY_ESCALATION_NS
-            }
-        );
-        assert!(!renewed.should_unload(7 + MEMORY_ESCALATION_NS));
-    }
-
-    #[test]
-    fn reclaim_unloads_one_interval_after_releases_are_exhausted() {
-        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
-        assert_eq!(reclaim, MemoryCondition::Reclaim { since: 5 });
-        // Continued Reclaim keeps the clock; a release that frees memory
-        // restarts it.
-        assert_eq!(reclaim.observe(MemoryObservation::Reclaim, 9), reclaim);
-        let released = reclaim.released(100);
-        assert_eq!(released, MemoryCondition::Reclaim { since: 100 });
-        assert!(!released.should_unload(100 + MEMORY_ESCALATION_NS - 1));
-        assert!(released.should_unload(100 + MEMORY_ESCALATION_NS));
-        // A failed reading during Reclaim neither resets nor extends it.
-        assert_eq!(released.observe(MemoryObservation::Blind, 200), released);
-    }
-
-    #[test]
-    fn recovery_clears_reclaim_and_a_new_episode_starts_fresh() {
-        let reclaim = MemoryCondition::Normal.observe(MemoryObservation::Reclaim, 5);
-        let normal = reclaim.observe(MemoryObservation::Normal, 10);
-        assert_eq!(normal, MemoryCondition::Normal);
-        assert!(!normal.should_unload(10 + MEMORY_ESCALATION_NS));
-        assert_eq!(normal.released(11), MemoryCondition::Normal);
-        let renewed = normal.observe(MemoryObservation::Reclaim, 11);
-        assert_eq!(renewed, MemoryCondition::Reclaim { since: 11 });
     }
 }
 
@@ -4607,7 +3929,7 @@ mod pending_retention_tests {
         assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
         let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
         let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
-        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait::Memory));
+        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait::Memory { at: AvailabilityEpoch::default() }));
         assert!(parked.settled().is_none());
         let State::Parked(round, _, _) = parked else { unreachable!() };
         let transition = round.prepare_round_transition(RequestId(1), &[], None, &mut NoFeatures).unwrap();
@@ -4618,7 +3940,7 @@ mod pending_retention_tests {
         assert_eq!(generation.output_len(), 0);
         assert!(generation.pending_reconciliation().is_none());
         assert_eq!(generation.resident_position(), generation.accepted_position());
-        let pending = State::Between(generation, Stage::Pending(priming(), Some(Wait::Memory)));
+        let pending = State::Between(generation, Stage::Pending(priming(), Some(Wait::Memory { at: AvailabilityEpoch::default() })));
         assert!(pending.settled().is_none(), "pending priming must block retention and terminal publication");
         let State::Between(generation, _) = pending else { unreachable!() };
         // finish_round returns completed method work as Ready.
@@ -4631,7 +3953,7 @@ mod pending_retention_tests {
         for (cancel, expected) in [(true, FinishReason::Cancelled), (false, FinishReason::Failed)] {
             let pending = State::Between(
                 super::termination_tests::generation(),
-                Stage::Pending(priming(), Some(Wait::Memory)),
+                Stage::Pending(priming(), Some(Wait::Memory { at: AvailabilityEpoch::default() })),
             );
             assert!(pending.settled().is_none());
             // terminate_request / fail_capacity_waiters discard composed work
@@ -4647,191 +3969,10 @@ mod pending_retention_tests {
         generation.evicted().unwrap();
         assert!(!generation.is_resident());
         assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
-        let state = State::Between(generation, Stage::NonResident(Some(Wait::Memory)));
+        let state = State::Between(generation, Stage::NonResident(Some(Wait::Memory { at: AvailabilityEpoch::default() })));
         assert!(state.settled().is_some());
         let State::Between(generation, _) = state else { unreachable!() };
         let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
         assert!(state.settled().is_some());
-    }
-}
-
-#[cfg(test)]
-mod ladder_tests {
-    use super::{Ladder, MEMORY_ESCALATION_NS, MemoryCondition, Release, RoomOwed};
-
-    /// A probe with no resize under way owes the claim one decision, taken
-    /// at the first boundary that can decide it, however many observations
-    /// without the bindings pass first; a resize finishing since, or under
-    /// way at the probe, leaves nothing owed.
-    #[test]
-    fn a_probe_owes_the_room_one_decision_until_the_bindings_return() {
-        let mut owed = RoomOwed::default();
-        owed.probed(false);
-        assert!(!owed.take(false), "a flight holds the bindings");
-        assert!(!owed.take(false));
-        assert!(owed.take(true));
-        assert!(!owed.take(true), "decided once");
-        owed.probed(false);
-        owed.resized();
-        assert!(!owed.take(true), "a resize finished since the probe");
-        owed.probed(true);
-        assert!(!owed.take(true), "a resize ran across the probe");
-    }
-
-    /// A release deferred for a gap keeps the ladder in motion, so nothing
-    /// is refused or unloaded for memory meanwhile, until the next boundary
-    /// takes it to try again; one pending keeps it in motion until its
-    /// resize finishes.
-    #[test]
-    fn a_deferred_release_holds_refusal_and_unload_until_its_boundary() {
-        let mut ladder = Ladder::default();
-        assert!(ladder.settled());
-        ladder.released(Release::Deferred);
-        assert!(!ladder.settled(), "a deferred shrink is not an exhausted ladder");
-        assert!(ladder.retry_deferred(), "the next boundary tries it again");
-        assert!(ladder.settled() && !ladder.retry_deferred());
-        ladder.released(Release::Pending(crate::release::Pending::Bank));
-        assert!(!ladder.settled());
-        ladder.released(Release::Nothing);
-        assert!(!ladder.settled(), "nothing more at a rung leaves the pending release");
-    }
-
-    /// A slot release and a bank resize pending at once each hold the
-    /// ladder until its own finish: either finishing first leaves the other
-    /// pending.
-    #[test]
-    fn a_slot_release_and_a_bank_resize_pending_at_once_each_finish_alone() {
-        use crate::release::Pending;
-        for (first, second) in [(Pending::Slots, Pending::Bank), (Pending::Bank, Pending::Slots)] {
-            let mut ladder = Ladder::default();
-            ladder.released(Release::Pending(Pending::Slots));
-            ladder.released(Release::Pending(Pending::Bank));
-            *ladder.pending.of(first) = false;
-            assert!(!ladder.settled(), "{second:?} still runs after {first:?} finished");
-            assert!(*ladder.pending.of(second));
-            *ladder.pending.of(second) = false;
-            assert!(ladder.settled());
-        }
-    }
-
-    /// What the host has yet to show released holds refusal and unload, as a
-    /// running release does.
-    #[test]
-    fn a_covered_release_holds_refusal_and_unload() {
-        let mut ladder = Ladder::default();
-        ladder.released(Release::Covered);
-        assert!(!ladder.settled());
-    }
-
-    /// A release the host has yet to show is waited on however long
-    /// Reclaim lasts: the clock neither unloads the model nor asks the bank
-    /// again for what it released (Metal unwires a released slab 0.47 s to
-    /// over 3 s after its release, past the 1 s clock), so one deficit is
-    /// released once.
-    #[test]
-    fn a_release_the_host_has_yet_to_show_is_never_released_again() {
-        let mut ladder = Ladder::default();
-        ladder.released(Release::Covered);
-        let condition = MemoryCondition::Reclaim { since: 0 };
-        for now in [0, MEMORY_ESCALATION_NS, 3 * MEMORY_ESCALATION_NS] {
-            assert!(!ladder.unload_due(condition, now), "at {now} ns");
-        }
-    }
-
-    /// More taken than is credited is real pressure however the credited
-    /// release fares: the next walk finds it short and, every rung spent,
-    /// the model unloads once Reclaim outlasts the clock.
-    #[test]
-    fn pressure_past_a_release_the_host_never_shows_unloads() {
-        let mut ladder = Ladder::default();
-        ladder.released(Release::Covered);
-        let condition = MemoryCondition::Reclaim { since: 0 };
-        assert!(!ladder.unload_due(condition, MEMORY_ESCALATION_NS));
-        // A reading short past the credit walks the rungs again, to the last.
-        ladder.walk();
-        ladder.released(Release::Nothing);
-        assert!(!ladder.unload_due(condition, MEMORY_ESCALATION_NS - 1));
-        assert!(ladder.unload_due(condition, MEMORY_ESCALATION_NS));
-    }
-}
-
-#[cfg(test)]
-mod measurement_room_tests {
-    use super::{BankStep, MeasurementRoom, RoomClaim};
-    use crate::protocol::{RoomAnswer, RoomGrant, RoomRefusal};
-    use std::task::{Context, Poll, Waker};
-
-    /// A claim, and the grant its job waits on.
-    fn claimed() -> (RoomClaim, RoomGrant) {
-        let (granter, grant) = RoomGrant::new();
-        (RoomClaim(granter), grant)
-    }
-
-    fn answer(grant: &mut RoomGrant) -> Option<RoomAnswer> {
-        match grant.poll_answer(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(answer) => Some(answer),
-            Poll::Pending => None,
-        }
-    }
-
-    /// A claim short of its room shrinks the bank by the rest and waits; it
-    /// is answered only at a later probe that reads the room made.
-    #[test]
-    fn a_claim_is_answered_after_its_shrink_makes_the_room() {
-        let (claim, mut grant) = claimed();
-        let mut asked = None;
-        let claim = claim
-            .decide::<()>(MeasurementRoom::Short(4096), |bytes| {
-                asked = Some(bytes);
-                Ok(BankStep::Begun(magnitude_executor::BankTier::Bank))
-            })
-            .unwrap()
-            .expect("the claim waits for its shrink");
-        assert_eq!(asked, Some(4096), "the bank shrinks by what the room is short");
-        assert_eq!(answer(&mut grant), None, "not answered before the shrink is read");
-        let unshrunk = |_| -> Result<BankStep, ()> { panic!("a made room shrinks nothing") };
-        assert!(claim.decide(MeasurementRoom::Made, unshrunk).unwrap().is_none());
-        assert_eq!(answer(&mut grant), Some(RoomAnswer::Made));
-    }
-
-    /// A shrink that cannot run yet (no gap, or another resize) leaves the
-    /// claim waiting for the next probe, which shrinks again; one at the
-    /// bank's floor refuses it.
-    #[test]
-    fn a_claim_at_the_floor_is_refused_and_one_without_a_gap_waits() {
-        let (claim, mut grant) = claimed();
-        let claim = claim
-            .decide::<()>(MeasurementRoom::Short(4096), |_| Ok(BankStep::Deferred))
-            .unwrap()
-            .expect("a deferred shrink waits");
-        let claim = claim
-            .decide::<()>(MeasurementRoom::Unread, |_| panic!("an unread room shrinks nothing"))
-            .unwrap()
-            .expect("an unread room waits");
-        assert_eq!(answer(&mut grant), None);
-        let claim = claim
-            .decide::<()>(MeasurementRoom::Draining, |_| panic!("a draining room shrinks nothing"))
-            .unwrap()
-            .expect("a room whose bank's traffic still runs waits");
-        assert_eq!(answer(&mut grant), None);
-        assert!(claim
-            .decide::<()>(MeasurementRoom::Short(4096), |_| Ok(BankStep::AtLimit))
-            .unwrap()
-            .is_none());
-        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 4096 })));
-    }
-
-    /// A claim short by more than the bank holds above its floor is refused
-    /// at once, before anything shrinks.
-    #[test]
-    fn a_claim_beyond_the_banks_floor_is_refused_without_a_shrink() {
-        let (claim, mut grant) = claimed();
-        let beyond = MeasurementRoom::Beyond { short: 8192, releasable: 4096 };
-        assert!(claim
-            .decide::<()>(beyond, |_| panic!("a claim no shrink can meet shrinks nothing"))
-            .unwrap()
-            .is_none());
-        let refused = RoomRefusal::BeyondFloor { short: 8192, releasable: 4096 };
-        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(refused)));
     }
 }

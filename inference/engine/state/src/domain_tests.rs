@@ -1022,3 +1022,99 @@ fn produced_domains_follow_the_per_token_ones() {
     assert!(ComponentDescriptor::produced(LayerRef::Target(0), DType::F32, 4, true).is_err());
     assert!(ComponentDescriptor::new(INDEX_KEYS, CodecSpec::dense(DType::F32, 4, 4), 1).is_err());
 }
+
+/// A batch's most rows in a domain are its rows at the worst position: one
+/// per row, or every block the rows can complete.
+#[test]
+fn a_batchs_most_rows_are_its_worst_positions() {
+    let kinds = [
+        HistoryDomainKind::Token,
+        HistoryDomainKind::Window { rows: 3 },
+        HistoryDomainKind::Block { rate: 1 },
+        HistoryDomainKind::Block { rate: 4 },
+        HistoryDomainKind::Block { rate: 7 },
+    ];
+    for kind in kinds {
+        for count in 0..20 {
+            let worst = (0..40).map(|position| kind.advance_rows(position, count)).max().unwrap();
+            assert_eq!(kind.most_advance_rows(count), worst, "{kind:?} at {count} rows");
+        }
+    }
+}
+
+/// The backing a submission batch newly takes in each domain, at its worst
+/// page offset (a history whose last page holds none of it), is its
+/// `batch_state_bytes`: a fresh history for the Token and Window domains, and
+/// for the Block(4) domain one at position 3, whose batch completes its
+/// first block.
+#[test]
+fn a_batch_takes_its_state_bytes_of_pages() {
+    let keys = |coordinates| ComponentDescriptor::produced(INDEX_KEYS, DType::F32, 4, coordinates).unwrap();
+    let layouts = [
+        HistoryDomainLayout::Token { components: vec![component(0, 1)] },
+        HistoryDomainLayout::Window { rows: 3, components: vec![keys(true)] },
+        HistoryDomainLayout::Block { rate: 4, components: vec![keys(false)] },
+    ];
+    let (context, max_advance) = (64, 16);
+    for rows in 1..=4 {
+        for (index, (layout, at)) in layouts.iter().zip([0, 0, 3]).enumerate() {
+            let domain = HistoryDomainId(index);
+            let store = indexed_store(cpu_device(), context, max_advance);
+            let state = match at {
+                0 => store.create().unwrap(),
+                at => commit(store.create().unwrap(), at),
+            };
+            let free = store.free_rows(domain);
+            let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
+            let taken = (free - store.free_rows(domain)) as u64 * store.history_row_bytes(domain);
+            let single = std::slice::from_ref(layout);
+            assert_eq!(
+                taken,
+                batch_state_bytes(single, context, max_advance, rows as u64).unwrap(),
+                "{:?} at {rows} rows",
+                layout.kind()
+            );
+            let _ = advance.abort();
+        }
+        // The store's every domain at once.
+        let each = layouts
+            .iter()
+            .map(|layout| batch_state_bytes(std::slice::from_ref(layout), context, max_advance, rows as u64).unwrap())
+            .sum::<u64>();
+        assert_eq!(batch_state_bytes(&layouts, context, max_advance, rows as u64).unwrap(), each);
+    }
+}
+
+/// A window history occupies at most its row limit's pages and the partial
+/// page at its front however long it grows, so `batch_state_bytes` of its
+/// rows from a page boundary caps there: as a sequence advances far past
+/// its window, the pages the store holds for it never exceed that figure,
+/// and reach it once the window straddles a page boundary in flight.
+#[test]
+fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
+    let (context, window, max_advance) = (4096, 300, 16);
+    let mut bindings = windowed_store(cpu_device(), context, window, max_advance, 1024, 2);
+    let store = Rc::clone(&bindings);
+    let single = [HistoryDomainLayout::Window { rows: window, components: vec![component(1, 2)] }];
+    let row_bytes = store.history_row_bytes(WINDOW);
+    let page = store.history_page_rows(WINDOW);
+    let cap = window_pages(page, window + max_advance) * page;
+    let free = store.free_rows(WINDOW);
+    let mut state = store.create().unwrap();
+    let mut most = 0;
+    for _ in 0..context / max_advance {
+        bindings.provision(&state.demands(max_advance), 0).unwrap();
+        let advance = OwnedStateAdvance::begin(state, max_advance).ok().unwrap();
+        let through = advance.position() + max_advance;
+        let held = free - store.free_rows(WINDOW);
+        let bytes = batch_state_bytes(&single, context, max_advance, through as u64).unwrap();
+        assert!(held as u64 * row_bytes <= bytes, "{held} rows held through {through}");
+        most = most.max(held);
+        let OwnedAdvanceResolution::Committed(next) = advance.commit_all().ok().unwrap() else {
+            panic!("an attention advance commits");
+        };
+        state = next;
+    }
+    assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
+    assert_eq!(batch_state_bytes(&single, context, max_advance, context as u64).unwrap(), cap as u64 * row_bytes);
+}

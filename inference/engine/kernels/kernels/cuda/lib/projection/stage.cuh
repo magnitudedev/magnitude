@@ -388,9 +388,10 @@ __device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K
 }
 
 // int8 activations (the GEMM's INT8 candidate): rows quantized per 32-code
-// group as q8_1 does, x ~= d * q with d = max|x| / 127 and q = rint(x / d),
-// staged by `stage_row_s8` as `q` ([M, width] bytes in the s8 fragments'
-// virtual k order, packets.cuh) and `groups` (each group's (d, d * sum q)).
+// group, x ~= d * q by the rule every backend's INT8 activations follow
+// (`s8_scale`, `s8_code`: the CPU's, `seismic-native-cpu` `quant.rs`), staged
+// by `stage_row_s8` as `q` ([M, width] bytes in the s8 fragments' virtual k
+// order, packets.cuh) and `groups` (each group's (d, d * sum q)).
 struct QuantizedRows {
     const u8 *q;
     u64 width;
@@ -401,6 +402,47 @@ struct QuantizedRows {
 __device__ __forceinline__ u32 s8_real_offset(u32 v) {
     const u32 half = v / 16, t = (v % 16) / 4, j = v % 4;
     return half * 16 + 2 * t + (j % 2) + 8 * (j / 2);
+}
+
+// The scale of a group whose largest magnitude is `maximum` (NaN ignored):
+// `maximum / 127` rounded to nearest, or where that is subnormal, rounded up
+// onto the subnormal grid, so `maximum / d <= 127` and `d` is zero only for
+// an all-zero group.
+__device__ __forceinline__ float s8_scale(float maximum) {
+    const float least_normal = __uint_as_float(0x00800000u);
+    float d = __fdiv_rn(maximum, 127.0f);
+    // F64 holds `d * 127` exactly.
+    if (d < least_normal && (double)d * 127.0 < (double)maximum)
+        d = __uint_as_float(__float_as_uint(d) + 1u);
+    return d;
+}
+
+// The code of `x` under the scale `d` (`s8_scale`): the exact quotient
+// rounded once, half away from zero; NaN, and a zero scale, code 0. Where
+// `d` is normal the F32 quotient is within half an ulp of the exact one, so
+// only a quotient that lands on a half decides by the sign of its remainder;
+// where `d` is subnormal the F64 quotient of two F32 values rounds like the
+// exact one.
+__device__ __forceinline__ int s8_code(float x, float d) {
+    if (d == 0.0f)
+        return 0;
+    const float magnitude = fabsf(x);
+    float rounded;
+    if (d < __uint_as_float(0x00800000u)) {
+        const double quotient = (double)magnitude / (double)d;
+        if (!(quotient == quotient))
+            return 0;
+        rounded = (float)round(quotient);
+    } else {
+        const float quotient = __fdiv_rn(magnitude, d);
+        if (!(quotient == quotient))
+            return 0;
+        rounded = roundf(quotient);
+        // A tie in F32 is below the exact quotient where the remainder is negative.
+        if (quotient - truncf(quotient) == 0.5f && fmaf(-quotient, d, magnitude) < 0.0f)
+            rounded = truncf(quotient);
+    }
+    return x < 0.0f ? -(int)rounded : (int)rounded;
 }
 
 // Staging launch of the INT8 candidate, one block per row m: the prologue's
@@ -420,7 +462,7 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
             values[j] = pro.value(factors, m, group * 32 + j);
             maximum = fmaxf(maximum, fabsf(values[j]));
         }
-        const float d = maximum / 127.0f;
+        const float d = s8_scale(maximum);
         int total = 0;
         u32 words[8];
 #pragma unroll
@@ -428,7 +470,7 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
             u32 word = 0;
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                const int code = d == 0.0f ? 0 : __float2int_rn(values[s8_real_offset(4 * w + b)] / d);
+                const int code = s8_code(values[s8_real_offset(4 * w + b)], d);
                 total += code;
                 word |= ((u32)code & 0xFFu) << (8 * b);
             }

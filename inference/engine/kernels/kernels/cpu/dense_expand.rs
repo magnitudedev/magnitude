@@ -1,4 +1,4 @@
-// dense_expand on CPU (contract and portable body in dense_rows.seismic).
+// dense_expand on CPU (contract and portable body in feed_forward.seismic).
 // `dense_expand_normalize` publishes the RMS-normalized residual row of each
 // output row (rounded to A) as F32 into scratch, one work item per row.
 // `dense_expand_rows` gives each work item ROWS gate and up weight rows, which
@@ -8,6 +8,7 @@
 use lib::core::functions;
 use lib::projection::projection;
 
+#[inline(always)]
 fn dense_expand_normalize<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -28,20 +29,13 @@ fn dense_expand_normalize<L: Isa, E: Elements>(
         normalized,
     );
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(h);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(normalized, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_o() as usize, &[&cx.arg_gate_weight(), &cx.arg_up_weight()]), cx.scratch_quantized(), 0) };
     }
     projection::operand_row(&[&cx.arg_gate_weight(), &cx.arg_up_weight()], normalized);
 }
 
+#[inline(always)]
 fn dense_expand_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -61,10 +55,8 @@ fn dense_expand_rows<L: Isa, E: Elements>(
     let up_scale = if cx.dim_us() == 0 { 1.0 } else { cx.arg_up_scale().get([0]) };
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, o * h) };
-    let blocks = seismic::cpu::quant::blocks(h);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
+        projection::quantized(cx.scratch_quantized(), 0, o, h, projection::tiled(o, &[&cx.arg_gate_weight(), &cx.arg_up_weight()]))
     });
     projection::project_pair_staged_arithmetic(
         (&gate_weight, rows.start),

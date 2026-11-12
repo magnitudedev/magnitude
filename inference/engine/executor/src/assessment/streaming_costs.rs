@@ -1822,11 +1822,35 @@ struct Sweeps<'a> {
 }
 
 impl Sweeps<'_> {
+    /// Reader `reader` of `readers`' contiguous share of `length` words.
+    fn share(length: usize, readers: usize, reader: usize) -> std::ops::Range<usize> {
+        reader * length / readers..(reader + 1) * length / readers
+    }
+
+    /// `length` words each reader of `readers` writes its own share of, so
+    /// the pages spread across the nodes the writers run on (a single writer
+    /// places every page on its one node: 29 GB/s read on a machine whose
+    /// memory streams 72 to all its cores). The threads are not pinned, so
+    /// a reader need not read the pages its writer wrote.
+    fn written(length: usize, readers: usize) -> Vec<u64> {
+        let mut words = vec![0u64; length];
+        std::thread::scope(|scope| {
+            let mut rest = words.as_mut_slice();
+            for reader in 0..readers {
+                let range = Self::share(length, readers, reader);
+                let (share, after) = rest.split_at_mut(range.len());
+                rest = after;
+                scope.spawn(move || share.iter_mut().zip(range).for_each(|(word, index)| *word = index as u64));
+            }
+        });
+        words
+    }
+
     fn sweep(&self) {
         let length = self.words.len();
         std::thread::scope(|scope| {
             for reader in 0..self.readers {
-                let share = &self.words[reader * length / self.readers..(reader + 1) * length / self.readers];
+                let share = &self.words[Self::share(length, self.readers, reader)];
                 scope.spawn(move || std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word))));
             }
         });
@@ -1930,8 +1954,9 @@ impl MemoryCosts {
     }
 
     /// Measure the line's sweeps by `readers` threads in the measurement job
-    /// (`walks`), every page of the span written once before it is timed
-    /// (an untouched page reads as the one zero page).
+    /// (`walks`), every page of the span written once before it is timed,
+    /// in `readers` shares ([`Sweeps::written`]; an untouched page reads as
+    /// the one zero page).
     pub(super) fn measure(readers: u64, walks: &mut Walks<'_, '_>) {
         let span = Self::span(walks.device().topology());
         let identity = walks.identity();
@@ -1939,8 +1964,8 @@ impl MemoryCosts {
         for bytes in [0, span] {
             let words = &words;
             walks.time_host(Self::key(&identity, readers, span, bytes), move || {
-                let words = words.get_or_init(|| (0..span / 8).collect::<Vec<u64>>());
                 let readers = usize::try_from(readers).map_err(|_| Unformed::Never(ExecutorCostsError(format!("{readers} readers exceed the host"))))?;
+                let words = words.get_or_init(|| Sweeps::written((span / 8) as usize, readers));
                 Ok(Sweeps { words: &words[..(bytes / 8) as usize], readers })
             });
         }
@@ -1965,6 +1990,20 @@ mod tests {
         assert_eq!(form.lines_of(lines, bytes).unwrap(), lines);
         let twice = CpuLines { expert: RowLine { one: ns(200_000.), row: RowCost::Measured(ns(20_000.)) }, handshake: ns(30_000.) };
         assert_eq!(form.lines_of(lines, 2 * bytes).unwrap(), twice);
+    }
+
+    /// A sweep's words are the span's, each written by the reader whose
+    /// share it is: the shares tile the span in order whatever the reader
+    /// count, so every word holds its index.
+    #[test]
+    fn written_words_are_the_spans_in_the_readers_shares() {
+        for (length, readers) in [(1000, 1), (1001, 7), (3, 8), (0, 4)] {
+            let shares = (0..readers).map(|reader| Sweeps::share(length, readers, reader)).collect::<Vec<_>>();
+            assert_eq!(shares.first().map_or(0, |share| share.start), 0);
+            assert!(shares.windows(2).all(|pair| pair[0].end == pair[1].start));
+            assert_eq!(shares.last().map_or(0, |share| share.end), length);
+            assert_eq!(Sweeps::written(length, readers), (0..length as u64).collect::<Vec<_>>());
+        }
     }
 
     #[test]

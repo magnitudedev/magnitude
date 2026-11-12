@@ -97,14 +97,14 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
     return result
 
 # Metal: GEMV below BATCH_FROM rows (`gemv` for one row, `gemv_pair` for two,
-# `gemv_rows` for more, see `dense_rows.seismic`), batched GEMV to 16, GEMM beyond with
+# `gemv_rows` for more, see `dense.seismic`), batched GEMV to 16, GEMM beyond with
 # SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
 # there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
-# TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`): on
+# TALL selects the tall GEMM past 64 rows (see `dense.seismic`): on
 # simdgroup matrices `relayout` first reorders the gated rows into
 # `fragments`, a second copy of them in whole 64-row tiles.
 # PACK selects `dense_output`'s token-packing form past 64 rows (see
-# `dense_rows.seismic`), with its launches, complete paired computation and transient
+# `dense.seismic`), with its launches, complete paired computation and transient
 # scratch, over the gated rows (the weights' factors a simdgroup per weight
 # row), for weights admitted to it (`form(OW, PACK)`); devices without the
 # packed path run the staged tile, with its results.
@@ -184,7 +184,7 @@ native attention_output for metal from "metal/attention_output.metal":
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands), both split
 # over K into 2 shares summed by `finalize` up to 128 rows (see
-# `cuda_dense.seismic`); the shared stage produces selected S8 or F16 matrix operands.
+# `dense.seismic`); the shared stage produces selected S8 or F16 matrix operands.
 # (Metal: batched GEMV class, no INT8 path.)
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
@@ -272,7 +272,7 @@ native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W, OS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where Q * W > 0 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * Q * W * 4)
     launch attention_output_stage:
         threadgroups (M, 1, 1)
@@ -362,7 +362,7 @@ native attention_output for cpu from "cpu/attention_output.rs":
 # draft-history injection: Q/gate outputs are zero and only K/V is consumed.
 # Native backends may omit the Q/gate projection work in that mode. Each
 # segment's weight has its accumulator-scale port (QS, GS, KS, VS; see
-# `dense_rows.seismic`), as `attention_output`'s weight has OS. The
+# `dense.seismic`), as `attention_output`'s weight has OS. The
 # normalized rows are A; the results are published in Y: A where attention
 # reads them, F32 where a pooled source pools them (`pooled.seismic`).
 fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](hidden: &tensor[M, PT * D] f32,
@@ -406,9 +406,9 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
         scale_rows(value_sum, value_scale, value)
     return query, gate, key, value
 
-# Metal: TALL selects the tall GEMM past 64 rows (see `dense_rows.seismic`)
+# Metal: TALL selects the tall GEMM past 64 rows (see `dense.seismic`)
 # over rows staged in its order.
-# PACK selects the token-packing form of `dense_rows.seismic` past 64 rows for
+# PACK selects the token-packing form of `dense.seismic` past 64 rows for
 # the four segments, over the staged normalized rows, as in
 # `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
 # each weight's own factor tables in segment order, the packed tiles in
@@ -576,7 +576,7 @@ native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
     params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where D > 0 and (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1 or form(KW, INT8) == 1 or form(VW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(D, Q8_VALUES) * Q8_BYTES)
+    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * D * 4)
     launch attention_project_normalize:
         threadgroups (M, 1, 1)
@@ -891,44 +891,69 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
 
 # Metal: partitions of max(SPAN, ceil(keys / PARTS)) keys; each simdgroup
 # holds the G / SLICES query heads of its slice, W / 32 columns per lane.
-# (CUDA: equal partitions.) MATRIX selects the grouped-query matrix form, as
+# (CUDA: equal partitions.) MATRIX 1 selects the grouped-query matrix form, as
 # `attention_decode_k8v4`'s: keys enter the score product in the activation
 # dtype, values the output product as F16. Its kv head's G query heads split
 # into head groups of min(HEADS, G), each its own threadgroup, so the query
 # tile and the score exchange follow the group, not G: HEADS of at least G
 # is one group (only the smallest such value is admitted, and is the
 # default), and a smaller HEADS of at least 8 that divides G splits it into
-# groups that fill whole 8-row blocks. A split is admitted only where no
-# form can hold the group whole: its prepared queries alone, G * W * 2
-# bytes, exceed the 32768 threadgroup bytes, a lower bound of both forms'
-# footprints (V4.1's G = 64 at W = 512: 65536). Every group either form
-# holds whole thus keeps exactly its one-group grid and tuning space, where
-# a split has no measurement that it wins (G = 16: 4096 at W = 128, Muse and
-# Nemotron; 16384 at W = 512). The vector form holds one group. A
-# row's KS index-list picks (the matrix form, one row a threadgroup) follow
-# its visible keys in the sequence the partitions split; each partition's
-# picks are read from `selected` in windows of KEYS, those naming a row
-# gathered into one tile, so picks add no launch. Fresh keys are rounded
-# (KR = 1) as they are appended and attended.
+# groups that fill whole 8-row blocks.
+#
+# MATRIX 2 selects the shared-tile matrix form (one row a threadgroup, the
+# whole group): one threadgroup per (kv head, partition, row) holds all G
+# query heads in ceil(G / 8) row blocks by C = max(1, W / 128) column slices
+# of simdgroups, its queries in registers, so each K/V tile is read once per
+# partition and staged once into one key and one F16 value tile that every
+# simdgroup reads (a stored-key or picked row loaded once for both), a
+# tile's loads issued before the previous tile's products. Its threadgroup
+# memory is the two tiles, KEYS rows of W + 8, and with C > 1 the score
+# exchange of C * ceil(G / 8) * 8 * KEYS F32; its limit is ceil(G / 8) * C
+# simdgroups of at most 1024 threads (G * W <= 32768 at W >= 128; V4.1's
+# G = 64 at W = 512 is 32 simdgroups).
+#
+# A head-group split is admitted only where no form can hold the group
+# whole: the matrix form's prepared queries alone, G * W * 2 bytes, exceed
+# the 32768 threadgroup bytes, and the shared-tile form exceeds its limit or
+# its bytes at KEYS 8. Every group a form holds whole thus keeps exactly its
+# one-group grid and tuning space, where a split has no measurement that it
+# wins (G = 16: 4096 at W = 128, Muse and Nemotron; 16384 at W = 512; V4.1's
+# 64 at W = 512, which the shared-tile form holds). The vector form holds
+# one group. A row's KS index-list picks (the matrix forms, one row a
+# threadgroup) follow its visible keys in the sequence the partitions split;
+# each partition's picks are read from `selected` in windows of KEYS, those
+# naming a row gathered into one tile, so picks add no launch. Fresh keys
+# are rounded (KR = 1) as they are appended and attended. With the output
+# rotary (RO = 1) the merge holds each head's whole row and turns it back in
+# F32 before publishing it.
+#
+# A row of its own (TOKENS = 1, every form) takes its keys in tiles, or the
+# vector form's batches, at fixed positions of its key sequence, history and
+# fresh keys alike, and a fresh key is prepared exactly as it is appended:
+# under one specialization a row's result is bit for bit the same whatever
+# rows share its launch, and whichever of its keys are still fresh. Row tiles
+# of several rows (TOKENS > 1) share their tiles across rows and do not hold
+# this.
 native attention_decode for metal from "metal/attention_decode.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
-        arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1,
+        arithmetic form MATRIX in [0, 1, 2] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1,
         arithmetic HEADS in [1, 2, 4, 8, 16, 32, 64, 128] default least where HEADS >= G)
-    where KR <= 1 and (KS == 0 or (MATRIX == 1 and TOKENS == 1)) and ((HEADS >= G and HEADS / 2 < G) or (MATRIX == 1 and HEADS >= 8 and HEADS < G and G % HEADS == 0 and G * (2 * P + S) * 2 > 32768)) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8 <= 32768))
+    where KR <= 1 and (KS == 0 or (MATRIX >= 1 and TOKENS == 1)) and ((HEADS >= G and HEADS / 2 < G) or (MATRIX == 1 and HEADS >= 8 and HEADS < G and G % HEADS == 0 and G * (2 * P + S) * 2 > 32768 and (ceil_div(G, 8) * max(1, (2 * P + S) / 128) > 32 or (2 * P + S) % max(1, (2 * P + S) / 128) != 0 or ((2 * P + S) / max(1, (2 * P + S) / 128)) % 32 != 0 or 4 * 8 * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * 8 * 4 > 32768))) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0 and 2 * P + S <= 1024)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX >= 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX < 2 or (TOKENS == 1 and SIMDS == 4 and HEADS >= G and ceil_div(G, 8) * max(1, (2 * P + S) / 128) <= 32 and (2 * P + S) % max(1, (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, (2 * P + S) / 128)) % 32 == 0 and 4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4 <= 32768)) and (MATRIX >= 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX != 1 or ((2 * P + S) % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    launch attention_decode_partial:
+    launch attention_decode_partial when MATRIX < 2:
         threadgroups (KV * ceil_div(G, HEADS), PARTS, ceil_div(M, TOKENS))
         threads_per_threadgroup (SIMDS * 32, 1, 1)
-        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * (ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8))
+        shared_bytes ((1 - min(1, MATRIX)) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + min(1, MATRIX) * (ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8))
+    launch attention_decode_shared when MATRIX == 2:
+        threadgroups (KV, PARTS, M)
+        threads_per_threadgroup (ceil_div(G, 8) * max(1, (2 * P + S) / 128) * 32, 1, 1)
+        shared_bytes (4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4)
     launch attention_decode_merge:
-        threadgroups (KV * G, M, (2 * P + S) / 32)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_decode_rotate when RO == 1:
-        threadgroups (M, KV * G, 1)
-        threads_per_threadgroup (P, 1, 1)
+        threadgroups (KV * G, M, (2 * P + S) / 32 - RO * ((2 * P + S) / 32 - 1))
+        threads_per_threadgroup (32 + RO * ((2 * P + S) - 32), 1, 1)
 
 # CUDA: split-KV decode over PARTS equal partitions per (kv head, row); WARPS
 # warps per block scan contiguous slices of the partition, a warp holding one
@@ -967,49 +992,63 @@ native attention_decode for cuda from "cuda/attention_decode.cu":
 # L2 (`vulkan/lib/attention/prefill.glsl` with PREFILL_DECODE) over row tiles of
 # 16 * SIMDS / G rows, whose query heads are the matrix rows; each partition
 # takes an equal run of 32-key tiles. Shared bytes: the prefill's, then the
-# query tile [16 * SIMDS][W + 8] f16.
+# query tile [16 * SIMDS][W + 8] f16. A group whose prepared queries alone,
+# G * W * 2 bytes, exceed the 32768 shared bytes (V4.1's G = 64 at W = 512:
+# 65536), which no tile can hold, takes them from the prefill's L1 instead
+# (`attention_decode_prepare`: queries and fresh rows into f16 scratch, the
+# K/V append), so its whole group still shares each staged key tile; every
+# group that fits keeps its launches and tuning space. The matrix form holds
+# the extended forms as the prefill does (rounded keys, adjacent or trailing
+# rotary pairs, the output rotary as its own launch, stored-key values), and
+# each row's KS index-list picks: the tile rows' pick tiles, in row order,
+# follow the visible key tiles in the sequence the partitions split, each
+# gathered from `selected` and attended by its own row alone (a pick of -1
+# scores -inf), so picks add no launch.
 native attention_decode for vulkan from "vulkan/attention_decode.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 1, 2] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
         arithmetic form MATRIX in [0, 1] default 0)
-    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or SIMDS >= 4) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 <= 32768))
+    where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and VK <= 1 and (MATRIX == 1 or (KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0)) and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (RO == 0 or (P > 0 and I == 0 and U == 0)) and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or SIMDS >= 4) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 <= 32768 and (G * (2 * P + S) * 2 > 32768 or 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 <= 32768)))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
+    scratch queries bytes ((ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * G + SIMDS * 16) * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
+    scratch keys bytes (M * KV * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
+    scratch values bytes (M * KV * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
+    launch attention_decode_prepare when G * (2 * P + S) * 2 > 32768:
+        threadgroups (ceil_div(ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * (G + 1), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch attention_decode_partial:
         threadgroups (KV, PARTS, (1 - MATRIX) * M + MATRIX * ceil_div(M, max(1, SIMDS * 16 / G)))
         threads_per_threadgroup (SIMDS * 32, 1, 1)
-        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2))
+        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + (1 - min(1, G * (2 * P + S) * 2 / 32769)) * SIMDS * 16 * ((2 * P + S) + 8) * 2))
     launch attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+    launch attention_decode_rotate when RO == 1:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
 
-# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, and the
-# keys and values of a layer with fresh rows, into F32 scratch; the K/V
-# append), `attend` per (kv head, partition, row) over partitions of max(128,
-# ceil(keys / PARTS)) keys, `merge` per row (the fixed-order partition merge
-# and the output gates).
+# CPU (`cpu/lib/attention/attention.rs`): one launch, `attend` per (kv head,
+# partition, row): the item prepares its queries and the keys and values of the
+# rows it reads into its own shared bytes (part 0 appends the row's K/V), absorbs
+# its partition of max(128, ceil(keys / PARTS)) keys, and the last item of its
+# (kv head, row) to arrive (`arrivals`) runs the fixed-order partition merge and
+# the output gates of its G query heads. A row's keys absorb in blocks at fixed
+# positions of its key sequence, history and fresh keys alike, so its result is
+# bit for bit the same whatever rows share its launch, as Metal's one-row forms.
+#
 native attention_decode for cpu from "cpu/attention_decode.rs":
     static (P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1
-    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
-    scratch keys bytes (M * KV * (2 * P + S) * 4)
-    scratch values bytes (M * KV * (2 * P + S) * 4)
     scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * PARTS * G * 8)
-    launch attention_decode_prepare:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (P * 8)
+    scratch arrivals bytes (M * KV * 4) sync
     launch attention_decode_attend:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((G * 32 + 2 * P + S) * 4)
-    launch attention_decode_merge:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((G * 32 + 2 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 
 
 # Prefill rows (M >= 16). L1 prepares queries, and for a layer with fresh rows
@@ -1067,17 +1106,25 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, SK, RA, RT
 # with G; HEADS of at least G is today's single group, and only the smallest
 # such value is admitted. An attend threadgroup fits the device's 1024
 # threads.
+# A layer with picks (KS > 0) runs no attend: prepare appends the rows, and
+# one `shared` threadgroup per (kv head, row) attends the row's whole key
+# sequence (visible keys, then its picks gathered into KEYS-key tiles) with
+# all G query heads as its matrix rows, attention_decode's shared-tile form
+# (MATRIX 2, its admission at KEYS), and publishes the finished row (gate,
+# output rotary): no partials, merge or rotate launch. QT, HEADS and
+# SPLIT_GROUPS (attend's) and KEYS (shared's) are each fixed where their
+# launch does not run (HEADS at the least that holds min(G, 16)).
 native attention_prefill for metal from "metal/attention_prefill.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic QT in [16, 8, 32] default 16, arithmetic HEADS in [16, 8, 4, 2, 1] default 16, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256,
-        arithmetic form DIRECT in [0, 1] default 0)
-    where KR <= 1 and (KS == 0 or (B == 0 and DIRECT == 0)) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (B == 0 or DIRECT == 0) and (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
-    scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
-    scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
-    scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
-    scratch partials bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) + min(1, KS)) * M * KV * G * 8)
-    scratch counts bytes (ceil_div(M, QT) * 4)
+        arithmetic form DIRECT in [0, 1] default 0, arithmetic KEYS in [8, 16, 32] default 8)
+    where KR <= 1 and (KS > 0 or KEYS == 8) and (KS == 0 or (B == 0 and DIRECT == 0 and QT == 16 and HEADS >= min(G, 16) and HEADS / 2 < min(G, 16) and SPLIT_GROUPS == 256 and ceil_div(G, 8) * max(1, (2 * P + S) / 128) <= 32 and (2 * P + S) % max(1, (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, (2 * P + S) / 128)) % 32 == 0 and 4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4 <= 32768)) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (B == 0 or DIRECT == 0) and (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
+    scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2) when KS == 0
+    scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2) when KS == 0
+    scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2) when KS == 0
+    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * (2 * P + S) * 4) when KS == 0
+    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * 8) when KS == 0
+    scratch counts bytes (ceil_div(M, QT) * 4) when KS == 0
     scratch worklist bytes (ceil_div(M, QT) * (QT * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
         threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
@@ -1086,17 +1133,18 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
         threadgroups (ceil_div(M, QT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((R + 1) * 16 + 9 * 4)
-    launch attention_prefill_attend:
+    launch attention_prefill_attend when KS == 0:
         threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))))
         threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
         shared_bytes ((32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + (R + 1) * 16 + DIRECT * ((R + 1) * 48 + 16))
-    launch attention_prefill_picks when KS > 0:
-        threadgroups (M, KV * G, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1 or KS > 0:
+    launch attention_prefill_shared when KS > 0:
+        threadgroups (KV, M, 1)
+        threads_per_threadgroup (ceil_div(G, 8) * max(1, (2 * P + S) / 128) * 32, 1, 1)
+        shared_bytes (4 * KEYS * ((2 * P + S) + 8) + min(1, max(1, (2 * P + S) / 128) - 1) * max(1, (2 * P + S) / 128) * ceil_div(G, 8) * 8 * KEYS * 4)
+    launch attention_prefill_merge when KS == 0 and ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)) > 1:
         threadgroups (ceil_div(M, QT), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
-    launch attention_prefill_rotate when RO == 1:
+    launch attention_prefill_rotate when RO == 1 and KS == 0:
         threadgroups (M, KV * G, 1)
         threads_per_threadgroup (P, 1, 1)
 
@@ -1108,21 +1156,22 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
 # values with its last piece (WARPS = 4 fits W = 512). As on Metal, a query tile's key
 # tiles split over up to SPLIT_GROUPS / (tiles x KV) partitions of at least
 # 16 tiles (so long histories fill the device) and a merge launch combines
-# them; SPLIT_GROUPS = 1 never splits. An index-list source (KS > 0) is one
-# more state per (row, query head), the partition after the key partitions'
-# (`attention_prefill_picks`, one warp over the row's picks), which the merge
-# folds in, so every tile publishes partials then. The output rotary (RO = 1)
-# is its own launch over the published rows, as on Metal.
+# them; SPLIT_GROUPS = 1 never splits, and the default splits, as Metal's and
+# Vulkan's do. An index-list source (KS > 0) is one more span of a query
+# tile's key sequence, after its fresh span: its tokens' picked rows are
+# gathered into the K/V tiles the partitions scan, so one staged tile serves a
+# token's whole query group and picks add no launch. The output rotary
+# (RO = 1) is its own launch over the published rows, as on Metal.
 native attention_prefill for cuda from "cuda/attention_prefill.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, KS)
-    params (arithmetic WARPS in [4, 2, 8, 1] default 4, arithmetic SPLIT_GROUPS in [1, 256, 512] default 1, arithmetic STAGES in [2, 3] default 2,
+    params (arithmetic WARPS in [4, 2, 8, 1] default 4, arithmetic SPLIT_GROUPS in [256, 1, 512] default 256, arithmetic STAGES in [2, 3] default 2,
         arithmetic COLUMNS in [1, 2] default 1, QREG in [0, 1] default 0)
     where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    scratch partials bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) + min(1, KS)) * M * KV * G * 8)
+    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, WARPS * 16 / G) * 4)
     scratch worklist bytes (ceil_div(M, (WARPS * 16 / G)) * ((WARPS * 16 / G) * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
@@ -1135,11 +1184,8 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
     launch attention_prefill_attend:
         threadgroups (ceil_div(M, WARPS * 16 / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)))
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
-        shared_bytes (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 + (R + 1) * 16)
-    launch attention_prefill_picks when KS > 0:
-        threadgroups (M, KV * G, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV) > 1 or KS > 0:
+        shared_bytes (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 + (R + 1 + min(1, KS)) * 16)
+    launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV) > 1:
         threadgroups (ceil_div(M, WARPS * 16 / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
     launch attention_prefill_rotate when RO == 1:
@@ -1149,8 +1195,8 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
 # Vulkan (`vulkan/lib/attention/prefill.glsl`): L1 prepares queries/keys (f16
 # scratch) and appends K/V; L2 streams 32-key K/V tiles per (tile of ROWS / G
 # tokens x G query heads, kv head, key partition), a head wider than 256 in
-# 256-column chunks; L3 merges split tiles. As on CUDA, an index-list source
-# (KS > 0) is the state after the key partitions' (`attention_prefill_picks`,
+# 256-column chunks; L3 merges split tiles. An index-list source (KS > 0) is
+# the state after the key partitions' (`attention_prefill_picks`,
 # a subgroup over the row's picks), which the merge folds in, and the output
 # rotary (RO = 1) is its own launch over the published rows.
 native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
@@ -1567,13 +1613,15 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
 # holds more than 32 elements only where the group cannot be split further.
 # SLICES starts at 2: over the 22 units searched to exhaustion the first
 # admitted configuration is then at most 1.67x the best (median 1.11x), where
-# starting at 1 it was at most 9.17x (median 1.53x).
+# starting at 1 it was at most 9.17x (median 1.53x). With the output rotary
+# (RO = 1) the merge holds each head's whole row and turns it back in F32
+# before publishing it, as `attention_decode`'s.
 native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [2, 1, 4, 8] default 2,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1, arithmetic form HEAD_BAND in [0, 8] default 0)
-    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and ((HEAD_BAND == 0 and (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max((SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2), (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8))) <= 32768 or (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) == 1)))) or (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and P % ((2 * P + S) / 32) == 0 and HEAD_BAND == 8 and MATRIX == 1 and TOKENS == 2 and SIMDS == 4 and SLICES == 1 and (2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64 <= 32768))
+    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0 and 2 * P + S <= 1024)) and VK == 0 and SK <= 1 and ((HEAD_BAND == 0 and (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max((SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2), (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8))) <= 32768 or (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) == 1)))) or (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and P % ((2 * P + S) / 32) == 0 and HEAD_BAND == 8 and MATRIX == 1 and TOKENS == 2 and SIMDS == 4 and SLICES == 1 and (2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_k8v4_partial:
@@ -1581,11 +1629,8 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
         threads_per_threadgroup (SIMDS * 32, 1, 1)
         shared_bytes ((1 - min(1, HEAD_BAND)) * ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * ((1 - (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8)))) * ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2, (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8)))) + (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) * (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8)) + min(1, HEAD_BAND) * (max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64))
     launch attention_decode_k8v4_merge:
-        threadgroups (KV * G, M, (2 * P + S) / 32)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_decode_k8v4_rotate when RO == 1:
-        threadgroups (M, KV * G, 1)
-        threads_per_threadgroup (P, 1, 1)
+        threadgroups (KV * G, M, (2 * P + S) / 32 - RO * ((2 * P + S) / 32 - 1))
+        threads_per_threadgroup (32 + RO * ((2 * P + S) - 32), 1, 1)
 
 # CUDA: `attention_decode`'s equal split-KV partitioning; history keys score
 # against raw codes (per group scale * (q . code) + zero * sum(q)) and values
@@ -1660,30 +1705,21 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CPU: the dense CPU decode's launches; `prepare` appends encoded rows and
-# `attend` decodes history keys and values (F32) as it absorbs them. W is
-# whole affine groups.
+# CPU: the dense CPU decode's launch: `attend` prepares its own queries, keys
+# and values, part 0 appends the encoded row, and it decodes history keys and
+# values (F32) as it absorbs them; the last item of a (kv head, row) to arrive
+# merges. W is whole affine groups.
 native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
-    scratch queries bytes (M * KV * G * (2 * P + S) * 4)
-    scratch keys bytes (M * KV * (2 * P + S) * 4)
-    scratch values bytes (M * KV * (2 * P + S) * 4)
     scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * PARTS * G * 8)
-    launch attention_decode_k8v4_prepare:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (P * 8)
+    scratch arrivals bytes (M * KV * 4) sync
     launch attention_decode_k8v4_attend:
         threadgroups (KV, PARTS, M)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((G * 32 + 2 * P + S) * 4)
-    launch attention_decode_k8v4_merge:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((G * 32 + 4 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 
 # Metal: `attention_prefill`'s launches and forms. DIRECT reads the listed
 # history tiles decoded to F16, in rounds of a `decode` and an attend launch.
@@ -1886,7 +1922,7 @@ native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
     launch attention_prefill_k8v4_attend:
         threadgroups (M, KV, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 3 * (2 * P + S) + 2 * P * RO) * 4)
 
 
 

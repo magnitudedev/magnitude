@@ -9,6 +9,7 @@
 use lib::core::{activation, gathered};
 use lib::projection::projection;
 
+#[inline(always)]
 fn draft_rows_join<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -44,19 +45,12 @@ fn draft_rows_join<L: Isa, E: Elements>(
     norm.copy_from_slice(&hidden_weight[stream * d..(stream + 1) * d]);
     projection::rms_row::<E::A>(values, norm, cx.arg_epsilon(), hidden);
     if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(2 * d);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(joined, q8);
+        // SAFETY: this work item alone writes row `row`'s quantized bytes.
+        unsafe { projection::quantize_row(joined, row, projection::tiled((cx.dim_m() * cx.dim_s()) as usize, &[&cx.arg_combine()]), cx.scratch_quantized(), 0) };
     }
 }
 
+#[inline(always)]
 fn draft_rows_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
@@ -68,10 +62,8 @@ fn draft_rows_rows<L: Isa, E: Elements>(
     let result = cx.result_0();
     // SAFETY: the join launch wrote every row before this launch.
     let joined = unsafe { cx.scratch_joined().slice::<f32>(0, m * 2 * d) };
-    let blocks = seismic::cpu::quant::blocks(2 * d);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_quantized()
-            .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
+        projection::quantized(cx.scratch_quantized(), 0, m, 2 * d, projection::tiled(m, &[&cx.arg_combine()]))
     });
     projection::project_staged_arithmetic(
         &cx.arg_combine(),

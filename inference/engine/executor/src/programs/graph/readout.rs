@@ -1970,20 +1970,20 @@ pub(crate) fn checked_readout_family_storage(
     geometry: &Decoder,
     limits: ResourceLimits,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    let ((family, _), _) = checked_readout_storage(backend, load, geometry, limits)?;
+    let (family, _) = checked_readout_storage(backend, load, geometry, limits)?;
     Ok(family)
 }
 
 /// The readout family's storage ([`checked_readout_family_storage`]) and
-/// what its graphs hold ([`readout_graphs`]), and its chunk family's: the
-/// most of a prompt chunk's classes ([`chunk_holds`]), whose slots a prompt
-/// group's class grows; none of a load whose readout has no such class.
+/// what its graphs hold ([`readout_graphs`]): what a load commits of its
+/// readout. A prompt chunk's family is charged by the class a group claims
+/// as it opens, from the pools themselves, never here.
 pub(crate) fn checked_readout_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
     limits: ResourceLimits,
-) -> Result<((NativeGraphStorageBytes, LaunchGraphs), Option<(NativeGraphStorageBytes, LaunchGraphs)>), GraphError> {
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs), GraphError> {
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
     let (regimes, classes) = load_readout_regimes::<seismic::NativeGraphOutline>(backend, load, geometry, norm, head, limits)?;
@@ -1991,9 +1991,7 @@ pub(crate) fn checked_readout_storage(
         layouts.map(Certified::storage_bytes).reduce(NativeGraphStorageBytes::most)
     };
     let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
-    let chunk = most(&mut regimes.iter().filter(|((_, (_, _, chunk)), _)| *chunk).map(|(_, layout)| layout));
-    let chunk = chunk.map(|chunk| Ok::<_, GraphError>((chunk, readout_graphs(&regimes, &classes, limits, true)?))).transpose()?;
-    Ok(((family, readout_graphs(&regimes, &classes, limits, false)?), chunk))
+    Ok((family, readout_graphs(&regimes, &classes, limits, false)?))
 }
 
 /// A readout regime of one of a load's sources: whether that source fuses a
@@ -2640,7 +2638,7 @@ mod resource_regime_tests {
             // regime and its drafter-free one alike: every graph of both,
             // none of one in place of the other's.
             let fused = regimes(&tapped, readout_sources(&tapped)[0]);
-            let ((_, charged), _) = checked_readout_storage(backend, &tapped, &definition.decoder, LIMITS).unwrap();
+            let (_, charged) = checked_readout_storage(backend, &tapped, &definition.decoder, LIMITS).unwrap();
             let recorded = fused.values().chain(unfused.values()).map(|layout| layout.storage_bytes().recorded.graphs).sum::<u64>();
             assert_eq!(charged.union.graphs, recorded, "{backend:?}");
             assert!(unfused.keys().all(|(kind, ..)| *kind != ReadoutKind::Features), "{backend:?}");
