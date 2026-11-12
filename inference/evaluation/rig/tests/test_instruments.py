@@ -57,7 +57,7 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
     assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json", "--", "general")
     # A cargo suite has the release catalog's headers, so no test of it lacks its inputs; the
     # host package is on PYTHONPATH from the job's `record`, not set again.
-    assert plan.device == "device" and job.env == (("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"),)
+    assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
     # Each executable gets cargo test's name filter first, then what follows `--`, as cargo passes them.
     for given, passed in ((("-p", "x", "--test", "routed", "general", "--", "--exact"), ("general", "--exact")),
                           (("--lib", "general", "-p", "x"), ("general",)),
@@ -73,9 +73,12 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
     ((_, named),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "x", "--test=routed"), None, "alpha").jobs
     assert not named.checkout
     assert plan.acquires == engine.Headers(None)
-    vulkan = parse("test", "--backend", "vulkan", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-    assert REGISTRY["test"].plan(vulkan, None, "alpha").jobs[0][1].env[:2] == (
-        ("SEISMIC_TEST_BACKEND", "vulkan"), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
+    for backend in ("cuda", "metal", "vulkan"):
+        named = parse("test", "--backend", backend, "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
+        assert REGISTRY["test"].plan(named, None, "alpha").jobs[0][1].env[:2] == (
+            ("SEISMIC_TEST_BACKEND", backend), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
+    cpu = parse("test", "--backend", "cpu", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
+    assert "SEISMIC_TEST_BACKEND" not in dict(REGISTRY["test"].plan(cpu, None, "alpha").jobs[0][1].env)
     # One that reads a model's files has the model, not the catalog.
     model = REGISTRY["test"].plan(parse("test", *COMMON, "--model", MODEL, "--", "-p", "x"), None, "alpha")
     assert model.acquires == engine.Weights(MODEL)

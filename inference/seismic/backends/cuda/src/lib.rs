@@ -49,7 +49,7 @@ pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, Opene
     static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     seismic_lang::registry::test_device_reached("opens the CUDA test device");
     let exclusive = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let selected = std::env::var("SEISMIC_TEST_BACKEND").is_ok_and(|name| name == "cuda");
+    let selected = seismic_lang::registry::requested_test_backend() == Some(BackendName::Cuda);
     match device_count() {
         Ok(count) if count > 0 => {}
         absent => {

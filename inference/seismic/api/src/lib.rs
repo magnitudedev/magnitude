@@ -55,15 +55,60 @@ pub mod testing {
     /// The executor a test runs `backend` on: the first available one of
     /// it in `topology`, where the runner requests `backend` or none. A
     /// test runs on each backend this names one for, and fails where it
-    /// does not open.
+    /// does not open. Where the runner requests `backend` and the host has
+    /// no available executor of it this panics, naming what discovery
+    /// listed: a run never passes by skipping the backend it was booked
+    /// for.
     pub fn selected(topology: &DeviceTopology, backend: BackendName) -> Option<&Executor> {
-        if requested_backend().is_some_and(|requested| requested != backend) {
+        selected_under(requested_backend(), topology, backend)
+    }
+
+    /// [`selected`] under the backend `requested`.
+    fn selected_under(requested: Option<BackendName>, topology: &DeviceTopology, backend: BackendName) -> Option<&Executor> {
+        if requested.is_some_and(|requested| requested != backend) {
             return None;
         }
-        topology
+        let found = topology
             .executors()
             .iter()
-            .find(|executor| executor.backend() == backend && matches!(executor.availability(), Availability::Available))
+            .find(|executor| executor.backend() == backend && matches!(executor.availability(), Availability::Available));
+        if found.is_none() && requested.is_some() {
+            let listed = topology
+                .executors()
+                .iter()
+                .filter(|executor| executor.backend() == backend)
+                .map(|executor| format!("{}: {:?}", executor.selector(), executor.availability()))
+                .collect::<Vec<_>>();
+            panic!("the run requests {backend:?}, and this host has no available {backend:?} executor: {listed:?}");
+        }
+        found
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A run that requests a backend the host lacks panics naming it, a
+        /// run that requests another backend or none selects nothing of it
+        /// quietly, and a requested backend the host has is selected.
+        #[test]
+        fn a_requested_backend_the_host_lacks_panics() {
+            let devices = super::super::Devices::discover(&[]).expect("devices are discovered");
+            let topology = devices.topology();
+            let available = |backend| selected_under(None, &topology, backend).is_some();
+            assert!(available(BackendName::Cpu), "every host has the CPU");
+            assert!(selected_under(Some(BackendName::Cpu), &topology, BackendName::Cpu).is_some());
+            let missing = [BackendName::Cuda, BackendName::Metal, BackendName::Vulkan]
+                .into_iter()
+                .find(|backend| !available(*backend))
+                .expect("no host has CUDA and Metal and Vulkan all");
+            assert!(selected_under(Some(BackendName::Cpu), &topology, missing).is_none());
+            assert!(selected_under(None, &topology, missing).is_none());
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| selected_under(Some(missing), &topology, missing).is_some()))
+                .expect_err("the requested backend is missing");
+            let message = panic.downcast_ref::<String>().expect("a formatted panic");
+            assert!(message.contains(&format!("no available {missing:?} executor")), "{message}");
+        }
     }
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions, MemoryStore};

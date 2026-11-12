@@ -13,10 +13,10 @@ suite has the catalog's header export as `{catalog}`, its headers `MAGNITUDE_CAT
 lacks its inputs; a host keeps the export of each catalog (`engine.catalog_key`), so only a
 catalog's first run there builds the catalog tool and exports it. The suite's arguments take
 the run's tokens (`{catalog}`, `{models}`, `{root}`, and `{checkout}` for a suite run in it).
-`--backend vulkan` selects Vulkan where the kernel tests otherwise take CUDA or Metal
-(`SEISMIC_TEST_BACKEND`, as the kernel tests read it). `--timed` runs tests that time the device
-(an ignored measurement test, a cost figure) under the timed hold, as every timing instrument
-runs."""
+A cuda, metal or vulkan run names its backend to the tests (`SEISMIC_TEST_BACKEND`): they run on
+it alone, and fail where the host has no such device, never pass by skipping it. `--timed` runs
+tests that time the device (an ignored measurement test, a cost figure) under the timed hold, as
+every timing instrument runs."""
 
 import argparse
 import re
@@ -57,7 +57,8 @@ def _given(arguments) -> list[str]:
 
 
 def plan(arguments, source, host) -> Plan:
-    env = (("SEISMIC_TEST_BACKEND", "vulkan"),) if arguments.backend == "vulkan" else ()
+    # A device run names its backend, so a test fails where that backend is missing, never passes by skipping it.
+    env = (("SEISMIC_TEST_BACKEND", arguments.backend),) if arguments.backend != "cpu" else ()
     if arguments.model is not None:
         env += (("MAGNITUDE_ARTIFACTS", "{artifacts}"),)
     # A cargo suite reads the release catalog's headers unless it reads one model's files.

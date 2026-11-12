@@ -55,32 +55,11 @@ pub(crate) fn open_backend(
 
 /// Whether a test runs on `backend` ([`seismic::testing::selected`]): the
 /// runner requests it or none, and discovery found an available executor
-/// of it. Such a test runs on each backend this holds for, and fails where
-/// an available one does not open. A build for a booked host names its
-/// backend (`--config env.SEISMIC_TEST_BOOKED=cuda`, read when the tests
-/// compile), and that backend holds or panics, naming it: a test never
-/// passes by skipping the backend its run was booked for.
+/// of it, which a run that requests it must ([`seismic::testing::selected`]
+/// panics otherwise). Such a test runs on each backend this holds for, and
+/// fails where an available one does not open.
 pub(crate) fn available(devices: &seismic::Devices, backend: seismic::BackendName) -> bool {
-    let topology = devices.topology();
-    let found = seismic::testing::selected(&topology, backend).is_some();
-    if !found && booked() == Some(backend) {
-        let listed = topology
-            .executors()
-            .iter()
-            .filter(|executor| executor.backend() == backend)
-            .map(|executor| format!("{}: {:?}", executor.selector(), executor.availability()))
-            .collect::<Vec<_>>();
-        panic!("the build was booked for {backend:?}, and this host has no available {backend:?} executor: {listed:?}");
-    }
-    found
-}
-
-/// The backend the build names as its host's (`SEISMIC_TEST_BOOKED`, at
-/// compile time); a value that names no backend panics.
-pub(crate) fn booked() -> Option<seismic::BackendName> {
-    option_env!("SEISMIC_TEST_BOOKED").map(|name| {
-        seismic::BackendName::parse(name).unwrap_or_else(|| panic!("unknown SEISMIC_TEST_BOOKED {name:?}"))
-    })
+    seismic::testing::selected(&devices.topology(), backend).is_some()
 }
 
 /// `sources`, held in memory, checked with each native implementation's
@@ -116,14 +95,14 @@ pub(crate) fn selected_with_room(catalog: &seismic::Devices, host_bytes: u64) ->
 
 /// Whether `selected` is a device backend: a test that streams experts or
 /// measures a device's attention cases has nothing to run on the CPU backend
-/// (which holds no expert bank), so it passes by skipping there, but never on
-/// a build booked for a device backend ([`booked`]).
+/// (which holds no expert bank), so it passes by skipping there, but never in
+/// a run that requests a device backend.
 #[cfg(test)]
 pub(crate) fn is_device_backend(selected: &crate::platform::SelectedDevice) -> bool {
     let backend = selected.info.backend();
     let device = backend != seismic::BackendName::Cpu;
-    if !device && booked().is_some_and(|booked| booked != seismic::BackendName::Cpu) {
-        panic!("the build was booked for {:?}, and this host selects {backend:?}", booked());
+    if !device && seismic::testing::requested_backend().is_some_and(|requested| requested != seismic::BackendName::Cpu) {
+        panic!("the run requests {:?}, and this host selects {backend:?}", seismic::testing::requested_backend());
     }
     device
 }
