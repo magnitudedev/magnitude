@@ -717,9 +717,26 @@ struct UE4M3Scale {
             scale[2 * h + 1] = values.y;
         }
 #else
+        // Below sm_89, in f16 without a conversion: a field x = e m (7 bits) placed at bit 7 is the f16 whose
+        // exponent field is e and mantissa top bits m, 2^(e - 15) (1 + m/8) for e > 0 and m 2^-17 for e = 0,
+        // so one exact multiply by 2^(8 + N) reads UE4M3 (2^(e - 7) (1 + m/8), m 2^-9) times 2^N. The NaN
+        // field 0x7f has bits 7..13 all ones, which one carry into bit 14 detects; setting that bit makes
+        // the f16 a NaN. Each field's bit 7 (the sign, ignored) is 0 by `fields`' mask, so it places no
+        // bit at 14 or 15, and the carry cannot leave its half. Exact while the multiplier 2^(8 + N) is an
+        // f16 (N <= 7) and the largest value, 448 2^N, is finite in f16 (the same N <= 7: 448 2^7 = 57344
+        // <= 65504), the smallest, 2^(N - 9), at least the f16 subnormal 2^-24 (N >= -15, `decode4`'s -14).
+        static_assert(8 + N <= 15 && N >= -15 && 448.0 * (double)(1u << (N > 0 ? N : 0)) <= 65504.0,
+                      "the f16 multiply neither overflows nor loses a scaled UE4M3 value, and 2^(8 + N) is an f16 normal");
+        constexpr u32 FACTOR = (u32)(23 + N) << 10; // 2^(8 + N) in f16
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            scale[i] = times_power2<N>(decode((fields >> (8 * i)) & 0xFFu));
+        for (int h = 0; h < 2; ++h) {
+            const u32 placed = prmt(fields, 0u, h == 0 ? 0x4140u : 0x4342u) << 7;
+            u32 pair = placed | ((placed + 0x00800080u) & 0x40004000u);
+            asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(pair) : "r"(pair), "r"(FACTOR * 0x00010001u));
+            const float2 values = seismic_unpack_f16x2(pair);
+            scale[2 * h] = values.x;
+            scale[2 * h + 1] = values.y;
+        }
 #endif
     }
 };
