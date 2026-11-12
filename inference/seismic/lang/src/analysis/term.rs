@@ -42,6 +42,51 @@ pub enum Variable {
     },
 }
 
+/// How an unresolved part of a term reads one of its variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// The variable's value may flow into the part's value.
+    Value,
+    /// The variable only positions the part's reads: it occurs only in
+    /// element indices.
+    Position,
+}
+
+impl Flow {
+    /// How a variable read with this flow is read by a part read with
+    /// `outer`: everything a position reads only positions.
+    fn within(self, outer: Flow) -> Flow {
+        match outer {
+            Flow::Value => self,
+            Flow::Position => Flow::Position,
+        }
+    }
+}
+
+/// A variable an unresolved part of a term reads, and how it reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Dependency {
+    pub(crate) variable: Variable,
+    pub(crate) flow: Flow,
+}
+
+impl Dependency {
+    pub(crate) fn value(variable: Variable) -> Dependency {
+        Dependency {
+            variable,
+            flow: Flow::Value,
+        }
+    }
+
+    /// This dependency as read by a position.
+    pub(crate) fn positioning(self) -> Dependency {
+        Dependency {
+            flow: Flow::Position,
+            ..self
+        }
+    }
+}
+
 /// The values a stored code takes. Adjacent codes are adjacent levels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodeLevels {
@@ -171,7 +216,7 @@ pub(crate) enum Node {
     Constant(f64),
     Variable(Variable),
     /// A value the analysis did not resolve, with the variables it reads.
-    Opaque(Vec<Variable>),
+    Opaque(Vec<Dependency>),
     Unary(Unary, Term),
     Binary(Binary, Term, Term),
     Select(Term, Term, Term),
@@ -191,7 +236,7 @@ pub(crate) enum Node {
     /// call may have replaced, where the analysis did not resolve whether it
     /// did. `earlier` is the parameter's content before that write; `by` are
     /// the variables the write's value and position read.
-    Overwritten { by: Vec<Variable>, earlier: Term },
+    Overwritten { by: Vec<Dependency>, earlier: Term },
     /// The analysis's own stand-in for loop-carried state while it resolves
     /// a loop; never present in a published term.
     Placeholder(u32, Vec<Term>),
@@ -224,7 +269,7 @@ impl Term {
         Term::new(Node::Variable(variable))
     }
 
-    pub(crate) fn opaque(dependencies: Vec<Variable>) -> Term {
+    pub(crate) fn opaque(dependencies: Vec<Dependency>) -> Term {
         Term::new(Node::Opaque(without_repeats(dependencies)))
     }
 
@@ -376,7 +421,7 @@ impl Term {
         })
     }
 
-    pub(crate) fn overwritten(by: Vec<Variable>, earlier: Term) -> Term {
+    pub(crate) fn overwritten(by: Vec<Dependency>, earlier: Term) -> Term {
         Term::new(Node::Overwritten {
             by: without_repeats(by),
             earlier,
@@ -396,18 +441,22 @@ impl Term {
     /// Every variable this term reads, outermost first, without repeats.
     /// Variables inside element indices are included.
     pub fn variables(&self) -> Vec<Variable> {
-        let mut out: Vec<Variable> = Vec::new();
-        self.visit(&mut |term| match term.node() {
-            Node::Variable(variable) => {
-                if !out.contains(variable) {
-                    out.push(variable.clone());
-                }
-            }
+        self.dependencies()
+            .into_iter()
+            .map(|dependency| dependency.variable)
+            .collect()
+    }
+
+    /// Every variable this term reads, as [`Term::variables`], each with how
+    /// the term reads it: [`Flow::Position`] when every occurrence is inside
+    /// an element index.
+    pub(crate) fn dependencies(&self) -> Vec<Dependency> {
+        let mut out = Vec::new();
+        self.walk(Flow::Value, &mut |term, flow| match term.node() {
+            Node::Variable(variable) => include(&mut out, variable, flow),
             Node::Opaque(dependencies) | Node::Overwritten { by: dependencies, .. } => {
-                for variable in dependencies {
-                    if !out.contains(variable) {
-                        out.push(variable.clone());
-                    }
+                for dependency in dependencies {
+                    include(&mut out, &dependency.variable, dependency.flow.within(flow));
                 }
             }
             _ => {}
@@ -418,44 +467,46 @@ impl Term {
     /// Visit this term and every subterm, including those inside variable
     /// indices.
     pub(crate) fn visit(&self, f: &mut impl FnMut(&Term)) {
+        self.walk(Flow::Value, &mut |term, _| f(term));
+    }
+
+    /// Visit this term, read with `flow`, and every subterm, each with how
+    /// this term reads it: a subterm inside an element index only positions.
+    fn walk(&self, flow: Flow, f: &mut impl FnMut(&Term, Flow)) {
         crate::cancellation::check();
-        f(self);
+        f(self, flow);
         match self.node() {
             Node::Constant(_) | Node::Opaque(_) => {}
-            Node::Placeholder(_, index) => {
-                for term in index {
-                    term.visit(f);
-                }
-            }
-            Node::Variable(variable) => match variable {
+            Node::Placeholder(_, index)
+            | Node::Variable(
                 Variable::Element { index, .. }
                 | Variable::Component { index, .. }
-                | Variable::Plane { index, .. } => {
-                    for term in index {
-                        term.visit(f);
-                    }
+                | Variable::Plane { index, .. },
+            ) => {
+                for term in index {
+                    term.walk(Flow::Position, f);
                 }
-                _ => {}
-            },
+            }
+            Node::Variable(_) => {}
             Node::Unary(_, a)
             | Node::Round(_, a)
             | Node::Truncate(a)
-            | Node::Overwritten { earlier: a, .. } => a.visit(f),
+            | Node::Overwritten { earlier: a, .. } => a.walk(flow, f),
             Node::Binary(_, a, b) => {
-                a.visit(f);
-                b.visit(f);
+                a.walk(flow, f);
+                b.walk(flow, f);
             }
             Node::Select(a, b, c) => {
-                a.visit(f);
-                b.visit(f);
-                c.visit(f);
+                a.walk(flow, f);
+                b.walk(flow, f);
+                c.walk(flow, f);
             }
             Node::Fold {
                 start, end, body, ..
             } => {
-                start.visit(f);
-                end.visit(f);
-                body.visit(f);
+                start.walk(flow, f);
+                end.walk(flow, f);
+                body.walk(flow, f);
             }
         }
     }
@@ -479,7 +530,7 @@ impl Term {
                 || matches!(
                     (term.node(), variable),
                     (Node::Opaque(dependencies) | Node::Overwritten { by: dependencies, .. }, Some(variable))
-                        if dependencies.contains(variable)
+                        if dependencies.iter().any(|dependency| dependency.variable == *variable)
                 )
         })
     }
@@ -503,7 +554,7 @@ impl Term {
             Node::Opaque(dependencies) => Term::opaque(
                 dependencies
                     .iter()
-                    .map(|variable| map_variable(variable, f))
+                    .map(|dependency| map_dependency(dependency, f))
                     .collect(),
             ),
             Node::Variable(variable) => Term::variable(map_variable(variable, f)),
@@ -516,7 +567,7 @@ impl Term {
             Node::Round(dtype, a) => Term::round(*dtype, f(a)),
             Node::Truncate(a) => Term::truncate(f(a)),
             Node::Overwritten { by, earlier } => Term::overwritten(
-                by.iter().map(|variable| map_variable(variable, f)).collect(),
+                by.iter().map(|dependency| map_dependency(dependency, f)).collect(),
                 f(earlier),
             ),
             Node::Fold {
@@ -691,7 +742,7 @@ impl Term {
                 || matches!(
                     term.node(),
                     Node::Opaque(dependencies) | Node::Overwritten { by: dependencies, .. }
-                        if dependencies.iter().any(|dependency| {
+                        if dependencies.iter().any(|Dependency { variable: dependency, .. }| {
                             reads.iter().any(|read| {
                                 dependency == read
                                     || (dependency.storage().is_some()
@@ -913,14 +964,40 @@ impl Affine {
     }
 }
 
-fn without_repeats(variables: Vec<Variable>) -> Vec<Variable> {
-    let mut unique: Vec<Variable> = Vec::new();
-    for variable in variables {
-        if !unique.contains(&variable) {
-            unique.push(variable);
-        }
+/// `dependencies` with each variable once, read as a value when any of its
+/// occurrences is.
+fn without_repeats(dependencies: Vec<Dependency>) -> Vec<Dependency> {
+    let mut unique = Vec::new();
+    for dependency in dependencies {
+        include(&mut unique, &dependency.variable, dependency.flow);
     }
     unique
+}
+
+/// Add `variable` read with `flow` to `dependencies`: a variable already
+/// present keeps its place and becomes a value read if this one is.
+fn include(dependencies: &mut Vec<Dependency>, variable: &Variable, flow: Flow) {
+    match dependencies
+        .iter_mut()
+        .find(|dependency| dependency.variable == *variable)
+    {
+        Some(found) => {
+            if flow == Flow::Value {
+                found.flow = Flow::Value;
+            }
+        }
+        None => dependencies.push(Dependency {
+            variable: variable.clone(),
+            flow,
+        }),
+    }
+}
+
+fn map_dependency(dependency: &Dependency, f: &mut impl FnMut(&Term) -> Term) -> Dependency {
+    Dependency {
+        variable: map_variable(&dependency.variable, f),
+        flow: dependency.flow,
+    }
 }
 
 fn map_variable(variable: &Variable, f: &mut impl FnMut(&Term) -> Term) -> Variable {
@@ -1077,11 +1154,11 @@ impl fmt::Display for Term {
             Node::Variable(variable) => write!(f, "{variable}"),
             Node::Opaque(dependencies) => {
                 f.write_str("opaque(")?;
-                for (ordinal, variable) in dependencies.iter().enumerate() {
+                for (ordinal, dependency) in dependencies.iter().enumerate() {
                     if ordinal > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{variable}")?;
+                    write!(f, "{}", dependency.variable)?;
                 }
                 f.write_str(")")
             }
@@ -1169,12 +1246,12 @@ mod tests {
         assert!(Term::round(DType::F16, decoded.clone()).affine_in(&code).is_none());
         assert!(Term::unary(Unary::Cos, code.clone()).affine_in(&code).is_none());
         // An unresolved part that reads the code's storage may depend on it.
-        let unresolved = Term::opaque(vec![Variable::Element {
+        let unresolved = Term::opaque(vec![Dependency::value(Variable::Element {
             parameter: "codes".into(),
             index: Vec::new(),
-        }]);
+        })]);
         assert!(code.clone().add(unresolved).affine_in(&code).is_none());
-        let elsewhere = Term::opaque(vec![Variable::Parameter("scale".into())]);
+        let elsewhere = Term::opaque(vec![Dependency::value(Variable::Parameter("scale".into()))]);
         assert!(code.clone().add(elsewhere).affine_in(&code).is_some());
     }
 
@@ -1213,7 +1290,7 @@ mod tests {
 
     #[test]
     fn an_overwritten_read_is_unresolved_until_taken_at_its_earlier_content() {
-        let read = Term::overwritten(vec![Variable::Binder(3)], element("codes"));
+        let read = Term::overwritten(vec![Dependency::value(Variable::Binder(3))], element("codes"));
         assert!(!read.is_resolved());
         assert_eq!(read.evaluate(&|_| Some(1.0)), Err(TermError::Unresolved));
         assert!(read.mentions(&Term::variable(Variable::Binder(3))));
@@ -1239,7 +1316,7 @@ mod tests {
             .unwrap();
         assert_eq!(value, 6.0);
         assert_eq!(
-            Term::opaque(vec![Variable::Parameter("x".into())]).evaluate(&|_| Some(1.0)),
+            Term::opaque(vec![Dependency::value(Variable::Parameter("x".into()))]).evaluate(&|_| Some(1.0)),
             Err(TermError::Unresolved)
         );
     }

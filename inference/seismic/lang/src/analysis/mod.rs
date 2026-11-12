@@ -470,7 +470,7 @@ fn packed(
             }
             // A function of the element's position alone.
             DecodeStep::ReadPlaneLane { .. } => {
-                Term::opaque(index.last().map(Term::variables).unwrap_or_default())
+                Term::opaque(index.last().map(Term::dependencies).unwrap_or_default())
             }
             // A signed code is its plane read's value, the read's sign its
             // own (`PlaneEncoding::SignedLocal`).

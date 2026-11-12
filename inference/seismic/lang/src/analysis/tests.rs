@@ -543,6 +543,57 @@ fn integer_elements_are_codes_only_through_an_affine_decode() {
 }
 
 #[test]
+fn an_integer_that_only_positions_an_unresolved_conversion_is_not_converted() {
+    // `code` is loop-carried through `|`, which the trace does not resolve:
+    // its conversion may be computed from anything whose value it reads.
+    let picks_of = |carried: &str| {
+        let source = format!(
+            concat!(
+                "fn probe[N](x: &tensor[N] f32, picks: &tensor[N] i32, out: &mut tensor[N] f32):\n",
+                "    let mut code = u32(0)\n",
+                "    for i in 0..N:\n",
+                "        code = {carried}\n",
+                "    for i in 0..N:\n",
+                "        out[i] = f32(code)\n",
+            ),
+            carried = carried
+        );
+        stored(&analyze(&entry(&source)), "picks").clone()
+    };
+    // `picks` only positions the reads of `x`.
+    assert_eq!(picks_of("code | u32(x[picks[i]])"), Stored::Discrete);
+    // `picks` is also read as a value.
+    assert_eq!(picks_of("code | u32(x[picks[i]]) | u32(picks[i])"), Stored::Converted);
+}
+
+#[test]
+fn an_integer_that_only_positions_an_unresolved_write_is_not_converted() {
+    // `picks` places each write, so a read of `staged` does not resolve which
+    // write, if any, it sees: its conversion may be computed from anything
+    // whose value the writes read.
+    let picks_of = |written: &str| {
+        let source = format!(
+            concat!(
+                "fn probe[N](codes: &tensor[N] i32, picks: &tensor[N] i32, out: &mut tensor[N] f32):\n",
+                "    let mut staged = tensor[N] i32\n",
+                "    for i in 0..N:\n",
+                "        staged[i] = 0\n",
+                "    for i in 0..N:\n",
+                "        staged[picks[i]] = {written}\n",
+                "    for i in 0..N:\n",
+                "        out[i] = f32(staged[i])\n",
+            ),
+            written = written
+        );
+        stored(&analyze(&entry(&source)), "picks").clone()
+    };
+    // `picks` only positions the writes' destinations.
+    assert_eq!(picks_of("codes[i]"), Stored::Discrete);
+    // `picks` is also the written value.
+    assert_eq!(picks_of("picks[i]"), Stored::Converted);
+}
+
+#[test]
 fn placeholder_terms_are_unresolved() {
     let term = Term::placeholder(1, Vec::new());
     assert!(!term.is_resolved());

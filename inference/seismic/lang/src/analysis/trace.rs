@@ -16,7 +16,7 @@
 //! recorded as a decode of that element.
 
 use super::domain::Domain;
-use super::term::{Binary, Fold, Node, Term, Unary, Variable};
+use super::term::{Binary, Dependency, Flow, Fold, Node, Term, Unary, Variable};
 use crate::entry::{
     LogicalEntryView, LoopKind, ParameterKind, RegionKind, ScalarRef, SemanticFunction,
     SemanticNodeView, SemanticType, SliceAxis, TensorStorage, ViewTransform,
@@ -39,7 +39,7 @@ pub(crate) enum Value {
     Tuple(Vec<Value>),
     Range(Term, Term),
     /// A value the trace does not model (an opaque intrinsic value).
-    Unknown(Vec<Variable>),
+    Unknown(Vec<Dependency>),
 }
 
 /// A view of one storage.
@@ -472,7 +472,7 @@ impl<'a> Trace<'a> {
                 let op = match op {
                     crate::expr::FoldOp::Sum => Fold::Sum,
                     crate::expr::FoldOp::Max => Fold::Max,
-                    crate::expr::FoldOp::Product => return Term::opaque(body.variables()),
+                    crate::expr::FoldOp::Product => return Term::opaque(body.dependencies()),
                 };
                 Term::fold(op, coordinate, start.clone(), start.add(extent), body)
             }
@@ -723,7 +723,7 @@ impl<'a> Trace<'a> {
             SemanticNodeView::TupleGet { tuple, index, output } => {
                 let item = match &frame.values[&tuple] {
                     Value::Tuple(items) => items[index as usize].clone(),
-                    other => Value::Unknown(value_variables(other)),
+                    other => Value::Unknown(value_dependencies(other)),
                 };
                 frame.values.insert(output, item);
             }
@@ -742,7 +742,7 @@ impl<'a> Trace<'a> {
             SemanticNodeView::Intrinsic { inputs, output, .. } => {
                 let dependencies = inputs
                     .iter()
-                    .flat_map(|input| value_variables(&frame.values[input]))
+                    .flat_map(|input| value_dependencies(&frame.values[input]))
                     .collect();
                 frame.values.insert(output, Value::Unknown(dependencies));
             }
@@ -798,7 +798,7 @@ impl<'a> Trace<'a> {
         output: SemanticValueId,
     ) -> Value {
         let Value::Tensor(base_tensor) = frame.values[&base].clone() else {
-            return Value::Unknown(value_variables(&frame.values[&base]));
+            return Value::Unknown(value_dependencies(&frame.values[&base]));
         };
         let shape = self.shape_of(frame, &function.value(output).ty);
         let step = match transform {
@@ -807,7 +807,7 @@ impl<'a> Trace<'a> {
             }
             ViewTransform::Plane { .. } => {
                 let dependencies = match &self.storages[base_tensor.storage].root {
-                    Root::Parameter { name, .. } => vec![Variable::Parameter(name.clone())],
+                    Root::Parameter { name, .. } => vec![Dependency::value(Variable::Parameter(name.clone()))],
                     _ => Vec::new(),
                 };
                 let value = self.new_storage(
@@ -907,7 +907,7 @@ impl<'a> Trace<'a> {
             }
             Value::Computed(computed) => self.read_computed(computed, index),
             Value::Scalar(term) => term.clone(),
-            other => Term::opaque(value_variables(other)),
+            other => Term::opaque(value_dependencies(other)),
         }
     }
 
@@ -936,7 +936,7 @@ impl<'a> Trace<'a> {
                     ReduceOp::Sum => Fold::Sum,
                     ReduceOp::Max => Fold::Max,
                     ReduceOp::Min => Fold::Min,
-                    ReduceOp::Argmax => return Term::opaque(body.variables()),
+                    ReduceOp::Argmax => return Term::opaque(body.dependencies()),
                 };
                 Term::fold(fold, binder, Term::constant(0.0), extent.clone(), body)
             }
@@ -974,9 +974,9 @@ impl<'a> Trace<'a> {
                     return Term::select(condition, value, rest);
                 }
                 Matched::Unknown => {
-                    let mut dependencies = record.value.variables();
+                    let mut dependencies = record.value.dependencies();
                     for term in index.iter().chain(&record.index) {
-                        dependencies.extend(term.variables());
+                        dependencies.extend(term.dependencies().into_iter().map(Dependency::positioning));
                     }
                     // Whether the write replaced the element is not
                     // resolved. An entry parameter keeps what it held before
@@ -1022,7 +1022,7 @@ impl<'a> Trace<'a> {
                 });
             }
         }
-        Term::opaque(value_variables(value))
+        Term::opaque(value_dependencies(value))
     }
 
     fn write(&mut self, tensor: &Tensor, index: Vec<Term>, value: Term) {
@@ -1425,9 +1425,11 @@ impl<'a> Trace<'a> {
                 }
             }
         }
-        let mut dependencies = initial.variables();
-        dependencies.extend(value.variables());
-        dependencies.retain(|variable| !matches!(variable, Variable::Binder(found) if *found == binder));
+        let mut dependencies = initial.dependencies();
+        dependencies.extend(value.dependencies());
+        dependencies.retain(|dependency| {
+            !matches!(dependency.variable, Variable::Binder(found) if found == binder)
+        });
         Term::opaque(dependencies)
     }
 
@@ -1455,7 +1457,7 @@ impl<'a> Trace<'a> {
                 } else {
                     end.clone()
                 }),
-                other => Value::Scalar(Term::opaque(value_variables(other))),
+                other => Value::Scalar(Term::opaque(value_dependencies(other))),
             },
             PrimitiveId::QuantizedComponentRead { component, .. } => {
                 let tensor = frame.values[&inputs[0]].clone();
@@ -1499,8 +1501,15 @@ impl<'a> Trace<'a> {
     fn note_conversion(&mut self, input: &Term, from: DType, to: DType) {
         let code = input.unshadowed();
         let reads = code.value_reads();
-        // An unresolved value may be computed from anything it reads.
-        let sources = reads.clone().unwrap_or_else(|| code.variables());
+        // An unresolved value may be computed from anything whose value it
+        // reads; what only positions its reads is not converted.
+        let sources = reads.clone().unwrap_or_else(|| {
+            code.dependencies()
+                .into_iter()
+                .filter(|dependency| dependency.flow == Flow::Value)
+                .map(|dependency| dependency.variable)
+                .collect()
+        });
         for source in &sources {
             if let Variable::Element { parameter, .. } = source {
                 if self.integer_elements(parameter).is_some() && !self.converted.contains(parameter) {
@@ -1560,7 +1569,7 @@ impl<'a> Trace<'a> {
                 match op {
                     UnaryOp::Neg => Term::unary(Unary::Neg, a),
                     UnaryOp::Not => Term::unary(Unary::Not, a),
-                    UnaryOp::BitNot => Term::opaque(a.variables()),
+                    UnaryOp::BitNot => Term::opaque(a.dependencies()),
                 }
             }
             PrimitiveId::Binary(op) => {
@@ -1615,7 +1624,7 @@ impl<'a> Trace<'a> {
                 let from = input_types.first().copied().unwrap_or(DType::F32);
                 self.cast(operands[0].clone(), from, *dtype)
             }
-            _ => Term::opaque(operands.iter().flat_map(Term::variables).collect()),
+            _ => Term::opaque(operands.iter().flat_map(Term::dependencies).collect()),
         }
     }
 }
@@ -1714,9 +1723,9 @@ fn merge(condition: &Term, then: Value, otherwise: Value) -> Value {
             Term::select(condition.clone(), a1, b1),
         ),
         (a, b) => {
-            let mut dependencies = value_variables(&a);
-            dependencies.extend(value_variables(&b));
-            dependencies.extend(condition.variables());
+            let mut dependencies = value_dependencies(&a);
+            dependencies.extend(value_dependencies(&b));
+            dependencies.extend(condition.dependencies());
             Value::Unknown(dependencies)
         }
     }
@@ -1725,18 +1734,18 @@ fn merge(condition: &Term, then: Value, otherwise: Value) -> Value {
 pub(crate) fn scalar(value: &Value) -> Term {
     match value {
         Value::Scalar(term) => term.clone(),
-        other => Term::opaque(value_variables(other)),
+        other => Term::opaque(value_dependencies(other)),
     }
 }
 
-pub(crate) fn value_variables(value: &Value) -> Vec<Variable> {
+pub(crate) fn value_dependencies(value: &Value) -> Vec<Dependency> {
     match value {
-        Value::Scalar(term) => term.variables(),
-        Value::Tuple(items) => items.iter().flat_map(value_variables).collect(),
+        Value::Scalar(term) => term.dependencies(),
+        Value::Tuple(items) => items.iter().flat_map(value_dependencies).collect(),
         Value::Range(a, b) => {
-            let mut variables = a.variables();
-            variables.extend(b.variables());
-            variables
+            let mut dependencies = a.dependencies();
+            dependencies.extend(b.dependencies());
+            dependencies
         }
         Value::Unknown(dependencies) => dependencies.clone(),
         Value::Tensor(_) | Value::Computed(_) => Vec::new(),
