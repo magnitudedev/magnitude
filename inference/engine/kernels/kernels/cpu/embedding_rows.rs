@@ -25,7 +25,9 @@ fn embedding_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
     let inverse = (cx.arg_normalize() != 0).then(|| reduce::rms_inverse(widened, cx.arg_epsilon()));
     for value in widened.iter_mut() {
         let decoded = *value;
-        *value = activation::publish::<E::A>(inverse.map_or(decoded, |inverse| decoded * inverse));
+        let published = activation::publish::<E::A>(inverse.map_or(decoded, |inverse| decoded * inverse));
+        // A NaN (a non-finite block scale's product) is the registry's one NaN, whatever the hardware's.
+        *value = if published.is_nan() { f32::NAN } else { published };
     }
     activation::store::<E::A>(widened, embedded);
 }

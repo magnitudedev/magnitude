@@ -114,7 +114,9 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
         inverse = rsqrtf(total / (float)width + __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON));
     }
     EMBEDDING_ROW([&](u64 column, float decoded) {
-        const float value = Act::round(normalize ? decoded * inverse : decoded);
+        const float rounded = Act::round(normalize ? decoded * inverse : decoded);
+        // A NaN (a non-finite block scale's product) is the registry's one NaN, whatever the hardware's.
+        const float value = rounded != rounded ? __uint_as_float(0x7fc00000u) : rounded;
         element::put<Act>(embedded, out0 + column * stride1, value);
         wide[out1 + column * wide1] = value;
     });

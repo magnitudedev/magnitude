@@ -78,9 +78,11 @@ void embedding_rows() {
                 const uint column = 32u * p + 8u * step + i;
                 if (column < width) {
                     const float decoded = ((i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]) * scale;
-                    const float value = element_round(ELEMENT_ACT, SEISMIC_PARAM_NORMALIZE != 0ul
+                    const float rounded = element_round(ELEMENT_ACT, SEISMIC_PARAM_NORMALIZE != 0ul
                         ? decoded * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul)
                         : decoded);
+                    // A NaN (a non-finite block scale's product) is the registry's one NaN.
+                    const float value = (floatBitsToUint(rounded) & 0x7fffffffu) > 0x7f800000u ? uintBitsToFloat(0x7fc00000u) : rounded;
                     element_put(ELEMENT_ACT, embedded,
                         row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, value);
                     element_f32_put(widened

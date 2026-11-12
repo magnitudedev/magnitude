@@ -64,7 +64,9 @@ kernel void embedding_rows(
                 uint column = 32u * p + 8u * step + i;
                 if (column < width) {
                     float decoded = ((i & 1u) ? odd[i >> 1] : even[i >> 1]) * scale;
-                    float value = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
+                    const float rounded = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
+                    // A NaN (a non-finite block scale's product) is the registry's one NaN.
+                    const float value = rounded != rounded ? as_type<float>(0x7fc00000u) : rounded;
                     out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
                         activation::store(value);
                     widened[ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1] = value;
