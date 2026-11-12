@@ -1003,3 +1003,17 @@ fn instantiated_contract_symbols_keep_their_parameter_sorts() {
     }
     assert!(scalars > 0, "the contract binds the scalar parameter");
 }
+
+#[test]
+fn interleaved_pair_writes_cover_whole_rows_and_floor_divided_pair_reads() {
+    let encode = "fn encode[C](coefficients: &mut tensor[C] f16):\n    for group in 0..C / 2:\n        coefficients[2 * group] = f16(1.0)\n        coefficients[2 * group + 1] = f16(0.0)\n\n";
+    let decode = "fn decode[W, C](coefficients: &tensor[C] f16, x: &mut tensor[W] f32) where W % 32 == 0 and 16 * C == W:\n    for i in 0..W:\n        x[i] = f32(coefficients[2 * (i / 32)]) + f32(coefficients[2 * (i / 32) + 1])\n\n";
+    // 16 * C == W and W % 32 == 0 make C even: the pairs fill [0, C).
+    check(&format!("{encode}{decode}fn probe[W, C](x: &mut tensor[W] f32) -> tensor[C] f16 where W % 32 == 0 and 16 * C == W:\n    let mut coefficients = tensor[C] f16\n    encode(coefficients)\n    decode(coefficients, x)\n    return coefficients\n")).unwrap();
+    // An odd C leaves its last element unwritten.
+    let error = check(&format!("{encode}fn probe[C]() -> tensor[C] f16:\n    let mut coefficients = tensor[C] f16\n    encode(coefficients)\n    return coefficients\n")).unwrap_err();
+    assert!(error.contains("initialization"), "{error}");
+    // Even offsets alone are no box.
+    let error = check(&format!("fn evens[C](coefficients: &mut tensor[C] f16):\n    for group in 0..C / 2:\n        coefficients[2 * group] = f16(1.0)\n\n{decode}fn probe[W, C](x: &mut tensor[W] f32) where W % 32 == 0 and 16 * C == W:\n    let mut coefficients = tensor[C] f16\n    evens(coefficients)\n    decode(coefficients, x)\n")).unwrap_err();
+    assert!(error.contains("initialization"), "{error}");
+}

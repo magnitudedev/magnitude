@@ -119,10 +119,13 @@ impl ExactZeros {
             return false;
         }
         match atom {
-            Atom::Quot(numerator, denominator) => {
-                denominator.as_constant().is_some_and(|d| d > 0)
-                    && self.quotient(atom, numerator, denominator).is_some()
-            }
+            Atom::Quot(numerator, denominator) => denominator
+                .as_constant()
+                .filter(|d| *d > 0)
+                .is_some_and(|divisor| {
+                    self.quotient(atom, numerator, denominator).is_some()
+                        || self.divides(numerator, divisor)
+                }),
             Atom::Rem(numerator, denominator) => denominator
                 .as_constant()
                 .filter(|d| *d > 0)
@@ -182,17 +185,30 @@ impl ExactZeros {
             if *known_n == *n {
                 return true;
             }
-            // For example W=16*C and W%32=0 imply C%2=0.
-            // Cancellation uses only an established exact zero relation.
+            // For example W=16*C and W%32=0 imply C%2=0, and so does
+            // V=C with them. Cancellation uses only exact zero relations.
             let factor = Poly::constant(multiple / divisor);
             let difference = known_n.sub(&n.mul(&factor));
-            difference.valid
-                && (difference.is_zero()
-                    || zeros.contains(&difference)
-                    || zeros.contains(&difference.neg()))
+            difference.valid && (difference.is_zero() || self.spans(difference))
         });
         self.remainders.borrow_mut().insert(atom.clone(), implied);
         implied
+    }
+
+    /// `divisor` divides `n`: its remainder vanishes as a polynomial or is
+    /// a remainder atom an equation establishes zero.
+    fn divides(&self, n: &Poly, divisor: i64) -> bool {
+        let remainder = n.rem(&Poly::constant(divisor));
+        if remainder.is_zero() {
+            return true;
+        }
+        let Some(atom) = single_atom_of(&remainder) else {
+            return false;
+        };
+        match &atom {
+            Atom::Rem(numerator, _) => self.zero_remainder(&atom, numerator, divisor),
+            _ => false,
+        }
     }
 
     fn apply(&self, e: Poly) -> Poly {
@@ -222,6 +238,36 @@ impl ExactZeros {
                 if substituted.valid {
                     e = substituted;
                 }
+            }
+        }
+        // `d * (n / d)` is `n` when `d` divides `n`: `16 * C == W` and
+        // `W % 32 == 0` make `2 * (C / 2)` exactly `C`. Only a multiple of
+        // `d` times the quotient has a quotient-free form.
+        for atom in e.atoms() {
+            let Atom::Quot(numerator, denominator) = &atom else {
+                continue;
+            };
+            let Some(divisor) = denominator.as_constant().filter(|d| *d > 0) else {
+                continue;
+            };
+            if !self.divides(numerator, divisor) {
+                continue;
+            }
+            let mut rewritten = Poly::default();
+            for (monomial, coefficient) in &e.terms {
+                let mut term = Poly::default();
+                if monomial.get(&atom) == Some(&1) && coefficient % divisor == 0 {
+                    let mut cofactor = monomial.clone();
+                    cofactor.remove(&atom);
+                    term.insert(cofactor, coefficient / divisor);
+                    term = term.mul(numerator);
+                } else {
+                    term.insert(monomial.clone(), *coefficient);
+                }
+                rewritten = rewritten.add(&term);
+            }
+            if rewritten.valid {
+                e = rewritten;
             }
         }
         for atom in e.atoms() {
@@ -3307,6 +3353,42 @@ mod tests {
         assert!(
             nonneg(&mut arena, &facts, at_least_one),
             "H >= KV proves H / KV >= 1"
+        );
+    }
+
+    #[test]
+    fn a_known_multiple_is_its_quotient_times_its_divisor() {
+        let mut arena = ExprArena::new();
+        let mut facts = Facts::new();
+        let w = dimension(&mut arena, &mut facts);
+        let c = dimension(&mut arena, &mut facts);
+        let (zero, one, two) = (arena.int(0), arena.int(1), arena.int(2));
+        let (sixteen, thirty_two) = (arena.int(16), arena.int(32));
+        let half = arena.int_div(c, two);
+        let doubled = arena.int_mul(two, half);
+        let excess = arena.int_sub(doubled, c);
+        let (_, symbol, value) = arena.nat_loop_binder();
+        let i = arena.int_from_nat(value);
+        let last = arena.int_sub(w, one);
+        facts.set_range(symbol, zero, last);
+        // 2 * (i / 32) + 1 < 2 * (C / 2): a pair read inside the pairs written.
+        let group = arena.int_div(i, thirty_two);
+        let pair = arena.int_mul(two, group);
+        let pair = arena.int_add(pair, two);
+        let read = arena.int_sub(doubled, pair);
+        assert!(!nonneg(&mut arena, &facts, excess), "C may be odd");
+        let scaled = arena.int_mul(sixteen, c);
+        let width = arena.int_sub(scaled, w);
+        facts.assume_zero(&arena, width);
+        let residue = arena.int_rem(w, thirty_two);
+        facts.assume_zero(&arena, residue);
+        assert!(
+            nonneg(&mut arena, &facts, excess),
+            "16 * C == W and W % 32 == 0 make 2 * (C / 2) exactly C"
+        );
+        assert!(
+            nonneg(&mut arena, &facts, read),
+            "i < W gives 2 * (i / 32) + 2 <= 2 * (C / 2)"
         );
     }
 

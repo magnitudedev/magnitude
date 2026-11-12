@@ -594,7 +594,20 @@ pub(crate) trait RegionOps {
                 let Some(child) = self.normalization_guard_scope(batch, scope, &path) else {
                     return Region::Empty;
                 };
-                Region::guarded(path, self.reduce_reached_region(*inner, batch, child))
+                let inner = self.reduce_reached_region(*inner, batch, child);
+                // A condition without which the reduced region is empty adds
+                // nothing to the guard: a loop's guard that it runs, around
+                // a box whose extent is its trip count, is the box alone.
+                let path = path
+                    .into_iter()
+                    .filter(|(condition, truth)| {
+                        let mut path = vec![];
+                        let mut facts = (*facts).clone();
+                        self.assume(&mut path, &mut facts, condition.clone(), !truth)
+                            && !self.required_region_empty(&inner, &path, &facts, &[])
+                    })
+                    .collect();
+                Region::guarded(path, inner)
             }
             Region::Union(mut parts) => {
                 // Remove repeated paths before recursively normalizing their
@@ -1091,6 +1104,16 @@ pub(crate) trait RegionOps {
     /// Join union members that are boxes equal on every axis but one, where
     /// their ranges meet or overlap: the box image of the joined range.
     fn join_images(&mut self, parts: &mut Vec<Region>, facts: &prove::Facts) {
+        let mut i = 0;
+        while i < parts.len() {
+            if let Some((members, joined)) = self.interleaved_images(parts, i, facts) {
+                parts[i] = joined;
+                for member in members.into_iter().rev() {
+                    parts.remove(member);
+                }
+            }
+            i += 1;
+        }
         let mut ranges = parts
             .iter()
             .map(|part| match part {
@@ -1161,6 +1184,90 @@ pub(crate) trait RegionOps {
             }
             i += 1;
         }
+    }
+    /// The later members that, with image `i`, differ only on one axis by
+    /// constant offsets filling an interval `[m, m + n)`, and the box their
+    /// union is: `2 * g` and `2 * g + 1` over `g in [0, G)` are `[0, 2 * G)`.
+    /// Members whose union is no box stay separate.
+    fn interleaved_images(
+        &mut self,
+        parts: &[Region],
+        i: usize,
+        facts: &prove::Facts,
+    ) -> Option<(Vec<usize>, Region)> {
+        let Region::Image {
+            domain,
+            coordinates,
+        } = &parts[i]
+        else {
+            return None;
+        };
+        for axis in 0..coordinates.len() {
+            let mut offsets = vec![(0, i)];
+            for (j, part) in parts.iter().enumerate().skip(i + 1) {
+                let Region::Image {
+                    domain: other_domain,
+                    coordinates: other,
+                } = part
+                else {
+                    continue;
+                };
+                let same_domain = domain.len() == other_domain.len()
+                    && domain.iter().zip(other_domain).all(|(a, b)| {
+                        a.symbol == b.symbol && self.same(a.start, b.start) && self.same(a.end, b.end)
+                    });
+                if !same_domain
+                    || other.len() != coordinates.len()
+                    || (0..other.len()).any(|k| k != axis && !self.same(other[k], coordinates[k]))
+                {
+                    continue;
+                }
+                let difference = self.arena().int_sub(other[axis], coordinates[axis]);
+                if let Some(offset) = prove::constant(self.arena_ref(), difference) {
+                    if offsets.iter().all(|(known, _)| *known != offset) {
+                        offsets.push((offset, j));
+                    }
+                }
+            }
+            offsets.sort_unstable();
+            let first = offsets[0].0;
+            if offsets.len() < 2 || (0..offsets.len()).any(|k| offsets[k].0 != first + k as i64) {
+                continue;
+            }
+            let (symbol, value) = self.fresh_integer();
+            let mut joined_domain = domain.clone();
+            joined_domain.push(Bound {
+                symbol,
+                start: self.arena().int(0),
+                end: self.arena().int(offsets.len() as i64),
+            });
+            let mut joined_coordinates = coordinates.clone();
+            let base = self.arena().int(first);
+            let base = self.arena().int_add(coordinates[axis], base);
+            joined_coordinates[axis] = self.arena().int_add(base, value);
+            let joined = self.rebased_image(joined_domain, joined_coordinates, facts);
+            let Region::Image {
+                domain: joined_domain,
+                coordinates: joined_coordinates,
+            } = &joined
+            else {
+                unreachable!("a rebased image is an image")
+            };
+            if self
+                .image_ranges(joined_domain, joined_coordinates, facts, true)
+                .is_none()
+            {
+                continue;
+            }
+            let mut members = offsets
+                .into_iter()
+                .map(|(_, j)| j)
+                .filter(|j| *j != i)
+                .collect::<Vec<_>>();
+            members.sort_unstable();
+            return Some((members, joined));
+        }
+        None
     }
     /// The one axis on which two boxes differ, with their joined range, when
     /// the two ranges on it meet or overlap.
@@ -1802,6 +1909,12 @@ pub(crate) trait RegionOps {
         let mut regions = self.normalize_many(vec![available, required], facts).into_iter();
         let available = regions.next().expect("normalized available region");
         let required = regions.next().expect("normalized required region");
+        // Normalization lifts a guard out of a binder (`Bind(i, Guard(c,
+        // R))` is `Guard(c, Bind(i, R))` when `c` is free of `i`), or a
+        // union out of one: this path assumes or splits it as above.
+        if matches!(required, Region::Guard(..) | Region::Union(..)) {
+            return self.covered(&available, &required, path, facts, extents);
+        }
         self.covered_plain(&available, &required, facts, extents)
     }
     fn covered_plain(
