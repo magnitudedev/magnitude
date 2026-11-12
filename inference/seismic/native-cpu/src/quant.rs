@@ -9,12 +9,15 @@
 //! (`max|x| < 127 · 2^-126`) it is rounded up onto the subnormal grid
 //! instead, so that every `|x / d| ≤ 127` and `d` is zero only when the block
 //! is. Each code is the stored scale's exact quotient rounded once, half away
-//! from zero (CUDA's INT8 staging rounds half to even), and NaN codes 0.
-//! Every step is scalar-exact, so every tier produces the same block.
+//! from zero, and NaN codes 0. Every step is scalar-exact, so every tier
+//! produces the same block, and CUDA's and Metal's INT8 staging (over groups
+//! of 32, Metal's scale on F16's grid) follow the same rule, which
+//! `tests/int8_rule` in `magnitude-kernels` checks against this quantizer.
 //!
 //! Quantizing activations changes a projection's arithmetic: an entry offers
 //! it as an `arithmetic` tuning parameter, validated like any other.
 
+use crate::element::{f16_to_f32, f32_to_f16};
 use seismic_lang::forms::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
 
 /// Values per quantized activation block (the k-quant super block).
@@ -54,6 +57,16 @@ impl Q8Block {
         sums: [0; Q8_BLOCK / 16],
         d: 0.0,
     };
+
+    /// The block's codes.
+    pub fn codes(&self) -> &[i8; Q8_BLOCK] {
+        &self.codes
+    }
+
+    /// The block's scale.
+    pub fn scale(&self) -> f32 {
+        self.d
+    }
 
     /// Blocks as the one-row tiles they are: a block's codes, sums and
     /// scale are a one-row [`Q8Tile`]'s, byte for byte.
@@ -151,13 +164,7 @@ pub const fn blocks(k: usize) -> usize {
 pub fn quantize(x: &[f32], out: &mut [Q8Block]) {
     let out = &mut out[..blocks(x.len())];
     for (values, block) in x.chunks(Q8_BLOCK).zip(out.iter_mut()) {
-        let d = scale(largest(values));
-        block.d = d;
-        // The quotient of two F32 values is exact enough in F64 that rounding
-        // it rounds the exact quotient; 0 / 0 and NaN code 0.
-        for (code, value) in block.codes.iter_mut().zip(values) {
-            *code = (f64::from(*value) / f64::from(d)).round() as i8;
-        }
+        block.d = quantize_group::<F32Grid>(values, &mut block.codes[..values.len()]);
         for code in &mut block.codes[values.len()..] {
             *code = 0;
         }
@@ -170,25 +177,85 @@ pub fn quantize(x: &[f32], out: &mut [Q8Block]) {
     }
 }
 
-/// The scale of a block whose largest magnitude is `maximum`:
+/// The format a block's scale is stored in, whose grid the rule rounds it
+/// to: F32 for the CPU, F16 for Metal's INT8 form.
+pub trait ScaleGrid {
+    /// The least normal value of the grid.
+    const LEAST_NORMAL: f32;
+    /// `value` rounded to nearest on the grid.
+    fn nearest(value: f32) -> f32;
+    /// The grid value above `scale`, a subnormal or zero one.
+    fn above(scale: f32) -> f32;
+}
+
+/// F32 scales.
+pub struct F32Grid;
+
+impl ScaleGrid for F32Grid {
+    const LEAST_NORMAL: f32 = f32::MIN_POSITIVE;
+    #[inline(always)]
+    fn nearest(value: f32) -> f32 {
+        value
+    }
+    #[inline(always)]
+    fn above(scale: f32) -> f32 {
+        f32::from_bits(scale.to_bits() + 1)
+    }
+}
+
+/// F16 scales.
+pub struct F16Grid;
+
+impl ScaleGrid for F16Grid {
+    const LEAST_NORMAL: f32 = f32::from_bits(0x3880_0000);
+    #[inline(always)]
+    fn nearest(value: f32) -> f32 {
+        f16_to_f32(f32_to_f16(value))
+    }
+    #[inline(always)]
+    fn above(scale: f32) -> f32 {
+        f16_to_f32(f32_to_f16(scale) + 1)
+    }
+}
+
+/// The scale of a group whose largest magnitude is `maximum`, on grid `G`:
 /// `maximum / 127` rounded to nearest, or where that is subnormal, rounded
 /// up onto the subnormal grid, so `maximum / d ≤ 127` and `d > 0` for every
 /// nonzero `maximum`. A normal `d` rounded down leaves `maximum / d` within
-/// one F32 ulp of 127, which still rounds to 127.
+/// one ulp of 127, which still rounds to 127.
 #[inline(always)]
-pub(crate) fn scale(maximum: f32) -> f32 {
-    let d = maximum / 127.0;
+pub fn scale_on<G: ScaleGrid>(maximum: f32) -> f32 {
+    let d = G::nearest(maximum / 127.0);
     // F64 holds `d · 127` exactly.
-    if d < f32::MIN_POSITIVE && f64::from(d) * 127.0 < f64::from(maximum) {
-        f32::from_bits(d.to_bits() + 1)
+    if d < G::LEAST_NORMAL && f64::from(d) * 127.0 < f64::from(maximum) {
+        G::above(d)
     } else {
         d
     }
 }
 
+/// The code of `value` under `scale`: the exact quotient (an F64 quotient of
+/// two F32 values rounds like it) rounded once, half away from zero; 0 / 0
+/// and NaN code 0.
+#[inline(always)]
+pub fn code(value: f32, scale: f32) -> i8 {
+    (f64::from(value) / f64::from(scale)).round() as i8
+}
+
+/// Quantizes a group on grid `G`: its scale, and its codes into `codes`
+/// (`values.len()` of them).
+#[inline(always)]
+pub fn quantize_group<G: ScaleGrid>(values: &[f32], codes: &mut [i8]) -> f32 {
+    let d = scale_on::<G>(largest(values));
+    for (code_out, value) in codes.iter_mut().zip(values) {
+        *code_out = code(*value, d);
+    }
+    d
+}
+
 /// The largest magnitude of `values`, ignoring NaN (as `fmaxnm` does).
 #[inline(always)]
-fn largest(values: &[f32]) -> f32 {
+pub fn largest(values: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     if let Ok(values) = <&[f32; Q8_BLOCK]>::try_from(values) {
         return neon::largest(values);

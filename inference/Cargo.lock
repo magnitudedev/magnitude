@@ -2571,6 +2571,7 @@ dependencies = [
  "seismic-build",
  "seismic-cpu",
  "seismic-lang",
+ "seismic-native-cpu",
  "seismic-native-tests",
  "seismic-std",
 ]

@@ -25,6 +25,7 @@ use seismic_lang::{
 
 mod declared;
 mod gguf_formats;
+mod int8_rule;
 mod operands;
 
 use gguf_formats::{Format, Rng, gguf_format_tests};
@@ -465,10 +466,17 @@ fn gguf_weight(format: Format, rows: usize, k: usize, rng: &mut Rng, scale: f32)
     let external = (0..rows * k / format.block_values())
         .flat_map(|_| format.block(rng, scale))
         .collect::<Vec<_>>();
+    gguf_weight_of(format, rows, k, &external)
+}
+
+/// The weight of `rows` rows over `k` columns of GGUF `external` blocks of
+/// `format`, through the registry's conversion.
+fn gguf_weight_of(format: Format, rows: usize, k: usize, external: &[u8]) -> Weight {
+    let repr = Repr::Gguf(format);
     let shape = [rows as u64, k as u64];
     let element = repr.element();
     let bytes = element
-        .repack_host(format.source(), &shape, &external)
+        .repack_host(format.source(), &shape, external)
         .unwrap();
     let values = element
         .decode_host(&shape, &bytes)
@@ -2415,6 +2423,68 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
         "relative CPU INT8 error {}",
         (error / scale).sqrt()
     );
+}
+
+/// Metal's INT8 form codes every activation group by the CPU's rule on F16's
+/// grid, which its scales are stored in (`int8_rule`): weights that read one
+/// column each (`int8_rule::probe_blocks`) make each output its column's
+/// `d * code` (rounded to BF16 by the projection's store), which matches the
+/// rule's on ties, their BF16 neighbours, subnormal scales, zero and NaN
+/// groups. Groups with F32 subnormal values are left out: Metal's F32
+/// arithmetic flushes them. Devices without tensor operations run no INT8
+/// quantization.
+#[test]
+fn metal_int8_activations_follow_the_cpu_rule() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    if !device.forms_tensor_operations() {
+        eprintln!("no tensor operations: Metal runs no INT8 quantization here");
+        return;
+    }
+    let (h, f) = (64, 512);
+    let down = gguf_weight_of(Format::Q8, h, f, &int8_rule::probe_blocks(h, f));
+    let mapping = Mapping {
+        tall: Some(TALL_DEFAULT),
+        ..gemm_mapping(64, 64, 1)
+    };
+    let groups = int8_rule::blocks()
+        .into_iter()
+        .filter(|group| !int8_rule::has_subnormal(group))
+        .collect::<Vec<_>>();
+    // INT8 runs past 64 rows.
+    for (at, groups) in groups.chunks(128).enumerate() {
+        let rows = groups.len().max(65);
+        let mut product = vec![0.0f32; rows * f];
+        for (row, group) in groups.iter().enumerate() {
+            product[row * f..row * f + int8_rule::GROUP].copy_from_slice(group);
+        }
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        let out = dense_output_native_arithmetic(
+            &device,
+            Act::Bf16,
+            &down,
+            &vec![0.0; rows * h],
+            rows,
+            &product,
+            &out_rows,
+            mapping,
+            true,
+        );
+        int8_rule::assert_codes(
+            &format!("Metal INT8 groups {at}"),
+            groups,
+            &out[..groups.len() * h],
+            h,
+            int8_rule::Grid::F16,
+            // The store rounds `d * code` to BF16 (2^-9 relative), under half
+            // of a code step (1 / 127) at every code.
+            2f64.powi(-8),
+        );
+    }
 }
 
 /// Metal's INT8 form of the down projection: int8 activations per (row, 32
