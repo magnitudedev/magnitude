@@ -335,35 +335,9 @@ pub(super) fn encoded_bytes(
     representation: RepresentationId,
     shape: &[usize],
 ) -> Result<usize, String> {
-    let (last, outer) = shape
-        .split_last()
-        .ok_or("encoded representation requires rank at least one")?;
-    let rows = outer.iter().try_fold(1u64, |value, axis| {
-        value
-            .checked_mul(*axis as u64)
-            .ok_or("tensor size overflow")
-    })?;
-    let bytes = match &registry::representation_info(representation).kind {
-        RepresentationKind::Packed(layout) => layout
-            .bytes(rows, *last as u64)
-            .ok_or("packed tensor size overflow")?,
-        RepresentationKind::PackedRows(layout) => layout
-            .bytes(
-                &shape
-                    .iter()
-                    .map(|extent| *extent as u64)
-                    .collect::<Vec<_>>(),
-            )
-            .ok_or("row-layout tensor size overflow or rank below its layout's")?,
-        RepresentationKind::External(layout) => layout
-            .matrices(&shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>())
-            .ok_or("external tensor size overflow")?
-            .tensor_bytes(),
-        RepresentationKind::Dense(dtype) => rows
-            .checked_mul(*last as u64)
-            .and_then(|elements| elements.checked_mul(u64::from(dtype.bytes())))
-            .ok_or("dense tensor size overflow")?,
-    };
+    let extents: Vec<u64> = shape.iter().map(|extent| *extent as u64).collect();
+    let bytes = registry::canonical_bytes(representation, &extents)
+        .ok_or("tensor size overflow, or rank below its representation's")?;
     usize::try_from(bytes).map_err(|_| "tensor is not host-addressable".to_owned())
 }
 

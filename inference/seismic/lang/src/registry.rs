@@ -1117,22 +1117,11 @@ impl PackedPacketLayout {
         logical_extent.div_ceil(u64::from(self.group))
     }
 
-    /// Canonical byte stride between adjacent packed-axis rows.
-    pub fn row_bytes(&self, logical_extent: u64) -> Option<u64> {
-        self.packet_extent(logical_extent)
-            .checked_mul(u64::from(self.packet_size))
-    }
-
     /// Byte offset of a plane within packet `packet`.
     pub fn plane_offset(&self, packet: u64, plane: usize) -> Option<u64> {
         packet
             .checked_mul(u64::from(self.packet_size))?
             .checked_add(u64::from(self.planes.get(plane)?.offset))
-    }
-
-    /// Total bytes for `outer_rows` rows of `logical_extent` elements.
-    pub fn bytes(&self, outer_rows: u64, logical_extent: u64) -> Option<u64> {
-        outer_rows.checked_mul(self.row_bytes(logical_extent)?)
     }
 
     /// Canonical packets of `rows` rows of `logical_extent` elements, assembled
@@ -1143,8 +1132,8 @@ impl PackedPacketLayout {
     /// occupies inside one canonical packet. Packet bytes no plane occupies
     /// are zero.
     ///
-    /// The caller has established that `bytes(rows, logical_extent)` exists
-    /// (the canonical byte count of the tensor fits `u64`); geometry that
+    /// The caller has established that the canonical byte count of the
+    /// tensor ([`canonical_bytes`]) fits `u64`; geometry that
     /// overflows is a caller contradiction and panics.
     pub fn packets_from_planes(
         &self,
@@ -1152,11 +1141,11 @@ impl PackedPacketLayout {
         logical_extent: u64,
         planes: &[(&str, &[u8])],
     ) -> Result<Vec<u8>, PlaneAssemblyError> {
-        let total = self
-            .bytes(rows, logical_extent)
+        let packet_count = self.packet_extent(logical_extent);
+        let total = units_bytes(&[rows, packet_count], u64::from(self.packet_size))
             .expect("packed tensor geometry has a canonical byte count");
         let packets = rows
-            .checked_mul(self.packet_extent(logical_extent))
+            .checked_mul(packet_count)
             .expect("packet count of a tensor with a canonical byte count fits u64");
         if planes.len() != self.planes.len()
             || !self.planes.iter().all(|plane| {
@@ -1454,11 +1443,9 @@ impl PackedRowLayout {
 
     /// Stored storage groups of a row of `logical_extent` values.
     pub fn row_groups(&self, logical_extent: u64) -> Option<u64> {
-        let multiple = u64::from(self.group_multiple);
         logical_extent
             .div_ceil(u64::from(self.packet.group))
-            .div_ceil(multiple)
-            .checked_mul(multiple)
+            .checked_next_multiple_of(u64::from(self.group_multiple))
     }
 
     /// Payload bytes of plane `plane` in one row (excluding alignment
@@ -1512,20 +1499,16 @@ impl PackedRowLayout {
         let mut units = leading.to_vec();
         if self.tile_rows() > 1 {
             let rows = units.last_mut()?;
-            let tile = self.tile_rows();
-            *rows = rows.div_ceil(tile).checked_mul(tile)?;
+            *rows = rows.checked_next_multiple_of(self.tile_rows())?;
         }
         units.push(1);
         Some(units)
     }
 
-    /// Canonical bytes of a tensor with `extents`.
+    /// Canonical bytes of a tensor with `extents`: its storage units'
+    /// bytes ([`units_bytes`]) at the row stride.
     pub fn bytes(&self, extents: &[u64]) -> Option<u64> {
-        let rows = self
-            .storage_units(extents)?
-            .iter()
-            .try_fold(1u64, |rows, extent| rows.checked_mul(*extent))?;
-        rows.checked_mul(self.row_stride_bytes(*extents.last()?)?)
+        units_bytes(&self.storage_units(extents)?, self.row_stride_bytes(*extents.last()?)?)
     }
 
     /// The stored row holding logical row `row` (row-major over the leading
@@ -2125,7 +2108,7 @@ impl PackedRowLayout {
 }
 
 fn align(bytes: u64) -> Option<u64> {
-    Some(bytes.checked_add(ROW_ALIGNMENT - 1)? / ROW_ALIGNMENT * ROW_ALIGNMENT)
+    bytes.checked_next_multiple_of(ROW_ALIGNMENT)
 }
 
 /// Bit of the code of `column` of stored `row` in a code plane (at row
@@ -2599,34 +2582,64 @@ fn element_name(representation: &str, operands: OperandRecipe, layout: Layout) -
     let storage = format!("{representation}{}", operands.suffix());
     Box::leak(stored_name(&storage, layout).into_boxed_str())
 }
-/// Canonical storage bytes of a contiguous tensor with `extents` in
-/// representation `id`: dense = elements × dtype bytes; packed and external =
-/// rows × ceil(last / group) × packet bytes, where rows is the product of the
-/// leading extents; row layouts = stored rows × row stride
-/// (`PackedRowLayout::bytes`). `None` when `extents` is empty for a packed or
-/// external representation (or below rank 2 for `mma16`), or when the count
-/// overflows `u64`.
-pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
-    let rows_and_last = || {
-        let (last, leading) = extents.split_last()?;
-        let rows = leading
-            .iter()
-            .try_fold(1u64, |rows, extent| rows.checked_mul(*extent))?;
-        Some((rows, *last))
+/// The storage units of a contiguous tensor with `extents` in
+/// representation `id`, per axis, and the bytes of one unit: dense units
+/// are elements; a packed or external tensor's packing axis counts packets
+/// (`⌈last / group⌉` of the packet's bytes); a row layout's leading extents
+/// count rows (the row axis padded to whole tiles) and its packing axis is
+/// one unit of the row stride (`PackedRowLayout::storage_units`,
+/// `row_stride_bytes`). `None` where `extents` is empty for a packed or
+/// external representation, below a row layout's rank, or on overflow.
+pub fn storage_units(id: RepresentationId, extents: &[u64]) -> Option<(Vec<u64>, u64)> {
+    let packets = |group: u32, packet_size: u32| {
+        let mut units = extents.to_vec();
+        let last = units.last_mut()?;
+        *last = last.div_ceil(u64::from(group));
+        Some((units, u64::from(packet_size)))
     };
     match &representation_info(id).kind {
-        RepresentationKind::Dense(dtype) => extents
-            .iter()
-            .try_fold(u64::from(dtype.bytes()), |bytes, extent| {
-                bytes.checked_mul(*extent)
-            }),
-        RepresentationKind::Packed(layout) => {
-            let (rows, last) = rows_and_last()?;
-            layout.bytes(rows, last)
+        RepresentationKind::Dense(dtype) => Some((extents.to_vec(), u64::from(dtype.bytes()))),
+        RepresentationKind::Packed(layout) => packets(layout.group, layout.packet_size),
+        // A source under a companion grid is stored planar: a matrix's codes
+        // then its grid are one unit, so the last two axes count that one
+        // unit and the leading axes count matrices. An empty matrix is no
+        // unit: a zero extent, as of any tensor that holds nothing.
+        RepresentationKind::External(layout) if layout.planes.is_some() => {
+            let matrices = layout.matrices(extents)?;
+            let mut units = extents[..extents.len() - 2].to_vec();
+            if matrices.bytes == 0 {
+                units.extend([0, 1]);
+                Some((units, 1))
+            } else {
+                units.extend([1, 1]);
+                Some((units, matrices.bytes))
+            }
         }
-        RepresentationKind::PackedRows(layout) => layout.bytes(extents),
-        RepresentationKind::External(layout) => layout.matrices(extents).map(|matrices| matrices.tensor_bytes()),
+        RepresentationKind::External(layout) => packets(layout.logical_group, layout.packet_size),
+        RepresentationKind::PackedRows(layout) => {
+            Some((layout.storage_units(extents)?, layout.row_stride_bytes(*extents.last()?)?))
+        }
     }
+}
+
+/// The bytes of contiguous storage `units` of `width` bytes each, `None`
+/// where a row-major stride over them overflows: their product accumulated
+/// from the last axis, as their strides are, times the width.
+pub fn units_bytes(units: &[u64], width: u64) -> Option<u64> {
+    units
+        .iter()
+        .rev()
+        .try_fold(1u64, |count, extent| count.checked_mul(*extent))?
+        .checked_mul(width)
+}
+
+/// Canonical storage bytes of a contiguous tensor with `extents` in
+/// representation `id`: its storage units' bytes ([`storage_units`],
+/// [`units_bytes`]). `None` where it has no storage units or a row-major
+/// stride over them overflows `u64`.
+pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
+    let (units, width) = storage_units(id, extents)?;
+    units_bytes(&units, width)
 }
 
 /// Bytes of one record (a row of the leading axis) of a tensor of
@@ -4514,6 +4527,16 @@ pub(crate) mod internals {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn units_take_their_bytes_by_the_order_their_strides_accumulate() {
+        // A zero extent met before an overflow (from the last axis) leaves
+        // no bytes; one met after the product overflowed does not.
+        assert_eq!(super::units_bytes(&[u64::MAX, 2, 0], 1), Some(0));
+        assert_eq!(super::units_bytes(&[0, u64::MAX, 2], 1), None);
+        assert_eq!(super::units_bytes(&[3, 4, 5], 2), Some(120));
+        assert_eq!(super::units_bytes(&[3, 4, 5], u64::MAX), None);
+    }
+
     /// A chunk's entries are its records' addresses within it, from its
     /// first record; the last chunk's stop at the reservation's last.
     #[test]
@@ -4992,24 +5015,24 @@ mod tests {
         );
         // Qwen3.5 K = 2560: codes 1280 | scales 120 -> 128 | supers 40 -> 48.
         let q4k = row_layout("q4k@rows16");
-        assert_eq!(q4k.plane_row_offset(1, 2560), Some(1280));
-        assert_eq!(q4k.plane_row_offset(2, 2560), Some(1408));
-        assert_eq!(q4k.row_stride_bytes(2560), Some(1456));
+        assert_eq!(q4k.plane_row_offset(1, 2560u64), Some(1280));
+        assert_eq!(q4k.plane_row_offset(2, 2560u64), Some(1408));
+        assert_eq!(q4k.row_stride_bytes(2560u64), Some(1456));
         assert_eq!(
-            canonical_bytes(representation("q4k@rows16").unwrap(), &[3, 2560]),
+            canonical_bytes(representation("q4k@rows16").unwrap(), &[3u64, 2560]),
             Some(3 * 1456)
         );
         // A q8 row of three groups: 96 code bytes, 6 super bytes -> 16.
         let q8 = row_layout("q8g32s@rows16");
-        assert_eq!(q8.row_stride_bytes(96), Some(112));
+        assert_eq!(q8.row_stride_bytes(96u64), Some(112));
         // mma16 pads rows per matrix and q8 rows to whole 64-column k-blocks.
         let q8_mma = representation("q8g32s@mma16").unwrap();
         assert_eq!(
-            row_layout("q8g32s@mma16").row_stride_bytes(96),
+            row_layout("q8g32s@mma16").row_stride_bytes(96u64),
             Some(128 + 16)
         );
-        assert_eq!(canonical_bytes(q8_mma, &[2, 17, 96]), Some(2 * 32 * 144));
-        assert_eq!(canonical_bytes(q8_mma, &[96]), None);
+        assert_eq!(canonical_bytes(q8_mma, &[2u64, 17, 96]), Some(2 * 32 * 144));
+        assert_eq!(canonical_bytes(q8_mma, &[96u64]), None);
         // mma16 rows hold whole k-blocks and whole 16-byte chunks of every
         // code plane: a 32-value group's one-bit high plane (4 bytes) takes
         // groups in fours, so Gemma's K = 704 stores 24 groups.
@@ -5025,8 +5048,8 @@ mod tests {
         ] {
             assert_eq!(row_layout(name).group_multiple, multiple, "{name}");
         }
-        assert_eq!(row_layout("q5g32@mma16").row_groups(704), Some(24));
-        assert_eq!(row_layout("q5g32@rows16").row_groups(704), Some(22));
+        assert_eq!(row_layout("q5g32@mma16").row_groups(704u64), Some(24));
+        assert_eq!(row_layout("q5g32@rows16").row_groups(704u64), Some(22));
     }
 
     /// `mma16` code placement re-derived from the PTX m16n8k16 A fragment:
@@ -5132,8 +5155,8 @@ mod tests {
         let layout = row_layout("iq2xxs@mma16");
         // Bolt's shared projections: K = 4096 holds 16 records a tile and
         // rows of 1056 bytes; K = 5376 rows of 21 * 66 = 1386 -> 1392.
-        assert_eq!(layout.row_stride_bytes(4096), Some(1056));
-        assert_eq!(layout.row_stride_bytes(5376), Some(1392));
+        assert_eq!(layout.row_stride_bytes(4096u64), Some(1056));
+        assert_eq!(layout.row_stride_bytes(5376u64), Some(1392));
         let k = 512u64;
         let geometry = layout.geometry(k).unwrap();
         let stride = geometry.stride;
@@ -5289,13 +5312,15 @@ mod tests {
     fn canonical_bytes_follow_the_representation_layout() {
         let q4g64 = representation("q4g64").unwrap();
         let q4_k = representation("gguf_q4_k").unwrap();
-        assert_eq!(canonical_bytes(dense(DType::F32), &[3, 5]), Some(60));
+        assert_eq!(canonical_bytes(dense(DType::F32), &[3u64, 5]), Some(60));
         assert_eq!(canonical_bytes(dense(DType::BF16), &[]), Some(2));
-        assert_eq!(canonical_bytes(dense(DType::F32), &[0, 5]), Some(0));
-        assert_eq!(canonical_bytes(q4g64, &[3, 128]), Some(3 * 2 * 36));
-        assert_eq!(canonical_bytes(q4g64, &[2, 3, 65]), Some(6 * 2 * 36));
-        assert_eq!(canonical_bytes(q4_k, &[512]), Some(288));
-        assert_eq!(canonical_bytes(q4_k, &[2, 257]), Some(2 * 2 * 144));
+        assert_eq!(canonical_bytes(dense(DType::F32), &[0u64, 5]), Some(0));
+        assert_eq!(canonical_bytes(dense(DType::F32), &[u64::MAX, 2, 0]), Some(0));
+        assert_eq!(canonical_bytes(dense(DType::F32), &[0, u64::MAX, 2]), None);
+        assert_eq!(canonical_bytes(q4g64, &[3u64, 128]), Some(3 * 2 * 36));
+        assert_eq!(canonical_bytes(q4g64, &[2u64, 3, 65]), Some(6 * 2 * 36));
+        assert_eq!(canonical_bytes(q4_k, &[512u64]), Some(288));
+        assert_eq!(canonical_bytes(q4_k, &[2u64, 257]), Some(2 * 2 * 144));
         assert_eq!(canonical_bytes(q4g64, &[]), None);
         assert_eq!(canonical_bytes(q4_k, &[]), None);
         assert_eq!(canonical_bytes(dense(DType::F32), &[u64::MAX, 2]), None);
@@ -5315,13 +5340,13 @@ mod tests {
         assert_eq!(bytes(q4_k, &[512]), None);
         for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
             let id = storage("q4k", layout).unwrap();
-            let matrix = canonical_bytes(id, &[24, 256]).unwrap();
+            let matrix = canonical_bytes(id, &[24u64, 256]).unwrap();
             assert_eq!(bytes(id, &[3, 24, 256]), Some(matrix), "{}", layout.as_str());
-            assert_eq!(canonical_bytes(id, &[3, 24, 256]), Some(3 * matrix));
+            assert_eq!(canonical_bytes(id, &[3u64, 24, 256]), Some(3 * matrix));
             let RepresentationKind::PackedRows(rows) = &representation_info(id).kind else {
                 unreachable!("a row layout's storage")
             };
-            let row = (rows.tile_rows() == 1).then(|| canonical_bytes(id, &[256]).unwrap());
+            let row = (rows.tile_rows() == 1).then(|| canonical_bytes(id, &[256u64]).unwrap());
             assert_eq!(bytes(id, &[32, 256]), row, "{}", layout.as_str());
         }
     }
@@ -5351,7 +5376,7 @@ mod tests {
                 .map(|(name, bytes)| (*name, bytes.as_slice()))
                 .collect();
             let canonical = layout.packets_from_planes(rows, extent, &reversed).unwrap();
-            assert_eq!(Some(canonical.len() as u64), layout.bytes(rows, extent));
+            assert_eq!(Some(canonical.len() as u64), canonical_bytes(info.id, &[rows, extent]));
             let mut occupied = vec![false; canonical.len()];
             for (index, (plane, (_, bytes))) in layout.planes.iter().zip(&supplied).enumerate() {
                 let width = plane.bytes_per_group as usize;

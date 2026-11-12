@@ -852,12 +852,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());
@@ -960,12 +955,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());
@@ -1003,12 +993,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());

@@ -137,8 +137,8 @@ use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
-pub use seismic_runtime::native::dimension::DimensionExpr;
-pub(crate) use seismic_runtime::native::dimension::{DimensionExpr as Expr, Operation};
+pub use seismic_lang::size::DimensionExpr;
+pub(crate) use seismic_lang::size::{DimensionExpr as Expr, Operation};
 
 /// A comparison a recorded builder made and what it found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

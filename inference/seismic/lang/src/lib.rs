@@ -20,6 +20,7 @@ pub mod forms;
 pub mod ids;
 pub mod registry;
 pub mod repack;
+pub mod size;
 
 mod check;
 mod external_tables;

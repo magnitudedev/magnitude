@@ -11,43 +11,13 @@ pub fn representation_alignment(representation: RepresentationId) -> u64 {
     }
 }
 
-/// Concrete per-axis storage units and the byte width of one unit.
-/// Packed/external final axes count packets rather than logical elements.
-/// Row layouts count rows: the final axis is one unit of the row stride, and
-/// `mma16` pads the row axis to whole 16-row tiles. A source under a
-/// companion grid (`ExternalPacketLayout::planes`) counts matrices: its
-/// last two axes are one unit, the matrix's codes and then its grid.
+/// Concrete per-axis storage units and the byte width of one unit
+/// (`registry::storage_units`), `None` for a unit of no bytes.
 pub fn concrete_storage_units(
     representation: RepresentationId,
     extents: &[u64],
 ) -> Option<(Vec<u64>, u64)> {
-    let mut units = extents.to_vec();
-    let width = match &registry::representation_info(representation).kind {
-        RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
-        RepresentationKind::Packed(packet) => {
-            *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.group));
-            u64::from(packet.packet_size)
-        }
-        RepresentationKind::External(packet) if packet.planes.is_some() => {
-            let matrices = packet.matrices(extents)?;
-            let leading = extents.len().checked_sub(2)?;
-            units.truncate(leading);
-            units.extend([1, 1]);
-            matrices.bytes
-        }
-        RepresentationKind::External(packet) => {
-            *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.logical_group));
-            u64::from(packet.packet_size)
-        }
-        RepresentationKind::PackedRows(layout) => {
-            units = layout.storage_units(extents)?;
-            layout.row_stride_bytes(*extents.last()?)?
-        }
-    };
-    if width == 0 {
-        return None;
-    }
-    Some((units, width))
+    registry::storage_units(representation, extents).filter(|(_, width)| *width != 0)
 }
 
 /// Exact byte span and unit width for one concrete affine tensor descriptor.
