@@ -10,9 +10,9 @@ versions never replace one another's, and a runner records the agent it runs (`r
     agent.py start   --root R --run ID   (prints {"staging"}; then the plan on stdin; prints
                                           {"agent", "pid"}; or, once started, {"started"})
     agent.py follow  --root R --run ID --after SEQ
-    agent.py stop    --root R --run ID
-    agent.py fetched --root R --run ID
-    agent.py status  --root R [--source KEY ...]
+    agent.py stop    --root R --run ID [--queued]
+    agent.py fetched --root R --run ID [--wait]
+    agent.py status  --root R [--ahead-of ID] [--env JSON] [--source KEY ...]
     agent.py install --from S --to D
 
 A hold is what a phase of a run needs from the host. Kinds, and which conflict:
@@ -119,7 +119,8 @@ which streams every line, minutes behind a run long ended. A step whose output i
 
 The run ends after its last operation, at the first failure, or on `stop`: the runner kills
 its command's whole process group, withdraws its entries, writes `ended.json` (each job's
-exit code, each phase's seconds, the failure if any) and the `ended` event, and exits.
+exit code, each phase's seconds, the failure if any, `moved` in it when `stop --queued` ended
+the run) and the `ended` event, and exits.
 `follow` prints the events after a sequence number until `ended` (output only as it is written
 from then on: each phase's log keeps what came before), so a caller that loses its connection
 follows again from the last event it saw; `fetched` removes the directory of an ended run once
@@ -258,8 +259,10 @@ from __future__ import annotations
 import argparse
 import errno
 import filecmp
+import glob
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -289,6 +292,8 @@ LINE_HEAD, LINE_TAIL = 1 << 20, 1 << 10
 # that left the group (a session of its own) holds it, and it is no longer waited for.
 OUTPUT_GRACE_SECONDS = 10.0
 _WINDOWS = os.name == "nt"
+# The signal `stop --queued` sends a runner: it ends recording that it was stopped to move (`Moved`).
+MOVE_SIGNAL = "SIGUSR2"
 # This agent's module in the deployed host package.
 MODULE = "magnitude_rig.host.agent"
 # A timed measurement shares its host with nothing that loads it: another run's build, device
@@ -366,6 +371,12 @@ def conflicts(a: str, b: str) -> bool:
     if a.startswith(CLAIMED) or b.startswith(CLAIMED):
         return False  # claimed, never requested: the claim takes only a checkout no one holds
     return (a, b) in CONFLICTS or (b, a) in CONFLICTS
+
+
+def comes_before(entry: dict, mine: str) -> bool:
+    """Whether live entry `entry` comes before the waiting request entered as `mine` (its name) in
+    the order holds are granted: held, wherever it was entered, or entered before it."""
+    return entry["state"] == "held" or entry["entry"] < mine
 
 
 class FileLock:
@@ -731,20 +742,10 @@ class Session:
 
         def judge():
             mine = os.path.basename(self.entries[kind][0])
-            ahead = True
-            blockers = []
-            for entry in self.rig.live():
-                if entry["entry"] == mine:
-                    ahead = False
-                    continue
-                if entry["run"] == self.info["run"]:
-                    continue
-                if entry.get("protocol") != PROTOCOL:
-                    continue  # a run of another protocol that came after this one waits on it
-                if not conflicts(entry["kind"], kind):
-                    continue
-                if entry["state"] == "held" or ahead:
-                    blockers.append(entry)
+            # A run of another protocol that came after this one waits on it.
+            blockers = [entry for entry in self.rig.live()
+                        if entry["run"] != self.info["run"] and entry.get("protocol") == PROTOCOL
+                        and conflicts(entry["kind"], kind) and comes_before(entry, mine)]
             if blockers:
                 return blockers
             if kind in DEVICE_KINDS and self.device is None:
@@ -1447,6 +1448,10 @@ class Failed(Exception):
     """The run ends here: a step failed, or it was stopped."""
 
 
+class Moved(Failed):
+    """The run ends here, stopped while it queued to start on another host (`stop --queued`)."""
+
+
 class Runner:
     """Carries out one run's plan to its end; see the module documentation."""
 
@@ -1456,7 +1461,9 @@ class Runner:
         with open(os.path.join(self.directory, PLAN)) as stream:
             self.plan = json.load(stream)
         self.events = Events(self.directory)
-        self.stopping = threading.Event()
+        # The stops asked (`stop`): plainly, and to move the run to another host; and whether it
+        # has been granted its build, which voids a stop to move asked at any time.
+        self.stopped = self.move_asked = self.granted = False
         info = dict(self.plan["info"], run=run, started=time.time(), protocol=PROTOCOL,
                     pid=os.getpid(), hostname=socket.gethostname())
         self.session = Session(rig, info)
@@ -1604,9 +1611,23 @@ class Runner:
 
         return dict(request, argv=argv[:2] + [messages] + argv[2:]), output, paths
 
+    def stop(self, moving: bool) -> None:
+        """A signal's handler: record the stop asked, `moving`, to start the run on another host.
+        Each stop sets only its own flag, so none undoes another."""
+        if moving:
+            self.move_asked = True
+        else:
+            self.stopped = True
+
+    def _stopping(self) -> bool:
+        """Whether the run is to end: stopped plainly, or to move while its build is not granted.
+        The runner, which owns the grant, judges a stop to move against it, so one asked while it
+        waited for the grant is void once it is granted."""
+        return self.stopped or (self.move_asked and not self.granted)
+
     def _check_stop(self) -> None:
-        if self.stopping.is_set():
-            raise Failed("stopped by mrig stop")
+        if self._stopping():
+            raise Failed("stopped by mrig stop") if self.stopped else Moved("stopped by mrig to start on another host")
 
     def hold(self, kind: str) -> None:
         reported = None
@@ -1618,6 +1639,7 @@ class Runner:
                 entered = not others
             blockers = [_public(e) for e in (self.session.blocking(kind) if entered else others)]
             if not blockers:
+                self.granted = self.granted or kind == "build"
                 self.events.emit("held", kind=kind)
                 return
             if [b.get("run") for b in blockers] != reported:
@@ -1700,7 +1722,7 @@ class Runner:
             if "job" in op:
                 watch = Watch(stacks, self.child.process.pid, self._held, self.session.info["estimate"], self._asked)
             while not self.child.finished.wait(POLL_SECONDS):
-                if self.stopping.is_set():
+                if self._stopping():
                     self.child.kill()
                 if watch is not None:
                     watch.check()
@@ -1800,6 +1822,8 @@ class Runner:
                 self.operate(op)
         except Failed as failure:
             failed = {"phase": self.events.phase, "detail": str(failure)}
+            if isinstance(failure, Moved):
+                failed["moved"] = True
         except Exception as error:  # the run's end is recorded whatever ends it
             failed = {"phase": self.events.phase, "detail": "agent: %r" % error}
         if self.child is not None and not self.child.finished.is_set():
@@ -1831,7 +1855,9 @@ def runner(arguments) -> int:
     current = Runner(Rig(arguments.root), arguments.run)
     for name in ("SIGTERM", "SIGINT"):
         if hasattr(signal, name):
-            signal.signal(getattr(signal, name), lambda signum, frame: current.stopping.set())
+            signal.signal(getattr(signal, name), lambda signum, frame: current.stop(False))
+    if hasattr(signal, MOVE_SIGNAL):
+        signal.signal(getattr(signal, MOVE_SIGNAL), lambda signum, frame: current.stop(True))
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)  # no connection's end ends the run
     staged = os.path.join(current.directory, ".%s.%d" % (RUNNER, os.getpid()))
@@ -2001,20 +2027,26 @@ def stop(arguments) -> int:
     """Stop the run's runner: it ends its command, releases its holds and records the stop.
     Signalled only under the guard while it runs (it holds the run's lock and has recorded no
     end), so its pid is the runner's, never one the OS has since given another process. Prints
-    whether it was stopped, and why not."""
+    whether the stop was delivered, and why not. With `--queued`, a stop to move it: the runner
+    ends only while it has not been granted its build, judged by the runner itself
+    (`Runner._stopping`), recording that it was stopped to move (`Moved`); a runner with no
+    signal to handle (Windows) cannot, so none there is sent."""
     rig = Rig(arguments.root)
     directory = rig.run(arguments.run)
 
     def deliver():
         if not _owned(directory) or os.path.exists(os.path.join(directory, ENDED)):
             return "run %s is not running" % arguments.run
+        if arguments.queued:
+            if _WINDOWS:
+                return "run %s: a stop here records no end, so it is not moved" % arguments.run
         with open(os.path.join(directory, RUNNER)) as stream:
             pid = json.load(stream)["pid"]
         if _WINDOWS:  # no signal to handle there: its process tree ends, and its locks with it
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, getattr(signal, MOVE_SIGNAL) if arguments.queued else signal.SIGTERM)
         return None
 
     reason = rig.guarded(deliver)
@@ -2022,10 +2054,17 @@ def stop(arguments) -> int:
     return 0
 
 
+# Seconds `fetched` waits for a runner that has recorded its end to exit, releasing its run.
+EXIT_SECONDS = 30.0
+
+
 def fetched(arguments) -> int:
-    """Remove an ended run's directory once its caller has fetched it."""
+    """Remove an ended run's directory once its caller has fetched it. With `--wait`, a runner
+    that has recorded its end (its caller may have followed it there) is waited for until it
+    exits, `EXIT_SECONDS` at most; else, and any runner that has not, refuses at once."""
     rig = Rig(arguments.root)
     directory = rig.run(arguments.run)
+    deadline = time.monotonic() + EXIT_SECONDS
 
     def remove():
         if _owned(directory):
@@ -2034,6 +2073,10 @@ def fetched(arguments) -> int:
         return None
 
     refusal = rig.guarded(remove)
+    while (refusal is not None and arguments.wait and os.path.exists(os.path.join(directory, ENDED))
+           and time.monotonic() < deadline):
+        time.sleep(POLL_SECONDS)
+        refusal = rig.guarded(remove)
     print(json.dumps({"removed": refusal is None, "reason": refusal}))
     return 0 if refusal is None else 1
 
@@ -2041,11 +2084,36 @@ def fetched(arguments) -> int:
 def status(arguments) -> int:
     if not len(arguments.build) == len(arguments.tree) == len(arguments.source):
         raise SystemExit("status: one --tree and one --build for each --source")
-    print(json.dumps(report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)))))
+    found = report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)), arguments.ahead_of)
+    print(json.dumps(dict(found, **capabilities(arguments.root, json.loads(arguments.env)))))
     return 0
 
 
-def report(root: str, sides: list) -> dict:
+def capabilities(root: str, env: dict) -> dict:
+    """What the host can run now (`backends`; its step environment `env`, `~` expanded, may name
+    a Vulkan driver of its own) and whether `mrig setup` verified it (`ready`)."""
+    backends = ["cpu"]
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        backends.append("metal")
+    if shutil.which("nvidia-smi") or os.path.exists("/dev/nvidiactl"):
+        backends.append("cuda")
+    icds = [p for p in env.get("VK_ICD_FILENAMES", "").split(os.pathsep) if p]
+    icds += glob.glob("/usr/share/vulkan/icd.d/*.json") + glob.glob("/etc/vulkan/icd.d/*.json")
+    if any(os.path.exists(p) for p in icds):
+        backends.append("vulkan")
+    return {"backends": backends, "ready": os.path.exists(os.path.join(root, "rig", "ready.json"))}
+
+
+def waiting_request(live: list, run: str):
+    """The name of run `run`'s waiting request for a hold among the live entries; None while it
+    waits for none. A session waits for one hold at a time; its request for room (`make_room`),
+    which no hold's grant judges, may wait beside it and decides nothing here."""
+    names = [e["entry"] for e in live if e.get("run") == run and e["state"] == "waiting" and e["kind"] != "room"]
+    assert len(names) <= 1, "run %s waits for %d holds at once" % (run, len(names))
+    return names[0] if names else None
+
+
+def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
     """The host's live entries, each with the time its run is expected to take still and how far
     it is past its estimate (`remaining`, `over`), the wait of a new request of each kind behind
     the runs holding or queued for a conflicting hold (each once, by its `remaining`: `waits`),
@@ -2055,18 +2123,25 @@ def report(root: str, sides: list) -> dict:
     with its warmth for that source (None: none is free, a cold build), the commit it last built
     and whether it keeps that build (`built`); and the bytes its build may add as measured here (`need`,
     None when unmeasured), each build's measurements here (`measured`), the largest build of any
-    (`largest`), the slowest (`slowest`), and the room its builds would find (`room`)."""
+    (`largest`), the slowest (`slowest`), and the room its builds would find (`room`). Given
+    `ahead_of`, a run queued here, the host as that run sees it: only the other runs' entries
+    that come before its waiting request (`comes_before`), and, while it waits for none, every
+    other run, as a request it entered now would come after all of them."""
     rig = Rig(root)
     base = os.path.join(root, "checkouts")
 
     def read():
-        live = rig.live()
-        # Every live run: those with entries, and those staged or claiming, which hold none yet.
+        everything = rig.live()
+        mine = None if ahead_of is None else waiting_request(everything, ahead_of)
+        live = everything if ahead_of is None else [
+            e for e in everything if e.get("run") != ahead_of and (mine is None or comes_before(e, mine))]
+        # Every live run: those with entries, and those staged or claiming, which hold none yet
+        # and so enter after any waiting request.
         directories = [rig.run(name) for name in _directories(os.path.join(root, "runs"))]
-        live_runs = {e.get("run") for e in live} | {
+        live_runs = {e.get("run") for e in live} | (set() if mine is not None else {
             os.path.basename(d) for d in directories
             if not os.path.exists(os.path.join(d, ENDED)) and (_owned(d) or _owned(d, STAGE_LOCK))
-        }
+        } - {ahead_of})
         taken, own, checkouts, needs = held_checkouts(live), set(), [], []
         for source, tree, build in sides:
             shared = shareable(live, own, tree, build)
@@ -2251,11 +2326,18 @@ def main() -> int:
         command.set_defaults(handler=handler)
         if name == "follow":
             command.add_argument("--after", type=int, default=0)
+        if name == "fetched":
+            command.add_argument("--wait", action="store_true", help="for a runner that has recorded its end to exit")
+        if name == "stop":
+            command.add_argument("--queued", action="store_true",
+                                 help="to move the run: it ends only while it has not been granted its build")
     command = commands.add_parser("status")
     command.add_argument("--root", required=True)
     command.add_argument("--source", action="append", default=[])
     command.add_argument("--tree", action="append", default=[], help="each --source's tree (`engine.tree_key`)")
     command.add_argument("--build", action="append", default=[], help="each --source's build (`engine.build_key`)")
+    command.add_argument("--ahead-of", help="a run queued here: report only what is ahead of it")
+    command.add_argument("--env", default="{}", help="the host's step environment (JSON, `~` expanded)")
     command.set_defaults(handler=status)
     command = commands.add_parser("install")
     command.add_argument("--from", dest="source", required=True)

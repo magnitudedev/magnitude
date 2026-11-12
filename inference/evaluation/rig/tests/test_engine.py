@@ -20,7 +20,10 @@ import pytest
 from conftest import link_down
 from waiting import until_exists
 from magnitude_rig import cli, engine, results, sources, state, store, sync
-from magnitude_rig.connection import CommandFailed, HostRun, HostUnavailable, connect, host_status
+from magnitude_rig.build import identify
+from magnitude_rig.connection import (
+    CommandFailed, HostRun, HostUnavailable, _json_line, connect, host_status, run_state,
+)
 from magnitude_rig.host import agent
 from magnitude_rig.instruments import Answer
 
@@ -237,11 +240,11 @@ def test_a_run_pinned_to_a_busy_host_finds_the_idle_hosts_it_passes_over(rig):
         pinned = request(source, host="alpha")
         placed = engine.place(pinned, hosts, "run")
         assert placed.remote.alias == "alpha"
-        assert sorted(engine.idle_elsewhere(pinned, hosts, placed)) == ["beta", "local"]
+        assert sorted(engine.idle_elsewhere(pinned, hosts, placed, "run")) == ["beta", "local"]
         free = request(source, host=None)
-        assert engine.idle_elsewhere(free, hosts, engine.place(free, hosts, "run")) == []
+        assert engine.idle_elsewhere(free, hosts, engine.place(free, hosts, "run"), "run") == []
         idle = request(source, host="beta")
-        assert engine.idle_elsewhere(idle, hosts, engine.place(idle, hosts, "run")) == []
+        assert engine.idle_elsewhere(idle, hosts, engine.place(idle, hosts, "run"), "run") == []
     finally:
         busy.stop()
 
@@ -404,6 +407,356 @@ def test_placement_takes_the_member_that_frees_first(rig):
         assert outcome.host == "beta"
     finally:
         busy.stop()
+
+
+def _ended(holder: HostRun) -> None:
+    """Stop another run's runner and wait until it has ended, its holds released."""
+    holder.stop()
+    for _ in holder.follow(0):
+        pass
+
+
+def _session(hosts, alias: str, run: str) -> agent.Session:
+    """Run `run`'s session on `alias`, with no entry yet."""
+    return agent.Session(agent.Rig(hosts.host(alias).root), {
+        "who": "other", "run": run, "purpose": "p", "estimate": 600.0, "started": time.time(),
+        "protocol": agent.PROTOCOL,
+    })
+
+
+def _queued(hosts, alias: str, run: str) -> agent.Session:
+    """Run `run` queued on `alias` for a build slot: its request is entered, none held."""
+    session = _session(hosts, alias, run)
+    assert session.request("build") == []
+    return session
+
+
+def test_a_queued_run_sees_ahead_of_it_what_its_host_would_grant_first(rig):
+    """What is ahead of a queued run is what the host's grant rule puts before its request
+    (`Session.blocking`): whatever another run holds and every request entered before its own,
+    though that run entered after it; never a request entered after its own."""
+    hosts, _, _ = rig
+    sessions = [_session(hosts, "alpha", run) for run in ("mine", "holder", "requester", "behind")]
+    mine, holder, requester, behind = sessions
+    try:
+        assert mine.claim("s", "mine-tree", "b", 0, "c0", 60)[2] == []  # its first entry
+        assert holder.claim("s", "holder-tree", "b", 0, "c0", 60)[2] == []
+        assert holder.request("timed") == [] and holder.blocking("timed") == []
+        assert requester.request("build") == []
+        assert mine.request("build") == []
+        assert behind.request("timed") == []
+        seen = agent.report(hosts.host("alpha").root, [], "mine")
+        assert {e["run"] for e in seen["entries"]} == {"holder", "requester"}
+        # Of those, what conflicts with its build is what keeps its build from it.
+        assert ({(e["run"], e["kind"]) for e in mine.blocking("build")}
+                == {(e["run"], e["kind"]) for e in seen["entries"] if agent.conflicts(e["kind"], "build")}
+                == {("holder", "timed")})
+        assert seen["waits"]["build"] == pytest.approx(600, abs=30)  # the holder's timed
+        assert seen["waits"]["timed"] == pytest.approx(1200, abs=30)  # and the requester's build
+        assert len(seen["room"]["ending"]) == 1  # the holder's checkout
+        assert len(seen["building"]) == 1  # the holder's build of it
+    finally:
+        for session in sessions:
+            session.release_all()
+            session.run_lock.close()
+
+
+def test_a_run_waiting_for_room_and_its_install_sees_ahead_of_it_what_comes_before_its_install(rig):
+    """A run waiting for room (`make_room`) waits for its install hold beside it: that hold's
+    request decides what is ahead of it, as it decides what keeps the hold from it."""
+    hosts, _, _ = rig
+    sessions = [_session(hosts, "alpha", run) for run in ("mine", "earlier", "later")]
+    mine, earlier, later = sessions
+    try:
+        assert mine.request("room") == []
+        assert earlier.request("timed") == []
+        assert mine.request("install") == []
+        assert later.request("timed") == []
+        seen = agent.report(hosts.host("alpha").root, [], "mine")
+        assert ({(e["run"], e["kind"]) for e in seen["entries"]}
+                == {(e["run"], e["kind"]) for e in mine.blocking("install")} == {("earlier", "timed")})
+    finally:
+        for session in sessions:
+            session.release_all()
+            session.run_lock.close()
+
+
+def test_a_queued_run_moves_to_the_candidate_that_would_start_it_sooner_by_more_than_the_margin(rig, monkeypatch):
+    hosts, source, _ = rig
+    busy = {alias: _holding(connect(hosts.host(alias)), f"busy-{alias}", "timed") for alias in ("alpha", "beta")}
+    queued = _queued(hosts, "alpha", "mine")
+    try:
+        asked = request(source)
+        # Both hosts hold a timed run: nothing is earlier elsewhere (the run's own request on alpha is
+        # not counted against alpha).
+        assert engine.replaced(asked, hosts, "mine", "alpha") is None
+        _ended(busy.pop("beta"))
+        moved = engine.replaced(asked, hosts, "mine", "alpha")
+        assert moved is not None and moved.remote.alias == "beta"
+        # Gaining less than the margin leaves it queued where it is.
+        monkeypatch.setattr(engine, "MOVE_MARGIN", 7200.0)
+        assert engine.replaced(asked, hosts, "mine", "alpha") is None
+    finally:
+        queued.run_lock.close()
+        for holder in busy.values():
+            holder.stop()
+
+
+def test_policy_and_pins_still_decide_which_hosts_a_queued_run_may_move_to(rig):
+    hosts, source, _ = rig
+    busy = _holding(connect(hosts.host("alpha")), "busy-alpha", "timed")
+    queued = _queued(hosts, "alpha", "mine")
+    try:
+        job = engine.Step("job", (PY, "-c", "print('ok')"))
+        work = request(source, jobs=[("job", job)]).work("alpha")
+
+        def excluding_beta(alias: str) -> engine.Work:
+            if alias == "beta":
+                raise engine.Refused("beta is out of use")
+            return work
+
+        excluded = engine.Request("test", "p", 60.0, "cpu", excluding_beta, host="pool")
+        assert engine.replaced(excluded, hosts, "mine", "alpha") is None  # beta is idle but not a candidate
+        assert engine.replaced(request(source, host="alpha"), hosts, "mine", "alpha") is None  # pinned
+        assert engine.replaced(request(source, host="pool"), hosts, "mine", "alpha").remote.alias == "beta"
+    finally:
+        queued.run_lock.close()
+        busy.stop()
+
+
+def test_placement_connects_a_healthy_host_once_and_one_whose_read_failed_again(rig, monkeypatch):
+    """What a kept connection's host can run and whether it is set up are read with each status."""
+    hosts, source, _ = rig
+    monkeypatch.setattr(engine, "_connected", {})
+    connected, connecting = [], engine.connect
+
+    def counted(config):
+        connected.append(config.alias)
+        return connecting(config)
+
+    monkeypatch.setattr(engine, "connect", counted)
+    asked = request(source)
+    engine.place(asked, hosts, "run")
+    engine.place(asked, hosts, "run")
+    assert sorted(connected) == ["alpha", "beta"]
+    read, failing = engine.host_status, ["alpha"]
+
+    def alpha_fails_once(remote, *arguments):
+        if remote.alias in failing:
+            failing.remove(remote.alias)
+            raise CommandFailed("alpha: the agent replied no JSON: ''")
+        return read(remote, *arguments)
+
+    monkeypatch.setattr(engine, "host_status", alpha_fails_once)
+    connected.clear()
+    assert engine.place(asked, hosts, "run").remote.alias == "beta"  # alpha unreadable this round
+    engine.place(asked, hosts, "run")
+    assert connected == ["alpha"]
+    ready = Path(hosts.host("alpha").root) / "rig" / "ready.json"
+    ready.rename(ready.with_suffix(".away"))  # `mrig setup` found it no longer fit
+    connected.clear()
+    candidates, skipped, unreadable = engine._candidates(asked, (hosts.host("alpha"),), "run")
+    assert candidates == [] and unreadable == set() and "not set up" in skipped[0] and connected == []
+
+
+def test_a_reply_that_does_not_parse_is_the_agents_failure_and_never_ends_placing_again(monkeypatch):
+    for reply in ("", "Traceback (most recent call last):\n  KeyError: 'x'\n"):
+        with pytest.raises(CommandFailed):
+            _json_line(reply)
+    followed, rounds, notes = threading.Event(), [], []
+
+    def placing(*arguments):
+        rounds.append(arguments)
+        if len(rounds) == 1:  # every host's status failed so
+            raise CommandFailed("no cpu host among pool: alpha: the agent replied no JSON: ''")
+        if len(rounds) == 3:
+            followed.set()
+            return None
+        return types.SimpleNamespace(work=types.SimpleNamespace(sides=()))
+
+    def stop(queued=False):
+        raise CommandFailed("alpha: `stop` exited 1: the agent replied no JSON: ''")
+
+    monkeypatch.setattr(engine, "REPLACE_SECONDS", 0.0)
+    monkeypatch.setattr(engine, "replaced", placing)
+    queued = types.SimpleNamespace(remote=types.SimpleNamespace(windows=False, alias="alpha"), built=False,
+                                   queued=True, run_id="queued", host=types.SimpleNamespace(stop=stop),
+                                   note=notes.append, destination=None)
+    engine._replace_when(queued, None, None, followed)  # returns: neither failure ended it
+    assert len(rounds) == 3 and len(notes) == 1 and "stop to move it failed" in notes[0]
+
+
+def test_a_home_host_that_cannot_be_read_keeps_the_run_and_one_no_longer_fit_lets_it_go(rig, monkeypatch):
+    hosts, source, _ = rig
+    busy = _holding(connect(hosts.host("alpha")), "busy-alpha", "timed")
+    queued = _queued(hosts, "alpha", "mine")
+    try:
+        work = request(source).work("alpha")
+
+        def excluding_alpha(alias: str) -> engine.Work:
+            if alias == "alpha":
+                raise engine.Refused("alpha is out of use")
+            return work
+
+        refused = engine.Request("test", "p", 60.0, "cpu", excluding_alpha, host="pool")
+        assert engine.replaced(refused, hosts, "mine", "alpha").remote.alias == "beta"
+        read = engine.host_status
+
+        def alpha_unreadable(remote, *arguments):
+            if remote.alias == "alpha":
+                raise HostUnavailable("alpha: unreachable")
+            return read(remote, *arguments)
+
+        monkeypatch.setattr(engine, "host_status", alpha_unreadable)
+        assert engine.replaced(request(source), hosts, "mine", "alpha") is None
+    finally:
+        queued.run_lock.close()
+        busy.stop()
+
+
+def test_a_run_granted_its_build_or_on_windows_is_never_stopped_to_move(rig, monkeypatch):
+    hosts, source, _ = rig
+    remote = connect(hosts.host("alpha"))
+    holder = _holding(remote, "holder", "build")
+    built = _holding(remote, "built", "build", released=True)
+    try:
+        deadline = time.monotonic() + 10
+        while any(e["run"] == "built" for e in host_status(remote)["entries"]):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        # One holds its build, the other holds nothing now: each was granted it, so its runner
+        # takes the stop to move as void and runs on.
+        assert holder.stop(queued=True)["stopped"] and built.stop(queued=True)["stopped"]
+        time.sleep(1.0)
+        assert run_state(remote, "holder") == run_state(remote, "built") == "running"
+        # A run the caller has seen granted its build, or on a Windows host, is not placed again at all.
+        monkeypatch.setattr(engine, "REPLACE_SECONDS", 0.0)
+        monkeypatch.setattr(engine, "replaced", lambda *args: pytest.fail("placed again"))
+        for windows, built_seen in ((False, True), (True, False)):
+            queued = types.SimpleNamespace(remote=types.SimpleNamespace(windows=windows, alias="alpha"),
+                                           built=built_seen, queued=True, run_id="queued")
+            engine._replace_when(queued, None, None, threading.Event())
+        building = engine.Run.__new__(engine.Run)
+        building.phase, building.built = "queue-build", False
+        assert building.queued
+        building.enter = engine.Run.enter.__get__(building)
+        building.phases, building.phase_started = [], time.monotonic()
+        building.state = types.SimpleNamespace(update=lambda **fields: None)
+        building.enter("build-source")
+        assert building.built and not building.queued
+    finally:
+        holder.stop()
+        built.stop()
+
+
+def _committed(source: sources.Source) -> sources.Source:
+    """`source` as the worktree: its directory committed, its identity read from it."""
+    for arguments in (("init", "-q"), ("add", "-A"), ("-c", "user.name=rig", "-c", "user.email=rig@example.invalid",
+                                                      "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+                                                      "commit", "-qm", "source")):
+        subprocess.run(["git", "-C", str(source.directory), *arguments], check=True, capture_output=True)
+    return dataclasses.replace(source, name=sources.WORKTREE, identity=identify(source.directory))
+
+
+def test_a_worktree_is_current_while_unedited_and_readable_and_a_fixed_source_always_is(rig):
+    _, source, tmp_path = rig
+    worktree = _committed(source)
+    assert worktree.current()
+    assert not dataclasses.replace(worktree, directory=tmp_path / "gone").current()  # cannot be read
+    (worktree.directory / "data.txt").write_text("edited\n")
+    assert not worktree.current()
+    assert source.current()  # fixed for the run, as a ref is
+
+
+@pytest.mark.parametrize("trouble", [None, "reply_lost", "fetch_fails", "edited", "edited_after_check"])
+def test_a_run_queued_behind_a_timed_run_goes_where_its_jobs_start_sooner(rig, monkeypatch, trouble):
+    """Whether it moved is its runner's end's to say: a stop whose reply is lost moves it too. A
+    run whose directory where it was could not be removed stays launched there, to be collected.
+    One whose worktree was edited while it queued stays: staged again, it would build the edit.
+    One whose worktree is edited once it was found unedited, as it is stopped to move, fails at
+    its stage there, which finds the edit."""
+    hosts, source, _ = rig
+    source = _committed(source)
+    monkeypatch.setattr(engine, "REPLACE_SECONDS", 0.3)
+    reply_lost = trouble == "reply_lost"
+    if trouble == "fetch_fails":
+        def fetched_refused(self, wait=False):
+            raise CommandFailed(f"{self.remote.alias}: `fetched` exited 1: run {self.run} is still running")
+
+        monkeypatch.setattr(HostRun, "fetched", fetched_refused)
+    if reply_lost:
+        stop, lost = HostRun.stop, []
+
+        def stop_reply_lost(self, queued=False):
+            reply = stop(self, queued)
+            if queued and not lost:
+                lost.append(reply)
+                raise HostUnavailable("the stop's reply was lost")
+            return reply
+
+        monkeypatch.setattr(HostRun, "stop", stop_reply_lost)
+    if trouble == "edited_after_check":
+        stop_to_move = HostRun.stop
+
+        def stop_then_edit(self, queued=False):
+            reply = stop_to_move(self, queued)
+            if queued:
+                (source.directory / "data.txt").write_text("edited after it was found unedited\n")
+            return reply
+
+        monkeypatch.setattr(HostRun, "stop", stop_then_edit)
+    busy = {alias: _holding(connect(hosts.host(alias)), f"busy-{alias}", "timed") for alias in ("alpha", "beta")}
+    lines = []
+    try:
+        job = engine.Step("job", (PY, "-c", "print('ok')"))
+        run_id = engine.new_run_id("test")
+
+        def free_the_other_host():  # once the run queues for a hold where it was placed
+            deadline = time.monotonic() + 60
+            while not any(r["run"] == run_id and r["phase"].startswith("queue-") for r in state.live_runs()):
+                assert time.monotonic() < deadline, "the run never queued"
+                time.sleep(0.1)
+            placed = next(alias for alias in busy if f"→ {alias} ·" in lines[0])
+            if trouble == "edited":
+                (source.directory / "data.txt").write_text("edited while it queued\n")
+            _ended(busy.pop("beta" if placed == "alpha" else "alpha"))
+            if trouble == "edited":
+                time.sleep(2.0)  # rounds of placing again, each finding the other host free
+                _ended(busy.pop(placed))
+
+        freeing = threading.Thread(target=free_the_other_host)
+        freeing.start()
+        if trouble == "fetch_fails":
+            with pytest.raises(CommandFailed):
+                engine.execute(request(source, jobs=[("job", job)]), run_id, hosts=hosts, announce=lines.append)
+            freeing.join()
+            placed = next(alias for alias in ("alpha", "beta") if f"→ {alias} ·" in lines[0])
+            assert state.Launched.read(run_id)["host"] == placed
+            return
+        if trouble == "edited_after_check":
+            with pytest.raises(engine.RunFailed) as failed:
+                engine.execute(request(source, jobs=[("job", job)]), run_id, hosts=hosts, announce=lines.append)
+            freeing.join()
+            placed = next(alias for alias in ("alpha", "beta") if f"→ {alias} ·" in lines[0])
+            assert failed.value.phase == "stage" and "source changed while it was staged" in failed.value.detail
+            assert failed.value.outcome.host != placed and failed.value.outcome.codes == {}
+            assert any("its jobs start sooner there" in line for line in lines)
+            return
+        outcome = engine.execute(request(source, jobs=[("job", job)]), run_id, hosts=hosts, announce=lines.append)
+        freeing.join()
+        placed = next(alias for alias in ("alpha", "beta") if f"→ {alias} ·" in lines[0])
+        if trouble == "edited":
+            assert outcome.host == placed and outcome.codes == {"job": 0}
+            assert not any("its jobs start sooner there" in line for line in lines)
+            assert "not moved: its worktree has changed" in (outcome.results / "logs" / "caller.log").read_text()
+            return
+        assert outcome.host != placed and outcome.codes == {"job": 0}
+        assert any("its jobs start sooner there" in line for line in lines)
+        assert not reply_lost or lost == [{"stopped": True}]
+        assert not (Path(hosts.host(placed).root) / "runs" / run_id).exists()  # nothing of it is left behind
+    finally:
+        for holder in busy.values():
+            holder.stop()
 
 
 def test_a_lost_connection_loses_nothing_of_the_run(rig, monkeypatch):
@@ -777,10 +1130,11 @@ def test_a_failed_answer_is_reported_and_the_run_stays_owed(rig, monkeypatch, ca
     assert not (tmp_path / "alpha" / "runs" / run_id).exists() and state.Launched.gone() == []
 
 
-def _holding(remote, run: str, kind: str) -> HostRun:
-    """Another run's runner holding `kind` until stopped."""
+def _holding(remote, run: str, kind: str, released: bool = False) -> HostRun:
+    """Another run's runner holding `kind` until stopped, or, `released`, holding it and then
+    releasing it."""
     plan = {"info": {"who": "other", "purpose": "p", "estimate": 3600},
-            "ops": [{"op": "hold", "kind": kind},
+            "ops": [{"op": "hold", "kind": kind}, *([{"op": "release", "kind": kind}] * released),
                     {"op": "run", "argv": [PY, "-c", "import time; time.sleep(3600)"], "cwd": remote.root, "env": {}}]}
     with HostRun.staging(remote, run) as start:
         host = start(plan)

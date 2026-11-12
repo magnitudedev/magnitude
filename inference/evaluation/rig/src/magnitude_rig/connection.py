@@ -53,19 +53,10 @@ if not os.path.exists(package):
     with open(temporary, "wb") as stream:
         stream.write(source)
     os.replace(temporary, package)
-import glob, platform, shutil
-backends = ["cpu"]
-if platform.system() == "Darwin" and platform.machine() == "arm64":
-    backends.append("metal")
-if shutil.which("nvidia-smi") or os.path.exists("/dev/nvidiactl"):
-    backends.append("cuda")
-icds = [p for p in env.get("VK_ICD_FILENAMES", "").split(os.pathsep) if p]
-icds += glob.glob("/usr/share/vulkan/icd.d/*.json") + glob.glob("/etc/vulkan/icd.d/*.json")
-if any(os.path.exists(p) for p in icds):
-    backends.append("vulkan")
-ready = os.path.exists(os.path.join(root, "rig", "ready.json"))
-print(json.dumps({{"root": root, "models": models, "package": package, "env": env,
-                  "backends": backends, "ready": ready}}))
+sys.path.insert(0, package)
+from magnitude_rig.host.agent import capabilities
+print(json.dumps(dict({{"root": root, "models": models, "package": package, "env": env}},
+                      **capabilities(root, env))))
 """
 
 
@@ -115,8 +106,8 @@ class Remote:
     models: str
     package: str  # the deployed host package (`host`)
     env: dict[str, str]  # the host's own step environment, `~` expanded on the host
-    backends: tuple[str, ...]  # what the host can run, probed on connect
-    ready: bool  # `mrig setup` verified the host
+    backends: tuple[str, ...]  # what the host can run, probed on connect (`host_status`: now)
+    ready: bool  # `mrig setup` verified the host, probed on connect (`host_status`: now)
     temperatures: bool = True  # the host exposes temperature sensors (`HostConfig.temperatures`)
 
     def command(self, argv: list[str], *, login: bool = False, cwd: str | None = None) -> list[str]:
@@ -240,15 +231,20 @@ def setup(config: HostConfig) -> str:
     return _ssh(config, f"sh -c {shlex.quote(script)}")
 
 
-def host_status(remote: Remote, sides: list[tuple[str, str, str]] = ()) -> dict:
+def host_status(remote: Remote, sides: list[tuple[str, str, str]] = (), ahead_of: str | None = None) -> dict:
     """The host agent's `status`: live holds and requests, queue estimates, free disk, and, for
     a run whose sides are `sides` (each its source's key, its tree's, `engine.tree_key`, and its
     build's, `engine.build_key`), the checkout each would claim or share now, what its build
-    would need and the room it would find."""
-    argv = remote.host(AGENT, "status", "--root", remote.root)
+    would need and the room it would find; `ahead_of`, a run queued there, as that run sees it
+    (only what is ahead of it); and what the host can run now and whether it is set up
+    (`backends`, `ready`, as `connect` probes them). A reply that does not parse is the agent's
+    failure (`CommandFailed`)."""
+    argv = remote.host(AGENT, "status", "--root", remote.root, "--env", json.dumps(remote.env))
+    if ahead_of is not None:
+        argv += ["--ahead-of", ahead_of]
     for source, tree, build in sides:
         argv += ["--source", source, "--tree", tree, "--build", build]
-    return json.loads(_ssh(remote, remote.command(argv)[-1]).strip().splitlines()[-1])
+    return _json_line(_ssh(remote, remote.command(argv)[-1]))
 
 
 def run_state(remote: Remote, run: str) -> str:
@@ -338,16 +334,23 @@ class HostRun:
                 process.kill()
             process.wait()
 
-    def stop(self) -> dict:
-        """Stop the runner if it still runs (the agent's `stop`): whether it was stopped, and
-        why not; the agent's own failure raises `CommandFailed`."""
-        return _json_line(_ssh(self.remote, self.remote.command(self._argv("stop"))[-1]))
+    def stop(self, queued: bool = False) -> dict:
+        """Signal the runner to stop if it still runs (the agent's `stop`); `queued`, to move it,
+        which the runner heeds only before it has been granted its build, its end then saying
+        so. `stopped`: whether the signal was delivered, and why not; the agent's own failure
+        raises `CommandFailed`."""
+        return _json_line(_ssh(self.remote, self.remote.command(self._argv("stop", *(["--queued"] * queued)))[-1]))
 
-    def fetched(self) -> None:
-        """The run's directory is fetched: the runner's agent removes it."""
-        _ssh(self.remote, self.remote.command(self._argv("fetched"))[-1])
+    def fetched(self, wait: bool = False) -> None:
+        """The run's directory is fetched: the runner's agent removes it, `wait`ing for a runner
+        that has recorded its end to exit (the agent's `fetched --wait`)."""
+        _ssh(self.remote, self.remote.command(self._argv("fetched", *(["--wait"] * wait)))[-1])
 
 
 def _json_line(output: str) -> dict:
-    return json.loads(output.strip().splitlines()[-1])
+    """The agent's reply, its last line; one that does not parse is its failure."""
+    try:
+        return json.loads(output.strip().splitlines()[-1])
+    except (IndexError, ValueError) as error:
+        raise CommandFailed(f"the agent replied no JSON: {output[-200:]!r}") from error
 

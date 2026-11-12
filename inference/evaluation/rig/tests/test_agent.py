@@ -3,6 +3,7 @@ estimates other runs see (its sessions in this process); and its runners, as rea
 processes: a run's plan carried out to its end whatever happens to the connections that follow
 it, stopped only when asked, and kept until fetched."""
 
+import argparse
 import errno
 import json
 import os
@@ -11,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1060,6 +1062,58 @@ def test_a_stopped_run_kills_its_work_releases_its_holds_and_records_it(tmp_path
         assert time.monotonic() < deadline, "work outlived its stopped run"
         time.sleep(0.05)
     assert status(tmp_path)["entries"] == []
+
+
+def test_a_plain_stop_overrides_a_stop_to_move_and_a_granted_build_voids_one():
+    def stops(*asked: bool, granted: bool = False):
+        runner = agent.Runner.__new__(agent.Runner)
+        runner.stopped = runner.move_asked = False
+        runner.granted = granted
+        for moving in asked:
+            runner.stop(moving)
+        try:
+            runner._check_stop()
+        except agent.Moved:
+            return "moved"
+        except agent.Failed:
+            return "stopped"
+        return None
+
+    assert stops(True) == stops(True, True) == "moved"
+    assert stops(False) == stops(True, False) == stops(False, True) == "stopped"  # either order
+    # A stop to move asked while the runner waited for its build, which it was then granted: void.
+    assert stops(True, granted=True) is None
+    assert stops(True, False, granted=True) == "stopped"
+
+
+def test_fetched_waits_only_when_asked_and_only_for_a_runner_that_has_recorded_its_end(tmp_path, monkeypatch, capsys):
+    """`fetched --wait` waits for a runner that has recorded its end but still holds its run, as
+    one just followed to its end does, until it exits or `EXIT_SECONDS` pass; a runner with no
+    end, or any without `--wait`, is refused at once."""
+    rig = agent.Rig(str(tmp_path))
+    directory = Path(rig.run("run"))
+    directory.mkdir(parents=True)
+    runner = agent.FileLock(str(directory / agent.RUN_LOCK))
+    assert runner.try_acquire()
+    fetched = lambda wait: agent.fetched(argparse.Namespace(root=str(tmp_path), run="run", wait=wait))
+
+    def timed(wait: bool) -> tuple[int, float]:
+        began = time.monotonic()
+        return fetched(wait), time.monotonic() - began
+
+    monkeypatch.setattr(agent, "EXIT_SECONDS", 0.6)
+    code, seconds = timed(True)
+    assert code == 1 and seconds < 0.3  # no end recorded: still running
+    (directory / agent.ENDED).write_text("{}")
+    code, seconds = timed(False)
+    assert code == 1 and seconds < 0.3
+    code, seconds = timed(True)
+    assert code == 1 and 0.6 <= seconds < 3 and directory.exists()  # it never exited
+    monkeypatch.setattr(agent, "EXIT_SECONDS", 30.0)
+    threading.Timer(0.5, runner.close).start()  # it exits
+    code, seconds = timed(True)
+    assert code == 0 and 0.4 <= seconds < 5 and not directory.exists()
+    capsys.readouterr()
 
 
 def test_a_runner_that_dies_holds_nothing_and_its_followers_learn_it(tmp_path):

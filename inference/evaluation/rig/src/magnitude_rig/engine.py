@@ -91,12 +91,12 @@ from pathlib import Path
 
 from . import sources, state, store, sync
 from .connection import (
-    AGENT, HostError, HostRun, HostUnavailable, Remote, _ssh, connect, host_status, run_state,
+    AGENT, CommandFailed, HostError, HostRun, HostUnavailable, Remote, _ssh, connect, host_status, run_state,
 )
 from .host.agent import ENDED, NOTE, SAME
 from .host.gate import GateSettings
 from .host.provenance import WRAPPER
-from .hosts import Hosts
+from .hosts import HostConfig, Hosts
 from .sources import Source
 
 # In each run's results (`store.results()`): what the run's process printed, its exit code once it has one, its
@@ -218,6 +218,10 @@ class Outcome:
     codes: dict[str, int]  # job name -> exit code
     phases: list[dict] = field(default_factory=list)
     estimate: float | None = None  # the run's seconds as placed, when recorded
+
+
+class SourceChanged(Exception):
+    """A source changed while the run staged it: what was sent is not what its tree key names."""
 
 
 class RunFailed(Exception):
@@ -357,35 +361,52 @@ def build_seconds(status: dict, index: int, key: str, commit: str, others: list[
     return status["slowest"]
 
 
-def _candidates(request: Request, names: tuple) -> tuple[list[Candidate], list[str]]:
+# Each host this process has connected (`connect`: its platform probed, its host package
+# deployed), kept while it reads: one that fails a read is connected again. What it can run and
+# whether it is set up are read anew with its status (`host_status`).
+_connected: dict[HostConfig, Remote] = {}
+
+
+def _connection(config: HostConfig) -> Remote:
+    remote = _connected.get(config)
+    if remote is None:
+        remote = _connected[config] = connect(config)
+    return remote
+
+
+def _candidates(request: Request, names: tuple, run_id: str) -> tuple[list[Candidate], list[str], set[str]]:
     """The hosts of `names` (their configurations) the request's work can be planned for, each
     with its status and the wait for room its builds' needs give it, a need this host has not
-    measured taken from the others of its platform (`fallbacks`); and why each other one that runs the backend
-    was skipped."""
+    measured taken from the others of its platform (`fallbacks`); why each other one that runs the backend
+    was skipped; and those of them that could not be read, unlike those read and found unfit.
+    Each host is read as run `run_id` sees it (`host_status`: what is ahead of it)."""
 
     def probe(config):
         try:
-            remote = connect(config)
+            remote = _connection(config)
         except HostError as error:
-            return None, str(error)
-        if request.backend not in remote.backends:
-            return None, None
-        if not remote.ready:
-            return None, f"{config.alias}: not set up (`mrig setup {config.alias}`)"
+            return None, str(error), True
         try:
             work = request.work(config.alias)
         except Refused as refused:
-            return None, f"{config.alias}: {refused}"
+            return None, f"{config.alias}: {refused}", False
         try:
             sides = [(side.source.key, tree_key(side.source), build_key(work, side)) for side in work.sides]
-            return (remote, host_status(remote, sides), work), None
+            status = host_status(remote, sides, run_id)
         except HostError as error:
-            return None, f"{config.alias}: {error}"
+            _connected.pop(config, None)
+            return None, f"{config.alias}: {error}", True
+        if request.backend not in status["backends"]:
+            return None, None, False
+        if not status["ready"]:
+            return None, f"{config.alias}: not set up (`mrig setup {config.alias}`)", False
+        return (remote, status, work), None, False
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         found = list(pool.map(probe, names))
-    probed = [c for c, _ in found if c is not None]
-    skipped = [reason for _, reason in found if reason]
+    probed = [c for c, _, _ in found if c is not None]
+    skipped = [reason for _, reason, _ in found if reason]
+    unreadable = {config.alias for config, (_, _, failed) in zip(names, found, strict=True) if failed}
     alike = lambda remote: [(found, work) for other, found, work in probed if platform(other) == platform(remote)]
     known = platform_fallbacks(probed)
 
@@ -399,7 +420,7 @@ def _candidates(request: Request, names: tuple) -> tuple[list[Candidate], list[s
                        for index, side in enumerate(work.sides))
         return Candidate(remote, status, work, own, room_wait(status["room"], need), builds)
 
-    return [candidate(*each) for each in probed], skipped
+    return [candidate(*each) for each in probed], skipped, unreadable
 
 
 def _start(candidate: Candidate) -> float:
@@ -420,20 +441,42 @@ def _start(candidate: Candidate) -> float:
     return max(built, status["waits"][kind])
 
 
-def place(request: Request, hosts: Hosts, run_id: str) -> Candidate:
-    """The candidate where the run's jobs would start earliest (`_start`); among equals, the
-    one run `run_id` ranks first by a hash of the two, so runs placed at the same moment, before
-    any sees another on a host, still spread across equal hosts."""
+def _ranked(request: Request, hosts: Hosts, run_id: str) -> tuple[list[Candidate], set[str]]:
+    """The candidates, the one where the run's jobs would start earliest (`_start`) first; among
+    equals, the one run `run_id` ranks first by a hash of the two, so runs placed at the same
+    moment, before any sees another on a host, still spread across equal hosts; and the hosts
+    that could not be read (`_candidates`)."""
     named = hosts.resolve(request.host) if request.host else tuple(hosts.host(a) for a in hosts.known())
-    candidates, skipped = _candidates(request, named)
+    candidates, skipped, unreadable = _candidates(request, named, run_id)
     if not candidates:
         where = request.host or "any host"
         detail = "; ".join(skipped) if skipped else f"none runs {request.backend}"
         raise HostError(f"no {request.backend} host among {where}: {detail}")
-    return min(
-        candidates,
-        key=lambda c: (_start(c), hashlib.sha256(f"{run_id} {c.remote.alias}".encode()).digest()),
-    )
+    ranked = sorted(candidates, key=lambda c: (_start(c), hashlib.sha256(f"{run_id} {c.remote.alias}".encode()).digest()))
+    return ranked, unreadable
+
+
+def place(request: Request, hosts: Hosts, run_id: str) -> Candidate:
+    """The candidate where the run's jobs would start earliest (`_ranked`)."""
+    return _ranked(request, hosts, run_id)[0][0]
+
+
+# Seconds a queued run must gain by moving: its source staged again, its runner stopped and started.
+MOVE_MARGIN = 120.0
+
+
+def replaced(request: Request, hosts: Hosts, run_id: str, here: str) -> Candidate | None:
+    """Where run `run_id`, queued on host `here` for a hold, goes instead: the candidate where
+    its jobs would now start earliest, when that is earlier than they would start on `here` (as
+    the run sees it, `host_status`: behind what is ahead of it) by `MOVE_MARGIN`; else None. A
+    `here` that cannot be read keeps it; one read and no longer a candidate (its policy, or the
+    run's pins) never starts them."""
+    ranked, unreadable = _ranked(request, hosts, run_id)
+    if here in unreadable:
+        return None
+    best = ranked[0]
+    stays = next((_start(c) for c in ranked if c.remote.alias == here), float("inf"))
+    return best if best.remote.alias != here and _start(best) + MOVE_MARGIN < stays else None
 
 
 def placed_estimate(request: Request, candidate: Candidate) -> float:
@@ -455,14 +498,15 @@ def _idle(candidate: Candidate) -> bool:
             and candidate.room_wait == 0)
 
 
-def idle_elsewhere(request: Request, hosts: Hosts, candidate: Candidate) -> list[str]:
+def idle_elsewhere(request: Request, hosts: Hosts, candidate: Candidate, run_id: str) -> list[str]:
     """When `--host` placed the run on a host that is not idle, the hosts outside what it names
-    that could run the request and are idle (`_idle`): the run still goes where it is pinned."""
+    that could run the request and are idle (`_idle`): the run still goes where it is pinned, and
+    is placed again within what `--host` names only (`replaced`)."""
     if request.host is None or _idle(candidate):
         return []
     pinned = {config.alias for config in hosts.resolve(request.host)}
     others = tuple(hosts.host(alias) for alias in hosts.known() if alias not in pinned)
-    return [found.remote.alias for found in _candidates(request, others)[0] if _idle(found)]
+    return [found.remote.alias for found in _candidates(request, others, run_id)[0] if _idle(found)]
 
 
 def against_estimate(entry: dict) -> str:
@@ -840,16 +884,38 @@ class Run:
         self.package: str | None = None  # the first side's stage, with the host package, once staged
         self.plan_sent = False  # whether a start of the run may have reached the host with its plan
         self.sequence = 0  # the last event followed
+        self.built = False  # whether it has entered its build, as its caller saw: from then on it is not placed again
+        # Where it goes once its runner ends stopped to move (`stopped_to_move`): the candidate
+        # the last stop it was sent to move was for.
+        self.destination: Candidate | None = None
+        self.carried = 0.0  # seconds it queued on the hosts it left
         self.stacks: list[str] = []  # each process asked for its stacks: where they go, and why
 
     def enter(self, phase: str) -> None:
         now = time.monotonic()
         self.phases.append({"phase": self.phase, "seconds": round(now - self.phase_started, 3)})
         self.phase, self.phase_started = phase, now
+        self.built = self.built or phase.startswith("build-")
         self.state.update(phase=phase, phase_started=time.time(), waiting_behind=None)
 
     def note(self, message: str) -> None:
         self.logs.note(f"{self.phase}: {message}")
+
+    @property
+    def queued(self) -> bool:
+        """Whether the run waits for a hold before its build is granted, as its caller last saw
+        it: only what decides whether it is placed again (`_replace_when`); its runner judges a
+        stop to move against its own grant (`agent.Runner._stopping`)."""
+        return self.phase.startswith("queue-") and not self.built
+
+    def relocate(self, candidate: Candidate, request: Request) -> None:
+        """The run, its runner stopped while it queued, goes on to `candidate` as `request`
+        (placed there): nothing of the host it left is kept, its queued time is."""
+        self.carried = state.account(self.state.value, time.time())[0]
+        self.remote, self.checkouts, self.request = candidate.remote, candidate.status["checkouts"], request
+        self.host, self.package, self.plan_sent, self.sequence, self.destination = None, None, False, 0, None
+        self.state.update(host=self.remote.alias, estimate=request.estimate, waited=self.carried,
+                          waiting_since=None)
 
     def receive(self, event: dict) -> None:
         """Mirror one runner event here."""
@@ -876,14 +942,16 @@ class Run:
         elif kind == "held":
             self.state.update(waiting_behind=None)
         elif kind == "queue":  # the host's account of its waits changed (`state.account`)
-            self.state.update(waited=event["waited"], waiting_since=time.time() if event["waiting"] else None)
+            self.state.update(waited=self.carried + event["waited"],
+                              waiting_since=time.time() if event["waiting"] else None)
 
     def stage(self, plan: Plan, stop: threading.Event) -> None:
         """Put everything the run reads from here into its directory on the host, before it
         starts: each side's source in its stage (sending only what the checkout it would claim
         at placement lacks) and the request's files in its inputs, sent from their copy in its
         results, which the record hashes (they are never fetched back); no more once `stop` is
-        set."""
+        set. A source that is no longer what it was read as once sent (`Source.current`) raises
+        `SourceChanged`: its stage may hold bytes its tree key does not name."""
         work, sides = plan.work, plan.work.sides
         inputs = plan.tokens(sides[0], None)["inputs"]
         made = [f"{plan.stage(side)}/src" for side in sides] + ([inputs] if work.files else [])
@@ -898,6 +966,9 @@ class Run:
                 self.remote, list(side.source.paths), side.source.directory, f"{plan.stage(side)}/src",
                 alike=alike), stop)
             self.note(f"staged {len(side.source.paths)} files of {side.label} in {time.monotonic() - started:.1f} s")
+        changed = [side.label for side in sides if not side.source.current()]
+        if changed:
+            raise SourceChanged(f"its {', '.join(changed)} source changed while it was staged: run it again")
         if work.files:
             local = self.results / sync.RUN_INPUTS
             local.mkdir(exist_ok=True)
@@ -987,6 +1058,50 @@ def _stop_when(run: Run, stop: threading.Event, followed: threading.Event) -> No
         _retrying(run, "stop", run.host.stop)
 
 
+# Seconds between a queued run's placements again (`replaced`).
+REPLACE_SECONDS = 30.0
+
+
+def _replace_when(run: Run, request: Request, hosts: Hosts, followed: threading.Event) -> None:
+    """While the run queues for its build slot, place it again every `REPLACE_SECONDS`
+    (`replaced`, over `request` as asked): where it would start sooner, `run.destination`, its
+    runner is stopped to move (`HostRun.stop`: its runner ends only if its build is not granted),
+    through lost connections; whether it moves is its end's to say (`stopped_to_move`), never
+    a reply's. Nothing once it has been granted its build or been followed to its end, nor on a
+    Windows host, whose runner cannot record that it was stopped to move (`HostRun.stop`), nor
+    once its source has changed since it was staged (`Source.current`), which its stage would
+    find only after its runner had been stopped (`Run.stage`)."""
+    if run.remote.windows:
+        return
+    while not followed.wait(REPLACE_SECONDS):
+        if run.built:
+            return
+        if not run.queued:
+            continue
+        try:
+            better = replaced(request, hosts, run.run_id, run.remote.alias)
+        except HostError:
+            continue  # no host could be read or take it: it stays where it is
+        if better is None:
+            continue
+        if not all(side.source.current() for side in better.work.sides):
+            run.note("not moved: its worktree has changed since it was staged, and it builds what it was staged as")
+            return
+        run.destination = better  # before the stop, which may end the runner even if its reply is lost
+        try:
+            if _retrying(run, "stop", lambda: run.host.stop(queued=True), followed)["stopped"]:
+                return
+        except Stopped:
+            return  # followed to its end meanwhile, which says whether a stop sent moved it
+        except CommandFailed as error:  # its end still says whether it moved
+            run.note(f"stop to move it failed ({error}); placed again in {REPLACE_SECONDS:.0f} s")
+
+
+def stopped_to_move(ended: dict) -> bool:
+    """Whether the runner's end is a stop to move it (`stop --queued`)."""
+    return ended["failed"] is not None and ended["failed"].get("moved", False)
+
+
 def _follow(run: Run) -> dict:
     """Follow the runner to its end, through lost connections; its `ended` event."""
     backoff = BACKOFF_FIRST
@@ -1059,43 +1174,62 @@ def _launch(run: Run, plan: Plan, stop: threading.Event) -> HostRun | None:
 
 def _execute(request: Request, run_id: str, results: Path, hosts: Hosts,
              announce: Callable[[str], None], current: list[Run], command: tuple[str, ...]) -> Outcome:
-    candidate = place(request, hosts, run_id)
-    request = dataclasses.replace(request, estimate=placed_estimate(request, candidate))
-    announce(launch_line(request, candidate, idle_elsewhere(request, hosts, candidate)))
+    asked = request
+    candidate = place(asked, hosts, run_id)
+    request = dataclasses.replace(asked, estimate=placed_estimate(asked, candidate))
+    announce(launch_line(request, candidate, idle_elsewhere(request, hosts, candidate, run_id)))
     run = Run(request, candidate, run_id, results, announce)
     current.append(run)
     stop = threading.Event()
     # Stopping the caller stops the run: the runner ends its command and releases its holds.
     previous = signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     try:
-        plan = plan_for(request, candidate, run_id)
-        run.enter("stage")
-        # A connection lost while staging loses the host's hold on the directory: stage again
-        # under a new one; stopped meanwhile, before its plan was sent, nothing starts.
-        try:
-            run.host = _retrying(run, "start", lambda: _launch(run, plan, stop))
-        except Stopped:
-            run.host = None
-        # The caller's phases: every one entered here, the last closing at the runner's first.
-        caller = len(run.phases) + 1
-        if run.host is None:
-            ended = {"codes": {}, "phases": [], "failed": {
-                "phase": run.phase, "detail": "stopped by mrig stop before it started"}}
-        else:
+        while True:
+            plan = plan_for(run.request, candidate, run_id)
+            run.enter("stage")
+            # A connection lost while staging loses the host's hold on the directory: stage again
+            # under a new one; stopped meanwhile, before its plan was sent, nothing starts, nor
+            # when its source changed while it was staged (a moved run too: it fails).
+            unstarted = "stopped by mrig stop before it started"
+            try:
+                run.host = _retrying(run, "start", lambda: _launch(run, plan, stop))
+            except Stopped:
+                run.host = None
+            except SourceChanged as changed:
+                run.host, unstarted = None, str(changed)
+            # The caller's phases: every one entered here, the last closing at the runner's first.
+            caller = len(run.phases) + 1
+            if run.host is None:
+                ended = {"codes": {}, "phases": [], "failed": {"phase": run.phase, "detail": unstarted}}
+                break
             state.Launched(run_id, run.remote.alias, run.host.agent, results, command).write()
             followed = threading.Event()
             threading.Thread(target=_stop_when, args=(run, stop, followed), daemon=True).start()
+            replacing = threading.Thread(target=_replace_when, args=(run, asked, hosts, followed), daemon=True)
+            replacing.start()
             ended = _follow(run)
             followed.set()  # the runner has ended, its holds released: no stop goes to its pid after it
-            run.enter("fetch")
-            _retrying(run, "fetch", lambda: sync.fetch_answer(run.remote, run.remote.path("runs", run_id), results))
+            replacing.join()  # it sends no stop and sets no destination from here on
+            if not stopped_to_move(ended):
+                run.enter("fetch")
+                _retrying(run, "fetch", lambda: sync.fetch_answer(run.remote, run.remote.path("runs", run_id), results))
+                break
+            # Stopped while it queued, to go where it starts sooner: what it left is removed.
+            candidate, left = run.destination, run.host
+            assert candidate is not None, "a runner stopped to move that no stop to move was sent"
+            _retrying(run, "fetch", lambda: left.fetched(wait=True))  # its runner may not have exited yet
+            state.Launched.remove(run_id)  # only once nothing of it is left there
+            moved = dataclasses.replace(asked, estimate=placed_estimate(asked, candidate))
+            announce(f"mrig: {run.remote.alias} → {candidate.remote.alias}: its jobs start sooner there; "
+                     + launch_line(moved, candidate, []))
+            run.relocate(candidate, moved)
     finally:
         signal.signal(signal.SIGTERM, previous)
-    outcome = Outcome(run_id, run.remote.alias, results, ended["codes"], estimate=request.estimate)
+    outcome = Outcome(run_id, run.remote.alias, results, ended["codes"], estimate=run.request.estimate)
     failed = ended["failed"]
     last = {"phase": run.phase, "seconds": round(time.monotonic() - run.phase_started, 3)}  # fetch, or stage
     outcome.phases = [*run.phases[:caller], *ended["phases"], last]
-    record((request, candidate.work), run_id, run.remote.alias, outcome, failed)
+    record((run.request, candidate.work), run_id, run.remote.alias, outcome, failed)
     if failed is not None:
         raise RunFailed(failed["phase"], failed["detail"], outcome)
     return outcome

@@ -58,6 +58,17 @@ class Source:
     branch: str  # the worktree's branch (`HEAD` when detached), or the ref as given
     tree: Path  # the worktree it was staged from: its own tree, or a ref's tools
 
+    def current(self) -> bool:
+        """Whether staging the source now would send what it was read as (`identity`): always for
+        a ref, materialized for the run; for the worktree, only while its commit and changes are
+        as they were (one that cannot be read is not)."""
+        if self.name != WORKTREE:
+            return True
+        try:
+            return identify(self.directory) == self.identity
+        except (subprocess.CalledProcessError, OSError):
+            return False
+
     def described(self) -> str:
         """`branch@commit (dirty|clean)`."""
         state = "clean" if self.identity.dirty_digest is None else "dirty"

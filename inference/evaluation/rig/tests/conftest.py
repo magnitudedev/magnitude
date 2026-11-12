@@ -111,7 +111,8 @@ def rig(tmp_path, monkeypatch):
                     ignore=shutil.ignore_patterns("__pycache__"))
     (source_dir / "data.txt").write_text("the source\n")
     paths = tuple(sorted(p.relative_to(source_dir).as_posix() for p in source_dir.rglob("*") if p.is_file()))
-    source = Source("worktree", "test-checkout", source_dir, paths, BuildIdentity("c" * 40, None), "test-branch",
+    # Fixed for the test, as a ref is for its run: never read again (`Source.current`).
+    source = Source("fixture", "test-checkout", source_dir, paths, BuildIdentity("c" * 40, None), "test-branch",
                     tmp_path / "test-worktree")
     return Hosts(HostConfig("", str(tmp_path / "default"), str(tmp_path / "models")),
                  {"pool": ("alpha", "beta")}, hosts), source, tmp_path
