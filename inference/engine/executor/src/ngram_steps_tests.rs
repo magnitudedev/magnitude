@@ -798,8 +798,8 @@ fn a_banked_loads_prompt_groups_score_as_resident() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// On Metal, a whole bank of the 128-expert fixture shrunk plateau by
-/// plateau between decode steps, then to its floor (as the release ladder
+/// On Metal and Vulkan, a whole bank of the 128-expert fixture shrunk
+/// plateau by plateau between decode steps, then to its floor (as the release ladder
 /// shrinks it under pressure; on unified memory the kept experts' bytes
 /// move within the one store), decodes on bit for bit as the resident load
 /// does, losing no step: every step before the first shrink runs the
@@ -813,14 +813,16 @@ fn a_banked_loads_prompt_groups_score_as_resident() {
 fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    // Only a host with Metal runs it.
-    if !available(&catalog, seismic::BackendName::Metal) {
-        return;
-    }
     let manifests: [(&str, fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest, usize); 2] =
         [("whole-bank-shrunk", streamed_experts_manifest, 1), ("two-groups-shrunk", two_group_experts_manifest, 2)];
-    for (test, manifest, groups) in manifests {
-        shrunk_bank_scores_as_resident(&catalog, test, manifest, groups);
+    // Only a host with Metal or Vulkan runs it, on each it has.
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Vulkan] {
+        if !available(&catalog, backend) {
+            continue;
+        }
+        for (test, manifest, groups) in manifests {
+            shrunk_bank_scores_as_resident(&catalog, backend, test, manifest, groups);
+        }
     }
 }
 
@@ -1244,27 +1246,27 @@ fn two_group_experts_manifest(definition: &ModelDefinition) -> magnitude_artifac
 
 /// [`a_whole_bank_shrunk_between_decode_steps_scores_as_resident`] over
 /// the 128-expert fixture's experts as `manifest` stores them, in `groups`
-/// bank groups.
+/// bank groups, on `backend`.
 fn shrunk_bank_scores_as_resident(
     catalog: &seismic::Devices,
+    backend: seismic::BackendName,
     test: &str,
     manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
     groups: usize,
 ) {
     let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), manifest);
-    let metal = seismic::BackendName::Metal;
     // Without lookahead each step's token is the host's; with it, the
     // device's selection, each step claiming the successor queued behind
     // the one before (unless a shrink orphaned it), as served decode runs.
     let decode = |banked: Banked, lookahead: bool| {
-        let (mut domain, mut bindings, _, _) = load(catalog, &definition, &package, metal, limits(2, lookahead, 1, 1), banked);
+        let (mut domain, mut bindings, _, _) = load(catalog, &definition, &package, backend, limits(2, lookahead, 1, 1), banked);
         if matches!(banked, Banked::Whole) {
             assert_eq!(domain.expert_bank_plan().map(|bank| bank.groups().len()), Some(groups), "{test}: the bank's groups");
         }
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
-        let (outcome, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, metal);
+        let (outcome, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
         let mut steps = vec![step_bits(&outcome)];
         let mut shrinks = 0;
         // The launches of decode rows run before the first shrink (its
@@ -1302,7 +1304,7 @@ fn shrunk_bank_scores_as_resident(
                 true => steps.last().and_then(|bits| bits.last()).and_then(|(_, _, selected)| *selected).expect("a step selects").0,
                 false => (position * 37 % 256) as u32,
             };
-            let (outcome, next, _) = step(&mut domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), metal);
+            let (outcome, next, _) = step(&mut domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), backend);
             steps.push(step_bits(&outcome));
             bindings = next;
         }

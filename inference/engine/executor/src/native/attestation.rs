@@ -369,6 +369,13 @@ impl AttestedPrograms {
             .collect()
     }
 
+    /// Whether the target's decode graphs are recorded ahead of their first
+    /// use (`seismic::NativeGraphFamily::records_decode_ahead`), so that a
+    /// bank shrink's step records none: CUDA's only.
+    pub(crate) fn records_decode_ahead(&self) -> bool {
+        self.target_graphs.iter().any(|graphs| graphs.family().records_decode_ahead())
+    }
+
     pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {
         &self.readout_choices
     }

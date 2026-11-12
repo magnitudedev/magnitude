@@ -690,8 +690,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// What expert bank resizes held the submitting thread.
     resize_held: ResizeHeld,
     /// A bank shrink began and its step, the next decode launch, has not
-    /// launched: that launch records no graph, as every one it replays was
-    /// recorded and kept as its slots were made.
+    /// launched: where decode graphs are recorded ahead (CUDA's), that
+    /// launch records no graph, as every one it replays was recorded and
+    /// kept as its slots were made; elsewhere it records its graphs at
+    /// first use, as any new shape's.
     shrink_step: bool,
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it

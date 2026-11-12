@@ -175,14 +175,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let started = Instant::now();
         let epoch = self.launch_epoch();
         let decodes = operations.iter().all(|operation| matches!(operation, Operation::Forward { kind: WorkKind::Decode, .. }));
-        // A bank shrink's step is the first decode launch after it began.
-        let shrink_step = (decodes && std::mem::take(&mut self.shrink_step)).then(|| self.family.graph_replays().recorded);
+        // A bank shrink's step is the first decode launch after it began; it
+        // records no graph only where decode graphs are recorded ahead
+        // (CUDA's): elsewhere it records its graphs at first use, as any
+        // new shape's.
+        let shrink_step = (decodes && std::mem::take(&mut self.shrink_step) && self.family.records_decode_ahead()).then(|| self.family.graph_replays().recorded);
         let submitted = self.submit_chain(chain, spare);
         if let Some(before) = shrink_step {
             assert_eq!(
                 self.family.graph_replays().recorded,
                 before,
-                "a bank shrink's step records no graph: every graph its decode launch replays was kept as its slots were made"
+                "a bank shrink's step records no graph where decode graphs are recorded ahead: every graph its decode launch replays was kept as its slots were made"
             );
         }
         let (submission, queued) = match submitted {

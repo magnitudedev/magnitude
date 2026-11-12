@@ -138,7 +138,8 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 /// both, so what is held for its every class (`decode_launch`;
 /// `LaunchGraphs::held`, and on CUDA the graphs
 /// `seismic::NativeGraphFamily::record_decode` records ahead) holds either
-/// form's, and a step that switches records none. The plan's census
+/// form's, so on CUDA a step that switches records none (elsewhere it
+/// records its graphs at first use, as any new shape's). The plan's census
 /// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)
 /// both count a launch's graphs by it.
 pub(super) struct LaunchRuns<'s, T> {

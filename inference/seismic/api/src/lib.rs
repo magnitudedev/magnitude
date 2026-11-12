@@ -4430,6 +4430,12 @@ impl NativeGraphFamily {
     pub fn graphs(&self) -> LaunchGraphs {
         self.inner.graphs()
     }
+    /// Whether [`Self::record_decode`] records ahead (CUDA's only): elsewhere
+    /// a graph is recorded at its shape's first use, a bank shrink's step
+    /// included.
+    pub fn records_decode_ahead(&self) -> bool {
+        self.inner.records_decode_ahead()
+    }
     /// Record, ahead of it, every graph its decode launch replays that is
     /// not kept, once the device's queued work has drained (CUDA's; other
     /// backends record at a shape's first use, with no wait): a step of it

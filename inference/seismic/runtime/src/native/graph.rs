@@ -3656,6 +3656,22 @@ impl NativeGraphFamily {
         self.graphs.launches()
     }
 
+    /// Whether [`Self::record_decode`] records its decode launches' graphs
+    /// ahead of their first use: CUDA's only. Elsewhere (Vulkan, Metal) a
+    /// graph is recorded at its shape's first use, a bank shrink's step
+    /// included, as any new shape's.
+    pub fn records_decode_ahead(&self) -> bool {
+        self.cuda().is_some()
+    }
+
+    /// The CUDA device its graphs are recorded on, none elsewhere.
+    fn cuda(&self) -> Option<&Arc<crate::backends::CudaOpened>> {
+        match &self.device.kind {
+            crate::backends::OpenedKind::Cuda(opened) => Some(opened),
+            _ => None,
+        }
+    }
+
     /// Record, ahead of them, every graph its decode launches in flight
     /// replay that is not kept: on CUDA each layout's graphs for the most
     /// runs of it any of its decode launches makes, for each live slot (a
@@ -3669,7 +3685,7 @@ impl NativeGraphFamily {
     /// (its word nodes name the device's placeholder word), and memory the
     /// driver refuses it is a capacity refusal.
     pub fn record_decode(&self) -> Result<(), TensorError> {
-        let crate::backends::OpenedKind::Cuda(opened) = &self.device.kind else {
+        let Some(opened) = self.cuda() else {
             return Ok(());
         };
         // The drain and the recordings under one guard, the submission

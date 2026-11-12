@@ -452,6 +452,14 @@ pub trait ProgramFamily: 'static {
     /// (`seismic::Device::graph_replays`).
     fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)>;
 
+    /// Whether the target's decode graphs are recorded ahead of their first
+    /// use (CUDA's only), so that a bank shrink's step records none:
+    /// elsewhere a graph is recorded at its shape's first use, that step's
+    /// included. A family with no native graphs records none.
+    fn records_decode_ahead(&self) -> bool {
+        false
+    }
+
     /// What the load's graphs cost serving so far, of every family
     /// ([`Self::family_graph_replays`]).
     fn graph_replays(&self) -> seismic::GraphReplays {
@@ -750,6 +758,9 @@ impl ProgramFamily for NativeFamily {
         let mut families = self.programs.graph_replays();
         families.push(("target overlays", self.target.overlay_graph_replays()));
         families
+    }
+    fn records_decode_ahead(&self) -> bool {
+        self.programs.records_decode_ahead()
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()

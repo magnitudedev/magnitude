@@ -93,8 +93,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`ElasticBank::shrink`), the queued steps orphaned first, as they
     /// may name records it retires; its memory is released at later flight
     /// boundaries ([`Self::advance_expert_bank`]), `wake` completed as it
-    /// progresses. The shrink's step records no graph: the decode launch's
-    /// were recorded as its slots were made (`NativeGraphPool::grow`). A
+    /// progresses. Where decode graphs are recorded ahead (CUDA's), the
+    /// shrink's step records no graph: the decode launch's were recorded as
+    /// its slots were made (`NativeGraphPool::grow`); elsewhere it records
+    /// its graphs at first use, as any new shape's. A
     /// load without an elastic bank is at its limit. While a chain is under
     /// way ([`Self::chain_holder`]) nothing begins: its queued chunks are its
     /// holder's to claim, never orphaned, so the shrink is deferred
