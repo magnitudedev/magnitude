@@ -1018,6 +1018,12 @@ impl ExecutionPlanDraft {
 }
 
 impl ExecutionPlan {
+    /// The plan of a component that opens no expert bank
+    /// ([`ModelLoadPlan::without_expert_bank`]).
+    pub fn without_expert_bank(self) -> Self {
+        Self { load: self.load.without_expert_bank(), ..self }
+    }
+
     /// The plan committing `slots` of its expert bank at the load, its
     /// ceiling kept ([`ModelLoadPlan::with_load_slots`]).
     pub fn with_load_slots(self, slots: u64) -> Result<Self, PlanError> {

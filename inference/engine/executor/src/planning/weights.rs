@@ -1626,6 +1626,12 @@ impl ModelLoadPlan {
         self.bank.as_ref()
     }
 
+    /// The plan of the load's components other than its target, which hold
+    /// no routed experts: without the expert bank.
+    pub fn without_expert_bank(self) -> Self {
+        Self { bank: None, ..self }
+    }
+
     /// The launches one merged-expert prompt pass of the load covers: its
     /// bank's settled pass, or a whole chain's where its experts are held
     /// whole.

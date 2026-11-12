@@ -870,23 +870,22 @@ fn build_held(
     if let Some(root) = &manifest.kernel_cache {
         adopt_volumes(root, &device, package.target(), execution_plan.load().expert_bank()).map_err(internal)?;
     }
-    let mut residency = ResidencyStore::new(
+    // A linked host tier backs to its load-time slots from the bank's open
+    // (`ExpertBank::back_host`): its claim is split from the target import's
+    // as the store is made, allocated as each slot backs, never before it
+    // exists.
+    let mut residency = ResidencyStore::for_target(
         device.clone(),
         programs.clone(),
         execution_plan.clone(),
         resource_identity.clone(),
         releases.clone(),
-        startup.ledgers.changes().clone(),
+        &startup.ledgers,
+        &mut weights,
     )
     .map_err(|error| internal(error.to_string()))?;
     // The rows steps name of a streamed table are kept beside the kernels,
     // for the next load of the model.
-    // A linked host tier backs to its load-time slots from the bank's open
-    // (`ExpertBank::back_host`): its claim is kept apart and handed to the
-    // bank, allocated as each slot backs, never before it exists.
-    if let Some(backing) = startup.ledgers.host_backing(&mut weights, execution_plan.load()).map_err(internal)? {
-        residency.back_host_tier(backing);
-    }
     if let Some(cache) = &manifest.kernel_cache {
         residency.keep_table_rows(cache.join("table-rows"));
         residency.keep_cpu_site(stored_cpu_site(cache, &device, &site_requests).map_err(internal)?);
@@ -942,7 +941,7 @@ fn build_held(
         .vision
         .as_ref()
         .map(|_| {
-            let store = ResidencyStore::new(
+            let store = ResidencyStore::for_component(
                 device.clone(),
                 programs.clone(),
                 execution_plan.clone(),

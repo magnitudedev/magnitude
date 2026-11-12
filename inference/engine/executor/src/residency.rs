@@ -740,18 +740,51 @@ pub struct ResidencyStore {
     /// (`memory::ledger::Changing`).
     changes: std::sync::Arc<crate::memory::ledger::Changes>,
     /// The claim to a linked host tier's load-time slots, which the bank
-    /// allocates as each backs from its open ([`Self::back_host_tier`]).
+    /// allocates as each backs from its open: held exactly where the plan's
+    /// bank has host slots ([`crate::memory::ledger::DeviceLedgers::host_backing`]),
+    /// split from the target import's claim as the store is made for it.
     host_backing: Option<crate::memory::ledger::Claim>,
 }
 
 impl ResidencyStore {
-    pub fn new(
+    /// The store of a load's target import: `weights` is the import's claim
+    /// on `ledgers`, which the tier of the plan's bank takes its backing
+    /// from, so a bank opened by this store has its host tier's claim.
+    pub fn for_target(
+        device: Rc<Device>,
+        programs: Rc<crate::native::AttestedPrograms>,
+        execution: ExecutionPlan,
+        domain: ResourceDomainId,
+        releases: crate::Releases,
+        ledgers: &crate::memory::ledger::DeviceLedgers,
+        weights: &mut crate::memory::ledger::Held,
+    ) -> Result<Self, WeightImportError> {
+        let backing = ledgers.host_backing(weights, execution.load()).map_err(invalid)?;
+        Self::make(device, programs, execution, domain, releases, ledgers.changes().clone(), backing)
+    }
+
+    /// The store of a component that opens no expert bank (the vision
+    /// tower's): its plan holds none, so no bank opens through it, with or
+    /// without a host tier's backing.
+    pub fn for_component(
         device: Rc<Device>,
         programs: Rc<crate::native::AttestedPrograms>,
         execution: ExecutionPlan,
         domain: ResourceDomainId,
         releases: crate::Releases,
         changes: std::sync::Arc<crate::memory::ledger::Changes>,
+    ) -> Result<Self, WeightImportError> {
+        Self::make(device, programs, execution.without_expert_bank(), domain, releases, changes, None)
+    }
+
+    fn make(
+        device: Rc<Device>,
+        programs: Rc<crate::native::AttestedPrograms>,
+        execution: ExecutionPlan,
+        domain: ResourceDomainId,
+        releases: crate::Releases,
+        changes: std::sync::Arc<crate::memory::ledger::Changes>,
+        host_backing: Option<crate::memory::ledger::Claim>,
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
             || execution.device().backend() != device.backend()
@@ -774,7 +807,7 @@ impl ResidencyStore {
             cpu_site: Default::default(),
             releases,
             changes,
-            host_backing: None,
+            host_backing,
         })
     }
 
@@ -835,13 +868,6 @@ impl ResidencyStore {
     /// Open the bank's CPU sites by what the job stored.
     pub fn keep_cpu_site(&mut self, cpu_site: crate::assessment::StoredCpuSite) {
         self.cpu_site = cpu_site;
-    }
-
-    /// `backing`, the claim to the host tier's load-time slots split from
-    /// the target import's (`Held::split_backing`): the expert bank holds it
-    /// from its open and allocates each slot in it as the slot backs.
-    pub fn back_host_tier(&mut self, backing: crate::memory::ledger::Claim) {
-        assert!(self.host_backing.replace(backing).is_none(), "invariant violated: a host tier's backing claimed twice");
     }
 
     pub fn keep_table_rows(&mut self, directory: std::path::PathBuf) {

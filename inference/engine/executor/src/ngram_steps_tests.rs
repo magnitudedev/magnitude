@@ -2196,13 +2196,23 @@ fn load_with(
         &ledgers,
     )
     .unwrap();
-    let mut residency = ResidencyStore::new(
+    // As the engine's load claims the target import, whose claim the host
+    // tier of a capped bank backs its load-time slots in.
+    let load = execution.load();
+    let demand = match load.expert_bank() {
+        Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+        None => load.target_weight_demand(),
+    }
+    .unwrap();
+    let mut weights = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, demand).unwrap();
+    let mut residency = ResidencyStore::for_target(
         device.clone(),
         programs.clone(),
         (*execution).clone(),
         identity,
         resources.releases(),
-        ledgers.changes().clone(),
+        &ledgers,
+        &mut weights,
     )
     .unwrap();
     let target = residency
