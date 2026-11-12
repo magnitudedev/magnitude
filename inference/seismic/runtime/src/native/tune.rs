@@ -1101,11 +1101,10 @@ pub struct Standing {
     /// it ([`GroupSearch::exhausted`]): the one way a search ends before
     /// its load's budget does.
     pub exhausted: bool,
-    /// Programs the search formed so far, with `forming_seconds` what
-    /// forming them took: launch variants where launches are formed
+    /// Programs the unit formed so far, each once, with `forming_seconds`
+    /// what forming them took: launch variants where launches are formed
     /// separately, configurations where the program is formed whole. The
-    /// defaults' programs, which the census formed as preparation, are not
-    /// among them.
+    /// defaults' programs, formed as preparation, are among them.
     pub programs: usize,
     /// What forming programs has taken so far.
     pub forming_seconds: f64,
@@ -1141,6 +1140,25 @@ struct Formation<'s, 'm> {
     /// What formations of this unit took: the one price of every formation
     /// of it, wherever it is quoted.
     price: &'s Mutex<FormationPrice>,
+}
+
+/// The formation of a unit ([`UnitSearch`]), read field by field: what
+/// forms into the unit's programs borrows them apart from it.
+macro_rules! formation {
+    ($unit:expr) => {
+        Formation {
+            device: &$unit.device,
+            module: $unit.module,
+            entry: $unit.entry,
+            logical: &$unit.logical,
+            bindings: &$unit.bindings,
+            cpu: $unit.cpu,
+            implementation: &$unit.implementation,
+            default: &$unit.default,
+            served: &$unit.served,
+            price: &$unit.formation_price,
+        }
+    };
 }
 
 /// What one formation call of a unit's challengers forms: the launch
@@ -3379,7 +3397,6 @@ impl Piece {
 struct Run {
     search: GroupSearch,
     keying: Keying,
-    programs: Programs,
     /// Every configuration placed in this run writes its results here.
     outputs: OutputPool,
     /// Measurements by point and key, in the unit's canonical units: a
@@ -3439,8 +3456,9 @@ pub struct UnitSearch<'m, 'a> {
     /// The served shapes beyond the points', learned with them.
     served: Vec<BTreeMap<String, u64>>,
     ground: Option<Ground>,
-    /// Programs formed for the defaults.
-    grounded: usize,
+    /// The programs the unit has formed, the canonical program's among
+    /// them from when it is formed: their one owner, whoever forms them.
+    programs: Programs,
     /// Measures the defaults as points are discovered; none once the
     /// search is open, which places into its own result storage.
     surveyor: Option<PointSurveyor>,
@@ -3538,6 +3556,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let default = implementation
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
+        let launch_scoped = implementation.launch_scoped();
         Ok(Self {
             expired: false,
             unit: Unit {
@@ -3563,7 +3582,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             specs: Vec::new(),
             served: Vec::new(),
             ground: None,
-            grounded: 0,
+            programs: Programs::of(launch_scoped),
             plan: None,
             progress: Progress::Discovering(Vec::new()),
             builds: Vec::new(),
@@ -3647,6 +3666,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         kernel
             .hand_off()
             .map_err(|error| TuneError::Handoff(error.to_string()))?;
+        self.programs.grounded(&self.implementation, &self.default, &kernel);
         self.ground = Some(Ground { kernel, validator });
         self.time.forming_seconds += grounded.elapsed.as_secs_f64();
         // Every launch of the canonical program, or the one program.
@@ -3655,11 +3675,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .expect("formation price lock")
             .canonical = grounded.elapsed;
         self.offered.set(None);
-        self.grounded = if self.implementation.launch_scoped() {
-            self.implementation.launches.len()
-        } else {
-            1
-        };
         Ok(())
     }
 
@@ -3676,9 +3691,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// been observed took the device for the rest of the minute.
     fn compiled_ahead(&self, searching: &Searching<'a>, piece: &Piece) -> Vec<Formable> {
         let formation = self.formation();
-        searching
-            .run
-            .programs
+        self.programs
             .formables(&self.implementation, piece.challengers(), piece.ahead())
             .into_iter()
             .filter(|formable| formation.compiles(formable))
@@ -3703,10 +3716,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// Hold the programs of the next piece's compile, which ran
     /// ([`UnitSearch::forming`]). Returns what the compile took.
     pub fn formed(&mut self, formed: Formed) -> Result<Duration, TuneError> {
-        let Progress::Searching(searching) = &mut self.progress else {
-            unreachable!("only a search's piece compiles ahead");
-        };
-        let elapsed = searching.run.programs.hold(
+        assert!(
+            matches!(self.progress, Progress::Searching(_)),
+            "only a search's piece compiles ahead"
+        );
+        let elapsed = self.programs.hold(
             formed,
             self.formation_price
                 .get_mut()
@@ -3737,18 +3751,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     }
 
     fn formation(&self) -> Formation<'_, 'm> {
-        Formation {
-            device: &self.device,
-            module: self.module,
-            entry: self.entry,
-            logical: &self.logical,
-            bindings: &self.bindings,
-            cpu: self.cpu,
-            implementation: &self.implementation,
-            default: &self.default,
-            served: &self.served,
-            price: &self.formation_price,
-        }
+        formation!(self)
     }
 
     /// The timed points built so far.
@@ -3845,7 +3848,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 }
                 searching.run.outputs = OutputPool::default();
                 if exhausted {
-                    searching.run.programs.clear();
+                    self.programs.clear();
                 }
             }
         }
@@ -3919,7 +3922,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     pub fn programs_held(&self) -> usize {
         match &self.progress {
             Progress::Discovering(_) => 0,
-            Progress::Searching(searching) => searching.run.programs.holding(),
+            Progress::Searching(_) => self.programs.holding(),
         }
     }
 
@@ -3939,9 +3942,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// load's budget and holding them costs bytes, and only the consumer
     /// sees both across units.
     pub fn give_up_programs(&mut self) {
-        if let Progress::Searching(searching) = &mut self.progress {
-            searching.run.programs.clear();
-        }
+        self.programs.clear();
         self.offered.set(None);
     }
 
@@ -4447,7 +4448,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // A leader that gave up its kernel is formed again: from the
         // programs the unit holds, or by one compile.
         if leader.kernel.is_none() {
-            quote = quote.and(self.formation().quote(&searching.run.programs.formables(
+            quote = quote.and(self.formation().quote(&self.programs.formables(
                 &self.implementation,
                 std::slice::from_ref(&leader.specialization),
                 &[],
@@ -4900,8 +4901,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .planned
             .take()
             .expect("a measurement performs a planned piece");
-        let plan = self.planned();
-        let formation = self.formation();
+        // Read field by field: the piece forms into the unit's programs
+        // while its formation is borrowed.
+        let plan = self
+            .plan
+            .as_ref()
+            .expect("a unit is given its plan before its optional work");
+        let formation = formation!(self);
         let compiled = formation.price.lock().expect("formation price lock").total();
         let weighing = Weighing::of(&searching.points);
         let mut forming = 0.;
@@ -4916,6 +4922,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = searching;
         let performed = run.perform(
             piece,
+            &mut self.programs,
             &formation,
             points,
             &plan.settings,
@@ -4974,22 +4981,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // A leader that gave up its kernel is formed again; one that can
         // no longer be formed is recorded so and gives way to the next.
         if ledger.contenders[&leader].kernel.is_none() {
-            let formation = Formation {
-                device: &self.device,
-                module: self.module,
-                entry: self.entry,
-                logical: &self.logical,
-                bindings: &self.bindings,
-                cpu: self.cpu,
-                implementation: &self.implementation,
-                default: &self.default,
-                served: &self.served,
-                price: &self.formation_price,
-            };
+            let formation = formation!(self);
             let specialization = ledger.contenders[&leader].specialization.clone();
             let compiled = formation.price.lock().expect("formation price lock").total();
             let began = Instant::now();
-            let formed = run
+            let formed = self
                 .programs
                 .form(&formation, &[specialization], &[])?
                 .pop()
@@ -5290,7 +5286,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         mut canonical: Vec<PointMeasurement>,
     ) -> Result<(Run, Vec<PointMeasurement>), TuneError> {
         let implementation = &self.implementation;
-        let (partition, keying, programs) = if implementation.launch_scoped() {
+        let (partition, keying) = if implementation.launch_scoped() {
             if !matches!(
                 self.backend,
                 seismic_lang::registry::BackendName::Metal
@@ -5304,11 +5300,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let partition =
                 plan::partition(implementation, &self.statics, shapes).map_err(planning)?;
             let keying = Keying::Launches(partition.boundary.clone());
-            (
-                partition,
-                keying,
-                Programs::Launches(LaunchPrograms::default()),
-            )
+            (partition, keying)
         } else {
             let (unserved, points) = unserved_parameters(implementation, &self.statics, shapes)?;
             let parameters = implementation
@@ -5328,7 +5320,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             (
                 plan::whole(&parameters, implementation.launches.len(), points),
                 Keying::Whole(Influence::of(implementation)),
-                Programs::Whole(WholePrograms::default()),
             )
         };
         // The defaults' measurement, keyed as the search keys its own.
@@ -5356,7 +5347,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     plan.start.clone(),
                 ),
                 keying,
-                programs,
                 outputs: OutputPool::default(),
                 samples,
                 shuffle: Shuffle::default(),
@@ -5377,7 +5367,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 requests: 0,
                 declared: None,
                 exhausted: false,
-                programs: 0,
+                programs: self.programs.formed(),
                 forming_seconds: self.time.forming_seconds,
             },
             Progress::Searching(searching) => Standing {
@@ -5387,7 +5377,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 requests: searching.run.search.requests,
                 declared: Some(searching.run.search.declared()),
                 exhausted: searching.planned.is_none() && searching.run.search.exhausted(),
-                programs: searching.run.programs.formed(),
+                programs: self.programs.formed(),
                 forming_seconds: self.time.forming_seconds,
             },
         }
@@ -5602,15 +5592,66 @@ struct WholePrograms {
     held: BTreeMap<Configuration, HeldPrograms>,
     /// Programs formed so far.
     formed: usize,
+    /// The canonical program, formed by grounding and held by the unit's
+    /// ground for its life ([`Programs::grounded`]): its configuration and
+    /// kernel.
+    canonical: Option<(Configuration, Arc<NativePrepared>)>,
+}
+
+impl WholePrograms {
+    /// The canonical program's kernel, where `configuration` is its.
+    fn canonical_kernel(&self, configuration: &Configuration) -> Option<&Arc<NativePrepared>> {
+        self.canonical
+            .as_ref()
+            .filter(|(canonical, _)| canonical == configuration)
+            .map(|(_, kernel)| kernel)
+    }
 }
 
 impl Programs {
+    /// No programs yet of an implementation formed by launch
+    /// (`launch_scoped`) or whole.
+    fn of(launch_scoped: bool) -> Self {
+        if launch_scoped {
+            Self::Launches(LaunchPrograms::default())
+        } else {
+            Self::Whole(WholePrograms::default())
+        }
+    }
+
+    /// The canonical program, `default` of `implementation`, was formed as
+    /// `kernel`: its programs are formed, and held for the unit's life by
+    /// its ground ([`Ground`]), so no challenger forms them again and giving
+    /// up the held programs gives none of them up.
+    fn grounded(
+        &mut self,
+        implementation: &NativeImplementation,
+        default: &NativeSpecialization,
+        kernel: &Arc<NativePrepared>,
+    ) {
+        match self {
+            Self::Launches(programs) => {
+                for (ordinal, variants) in launch_variants(implementation, std::slice::from_ref(default)) {
+                    for variant in variants {
+                        programs.formed.insert((ordinal, variant.clone()));
+                        programs.canonical.insert((ordinal, variant));
+                    }
+                }
+            }
+            Self::Whole(programs) => {
+                programs.canonical = Some((Configuration::of(default), kernel.clone()));
+                programs.formed += 1;
+            }
+        }
+    }
+
     /// The formation calls forming `specializations` makes: per launch
     /// whose held program lacks a variant they run, one compile of its
     /// source that also forms what `ahead` runs
     /// ([`LaunchPrograms::sources`]); or the program of each of them not
-    /// formed yet, and nothing of `ahead`, whose programs share no compile
-    /// with theirs. None when everything is held.
+    /// formed yet, the canonical program never among them, and nothing of
+    /// `ahead`, whose programs share no compile with theirs. None when
+    /// everything is held.
     fn formables(
         &self,
         implementation: &NativeImplementation,
@@ -5629,9 +5670,8 @@ impl Programs {
             Self::Whole(programs) => specializations
                 .iter()
                 .filter(|specialization| {
-                    !programs
-                        .ready
-                        .contains_key(&Configuration::of(specialization))
+                    let configuration = Configuration::of(specialization);
+                    !programs.ready.contains_key(&configuration) && programs.canonical_kernel(&configuration).is_none()
                 })
                 .cloned()
                 .map(Formable::Program)
@@ -5674,8 +5714,8 @@ impl Programs {
                     Product::Program(kernel),
                 ) => {
                     let configuration = Configuration::of(&specialization);
-                    // Assembled again from its held programs, it was
-                    // formed before.
+                    // Assembled again from its held programs, it was formed
+                    // before.
                     if !programs.held.contains_key(&configuration) {
                         programs.formed += 1;
                     }
@@ -5759,6 +5799,11 @@ impl Programs {
                 .and_then(|kernel| serving(kernel, formation.served)),
                 Self::Whole(programs) => {
                     let configuration = Configuration::of(specialization);
+                    // The canonical program is its ground's, held for the
+                    // unit's life.
+                    if let Some(kernel) = programs.canonical_kernel(&configuration) {
+                        return Ok(kernel.clone());
+                    }
                     let kernel = programs
                         .ready
                         .remove(&configuration)
@@ -5780,7 +5825,8 @@ impl Programs {
         }
     }
 
-    /// Programs formed so far: launch variants, or whole programs.
+    /// Programs formed so far, each once: launch variants, or whole
+    /// programs, the canonical program's among them.
     fn formed(&self) -> usize {
         match self {
             Self::Launches(programs) => programs.formed.len(),
@@ -5824,14 +5870,46 @@ struct LaunchPrograms {
     held: BTreeMap<usize, Vec<(BTreeSet<plan::LaunchVariant>, Rc<HeldPrograms>)>>,
     /// Every launch variant formed so far.
     formed: BTreeSet<(usize, plan::LaunchVariant)>,
+    /// The canonical program's launch variants: held by its kernel for the
+    /// unit's life, never given up with the rest ([`Programs::grounded`]).
+    canonical: BTreeSet<(usize, plan::LaunchVariant)>,
+}
+
+/// By launch, the variants `specializations` of `implementation` run: a
+/// configuration runs only the launches it reaches
+/// ([`NativeImplementation::reachable`]), as preparation forms it.
+fn launch_variants(
+    implementation: &NativeImplementation,
+    specializations: &[NativeSpecialization],
+) -> BTreeMap<usize, BTreeSet<plan::LaunchVariant>> {
+    let mut variants = BTreeMap::<usize, BTreeSet<plan::LaunchVariant>>::new();
+    for specialization in specializations {
+        let specialization = implementation.with_owned_defaults(specialization.clone());
+        for ordinal in 0..implementation.launches.len() {
+            if !implementation.reachable(&specialization, ordinal) {
+                continue;
+            }
+            variants
+                .entry(ordinal)
+                .or_default()
+                .insert(plan::LaunchVariant {
+                    code: plan::code_values(implementation, &specialization, ordinal),
+                    group_size: implementation.static_group_size(&specialization, ordinal),
+                });
+        }
+    }
+    variants
 }
 
 impl LaunchPrograms {
-    /// Whether a held program of launch `ordinal` has `variant`.
+    /// Whether a held program of launch `ordinal`, or the canonical
+    /// program, has `variant`.
     fn holds(&self, ordinal: usize, variant: &plan::LaunchVariant) -> bool {
-        self.held
-            .get(&ordinal)
-            .is_some_and(|held| held.iter().any(|(variants, _)| variants.contains(variant)))
+        self.canonical.contains(&(ordinal, variant.clone()))
+            || self
+                .held
+                .get(&ordinal)
+                .is_some_and(|held| held.iter().any(|(variants, _)| variants.contains(variant)))
     }
 
     /// The launch sources forming `specializations` compiles: per launch
@@ -5840,36 +5918,16 @@ impl LaunchPrograms {
     /// that launch that none has either. A compile call has a cost of its
     /// own besides what each variant it forms costs, so a call that must
     /// happen also forms what is measured next. None when every variant is
-    /// held. A configuration runs only the launches it reaches
-    /// ([`NativeImplementation::reachable`]), as preparation forms it: a
-    /// launch it does not reach is formed for it in no variant.
+    /// held ([`launch_variants`]): a launch a configuration does not reach
+    /// is formed for it in no variant.
     fn sources(
         &self,
         implementation: &NativeImplementation,
         specializations: &[NativeSpecialization],
         ahead: &[NativeSpecialization],
     ) -> Vec<plan::LaunchSource> {
-        let variants = |specializations: &[NativeSpecialization]| {
-            let mut variants = BTreeMap::<usize, BTreeSet<plan::LaunchVariant>>::new();
-            for specialization in specializations {
-                let specialization = implementation.with_owned_defaults(specialization.clone());
-                for ordinal in 0..implementation.launches.len() {
-                    if !implementation.reachable(&specialization, ordinal) {
-                        continue;
-                    }
-                    variants
-                        .entry(ordinal)
-                        .or_default()
-                        .insert(plan::LaunchVariant {
-                            code: plan::code_values(implementation, &specialization, ordinal),
-                            group_size: implementation.static_group_size(&specialization, ordinal),
-                        });
-                }
-            }
-            variants
-        };
-        let mut next = variants(ahead);
-        variants(specializations)
+        let mut next = launch_variants(implementation, ahead);
+        launch_variants(implementation, specializations)
             .into_iter()
             .filter_map(|(ordinal, mut variants)| {
                 variants.retain(|variant| !self.holds(ordinal, variant));
@@ -6467,6 +6525,7 @@ impl Run {
     fn perform(
         &mut self,
         piece: Piece,
+        programs: &mut Programs,
         formation: &Formation<'_, '_>,
         points: &[PreparedPoint<'_>],
         settings: &SearchSettings,
@@ -6491,9 +6550,9 @@ impl Run {
             } => (ready, ahead, Some((group, baseline))),
         };
         let began = Instant::now();
-        let formed = self.programs.form(formation, &specializations, &ahead)?;
+        let formed = programs.form(formation, &specializations, &ahead)?;
         *forming_seconds += began.elapsed().as_secs_f64();
-        let formations = self.programs.records(
+        let formations = programs.records(
             &mut formation.price.lock().expect("formation price lock"),
             &specializations,
         );
@@ -7470,12 +7529,10 @@ impl Tuned<'_> {
         let validator = &self.ground.validator;
         let mut records = Vec::new();
         // The unit's programs as its search forms them: launches formed
-        // separately from held launch programs, or programs formed whole.
-        let mut programs = if self.formation.implementation.launch_scoped() {
-            Programs::Launches(LaunchPrograms::default())
-        } else {
-            Programs::Whole(WholePrograms::default())
-        };
+        // separately from held launch programs, or programs formed whole,
+        // the canonical program's among them.
+        let mut programs = Programs::of(self.formation.implementation.launch_scoped());
+        programs.grounded(self.formation.implementation, self.default, &self.ground.kernel);
         // What the walk visits, counted before anything is formed.
         let mut progress = SurveyProgress {
             configurations: 0,
@@ -9263,9 +9320,9 @@ mod tests {
         }
     }
 
-    /// The ledger of a unit timed at `points` points, its defaults measured
-    /// at one second each.
-    fn recorded(points: usize) -> Recorded {
+    /// A CPU kernel of a one-launch entry at N = 8: its logical entry, its
+    /// specialization and the kernel.
+    fn project_kernel() -> (Arc<LogicalEntry>, NativeSpecialization, Arc<NativePrepared>) {
         use crate::native::cpu::CpuLaunchVariants;
         static KERNELS: CpuNativeKernels = CpuNativeKernels {
             digest: "ledger-test",
@@ -9296,6 +9353,13 @@ mod tests {
         )
         .unwrap();
         let logical = Arc::new(module.entry(entry, &ElementBindings::new()).unwrap());
+        (logical, default, kernel)
+    }
+
+    /// The ledger of a unit timed at `points` points, its defaults measured
+    /// at one second each.
+    fn recorded(points: usize) -> Recorded {
+        let (logical, default, kernel) = project_kernel();
         let requirement = NumericalRequirement::BitExact;
         let validator = Validator::new(&logical, &[], &requirement, &kernel);
         let canonical = timed(points, |_| 0, |_| 1.);
@@ -9773,15 +9837,24 @@ mod tests {
         );
     }
 
+    /// One parameter, `ROWS`, of two launches serving apart rows.
+    const ROWS_BY_LAUNCH: &str = concat!(
+        "    params (ROWS in [16, 32, 64] default 16)\n",
+        "    launch gemv when N < 16:\n",
+        "        threadgroups (N, 1, 1)\n",
+        "        threads_per_threadgroup (ROWS, 1, 1)\n",
+        "    launch gemm when N >= 16:\n",
+        "        threadgroups (N, 1, 1)\n",
+        "        threads_per_threadgroup (ROWS, 1, 1)\n",
+    );
+
     /// What a search formed stays held whatever was formed after it: a
     /// variant is asked of the toolchain once, a later compile call asks
     /// only for what no held program has, and the programs leave only when
     /// they are given up.
     #[test]
     fn a_formed_variant_is_held_until_given_up_and_never_asked_for_twice() {
-        let implementation = declared(
-            "    params (ROWS in [16, 32, 64] default 16)\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n",
-        );
+        let implementation = declared(ROWS_BY_LAUNCH);
         let default = implementation
             .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
@@ -9820,6 +9893,53 @@ mod tests {
         programs.clear();
         assert_eq!((programs.holding(), programs.formed()), (0, 6));
         assert_eq!(form(&mut programs, &[rows(32)], &[]), [1, 1]);
+    }
+
+    /// The canonical program's variants, or its whole program, are formed
+    /// once, by grounding: the unit's programs count them from then on, no
+    /// challenger's compile asks for them again, and giving up the held
+    /// programs neither gives them up nor counts them as given back (its
+    /// kernel holds them).
+    #[test]
+    fn the_canonical_programs_are_counted_once_and_never_formed_again() {
+        let implementation = declared(ROWS_BY_LAUNCH);
+        let default = implementation
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .unwrap();
+        let rows = |rows| default.clone().with_param("ROWS", rows);
+        let (_, _, kernel) = project_kernel();
+        let mut programs = Programs::of(true);
+        programs.grounded(&implementation, &default, &kernel);
+        assert_eq!((programs.holding(), programs.formed()), (0, 2));
+        let Programs::Launches(launches) = &mut programs else {
+            unreachable!()
+        };
+        // The defaults beside a challenger: only the challenger's variants.
+        let sources = launches.sources(&implementation, &[default.clone(), rows(32)], &[]);
+        assert_eq!(
+            sources.iter().map(|source| source.variants.len()).collect::<Vec<_>>(),
+            [1, 1]
+        );
+        launches.hold(sources, Ok(HeldPrograms(Box::new(())))).unwrap();
+        assert!(launches.sources(&implementation, &[default.clone()], &[]).is_empty());
+        assert_eq!((programs.holding(), programs.formed()), (2, 4));
+        programs.clear();
+        assert_eq!((programs.holding(), programs.formed()), (0, 4));
+        let Programs::Launches(launches) = &programs else {
+            unreachable!()
+        };
+        assert!(launches.sources(&implementation, &[default.clone()], &[]).is_empty());
+        // Formed whole, the canonical program is the ground's kernel: no
+        // challenger beside it compiles it again.
+        let mut whole = Programs::of(false);
+        whole.grounded(&implementation, &default, &kernel);
+        assert_eq!((whole.holding(), whole.formed()), (0, 1));
+        let formables = whole.formables(&implementation, &[default.clone(), rows(32)], &[]);
+        assert!(
+            matches!(formables.as_slice(), [Formable::Program(formed)] if *formed == rows(32)),
+            "only the challenger is formed"
+        );
+        assert!(whole.formables(&implementation, &[default.clone()], &[]).is_empty());
     }
 
     /// A configuration's record states the formation calls made for its
