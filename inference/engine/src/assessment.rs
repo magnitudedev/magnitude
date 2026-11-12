@@ -185,7 +185,7 @@ impl AssessmentStructure {
 pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, kernels: &Path, storage: &Path) -> Measurements {
     let records = KernelCache::measurement_records(kernels);
     let walked = ExecutorCosts::stored(topology, info, &records);
-    let costs_outstanding = walked.as_ref().ok().and_then(StoredCosts::outstanding);
+    let costs_outstanding = StoredCosts::outstanding_of(&walked);
     match walked {
         Ok(StoredCosts::Complete {
             costs,

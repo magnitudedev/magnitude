@@ -25,7 +25,7 @@ use super::client::{handshake, receive, Lost};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
-use magnitude_executor::assessment::{requests, ExecutorCosts, PointRequests};
+use magnitude_executor::assessment::{requests, ExecutorCosts, PointRequests, StoredCosts};
 use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
@@ -497,7 +497,7 @@ impl InProcessJobs {
     /// ([`PointRequests::outstanding`]).
     pub fn outstanding(&self) -> Result<magnitude_executor::assessment::Outstanding, String> {
         let records = KernelCache::measurement_records(&self.request.kernels);
-        let costs = ExecutorCosts::stored(&self.topology, &self.executor, &records).ok().and_then(|walked| walked.outstanding());
+        let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(&self.topology, &self.executor, &records));
         PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
     }
 
@@ -608,7 +608,7 @@ pub fn measure_machine(
     };
     let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
-    let costs = ExecutorCosts::stored(topology, executor, &records).ok().and_then(|walked| walked.outstanding());
+    let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(topology, executor, &records));
     let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &request.storage, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,

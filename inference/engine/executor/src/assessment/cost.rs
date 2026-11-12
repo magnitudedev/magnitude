@@ -533,7 +533,10 @@ impl ExpertLines {
             .map(|(layer, &host)| pass.lines(layer).map(|gpu| gpu.map(|gpu| Self { host, gpu })))
             .collect::<Option<Result<Arc<[Self]>, LineError>>>();
         match lines {
-            None => Priced::Pending("the executor's costs have not read host storage, the link line's".into()),
+            None => match pass.host_unobtainable() {
+                Some(unread) => Priced::Unavailable(format!("the executor's costs cannot read host storage, the link line's: {unread}")),
+                None => Priced::Pending("the executor's costs have not read host storage, the link line's".into()),
+            },
             Some(Ok(lines)) => Priced::Measured(lines),
             Some(Err(error)) => Priced::Unavailable(format!("a GPU line: {error}")),
         }

@@ -232,6 +232,12 @@ impl ExpertPass {
         (bytes.iter().map(|bytes| bytes.bytes).sum(), flops.iter().map(|flops| flops.flops).sum())
     }
 
+    /// Why [`Self::lines`] has none for good: the host route's activation
+    /// rate is one no job will measure ([`ExecutorCosts::unobtainable_along`]).
+    pub fn host_unobtainable(&self) -> Option<&super::executor_costs::Unobtainable> {
+        self.costs.unobtainable_along(OperandStorage::Host)
+    }
+
     /// Streamed layer `layer`'s expert on the GPU ([`super::cost::GpuLines`]):
     /// its record read in place where the host tier lies (host storage,
     /// `Tensor::shared`: across a discrete GPU's link) and from the GPU's

@@ -1250,7 +1250,7 @@ pub(crate) fn load_measures(pricing: &LoadPricing) -> Result<magnitude_executor:
     // The executor's costs walked once: what the load prices on, and the
     // part of them the job has points of left, which its requests ask.
     let walked = magnitude_executor::assessment::ExecutorCosts::stored(pricing.device.topology(), pricing.device.info(), &records);
-    let costs_outstanding = walked.as_ref().ok().and_then(magnitude_executor::assessment::StoredCosts::outstanding);
+    let costs_outstanding = magnitude_executor::assessment::StoredCosts::outstanding_of(&walked);
     let costs = crate::assessment::priced_costs(walked);
     if let Priced::Pending(reason) = &costs {
         return Err(format!("a load priced before its executor's costs were stored, which it plans on: {reason}"));
@@ -2181,7 +2181,7 @@ mod tests {
         let requests = [PointRequest::HostMemory { readers: 2 }, PointRequest::HostMemory { readers: 1 }];
         touch(root.path(), &identity, &requests);
         let records = seismic::measure::HeldStore::default();
-        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &executor, &records).ok().and_then(|walked| walked.outstanding());
+        let costs = magnitude_executor::assessment::StoredCosts::outstanding_of(&magnitude_executor::assessment::ExecutorCosts::stored(&topology, &executor, &records));
         let storage = root.path();
         let mut standing = magnitude_executor::assessment::requests::standing(&topology, &executor, storage).unwrap();
         // A CPU executor's graphs hold no memory: its graph cost is never outstanding.

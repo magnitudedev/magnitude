@@ -521,6 +521,38 @@ pub enum Derived {
     History(KvCodec),
 }
 
+/// How a step the walk reached ended without a figure ([`Stop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cannot {
+    /// Its point is recorded unobtainable.
+    Point,
+    /// It failed outside any point's timing.
+    Failed,
+}
+
+/// A figure the walk reached and could not read, which the costs price from
+/// the figures that were read ([`Derived`]) for good: no job has anything
+/// left to measure of it, unlike a figure whose point is merely unrecorded
+/// ([`StoredCosts::Complete`]'s `pending`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unobtainable {
+    pub figure: Derived,
+    /// The step that ended, as the walk names it.
+    pub step: String,
+    pub cannot: Cannot,
+    pub reason: String,
+}
+
+impl fmt::Display for Unobtainable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cannot = match self.cannot {
+            Cannot::Point => "its point is recorded unobtainable",
+            Cannot::Failed => "it failed",
+        };
+        write!(formatter, "{:?} cannot be read: step {} ended ({cannot}): {}", self.figure, self.step, self.reason)
+    }
+}
+
 /// A figure the costs need beside the probe, which no other prices: the
 /// costs are pending until it is read ([`StoredCosts::Missing`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -571,6 +603,9 @@ pub struct ExecutorCosts {
     /// Host seconds of one submit and wait beyond its device time (decode
     /// without lookahead).
     pub step_round_trip_seconds: MeasuredCost,
+    /// The figures the walk reached and could not read, each why: the ones
+    /// of [`Self::derived`] no job will ever measure.
+    pub unobtainable: Vec<Unobtainable>,
 }
 
 impl ExecutorCosts {
@@ -648,6 +683,16 @@ impl ExecutorCosts {
         std::iter::once(&placement.first).chain(&placement.rest).all(|&route| {
             route == self.first.route
                 || self.routes.iter().any(|costs| costs.route == route && costs.activation.is_some())
+        })
+    }
+
+    /// Why a route of `storage`'s placement has no activation rate read
+    /// ([`Self::reads_along`]) though the walk reached it: none while its
+    /// point is merely unrecorded, which a job measures.
+    pub fn unobtainable_along(&self, storage: OperandStorage) -> Option<&Unobtainable> {
+        let placement = self.placements.of(storage);
+        std::iter::once(&placement.first).chain(&placement.rest).find_map(|&route| {
+            self.unobtainable.iter().find(|unread| unread.figure == Derived::ActivationRate(route))
         })
     }
 
@@ -807,6 +852,16 @@ pub enum StoredCosts {
 }
 
 impl StoredCosts {
+    /// [`Self::outstanding`] of a retrace's verdict: an error is a terminal
+    /// one (a required figure recorded unobtainable, which plans as
+    /// unavailable), so a job has nothing to measure of it.
+    pub fn outstanding_of(stored: &Result<Self, ExecutorCostsError>) -> Option<CostWalk> {
+        match stored {
+            Ok(stored) => stored.outstanding(),
+            Err(_) => None,
+        }
+    }
+
     /// The first part of the walk with a point no record holds, which the
     /// job has points of left to measure, and every part after it: the
     /// required figures while one is unread, else the whole while a later
@@ -3630,6 +3685,22 @@ impl Step {
     fn streams(self) -> bool {
         matches!(self, Self::WeightRate(_, format, Pass::Rate) if format != Element::bf16())
     }
+
+    /// The figure this step reads, which the costs price from the others
+    /// where it ended ([`Cannot`]); none for the figures the costs require
+    /// ([`Required`]), whose ending is the walk's own.
+    fn unobtainable(self, walk: &Walk<'_>, cannot: Cannot, error: &ExecutorCostsError) -> Option<Unobtainable> {
+        let figure = match self {
+            Self::WeightRate(0, format, Pass::Rate) if format == Element::bf16() => return None,
+            Self::WeightRate(route, format, _) if format == Element::bf16() => Derived::ActivationRate(walk.routes[route].route),
+            Self::WeightRate(route, format, _) => Derived::WeightRate(walk.routes[route].route, format),
+            Self::Matrix(format) if format == Element::bf16() => Derived::ActivationMatrix,
+            Self::Matrix(format) => Derived::MatrixThroughput(format),
+            Self::Rung(layout, _) => Derived::History(layout),
+            Self::Launch(_) | Self::Chain => return None,
+        };
+        Some(Unobtainable { figure, step: self.to_string(), cannot, reason: error.to_string() })
+    }
 }
 
 impl fmt::Display for Step {
@@ -3824,9 +3895,13 @@ fn walk<T: Times>(
                             missing = Some(key);
                         }
                     }
-                    Stop::Failed(error) => failures.push(failed(&step.to_string())(&error)),
+                    Stop::Failed(error) => {
+                        read.unobtainable.extend(step.unobtainable(&walk, Cannot::Failed, &error));
+                        failures.push(failed(&step.to_string())(&error));
+                    }
                     // The point's own outcome reports it.
-                    Stop::Point(_) | Stop::Expired => {}
+                    Stop::Point(error) => read.unobtainable.extend(step.unobtainable(&walk, Cannot::Point, &error)),
+                    Stop::Expired => {}
                 }
             }
         }
@@ -3927,6 +4002,8 @@ struct Read {
     chain: Option<ChainRead>,
     activation_matrix: Option<MatrixCosts>,
     matrices: Vec<(Element, MatrixCosts)>,
+    /// The steps that ended without a figure ([`Unobtainable`]).
+    unobtainable: Vec<Unobtainable>,
 }
 
 /// A history layout's ladder as the walk has read it.
@@ -3955,6 +4032,7 @@ impl Read {
             chain: None,
             activation_matrix: None,
             matrices: Vec::new(),
+            unobtainable: Vec::new(),
         }
     }
 
@@ -4069,6 +4147,7 @@ impl Read {
             },
             step_pipelined_seconds: beyond(queued),
             step_round_trip_seconds: beyond(waited),
+            unobtainable: self.unobtainable,
         }))
     }
 }
@@ -5024,6 +5103,28 @@ impl ExecutorCosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host route whose activation rate no record can give is named, and
+    /// one merely unrecorded is not: the second is pending, the first never
+    /// ends ([`ExecutorCosts::unobtainable_along`]).
+    #[test]
+    fn a_host_route_that_cannot_be_read_is_named() {
+        let (device, link) = (super::super::synthetic::kind(0), super::super::synthetic::kind(1));
+        let mut costs = super::super::synthetic::costs();
+        costs.placements.host = Placement { first: device, rest: vec![link] };
+        costs.routes = vec![RouteCosts { route: link, activation: None, formats: Vec::new() }];
+        assert!(!costs.reads_along(OperandStorage::Host));
+        assert!(costs.unobtainable_along(OperandStorage::Host).is_none(), "unrecorded is pending, not unobtainable");
+        costs.unobtainable = vec![Unobtainable {
+            figure: Derived::ActivationRate(link),
+            step: "probe".into(),
+            cannot: Cannot::Point,
+            reason: "recorded unobtainable".into(),
+        }];
+        let unread = costs.unobtainable_along(OperandStorage::Host).expect("the host route is named");
+        assert_eq!(unread.figure, Derived::ActivationRate(link));
+        assert!(unread.to_string().contains("recorded unobtainable"));
+    }
 
     /// A point that touches the host holds the formation between its
     /// programs: none begins while it is held, and the hold waits for the
