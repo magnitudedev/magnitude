@@ -15,9 +15,19 @@
 // form (KEYWISE, `history_keywise_absorb`) lane t scores key t of each 32-key
 // batch over the whole width, so a score needs no subgroup reduction, and
 // each lane decodes its value columns (code * scale + zero) as it accumulates
-// them. The fresh span stays dense; the bias is folded into the output before
-// it. Partition 0 of a layer with fresh rows appends the row's key (prepared,
-// rounded to A) and value encoded (`history_encode`).
+// them. A key has one value, the one history will hold: the fresh span's
+// keys (prepared, rounded to A) and values are encoded in registers
+// (`history_quantize`) and absorbed by the same path as history's, in the
+// keywise form through the staging tile (`history_keywise_fresh_*`). The
+// bias joins the output once, after the walk. Partition 0 of a layer with
+// fresh rows appends the row's key and value encoded (`history_hold`).
+//
+// The vector form reads a key group's keys through its cursor
+// (`attention_cursor`) in batches at fixed positions of the row's sequence,
+// so under one specialization a row's result is bit for bit the same
+// whatever rows share its launch. The keywise form cuts its 32-key batches
+// at slab edges and before the fresh span, so its batches, and the order of
+// a row's sums, move with which of the row's keys are still fresh.
 //
 // Shared words: the subgroup states [SIMDS][G / SLICES][2] (floats), then the
 // prepared queries: in the vector form [ceil(G / 2)][W] (two activation-dtype
@@ -51,7 +61,8 @@
 #if SEISMIC_TUNE_MATRIX
 // The grouped-query matrix form: the prefill body's L2 over decode rows
 // (`lib/attention/prefill.glsl`, PREFILL_DECODE), 16 matrix rows per
-// subgroup; history tiles are staged as f16 and the products are cooperative
+// subgroup; history tiles are staged as f16, fresh tiles from their encoding
+// decoded the same way (`history_hold`), and the products are cooperative
 // matrices.
 #define PREFILL_DECODE
 #define PREFILL_ROWS (16u * uint(SEISMIC_TUNE_SIMDS))
@@ -122,12 +133,63 @@ decode_part decode_part_at(
         slab_region(h.value_coefficients, slab) + first_vector * pair_bytes, slab_rows - token % slab_rows);
 }
 
+// That row as history holds it: this lane's codes and its group's packed
+// pair (`history_quantize`, as `history_hold` encodes the row it appends).
+void decode_fresh_codes(const bool is_key, uint64_t token, uint kv_head, out uint w[HISTORY_LANE_WORDS],
+    out uint pair) {
+    float x[ATTENTION_E];
+    history_fresh_row(is_key, token, kv_head, SEISMIC_LANE, x);
+    history_quantize(is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS, x, w, pair);
+}
+
+// A vector-form key group's planes: its cursor's slab's key and value code
+// rows and (scale, zero) pair rows, from the cursor's kv head.
+struct decode_planes {
+    uint64_t key_rows;
+    uint64_t value_rows;
+    uint64_t key_pairs;
+    uint64_t value_pairs;
+};
+
+// Key `position` of `row`'s sequence (at or past the cursor's,
+// `attention_cursor`) for `kv_head`, as this lane's codes and its group's
+// (scale, zero) pair: a history row as stored, from the cursor's slab's
+// planes `p` (resolved again only when the cursor's slab moves), or a fresh
+// row as its append encodes it (`decode_fresh_codes`). The whole subgroup
+// calls it.
+void decode_read_codes(inout attention_cursor c, inout decode_planes p, attention_history h, uint64_t row,
+    uint kv_head, uint position, out uint k[HISTORY_LANE_WORDS], out vec2 kc, out uint v[HISTORY_LANE_WORDS],
+    out vec2 vc) {
+    bool moved;
+    const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, 0u, h.slab_rows, position, moved);
+    if (c.span < SEISMIC_DIM_R) {
+        const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
+        const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
+        const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
+        if (moved)
+            p = decode_planes(slab_region(h.key, c.slab) + uint64_t(kv_head) * key_bytes,
+                slab_region(h.value, c.slab) + uint64_t(kv_head) * value_bytes,
+                slab_region(h.key_coefficients, c.slab) + uint64_t(kv_head) * pair_bytes,
+                slab_region(h.value_coefficients, c.slab) + uint64_t(kv_head) * pair_bytes);
+        const uint64_t step = (index - c.slab_lo) * uint64_t(ATTENTION_KV);
+        const uint64_t pair = uint64_t(SEISMIC_LANE / HISTORY_PAIR_LANES) * 4ul;
+        history_lane_load(HISTORY_KEY_BITS, p.key_rows + step * key_bytes, SEISMIC_LANE, k);
+        history_lane_load(HISTORY_VALUE_BITS, p.value_rows + step * value_bytes, SEISMIC_LANE, v);
+        kc = unpackHalf2x16(element_u32_at(p.key_pairs + step * pair_bytes + pair));
+        vc = unpackHalf2x16(element_u32_at(p.value_pairs + step * pair_bytes + pair));
+        return;
+    }
+    uint key_pair, value_pair;
+    decode_fresh_codes(true, index, kv_head, k, key_pair);
+    decode_fresh_codes(false, index, kv_head, v, value_pair);
+    kc = unpackHalf2x16(key_pair);
+    vc = unpackHalf2x16(value_pair);
+}
+
 void attention_decode_k8v4_partial() {
     const uint64_t amplitudes = ATTENTION_AMPLITUDE_BUFFER;
-    const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
-    const uint64_t value = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
     const uint64_t query_norm = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM);
-    const uint64_t key_norm = SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM);
     const uint64_t components = SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS);
     const uint64_t frequencies = SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES);
     const uint64_t coordinates = SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES);
@@ -155,19 +217,9 @@ void attention_decode_k8v4_partial() {
     if (ATTENTION_FRESH && part == 0u) {
         const int destination = element_i32_at(destinations + row * 4ul);
         for (uint plane = sg; destination >= 0 && plane < 2u; plane += simds) {
-            const uint64_t source = (row * KV + kv_head) * W;
             float x[ATTENTION_E];
-            if (plane == 0u) {
-                attention_prepare(key + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_NORM,
-                    key_norm, row_coordinates, components, frequencies, amplitudes, epsilon, lane,
-                    ATTENTION_KEY_ROUNDING, x);
-                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                    x[i] = element_round(ELEMENT_ACT, x[i]);
-            } else {
-                attention_value(value + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_VALUE_NORM_BUFFER,
-                    epsilon, lane, x);
-            }
-            history_append(h, plane == 0u, destination, kv_head, lane, x);
+            history_fresh_row(plane == 0u, row, kv_head, lane, x);
+            history_hold(h, plane == 0u, destination, kv_head, lane, false, x);
         }
     }
 
@@ -231,8 +283,7 @@ void attention_decode_k8v4_partial() {
     }
     barrier();
     const uint head0 = attention_slice(sg) * ATTENTION_HEADS;
-    // The vector form holds the queries in registers throughout; the keywise
-    // form loads them for the fresh span only.
+    // The vector form holds the queries in registers throughout.
     float q[ATTENTION_HEADS][ATTENTION_E];
     float qsum[ATTENTION_HEADS];
     float maximum[ATTENTION_HEADS];
@@ -303,74 +354,61 @@ void attention_decode_k8v4_partial() {
                 denominator, result);
             position += n;
         }
-    }
-    // The walk starts on the span holding the group's first key.
-    const uvec2 located = attention_locate(visible, fresh, row, spans, range.x);
-    uint offset = located.y;
-    for (uint64_t span = located.x; span <= spans && offset < range.y; ++span) {
-        const bool historical = span < spans;
-        int lo, hi;
-        attention_span(visible, fresh, row, spans, span, lo, hi);
-        const uint length = uint(max(hi - lo, 0));
-        const uint begin = max(range.x, offset);
-        const uint end = min(range.y, offset + length);
-        if (historical) {
-            for (uint part_start = begin; !DECODE_KEYWISE && part_start < end;) {
-                const decode_part rows = decode_part_at(
-                    h, uint(lo) + (part_start - offset), slab_rows, kv_head, key_bytes, value_bytes, pair_bytes);
-                const uint part_end = min(end, part_start + rows.slab_keys);
-                for (uint position = part_start; position < part_end;) {
-                    const uint n = min(HISTORY_BATCH, part_end - position);
-                    uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
-                    uint v[HISTORY_BATCH][HISTORY_LANE_WORDS];
-                    vec2 kc[HISTORY_BATCH];
-                    vec2 vc[HISTORY_BATCH];
-                    [[unroll]] for (uint j = 0u; j < HISTORY_BATCH; ++j) {
-                        if (j < n) {
-                            const uint64_t step = uint64_t(position + j - part_start) * KV;
-                            const uint64_t key_code = rows.key_rows + step * key_bytes;
-                            const uint64_t value_code = rows.value_rows + step * value_bytes;
-                            const uint64_t key_pair = rows.key_pairs + step * pair_bytes;
-                            const uint64_t value_pair = rows.value_pairs + step * pair_bytes;
-                            history_lane_load(HISTORY_KEY_BITS, key_code, lane, k[j]);
-                            history_lane_load(HISTORY_VALUE_BITS, value_code, lane, v[j]);
-                            kc[j] = unpackHalf2x16(
-                                element_u32_at(key_pair + uint64_t(lane / HISTORY_PAIR_LANES) * 4ul));
-                            vc[j] = unpackHalf2x16(
-                                element_u32_at(value_pair + uint64_t(lane / HISTORY_PAIR_LANES) * 4ul));
-                        }
-                    }
-                    history_absorb_affine(n, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);
-                    position += n;
-                }
-                part_start = part_end;
+        // Then its fresh keys, the last of the row's sequence: they enter the
+        // history batch's scoring and value product through the tile,
+        // encoded as history will hold them.
+        int fresh_lo, fresh_hi;
+        attention_span(visible, fresh, row, spans, spans, fresh_lo, fresh_hi);
+        const uint fresh_first = total - uint(max(fresh_hi - fresh_lo, 0));
+        for (uint key = max(range.x, fresh_first); key < range.y;) {
+            const uint n = min(HISTORY_FRESH_KEYS, range.y - key);
+            const uint64_t first = uint64_t(fresh_lo) + (key - fresh_first);
+            // The tile's previous rows are read.
+            subgroupBarrier();
+            for (uint j = 0u; j < n; ++j) {
+                uint w[HISTORY_LANE_WORDS];
+                uint pair;
+                decode_fresh_codes(true, first + j, kv_head, w, pair);
+                history_keywise_fresh_key(j, w, pair, staging);
             }
-        } else {
-            // The dense absorb carries only the output: fold the bias in first.
-            [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g) {
-                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                    result[g][i] += bias[g];
-                bias[g] = 0.0;
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            float score[ATTENTION_HEADS];
+            history_keywise_fresh_score(n - 1u, staging, prepared, sums, head0, score);
+            // Its barriers order the key rows' reads before the values
+            // replace them.
+            attention_keywise_softmax(n, score, weights, maximum, denominator, result);
+            for (uint j = 0u; j < n; ++j) {
+                uint w[HISTORY_LANE_WORDS];
+                uint pair;
+                decode_fresh_codes(false, first + j, kv_head, w, pair);
+                history_keywise_fresh_value(j, w, pair, staging);
             }
-            if (DECODE_KEYWISE)
-                [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
-                    attention_keywise_columns(prepared, head0 + g, lane, q[g]);
-            for (uint position = begin; position < end; ++position) {
-                const uint64_t token = uint64_t(lo) + (position - offset);
-                const uint64_t at = (token * KV + kv_head) * W;
-                float k[4][ATTENTION_E];
-                float v[4][ATTENTION_E];
-                attention_prepare(key + at * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_NORM,
-                    key_norm, coordinates + token * 16ul, components, frequencies, amplitudes, epsilon, lane,
-                    ATTENTION_KEY_ROUNDING, k[0]);
-                [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                    k[0][i] = element_round(ELEMENT_ACT, k[0][i]);
-                attention_value(value + at * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)), ATTENTION_VALUE_NORM_BUFFER,
-                    epsilon, lane, v[0]);
-                attention_absorb(1u, q, k, v, maximum, denominator, result);
-            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            history_keywise_values(n, staging, weights, result);
+            key += n;
         }
-        offset += length;
+    } else {
+        // The vector form takes the group's keys in batches of HISTORY_BATCH
+        // at fixed positions range.x + i * HISTORY_BATCH of the row's
+        // sequence (the last batch the rest), each read through its cursor:
+        // history rows as stored, fresh rows as their append encodes them, so
+        // a row's reduction order is set by its keys' positions alone.
+        attention_cursor c = attention_cursor_at(visible, fresh, row, spans, 0u, range.x);
+        decode_planes planes = decode_planes(0ul, 0ul, 0ul, 0ul);
+        for (uint position = range.x; position < range.y;) {
+            const uint n = min(HISTORY_BATCH, range.y - position);
+            uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
+            uint v[HISTORY_BATCH][HISTORY_LANE_WORDS];
+            vec2 kc[HISTORY_BATCH];
+            vec2 vc[HISTORY_BATCH];
+            [[unroll]] for (uint j = 0u; j < HISTORY_BATCH; ++j)
+                if (j < n)
+                    decode_read_codes(c, planes, h, row, kv_head, position + j, k[j], kc[j], v[j], vc[j]);
+            history_absorb_affine(n, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);
+            position += n;
+        }
     }
     [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)

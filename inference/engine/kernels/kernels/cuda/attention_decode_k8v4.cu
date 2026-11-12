@@ -15,14 +15,18 @@
 // affine K8/V4 history.
 //
 // L1 `attention_decode_k8v4_partial`, one block per (kv head, partition, row),
-// partitioned and sliced over the query group exactly as the dense entry. History keys score as the sum over
-// groups of scale * (q . code) + zero * sum(q) and values accumulate
-// (p * scale) * code plus the bias sum(p * zero) of each lane's group, carried
-// through the online softmax by the same factor as the accumulator (`absorb`),
-// so no history element is decoded. The fresh span stays dense; the bias is
-// folded into the accumulator before it. Partition 0 of a layer with fresh
-// rows appends the row's key and value encoded. L2 `attention_decode_k8v4_merge`:
-// the dense entry's merge and gate.
+// partitioned and sliced over the query group exactly as the dense entry. Keys
+// score as the sum over groups of scale * (q . code) + zero * sum(q) and
+// values accumulate (p * scale) * code plus the bias sum(p * zero) of each
+// lane's group, carried through the online softmax by the same factor as the
+// accumulator (`absorb`), so no element is decoded. History rows are read as
+// stored; a fresh row is prepared and quantized in registers exactly as the
+// append encodes it (`AffineHistory::quantize`), so it is absorbed as history
+// holds it. Its batches of TOKENS keys start at each slab's part of a span
+// and at the fresh span, so the order of a row's sums, though not the values
+// it sums, moves with which of its keys are still fresh. Partition 0 of a
+// layer with fresh rows appends the row's key and value encoded. L2
+// `attention_decode_k8v4_merge`: the dense entry's merge and gate.
 //
 // Grouped-query matrix form (MATRIX = 1): `attention_decode`'s, over affine
 // history: producer warps decode code tiles into F16 operands beside the MMA
@@ -155,7 +159,7 @@ __device__ __forceinline__ void absorb(State &state, float (&bias)[H],
 }
 
 // Fold the per-head bias into the accumulator (it then carries the whole
-// attended sum), for the dense absorb or the publication.
+// attended sum), for the publication.
 __device__ __forceinline__ void fold(State &state, float (&bias)[H]) {
 #pragma unroll
     for (int h = 0; h < H; ++h) {
@@ -278,23 +282,41 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                             const u64 at = static_cast<u64>(min(token + t, part_hi - 1) - part_lo);
                             KeyCodes::load(key_rows + at * key_step, lane, k[t]);
                             ValueCodes::load(value_rows + at * value_step, lane, v[t]);
-                            kc[t] = attention::coefficients(key_pairs + at * key_pair_step);
-                            vc[t] = attention::coefficients(value_pairs + at * value_pair_step);
+                            kc[t] = attention::coefficients(key_pairs[at * key_pair_step]);
+                            vc[t] = attention::coefficients(value_pairs[at * value_pair_step]);
                         }
                         absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
                     }
                     part_lo = part_hi;
                 }
             } else {
-                fold(state, bias);
-                for (int token = lo; token < hi; ++token) {
-                    float k[1][DPL];
-                    float v[1][DPL];
-                    attention::prepared_key(in, token, kv, k[0], own, lane);
-                    attention::fresh_value(in, token, kv, v[0], lane);
-                    float score[1][H];
-                    attention::scores(q, k, score, lane);
-                    attention::absorb(state, score, v, 1);
+                // Fresh rows, encoded in registers as the append encodes them.
+                for (int token = lo; token < hi; token += TOKENS) {
+                    const int count = min(TOKENS, hi - token);
+                    u32 k[TOKENS][KeyCodes::words];
+                    u32 v[TOKENS][ValueCodes::words];
+                    float2 kc[TOKENS];
+                    float2 vc[TOKENS];
+#pragma unroll
+                    for (int t = 0; t < TOKENS; ++t) {
+                        // Past the span, zero codes and pairs: `absorb` skips
+                        // them.
+                        attention::AffineHistory::Encoding e{};
+                        if (t < count) {
+                            float key[DPL];
+                            float value[DPL];
+                            attention::prepared_key(in, token + t, kv, key, own, lane);
+                            attention::fresh_value(in, token + t, kv, value, lane);
+                            e = attention::AffineHistory::quantize(key, value);
+                        }
+#pragma unroll
+                        for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = e.key.codes[j];
+#pragma unroll
+                        for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = e.value.codes[j];
+                        kc[t] = attention::coefficients(e.key.pair);
+                        vc[t] = attention::coefficients(e.value.pair);
+                    }
+                    absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
                 }
             }
         }

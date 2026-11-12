@@ -21,7 +21,6 @@
 //
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
-#include <seismic/slab.glsl>
 #include "../core/matrix.glsl"
 
 #define FLASH_KEYS 32u
@@ -62,31 +61,6 @@ void flash_stage(const int kind, uint64_t plane, uint64_t row_stride, uint64_t c
         uvec4 bits = uvec4(0u);
         if (t < end) {
             bits = element_uvec4_at(plane + (uint64_t(t) * row_stride + column + c) * 2ul);
-            if (kind == ELEMENT_BF16) {
-                vec4 even, odd;
-                element_split8(ELEMENT_BF16, bits, even, odd);
-                bits = element_pack8(ELEMENT_F16, even, odd);
-            }
-        }
-        seismic_shared_uvec4[(base + k * flash_pitch(w) + c) / 8u] = bits;
-    }
-}
-
-// Stages a component whose rows live in separately allocated slabs: the w
-// columns from `column` of rows of `row_elements` elements. Each table
-// address already points to the component's region of its slab.
-void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint row_elements, uint column,
-    uint w, int first, int end, uint base) {
-    const uint pieces = w / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
-        const uint k = item / pieces;
-        const uint c = (item % pieces) * 8u;
-        const int t = first + int(k);
-        uvec4 bits = uvec4(0u);
-        if (t < end) {
-            const uint64_t row = slab_row(table, uint(t), uint(slab_rows),
-                uint64_t(row_elements) * ELEMENT_BYTES(kind));
-            bits = element_uvec4_at(row + uint64_t(column + c) * ELEMENT_BYTES(kind));
             if (kind == ELEMENT_BF16) {
                 vec4 even, odd;
                 element_split8(ELEMENT_BF16, bits, even, odd);

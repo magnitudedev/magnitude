@@ -309,12 +309,6 @@ vec4 attention_keywise_query(uint queries, uint head, uint column) {
     return uintBitsToFloat(seismic_shared_uvec4[(queries + head * ATTENTION_W + column) / 4u]);
 }
 
-// Lane `lane`'s E columns of query head `head` from the keywise queries.
-void attention_keywise_columns(uint queries, uint head, uint lane, out float q[ATTENTION_E]) {
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-        q[i] = seismic_shared_f32[queries + head * ATTENTION_W + lane * ATTENTION_E + i];
-}
-
 // Folds a batch of `n` keys into the online state from each lane's scores of
 // its key (lanes at or past `n` hold none): per head one maximum over the
 // batch; the outputs rescale, and the probabilities go to the subgroup's

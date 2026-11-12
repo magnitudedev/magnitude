@@ -152,7 +152,8 @@ bool decode_read(inout attention_cursor c, inout uint64_t keys, inout uint64_t v
 // batch, and so the row's reduction order, depends on its position alone,
 // never on which keys are still fresh (how many rows share the launch) or
 // where its spans, slabs and picks fall; and a fresh key and value are
-// attended exactly as they are appended.
+// attended exactly as they are appended. So under one specialization a row's
+// result is bit for bit the same whatever rows share its launch.
 //
 // Shared words: the subgroup states [SIMDS][ATTENTION_HEADS][2] (floats),
 // then the group's prepared queries [ceil(HEAD_GROUP / 2)][W] (two
@@ -186,7 +187,7 @@ void attention_decode_partial() {
         if (destination >= 0) {
             float x[ATTENTION_E];
             history_fresh_row(sg == 0u, row, kv_head, lane, x);
-            history_append(decode_history(), sg == 0u, destination, kv_head, lane, x);
+            history_hold(decode_history(), sg == 0u, destination, kv_head, lane, false, x);
         }
     }
 

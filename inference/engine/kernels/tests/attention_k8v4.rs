@@ -1,8 +1,9 @@
 // `attention_decode_k8v4` and `attention_prefill_k8v4` (affine K8/V4 history)
 // in Qwen's form on every accelerator present and the CPU: against their
 // portable body (the reference interpreter, small shapes) and against a host
-// model of that body (the dense host model over the decoded history, Qwen3.5
-// geometries and 512-column heads, long contexts).
+// model of that body (the dense host model over the decoded history and the
+// fresh rows' decoded encodings, Qwen3.5 geometries and 512-column heads, long
+// contexts).
 #![allow(dead_code)]
 
 mod common;
@@ -15,6 +16,7 @@ use seismic::{
 use seismic_lang::registry::{f16_bits, f16_to_f32};
 
 include!("attention_common/fixtures.rs");
+include!("attention_common/verify.rs");
 
 const KEY_BITS: u32 = 8;
 const VALUE_BITS: u32 = 4;
@@ -71,6 +73,13 @@ fn encode(x: &[f32], bits: u32) -> (Vec<u32>, Vec<u16>) {
         coefficients.extend([scale, zero]);
     }
     (words, coefficients)
+}
+
+/// A fresh vector as history holds it, which every read of it attends: its
+/// encoding decoded.
+fn held(x: &[f32], bits: u32) -> Vec<f32> {
+    let (codes, coefficients) = encode(x, bits);
+    decode(&codes, &coefficients, bits, x.len())
 }
 
 fn decode(words: &[u32], coefficients: &[u16], bits: u32, width: usize) -> Vec<f32> {
@@ -149,8 +158,9 @@ impl Encoded {
         Self { case, planes }
     }
 
-    /// The host model: the dense host model over the decoded history, and the
-    /// planes after the rows' appends (encoded prepared keys and values).
+    /// The host model: the dense host model over the decoded history, every
+    /// fresh row read as its encoding decoded, and the planes after the
+    /// rows' appends (encoded prepared keys and values).
     fn expected(&self) -> (Vec<f32>, Planes) {
         let geometry = self.case.geometry;
         let w = geometry.w();
@@ -160,7 +170,9 @@ impl Encoded {
             decoded.history_key[vector * w..][..w].copy_from_slice(&key);
             decoded.history_value[vector * w..][..w].copy_from_slice(&value);
         }
-        let (gated, keys, values) = decoded.expected();
+        let (gated, keys, values) = decoded.expected_holding(&|_, _| true, &|vector, key| {
+            held(vector, if key { KEY_BITS } else { VALUE_BITS })
+        });
         let mut planes = self.planes.clone();
         let (kw, vw) = (w * KEY_BITS as usize / 32, w * VALUE_BITS as usize / 32);
         let c = coefficient_elements(w);
@@ -881,6 +893,40 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
                 .collect()
         }
     }
+}
+
+/// A configuration's value of parameter `name`, where it names one.
+fn param(config: &[(&'static str, u64)], name: &str) -> Option<u64> {
+    config
+        .iter()
+        .find(|(param, _)| *param == name)
+        .map(|(_, value)| *value)
+}
+
+/// The first of `decode_configs` of `backend` at `geometry` of each kernel
+/// body or branch it selects, not per tuning size: Metal's vector form and
+/// its matrix form at each row tile (TOKENS), Vulkan's vector walks
+/// (KEYWISE) and matrix form, CUDA's vector form and matrix form with
+/// queries in shared memory and in registers (QREG), over heads wider than
+/// 256 columns also each column split (COLUMNS), and the CPU's one form.
+fn decode_forms(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
+    let wide = geometry.w() > 256;
+    let mut forms = Vec::new();
+    let mut chosen = Vec::new();
+    for config in decode_configs(backend, geometry) {
+        let form = [
+            param(&config, "MATRIX"),
+            param(&config, "TOKENS"),
+            param(&config, "KEYWISE"),
+            param(&config, "QREG"),
+            param(&config, "COLUMNS").filter(|_| wide),
+        ];
+        if !forms.contains(&form) {
+            forms.push(form);
+            chosen.push(config);
+        }
+    }
+    chosen
 }
 
 /// The specialization of `params` on `device`: GPU forms take the geometry's
@@ -1719,9 +1765,7 @@ fn metal_direct_prefill_resumes_across_rounds() {
         .iter()
         .fold(0f32, |largest, value| largest.max(value.abs()));
     for (index, (resumed, whole)) in resumed.iter().zip(&whole).enumerate() {
-        let step = f32::from_bits(
-            (resumed.abs().max(whole.abs()).to_bits() & 0x7f80_0000).saturating_sub(7 << 23),
-        );
+        let step = bf16_step(resumed.abs().max(whole.abs()));
         assert!(
             (resumed - whole).abs() <= (2.0 * step).max(scale / 2048.0),
             "element {index}: {resumed} over rounds, {whole} in one"
@@ -1758,6 +1802,11 @@ fn metal_direct_prefill_resumes_across_rounds() {
             &expected,
         );
     }
+}
+
+/// One BF16 rounding step at the magnitude of `x` (2^-7 of its binade).
+fn bf16_step(x: f32) -> f32 {
+    f32::from_bits((x.abs().to_bits() & 0x7f80_0000).saturating_sub(7 << 23))
 }
 
 /// Gated outputs agree with the host model within bf16 publication plus
@@ -2034,6 +2083,143 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
             &expected,
         );
     }
+}
+
+/// A decode row's result is the same at verify widths 1, 2, 4, 8 and 16
+/// under one specialization: the same row over the same affine history, its
+/// earlier block rows fresh keys at the wider widths and history rows (as the
+/// widest launch appended them) at the narrower. So a fresh key and value are
+/// read as their encoding, the one history holds, and a row's reduction order
+/// is set by key positions alone. On the CPU, on Metal and in Vulkan's vector
+/// form it is bit for bit the same; Metal's row tiles of several rows
+/// (TOKENS > 1) share tiles across rows and are not held to it.
+///
+/// CUDA's vector form and Vulkan's keywise form cut their key batches at slab
+/// edges and at the fresh span, and the matrix forms tile spans, so the order
+/// of a row's F32 sums moves with its fresh keys; they are held to one BF16
+/// rounding step of the row block's largest result: an F32 difference of a
+/// few units of its last place moves a BF16 result by at most one step, 2^-7
+/// of its binade. A result is a convex combination of values in [-1, 1) times
+/// a gate below 1, so that step is at most 2^-8, under 1/30 of a V4 step
+/// ((max - min) / 15 of a 32-column group, about 0.13 for these values), and
+/// about 1/250 of one at the outputs' typical magnitude (0.1). A key or value
+/// read other than as the encoding history holds moves a result by the key's
+/// weight (1/40 or more over the short histories) times up to half a V4 step,
+/// several such BF16 steps.
+///
+/// The histories: 8 rows (one key partition); 20 rows, whose block rows' 21
+/// to 36 keys cross the first 32-key partition and tile; and two spans over
+/// 64-row slabs, whose keys run across a span edge at position 70 and a slab
+/// edge at position 123 (history row 128), both inside a 4-key batch, before
+/// the block's rows, so at every width some batch straddles each.
+#[test]
+fn decode_rows_are_the_same_at_every_verify_width() {
+    // (label, history spans, store rows, rows per slab)
+    let histories: [(&str, &[(i32, i32)], usize, usize); 3] = [
+        ("8 history rows", &[(0, 8)], 24, 24),
+        ("20 history rows", &[(0, 20)], 36, 36),
+        ("two spans over 64-row slabs", &[(0, 70), (75, 150)], 192, 64),
+    ];
+    // Every configuration where other tests sweep them, one per form at
+    // Qwen3.6 35B's geometry.
+    type Configs = fn(BackendName, Geometry) -> Vec<Vec<(&'static str, u64)>>;
+    let geometries: [(&str, Geometry, u64, Configs); 3] = [
+        ("grouped", GROUPED, 120, decode_configs),
+        ("qwen35b", QWEN35B, 121, decode_forms),
+        ("sliced", SLICED, 122, decode_configs),
+    ];
+    let mut failures = Vec::new();
+    for device in seismic_native_tests::every_device() {
+        for (name, geometry, seed, configs) in geometries {
+            let row = geometry.kv * geometry.g * geometry.w();
+            for (history, spans, store, slab_rows) in histories {
+                let widest = Encoded::new(Case::new(
+                    geometry,
+                    store,
+                    spans.len(),
+                    &verify_rows(spans, VERIFY_ROWS),
+                    seed,
+                ));
+                for config in configs(device.backend(), geometry)
+                    .into_iter()
+                    .filter(|config| {
+                        device.backend() != BackendName::Metal
+                            || config
+                                .iter()
+                                .all(|&(name, value)| name != "TOKENS" || value == 1)
+                    })
+                {
+                    let label = format!("{name} {history} {:?} {config:?}", device.backend());
+                    let exact = match device.backend() {
+                        BackendName::Metal | BackendName::Cpu => true,
+                        BackendName::Vulkan => {
+                            param(&config, "MATRIX") == Some(0) && param(&config, "KEYWISE") == Some(0)
+                        }
+                        _ => false,
+                    };
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let kernel = decode_kernel(&device, geometry, &config);
+                        let run = |encoded: &Encoded| {
+                            let mut bound =
+                                Bound::new_with_slab_rows(&device, encoded, slab_rows, false);
+                            let gated = kernel
+                                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                                .unwrap()
+                                .value;
+                            (bf16_values(&gated), bound.planes())
+                        };
+                        let (wide, planes) = run(&widest);
+                        for width in [8usize, 4, 2, 1] {
+                            let first = VERIFY_ROWS - width;
+                            let mut case = Case::new(
+                                geometry,
+                                store,
+                                spans.len(),
+                                &verify_rows(spans, width),
+                                seed,
+                            );
+                            let tail = |values: &[f32]| {
+                                values[first * values.len() / VERIFY_ROWS..].to_vec()
+                            };
+                            case.query_gate = tail(&widest.case.query_gate);
+                            case.key = tail(&widest.case.key);
+                            case.value = tail(&widest.case.value);
+                            let narrow = Encoded {
+                                case,
+                                planes: planes.clone(),
+                            };
+                            let (actual, narrow_planes) = run(&narrow);
+                            let wide = &wide[first * row..];
+                            assert_eq!(actual.len(), wide.len());
+                            // One BF16 step at the result's largest magnitude:
+                            // a reordered F32 sum's error scales with its
+                            // terms, not with a result near zero.
+                            let tolerance = bf16_step(wide.iter().fold(0.0f32, |m, w| m.max(w.abs())));
+                            for (index, (a, w)) in actual.iter().zip(wide).enumerate() {
+                                let agree = if exact {
+                                    a.to_bits() == w.to_bits()
+                                } else {
+                                    (a - w).abs() <= tolerance
+                                };
+                                assert!(
+                                    agree,
+                                    "{label}: width {width}'s element {index} is {a}, width 16's {w}"
+                                );
+                            }
+                            assert_eq!(
+                                narrow_planes, planes,
+                                "{label} width {width}: history planes"
+                            );
+                        }
+                    }));
+                    if outcome.is_err() {
+                        failures.push(label);
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
 }
 
 /// Nemotron 3.5 Bolt's draft attention: 2 kv heads of 16 query heads, 128
@@ -3078,8 +3264,8 @@ fn tuning_requirement(scale: f64) -> seismic::NumericalRequirement {
     }
 }
 
-/// A single fresh key has a simple independent result: its normalized value,
-/// repeated for every query head. This catches the actual Gemma form defect
+/// A single fresh key has a simple independent result: its normalized value as
+/// history holds it, repeated for every query head. This catches the actual Gemma form defect
 /// without assuming the default native implementation is mathematically correct.
 #[test]
 fn gemma_tuner_rejects_corrupted_fresh_only_attention() {
@@ -3161,8 +3347,12 @@ fn gemma_fresh_only_with_scale(scale: f64) {
     for value in encoded.case.value.chunks_exact(w) {
         let squares = value.iter().map(|v| v * v).sum::<f32>();
         let inverse = 1. / (squares / w as f32 + encoded.case.epsilon).sqrt();
+        let value = held(
+            &value.iter().map(|v| bf16(v * inverse)).collect::<Vec<_>>(),
+            VALUE_BITS,
+        );
         for _ in 0..geometry.g {
-            expected.extend(value.iter().map(|v| bf16(v * inverse)));
+            expected.extend(value.iter().map(|v| bf16(*v)));
         }
     }
     // A survey measures and times every configuration; the ones its
@@ -3208,7 +3398,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
 }
 
 /// The target's ordered append and prepared-cache visibility preserve the
-/// serial dense-self computation across scalar and packed matrix forms.
+/// serial computation across scalar and packed matrix forms.
 #[test]
 fn prepared_causal_verification_matches_committed_prefix() {
     let geometry = Geometry {
@@ -3265,7 +3455,8 @@ fn prepared_causal_verification_matches_committed_prefix() {
             let committed = run(&serial);
             // A separate preparation makes every destination available before
             // attention. Redirect only the prior fresh row through the cache;
-            // the query's own row remains dense, preserving serial semantics.
+            // the query's own row stays fresh, read as its encoding as the
+            // serial launch reads it.
             let mut prepared = Bound::new(&device, &batch);
             let append = attention_append_k8v4::native_for_device_with(
                 &device,
@@ -3296,9 +3487,9 @@ fn prepared_causal_verification_matches_committed_prefix() {
             assert_eq!(
                 &normalized[64..128],
                 &committed[64..128],
-                "prepared cache view must preserve dense-self serial semantics"
+                "prepared cache view must preserve the serial semantics"
             );
-            eprintln!("prepared-cache prior + dense self matches committed prefix exactly");
+            eprintln!("prepared-cache prior + fresh self matches committed prefix exactly");
             let max = batched[64..128]
                 .iter()
                 .zip(&committed[64..128])
@@ -3351,7 +3542,8 @@ fn ordered_append_matches_fused_codec() {
     }
 }
 
-/// With one visible key, attention returns its normalized value. Fully
+/// With one visible key, attention returns its normalized value as history
+/// holds it. Fully
 /// rotary 512-column scalar heads exposed native BF16 casts producing F16
 /// bits (1.0 became 0.0078125), hidden by comparison to the native default.
 #[test]
@@ -3384,7 +3576,11 @@ fn metal_gemma_fresh_scalar_preserves_bf16_values() {
             .flat_map(|value| {
                 let squares = value.iter().map(|v| v * v).sum::<f32>();
                 let inverse = 1.0 / (squares / w as f32 + encoded.case.epsilon).sqrt();
-                (0..geometry.g).flat_map(move |_| value.iter().map(move |v| bf16(v * inverse)))
+                let value = held(
+                    &value.iter().map(|v| bf16(v * inverse)).collect::<Vec<_>>(),
+                    VALUE_BITS,
+                );
+                (0..geometry.g).flat_map(move |_| value.clone().into_iter().map(bf16))
             })
             .collect();
         let mut bound = Bound::new(&device, &encoded);
@@ -3897,14 +4093,23 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
             for head in 0..h {
                 let kh = head / g;
                 let q = &case.query_gate[(row * h + head) * w..][..w];
-                let keys = (0..case.history_rows)
-                    .map(|t| (&hk[(t * kv + kh) * w..][..w], &hv[(t * kv + kh) * w..][..w]))
-                    .chain((0..=row).map(|t| {
-                        (
+                // Over encoded history, a fresh row is read as history holds it.
+                let fresh = (0..=row)
+                    .map(|t| {
+                        let (k, v) = (
                             &case.key[(t * kv + kh) * w..][..w],
                             &case.value[(t * kv + kh) * w..][..w],
-                        )
-                    }))
+                        );
+                        if planes.is_some() {
+                            (held(k, KEY_BITS), held(v, VALUE_BITS))
+                        } else {
+                            (k.to_vec(), v.to_vec())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let keys = (0..case.history_rows)
+                    .map(|t| (&hk[(t * kv + kh) * w..][..w], &hv[(t * kv + kh) * w..][..w]))
+                    .chain(fresh.iter().map(|(k, v)| (&k[..], &v[..])))
                     .collect::<Vec<_>>();
                 let scores = keys
                     .iter()

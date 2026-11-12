@@ -86,21 +86,32 @@ template <int B> struct LaneCodes {
         }
     }
 
+    // Code i of this lane's dimensions.
+    __device__ static __forceinline__ u32 at(const u32 (&w)[words], int i) {
+        return (w[i * B / 32] >> ((i * B) % 32)) & levels;
+    }
+
     // Code i of this lane's dimensions, as F32 (exact): the code in the
     // mantissa of 2^23, minus 2^23 (no conversion instruction).
     __device__ static __forceinline__ float code(const u32 (&w)[words], int i) {
-        return __uint_as_float(0x4B000000u | ((w[i * B / 32] >> ((i * B) % 32)) & levels)) -
-               8388608.0f;
+        return __uint_as_float(0x4B000000u | at(w, i)) - 8388608.0f;
     }
 };
 
-// Encodes one vector held by a warp (lane `lane` owns dimensions
-// [lane * DPL, (lane + 1) * DPL)) as B-bit codes at `row` (its code row) and
-// its group (scale, zero) pairs at `pairs`: per group, zero = f16(min),
-// scale = f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale,
-// 0.5))), 0 when scale is 0.
+// A lane's share of an encoded vector: its DPL codes, laid out as
+// `LaneCodes::load` returns a code row's, and its group's (scale, zero) pair
+// as stored (F16 scale in the low half, zero in the high).
+template <int B> struct LaneEncoding {
+    u32 codes[LaneCodes<B>::words];
+    u32 pair;
+};
+
+// This lane's share of the B-bit encoding of one vector held by a warp (each
+// lane owns its DPL consecutive dimensions; the whole warp calls it): per
+// group, zero = f16(min), scale = f16((max - min) / L), code = min(L,
+// u32(fma(x - zero, 1 / scale, 0.5))), 0 when scale is 0.
 template <int B>
-__device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pairs, int lane) {
+__device__ __forceinline__ LaneEncoding<B> quantize(const float (&x)[DPL]) {
     typedef LaneCodes<B> Codes;
     float low = x[0];
     float high = x[0];
@@ -120,35 +131,42 @@ __device__ __forceinline__ void encode(const float (&x)[DPL], u32 *row, u32 *pai
     const float zero = seismic_f16_to_f32(zero_bits);
     const float scale = seismic_f16_to_f32(scale_bits);
     const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
-    u32 w[Codes::words];
+    LaneEncoding<B> e;
 #pragma unroll
-    for (int j = 0; j < Codes::words; ++j) w[j] = 0u;
+    for (int j = 0; j < Codes::words; ++j) e.codes[j] = 0u;
 #pragma unroll
     for (int d = 0; d < DPL; ++d) {
         const float t = __fmaf_rn(x[d] - zero, inverse, 0.5f);
         const u32 c = min(static_cast<u32>(fmaxf(t, 0.0f)), Codes::levels);
-        w[d * B / 32] |= c << ((d * B) % 32);
+        e.codes[d * B / 32] |= c << ((d * B) % 32);
     }
+    e.pair = static_cast<u32>(scale_bits) | (static_cast<u32>(zero_bits) << 16);
+    return e;
+}
+
+// Stores a warp's encoding of one vector: its codes at `row` (its code row)
+// and its group pairs at `pairs` (the whole warp calls it).
+template <int B>
+__device__ __forceinline__ void store_encoding(const LaneEncoding<B> &e, u32 *row, u32 *pairs,
+                                               int lane) {
+    typedef LaneCodes<B> Codes;
     if constexpr (Codes::bits >= 32) {
 #pragma unroll
-        for (int j = 0; j < Codes::words; ++j) row[lane * Codes::words + j] = w[j];
+        for (int j = 0; j < Codes::words; ++j) row[lane * Codes::words + j] = e.codes[j];
     } else {
         // 32 / bits neighbouring lanes share a word: join their parts.
         constexpr int sharing = 32 / Codes::bits;
-        u32 joined = w[0] << ((lane % sharing) * Codes::bits);
+        u32 joined = e.codes[0] << ((lane % sharing) * Codes::bits);
 #pragma unroll
         for (int offset = 1; offset < sharing; offset *= 2)
             joined |= seismic_shfl_xor_u32(joined, offset);
         if (lane % sharing == 0) row[lane / sharing] = joined;
     }
-    if (lane % PAIR_LANES == 0)
-        pairs[lane / PAIR_LANES] = static_cast<u32>(scale_bits) | (static_cast<u32>(zero_bits) << 16);
+    if (lane % PAIR_LANES == 0) pairs[lane / PAIR_LANES] = e.pair;
 }
 
 // A (scale, zero) pair, as F32.
-__device__ __forceinline__ float2 coefficients(const u32 *pair) {
-    return seismic_unpack_f16x2(*pair);
-}
+__device__ __forceinline__ float2 coefficients(u32 pair) { return seismic_unpack_f16x2(pair); }
 
 // Affine history: code planes [T, KV, W * B / 32] u32 and (scale, zero)
 // planes [T, KV, 2 * PAIRS] f16 per vector kind. Every plane is canonical: a
@@ -209,13 +227,27 @@ struct AffineHistory {
                        at(value_pairs, value_pairs_row * 2, value_pairs_head / 2)};
     }
 
-    // The key is the prepared key rounded to the activation element (as `k`
-    // holds it), the value the projected value.
+    // A lane's share of a key's and a value's encodings.
+    struct Encoding {
+        LaneEncoding<KEY_BITS> key;
+        LaneEncoding<VALUE_BITS> value;
+    };
+    // The encodings of a key and a value held by a warp (the whole warp calls
+    // it): the key is the prepared key rounded to the activation element (as
+    // `k` holds it), the value the projected value. Every read of a batch row
+    // reads this encoding, as history holds it.
+    __device__ static __forceinline__ Encoding quantize(const float (&k)[DPL], const float (&v)[DPL]) {
+        return Encoding{attention::quantize<KEY_BITS>(k), attention::quantize<VALUE_BITS>(v)};
+    }
+    __device__ __forceinline__ void store(int destination, int kv_head, const Encoding &e,
+                                          int lane) const {
+        store_encoding(e.key, key_row(destination, kv_head), key_pair(destination, kv_head), lane);
+        store_encoding(e.value, value_row(destination, kv_head), value_pair(destination, kv_head),
+                       lane);
+    }
     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],
                                            const float (&v)[DPL], int lane) const {
-        encode<KEY_BITS>(k, key_row(destination, kv_head), key_pair(destination, kv_head), lane);
-        encode<VALUE_BITS>(v, value_row(destination, kv_head), value_pair(destination, kv_head),
-                           lane);
+        store(destination, kv_head, quantize(k, v), lane);
     }
 };
 

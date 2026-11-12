@@ -202,6 +202,17 @@ impl Case {
     /// `expected` where row `row` reads its key `o` (spans in order, then
     /// fresh rows) only when `reads(row, o)`: a WorkList prefill.
     fn expected_reading(&self, reads: &dyn Fn(usize, usize) -> bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.expected_holding(reads, &|vector, _| vector.to_vec())
+    }
+
+    /// `expected_reading` over a history that holds a fresh row's prepared
+    /// key (`key`) or value as `held(vector, key)`, which is what every read
+    /// of the row attends; the histories returned hold the prepared rows.
+    fn expected_holding(
+        &self,
+        reads: &dyn Fn(usize, usize) -> bool,
+        held: &dyn Fn(&[f32], bool) -> Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let Geometry { kv, g, .. } = self.geometry;
         let w = self.geometry.w();
         let keys = (0..self.rows)
@@ -212,6 +223,18 @@ impl Case {
                             &self.key[(row * kv + head) * w..][..w],
                             &self.key_norm,
                             row,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let fresh = (0..self.rows)
+            .map(|row| {
+                (0..kv)
+                    .map(|head| {
+                        (
+                            held(&keys[row][head], true),
+                            held(&self.value[(row * kv + head) * w..][..w], false),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -238,10 +261,8 @@ impl Case {
                 }
                 for token in self.fresh[row * 2].max(0)..self.fresh[row * 2 + 1] {
                     let token = token as usize;
-                    entries.push((
-                        &keys[token][kv_head],
-                        &self.value[(token * kv + kv_head) * w..][..w],
-                    ));
+                    let (key, value) = &fresh[token][kv_head];
+                    entries.push((&key[..], &value[..]));
                 }
                 let entries = entries
                     .into_iter()

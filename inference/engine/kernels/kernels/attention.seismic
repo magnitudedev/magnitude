@@ -22,8 +22,13 @@
 # order (C = W / 16 halves). Keys use 8-bit codes (L = 255, four per u32
 # word), values 4-bit codes (L = 15, eight per word); code i sits at bits
 # B * (i % (32 / B)) of word i / (32 / B). The key encoded is the prepared key
-# rounded to the activation dtype, the value the projected value. Fresh rows
-# of the batch attend dense; only history is encoded.
+# rounded to the activation dtype, the value the projected value.
+#
+# A key has one value: the one history will hold. A fresh row of the batch has
+# one encoding, the one appended for it, and every read of it decodes that
+# encoding, so a row attends an earlier row of its batch exactly as a later
+# one-row decode reads it from history. The encode is deterministic, so a
+# backend may repeat it per reader rather than store it first.
 fn affine_encode[W, N, C](x: &tensor[W] f32, codes: &mut tensor[N] u32,
     coefficients: &mut tensor[C] f16):
     let levels = (u32(1) << u32(32 * N / W)) - u32(1)
@@ -1020,8 +1025,13 @@ native attention_decode for cuda from "cuda/attention_decode.cu":
 # row alone (a pick of -1 scores -inf), so picks add no launch.
 #
 # The vector form takes a row's keys in batches at fixed positions of its
-# key sequence (`attention_cursor`), history, fresh keys and picks alike, a
-# fresh key and value prepared exactly as they are appended.
+# key sequence (`attention_cursor`), history, fresh keys and picks alike, and
+# the matrix form's one-row tiles (16 * SIMDS / G = 1) take them in key tiles
+# cut at fixed positions; a fresh key and value are prepared exactly as they
+# are appended. Under one specialization of either, a row's result is bit
+# for bit the same whatever rows share its launch, and whichever of its keys
+# are still fresh. Matrix row tiles of several rows share their key tiles
+# across rows and do not hold this.
 native attention_decode for vulkan from "vulkan/attention_decode.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
@@ -1270,10 +1280,10 @@ native attention_prefill for cpu from "cpu/attention_prefill.rs":
 
 
 # The family over affine K8/V4 history (the `affine_k8_uniform_v4` codec;
-# `affine_encode`, `affine_decode`): `attention_rows` with every history key
-# and value decoded as it is absorbed and the fresh rows' prepared key (as
-# rounded to the activation dtype) and value encoded at their destinations.
-# Fresh rows of the batch attend dense.
+# `affine_encode`, `affine_decode`): `attention_rows` with every key and value
+# decoded as it is absorbed. The fresh rows' prepared key (as rounded to the
+# activation dtype) and value each have one encoding: what the fresh span
+# attends and what is stored at their destinations.
 fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, VP, SK, RA, RT, RO](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
@@ -1292,6 +1302,12 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, 
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1:
     let mut fresh_key = tensor[F, M, KV, 2 * P + S] A
     let mut fresh_value = tensor[F, M, KV, 2 * P + S] A
+    let mut fresh_key_codes = tensor[F, M, KV, KC] u32
+    let mut fresh_key_coefficients = tensor[F, M, KV, KP] f16
+    let mut fresh_value_codes = tensor[F, M, KV, VC] u32
+    let mut fresh_value_coefficients = tensor[F, M, KV, VP] f16
+    let mut held_key = tensor[F, M, KV, 2 * P + S] f32
+    let mut held_value = tensor[F, M, KV, 2 * P + S] f32
     for layer in 0..F:
         for row in 0..M:
             for head in 0..KV:
@@ -1302,6 +1318,15 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, 
                 fresh_value[layer, row, head] = head_norm(
                     value[layer, row, head * (2 * P + S) : (head + 1) * (2 * P + S)],
                     value_norm, epsilon)
+                if (2 * P + S) / 16 >= 1 and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
+                    affine_encode(f32(fresh_key[layer, row, head]), fresh_key_codes[layer, row, head],
+                        fresh_key_coefficients[layer, row, head])
+                    affine_encode(f32(fresh_value[layer, row, head]), fresh_value_codes[layer, row, head],
+                        fresh_value_coefficients[layer, row, head])
+                    affine_decode(fresh_key_codes[layer, row, head],
+                        fresh_key_coefficients[layer, row, head], held_key[layer, row, head])
+                    affine_decode(fresh_value_codes[layer, row, head],
+                        fresh_value_coefficients[layer, row, head], held_value[layer, row, head])
     let mut result = tensor[M, KV * G, 2 * P + S] A
     let mut decoded_key = tensor[2 * P + S] f32
     let mut decoded_value = tensor[2 * P + S] f32
@@ -1345,16 +1370,14 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, 
             let fresh_hi = fresh[row, 1]
             for layer in 0..F:
                 if fresh_hi > fresh_lo and fresh_lo >= 0:
-                    if B == 0:
-                        attention_update(qt, fresh_key[layer, fresh_lo : fresh_hi, kv_head],
-                            fresh_value[layer, fresh_lo : fresh_hi, kv_head], maximum,
-                            denominator, accumulator, scale)
-                    else:
-                        for token in fresh_lo..fresh_hi:
-                            if token < M and block_read(selection[row], ordinal + token - fresh_lo, block_rows):
-                                attention_absorb(qt, f32(fresh_key[layer, token, kv_head]),
-                                    f32(fresh_value[layer, token, kv_head]), maximum, denominator,
-                                    accumulator, scale)
+                    for token in fresh_lo..fresh_hi:
+                        let mut read = token < M
+                        if read and B > 0:
+                            read = block_read(selection[row], ordinal + token - fresh_lo, block_rows)
+                        if read:
+                            attention_absorb(qt, held_key[layer, token, kv_head],
+                                held_value[layer, token, kv_head], maximum, denominator,
+                                accumulator, scale)
             for head in 0..G:
                 # A sink adds its logit's weight to the denominator only.
                 let mut total = denominator[head]
@@ -1373,12 +1396,10 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, 
         for row in 0..M:
             if destinations[row] >= 0 and (2 * P + S) / 16 >= 1 and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
                 for head in 0..KV:
-                    affine_encode(f32(fresh_key[layer, row, head]),
-                        history_key_codes[destinations[row], head],
-                        history_key_coefficients[destinations[row], head])
-                    affine_encode(f32(fresh_value[layer, row, head]),
-                        history_value_codes[destinations[row], head],
-                        history_value_coefficients[destinations[row], head])
+                    history_key_codes[destinations[row], head, :] = fresh_key_codes[layer, row, head]
+                    history_key_coefficients[destinations[row], head, :] = fresh_key_coefficients[layer, row, head]
+                    history_value_codes[destinations[row], head, :] = fresh_value_codes[layer, row, head]
+                    history_value_coefficients[destinations[row], head, :] = fresh_value_coefficients[layer, row, head]
     return result
 
 # Decode rows (M <= 8) over affine K8/V4 history: `attention_decode`'s
@@ -1556,8 +1577,9 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, KC, KP, VC, V
         history_value_coefficients, layout, epsilon, scale, gate_function)
 
 # Prefill rows (M >= 16) over affine K8/V4 history: `attention_prefill`'s
-# launches with the prepare launch appending encoded rows and every history
-# K/V tile decoded (rounded to F16) as it is staged.
+# launches with the prepare launch encoding each row once, appending that
+# encoding and putting it in the fresh rows' scratch decoded (rounded to F16)
+# as every history K/V tile is decoded as it is staged.
 #
 # `history_tiles` (L = 1) lists the history row tiles the call's rows see:
 # the distinct tiles (256 rows; tile t is rows [256 t, 256 t + 256), the unit
@@ -1634,6 +1656,14 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
 # starting at 1 it was at most 9.17x (median 1.53x). With the output rotary
 # (RO = 1) the merge holds each head's whole row and turns it back in F32
 # before publishing it, as `attention_decode`'s.
+#
+# A fresh key and value are read as their encoding, as history holds them,
+# and a row of its own (TOKENS = 1, either form) takes its keys at fixed
+# positions of its key sequence (the vector form walks its spans and slab
+# parts and gathers a batch that an edge cuts, and the fresh rows, into a
+# pending batch), so under one specialization its result is bit
+# for bit the same whatever rows share its launch. Row tiles of several rows
+# (TOKENS > 1) share their tiles across rows and do not hold this.
 native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
@@ -1671,6 +1701,11 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
 # splits into: at 64 (Qwen3.6 35B's G = 8, W = 256 at SLICES 1, WARPS 4) the
 # history batch's scores and values beside them take the RTX 3090's 255
 # registers a thread and spill 104 bytes (LOCAL_SIZE_BYTES).
+#
+# A fresh key and value are read as their encoding, as history holds them,
+# but the vector form's batches start at each slab's part of a span and at
+# the fresh span, so the order of a row's sums moves with which of its keys
+# are still fresh.
 native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic PARTS in [12, 24, 48, 96] default 12, arithmetic WARPS in [4, 8, 1, 2] default 4,
@@ -1707,6 +1742,14 @@ native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
 # 255-register ceiling and spills (NVIDIA 595), and Qwen3.6 35B's recorded
 # searches chose KEYWISE 1, SIMDS 2 on the RTX 3090 and on GB10, 3x (GB10)
 # and up to 18x (RTX 3090, 3838 tokens) faster than KEYWISE 0, SIMDS 4.
+#
+# A fresh key and value are read as their encoding, as history holds them.
+# The vector form (KEYWISE 0) takes a row's keys in batches at fixed
+# positions of its key sequence (`attention_cursor`), so under one
+# specialization its result is bit for bit the same whatever rows share its
+# launch; the keywise form cuts its batches at slab edges and before the
+# fresh span, so the order of a row's sums moves with which of its keys are
+# still fresh.
 native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
@@ -1725,8 +1768,9 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
 
 # CPU: the dense CPU decode's launch: `attend` prepares its own queries, keys
 # and values, part 0 appends the encoded row, and it decodes history keys and
-# values (F32) as it absorbs them; the last item of a (kv head, row) to arrive
-# merges. W is whole affine groups.
+# values (F32) as it absorbs them, its fresh keys and values as history will
+# hold them (encoded and decoded back); the last item of a (kv head, row) to
+# arrive merges. W is whole affine groups.
 native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic PARTS in [8, 4, 16, 1] default 8)
@@ -1896,8 +1940,9 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
         threads_per_threadgroup (2 * P + S, 1, 1)
 
 # Vulkan: the dense prefill's launches (`vulkan/lib/attention/prefill.glsl`);
-# the prepare launch appends encoded rows and history tiles decode (rounded to
-# the f16 operand) as they are staged.
+# the prepare launch encodes each row once, appending the encoding and
+# writing it decoded (rounded to the f16 operand) to the fresh rows' scratch,
+# as history tiles decode as they are staged.
 native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256)
@@ -1924,9 +1969,10 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CPU: the dense CPU prefill's launches; `prepare` appends encoded rows and
-# `attend` decodes history keys and values (F32) as it absorbs them. W is
-# whole affine groups.
+# CPU: the dense CPU prefill's launches; `prepare` appends the encoded row and
+# leaves each fresh key and value in the scratch as history will hold them
+# (encoded and decoded back), and `attend` decodes history keys and values
+# (F32) as it absorbs them. W is whole affine groups.
 native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0

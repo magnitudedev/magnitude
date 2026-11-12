@@ -15,9 +15,11 @@
 #define ATTENTION_INTERLEAVED SEISMIC_DIM_I
 #define ATTENTION_SEPARATE SEISMIC_DIM_U
 // attention_prefill_k8v4 (M >= 16): `attention_prefill` over affine K8/V4
-// history (bodies in lib/attention/prefill.cuh): the prepare launch appends
-// encoded rows; the attend launch's producer warps decode code tiles into F16
-// operands beside its MMA warps (every product is F16).
+// history (bodies in lib/attention/prefill.cuh): the prepare launch encodes
+// each batch row once, appends the encoding and puts it, decoded as a history
+// tile is, in scratch as the fresh rows' F16 operands; the attend launch's
+// producer warps decode code tiles into F16 operands beside its MMA warps
+// (every product is F16).
 
 #define ATTENTION_STAGES SEISMIC_TUNE_STAGES
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS

@@ -5,9 +5,11 @@
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_prefill_k8v4: streaming attention for prefill rows over affine
 // K8/V4 history. The body (three launches) is `lib/attention/prefill.glsl`: the
-// prepare launch appends encoded rows and every history K/V tile decodes
-// (code * scale + zero, rounded to the f16 operand) as it is staged, so the
-// products are those of the dense form over the decoded history.
+// prepare launch encodes each fresh row once, appending the encoding and
+// storing it decoded to the f16 fresh scratch, and every history K/V tile
+// decodes (code * scale + zero, rounded to the f16 operand) as it is staged,
+// so the products are those of the dense form over the decoded history and
+// fresh rows alike.
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)

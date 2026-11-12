@@ -5,11 +5,12 @@
 // `attention_history` (lib/attention/history.glsl), which is all that differs.
 //
 // L1 (prepare): one subgroup per (row, query or kv head), rows padded to whole
-// QT tiles, prepares the query or the key (rounded to A) and stores it to
-// scratch as f16, the attention operand type; the value is copied beside the
-// key, and K/V are appended to the history at the row's destination (dense in
-// A, or encoded). Queries sit at [KV][rows][G][W], so the QT x G matrix rows
-// of one (tile, kv head) are consecutive rows of stride W.
+// QT tiles, prepares the query, or the key (rounded to A) and the value, and
+// stores them to scratch as f16, the attention operand type. K/V are stored
+// as history holds them (`history_hold`): dense, as prepared; affine, their
+// encoding decoded, the one encoding also appended at the row's destination.
+// Queries sit at [KV][rows][G][W], so the QT x G matrix rows of one (tile, kv
+// head) are consecutive rows of stride W.
 //
 // L2 (attend): workgroup (QT-row tile, kv head, key partition); its QT * G
 // matrix rows (token-major, head-minor) split into 16-row blocks, one per
@@ -36,9 +37,13 @@
 // (PREFILL_PREPARED, the entry's choice for a query group whose prepared
 // queries exceed the shared bytes), it prepares its own query tile into
 // shared memory after the subgroup scratch ([ROWS][W + 8] f16) and its fresh
-// K/V tiles (prepared and rounded as L1 would), partition 0 appending the
-// tile's rows. The key tiles, then with an index-list source (PREFILL_PICKS)
-// each row's pick tiles in row order, split into equal runs over
+// K/V tiles (prepared and held as L1 holds them), partition 0 appending the
+// tile's rows. A tile of one row (QT = 1) cuts its key tiles at fixed
+// positions of the row's key sequence, history and fresh keys alike, so over
+// dense history the row's result does not depend on which rows share its
+// launch; a tile of several rows tiles each span's union interval. The key
+// tiles, then with an index-list source (PREFILL_PICKS) each row's pick
+// tiles in row order, split into equal runs over
 // PREFILL_PARTS partitions, and every partition, an empty one too
 // (denominator 0), stores its partial in the decode layout
 // ((row * KV * G + head) * PARTS + part) for the decode merge.
@@ -157,14 +162,17 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
         return;
     const uint kv_head = head - KV * G;
     const uint64_t source = (row * KV + kv_head) * W;
+    const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
     float k[ATTENTION_E], v[ATTENTION_E];
     history_fresh_row(true, row, kv_head, lane, k);
-    // A stored-key value is the prepared key.
+    history_hold(h, true, destination, kv_head, lane, true, k);
+    // A stored-key value is the key.
     if (ATTENTION_STORED_KEY) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             v[i] = k[i];
     } else {
         history_fresh_row(false, row, kv_head, lane, v);
+        history_hold(h, false, destination, kv_head, lane, true, v);
     }
     const uint64_t keys = scratch_planes.keys;
     const uint64_t values = scratch_planes.values;
@@ -172,11 +180,6 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
         element_put(ELEMENT_F16, keys, source + lane * E + i, k[i]);
         element_put(ELEMENT_F16, values, source + lane * E + i, v[i]);
     }
-    const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
-    if (destination < 0)
-        return;
-    history_append(h, true, destination, kv_head, lane, k);
-    history_append(h, false, destination, kv_head, lane, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +197,8 @@ void prefill_put_row(uint base, uint pitch, uint row, uint column, const uint w,
 
 // Stages columns [column, column + w) of rows [first, first + 32) of one kv
 // head as the f16 tile at shared half 0 (row pitch w + 8): history (dense or
-// decoded) or the batch's fresh rows (from L1's f16 scratch, or for decode
-// rows prepared here, a subgroup per row).
+// decoded) or the batch's fresh rows as history holds them (from L1's f16
+// scratch, or for decode rows prepared and held here, a subgroup per row).
 void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bool is_key, bool historical, int first,
     int end, uint kv_head, uint column, const uint w) {
     if (historical) {
@@ -207,6 +210,7 @@ void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bo
             float x[ATTENTION_E];
             if (t < end) {
                 history_fresh_row(is_key, uint64_t(t), kv_head, SEISMIC_LANE, x);
+                history_hold(h, is_key, -1, kv_head, SEISMIC_LANE, true, x);
             } else {
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     x[i] = 0.0;
@@ -253,6 +257,63 @@ void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, co
         }
         seismic_shared_uvec4[(k * flash_pitch(w) + c) / 8u] = bits;
     }
+}
+
+// Stages columns [column, column + w) of keys [first, first + 32) of row
+// `row`'s key sequence (its visible spans in order, then its fresh keys) of
+// one kv head as the f16 tile at shared half 0 (row pitch w + 8): a tile cut
+// at a fixed position of the sequence, whichever spans, slabs and fresh rows
+// its keys fall in. The history keys lead (`history_piece`, from the span
+// cursor of key `first`); the fresh keys follow as history holds them, from
+// L1's scratch or prepared and held here a subgroup per row. Keys at or past
+// `end` (the sequence's length) stage zeros.
+void prefill_stage_positions(attention_history h, prefill_scratch scratch_planes, const bool is_key, int first,
+    int end, uint64_t row, uint kv_head, uint column, const uint w) {
+    const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
+    const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
+    const uint64_t spans = SEISMIC_DIM_R;
+    int fresh_lo, fresh_hi;
+    attention_span(visible, fresh, row, spans, spans, fresh_lo, fresh_hi);
+    const int historical = end - max(fresh_hi - fresh_lo, 0);
+    const uvec2 start = attention_locate(visible, fresh, row, spans, uint(first));
+    const uint pieces = w / 8u;
+    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
+        const uint k = item / pieces;
+        const uint c = (item % pieces) * 8u;
+        const int key = first + int(k);
+        uvec4 bits = uvec4(0u);
+        if (key < historical) {
+            uint64_t span = uint64_t(start.x);
+            int offset = int(start.y), lo, hi;
+            attention_span(visible, fresh, row, spans, span, lo, hi);
+            while (key >= offset + max(hi - lo, 0)) {
+                offset += max(hi - lo, 0);
+                attention_span(visible, fresh, row, spans, ++span, lo, hi);
+            }
+            bits = history_piece(h, is_key, lo + key - offset, kv_head, column + c);
+        } else if (key < end) {
+#if PREFILL_PREPARED
+            const uint64_t t = uint64_t(fresh_lo + key - historical);
+            bits = element_uvec4_at((is_key ? scratch_planes.keys : scratch_planes.values)
+                + ((t * ATTENTION_KV + kv_head) * ATTENTION_W + column + c) * 2ul);
+#else
+            // Prepared below.
+            continue;
+#endif
+        }
+        seismic_shared_uvec4[(k * flash_pitch(w) + c) / 8u] = bits;
+    }
+#if !PREFILL_PREPARED
+    for (uint r = SEISMIC_SUBGROUP; r < FLASH_KEYS; r += SEISMIC_SUBGROUPS) {
+        const int key = first + int(r);
+        if (key < historical || key >= end)
+            continue;
+        float x[ATTENTION_E];
+        history_fresh_row(is_key, uint64_t(fresh_lo + key - historical), kv_head, SEISMIC_LANE, x);
+        history_hold(h, is_key, -1, kv_head, SEISMIC_LANE, true, x);
+        prefill_put_row(0u, flash_pitch(w), r, column, w, SEISMIC_LANE, x);
+    }
+#endif
 }
 #endif
 
@@ -447,18 +508,24 @@ void prefill_scores_add(uint64_t scratch_rows, uint tile_half, uint column, cons
 }
 
 // Where a key tile's rows come from: history, the batch's fresh rows, or (a
-// decode row's) picks.
+// decode row's) picks or key sequence positions.
 #define PREFILL_FROM_HISTORY 0u
 #define PREFILL_FROM_FRESH 1u
 #define PREFILL_FROM_PICKS 2u
+#define PREFILL_FROM_POSITIONS 3u
 
 // Stages columns [column, column + w) of the key or value tile of `source`
-// whose first key is `first` (a pick tile: its first pick of row `row`).
+// whose first key is `first` (a pick tile: its first pick of row `row`; a
+// positions tile: key `first` of row `row`'s sequence, `end` keys long).
 void prefill_stage_from(attention_history h, prefill_scratch scratch_planes, const bool is_key, uint source, int first,
     int end, uint64_t row, uint kv_head, uint column, const uint w) {
 #ifdef PREFILL_DECODE
     if (source == PREFILL_FROM_PICKS) {
         prefill_stage_picks(row, uint(first), kv_head, column, w);
+        return;
+    }
+    if (source == PREFILL_FROM_POSITIONS) {
+        prefill_stage_positions(h, scratch_planes, is_key, first, end, row, kv_head, column, w);
         return;
     }
 #endif
@@ -564,16 +631,31 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 continue;
             float x[ATTENTION_E];
             history_fresh_row(true, token, kv_head, lane, x);
-            history_append(h, true, destination, kv_head, lane, x);
+            history_hold(h, true, destination, kv_head, lane, false, x);
             history_fresh_row(false, token, kv_head, lane, x);
-            history_append(h, false, destination, kv_head, lane, x);
+            history_hold(h, false, destination, kv_head, lane, false, x);
         }
     }
     barrier();
 #endif
 
-    uint total_tiles = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
-    // The tiles of the spans; a decode row's pick tiles follow them.
+#ifdef PREFILL_DECODE
+    // A row of its own (QT = 1) takes its keys in tiles at fixed positions of
+    // its key sequence, history and fresh keys alike
+    // (`prefill_stage_positions`), and its partitions split those tiles:
+    // over dense history, where a fresh key stages as history stores it, its
+    // result is bit for bit the same whatever rows share its launch and
+    // whichever of its keys are still fresh. Row tiles of several rows share
+    // their key tiles across rows, span by span, and do not hold this.
+    const bool positions = PREFILL_QT == 1u;
+#else
+    const bool positions = false;
+#endif
+    const uint sequence = positions ? attention_visible_total(visible, fresh, tile_first, spans) : 0u;
+    uint total_tiles = positions ? (sequence + PREFILL_KEYS - 1u) / PREFILL_KEYS
+                                 : prefill_total_tiles(visible, fresh, tile_first, rows, spans);
+    // The tiles of the spans or positions; a decode row's pick tiles follow
+    // them.
     const uint visible_tiles = total_tiles;
 #ifdef PREFILL_DECODE
     // Each row of the tile has its own picks, in tiles of PREFILL_KEYS.
@@ -609,7 +691,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint tiles_hi = min(tiles_lo + per, total_tiles);
     // The partition's walk over the spans starts on the span holding its
     // first tile and ends past its last.
-    const uvec2 located = PREFILL_SELECTED_PASS
+    const uvec2 located = PREFILL_SELECTED_PASS || positions
         ? uvec2(0u)
         : prefill_locate_tile(visible, fresh, tile_first, rows, spans, tiles_lo);
 
@@ -689,9 +771,15 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 flash_accumulate(p_half, 0u, width, width, 0u, o);
         }
 #endif
+        for (uint t = tiles_lo; positions && t < min(tiles_hi, visible_tiles); ++t) {
+            const int first = int(t * PREFILL_KEYS);
+            prefill_absorb(h, scratch_planes, PREFILL_FROM_POSITIONS, first, int(sequence),
+                first + int(PREFILL_KEYS) <= int(sequence), 0, int(sequence), tile_first, token, kv_head, chunk,
+                column0, width, computes, block_queries, shared_queries, scratch, scale, softmax, o);
+        }
         uint tiles_before = located.y;
-        for (uint64_t index = located.x; index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS;
-             ++index) {
+        for (uint64_t index = located.x;
+             index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS && !positions; ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
             const uint span_tiles = prefill_span_tiles(interval);
             const uint span_first = tiles_before;

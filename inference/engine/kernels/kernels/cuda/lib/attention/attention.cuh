@@ -5,9 +5,9 @@
 // rotary table) computed by one warp whose lanes own contiguous dimensions, a
 // row's span walk, partition bounds, the online-softmax absorb of N keys, the
 // fixed-order merge of partial softmax states, the decode publication and
-// gated merge, the history policies (dense planes; the affine codec: encode on
-// append, per-lane code access), and the entries' tensor addressing. Each
-// kernel keeps its own loop structure and calls these; the tensor-core bodies
+// gated merge, the history policies (dense planes; the affine codec: per-lane
+// quantize, stored on append, per-lane code access), and the entries' tensor
+// addressing. Each kernel keeps its own loop structure and calls these; the tensor-core bodies
 // (prefill, and the decode matrix form) are in lib/attention/prefill.cuh. Every activation tensor is canonical (unit
 // innermost stride); rows and heads are addressed through their ABI strides.
 

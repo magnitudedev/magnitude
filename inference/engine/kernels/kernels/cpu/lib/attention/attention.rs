@@ -1620,4 +1620,4 @@ pub fn merge<'p>(
     total
 }
 
-pub use super::history::{affine_encode, affine_decode};
+pub use super::history::{affine_decode, affine_encode, affine_round_trip};

@@ -34,7 +34,6 @@ kernel void attention_append_k8v4(
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint KV = SEISMIC_DIM_KV;
-    constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     typedef attention::lane_codes<ATTENTION_KEY_BITS> key_lane;
     typedef attention::lane_codes<ATTENTION_VALUE_BITS> value_lane;
@@ -43,23 +42,18 @@ kernel void attention_append_k8v4(
     const uint kv_head = uint(item % KV);
     if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M || destinations[row] < 0)
         return;
-    const ulong source = (row * KV + kv_head) * W;
     const ulong destination = ulong(destinations[row]);
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     float k[E], v[E];
-    attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + row * 4,
-        rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k);
-    attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, v);
-    ATTENTION_UNROLL
-    for (uint i = 0; i < E; ++i) {
-        k[i] = element::Act::round(k[i]);
-        v[i] = element::Act::round(v[i]);
-    }
-    attention::encode<ATTENTION_KEY_BITS>(k,
+    attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, rounding::none(), lane, k);
+    attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, rounding::none(), lane, v);
+    attention::store<ATTENTION_KEY_BITS>(attention::held_encoding<true>(k),
         slab::row<uint>(key_codes, destination, slab_rows, KV * key_lane::row_words) + kv_head * key_lane::row_words,
         slab::row<half>(key_coefficients, destination, slab_rows, KV * key_lane::pairs * 2) + kv_head * key_lane::pairs * 2, lane);
-    attention::encode<ATTENTION_VALUE_BITS>(v,
+    attention::store<ATTENTION_VALUE_BITS>(attention::held_encoding<false>(v),
         slab::row<uint>(value_codes, destination, slab_rows, KV * value_lane::row_words) + kv_head * value_lane::row_words,
         slab::row<half>(value_coefficients, destination, slab_rows, KV * value_lane::pairs * 2) + kv_head * value_lane::pairs * 2, lane);
 }

@@ -36,13 +36,13 @@ inline void append_rows(device const attention::Scalar *key, device const attent
         const int destination = destinations[appended];
         if (destination < 0 || (ATTENTION_STORED_KEY && item % 2 != 0))
             continue;
-        const ulong source = (appended * KV + kv_head) * W;
         float x[E];
         if (item % 2 == 0)
-            attention::rounded_head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + appended * 4,
-                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, key_rounding, lane, x);
+            attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components,
+                rotary_frequencies, rotary_amplitudes, appended, kv_head, epsilon, key_rounding, lane, x);
         else
-            attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, x);
+            attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components,
+                rotary_frequencies, rotary_amplitudes, appended, kv_head, epsilon, key_rounding, lane, x);
         attention::append(slab::row<attention::Scalar>(item % 2 == 0 ? history_key : history_value,
             ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS), KV * W), 0, kv_head, lane, x);
     }
@@ -187,58 +187,42 @@ kernel void attention_decode_partial(
     const uint first = partition_lo + (simd / SLICES) * sub;
     const uint last = metal::min(first + sub, partition_hi);
     // The key group's keys absorb in batches of DECODE_BATCH at fixed
-    // positions first + i * DECODE_BATCH, then one at a time: a key's batch,
-    // and so the row's reduction order, depends on its position alone, never
-    // on which keys are still fresh (how many rows share the launch) or where
-    // its spans and slabs fall. A cursor walks the spans (span `span`,
-    // [lo, hi), `length` keys at key offset `offset`) and keeps the slab of
-    // its last history row, resolved again only when a row leaves it.
-    const attention::span_start start = attention::form_locate(visible, fresh, row, R, first, lane);
-    ulong span = start.span;
-    uint offset = start.offset;
-    int lo = 0, hi = 0;
-    if (first < last)
-        attention::form_span(visible, fresh, row, R, span, lo, hi);
-    uint length = uint(metal::max(hi - lo, 0));
-    const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
-    // The cursor's slab: its index, its first row and the row past it.
-    ulong slab_index = 0, slab_lo = 1, slab_hi = 0;
+    // positions first + i * DECODE_BATCH, then one at a time, read through
+    // its cursor (attention::key_cursor): a key's batch, and so the row's
+    // reduction order, depends on its position alone.
+    attention::key_cursor cursor =
+        attention::form_cursor(visible, fresh, row, R, ulong(SEISMIC_PARAM_SLAB_ROWS), first, lane);
+    // The cursor's slab's planes.
     device const attention::Scalar *key_slab = nullptr;
     device const attention::Scalar *value_slab = nullptr;
     // Key `position` of the row's sequence (at or past the cursor's) into
-    // `k` and `v`: a history row from its slab, a fresh row prepared (its
-    // key rounded by the trained rounding, as it is appended); a stored-key
-    // value is the key.
+    // `k` and `v`: a history row from its slab, a fresh row as it is
+    // appended (prepared, as history holds it); a stored-key value is the
+    // key.
     auto read = [&](uint position, thread float (&k)[E], thread float (&v)[E]) {
-        while (position >= offset + length) {
-            offset += length;
-            ++span;
-            attention::form_span(visible, fresh, row, R, span, lo, hi);
-            length = uint(metal::max(hi - lo, 0));
-        }
-        const ulong token = ulong(lo) + (position - offset);
-        if (span < R) {
-            if (token < slab_lo || token >= slab_hi) {
-                slab_index = token / slab_rows;
-                slab_lo = slab_index * slab_rows;
-                slab_hi = slab_lo + slab_rows;
-                key_slab = slab::region<attention::Scalar>(history_key, slab_index);
+        bool moved;
+        const ulong token = cursor.seek(position, moved);
+        if (cursor.historical()) {
+            if (moved) {
+                key_slab = slab::region<attention::Scalar>(history_key, cursor.slab);
                 value_slab = slab::region<attention::Scalar>(attention::values_plane(history_key, history_value),
-                    slab_index);
+                    cursor.slab);
             }
-            const ulong at = ((token - slab_lo) * KV + kv_head) * W + lane * E;
+            const ulong at = ((token - cursor.slab_lo) * KV + kv_head) * W + lane * E;
             element::span<element::Act>(key_slab + at, k);
             element::span<element::Act>(value_slab + at, v);
         } else {
-            const ulong at = (token * KV + kv_head) * W;
-            attention::rounded_head_rotary<ATTENTION_NORM>(key + at, key_norm, coordinates + token * 4,
-                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, key_rounding, lane, k);
-            if (!ATTENTION_STORED_KEY)
-                attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v);
-            ATTENTION_UNROLL
-            for (uint i = 0; i < E; ++i) {
-                k[i] = element::Act::round(k[i]);
-                v[i] = ATTENTION_STORED_KEY ? k[i] : element::Act::round(v[i]);
+            attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components,
+                rotary_frequencies, rotary_amplitudes, token, kv_head, epsilon, key_rounding, lane, k);
+            attention::dense_history::held<true>(k, lane);
+            if (ATTENTION_STORED_KEY) {
+                ATTENTION_UNROLL
+                for (uint i = 0; i < E; ++i)
+                    v[i] = k[i];
+            } else {
+                attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components,
+                    rotary_frequencies, rotary_amplitudes, token, kv_head, epsilon, key_rounding, lane, v);
+                attention::dense_history::held<false>(v, lane);
             }
         }
     };

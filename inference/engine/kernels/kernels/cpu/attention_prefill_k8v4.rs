@@ -1,8 +1,10 @@
 // attention_prefill_k8v4 on CPU (contract and portable body in
 // attention.seismic): `attention_prefill`'s launches over affine K8/V4
-// history. `prepare` appends the row's prepared key and value encoded;
-// `attend` decodes each history key and value (code * scale + zero, F32) as it
-// absorbs them; fresh rows attend dense. Head widths are whole affine groups
+// history. `prepare` appends the row's prepared key and value encoded, then
+// leaves them in the fresh rows' scratch as history will hold them (encoded
+// and decoded back), so a row's result does not depend on how many rows share
+// the launch; `attend` decodes each history key and value (code * scale +
+// zero, F32) as it absorbs them. Head widths are whole affine groups
 // (the declaration's `where`), so every vector has at least one group.
 
 use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
@@ -69,8 +71,13 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
         keys,
         values,
     );
+    if !form.fresh {
+        return;
+    }
+    let bits = |words: u64| (32 * words / (2 * cx.dim_p() + cx.dim_s())) as u32;
+    let (key_bits, value_bits) = (bits(cx.dim_kc()), bits(cx.dim_vc()));
     let destination = cx.arg_destinations().get([row]);
-    if form.fresh && destination >= 0 {
+    if destination >= 0 {
         let destination = destination as usize;
         let slab_rows = cx.arg_slab_rows() as usize;
         let (key_codes, key_coefficients) = (
@@ -88,10 +95,7 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
                 attention::store_affine_head(
                     &keys[head * w..][..w],
                     &values[head * w..][..w],
-                    (
-                        (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                        (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    ),
+                    (key_bits, value_bits),
                     (&key_codes, &key_coefficients),
                     (&value_codes, &value_coefficients),
                     destination,
@@ -99,6 +103,12 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
                 );
             }
         }
+    }
+    // The row's keys and values as the history row it becomes reads: each
+    // encoded as its append encodes it, decoded back.
+    for head in 0..kv {
+        attention::affine_round_trip(&mut keys[head * w..][..w], key_bits, cx.dim_kp() as usize);
+        attention::affine_round_trip(&mut values[head * w..][..w], value_bits, cx.dim_vp() as usize);
     }
 }
 

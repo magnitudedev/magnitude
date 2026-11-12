@@ -37,9 +37,10 @@
 
 
 // The launches over affine K8/V4 history (bodies in lib/attention/attention.h):
-// the prepare launch appends encoded rows, and every history K/V tile is
-// decoded to F16 as it is staged; every product takes F16 operands
-// (attention::affine_history). The scratch rows are F16. Under DIRECT the
+// the prepare launch encodes each row once, appends that encoding and puts
+// it in scratch decoded to F16, as every history K/V tile is decoded as it is
+// staged; every product takes F16 operands (attention::affine_history). The
+// scratch rows are F16. Under DIRECT the
 // call runs in rounds: the `decode` launch decodes the round's part of the
 // history row tiles the batch sees (`history_tiles`) to F16 in the cells of
 // `partials` the key partitions leave (attention::history_window), the

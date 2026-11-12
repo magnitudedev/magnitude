@@ -32,15 +32,17 @@
 // The rows policy supplies the query tile and fresh tiles and stores the
 // partition's result. Prefill rows (`PrefillRows`): L1 `prepare`, one warp
 // per (row, query or kv head), puts the queries (norm_rotary, rounded to the
-// activation element) and the batch's prepared keys and values in scratch as
-// the policy's 16-bit MMA operands (`Operands`; scores are scaled into the
-// exp2 domain after Q K^T) and appends the row's K/V at its destination; L2
-// `attend` copies them and stores its gated output directly when one
-// partition serves the tile, else partials that L3 `merge_partitions`
-// combines. Decode rows (`DecodeRows`): the block prepares its own query tile
-// and fresh tiles, partition 0 appends the tile's K/V, and every partition
-// (an empty one too) publishes its partial in the decode layout for the
-// decode merge (`attention::decode_gate`).
+// activation element) and the batch's keys and values as history holds them
+// (`hold`: over affine history their encoding, decoded as a history tile is)
+// in scratch as the policy's 16-bit MMA operands (`Operands`; scores are
+// scaled into the exp2 domain after Q K^T) and appends the row's K/V at its
+// destination from the same encoding; L2 `attend` copies them and stores its
+// gated output directly when one partition serves the tile, else partials
+// that L3 `merge_partitions` combines. Decode rows (`DecodeRows`): the block
+// prepares its own query tile and fresh tiles (keys and values as history
+// holds them, `hold`), partition 0 appends the tile's K/V, and every
+// partition (an empty one too) publishes its partial in the decode layout for
+// the decode merge (`attention::decode_gate`).
 
 #include "attention.cuh"
 
@@ -270,10 +272,13 @@ static_assert(GROUP % KEY_PIECE_CODES == 0 && GROUP % VALUE_PIECE_CODES == 0,
               "a code piece lies in one group");
 // Codes decode in packed F16 (the affine operands' element): code c sits in
 // the mantissa of the F16 1024 (0x6400 | c, exact), 1024 is subtracted
-// exactly, and one F16x2 fma applies the group's (scale, zero), rounding once
-// (the F32 fma rounded to F16 gives the same operands on the goldens), two
-// dimensions per instruction.
-__device__ __forceinline__ u32 half_decode(u32 biased, u32 scales, u32 zeros) {
+// exactly, and one F16x2 fma applies the group's (scale, zero) `pair`,
+// rounding once (the F32 fma rounded to F16 gives the same operands on the
+// goldens), two dimensions per instruction. Every affine operand, history or
+// fresh, is decoded here.
+__device__ __forceinline__ u32 half_decode(u32 biased, u32 pair) {
+    const u32 scales = __byte_perm(pair, 0, 0x1010);
+    const u32 zeros = __byte_perm(pair, 0, 0x3232);
     u32 code, value;
     asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(code) : "r"(biased), "r"(0x64006400u));
     asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(code), "r"(scales), "r"(zeros));
@@ -283,19 +288,15 @@ __device__ __forceinline__ u32 half_decode(u32 biased, u32 scales, u32 zeros) {
 // Eight 8-bit codes (two words) decoded with their group's (scale, zero)
 // `pair` into one operand chunk.
 __device__ __forceinline__ uint4 key_chunk(u32 low, u32 high, u32 pair) {
-    const u32 scales = __byte_perm(pair, 0, 0x1010);
-    const u32 zeros = __byte_perm(pair, 0, 0x3232);
-    return make_uint4(half_decode(__byte_perm(low, 0x64646464u, 0x4140), scales, zeros),
-                      half_decode(__byte_perm(low, 0x64646464u, 0x4342), scales, zeros),
-                      half_decode(__byte_perm(high, 0x64646464u, 0x4140), scales, zeros),
-                      half_decode(__byte_perm(high, 0x64646464u, 0x4342), scales, zeros));
+    return make_uint4(half_decode(__byte_perm(low, 0x64646464u, 0x4140), pair),
+                      half_decode(__byte_perm(low, 0x64646464u, 0x4342), pair),
+                      half_decode(__byte_perm(high, 0x64646464u, 0x4140), pair),
+                      half_decode(__byte_perm(high, 0x64646464u, 0x4342), pair));
 }
 
 // Eight 4-bit codes (one word) decoded with their group's pair into one
 // operand chunk: dimension pair j is byte j's low and high nibbles.
 __device__ __forceinline__ uint4 value_chunk(u32 word, u32 pair) {
-    const u32 scales = __byte_perm(pair, 0, 0x1010);
-    const u32 zeros = __byte_perm(pair, 0, 0x3232);
     // Byte j of `low` holds nibble 2j, of `high` nibble 2j + 1; pair j
     // gathers both into bytes 0 and 1, then under the F16 1024's exponent.
     const u32 low = word & 0x0F0F0F0Fu;
@@ -305,8 +306,23 @@ __device__ __forceinline__ uint4 value_chunk(u32 word, u32 pair) {
     for (int j = 0; j < 4; ++j)
         biased[j] = __byte_perm(__byte_perm(low, high, static_cast<u32>(j) | (static_cast<u32>(4 + j) << 4)),
                                 0x64646464u, 0x4140);
-    return make_uint4(half_decode(biased[0], scales, zeros), half_decode(biased[1], scales, zeros),
-                      half_decode(biased[2], scales, zeros), half_decode(biased[3], scales, zeros));
+    return make_uint4(half_decode(biased[0], pair), half_decode(biased[1], pair),
+                      half_decode(biased[2], pair), half_decode(biased[3], pair));
+}
+
+// A lane's share of an encoded vector decoded into its DPL operands, as F32
+// (exact): dimension pairs decode as a history tile's (`half_decode`).
+template <int B>
+__device__ __forceinline__ void decoded(const LaneEncoding<B> &e, float (&x)[DPL]) {
+    typedef LaneCodes<B> Codes;
+#pragma unroll
+    for (int d = 0; d < DPL; d += 2) {
+        const u32 high = d + 1 < DPL ? Codes::at(e.codes, d + 1) : 0u;
+        const u32 biased = (0x6400u | Codes::at(e.codes, d)) | ((0x6400u | high) << 16);
+        const float2 pair = seismic_unpack_f16x2(half_decode(biased, e.pair));
+        x[d] = pair.x;
+        if (d + 1 < DPL) x[d + 1] = pair.y;
+    }
 }
 
 // A producer thread's codes and (scale, zero) pairs of one affine unit, held
@@ -500,6 +516,27 @@ __device__ __forceinline__ void decode_codes(const u8 *codes, u8 *k_tile, u8 *v_
 
 #endif
 
+// A batch row's prepared key `k` and value `v` (one lane's share; the whole
+// warp calls it) made the operands every read of the row takes, the values
+// history holds: dense history holds them as they are, affine history their
+// encoding (`AffineHistory::quantize`), decoded as a history tile is. Stored
+// at `destination` when it is >= 0, from the same encoding.
+template <class History>
+__device__ __forceinline__ void hold(const History &history, int destination, int kv,
+                                     float (&k)[DPL], float (&v)[DPL], int lane) {
+#ifdef ATTENTION_AFFINE_HISTORY
+    if constexpr (History::CODED) {
+        const AffineHistory::Encoding e = AffineHistory::quantize(k, v);
+        if (destination >= 0) history.store(destination, kv, e, lane);
+        decoded(e.key, k);
+        decoded(e.value, v);
+    } else
+#endif
+    {
+        if (destination >= 0) history.append(destination, kv, k, v, lane);
+    }
+}
+
 // Named barriers between the MMA and the producer warps (0 is
 // `__syncthreads`): stage b is full (produced) at FULL + b and empty
 // (consumed) at EMPTY + b; the MMA warps' own barrier is MMA.
@@ -653,9 +690,10 @@ struct PrefillRows {
     // `limit`): the keys' piece, and with the last piece the values' window
     // from column0, by `threads` threads of which this is `thread`.
     template <class History>
-    __device__ __forceinline__ void stage_fresh(const Inputs &, u8 *k_tile, u8 *v_tile, int first,
-                                                int limit, int kv, int piece, int column0,
-                                                int thread, int threads, float *) const {
+    __device__ __forceinline__ void stage_fresh(const Inputs &, const History &, u8 *k_tile,
+                                                u8 *v_tile, int first, int limit, int kv,
+                                                int piece, int column0, int thread, int threads,
+                                                float *) const {
         auto row = [&](int r) -> long long {
             const int token = first + r;
             return token < limit ? (static_cast<long long>(token) * KV + kv) * W : -1;
@@ -714,9 +752,10 @@ struct PrefillRows {
 };
 
 // Decode rows: the block prepares its query tile and the fresh tiles itself
-// (a warp per row, through a [WARPS][W] F32 exchange) and publishes every
-// partition in the decode layout (`attention::publish`): slot = (row * KV * G
-// + query head) * PARTS + partition, an empty partition with denominator 0.
+// (a warp per row, through a [WARPS][W] F32 exchange; fresh keys and values
+// as history holds them, `hold`) and publishes every partition in the decode
+// layout (`attention::publish`): slot = (row * KV * G + query head) * PARTS +
+// partition, an empty partition with denominator 0.
 template <int PARTS>
 struct DecodeRows {
     static constexpr int MIN_TILES = 1;
@@ -774,9 +813,10 @@ struct DecodeRows {
     // `limit`), prepared by the warps of `threads` threads of which this is
     // `thread`, a warp per token.
     template <class History>
-    __device__ __forceinline__ void stage_fresh(const Inputs &in, u8 *k_tile, u8 *v_tile, int first,
-                                                int limit, int kv, int piece, int column0,
-                                                int thread, int threads, float *exchange) const {
+    __device__ __forceinline__ void stage_fresh(const Inputs &in, const History &history,
+                                                u8 *k_tile, u8 *v_tile, int first, int limit,
+                                                int kv, int piece, int column0, int thread,
+                                                int threads, float *exchange) const {
         typedef Operands<History> Ops;
         const int lane = thread % 32;
         float *own = exchange + (thread / 32) * W;
@@ -787,6 +827,7 @@ struct DecodeRows {
             if (token < limit) {
                 prepared_key(in, token, kv, k, own, lane);
                 fresh_value(in, token, kv, v, lane);
+                hold(history, -1, kv, k, v, lane);
             } else {
 #pragma unroll
                 for (int d = 0; d < DPL; ++d) k[d] = v[d] = 0.0f;
@@ -817,8 +858,9 @@ struct DecodeRows {
 };
 
 // Prefill L1 over `M` rows: 8 warps per block (launch with 256 threads). Queries,
-// keys and values go to scratch as the history policy's operands ([M, KV * G,
-// W], [M, KV, W] and [M, KV, W]).
+// and keys and values as history holds them (`hold`), go to scratch as the
+// history policy's operands ([M, KV * G, W], [M, KV, W] and [M, KV, W]); a row
+// with a destination is appended there.
 template <class History>
 __device__ __forceinline__ void prepare(const Inputs &in, const History &history, u16 *queries,
                                         u16 *keys, u16 *values, rounding::Rounding trained) {
@@ -852,14 +894,13 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     } else {
         fresh_value(in, row, kv, v, lane);
     }
+    hold(history, ATTENTION_DESTINATION(in, row), kv, k, v, lane);
     const u64 at = (row * KV + kv) * W + lane * DPL;
 #pragma unroll
     for (int d = 0; d < DPL; ++d) {
         keys[at + d] = Ops::operand(k[d]);
         values[at + d] = Ops::operand(v[d]);
     }
-    const int destination = ATTENTION_DESTINATION(in, row);
-    if (destination >= 0) history.append(destination, kv, k, v, lane);
 }
 
 // Block `block`: WARPS MMA warps, plus WARPS producer warps for affine
@@ -1160,9 +1201,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // last piece the values' window from column0), by `threads` threads of
     // which this is `thread`.
     auto stage_fresh = [&](Tile tile, int buffer, int piece, int column0, int thread, int threads) {
-        rows.template stage_fresh<History>(in, k_tile(buffer), v_tile(buffer), tile.first,
-                                           table[tile.span * 4 + 1], kv, piece, column0, thread,
-                                           threads, exchange);
+        rows.stage_fresh(in, history, k_tile(buffer), v_tile(buffer), tile.first,
+                         table[tile.span * 4 + 1], kv, piece, column0, thread, threads, exchange);
     };
     // Picks tile `tile` into operand stage b: its picks' selected vectors
     // (zero for none or past the span), the keys' piece and with the last

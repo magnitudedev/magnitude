@@ -36,24 +36,23 @@ kernel void attention_append_dense(
     const uint kv_head = uint(item % KV);
     if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M || destinations[row] < 0)
         return;
-    const ulong source = (row * KV + kv_head) * W;
     const ulong destination = ulong(destinations[row]);
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     float k[E], v[E];
     // The stored key prepared and rounded as the attention entries do.
-    const attention::rotary_table table(coordinates + row * 4, rotary_components, rotary_frequencies,
-        rotary_amplitudes, lane);
-    attention::rounded_head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon,
-        attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
-            uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)),
-        lane, k);
+    const rounding::Rounding key_rounding = attention::key_rounding(SEISMIC_DIM_KR != 0,
+        uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT), uint(SEISMIC_PARAM_KEY_SCALE),
+        uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
+    attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, k);
     attention::append(slab::row<attention::Scalar>(history_key, destination, slab_rows, KV * W),
         0, kv_head, lane, k);
     // Stored-key values are the key plane.
     if (ATTENTION_STORED_KEY)
         return;
-    attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, v);
+    attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, v);
     attention::append(slab::row<attention::Scalar>(history_value, destination, slab_rows, KV * W),
         0, kv_head, lane, v);
 }

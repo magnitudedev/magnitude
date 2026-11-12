@@ -3230,28 +3230,7 @@ fn v41_compressed_natives_round_and_attend() {
     assert!(failures.is_empty(), "failed: {failures:?}");
 }
 
-/// The widest verify block: a verification pass's rows.
-const VERIFY_ROWS: usize = 16;
-
-/// The rows of a verify block of `width` rows ending where a VERIFY_ROWS-row
-/// block after `history` rows ends: block row j, the widest block's row
-/// i = VERIFY_ROWS - width + j, sees the history before the block, [0,
-/// history + VERIFY_ROWS - width), and the block's fresh rows 0..=j,
-/// appending at history + i.
-fn verify_rows(history: i32, width: usize) -> Vec<Row> {
-    let first = VERIFY_ROWS - width;
-    (0..width)
-        .map(|j| {
-            let i = (first + j) as i32;
-            Row {
-                spans: vec![(0, history + first as i32)],
-                fresh: (0, j as i32 + 1),
-                destination: history + i,
-                position: history + i,
-            }
-        })
-        .collect()
-}
+include!("attention_common/verify.rs");
 
 impl Case {
     /// The verify block of `width` rows ending where this widest block
@@ -3264,7 +3243,7 @@ impl Case {
         let mut case = Self::new(
             self.form,
             self.history_rows,
-            verify_rows(history, width),
+            verify_rows(&[(0, history)], width),
             self.slab_rows,
             1.0,
             self.scale,
@@ -3297,52 +3276,69 @@ impl Case {
     }
 }
 
-/// A decode row's result on Metal and the CPU is bit for bit the same at
+/// A decode row's result on Metal, Vulkan and the CPU is bit for bit the same at
 /// verify widths 1, 2, 4, 8 and 16 under one specialization: the same row
 /// over the same history, its earlier block rows fresh keys at the wider
 /// widths and history rows (as the widest launch appended them) at the
 /// narrower. So its reduction order is set by key positions alone, and a
 /// prepared fresh key and value equal the appended ones bit for bit (the
 /// narrower widths read as history what the wider attend fresh). Every
-/// configuration that holds one row a work item is checked, over a history
-/// crossing slabs: Muse (Metal's vector, matrix and shared-tile forms), and
-/// V4.1's compressed layer small and at its shape (picks, rounded keys,
-/// sinks, stored-key values, the output rotary). The re-appended rows equal
-/// the widest launch's.
+/// configuration that holds one row a work item is checked: Metal's vector,
+/// matrix and shared-tile forms, Vulkan's vector form and its matrix form's
+/// one-row tiles, the CPU's; over Muse, and V4.1's compressed layer small and
+/// at its heads (picks, rounded keys, sinks, stored-key values, the output
+/// rotary). The re-appended rows equal the widest launch's.
+///
+/// The history is the smallest that reaches every path at every width: 70
+/// rows over 32-row slabs, so a row's 71 to 86 keys cross slab edges (32, 64)
+/// and the 32-key tile edge at 64 inside its history, and the tile from 64
+/// holds history and fresh keys in a different split at each width; its 40
+/// picks over a 96-row pick plane of 32-row slabs fill one pick tile and part
+/// of a second, some of them -1.
 #[test]
 fn decode_rows_are_the_same_at_every_verify_width() {
-    let history = 300;
+    let history = 70;
+    let (slab_rows, picks, pooled) = (32, 40, 96);
+    let rows = || verify_rows(&[(0, history)], VERIFY_ROWS);
+    let store = history as usize + VERIFY_ROWS;
     let scale = 1.0 / (512f32).sqrt();
     let cases = [
-        ("muse", Case::new(MUSE, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, 0.125, 110)),
+        ("muse", Case::new(MUSE, store, rows(), slab_rows, 1.0, 0.125, 110)),
         (
             "small v41",
-            Case::new(SMALL_V41, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, 0.125, 111)
+            Case::new(SMALL_V41, store, rows(), slab_rows, 1.0, 0.125, 111)
                 .with_theta(1.0e4)
                 .with_sinks(112)
-                .with_picks(48, 1000, 256, 113)
+                .with_picks(picks, pooled, slab_rows, 113)
                 .with_key_rounding(KEY_ROUNDING),
         ),
         (
             "v41",
-            Case::new(V41, history as usize + VERIFY_ROWS, verify_rows(history, VERIFY_ROWS), 128, 1.0, scale, 114)
+            Case::new(V41, store, rows(), slab_rows, 1.0, scale, 114)
                 .with_theta(1.0e4)
                 .with_sinks(115)
-                .with_picks(64, 1000, 256, 116)
+                .with_picks(picks, pooled, slab_rows, 116)
                 .with_key_rounding(KEY_ROUNDING),
         ),
     ];
     let mut failures = Vec::new();
     for device in devices()
         .into_iter()
-        .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Cpu))
+        .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Vulkan | BackendName::Cpu))
     {
         for (name, case) in &cases {
-            // Row tiles of several rows (TOKENS > 1) share tiles across rows.
-            for config in case_configurations(&device, true, case)
-                .into_iter()
-                .filter(|config| config.iter().all(|&(name, value)| name != "TOKENS" || value == 1))
-            {
+            // Row tiles of several rows (Metal's TOKENS > 1, Vulkan's matrix
+            // form where 16 * SIMDS rows hold two or more rows of G heads)
+            // share tiles across rows; Vulkan's vector form holds one row a
+            // workgroup.
+            let one_row = |config: &[(&str, u64)]| {
+                let param = |wanted: &str| config.iter().find(|(name, _)| *name == wanted).map(|(_, value)| *value);
+                param("TOKENS").is_none_or(|tokens| tokens == 1)
+                    && (device.backend() != BackendName::Vulkan
+                        || param("MATRIX") == Some(0)
+                        || param("SIMDS").is_some_and(|simds| 16 * simds / case.form.g as u64 == 1))
+            };
+            for config in case_configurations(&device, true, case).into_iter().filter(|config| one_row(config)) {
                 let specialization = config
                     .iter()
                     .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));

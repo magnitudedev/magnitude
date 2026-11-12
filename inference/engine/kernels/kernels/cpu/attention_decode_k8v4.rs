@@ -3,7 +3,9 @@
 // history. Each (kv head, partition, row) item prepares its own queries, keys
 // and values, part 0 appends the row's key and value encoded; the item
 // decodes each history key and value (code * scale + zero, F32) as it absorbs
-// them; fresh rows attend dense. The last item of a (kv head, row) to arrive
+// them; fresh rows attend as history will hold them (encoded and decoded
+// back), so a row's result does not depend on how many rows verify beside
+// it. The last item of a (kv head, row) to arrive
 // merges its partitions. Head widths are whole affine groups (the
 // declaration's `where`), so every vector has at least one group.
 
@@ -107,6 +109,8 @@ fn attention_decode_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, 
         SlabTensor::from_scalars(cx.arg_history_value_codes(), slab_rows),
         SlabTensor::from_bound(cx.arg_history_value_coefficients(), slab_rows),
     );
+    let bits = |words: u64| (32 * words / (2 * cx.dim_p() + cx.dim_s())) as u32;
+    let (key_bits, value_bits) = (bits(cx.dim_kc()), bits(cx.dim_vc()));
     if append {
         // SAFETY: destinations are distinct, freshly reserved history rows
         // no row of the call reads.
@@ -114,16 +118,20 @@ fn attention_decode_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, 
             attention::store_affine_head(
                 &keys[row * w..][..w],
                 &values[row * w..][..w],
-                (
-                    (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                ),
+                (key_bits, value_bits),
                 (&key_codes, &key_coefficients),
                 (&value_codes, &value_coefficients),
                 destination as usize,
                 kv_head,
             );
         }
+    }
+    // The fresh keys and values as the history rows they become read: each
+    // encoded as its append encodes it, decoded back.
+    for fresh_row in spans::span(fresh.0, fresh.1) {
+        let at = fresh_row as usize * w;
+        attention::affine_round_trip(&mut keys[at..][..w], key_bits, cx.dim_kp() as usize);
+        attention::affine_round_trip(&mut values[at..][..w], value_bits, cx.dim_vp() as usize);
     }
     let history = (
         attention::affine_rows::<8, _>(&key_codes, &key_coefficients, kv_head),
