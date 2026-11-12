@@ -160,7 +160,7 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
         ReportedBy::WindowsTotalPhys => HardwareReportedBy::WindowsTotalPhys,
         ReportedBy::LinuxMemAvailable => HardwareReportedBy::LinuxMemAvailable,
         ReportedBy::MachMovablePages => HardwareReportedBy::MachMovablePages,
-        ReportedBy::MachAllocatablePages => HardwareReportedBy::MachAllocatablePages,
+        ReportedBy::MacOsFreePages => HardwareReportedBy::MacOsFreePages,
         ReportedBy::WindowsPhysicalAndCommit => HardwareReportedBy::WindowsPhysicalAndCommit,
         ReportedBy::CpuAddressSpace => HardwareReportedBy::CpuAddressSpace,
         ReportedBy::MetalMaxBufferLength => HardwareReportedBy::MetalMaxBufferLength,

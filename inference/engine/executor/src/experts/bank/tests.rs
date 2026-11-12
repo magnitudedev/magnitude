@@ -35,10 +35,11 @@ fn a_resize_step_that_panics_is_reported_and_the_thread_runs_on() {
 }
 
 /// A growth joins slot by slot, each only once every tensor commits it and
-/// its memory is recorded,
-/// and a stop ends it at the next slot: two record tensors of a slot a
-/// row, grown from one slot toward six on the CPU backend, stopped as
-/// slot 3 joins, joined 2 and 3 and stopped there.
+/// its memory is recorded in its ledger within the slot's change (a record
+/// outside one panics in this scope), and a stop ends it at the next slot:
+/// two record tensors of a slot a row, grown from one slot toward six on
+/// the CPU backend, stopped as slot 3 joins, joined 2 and 3 and stopped
+/// there.
 #[test]
 fn a_growth_joins_each_slot_as_every_tensor_backs_it() {
     let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
@@ -53,11 +54,21 @@ fn a_growth_joins_each_slot_as_every_tensor_backs_it() {
         .unzip();
     let (slots, stop, rises) = (AtomicU64::new(1), AtomicBool::new(false), Mutex::new(()));
     let (posted, backed) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+    let scope = crate::memory::ledger::Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }));
+    ledger.read(ledger.sampled(Instant::now()), Ok(crate::memory::ledger::Available::new(1 << 40, 1 << 40, None).expect("a reading")));
+    let changes = scope.changes().clone();
+    let claim = Mutex::new(ledger.backing(6 * 2 * row).expect("the slots fit"));
+    let record = |at: u64, changing: &crate::memory::ledger::Changing| {
+        claim.lock().unwrap().backed(at * 2 * row, changing);
+        backed.lock().unwrap().push(at);
+    };
     let grown = grow_by_slots(
         resizers,
         (1, 6),
         |at| vec![at; 2],
-        |at| backed.lock().unwrap().push(at),
+        (&changes, record),
         |at| {
             assert_eq!(backed.lock().unwrap().last(), Some(&at), "slot {at} joined before its memory was recorded");
             Ok(Join::Bank { records: vec![at as usize] })
@@ -79,11 +90,14 @@ fn a_growth_joins_each_slot_as_every_tensor_backs_it() {
     assert_eq!(slots.load(Ordering::Acquire), 3);
     assert!(matches!(grown.cut, Cut::None) && grown.joined.is_some() && grown.resizers.len() == 2);
     assert!(tensors.iter().all(|tensor| tensor.committed_rows() == 3));
+    assert_eq!(ledger.snapshot().allocated(), 3 * 2 * row, "every slot joined is recorded");
     // Stopped before its first slot, it joins none: its end says so.
-    let again = grow_by_slots(grown.resizers, (3, 6), |at| vec![at; 2], |_| {}, |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &stop, || Some(()));
+    let none = |_: u64, _: &crate::memory::ledger::Changing| {};
+    let again = grow_by_slots(grown.resizers, (3, 6), |at| vec![at; 2], (&changes, none), |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &stop, || Some(()));
     assert!(again.joined.is_none() && matches!(again.cut, Cut::None));
     // A slot the load's traffic does not let begin ends the growth there.
-    let held = grow_by_slots(again.resizers, (3, 6), |at| vec![at; 2], |_| {}, |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &AtomicBool::new(false), || None::<()>);
+    let held = grow_by_slots(again.resizers, (3, 6), |at| vec![at; 2], (&changes, none), |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &AtomicBool::new(false), || None::<()>);
     assert!(held.joined.is_none() && matches!(held.cut, Cut::None));
     assert!(tensors.iter().all(|tensor| tensor.committed_rows() == 3));
+    changes.change(|_| drop(claim));
 }

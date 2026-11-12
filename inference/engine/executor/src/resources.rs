@@ -197,7 +197,6 @@ struct SlotsReleasing {
     slots: usize,
     began: std::time::Instant,
     done: crate::storage_thread::Done<u64>,
-    _cache: Vec<crate::memory::ledger::Cached>,
 }
 
 /// Idle graph slots released off the submitting thread
@@ -409,10 +408,10 @@ impl AllocatedResources {
     /// free storage, on the load's release thread (`Releases`), `wake`
     /// completed once they are released: whether a release began, which a
     /// later boundary finishes ([`Self::released_slots`]). `cache`, a
-    /// closed group's idle slots' cache, is held until then, what claims
-    /// took of it included: the slots' memory exists until the release
-    /// ends. None begins while one runs ([`Self::releasing_slots`]); with no
-    /// slot idle, `cache` names no memory and is let go.
+    /// closed group's idle slots' cache, what claims took of it included,
+    /// is let go with the slots' memory, in one change with their free.
+    /// None begins while one runs ([`Self::releasing_slots`]); with no slot
+    /// idle, `cache` is let go as a change of its own.
     pub(crate) fn release_idle_slots(&mut self, cache: Vec<crate::memory::ledger::Cached>, wake: crate::CompletionWake) -> bool {
         assert!(self.releasing.is_none(), "a graph slot release begins only once the one before it finished");
         let mut idle = IdleSlots::default();
@@ -433,11 +432,23 @@ impl AllocatedResources {
         }
         let slots = idle.len();
         if slots == 0 {
+            // A claim took the cache of slots no longer idle: what it lent
+            // is let go, one change on the owner's thread.
+            self.ledgers.changes().clone().change(|_| drop(cache));
             return false;
         }
         let began = std::time::Instant::now();
-        let done = self.releases.run(wake, move || idle.release());
-        self.releasing = Some(SlotsReleasing { slots, began, done, _cache: cache });
+        // The slots' free and the release of their claims and cache, a held
+        // class's slots holding none of their own, are one change.
+        let changes = self.ledgers.changes().clone();
+        let done = self.releases.run(wake, move || {
+            changes.back(|_| {
+                let released = idle.release();
+                drop(cache);
+                released
+            })
+        });
+        self.releasing = Some(SlotsReleasing { slots, began, done });
 
         true
     }

@@ -697,6 +697,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// has not taken yet ([`Self::take_published_memory`]): one observed
     /// between a chain's submissions is the owner's reading too.
     unseen_reading: RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
+    /// The thread it is made on owns its memory for its life: an owner's
+    /// change of the scope begun on another panics.
+    _owner: crate::memory::ledger::Owner,
+    /// The domain's teardown, one change from its drop until this, its
+    /// last field, drops: every free and record its fields make dropping is
+    /// part of it.
+    teardown: crate::memory::ledger::OpenChange,
 }
 
 /// A gap between flights the domain saw: no step of the expert bank runs
@@ -715,6 +722,7 @@ impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
     /// with the fields). A queued step that faulted is nobody's outcome:
     /// the device is past it either way.
     fn drop(&mut self) {
+        self.teardown = crate::memory::ledger::OpenChange::begin(self.resources.ledgers().changes());
         match self.drain_queue() {
             Ok(()) => {}
             Err(DomainError::Device(error)) => {
@@ -1203,8 +1211,8 @@ impl<'d> MemoryProbe<'d> {
     /// published since.
     fn probe_published(&self, bank: Option<&dyn ElasticBank>) -> Option<Result<(), DomainError>> {
         let _rises = bank.map(|bank| bank.hold_rises());
-        let (readings, status, at) = self.memory.borrow_mut().refresh_published()?;
-        self.memory.borrow().read_ledgers(self.ledgers, &status, at);
+        let (readings, sample) = self.memory.borrow_mut().refresh_published(self.ledgers.changes())?;
+        self.memory.borrow().read_ledgers(self.ledgers, &sample);
         let observed = readings.map_err(|error| DomainError::Blind(error.to_string()));
         let outcome = observed.as_ref().map(drop).map_err(Clone::clone);
         *self.unseen.borrow_mut() = Some(observed);
@@ -1214,11 +1222,7 @@ impl<'d> MemoryProbe<'d> {
     /// What the process holds now (`MemoryMoment`).
     fn moment(&self) -> MemoryMoment {
         let ledger = self.domain.device().device_ledger();
-        MemoryMoment {
-            charged: ledger.charged,
-            claimed: ledger.claim,
-            footprint: seismic::ProcessMemory::read().footprint_bytes,
-        }
+        MemoryMoment { charged: ledger.charged, claimed: ledger.claim }
     }
 
     /// What the expert bank's store is short of now, read between a
@@ -1431,9 +1435,9 @@ impl ExecutorDomain<NativeFamily> {
         if head_state.is_some() != (head_loader.is_some() && keeps_history) {
             return Err(DomainError::invariant("head state arena differs from enabled head component"));
         }
-        let family = NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded)?;
-        // The family bound the target's constants.
-        constants.allocated();
+        // The family binds the target's constants: one change with their
+        // record.
+        let family = constants.allocate(|| NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded))?;
         recorded.record(constants);
         Self::with_family(
             execution,
@@ -1564,6 +1568,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 bank_cache = snapshot.cache_of(crate::memory::ledger::CacheKind::Bank),
                 free = snapshot.free(),
                 others = snapshot.others().unwrap_or(0),
+                os_available = snapshot.os_figures().map_or(0, |figures| figures.0),
+                os_reclaimable = snapshot.os_figures().map_or(0, |figures| figures.1),
+                allocated = snapshot.allocated(),
                 guarantee,
                 bank_slots = experts.map_or(0, |target| target.held),
                 bank_target = experts.map_or(0, |target| target.target),
@@ -2144,8 +2151,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     crate::memory::ledger::CommittedKind::Component,
                     crate::memory::ClaimDemand { device: constants, ..Default::default() },
                 )?;
-                self.family.bind_head(resident, &self.definition)?;
-                binding.allocated();
+                binding.allocate(|| self.family.bind_head(resident, &self.definition))?;
                 self.head_binding = binding.into_claims();
                 self.hold_bound_head()?;
                 Ok(())
@@ -2165,8 +2171,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     crate::memory::ledger::CommittedKind::Component,
                     crate::memory::ClaimDemand { device: constants, ..Default::default() },
                 )?;
-                self.family.bind_vision(resident, &self.definition)?;
-                binding.allocated();
+                binding.allocate(|| self.family.bind_vision(resident, &self.definition))?;
                 self.vision_binding = binding.into_claims();
                 Ok(())
             }
@@ -2430,6 +2435,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         family: F,
         mut recorded: crate::memory::ledger::Recorded,
     ) -> Result<(Self, StateBindings), DomainError> {
+        let owner = resources.ledgers().changes().own();
+        // The load's last allocation is behind it, and the OS has since
+        // refilled the free pages its allocations took from the file cache:
+        // the arena's claim, the first serving claims and the bank's first
+        // target are judged by a reading taken now, not by the one the
+        // load's last claim was made on.
+        memory.read_ledgers_now(resources.ledgers());
         let arena = state::claim_arena(&execution, &resources, &family, &mut recorded)?;
         let id = resources.domain().clone();
         let lane_identities = ["target", "head", "vision"].map(|lane| {
@@ -2479,6 +2491,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             shrink_step: false,
             running_release: None,
             unseen_reading: RefCell::new(None),
+            _owner: owner,
+            teardown: Default::default(),
         };
         let bindings = StateBindings {
             target: target_state,

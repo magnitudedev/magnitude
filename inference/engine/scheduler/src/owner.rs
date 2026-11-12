@@ -1642,7 +1642,6 @@ trait MemoryStep: MemoryHost + Sized {
             release_micros = released.released.duration_since(released.began).as_micros() as u64,
             charged_after = after.charged,
             claimed_after = after.claimed,
-            footprint_after = after.footprint,
             "graph slots released"
         );
         self.advance_epoch();
@@ -1701,8 +1700,6 @@ trait MemoryStep: MemoryHost + Sized {
                     charged_after = after.charged,
                     claimed_before = before.claimed,
                     claimed_after = after.claimed,
-                    footprint_before = before.footprint,
-                    footprint_after = after.footprint,
                     deciding_micros = times.decided.duration_since(held.started).as_micros() as u64,
                     queued_micros = times.queued.as_micros() as u64,
                     planned_micros = times.planned.as_micros() as u64,
@@ -1741,8 +1738,6 @@ trait MemoryStep: MemoryHost + Sized {
                     charged_after = after.charged,
                     claimed_before = before.claimed,
                     claimed_after = after.claimed,
-                    footprint_before = before.footprint,
-                    footprint_after = after.footprint,
                     decided_before = before_now(times.decided),
                     prepared_before = before_now(times.prepared),
                     installed_before = before_now(times.installed),
@@ -3452,8 +3447,6 @@ impl<F: ProgramFamily> Releases for Releasing<'_, F> {
                 charged_after = after.charged,
                 claimed_before = before.claimed,
                 claimed_after = after.claimed,
-                footprint_before = before.footprint,
-                footprint_after = after.footprint,
                 "memory released"
             );
         }

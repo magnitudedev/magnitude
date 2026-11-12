@@ -735,6 +735,13 @@ pub struct ResidencyStore {
     cpu_site: crate::assessment::StoredCpuSite,
     /// The load's release thread, which the expert bank releases on.
     releases: crate::Releases,
+    /// The changes of the load's ledgers' scope, which the expert bank
+    /// holds each memory change of with its record from its open
+    /// (`memory::ledger::Changing`).
+    changes: std::sync::Arc<crate::memory::ledger::Changes>,
+    /// The claim to a linked host tier's load-time slots, which the bank
+    /// allocates as each backs from its open ([`Self::back_host_tier`]).
+    host_backing: Option<crate::memory::ledger::Claim>,
 }
 
 impl ResidencyStore {
@@ -744,6 +751,7 @@ impl ResidencyStore {
         execution: ExecutionPlan,
         domain: ResourceDomainId,
         releases: crate::Releases,
+        changes: std::sync::Arc<crate::memory::ledger::Changes>,
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
             || execution.device().backend() != device.backend()
@@ -765,6 +773,8 @@ impl ResidencyStore {
             kept_table_rows: None,
             cpu_site: Default::default(),
             releases,
+            changes,
+            host_backing: None,
         })
     }
 
@@ -825,6 +835,13 @@ impl ResidencyStore {
     /// Open the bank's CPU sites by what the job stored.
     pub fn keep_cpu_site(&mut self, cpu_site: crate::assessment::StoredCpuSite) {
         self.cpu_site = cpu_site;
+    }
+
+    /// `backing`, the claim to the host tier's load-time slots split from
+    /// the target import's (`Held::split_backing`): the expert bank holds it
+    /// from its open and allocates each slot in it as the slot backs.
+    pub fn back_host_tier(&mut self, backing: crate::memory::ledger::Claim) {
+        assert!(self.host_backing.replace(backing).is_none(), "invariant violated: a host tier's backing claimed twice");
     }
 
     pub fn keep_table_rows(&mut self, directory: std::path::PathBuf) {
@@ -1045,7 +1062,7 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`HostLines::of_bank`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone())?;
+        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
         if plan.whole() {
@@ -1664,8 +1681,11 @@ impl<T: Clone> ComponentLoader<T> {
             *self.cached.borrow_mut() = None;
         }
         let store = self.store.borrow();
-        store.resident.release(store.importer);
-        self.claims.borrow_mut().clear();
+        // The import's free and its claims' release are one change.
+        store.changes.clone().change(|_| {
+            store.resident.release(store.importer);
+            self.claims.borrow_mut().clear();
+        });
     }
 
     fn new(
@@ -1696,9 +1716,8 @@ impl<T: Clone> ComponentLoader<T> {
     /// made before is returned as it ended, `held` released.
     pub fn import(&self, mut held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
         assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
-        let imported = self.load();
+        let imported = held.allocate(|| self.load());
         if imported.is_ok() {
-            held.allocated();
             *self.claims.borrow_mut() = held.into_claims();
         }
         imported

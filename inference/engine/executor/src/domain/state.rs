@@ -20,8 +20,6 @@ pub struct MemoryMoment {
     /// holds natively where that is more (block slack, recorded graphs). A
     /// release of backend holdings shows here and not in `charged`.
     pub claimed: u64,
-    /// The process footprint, where the platform reports one.
-    pub footprint: Option<u64>,
 }
 
 /// What a shrink of the state's surplus came to ([`ExecutorDomain::shrink_state`]):
@@ -227,9 +225,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             crate::memory::ledger::CommittedKind::Component,
             crate::memory::ClaimDemand { device: bytes, ..Default::default() },
         )?;
-        let tensor = Tensor::zeros(self.domain.device(), element, &[1, width]);
-        let tensor = tensor.map_err(|error| DomainError::Input(error.to_string()))?;
-        held.allocated();
+        let changes = self.resources.ledgers().changes().clone();
+        let tensor = changes.change(|changing| {
+            let tensor = Tensor::zeros(self.domain.device(), element, &[1, width]);
+            let tensor = tensor.map_err(|error| DomainError::Input(error.to_string()))?;
+            held.allocated(changing);
+            Ok::<_, DomainError>(tensor)
+        })?;
         self.domain
             .publish_features(tensor, held.into_claims())
             .map_err(|error| DomainError::Input(error.to_string()))
@@ -570,7 +572,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if head_banks != 0 && self.head_store.is_some() {
             self.grant_state_growth(bindings, true, &head, &head_queued, head_banks)?;
         }
-        self.settle_state_slabs();
+        self.change_state(|_| ());
         let lane = match operations.first() {
             Some(Operation::Forward { .. }) => ReservationLane::Target,
             Some(Operation::Head { .. }) => ReservationLane::Head,
@@ -762,8 +764,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let store = bindings.store(head)?;
         let claim = store.growth_claim(demands, queued, banks)?;
         if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
-            store.provision_with_growth(demands, queued, banks, GrowthChoice::Minimum)?;
-            self.settle_state_slabs();
+            self.change_state(|_| store.provision_with_growth(demands, queued, banks, GrowthChoice::Minimum))?;
             return Ok(());
         }
         for choice in [GrowthChoice::Preferred, GrowthChoice::Minimum] {
@@ -784,8 +785,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 return Err(DomainError::short(short, self.resources.ledgers()));
             }
-            let grown = store.provision_with_growth(demands, queued, banks, choice);
-            self.settle_state_slabs();
+            let grown = self.change_state(|_| store.provision_with_growth(demands, queued, banks, choice));
             match grown {
                 Ok(()) => return Ok(()),
                 Err(error)
@@ -839,22 +839,31 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(refused);
             }
         };
-        if let Err(error) = self.family.hold_bound_head(places) {
+        let changes = self.resources.ledgers().changes().clone();
+        let bound = changes.change(|changing| {
+            self.family.hold_bound_head(places)?;
+            held.allocated(changing);
+            Ok::<(), String>(())
+        });
+        if let Err(error) = bound {
             self.unbind(super::OptionalComponent::Drafter);
             return Err(DomainError::invariant(error));
         }
-        held.allocated();
         self.head_binding.extend(held.into_claims());
         Ok(())
     }
 
     /// Unbind `component`, releasing what its binding claimed.
     fn unbind(&mut self, component: super::OptionalComponent) {
-        self.family.unbind_optional(component);
-        match component {
-            super::OptionalComponent::Drafter => self.head_binding.clear(),
-            super::OptionalComponent::Vision => self.vision_binding.clear(),
-        }
+        // The binding's free and its claims' are one change.
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|_| {
+            self.family.unbind_optional(component);
+            match component {
+                super::OptionalComponent::Drafter => self.head_binding.clear(),
+                super::OptionalComponent::Vision => self.vision_binding.clear(),
+            }
+        });
     }
 
 
@@ -958,11 +967,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         wake: crate::CompletionWake,
     ) -> Result<StateShrink, DomainError> {
         self.orphan_queue(bindings)?;
-        let mut released = self.shrink_store(bindings, false, policy)?;
-        if self.head_store.is_some() {
-            released += self.shrink_store(bindings, true, policy)?;
-        }
-        self.settle_state_slabs();
+        let released = self.change_state(|this| {
+            let mut released = this.shrink_store(bindings, false, policy)?;
+            if this.head_store.is_some() {
+                released += this.shrink_store(bindings, true, policy)?;
+            }
+            Ok::<_, DomainError>(released)
+        })?;
         let slots = self.release_idle_graph_slots(wake);
         Ok(StateShrink { released, slots })
     }
@@ -1018,26 +1029,31 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // holds what idles there beside what it grows (`class_demand` counts
         // only slots not yet allocated), so it covers every slot beyond the
         // floor, as its close turns them cache again. Opened with none, they
-        // idle again.
-        let ledgers = self.resources.ledgers();
-        let idle = [ledgers.device(), ledgers.host()].map(|ledger| {
-            let store = ledger.store();
-            let bytes = self.idle_class.iter().filter(|cached| cached.store() == store).map(crate::memory::ledger::Cached::bytes).sum::<u64>();
-            self.idle_class.retain(|cached| cached.store() != store);
-            bytes
-        });
-        assert!(self.idle_class.is_empty(), "invariant violated: idle slots' cache in a store the device's ledgers do not keep");
-        let opened = self.claim_group_class(chunks, idle, quiet);
-        if self.group_class.is_none() {
+        // idle again. Letting their cache go, the class's growth and the
+        // cache held again are one change: no reading sees the idle slots
+        // free.
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|changing| {
             let ledgers = self.resources.ledgers();
-            for (ledger, bytes) in [ledgers.device(), ledgers.host()].into_iter().zip(idle).filter(|(_, bytes)| *bytes > 0) {
-                let cached = ledger
-                    .cache(crate::memory::ledger::CacheKind::GraphSlots, bytes)
-                    .expect("invariant violated: the idle slots' cache let go a moment ago fits again");
-                self.idle_class.push(cached);
+            let idle = [ledgers.device(), ledgers.host()].map(|ledger| {
+                let store = ledger.store();
+                let bytes = self.idle_class.iter().filter(|cached| cached.store() == store).map(crate::memory::ledger::Cached::bytes).sum::<u64>();
+                self.idle_class.retain(|cached| cached.store() != store);
+                bytes
+            });
+            assert!(self.idle_class.is_empty(), "invariant violated: idle slots' cache in a store the device's ledgers do not keep");
+            let opened = self.claim_group_class(chunks, idle, quiet);
+            if self.group_class.is_none() {
+                let ledgers = self.resources.ledgers();
+                for (ledger, bytes) in [ledgers.device(), ledgers.host()].into_iter().zip(idle).filter(|(_, bytes)| *bytes > 0) {
+                    let cached = ledger
+                        .cache(crate::memory::ledger::CacheKind::GraphSlots, bytes, changing)
+                        .expect("invariant violated: the idle slots' cache let go a moment ago fits again");
+                    self.idle_class.push(cached);
+                }
             }
-        }
-        opened
+            opened
+        })
     }
 
     /// The class of `chunks` places or fewer, the most whose claims yield
@@ -1068,19 +1084,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             let limits = self.execution.policy().limits();
             let grown = std::num::NonZeroUsize::new(places).expect("a class of two places or more");
-            let held = self
-                .resources
-                .grow_class(grown, limits.class_slots(places))
-                .and_then(|grown| self.family.hold_group(places, quiet).map(|()| grown))
-                .map(|grown| self.resources.hold_class(grown));
+            // The class's allocations and their record are one change:
+            // allocated whole, the pools' slots and the group's buffers are
+            // made, those a closed group left idle among them, whose cache
+            // the claims now cover.
+            let changes = ledgers.changes().clone();
+            let held = changes.change(|changing| {
+                let held = self
+                    .resources
+                    .grow_class(grown, limits.class_slots(places))
+                    .and_then(|grown| self.family.hold_group(places, quiet).map(|()| grown))
+                    .map(|grown| self.resources.hold_class(grown));
+                if held.is_ok() {
+                    for claim in claims.iter_mut().flatten() {
+                        claim.allocated(claim.bytes() - claim.allocated_bytes(), changing);
+                    }
+                }
+                held
+            });
             return match held {
                 Ok(()) => {
-                    // Allocated whole: the pools' slots and the group's
-                    // buffers are made, those a closed group left idle
-                    // among them, whose cache the claims now cover.
-                    for claim in claims.iter_mut().flatten() {
-                        claim.allocated(claim.bytes() - claim.allocated_bytes());
-                    }
                     self.group_class = Some(GroupClass { places, claims });
                     Ok(())
                 }
@@ -1127,19 +1150,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let GroupClass { places, claims } = self.group_class.take().expect("invariant violated: a held class without its claims");
         let freed = self.family.group_demand(places).map_err(DomainError::invariant)?;
         let freed = [freed.checked_bytes().map(|bytes| bytes - freed.host), Some(freed.host)];
-        self.family.hold_group(1, quiet).map_err(|error| DomainError::invariant(error.to_string()))?;
-        self.resources.release_class();
-        for (claim, freed) in claims.into_iter().zip(freed) {
-            let freed = freed.ok_or_else(|| DomainError::invariant("a group's buffers overflow"))?;
-            let Some(mut claim) = claim else {
-                assert_eq!(freed, 0, "invariant violated: a group's buffers lie in a store its class claimed nothing of");
-                continue;
-            };
-            claim.shrink(freed);
-            self.idle_class.push(claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots));
-
-        }
-        Ok(())
+        let freed = freed.map(|freed| freed.ok_or_else(|| DomainError::invariant("a group's buffers overflow")));
+        let [freed_device, freed_host] = freed;
+        let freed = [freed_device?, freed_host?];
+        // The buffers' free and the claims' shrink are one change.
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|changing| {
+            self.family.hold_group(1, quiet).map_err(|error| DomainError::invariant(error.to_string()))?;
+            self.resources.release_class();
+            for (claim, freed) in claims.into_iter().zip(freed) {
+                let Some(mut claim) = claim else {
+                    assert_eq!(freed, 0, "invariant violated: a group's buffers lie in a store its class claimed nothing of");
+                    continue;
+                };
+                claim.shrink(freed, changing);
+                self.idle_class.push(claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots));
+            }
+            Ok::<(), DomainError>(())
+        })
     }
 
     /// Claim `bytes` of device memory for the service's measurement job
@@ -1383,14 +1411,20 @@ pub(super) struct GroupClass {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    /// Settle the device's ledger with the state slabs the stores hold now
-    /// ([`StateSlabs::settle`]): after every change to the slabs or to the
-    /// sequences' row claims.
-    pub(super) fn settle_state_slabs(&mut self) {
-        let backed = self.committed_state_bytes();
-        let ledger = self.resources.ledgers().device();
-        let claims = self.state_claims.values_mut().map(|state| &mut state.claim);
-        self.state_slabs.settle(ledger, backed, claims);
+    /// `change`, a change to the state slabs or to the sequences' row
+    /// claims, and the device's ledger settled with the slabs the stores
+    /// hold after it ([`StateSlabs::settle`]), as one change
+    /// (`memory::ledger::Changes::change`).
+    pub(super) fn change_state<R>(&mut self, change: impl FnOnce(&mut Self) -> R) -> R {
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|changing| {
+            let changed = change(self);
+            let backed = self.committed_state_bytes();
+            let ledger = self.resources.ledgers().device();
+            let claims = self.state_claims.values_mut().map(|state| &mut state.claim);
+            self.state_slabs.settle(ledger, backed, claims, changing);
+            changed
+        })
     }
 }
 
@@ -1452,6 +1486,7 @@ impl StateSlabs {
         ledger: &crate::memory::ledger::Ledger,
         backed: u64,
         claims: impl Iterator<Item = &'a mut crate::memory::ledger::Claim>,
+        changing: &crate::memory::ledger::Changing,
     ) {
         let mut grown = backed.saturating_sub(self.floor);
         let claims: Vec<_> = claims
@@ -1469,14 +1504,14 @@ impl StateSlabs {
         let mut freed = gone;
         for spare in &mut self.spare {
             let paid = spare.releasing().min(freed);
-            spare.released(paid);
+            spare.released(paid, changing);
             freed -= paid;
         }
         for (claim, rows) in claims {
             let has = claim.allocated_bytes();
             match rows.cmp(&has) {
-                std::cmp::Ordering::Greater => claim.allocated(rows - has),
-                std::cmp::Ordering::Less => claim.deallocated(has - rows),
+                std::cmp::Ordering::Greater => claim.allocated(rows - has, changing),
+                std::cmp::Ordering::Less => claim.deallocated(has - rows, changing),
                 std::cmp::Ordering::Equal => {}
             }
         }
@@ -1502,13 +1537,13 @@ impl StateSlabs {
         if let Some(pending) = self.pending.take() {
             let backed = grown.saturating_sub(held).min(pending.bytes());
             if backed > 0 {
-                self.spare.push(pending.into_backed_cache(backed, crate::memory::ledger::CacheKind::Spare));
+                self.spare.push(pending.into_backed_cache(backed, crate::memory::ledger::CacheKind::Spare, changing));
                 held += backed;
             }
         }
         if grown > held {
             // Refused where the room is held already: not held twice.
-            self.spare.extend(ledger.cache(crate::memory::ledger::CacheKind::Spare, grown - held).ok());
+            self.spare.extend(ledger.cache(crate::memory::ledger::CacheKind::Spare, grown - held, changing).ok());
         }
     }
 }

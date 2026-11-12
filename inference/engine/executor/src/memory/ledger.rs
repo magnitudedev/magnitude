@@ -18,14 +18,19 @@
 //!   taken by [`Ledger::cache`]. The allocation paths (the granule pool's
 //!   blocks, the arena, weights) take one of them as their right to
 //!   allocate, and dropping it is the free.
-//! - **Every free shows at once.** Every store's frees are synchronous:
-//!   host blocks are mapped directly (`munmap`, `VirtualFree`), and plain
-//!   device allocations free at once on every backend (`cuMemFree`,
-//!   `vkFreeMemory`; a released shared Metal buffer unwires within one
-//!   reading interval, 66 ms for 4 GiB on an M4 Pro). Bytes a GPU fence
-//!   still reads stay held in their own entry until the fence completes
-//!   and the free returns: the holder drops its handle then. So what the
-//!   ledger holds covers them.
+//! - **Every byte to its owner at the reading's instant.** A reading is
+//!   one sample of the OS at one instant ([`Sample`]), taken off the
+//!   owner's thread and paired with the ledger later. The ledger journals
+//!   its own allocation changes in order (`Journaled`), and pairs a
+//!   reading with what the process had allocated as its figure shows it:
+//!   its allocations now, less every change made after the sample. An
+//!   allocation change is its OS effect and its record run as one change
+//!   the ledger owns ([`Changing`]): every record of one takes it, and no
+//!   sample beside one stands. Every store's figure shows a release at
+//!   once, so a release's bytes are free at the first sample after it.
+//!   Bytes a GPU fence still reads stay held in their own entry until the
+//!   fence completes and the free returns: the holder drops its handle
+//!   then. So what the ledger holds covers them.
 //! - **Allocated is what exists.** An entry's allocated bytes are memory
 //!   that exists for it: an allocation backed after it begins (a bank's
 //!   growth) is allocated as it backs ([`Ledger::backing`]), and cache a
@@ -45,12 +50,12 @@
 //! [`Ledger::claim`] and [`Ledger::admit`] through the one private `size`,
 //! the same functions plan and assessment predict with.
 //!
-//! Effect-free: no clocks are read and no OS is queried here. Readings are
-//! handed in.
+//! No OS is queried here: readings are handed in.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use crate::operation::RequestId;
@@ -60,19 +65,347 @@ use crate::planning::BankTier;
 // The one OS input.
 // ---------------------------------------------------------------------------
 
+/// A scope's own allocation changes across its stores ([`Ledgers`]): above
+/// [`IN_FLIGHT_BITS`], how many were begun (`Journaled`'s number, and the
+/// place a sample takes among them, [`Sampled`]); below, how many are under
+/// way ([`Changing`]). A sample stands only where none was under way as it
+/// began and none began while it read ([`Sampled::attempt`]): a change
+/// numbered below its place was made, OS effect and record alike, before
+/// every figure of the sample, and one at or above it after every figure.
+/// The product's one scope is the process's; a test's own scope counts only
+/// its own changes.
+#[derive(Default)]
+pub struct Changes {
+    /// A test's scope, no OS behind it ([`Ledgers::new`]): a record outside
+    /// a change is a change of its own, until the test holds it to the
+    /// process's rule ([`Self::strict`]).
+    alone: AtomicBool,
+    count: AtomicU64,
+    /// The threads that own the scope's memory now, one per load or domain
+    /// ([`Owner`]): only they begin an owner's change.
+    owners: Mutex<Vec<std::thread::ThreadId>>,
+    /// Where a change's end and a sample waiting for one meet.
+    meet: Mutex<Meet>,
+    moved: Condvar,
+}
+
+/// How many changes ended, how many samples wait to stand (a step off the
+/// owner's thread begins none while one waits, [`Changes::back`]), and how
+/// many changes under way are the owner's ([`Changes::change`]).
+#[derive(Default)]
+struct Meet {
+    ended: u64,
+    wanted: usize,
+    owner: usize,
+}
+
+/// The bits of [`Changes`] that count changes under way.
+const IN_FLIGHT_BITS: u32 = 20;
+
+/// One change begun, in [`Changes`].
+const ONE_CHANGE: u64 = 1 << IN_FLIGHT_BITS;
+
+impl Changes {
+    fn meet(&self) -> MutexGuard<'_, Meet> {
+        self.meet.lock().expect("a scope's changes lock is never poisoned")
+    }
+
+    /// A change of this scope begun on this thread, or the one this thread
+    /// has under way already, which it joins: one logical change, one
+    /// number, however its parts nest.
+    fn begin(self: &Arc<Self>, owner: bool) -> Changing {
+        if let Some(number) = self.open_here() {
+            return Changing { changes: self.clone(), number, owner, joined: true };
+        }
+        if owner {
+            let here = std::thread::current().id();
+            let owned = self.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&here);
+            assert!(owned || self.alone.load(Ordering::Relaxed), "invariant violated: an owner's change begun off its owner's thread");
+            self.meet().owner += 1;
+            self.moved.notify_all();
+        }
+        let number = self.count.fetch_add(ONE_CHANGE + 1, Ordering::SeqCst) >> IN_FLIGHT_BITS;
+        OPEN.with_borrow_mut(|open| open.push((self.key(), number)));
+        Changing { changes: self.clone(), number, owner, joined: false }
+    }
+
+    /// This scope's identity among the threads' open changes.
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// The number of the change of this scope this thread has under way.
+    fn open_here(&self) -> Option<u64> {
+        OPEN.with_borrow(|open| open.iter().find(|(key, _)| *key == self.key()).map(|(_, number)| *number))
+    }
+
+    /// From now, a record outside a change panics in this test's scope, as
+    /// in the process's.
+    #[cfg(test)]
+    pub(crate) fn strict(&self) {
+        self.alone.store(false, Ordering::Relaxed);
+    }
+
+    /// Wake a sample waiting on a change ([`Sampled::steady`]) to check
+    /// whether its sampler was stopped.
+    pub fn wake(&self) {
+        drop(self.meet());
+        self.moved.notify_all();
+    }
+
+    /// `change`, an OS change of the scope's memory on the owner's thread
+    /// and its records in the ledgers, run as one: no sample beside it
+    /// stands. The owner takes no reading while it runs, so a sample waits
+    /// for it however long it lasts (an import).
+    pub fn change<R>(self: &Arc<Self>, change: impl FnOnce(&Changing) -> R) -> R {
+        change(&self.begin(true))
+    }
+
+    /// The calling thread as an owner of the scope's memory until the
+    /// returned [`Owner`] drops: a load's or a domain's thread.
+    pub fn own(self: &Arc<Self>) -> Owner {
+        let thread = std::thread::current().id();
+        self.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
+        Owner { changes: self.clone(), thread }
+    }
+
+    /// One step off the owner's thread (a slot of a bank's growth, a
+    /// release on the release thread), as one change once no sample waits
+    /// to stand: so a sample waits at most for the step under way
+    /// ([`Sampled::steady`]). While a change of the owner's runs no sample
+    /// stands anyway, and the step waits for none: the owner may wait for
+    /// it.
+    ///
+    /// A step its thread runs within a change under way joins it at once:
+    /// a sample waits for that change, never the change for the sample.
+    pub fn back<R>(self: &Arc<Self>, step: impl FnOnce(&Changing) -> R) -> R {
+        if self.open_here().is_some() {
+            return step(&self.begin(false));
+        }
+        let meet = self.meet();
+        let waiting = |meet: &mut Meet| meet.wanted > 0 && meet.owner == 0;
+        drop(self.moved.wait_while(meet, waiting).expect("a scope's changes lock is never poisoned"));
+        step(&self.begin(false))
+    }
+}
+
+/// A thread's ownership of a scope's memory ([`Changes::own`]), held by a
+/// load and a domain for their lives: an owner's change begun on any other
+/// thread panics.
+pub struct Owner {
+    changes: Arc<Changes>,
+    thread: std::thread::ThreadId,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let mut owners = self.changes.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = owners.iter().position(|thread| *thread == self.thread).expect("an owner is listed until it drops");
+        owners.swap_remove(at);
+    }
+}
+
+/// A change held open until its holder drops, its thread owning the scope
+/// meanwhile: a load while it runs, a domain while its fields drop. Every
+/// free and record its thread makes meanwhile is part of it, so none is
+/// made apart from its change.
+#[derive(Default)]
+pub struct OpenChange {
+    _open: Option<(Owner, Changing)>,
+}
+
+impl OpenChange {
+    /// A change of `changes`' scope on the calling thread, its owner's, open
+    /// from now.
+    pub fn begin(changes: &Arc<Changes>) -> Self {
+        let owner = changes.own();
+        Self { _open: Some((owner, changes.begin(true))) }
+    }
+}
+
+thread_local! {
+    /// The change each scope has under way on this thread
+    /// ([`Changes::begin`]): every record this thread makes is part of it.
+    static OPEN: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A change of the scope's memory under way ([`Changes::change`],
+/// [`Changes::back`]), from before its OS effect until the ledger records
+/// it: no sample beside it stands. Only the ledger makes one, and every
+/// record of an allocation change, a holder's drop included, is part of the
+/// one its thread has under way: one outside any panics (`Locked`).
+pub struct Changing {
+    changes: Arc<Changes>,
+    /// Its place among the scope's changes.
+    number: u64,
+    owner: bool,
+    /// Part of a change its thread had under way, which ends it.
+    joined: bool,
+}
+
+impl Drop for Changing {
+    fn drop(&mut self) {
+        if self.joined {
+            return;
+        }
+        OPEN.with_borrow_mut(|open| {
+            let at = open.iter().rposition(|(key, _)| *key == self.changes.key()).expect("a change under way is open on its thread");
+            open.remove(at);
+        });
+        self.changes.count.fetch_sub(1, Ordering::SeqCst);
+        let mut meet = self.changes.meet();
+        meet.ended += 1;
+        meet.owner -= usize::from(self.owner);
+        drop(meet);
+        self.changes.moved.notify_all();
+    }
+}
+
+/// The instant a sample was taken at: its time on the owner's clock, and
+/// its place among the process's own allocation changes ([`Changes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sampled {
+    at: Instant,
+    after: u64,
+}
+
+impl Sampled {
+    /// `read`'s figures and the instant they were read at, read where no
+    /// change of the process's was under way as they began and none began
+    /// before the last was read: tried again as each change beside it ends.
+    /// A step off the owner's thread begins none while it waits
+    /// ([`Changes::back`]), so it waits at most for the changes under way,
+    /// however long one runs (a slot's backing, an import).
+    ///
+    /// # Panics
+    /// Where, with no change under way, none stands within a reading
+    /// interval ([`crate::platform::READING_INTERVAL`]): changes begin one
+    /// after another beside it, which a path that changes memory without
+    /// yielding to samples would do.
+    /// None once `stopped` (the sampler's owner ends it), checked as each
+    /// interval of waiting passes.
+    fn steady<T>(changes: &Changes, now: impl Fn() -> Instant, read: impl Fn() -> T, stopped: impl Fn() -> bool) -> Option<(Self, T)> {
+        /// The wait for a sample, let go however it ends: a step waits
+        /// for no sample that no longer waits.
+        struct Wanted<'a>(&'a Changes);
+        impl Drop for Wanted<'_> {
+            fn drop(&mut self) {
+                self.0.meet().wanted -= 1;
+                self.0.moved.notify_all();
+            }
+        }
+        changes.meet().wanted += 1;
+        let _wanted = Wanted(changes);
+        let mut deadline = Instant::now() + crate::platform::READING_INTERVAL;
+        loop {
+            let ended = changes.meet().ended;
+            if let Some(stood) = Self::attempt(changes, &now, &read, 0) {
+                return Some(stood);
+            }
+            if changes.count.load(Ordering::SeqCst) % ONE_CHANGE == 0 {
+                assert!(Instant::now() < deadline, "invariant violated: no sample stood within a reading interval with no change under way");
+                continue;
+            }
+            let mut meet = changes.meet();
+            while meet.ended == ended {
+                if stopped() {
+                    return None;
+                }
+                meet = changes.moved.wait_timeout(meet, crate::platform::READING_INTERVAL).expect("a scope's changes lock is never poisoned").0;
+            }
+            drop(meet);
+            deadline = Instant::now() + crate::platform::READING_INTERVAL;
+        }
+    }
+
+    /// One try of [`Self::steady`]: the figures where they stand; none
+    /// where a change was under way as it began beside the `mine` its own
+    /// thread has (the figures are then not read), or one began while they
+    /// were read.
+    fn attempt<T>(changes: &Changes, now: &impl Fn() -> Instant, read: &impl Fn() -> T, mine: u64) -> Option<(Self, T)> {
+        let before = changes.count.load(Ordering::SeqCst);
+        if before % ONE_CHANGE != mine {
+            return None;
+        }
+        let at = Self { at: now(), after: before >> IN_FLIGHT_BITS };
+        let figures = read();
+        (changes.count.load(Ordering::SeqCst) == before).then_some((at, figures))
+    }
+
+    /// Whether this sample was begun no later than `other`, in time and
+    /// among the changes alike.
+    fn precedes(&self, other: &Self) -> bool {
+        self.at <= other.at && self.after <= other.after
+    }
+}
+
+/// One sample of the machine at one instant: the device's status (its
+/// grants) and host RAM's reading, read with no change of the process's
+/// beside them, so the ledgers pair both with what the process had
+/// allocated then ([`DeviceLedgers::read`]).
+pub struct Sample {
+    status: seismic::Status,
+    host: Result<Available, Blind>,
+    at: Sampled,
+}
+
+impl Sample {
+    /// The periodic sample, taken now off the owner's thread, its time read
+    /// from `now`: `host` and `status` read with no change of `changes`'
+    /// scope under way or begun between the first figure and the last
+    /// ([`Sampled::steady`]), so no figure shows a change the sample's place
+    /// counts after it, nor misses one it counts before.
+    ///
+    /// None once `stopped`, waiting.
+    ///
+    /// # Panics
+    /// Where none stands within a reading interval ([`Sampled::steady`]).
+    pub fn take(
+        changes: &Changes,
+        now: impl Fn() -> Instant,
+        status: impl Fn() -> seismic::Status,
+        host: impl Fn() -> Result<Available, Blind>,
+        stopped: impl Fn() -> bool,
+    ) -> Option<Self> {
+        let (at, (host, status)) = Sampled::steady(changes, now, || (host(), status()), stopped)?;
+        Some(Self { status, host, at })
+    }
+
+    /// A sample taken now on the owner's thread, which never waits: none
+    /// where a change of another thread's (a bank's resize) is beside it
+    /// ([`Sampled::attempt`]). A change the owner has under way (a load)
+    /// does not stop it: the owner reads between its own allocations, each
+    /// recorded as it is made.
+    pub fn try_now(
+        changes: &Changes,
+        now: impl Fn() -> Instant,
+        status: impl Fn() -> seismic::Status,
+        host: impl Fn() -> Result<Available, Blind>,
+    ) -> Option<Self> {
+        let mine = u64::from(changes.open_here().is_some());
+        let (at, (host, status)) = Sampled::attempt(changes, &now, &|| (host(), status()), mine)?;
+        Some(Self { status, host, at })
+    }
+
+    pub fn status(&self) -> &seismic::Status {
+        &self.status
+    }
+}
+
 /// A store's available memory at one instant: the only OS memory figure the
 /// process reads. Available means pages the OS can hand out without
 /// swapping or compressing anyone (`seismic::HostStatus::allocatable`, which
 /// says why the OSes differ). One function per OS (and per device backend)
-/// produces it:
+/// produces it, and each shows the process's own allocation changes as it
+/// says:
 ///
-/// | Store | Reading |
-/// |---|---|
-/// | macOS | `free_count − speculative_count + purgeable_count` less `vm.vm_page_free_target` (`HOST_VM_INFO64`); `external_page_count` (file-backed) beside it, [`Available::reclaimable`] |
-/// | Linux | `MemAvailable`, bounded by cgroup v2 `memory.max − memory.current` |
-/// | Windows | `ullAvailPhys`, bounded by the job object's limit |
-/// | CUDA device | `cuMemGetInfo` free |
-/// | Vulkan device | `VK_EXT_memory_budget` budget less usage (the backend's floor requires the extension) |
+/// | Store | Reading | Shows the process's changes |
+/// |---|---|---|
+/// | macOS | `vm.page_free_count + vm.page_purgeable_count` less `vm.vm_page_free_target`, the live counts (`host_statistics64` serves a cached figure); `vm.page_pageable_external_count` (file-backed) beside it, [`Available::reclaimable`] | as its recommit returns: a Metal reservation's chunks return their pages at their release (2.00 GiB shown at the return, measured) (a buffer over a whole reservation kept them until the range was unmapped, so none spans one) |
+/// | Linux | `MemAvailable`, bounded by cgroup v2 `memory.max − memory.current` | at once but for at most 125 pages per CPU (unmeasured): a CPU's count of freed pages folds into the global past that threshold, and only the remainder waits for `vm.stat_interval`; `memory.current` counts at the charge |
+/// | Windows | `ullAvailPhys`, bounded by the job object's limit | at once |
+/// | CUDA device | `cuMemGetInfo` free | at once (`cuMemFree`; no stream-ordered pools are used) |
+/// | Vulkan device | `VK_EXT_memory_budget` budget less usage (the backend's floor requires the extension) | at the query on RADV; NVIDIA's refresh is undocumented and unmeasured, read as at once |
 ///
 /// Fields are private: `available ≤ total` holds by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,9 +419,9 @@ pub struct Available {
     reclaimable: u64,
     /// What a driver's grant on the process's allocations in the store
     /// leaves (Metal's working set less what it has allocated); none where
-    /// no grant bounds the store.
+    /// no grant bounds the store. Every grant shows the process's changes
+    /// at once.
     grant_left: Option<u64>,
-    at: Instant,
 }
 
 /// A reading that does not satisfy `available ≤ total`.
@@ -97,16 +430,11 @@ pub struct ImpossibleReading;
 
 impl Available {
     /// The reading, refused where it is not one.
-    pub fn new(
-        total: u64,
-        available: u64,
-        grant_left: Option<u64>,
-        at: Instant,
-    ) -> Result<Self, ImpossibleReading> {
+    pub fn new(total: u64, available: u64, grant_left: Option<u64>) -> Result<Self, ImpossibleReading> {
         if available > total {
             return Err(ImpossibleReading);
         }
-        Ok(Self { total, available, reclaimable: 0, grant_left, at })
+        Ok(Self { total, available, reclaimable: 0, grant_left })
     }
 
     /// This reading with `bytes` of clean file-backed pages a load may count
@@ -115,14 +443,14 @@ impl Available {
         Self { reclaimable: bytes.min(self.total - self.available), ..self }
     }
 
-    /// Host RAM's reading on this OS. The one place host memory figures
+    /// Host RAM's reading on this OS now. The one place host memory figures
     /// are read.
     ///
     /// # Panics
     /// Where the OS reports more available than total: no reading.
-    pub fn host(at: Instant) -> Result<Self, Blind> {
+    pub fn host() -> Result<Self, Blind> {
         let reading = seismic::host_available().map_err(|error| Blind(error.to_string()))?;
-        let available = Self::new(reading.total, reading.available, None, at).unwrap_or_else(|ImpossibleReading| {
+        let available = Self::new(reading.total, reading.available, None).unwrap_or_else(|ImpossibleReading| {
             panic!("invariant violated: host RAM reads {} available of {} total", reading.available, reading.total)
         });
         Ok(available.with_reclaimable(reading.reclaimable))
@@ -142,9 +470,6 @@ impl Available {
         self.reclaimable
     }
 
-    pub fn at(&self) -> Instant {
-        self.at
-    }
 }
 
 /// The available reading failed: the ledger cannot see the store.
@@ -402,21 +727,39 @@ fn size(shape: &LoadShape, need: &Need) -> u64 {
 /// ([`Self::process`]); a test may use one of its own ([`Self::new`]),
 /// sharing nothing with other tests. A store has one ledger in a scope by
 /// construction: there is no other way to make one.
-#[derive(Default)]
 pub struct Ledgers {
     stores: Mutex<HashMap<seismic::StoreIdentity, Weak<Store>>>,
+    changes: Arc<Changes>,
 }
 
 impl Ledgers {
-    /// A scope of its own.
+    fn of(changes: Changes) -> Self {
+        Self { stores: Mutex::default(), changes: Arc::new(changes) }
+    }
+
+    /// A test's scope of its own, no OS behind its stores: a record its
+    /// test makes outside a change is a change of its own.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn new() -> Self {
-        Self::default()
+        Self::of(Changes { alone: AtomicBool::new(true), ..Changes::default() })
+    }
+
+    /// A test's scope of its own under the process's rule: a record
+    /// outside a change panics.
+    #[cfg(test)]
+    pub(crate) fn strict() -> Self {
+        Self::of(Changes::default())
+    }
+
+    /// The changes of this scope's stores ([`Changes`]).
+    pub fn changes(&self) -> &Arc<Changes> {
+        &self.changes
     }
 
     /// The process's scope.
     pub fn process() -> &'static Self {
         static PROCESS: OnceLock<Ledgers> = OnceLock::new();
-        PROCESS.get_or_init(Ledgers::new)
+        PROCESS.get_or_init(|| Ledgers::of(Changes::default()))
     }
 
     /// `store`'s one ledger in this scope, as a load of `shape` sees it.
@@ -424,7 +767,7 @@ impl Ledgers {
         let mut stores = self.stores.lock().expect("ledger scope lock poisoned");
         let found = stores.get(&store).and_then(Weak::upgrade);
         let store = found.unwrap_or_else(|| {
-            let made = Arc::new(Store { identity: store.clone(), state: Mutex::new(State::default()) });
+            let made = Arc::new(Store { identity: store.clone(), state: Mutex::new(State::default()), changes: self.changes.clone() });
             stores.insert(store, Arc::downgrade(&made));
             made
         });
@@ -452,10 +795,8 @@ impl DeviceLedgers {
     /// The ledgers `device` reaches in `scope`: a test's own, so tests
     /// running together share no store.
     pub fn open_in(scope: &Ledgers, device: &seismic::Device, shape: Arc<LoadShape>) -> Self {
-        Self {
-            device: scope.ledger(placed_store(device, seismic::Contract::DeviceOnly), shape.clone()),
-            host: scope.ledger(placed_store(device, seismic::Contract::Shared), shape),
-        }
+        let view = |contract, shape| scope.ledger(placed_store(device, contract), shape);
+        Self { device: view(seismic::Contract::DeviceOnly, shape.clone()), host: view(seismic::Contract::Shared, shape) }
     }
 
     /// Whether the stores `device` reaches hold `demand` beside every
@@ -569,19 +910,21 @@ impl DeviceLedgers {
         Ok(self.claim(device, kind, demand(fitting)?).map(|held| (fitting, held)))
     }
 
-    /// Read every store `device` reaches, each by its one reading, at `at`:
-    /// host RAM by `host`, its reading then (the live machine's
-    /// [`Available::host`]), bounded on unified memory by the device's grant
-    /// (Metal's working set); the device's own memory, where it is a store
-    /// of its own, by what its grant leaves (`cuMemGetInfo`'s free, Vulkan's
-    /// budget less usage), of the store's capacity. `status` is the device's
-    /// status now, the one source of its grants.
+    /// Read every store `device` reaches from `sample`, one instant's: host
+    /// RAM by its host reading (the live machine's [`Available::host`]),
+    /// bounded on unified memory by the device's grant (Metal's working
+    /// set); the device's own memory, where it is a store of its own, by
+    /// what its grant leaves (`cuMemGetInfo`'s free, Vulkan's budget less
+    /// usage), of the store's capacity. The sample's status is the one
+    /// source of the device's grants.
     ///
     /// # Panics
     /// Where a device whose memory is its own reports no grant: every
     /// backend with such memory reads one for an opened device (CUDA's free
     /// figure, Vulkan's memory budget, which its floor requires).
-    pub fn read(&self, device: &seismic::Device, status: &seismic::Status, host: Result<Available, Blind>, at: Instant) {
+    pub fn read(&self, device: &seismic::Device, sample: &Sample) {
+        let Sample { status, host, at } = sample;
+        let (host, at) = (host.clone(), *at);
         let topology = device.topology();
         let path = device
             .info()
@@ -595,19 +938,22 @@ impl DeviceLedgers {
             Some(Err(error)) => Err(Blind(error.to_string())),
         };
         if Arc::ptr_eq(&self.device.store, &self.host.store) {
-            self.host.read(|| {
-                let host = host?;
-                Ok(Available { grant_left: left()?, ..host })
-            });
+            self.host.read(at, host.and_then(|host| Ok(Available { grant_left: left()?, ..host })));
             return;
         }
-        self.host.read(|| host);
+        self.host.read(at, host);
         let capacity = topology.store(path.store()).expect("a path's store is of its revision").capacity().value;
-        self.device.read(|| {
-            let available = left()?
-                .unwrap_or_else(|| panic!("invariant violated: an opened device whose memory is its own reports no grant"));
-            Ok(Available::new(capacity, available.min(capacity), None, at).expect("a grant bounded by the store's capacity is a reading"))
-        });
+        self.device.read(at, left().map(|left| {
+            let available =
+                left.unwrap_or_else(|| panic!("invariant violated: an opened device whose memory is its own reports no grant"));
+            Available::new(capacity, available.min(capacity), None).expect("a grant bounded by the store's capacity is a reading")
+        }));
+    }
+
+    /// The changes of the scope these ledgers are in, which a sample paired
+    /// with them is taken beside ([`Sample::take`]).
+    pub fn changes(&self) -> &Arc<Changes> {
+        &self.device.store.changes
     }
 
     /// The device's own memory's ledger: host RAM's on unified memory.
@@ -651,12 +997,26 @@ pub struct Held {
 }
 
 impl Held {
-    /// Every claimed byte allocated: the allocation was made.
-    pub fn allocated(&mut self) {
+    /// Every claimed byte allocated: the allocation was made, within
+    /// `changing`.
+    pub fn allocated(&mut self, changing: &Changing) {
         for claim in &mut self.claims {
             let left = claim.bytes() - claim.allocated_bytes();
-            claim.allocated(left);
+            claim.allocated(left, changing);
         }
+    }
+
+    /// `make`, the allocation on the owner's thread, and every claimed byte
+    /// allocated as one change ([`Changes::change`]); refused, none is.
+    pub fn allocate<T, E>(&mut self, make: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let Some(changes) = self.claims.first().map(|claim| claim.ledger.store.changes.clone()) else {
+            return make();
+        };
+        changes.change(|changing| {
+            let made = make()?;
+            self.allocated(changing);
+            Ok(made)
+        })
     }
 
     /// The claims, to keep for the life of the allocation.
@@ -671,8 +1031,8 @@ impl Held {
 
     /// Split off `bytes` claimed in `store`, before any is allocated, as a
     /// [`CommittedKind::Backing`] claim: memory the allocation backs after
-    /// the rest is made (a host tier backed to its load-time slots after
-    /// its import), which [`Recorded::record_backing`] keeps apart.
+    /// the rest is made (a host tier backed to its load-time slots, which
+    /// its bank allocates as each slot backs).
     ///
     /// # Panics
     /// Where it claimed fewer unallocated bytes there.
@@ -685,6 +1045,20 @@ impl Held {
     }
 }
 
+/// `free`, on the owner's thread, the free of what `claims` hold, and their
+/// release, as one change ([`Changes::change`]); with no claims there is no
+/// record to make.
+pub fn free<R>(claims: Vec<Claim>, free: impl FnOnce() -> R) -> R {
+    let Some(changes) = claims.first().map(|claim| claim.ledger.store.changes.clone()) else {
+        return free();
+    };
+    changes.change(|_| {
+        let freed = free();
+        drop(claims);
+        freed
+    })
+}
+
 /// What a load allocated as it started: one [`CommittedKind::Load`] claim
 /// per store its device reaches, allocated whole. The holdings that name
 /// those bytes carve them out ([`Self::carve`]), so no allocation is
@@ -694,9 +1068,6 @@ pub struct Recorded {
     /// The load's minimum request state, in each store that holds state
     /// ([`Self::record_state_floor`]): held for the domain's life.
     state_floors: Vec<Claim>,
-    /// Allocations the load began that back after it started, each store's
-    /// claim to them allocated as they back ([`Self::record_backing`]).
-    backings: Vec<Claim>,
 }
 
 impl Recorded {
@@ -710,7 +1081,7 @@ impl Recorded {
             let id = ledger.state().insert(Holding::Committed(CommittedKind::Load), 0);
             claims.push(Claim { ledger: ledger.clone(), id, kind: CommittedKind::Load });
         }
-        Self { claims, state_floors: Vec::new(), backings: Vec::new() }
+        Self { claims, state_floors: Vec::new() }
     }
 
     /// `floor`, the load's minimum request state claimed as
@@ -720,22 +1091,6 @@ impl Recorded {
             assert_eq!(claim.kind, CommittedKind::StateFloor, "invariant violated: a state floor recorded of another kind");
             self.state_floors.push(claim);
         }
-    }
-
-    /// `backing`, a [`CommittedKind::Backing`] claim split from an
-    /// allocation the load made as it started ([`Held::split_backing`]),
-    /// kept until its holder takes it ([`Self::backing`]): one per store.
-    pub fn record_backing(&mut self, backing: Claim) {
-        assert_eq!(backing.kind, CommittedKind::Backing, "invariant violated: a backing recorded of another kind");
-        let store = &backing.ledger.store.identity;
-        assert!(self.backings.iter().all(|held| held.ledger.store.identity != *store), "invariant violated: two backings recorded in {store:?}");
-        self.backings.push(backing);
-    }
-
-    /// The backing recorded in `store`, to its holder.
-    pub fn backing(&mut self, store: &seismic::StoreIdentity) -> Option<Claim> {
-        let at = self.backings.iter().position(|backing| backing.ledger.store.identity == *store)?;
-        Some(self.backings.remove(at))
     }
 
     /// The record of `store`.
@@ -789,11 +1144,7 @@ impl Recorded {
     }
 
     /// The record's claims, held for the domain's life.
-    ///
-    /// # Panics
-    /// Where a backing recorded was never taken by its holder.
     pub fn into_claims(self) -> Vec<Claim> {
-        assert!(self.backings.is_empty(), "invariant violated: a backing recorded that no holding took");
         self.claims.into_iter().chain(self.state_floors).collect()
     }
 
@@ -831,10 +1182,22 @@ pub enum Short {
     Over { store: seismic::StoreIdentity, required: u64, over: u64 },
 }
 
-/// One store's record.
+/// One store's record, and the changes of its scope.
 struct Store {
     identity: seismic::StoreIdentity,
     state: Mutex<State>,
+    changes: Arc<Changes>,
+}
+
+/// One change of what the process allocated in a store, net of everything
+/// one locked operation did (a move between entries, as a carve, changes
+/// nothing): kept until a sample follows it.
+#[derive(Clone, Copy, Debug)]
+struct Journaled {
+    /// Its change's place among the scope's ([`Changes`]).
+    number: u64,
+    bytes: u64,
+    grew: bool,
 }
 
 /// Which entry of a store.
@@ -871,7 +1234,13 @@ struct State {
     pending: std::collections::HashSet<EntryId>,
     /// Which cache yields first to a claim.
     order: Vec<CacheKind>,
+    /// The process's own changes of `allocated` that no sample follows yet,
+    /// in order.
+    journal: Vec<Journaled>,
     reading: Option<Result<Available, Blind>>,
+    /// The instant of the latest reading taken: an earlier one is never
+    /// taken after it.
+    sampled: Option<Sampled>,
     others: Option<u64>,
     others_before: Option<u64>,
     /// What the grant lets the process hold, as of the reading: what it
@@ -912,6 +1281,22 @@ impl State {
             others_before: self.others_before,
             grant: self.grant,
         }
+    }
+
+    /// What the process had allocated at a sample at `at`: its allocations
+    /// now, less every change made after it.
+    ///
+    /// # Panics
+    /// Where that is not a count of bytes: the journal holds every change
+    /// since the latest sample.
+    fn allocated_at(&self, at: Sampled) -> u64 {
+        let shown = self.journal.iter().filter(|change| change.number >= at.after).fold(i128::from(self.allocated), |shown, change| {
+            match change.grew {
+                true => shown - i128::from(change.bytes),
+                false => shown + i128::from(change.bytes),
+            }
+        });
+        u64::try_from(shown).unwrap_or_else(|_| panic!("invariant violated: the process's allocations read {shown} bytes at a reading"))
     }
 
     /// Add `bytes` to the totals of `holding`, or take them away.
@@ -1246,6 +1631,56 @@ pub struct Ledger {
     shape: Arc<LoadShape>,
 }
 
+/// A view's hold of its store's state: every change of what the process
+/// allocated that one hold makes is journaled, net, as it ends
+/// (`Journaled`), so no path that allocates or frees escapes the journal;
+/// in the change it is part of ([`Ledger::changed`]), or, a holder's drop
+/// letting its bytes go, in one of its own.
+struct Locked<'a> {
+    /// Held until the hold drops, which lets it go before any panic.
+    state: Option<MutexGuard<'a, State>>,
+    ledger: &'a Ledger,
+    allocated: u64,
+    changing: Option<&'a Changing>,
+}
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.state.as_ref().expect("a hold holds its state until it drops")
+    }
+}
+
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_mut().expect("a hold holds its state until it drops")
+    }
+}
+
+impl Drop for Locked<'_> {
+    /// Nothing is recorded while unwinding ([`Claim`]'s drop). A record
+    /// outside any change is journaled as one of its own, the state let go,
+    /// and then panics: the ledger stays whole and unpoisoned, so the
+    /// violation reports itself.
+    fn drop(&mut self) {
+        let mut state = self.state.take().expect("a hold holds its state until it drops");
+        let (before, now) = (self.allocated, state.allocated);
+        if before == now || std::thread::panicking() {
+            return;
+        }
+        let changes = &self.ledger.store.changes;
+        let open = self.changing.map(|changing| changing.number).or_else(|| changes.open_here());
+        let number = open.unwrap_or_else(|| changes.begin(false).number);
+        state.journal.push(Journaled { number, bytes: before.abs_diff(now), grew: now > before });
+        drop(state);
+        assert!(
+            open.is_some() || changes.alone.load(Ordering::Relaxed),
+            "invariant violated: an allocation change recorded outside a change of its memory"
+        );
+    }
+}
+
 /// A committed claim: the right to allocate its bytes, held until dropped.
 /// Dropping it frees its bytes; its holder drops it once no GPU fence reads
 /// them. Not `Clone`: one holder.
@@ -1401,31 +1836,71 @@ pub struct Snapshot {
 }
 
 impl Ledger {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.store.state.lock().expect("ledger lock poisoned")
+    fn state(&self) -> Locked<'_> {
+        let state = self.store.state.lock().expect("ledger lock poisoned");
+        let allocated = state.allocated;
+        Locked { state: Some(state), ledger: self, allocated, changing: None }
+    }
+
+    /// The store's state, held within `changing`: what it records is part
+    /// of that change.
+    ///
+    /// # Panics
+    /// Where `changing` is of another scope.
+    fn changed<'a>(&'a self, changing: &'a Changing) -> Locked<'a> {
+        assert!(Arc::ptr_eq(&changing.changes, &self.store.changes), "invariant violated: a change recorded in a ledger of another scope");
+        let state = self.store.state.lock().expect("ledger lock poisoned");
+        let allocated = state.allocated;
+        Locked { state: Some(state), ledger: self, allocated, changing: Some(changing) }
+    }
+
+    /// `change`, an OS change of the process's memory and its records in
+    /// the ledgers, run as one change ([`Changes::change`]).
+    pub fn change<R>(&self, change: impl FnOnce(&Changing) -> R) -> R {
+        self.store.changes.change(change)
     }
 
     pub fn store(&self) -> seismic::StoreIdentity {
         self.store.identity.clone()
     }
 
-    /// Take the store's reading with `read` (its OS's [`Available`]
-    /// function) under the ledger's lock, so no claim or free falls between
-    /// the OS's figure and the entries it is paired with. A reading older
-    /// than the latest is ignored, so readings never mix.
-    pub fn read(&self, read: impl FnOnce() -> Result<Available, Blind>) {
+    /// A test's sample of this store taken now, at `at` on its clock, with
+    /// no change beside it. Every other sample is [`Sample::take`]'s.
+    #[cfg(test)]
+    pub(crate) fn sampled(&self, at: Instant) -> Sampled {
+        Sampled { at, after: self.store.changes.count.load(Ordering::SeqCst) >> IN_FLIGHT_BITS }
+    }
+
+    /// Take the store's reading (its OS's [`Available`] function's), or its
+    /// failure, sampled at `at`: a reading is paired with what the process
+    /// had allocated at the sample (`State::allocated_at`), so others'
+    /// memory is what the figure uses beyond that, and no change of the
+    /// process's moves it. A reading sampled before the latest is ignored,
+    /// so readings never mix; a failure always blinds the store. Either lets
+    /// go of every change the sample follows, so the journal holds only what
+    /// samples to come may not show, whether the store reads or not.
+    pub fn read(&self, at: Sampled, reading: Result<Available, Blind>) {
         let mut state = self.state();
-        let reading = read();
-        if let (Ok(now), Some(Ok(latest))) = (&reading, &state.reading) {
-            if now.at < latest.at {
-                return;
-            }
+        let follows = state.sampled.is_none_or(|latest| latest.precedes(&at));
+        if reading.is_ok() && !follows {
+            return;
         }
-        // What the process allocated is its memory of the reading; what it
-        // holds beyond that is not in the reading yet, so never others'.
-        let allocated = state.allocated;
-        let others = reading.as_ref().ok().map(|reading| (reading.total - reading.available).saturating_sub(allocated));
-        state.grant = reading.as_ref().ok().and_then(|reading| reading.grant_left).map(|left| allocated.saturating_add(left));
+        if follows {
+            state.journal.retain(|change| change.number >= at.after);
+            state.sampled = Some(at);
+        }
+        let others = match &reading {
+            Ok(reading) => {
+                let used = reading.total - reading.available;
+                let at_sample = state.allocated_at(at);
+                state.grant = reading.grant_left.map(|left| at_sample.saturating_add(left));
+                Some(used.saturating_sub(at_sample))
+            }
+            Err(_) => {
+                state.grant = None;
+                None
+            }
+        };
         state.reading = Some(reading);
         state.others_before = std::mem::replace(&mut state.others, others);
     }
@@ -1521,12 +1996,12 @@ impl Ledger {
         Claim { ledger, id: entry, kind }
     }
 
-    /// Hold `bytes` of free room as cache of `kind`; refused where free
-    /// room is short of them or the store is blind. Free room is the budget
-    /// less everything held; the bank's target subtracts the guarantee
-    /// before it asks.
-    pub fn cache(&self, kind: CacheKind, bytes: u64) -> Result<Cached, Short> {
-        let mut state = self.state();
+    /// Hold `bytes` of free room as cache of `kind`, memory made within
+    /// `changing`; refused where free room is short of them or the store is
+    /// blind. Free room is the budget less everything held; the bank's
+    /// target subtracts the guarantee before it asks.
+    pub fn cache(&self, kind: CacheKind, bytes: u64, changing: &Changing) -> Result<Cached, Short> {
+        let mut state = self.changed(changing);
         state.seen(&self.store.identity, bytes)?;
         let free = state.snapshot().free();
         if free < bytes {
@@ -1564,34 +2039,36 @@ impl Claim {
         self.ledger.state().entry(self.id).bytes
     }
 
-    /// Its holder made `bytes` more of it.
+    /// Its holder made `bytes` more of it, within `changing`.
     ///
     /// # Panics
     /// Past [`Self::bytes`].
-    pub fn allocated(&mut self, bytes: u64) {
-        let mut state = self.ledger.state();
+    pub fn allocated(&mut self, bytes: u64, changing: &Changing) {
+        let mut state = self.ledger.changed(changing);
         let has = state.entry(self.id).allocated;
         state.allocate(self.id, has.checked_add(bytes).expect("a claim's bytes fit u64"));
     }
 
-    /// Its holder freed `bytes` of what it allocated, keeping the claim.
+    /// Its holder freed `bytes` of what it allocated, keeping the claim,
+    /// within `changing`.
     ///
     /// # Panics
     /// Past what it allocated.
-    pub fn deallocated(&mut self, bytes: u64) {
-        let mut state = self.ledger.state();
+    pub fn deallocated(&mut self, bytes: u64, changing: &Changing) {
+        let mut state = self.ledger.changed(changing);
         let has = state.entry(self.id).allocated;
         let left = has.checked_sub(bytes).unwrap_or_else(|| panic!("invariant violated: a claim frees {bytes} of its {has} allocated bytes"));
         state.allocate(self.id, left);
     }
 
-    /// Its holder freed `bytes` it allocated and holds no claim to them
-    /// any more: its bytes and what it allocated both fall by them.
+    /// Its holder freed `bytes` it allocated, within `changing`, and holds
+    /// no claim to them any more: its bytes and what it allocated both fall
+    /// by them.
     ///
     /// # Panics
     /// Past what it allocated.
-    pub fn shrink(&mut self, bytes: u64) {
-        let mut state = self.ledger.state();
+    pub fn shrink(&mut self, bytes: u64, changing: &Changing) {
+        let mut state = self.ledger.changed(changing);
         let entry = *state.entry(self.id);
         let allocated = entry
             .allocated
@@ -1606,19 +2083,20 @@ impl Claim {
         self.ledger.state().entry(self.id).allocated
     }
 
-    /// `backed` of its bytes exist now: what its holder allocated is that,
-    /// at most its bytes (Seismic's charge of a backing may run past the
-    /// plan's figure it was claimed by).
-    pub fn backed(&mut self, backed: u64) {
-        let mut state = self.ledger.state();
+    /// `backed` of its bytes exist now, backed within `changing`: what its
+    /// holder allocated is that, at most its bytes (Seismic's charge of a
+    /// backing may run past the plan's figure it was claimed by).
+    pub fn backed(&mut self, backed: u64, changing: &Changing) {
+        let mut state = self.ledger.changed(changing);
         let bytes = state.entry(self.id).bytes;
         state.allocate(self.id, backed.min(bytes));
     }
 
-    /// The backing ended at `backed` bytes: what it did not back is free,
-    /// and the rest is cache of `kind` ([`Self::into_cache`]).
-    pub fn into_backed_cache(mut self, backed: u64, kind: CacheKind) -> Cached {
-        self.backed(backed);
+    /// The backing ended at `backed` bytes, backed within `changing`: what
+    /// it did not back is free, and the rest is cache of `kind`
+    /// ([`Self::into_cache`]).
+    pub fn into_backed_cache(mut self, backed: u64, kind: CacheKind, changing: &Changing) -> Cached {
+        self.backed(backed, changing);
         let allocated = self.allocated_bytes();
         self.ledger.state().resize(self.id, allocated);
         self.into_cache(kind)
@@ -1711,13 +2189,13 @@ impl Cached {
         self.ledger.state().entry(self.id).releasing
     }
 
-    /// Its holder freed `bytes` of what claims took of it: their claims may
-    /// allocate them now.
+    /// Its holder freed `bytes` of what claims took of it, within
+    /// `changing`: their claims may allocate them now.
     ///
     /// # Panics
     /// Past [`Self::releasing`].
-    pub fn released(&mut self, bytes: u64) {
-        self.ledger.state().released(self.id, bytes);
+    pub fn released(&mut self, bytes: u64, changing: &Changing) {
+        self.ledger.changed(changing).released(self.id, bytes);
     }
 
     /// The store it is held in.
@@ -1817,11 +2295,19 @@ impl Snapshot {
         }
     }
 
+    /// What the OS read as available and as clean file cache at the
+    /// reading, the two figures `others` is built from.
+    pub fn os_figures(&self) -> Option<(u64, u64)> {
+        self.reading.as_ref().ok().map(|reading| (reading.available, reading.reclaimable))
+    }
+
     /// Other programs' memory: `(total − available) − allocated`, all as
-    /// of the reading: only the process's allocated bytes are its own in a
-    /// reading, so a claim not yet allocated stays out of free room and is
-    /// never read as others'. The single definition; never read
-    /// separately. None when blind.
+    /// of the reading's instant, the process's allocations as its figure
+    /// shows them ([`Ledger::read`]): only the process's allocated bytes are
+    /// its own in a reading, so a claim not yet allocated stays out of free
+    /// room and is never read as others', and no claim or free of the
+    /// process's moves it. The single definition; never read separately.
+    /// None when blind.
     pub fn others(&self) -> Option<u64> {
         self.others.filter(|_| self.reading.is_ok())
     }
@@ -1874,6 +2360,23 @@ impl Snapshot {
     /// stop rising.
     pub fn unload(&self, in_process: u64) -> bool {
         self.reading.is_err() || self.free() < self.guarantee(in_process) && self.cache == 0 && self.preemptible == 0
+    }
+}
+
+/// A test's allocations, each made as a change of its own.
+#[cfg(test)]
+impl Ledger {
+    /// [`Self::cache`] of memory a test made.
+    pub(crate) fn cached(&self, kind: CacheKind, bytes: u64) -> Result<Cached, Short> {
+        self.change(|changing| self.cache(kind, bytes, changing))
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Held {
+    /// [`Self::allocated`] of an allocation a test made.
+    pub(crate) fn made(&mut self) {
+        self.allocate(|| Ok::<_, ()>(())).expect("a test's allocation is made");
     }
 }
 

@@ -815,6 +815,13 @@ struct Released {
 }
 
 impl RecommitRelease {
+    /// Wait for the device work submitted before the install, which may
+    /// still use what the release frees: a [`Self::release`] after it frees
+    /// without waiting.
+    pub fn retire(&self) {
+        self.released.as_ref().expect("a resize is retired before its release").submitted.retire();
+    }
+
     /// Once the device work submitted before the install completes, free
     /// what the reservation backs beyond the tensor's rows; its charge
     /// follows. It returns the resizer.

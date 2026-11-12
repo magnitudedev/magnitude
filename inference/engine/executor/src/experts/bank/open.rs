@@ -29,6 +29,7 @@ impl ExpertBank {
         lines: std::sync::Arc<[crate::assessment::BankLines]>,
         cpu: &crate::assessment::StoredCpuSite,
         releases: Releases,
+        (changes, host_backing): (std::sync::Arc<crate::memory::ledger::Changes>, Option<crate::memory::ledger::Claim>),
     ) -> Result<Self, crate::residency::WeightImportError> {
         // A layer whose CPU site its qualification refused serves every miss
         // over the link: never silently, and with why.
@@ -162,6 +163,7 @@ impl ExpertBank {
         // Derived once here, so no resize derives them on the step's thread.
         let deriving = std::time::Instant::now();
         let counts = Arc::new(plan.counts()?);
+        let host_backing = host_backing.map(|claim| (counts.host_charge(0), claim));
         tracing::info!("derived the bank's counts up to {} slots in {:.1} ms", plan.ceiling, deriving.elapsed().as_secs_f64() * 1e3);
         let floor = allocate_placed(device, plan, std::num::NonZeroU64::MIN)
             .map_err(|error| crate::residency::WeightImportError::of_allocation(seismic::Contract::Words, error))?;
@@ -206,7 +208,7 @@ impl ExpertBank {
             landed,
             plan: plan.clone(),
             counts,
-            cache: Default::default(),
+            cache: Arc::new(super::cache::BankCache::opened(changes, plan.host_slots, host_backing)),
         };
         if plan.host_slots > 0 {
             bank.back_host().map_err(|error| format!("the host tier's backing: {error}"))?;

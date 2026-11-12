@@ -23,7 +23,7 @@ fn wake() -> crate::CompletionWake {
 /// process's allocations hold.
 fn read(ledger: &Ledger, at: Instant) {
     let available = TOTAL - OTHERS - ledger.snapshot().allocated();
-    ledger.read(|| Ok(Available::new(TOTAL, available, None, at).expect("a reading")));
+    ledger.read(ledger.sampled(at), Ok(Available::new(TOTAL, available, None).expect("a reading")));
 }
 
 /// Item 9, the laptop's failure, on the ledger: a bank at its full target,

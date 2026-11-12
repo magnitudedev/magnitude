@@ -1324,8 +1324,8 @@ impl fmt::Display for DomainReading {
         if let Some(held) = self.held {
             write!(
                 f,
-                "; the host holds {} bytes wired and {} compressed",
-                held.wired_bytes, held.compressed_bytes
+                "; the host holds {} bytes compressed",
+                held.compressed_bytes
             )?;
         }
         Ok(())
@@ -1422,7 +1422,7 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
 
     const LINUX: ReportedBy = ReportedBy::LinuxMemAvailable;
-    const MACOS: ReportedBy = ReportedBy::MachAllocatablePages;
+    const MACOS: ReportedBy = ReportedBy::MacOsFreePages;
 
     /// Memory recovers once free for the stable time at every reading; one
     /// reading that is not free starts it over.

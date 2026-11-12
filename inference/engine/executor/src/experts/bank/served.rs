@@ -39,9 +39,9 @@ impl ServedBank {
     /// landing rows (`ExpertBankPlan::landing`) and each holding's floor
     /// are committed of it, and what each holds above its floor is cache of
     /// it, never admitted again. A host tier backing to its load-time slots
-    /// after the import (`ExpertBank::back_host`) holds its import's claim
-    /// to them (`Recorded::backing`) as a growth: allocated as its slots
-    /// back it, cache of what it backed once it ends.
+    /// from the bank's open (`ExpertBank::back_host`) holds its import's
+    /// claim to them as a growth from then (`ExpertBank::open`): allocated
+    /// as its slots back it, cache of what it backed once it ends.
     pub fn new(
         bank: Arc<ExpertBank>,
         programs: &crate::AttestedPrograms,
@@ -50,6 +50,7 @@ impl ServedBank {
         recorded: &mut Recorded,
     ) -> Result<Self, DomainError> {
         let moves = programs.expert_bank_moves(&bank.plan).map_err(DomainError::invariant)?;
+        bank.cache.served_on(ledgers, bank.plan.host_slots);
         let served = Self {
             bank,
             moves,
@@ -74,21 +75,13 @@ impl ServedBank {
             floors.push(recorded.carve(&store, CommittedKind::BankFloor, floor));
             let from = (target.charge)(target.shape.floor_slots());
             let above = (target.charge)(target.at) - from;
-            let backing = match target.holding {
-                BankHolding::Host => recorded.backing(&store),
-                _ => None,
-            };
-            match backing {
-                // Its slots backed before the claim is held here are
-                // recorded as it is; each later one as it backs.
-                Some(backing) if served.bank.host_backing() => {
-                    served.bank.cache.grow(BankHolding::Host, from, backing);
-                    served.bank.cache.backed((target.charge)(served.bank.host_slots()));
-                }
-                Some(backing) => served.bank.cache.hold(BankHolding::Host, backing.into_backed_cache(above, CacheKind::Bank)),
-                None => served.bank.cache.hold(target.holding, recorded.carve(&store, CommittedKind::Load, above).into_cache(CacheKind::Bank)),
+            // A host tier's slots are allocated in its claim as each backs,
+            // from the bank's open (`BankCache::opened`), until an advance
+            // settles it.
+            match target.holding {
+                BankHolding::Host if served.bank.plan.host_slots > 0 => {}
+                holding => served.bank.cache.hold(holding, recorded.carve(&store, CommittedKind::Load, above).into_cache(CacheKind::Bank)),
             }
-
         }
 
         Ok(Self { _floors: floors, ..served })
@@ -136,7 +129,16 @@ impl ServedBank {
     /// advance reports, `wake` completed at once.
     fn shrink_host(&self, cuts: (u64, u64), decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
         let holding = BankHolding::Host;
-        let LandedShrink { unpinned, from, to: at, before, after } = match self.bank.shrink_host(cuts)? {
+        // The shrink's free and its record are one change.
+        let shrunk = self.bank.cache.changes().clone().change(|changing| {
+            let shrunk = self.bank.shrink_host(cuts)?;
+            if let Shrinking::Begun(LandedShrink { before, after, .. }) = &shrunk {
+                let released = before.checked_sub(*after).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+                self.bank.cache.released(holding, released, changing);
+            }
+            Ok::<_, DomainError>(shrunk)
+        })?;
+        let LandedShrink { unpinned, from, to: at, before, after } = match shrunk {
             Shrinking::Begun(shrunk) => shrunk,
             Shrinking::Running => return Ok(BankStep::Running),
             Shrinking::Deferred => return Ok(in_flight(holding, cuts)),
@@ -153,9 +155,7 @@ impl ServedBank {
             released: done,
             unpinned,
         };
-        let released = before
-            .checked_sub(after)
-            .ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+        let released = before - after;
         let resized = BankResized::Shrunk { holding, from, to: at, released, times };
         self.finished.lock().expect("table resize outcome").push_back(resized);
         wake.complete();
@@ -209,8 +209,19 @@ impl ServedBank {
                 .ok_or_else(|| DomainError::invariant("a held table's slots are charged"))
         };
         let (before, from, unpinning) = (charged()?, held.table.records(), seismic::backing_times());
-        let outcome = held.table.resize(records).map_err(DomainError::invariant)?;
-        let (after, to, done) = (charged()?, held.table.records(), Instant::now());
+        // The resize and its record are one change: a shrink's release, or
+        // a growth's backing in the claim its caller holds for it.
+        let holding = BankHolding::Table { table: index };
+        let (outcome, after) = self.bank.cache.changes().clone().change(|changing| {
+            let outcome = held.table.resize(records).map_err(DomainError::invariant)?;
+            let after = charged()?;
+            match after < before {
+                true => self.bank.cache.released(holding, before - after, changing),
+                false => self.bank.cache.backed(self.holding_charge(holding, held.table.records())?, changing),
+            }
+            Ok::<_, DomainError>((outcome, after))
+        })?;
+        let (to, done) = (held.table.records(), Instant::now());
         let unpinned = seismic::backing_times().since(unpinning).unpin;
         let times = ResizeTimes {
             decided,
@@ -223,7 +234,6 @@ impl ServedBank {
             released: done,
             unpinned,
         };
-        let holding = BankHolding::Table { table: index };
         let resized = match outcome {
             // A shrink needs no memory: its refusal breaks an invariant, as the bank's does.
             Err(refusal) if records < from => {
@@ -438,18 +448,19 @@ impl ElasticBank for ServedBank {
         let Ok(claim) = ledgers.of(self.storage(holding)?).backing(bytes) else {
             return Ok(BankStep::Deferred);
         };
+        // Held before the growth begins: each slot's backing is recorded in
+        // it as one change with the slot (`grow_by_slots`), a table's with
+        // its resize ([`Self::resize_table`]).
+        self.bank.cache.grow(holding, from, claim);
         let step = match holding {
             BankHolding::Experts => self.bank.grow(to, wake),
             BankHolding::Table { table: index } => self.resize_table(index, to, Instant::now(), Duration::ZERO, wake),
             BankHolding::Host => self.bank.grow_host(to, wake),
-        }?;
-        if let BankStep::Begun(_) = step {
-            // Slots backed before the claim is held here are recorded as it
-            // is; each later one as it backs (`grow_by_slots`).
-            self.bank.cache.grow(holding, from, claim);
-            self.bank.cache.backed(self.holding_charge(holding, self.size(holding))?);
+        };
+        if !matches!(step, Ok(BankStep::Begun(_))) {
+            self.bank.cache.abandon();
         }
-        Ok(step)
+        step
     }
 
     fn holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {

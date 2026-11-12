@@ -125,6 +125,21 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
+/// A domain is made on a reading taken after everything its load
+/// allocated: a reading taken right after it is made shows its ledgers
+/// nothing they had not seen.
+#[test]
+fn a_domain_is_made_on_a_reading_taken_after_its_loads_allocations() {
+    let (domain, _bindings) = fixture(None);
+    let shown = |domain: &ExecutorDomain<TestFamily>| {
+        let ledgers = domain.resources.ledgers();
+        [ledgers.device().snapshot().os_figures(), ledgers.host().snapshot().os_figures()]
+    };
+    let made = shown(&domain);
+    domain.memory.borrow().read_ledgers_now(domain.resources.ledgers());
+    assert_eq!(shown(&domain), made, "a reading taken after the domain was made showed its ledgers more");
+}
+
 /// A launch is charged the host work since the flight before it finished
 /// when that flight carried its request: a round's host time is part of its
 /// cost. Time the owner spent idle, or a flight of other requests, is

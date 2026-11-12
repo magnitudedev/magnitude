@@ -2883,7 +2883,7 @@ mod tests {
         let ledgers = crate::memory::ledger::DeviceLedgers::open_in(&crate::memory::ledger::Ledgers::new(), &host, shape);
         let now = std::time::Instant::now();
         for ledger in [ledgers.device(), ledgers.host()] {
-            ledger.read(|| Ok(crate::memory::ledger::Available::new(2 * whole_bytes, target, None, now).unwrap()));
+            ledger.read(ledger.sampled(now), Ok(crate::memory::ledger::Available::new(2 * whole_bytes, target, None).unwrap()));
         }
         // The whole plan is refused for room ...
         let load = crate::memory::ledger::CommittedKind::Load;

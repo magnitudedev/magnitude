@@ -64,7 +64,7 @@ mod tests {
     fn ledger(total: u64) -> (Ledgers, Ledger) {
         let scope = Ledgers::new();
         let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
-        ledger.read(|| Ok(Available::new(total, total, None, Instant::now()).expect("a reading")));
+        ledger.read(ledger.sampled(Instant::now()), Ok(Available::new(total, total, None).expect("a reading")));
         (scope, ledger)
     }
 
@@ -90,7 +90,7 @@ mod tests {
     fn a_group_takes_only_what_yields_at_once() {
         let (_scope, ledger) = ledger(64 * RECORD);
         let committed = ledger.claim(Need::Measurement { bytes: 50 * RECORD }).expect("room");
-        let bank = ledger.cache(CacheKind::Bank, 10 * RECORD + RECORD / 2).expect("room");
+        let bank = ledger.cached(CacheKind::Bank, 10 * RECORD + RECORD / 2).expect("room");
         // Free: 3.5 records; the bank's cache: 10.5. Whole records: 14.
         let scratch = PromptScratch::open(&ledger, shape(16, 40));
         assert_eq!(scratch.records(), 16 + 14);

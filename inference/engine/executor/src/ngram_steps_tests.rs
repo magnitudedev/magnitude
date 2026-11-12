@@ -2191,6 +2191,7 @@ fn load_with(
     let execution = Rc::new(draft.admit(resources_plan).unwrap());
     let identity = ResourceDomainId::new("ngram-steps").unwrap();
     let programs = Rc::new(programs);
+    let ledgers = crate::domain::fixtures::fixture_ledgers(&device, &execution, &seismic::Devices::discover(&[]).unwrap());
     let resources = ResourceAllocator::allocate(
         &execution,
         &device,
@@ -2200,7 +2201,7 @@ fn load_with(
         programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
-        &crate::domain::fixtures::fixture_ledgers(&device, &execution, &seismic::Devices::discover(&[]).unwrap()),
+        &ledgers,
     )
     .unwrap();
     let mut residency = ResidencyStore::new(
@@ -2209,6 +2210,7 @@ fn load_with(
         (*execution).clone(),
         identity,
         resources.releases(),
+        ledgers.changes().clone(),
     )
     .unwrap();
     let target = residency

@@ -16,7 +16,7 @@ use seismic_native_tests::{
     written_marks,
 };
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The range every non-empty scratch arena reserves at its start for `sync`
 /// scratch (the runtime's `SYNC_SCRATCH_BYTES`).
@@ -961,7 +961,6 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
 fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() {
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::time::Instant;
     let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
@@ -2871,9 +2870,10 @@ fn a_chunked_reserved_tensor_binds_only_through_a_record_port() {
     }
 }
 
-/// A shrink of a reserved tensor returns its pages to the host, and a
-/// regrow takes fresh ones, as the host's one available reading
-/// (`seismic::host_available`) sees them. On Metal a reservation bound as
+/// A shrink of a reserved tensor returns its pages to the host by the time
+/// its recommit returns, and a regrow takes fresh ones, as the host's one
+/// available reading (`seismic::host_available`) sees them: the memory
+/// ledger counts a release free at the first reading after it. On Metal a reservation bound as
 /// one buffer over its range kept its pages past every release until it was
 /// unmapped (M4 Pro, macOS 15.7.9, 2026-11-12: 2 GiB released of 4 GiB of
 /// written rows raised host free memory by nothing within 1 s), while its
@@ -2883,12 +2883,12 @@ fn a_chunked_reserved_tensor_binds_only_through_a_record_port() {
 #[ignore = "a measurement of host memory: run alone with --ignored"]
 fn a_reserved_tensors_shrink_returns_its_pages_to_the_host() {
     const MIB: u64 = 1 << 20;
-    // 1 MiB rows; host_available reads the kernel's live counts, read
-    // 100 ms after each change: a chunk's pages return within 50 ms.
+    // 1 MiB rows; host_available reads the kernel's live counts.
     let (rows, n) = (4096u64, MIB / 4);
+    let available = || seismic::host_available().expect("host memory reads").available as i64;
     let settled = || {
         std::thread::sleep(Duration::from_millis(100));
-        seismic::host_available().expect("host memory reads").available as i64
+        available()
     };
     // Random bytes, so the compressor takes nothing back from them.
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -2914,10 +2914,26 @@ fn a_reserved_tensors_shrink_returns_its_pages_to_the_host() {
         write(&reserved, 0, rows);
         let held = settled();
         let resizer = resizer.recommit(rows / 2).unwrap();
-        let released = settled();
+        let at_return = available();
+        // How long the host took to show 90% of the shrink, if not at once.
+        let returned = Instant::now();
         let half = (rows / 2 * MIB) as i64;
-        eprintln!("{backend:?}: a shrink of {:.2} GiB raised host available memory {:.2} GiB", gib(half), gib(released - held));
-        assert!(released - held >= half * 9 / 10, "{backend:?}: the shrink returned {:.2} GiB of {:.2}", gib(released - held), gib(half));
+        while available() - held < half * 9 / 10 && returned.elapsed() < Duration::from_secs(1) {}
+        let shown = returned.elapsed();
+        let released = settled();
+        eprintln!(
+            "{backend:?}: a shrink of {:.2} GiB raised host available memory {:.2} GiB as its recommit returned, 90% of it {:.1} ms later, {:.2} GiB by 100 ms",
+            gib(half),
+            gib(at_return - held),
+            shown.as_secs_f64() * 1e3,
+            gib(released - held)
+        );
+        assert!(
+            at_return - held >= half * 9 / 10,
+            "{backend:?}: the shrink returned {:.2} GiB of {:.2} as its recommit returned",
+            gib(at_return - held),
+            gib(half)
+        );
         let resizer = resizer.recommit(rows).unwrap();
         write(&reserved, rows / 2, rows);
         let regrown = settled();

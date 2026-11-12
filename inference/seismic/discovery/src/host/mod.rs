@@ -109,10 +109,13 @@ pub struct HostAvailable {
     pub reclaimable: u64,
 }
 
-/// Host RAM's available reading now, the same definition on every OS: its
-/// own figure (macOS `free_count − speculative_count + purgeable_count` less `vm.vm_page_free_target`,
-/// Linux `MemAvailable`, Windows `ullAvailPhys`), bounded by the cgroup or job
-/// limit the process lies in where one is set and binds harder.
+/// Host RAM's available reading now: each OS's own figure, which differ in
+/// what they include ([`HostStatus::allocatable`]): macOS
+/// `vm.page_free_count + vm.page_purgeable_count` less
+/// `vm.vm_page_free_target`, which leaves out the file cache (read beside it
+/// as `reclaimable`); Linux `MemAvailable` and Windows `ullAvailPhys`, which
+/// count the file cache the kernel reclaims first. Bounded by the cgroup or
+/// job limit the process lies in where one is set and binds harder.
 pub fn host_available() -> Result<HostAvailable, ObservationError> {
     let capacity = capacity().map_err(ObservationError::Failed)?.value;
     let sample = status()?;
@@ -143,10 +146,8 @@ fn available_within(capacity: u64, available: u64, limits: &[ProcessMemoryLimit]
 /// counted in [`HostStatus::allocatable`]; on a platform that counts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostHeld {
-    /// Wired memory: pinned by the kernel and drivers, GPU buffers included
-    /// on unified memory.
-    pub wired_bytes: u64,
-    /// Physical memory the compressor occupies.
+    /// The size of the data the compressor stores
+    /// (`vm.compressor_bytes_used`), not the physical pages that hold it.
     pub compressed_bytes: u64,
 }
 
@@ -293,19 +294,16 @@ mod tests {
     #[test]
     fn macos_allocatable_is_free_and_purgeable_pages_above_the_target() {
         let reading = macos::vm_reading().unwrap();
-        let pages = &reading.statistics;
-        let allocatable = (u64::from(pages.free_count) - u64::from(pages.speculative_count)
-            + u64::from(pages.purgeable_count))
-        .saturating_sub(reading.free_target);
+        let allocatable = (reading.free + reading.purgeable).saturating_sub(reading.free_target);
         let sample = macos::sample_of(&reading).unwrap();
         assert_eq!(
             sample.allocatable,
             Reported::new(
                 allocatable * reading.page_size,
-                seismic_topology::ReportedBy::MachAllocatablePages
+                seismic_topology::ReportedBy::MacOsFreePages
             )
         );
-        assert_eq!(sample.reclaimable, u64::from(pages.external_page_count) * reading.page_size);
+        assert_eq!(sample.reclaimable, reading.external * reading.page_size);
     }
 }
 
@@ -337,7 +335,7 @@ mod available_tests {
     #[test]
     fn only_a_load_counts_the_clean_file_cache() {
         let status = HostStatus {
-            allocatable: Reported::new(4 * GB, seismic_topology::ReportedBy::MachAllocatablePages),
+            allocatable: Reported::new(4 * GB, seismic_topology::ReportedBy::MacOsFreePages),
             reclaimable: 6 * GB,
             limits: Vec::new(),
             limit_visibility: LimitVisibility::Complete,

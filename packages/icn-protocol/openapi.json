@@ -6454,7 +6454,7 @@
           "windows_total_phys",
           "linux_mem_available",
           "mach_movable_pages",
-          "mach_allocatable_pages",
+          "mac_os_free_pages",
           "windows_physical_and_commit",
           "cpu_address_space",
           "metal_max_buffer_length",

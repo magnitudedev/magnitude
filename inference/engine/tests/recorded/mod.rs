@@ -56,7 +56,7 @@ fn recorded_setup(
         sample: seismic::Sample {
             taken: std::time::SystemTime::now(),
             host_ram: Ok(seismic::HostStatus {
-                allocatable: seismic::Reported::new(0, seismic::ReportedBy::MachAllocatablePages),
+                allocatable: seismic::Reported::new(0, seismic::ReportedBy::MacOsFreePages),
                 reclaimable: 0,
                 limits: Vec::new(),
                 limit_visibility: seismic::LimitVisibility::Complete,

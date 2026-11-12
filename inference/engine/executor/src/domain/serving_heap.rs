@@ -47,7 +47,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if self.resources.release_idle_slots(std::mem::take(&mut self.idle_class), wake) {
                 return Ok(Followed::ReleasingSlots);
             }
-            // No slot idles any more: the cache named no memory. The bank
+            // No slot idles any more: their cache is let go. The bank
             // follows at the next call, which brings its own wake.
             return Ok(Followed::Holds);
         }

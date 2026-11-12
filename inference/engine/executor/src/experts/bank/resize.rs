@@ -3,6 +3,7 @@ use crate::planning::{BankTier, ExpertBankPlan, Placer};
 use crate::experts::watcher::Candidates;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, MemoryMoment, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::CompletionWake;
+use crate::memory::ledger::{Changes, Changing};
 use std::time::{Duration, Instant};
 use crate::native::BankMoves;
 use magnitude_kernels::routed_move;
@@ -152,23 +153,24 @@ type RecordsAt = fn(&ExpertBankPlan, usize, u64) -> u64;
 /// Grow `resizers` from `from` to `to` slots, one slot at a time unless
 /// `stop` is set: each tensor prepares the slot's `rows`, then installs
 /// them (a growth installs beside submission,
-/// `seismic::PreparedRecommit::install`), then each install's release
-/// returns once the device work submitted before it completed, so no work
-/// that could not reach the slot's rows (on Metal, committed before its
-/// chunks joined the queue's residency set) can be handed them; only then
-/// `resident` records the slot's memory, which exists from its backing (a
-/// reservation backs a granule by touching or wiring every page), and
-/// `join` forms the slot's join, `post` hands it to the watcher
-/// (`Shared::join`, taken at its next pass), and `slots` holds it. A
-/// refusal ends it at the slots joined before. The installs, where the
-/// tensors' charges rise, hold `rises` ([`ExpertBank::hold_rises`]). Each
-/// slot begins by `begin`, held until it is joined, none where it gives
-/// none (the load's traffic is held, `watcher::Shared::backing_slot`).
+/// `seismic::PreparedRecommit::install`), and `resident` records the
+/// slot's memory, which exists from its backing (a reservation backs a
+/// granule by touching or wiring every page): backing, installs and record
+/// are one change of `changes`' scope ([`Changes::back`]). Then each
+/// install's release returns once the device work submitted before it
+/// completed, so no work that could not reach the slot's rows (on Metal,
+/// committed before its chunks joined the queue's residency set) can be
+/// handed them; only then `join` forms the slot's join, `post` hands it to
+/// the watcher (`Shared::join`, taken at its next pass), and `slots` holds
+/// it. A refusal ends it at the slots joined before. The installs, where
+/// the tensors' charges rise, hold `rises` ([`ExpertBank::hold_rises`]).
+/// Each slot begins by `begin`, held until it is joined, none where it
+/// gives none (the load's traffic is held, `watcher::Shared::backing_slot`).
 pub(super) fn grow_by_slots<S>(
     mut resizers: Vec<Resizer>,
     (from, to): (u64, u64),
     rows: impl Fn(u64) -> Vec<u64>,
-    resident: impl Fn(u64),
+    (changes, resident): (&Arc<Changes>, impl Fn(u64, &Changing)),
     join: impl Fn(u64) -> Result<Join, String>,
     post: impl Fn(Join),
     (slots, rises): (&AtomicU64, &Mutex<()>),
@@ -184,41 +186,48 @@ pub(super) fn grow_by_slots<S>(
             break;
         };
         spent.slots += 1;
-        let (preparing, backed) = (Instant::now(), seismic::backing_times());
-        let prepared = prepare(resizers, rows(at));
-        spent.prepare += preparing.elapsed();
-        spent.backing += seismic::backing_times().since(backed);
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
+        let mut refusal = None;
+        let installed = changes.back(|changing| {
+            let (preparing, backed) = (Instant::now(), seismic::backing_times());
+            let prepared = prepare(resizers, rows(at));
+            spent.prepare += preparing.elapsed();
+            spent.backing += seismic::backing_times().since(backed);
+            let prepared = prepared?;
+            let installing = Instant::now();
+            let installed = {
+                let _rises = rises.lock().expect("the bank's charge rises");
+                prepared
+                    .into_iter()
+                    .map(|prepared| match prepared.install() {
+                        Ok(release) => Installed::Release(release),
+                        Err(refused) => {
+                            refusal.get_or_insert(refused.error);
+                            Installed::Kept(refused.resizer)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            spent.install += installing.elapsed();
+            // The slot's storage is resident (a reservation's granules are
+            // backed by touching or wiring every page,
+            // `seismic_reservation`): its memory exists from here, and its
+            // growth's claim says so.
+            if refusal.is_none() {
+                resident(at, changing);
+            }
+            Ok::<_, (Vec<Resizer>, TensorError)>(installed)
+        });
+        let installed = match installed {
+            Ok(installed) => installed,
             Err((resizers, refusal)) => return Grown { resizers, joined, cut: Cut::Refused(refusal), spent },
         };
-        let mut refusal = None;
-        // Every tensor installs, then the releases wait together.
-        let installing = Instant::now();
-        let installed = {
-            let _rises = rises.lock().expect("the bank's charge rises");
-            prepared
-                .into_iter()
-                .map(|prepared| match prepared.install() {
-                    Ok(release) => Installed::Release(release),
-                    Err(refused) => {
-                        refusal.get_or_insert(refused.error);
-                        Installed::Kept(refused.resizer)
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+        // The releases wait together, beside no change.
         let releasing = Instant::now();
-        spent.install += releasing - installing;
         resizers = installed.into_iter().map(Installed::release).collect();
         spent.release += releasing.elapsed();
         if let Some(refusal) = refusal {
             return Grown { resizers, joined, cut: Cut::Refused(refusal), spent };
         }
-        // The slot's storage is resident (a reservation's granules are
-        // backed by touching or wiring every page, `seismic_reservation`):
-        // its memory exists from here, and its growth's claim says so.
-        resident(at);
         let joining = Instant::now();
         match join(at) {
             Ok(join) => post(join),
@@ -364,12 +373,26 @@ enum Installed {
 }
 
 impl Installed {
+    /// Wait for the device work its release waits for
+    /// (`seismic::RecommitRelease::retire`).
+    fn retire(&self) {
+        if let Self::Release(release) = self {
+            release.retire();
+        }
+    }
+
     fn release(self) -> Resizer {
         match self {
             Self::Release(release) => release.release(),
             Self::Kept(resizer) => resizer,
         }
     }
+}
+
+/// What `records`' storage is charged in all; none where any is no longer
+/// held.
+fn charged_of(records: &[seismic::TensorStorageObserver]) -> Option<u64> {
+    records.iter().try_fold(0u64, |bytes, record| record.charged_bytes().map(|charged| bytes + charged))
 }
 
 /// Prepare each resizer's tensor at its `rows`, in order: on a refusal
@@ -514,10 +537,10 @@ impl ExpertBank {
         let (decided, from) = (Instant::now(), slots.load(Ordering::Acquire));
         let plan = Arc::new(self.plan.clone());
         let (shared, slots, stop) = (self.watcher.shared().clone(), slots.clone(), Arc::new(AtomicBool::new(false)));
-        let (stopping, rises) = (stop.clone(), self.rises.clone());
+        let (stopping, rises, changes) = (stop.clone(), self.rises.clone(), self.cache.changes().clone());
         let backed = {
             let (cache, counts) = (self.cache.clone(), self.counts.clone());
-            move |at: u64| cache.backed(charge(&counts, at))
+            move |at: u64, changing: &Changing| cache.backed(charge(&counts, at), changing)
         };
         let join = {
             let plan = plan.clone();
@@ -540,7 +563,8 @@ impl ExpertBank {
         };
         let done = thread.run(wake, move || {
             let rows = |at| groups.iter().map(|&group| records(&plan, group, at)).collect();
-            grow_by_slots(resizers, (from, to), rows, backed, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
+            let slot = || shared.backing_slot(&stopping);
+            grow_by_slots(resizers, (from, to), rows, (&changes, backed), join, |join| shared.join(join), (&slots, &rises), &stopping, slot)
         });
         Ok(Growing { from, charged, decided, stop, done })
     }
@@ -758,17 +782,13 @@ impl ExpertBank {
     /// Every record tensor's charge, as Seismic measures it: the one reading
     /// a resize is credited by.
     fn charged(&self) -> Result<u64, DomainError> {
-        self.layout
-            .groups
-            .iter()
-            .flat_map(|group| group.records.iter().map(|(_, tensor)| tensor))
-            .try_fold(0u64, |bytes, tensor| {
-                tensor
-                    .observe_storage()
-                    .charged_bytes()
-                    .map(|charged| bytes + charged)
-                    .ok_or_else(|| DomainError::invariant("a held allocation is charged"))
-            })
+        charged_of(&self.record_storage()).ok_or_else(|| DomainError::invariant("a held allocation is charged"))
+    }
+
+    /// Every record tensor's storage, observed where a resize thread reads
+    /// its charge ([`charged_of`]).
+    fn record_storage(&self) -> Vec<seismic::TensorStorageObserver> {
+        self.layout.groups.iter().flat_map(|group| group.records.iter().map(|(_, tensor)| tensor.observe_storage())).collect()
     }
 
     /// The resizers, taken while no resize runs (none while one does); why
@@ -1005,7 +1025,19 @@ impl ExpertBank {
                 }
             })
             .collect::<Vec<_>>();
-        let done = self.release_thread.run(wake, move || tensors.into_iter().map(Installed::release).collect());
+        // Once the device work before the install completes, the free and
+        // its record are one change, never recorded at the advance that
+        // reports it.
+        let (cache, records) = (self.cache.clone(), self.record_storage());
+        let done = self.release_thread.run(wake, move || {
+            tensors.iter().for_each(Installed::retire);
+            cache.changes().clone().back(|changing| {
+                let resizers = tensors.into_iter().map(Installed::release).collect();
+                let after = charged_of(&records).expect("invariant violated: a held allocation is charged");
+                cache.released(BankHolding::Experts, charged.saturating_sub(after), changing);
+                resizers
+            })
+        });
         Resize::Releasing { from, charged, refusal, begun, prepared, installed, done }
     }
 

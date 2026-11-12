@@ -114,7 +114,7 @@ pub fn clock(domain: &ExecutorDomain<TestFamily>) -> TestClock {
 impl StillHost {
     fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed, clock: TestClock) -> Self {
         let first = catalog.device_status(&device);
-        let host = crate::memory::ledger::Available::host(clock.now());
+        let host = crate::memory::ledger::Available::host();
         let charged = Self::charges(&device);
         Self { device, topology: catalog.topology(), first, host, charged, pressed, clock }
     }
@@ -159,9 +159,6 @@ impl StatusReading for StillHost {
         if let Ok(host) = &mut sample.host_ram {
             let store = topology.host_ram().id();
             host.allocatable.value = moved(host.allocatable.value, store);
-            if let Some(held) = &mut host.held {
-                held.wired_bytes = used(held.wired_bytes, store, 0);
-            }
             for limit in &mut host.limits {
                 limit.used_bytes = match limit.kind {
                     seismic::ProcessLimitKind::CgroupV1 { .. } | seismic::ProcessLimitKind::CgroupV2 { .. } => {
@@ -188,12 +185,12 @@ impl StatusReading for StillHost {
     /// Host RAM's available memory as first read, less what the device
     /// charged it since and what another program holds of it now: it moves
     /// only as the test moves it, as the status does.
-    fn available(&self, at: std::time::Instant) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
+    fn available(&self) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
         let first = self.host.clone()?;
         let store = self.topology.host_ram().id();
         let charged = |charges: &BTreeMap<seismic::StoreId, u64>| charges.get(&store).copied().unwrap_or(0);
         let available = (first.available() + charged(&self.charged)).saturating_sub(charged(&Self::charges(&self.device)) + self.held(store));
-        crate::memory::ledger::Available::new(first.total(), available.min(first.total()), None, at)
+        crate::memory::ledger::Available::new(first.total(), available.min(first.total()), None)
             .map_err(|_| crate::memory::ledger::Blind("an impossible reading".into()))
     }
 }
@@ -472,7 +469,7 @@ pub(crate) fn fixture_recorded(
     let mut held = ledgers
         .claim(device, CommittedKind::Load, demand)
         .expect("the fixture's ledgers hold what it allocated");
-    held.allocated();
+    held.made();
     recorded.record(held);
     recorded
 }
@@ -484,8 +481,7 @@ pub(crate) fn fixture_recorded(
 pub(crate) fn fixture_ledgers(device: &seismic::Device, execution: &crate::ExecutionPlan, reading: &dyn StatusReading) -> crate::memory::ledger::DeviceLedgers {
     use crate::memory::ledger::{DeviceLedgers, Ledgers, LoadShape};
     let ledgers = DeviceLedgers::open_in(&Ledgers::new(), device, Arc::new(LoadShape::of(execution)));
-    let at = reading.now();
-    ledgers.read(device, &reading.status(device), reading.available(at), at);
+    ledgers.read(device, &reading.sample(device, ledgers.changes()).expect("a test's sample stands beside its own scope's changes"));
     ledgers
 }
 
@@ -532,7 +528,7 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
     };
     let (tensor, resizer) = seismic::Tensor::reserved(device, seismic::Element::bool(), &[rows, row], committed)
         .unwrap_or_else(|error| panic!("{backend:?}: the device reserves the bank: {error}"));
-    let bank = FakeBank::new(tensor, resizer);
+    let bank = FakeBank::new(tensor, resizer, domain.resources.ledgers().changes().clone());
     bank.hold_cache(domain.resources.ledgers());
     domain.family.bank = Some(bank);
     (domain, bindings)
@@ -935,7 +931,7 @@ enum FakeResize {
 }
 
 impl FakeBank {
-    pub fn new(tensor: seismic::Tensor, resizer: seismic::Resizer) -> Self {
+    pub fn new(tensor: seismic::Tensor, resizer: seismic::Resizer, changes: std::sync::Arc<crate::memory::ledger::Changes>) -> Self {
         Self {
             tensor,
             resize: std::sync::Mutex::new(Some(FakeResize::Idle(resizer))),
@@ -950,7 +946,7 @@ impl FakeBank {
             refuse_tier_copy: false,
             tier_copy: std::sync::Mutex::new(None),
             covers: std::sync::atomic::AtomicU64::new(1),
-            cache: Default::default(),
+            cache: crate::experts::cache::BankCache::new(changes),
         }
     }
 
@@ -960,7 +956,8 @@ impl FakeBank {
         let rows = self.tensor.extents()[0];
         let unit = (self.tensor.byte_len() / rows).max(1);
         let above = self.slots().saturating_sub(1) * unit;
-        let cache = ledgers.of(crate::planning::BankTier::Bank).cache(crate::memory::ledger::CacheKind::Bank, above).expect("the fixture's ledger holds its bank");
+        let ledger = ledgers.of(crate::planning::BankTier::Bank);
+        let cache = ledger.change(|changing| ledger.cache(crate::memory::ledger::CacheKind::Bank, above, changing)).expect("the fixture's ledger holds its bank");
         self.cache.hold(crate::BankHolding::Experts, cache);
     }
 
@@ -983,9 +980,20 @@ impl FakeBank {
     pub fn release_now(&self) {
         let mut resize = self.resize.lock().unwrap();
         match resize.take().unwrap() {
-            FakeResize::Releasing(release, before) => *resize = Some(FakeResize::Released(release.release(), before)),
+            FakeResize::Releasing(release, before) => *resize = Some(self.released(release, before)),
             _ => panic!("no shrink's release is installed"),
         }
+    }
+
+    /// `release` taken, recorded in the bank's cache as it is freed: one
+    /// change, as the served bank's (`memory::ledger::Changes::change`).
+    fn released(&self, release: seismic::RecommitRelease, before: (u64, u64)) -> FakeResize {
+        let resizer = self.cache.changes().clone().change(|changing| {
+            let resizer = release.release();
+            self.cache.released(crate::BankHolding::Experts, before.0.saturating_sub(self.charged()), changing);
+            resizer
+        });
+        FakeResize::Released(resizer, before)
     }
 
     fn in_gap(&self) -> bool {
@@ -1227,7 +1235,7 @@ impl ElasticBank for FakeBank {
             },
             // The release taken now, or already by the bank's own thread.
             FakeResize::Releasing(release, before) => {
-                *resize = Some(FakeResize::Released(release.release(), before));
+                *resize = Some(self.released(release, before));
                 drop(resize);
                 return self.advance(wake);
             }

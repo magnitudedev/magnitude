@@ -1658,7 +1658,7 @@ export const HardwareReportedBy = S.Union(
   S.Literal("windows_total_phys"),
   S.Literal("linux_mem_available"),
   S.Literal("mach_movable_pages"),
-  S.Literal("mach_allocatable_pages"),
+  S.Literal("mac_os_free_pages"),
   S.Literal("windows_physical_and_commit"),
   S.Literal("cpu_address_space"),
   S.Literal("metal_max_buffer_length"),

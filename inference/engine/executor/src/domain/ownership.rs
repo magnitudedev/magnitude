@@ -238,8 +238,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
-        self.drop_state_claim(request);
-        self.settle_state_slabs();
+        self.change_state(|this| this.drop_state_claim(request));
         self.poisoned.remove(&request);
         Ok(())
     }
@@ -316,9 +315,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             self.target.remove(request);
             self.head.remove(request);
-            self.drop_state_claim(*request);
         }
-        self.settle_state_slabs();
+        self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
         Ok(bytes)
     }
 
@@ -327,23 +325,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn reclaim_idle(&mut self, bindings: &mut StateBindings) -> Result<u64, String> {
         self.orphan_queue(bindings)
             .map_err(|error| error.to_string())?;
-        let mut bytes = u64::try_from(
-            bindings
-                .target
-                .release_idle()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|_| "target idle bytes exceed u64")?;
-        if let Some(store) = &mut bindings.head {
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(store.release_idle().map_err(|error| error.to_string())?)
-                        .map_err(|_| "head idle bytes exceed u64")?,
-                )
-                .ok_or("idle reclaim byte count overflow")?;
-        }
-        self.settle_state_slabs();
-        Ok(bytes)
+        self.change_state(|_| {
+            let mut bytes = u64::try_from(
+                bindings
+                    .target
+                    .release_idle()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|_| "target idle bytes exceed u64")?;
+            if let Some(store) = &mut bindings.head {
+                bytes = bytes
+                    .checked_add(
+                        u64::try_from(store.release_idle().map_err(|error| error.to_string())?)
+                            .map_err(|_| "head idle bytes exceed u64")?,
+                    )
+                    .ok_or("idle reclaim byte count overflow")?;
+            }
+            Ok::<u64, String>(bytes)
+        })
     }
 }
 

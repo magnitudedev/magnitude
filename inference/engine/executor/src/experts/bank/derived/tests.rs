@@ -49,13 +49,13 @@ impl Store {
         let at = self.start + Duration::from_millis(100) * self.readings;
         let allocated = self.ledger.snapshot().allocated();
         let available = TOTAL.checked_sub(others + allocated).expect("others and the process fit the store");
-        self.ledger.read(|| Ok(Available::new(TOTAL, available, None, at).expect("a reading")));
+        self.ledger.read(self.ledger.sampled(at), Ok(Available::new(TOTAL, available, None).expect("a reading")));
     }
 
     /// A committed claim of exactly `bytes`, allocated.
     fn commit(&self, bytes: u64) -> Claim {
         let mut claim = self.ledger.claim(Need::Measurement { bytes }).expect("the claim fits");
-        claim.allocated(bytes);
+        self.ledger.change(|changing| claim.allocated(bytes, changing));
         claim
     }
 
@@ -84,7 +84,7 @@ fn the_laptops_bank_holds_132_slots_through_a_prompt_and_its_decode() {
     let base = others_at(132, committed);
     store.read(base);
     let _weights = store.commit(committed);
-    let _bank = store.ledger.cache(CacheKind::Bank, (132 - shape().floor_slots()) * SLOT).expect("the bank's room");
+    let _bank = store.ledger.cached(CacheKind::Bank, (132 - shape().floor_slots()) * SLOT).expect("the bank's room");
     store.read(base);
     assert_eq!(store.target(0), 132, "the bank as it stood");
     // Others take a third of a slot for a reading (the laptop's brief
@@ -166,7 +166,7 @@ fn the_guarantee_is_the_only_margin() {
 fn a_blind_or_overcommitted_store_holds_the_floor() {
     let mut store = Store::new();
     store.read(TOTAL / 2);
-    store.ledger.read(|| Err(Blind("no reading".into())));
+    store.ledger.read(store.ledger.sampled(Instant::now()), Err(Blind("no reading".into())));
     assert_eq!(store.target(0), shape().floor_slots(), "blind");
     let mut store = Store::new();
     store.read(0);
@@ -272,7 +272,7 @@ fn a_load_imports_what_its_first_reading_keeps() {
     let imported = import_target(&store.ledger.snapshot(), in_process, beside, &shape(), &charge);
     assert!(floor < imported && imported < shape().saturation_slots(), "{imported} slots");
     let _held = store.commit(beside);
-    let _cache = store.ledger.cache(CacheKind::Bank, charge(imported) - charge(floor)).expect("the import's room holds its cache");
+    let _cache = store.ledger.cached(CacheKind::Bank, charge(imported) - charge(floor)).expect("the import's room holds its cache");
     store.read(others);
     assert_eq!(store.target(in_process), imported);
 }

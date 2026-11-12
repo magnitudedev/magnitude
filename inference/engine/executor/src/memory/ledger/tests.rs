@@ -56,14 +56,14 @@ fn read(ledger: &Ledger, clock: &mut Clock, total: u64, available: u64, grant: O
     let at = clock.next();
     let snapshot = ledger.snapshot();
     let left = grant.map(|grant| grant.saturating_sub(snapshot.allocated()));
-    ledger.read(|| Ok(Available::new(total, available, left, at).expect("a reading")));
+    ledger.read(ledger.sampled(at), Ok(Available::new(total, available, left).expect("a reading")));
 }
 
 /// A committed claim of exactly `bytes`, sized without any formula, and
 /// allocated: memory the process made.
 fn commit(ledger: &Ledger, bytes: u64) -> Claim {
     let mut claim = ledger.claim(Need::Measurement { bytes }).expect("the claim fits");
-    claim.allocated(bytes);
+    ledger.change(|changing| claim.allocated(bytes, changing));
     claim
 }
 
@@ -76,7 +76,7 @@ fn an_own_free_is_never_others_memory() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let weights = commit(&ledger, 40 * GB);
-    let bank = ledger.cache(CacheKind::Bank, 20 * GB).expect("free room");
+    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     let before = ledger.snapshot();
     assert_eq!(before.others(), Some(0));
@@ -98,15 +98,15 @@ fn a_fenced_free_stays_held_until_its_fence_completes() {
     let (_scope, ledger) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 16 * GB, 16 * GB, None);
-    let retired = ledger.cache(CacheKind::Bank, 10 * GB).expect("free room");
+    let retired = ledger.cached(CacheKind::Bank, 10 * GB).expect("free room");
     // The fence is in flight: the holder keeps its handle.
     let fenced = retired;
     assert_eq!(ledger.snapshot().cache(), 10 * GB);
-    assert!(ledger.cache(CacheKind::Prefix, 7 * GB).is_err(), "the fenced bytes are not free");
+    assert!(ledger.cached(CacheKind::Prefix, 7 * GB).is_err(), "the fenced bytes are not free");
     // The fence completes; the free returns.
     drop(fenced);
     assert_eq!(ledger.snapshot().cache(), 0);
-    assert!(ledger.cache(CacheKind::Prefix, 7 * GB).is_ok());
+    assert!(ledger.cached(CacheKind::Prefix, 7 * GB).is_ok());
 }
 
 /// Items 2, 25: memory the process claims and backs is never read as other
@@ -138,7 +138,7 @@ fn the_guarantee_is_others_rise_and_the_chunk_only() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 30 * GB);
-    let bank = ledger.cache(CacheKind::Bank, 20 * GB).expect("free room");
+    let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
     drop(bank);
     // Our free, shown: no term of it.
@@ -158,7 +158,7 @@ fn the_budget_is_held_and_available() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 48 * GB, 48 * GB, None);
     let _weights = commit(&ledger, 12 * GB);
-    let _prefix = ledger.cache(CacheKind::Prefix, 2 * GB).expect("free room");
+    let _prefix = ledger.cached(CacheKind::Prefix, 2 * GB).expect("free room");
     read(&ledger, &mut clock, 48 * GB, 10 * GB, None);
     let snapshot = ledger.snapshot();
     assert_eq!((snapshot.committed(), snapshot.cache()), (12 * GB, 2 * GB));
@@ -206,7 +206,7 @@ fn a_store_has_one_ledger() {
     assert_eq!(two.snapshot().committed(), 5 * GB);
     read(&two, &mut clock, 64 * GB, 30 * GB, None);
     let stale = clock.0 + Duration::from_millis(50);
-    one.read(|| Ok(Available::new(64 * GB, 1 * GB, None, stale).expect("a reading")));
+    one.read(one.sampled(stale), Ok(Available::new(64 * GB, 1 * GB, None).expect("a reading")));
     assert_eq!(one.snapshot().others(), Some(64 * GB - 30 * GB - 5 * GB));
     let other = Ledgers::new().ledger(seismic::StoreIdentity::HostRam, shape());
     assert_eq!(other.snapshot().committed(), 0);
@@ -247,7 +247,7 @@ fn a_full_store_refuses_and_only_blindness_unloads() {
     assert_eq!(full.budget(), 30 * GB);
     assert!(!full.unload(0));
     assert!(matches!(ledger.claim(Need::Measurement { bytes: 1 }), Err(Refused::Short(Short::Over { .. }))));
-    ledger.read(|| Err(Blind("no reading".into())));
+    ledger.read(ledger.sampled(Instant::now()), Err(Blind("no reading".into())));
     assert!(ledger.snapshot().unload(0));
 }
 
@@ -302,7 +302,7 @@ fn four_sequences(ledger: &Ledger) -> ([Claim; 4], Cached, u64) {
     read(ledger, &mut clock, 64 * GB, 64 * GB, Some(40 * GB));
     let claims = [1, 2, 3, 4].map(|sequence| ledger.claim(pages(sequence, 0, 1)).expect("room"));
     let page = claims[0].bytes();
-    let bank = ledger.cache(CacheKind::Bank, ledger.snapshot().budget() - 4 * page).expect("the rest");
+    let bank = ledger.cached(CacheKind::Bank, ledger.snapshot().budget() - 4 * page).expect("the rest");
     (claims, bank, page)
 }
 
@@ -380,9 +380,9 @@ fn a_claim_shrinks_by_what_its_holder_freed() {
     read(&ledger, &mut clock, 64 * GB, 60 * GB, None);
     let (mut claim, units) = ledger.claim_units(CommittedKind::GroupClass, NonZeroU64::new(GB).unwrap(), 3);
     assert_eq!(units, 3);
-    claim.allocated(3 * GB);
+    ledger.change(|changing| claim.allocated(3 * GB, changing));
     let free = ledger.snapshot().free();
-    claim.shrink(GB);
+    ledger.change(|changing| claim.shrink(GB, changing));
     assert_eq!((claim.bytes(), claim.allocated_bytes()), (2 * GB, 2 * GB));
     assert_eq!(ledger.snapshot().free(), free + GB);
 }
@@ -395,7 +395,7 @@ fn a_claim_takes_cache_and_is_refused_only_past_the_budget() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 20 * GB);
-    let _bank = ledger.cache(CacheKind::Bank, 20 * GB).expect("free room");
+    let _bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     // Another program holds 20 GB: 4 GB are free.
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     let need = Need::Measurement { bytes: 10 * GB };
@@ -422,7 +422,7 @@ fn a_loads_claim_takes_clean_file_cache_once_and_a_growth_never() {
     let at = clock.next();
     // Other programs hold 54 GB: 4 GB are free above the floor, and 6 GB of
     // clean file cache lie beside them.
-    ledger.read(|| Ok(Available::new(64 * GB, 4 * GB, None, at).expect("a reading").with_reclaimable(6 * GB)));
+    ledger.read(ledger.sampled(at), Ok(Available::new(64 * GB, 4 * GB, None).expect("a reading").with_reclaimable(6 * GB)));
     assert_eq!(ledger.snapshot().free(), 4 * GB);
     assert_eq!(ledger.snapshot().free_for(seismic::Reclaim::CleanFileCache), 10 * GB);
     // A growth takes no file cache.
@@ -440,12 +440,309 @@ fn a_loads_claim_takes_clean_file_cache_once_and_a_growth_never() {
     assert_eq!(ledger.snapshot().free_for(seismic::Reclaim::CleanFileCache), 10 * GB);
 }
 
+/// A load's claim that took the clean file cache is judged, for the serving
+/// claims after it, on a reading taken after its allocation: the OS then
+/// refills free pages from the inactive cache, which only a new reading shows.
+/// On the reading before it (1.40 GB allocated, 7.03 GB available, 39.47 GB
+/// of clean file cache, others 43.10 GB) the 13.7 GB import leaves no room
+/// for a serving claim past the load's floor; on one after it (about 7.27 GB
+/// available) the same claim is admitted.
+#[test]
+fn a_serving_claim_after_a_load_is_judged_on_a_reading_taken_after_the_load() {
+    const MB: u64 = 1 << 20;
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    // Total memory: others 43.10 + available 7.03 + allocated 1.40 GB.
+    let total = (44_134 + 7_199 + 1_434) * MB;
+    read(&ledger, &mut clock, total, total, None);
+    let _before = commit(&ledger, 1_434 * MB);
+    let at = clock.next();
+    ledger.read(ledger.sampled(at), Ok(Available::new(total, 7_199 * MB, None).expect("a reading").with_reclaimable(40_417 * MB)));
+    assert_eq!(ledger.snapshot().others(), Some(44_134 * MB));
+    let mut import = ledger.claim(Need::BankFloor { bytes: 14_029 * MB }).expect("a load counts the clean file cache");
+    ledger.change(|changing| import.allocated(14_029 * MB, changing));
+    // The reading predates the import: its room is the free memory of then,
+    // all held.
+    let serving = Need::Measurement { bytes: 1_187_840 };
+    assert_eq!(ledger.snapshot().free(), 0);
+    assert!(ledger.admit(&serving).is_err(), "the stale reading leaves a serving claim no room");
+    // The OS refilled free pages from the cache the import displaced.
+    let at = clock.next();
+    ledger.read(ledger.sampled(at), Ok(Available::new(total, 7_444 * MB, None).expect("a reading").with_reclaimable(32_000 * MB)));
+    assert_eq!(ledger.admit(&serving), Ok(()), "a reading taken after the import shows the room");
+}
+
 /// A reading's clean file cache is never more than the room it leaves in
 /// the total.
 #[test]
 fn a_readings_file_cache_never_exceeds_what_it_leaves() {
-    let at = Instant::now();
-    assert_eq!(Available::new(10 * GB, 8 * GB, None, at).expect("a reading").with_reclaimable(5 * GB).reclaimable(), 2 * GB);
+    assert_eq!(Available::new(10 * GB, 8 * GB, None).expect("a reading").with_reclaimable(5 * GB).reclaimable(), 2 * GB);
+}
+
+/// The user's shrink cascades (55→20 and 76→20 bank slots ~100 ms apart):
+/// a reading sampled before a shrink reached the ledger after it, read the
+/// freed bytes as others' and set the guarantee by them, and the next
+/// shrink was larger. A shrink never raises others or the guarantee,
+/// whichever side of it the reading was sampled on.
+#[test]
+fn a_shrink_never_raises_others_or_the_guarantee() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    let mut bank: Vec<Cached> = (0..4).map(|_| ledger.cached(CacheKind::Bank, 5 * GB).expect("free room")).collect();
+    // Other programs hold 4 GB.
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 50 * GB, None);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 50 * GB, None);
+    let before = ledger.snapshot();
+    assert_eq!((before.others(), before.guarantee(0)), (Some(4 * GB), 0));
+    while let Some(slice) = bank.pop() {
+        // Sampled with the slice held, paired after its free.
+        let held = ledger.snapshot().allocated();
+        let at = ledger.sampled(clock.next());
+        let sampled = Available::new(64 * GB, 64 * GB - 4 * GB - held, None).expect("a reading");
+        drop(slice);
+        ledger.read(at, Ok(sampled));
+        let after = ledger.snapshot();
+        assert_eq!((after.others(), after.guarantee(0), after.budget()), (Some(4 * GB), 0, before.budget()));
+        // The next reading shows the free.
+        read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - ledger.snapshot().allocated(), None);
+        let shown = ledger.snapshot();
+        assert_eq!((shown.others(), shown.guarantee(0), shown.budget()), (Some(4 * GB), 0, before.budget()));
+        assert!(!shown.unload(0));
+    }
+}
+
+/// A change that lands while a sample reads the OS (one bank slot backed
+/// beside it) could show in one figure and not the other, or in the figure
+/// and not the sample's place among the changes: such a sample does not
+/// stand, and the one that does pairs exactly.
+#[test]
+fn a_sample_a_change_falls_within_is_taken_again() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 30 * GB, None);
+    let slot = std::cell::RefCell::new(None);
+    let reads = std::cell::Cell::new(0);
+    let at = clock.next();
+    let figure = || {
+        reads.set(reads.get() + 1);
+        let figure = 64 * GB - 4 * GB - ledger.snapshot().allocated();
+        // The first read's figure is taken, then a slot lands beside it.
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(ledger.cached(CacheKind::Bank, GB).expect("free room"));
+        }
+        figure
+    };
+    assert!(Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).is_none(), "the sample the slot fell within does not stand");
+    let (sampled, figure) = Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).expect("the next stands");
+    assert_eq!(reads.get(), 2);
+    ledger.read(sampled, Ok(Available::new(64 * GB, figure, None).expect("a reading")));
+    assert_eq!((ledger.snapshot().others(), ledger.snapshot().guarantee(0)), (Some(4 * GB), 0));
+}
+
+/// A shrink's memory is freed before its ledger record is written (the
+/// release thread unmaps, the record follows): within the change that
+/// spans both, no sample stands, so none reads the freed memory as others'
+/// while the ledger still counts it; after it, others are exact. Others
+/// never move.
+#[test]
+fn a_free_before_its_record_never_moves_others() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    let slice = ledger.cached(CacheKind::Bank, 8 * GB).expect("free room");
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 38 * GB, None);
+    let used = std::cell::Cell::new(4 * GB + 38 * GB);
+    let at = clock.next();
+    let figure = || 64 * GB - used.get();
+    ledger.store.changes.back(|_| {
+        // The OS frees the slice; the ledger has not recorded it yet.
+        used.set(4 * GB + 30 * GB);
+        assert!(Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).is_none(), "no sample stands between the free and its record");
+        drop(slice);
+        assert!(Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).is_none(), "nor before the change ends");
+    });
+    let (sampled, available) = Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).expect("a sample stands once the change ended");
+    ledger.read(sampled, Ok(Available::new(64 * GB, available, None).expect("a reading")));
+    let after = ledger.snapshot();
+    assert_eq!((after.others(), after.guarantee(0)), (Some(4 * GB), 0));
+}
+
+/// A host tier's slot backed at load, as the bank opens and before any
+/// served bank exists, is allocated in the tier's claim within one change
+/// with its backing: between the slot's memory landing and its record no
+/// sample stands, and after both others are exact. Others never move.
+#[test]
+fn a_slot_backed_at_load_before_its_record_never_moves_others() {
+    let (scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 30 * GB, None);
+    // The tier's claim, split from the import's, held by the bank from its open.
+    let cache = crate::experts::cache::BankCache::new(scope.changes().clone());
+    cache.grow(crate::domain::BankHolding::Host, 0, ledger.backing(8 * GB).expect("room"));
+    let used = std::cell::Cell::new(4 * GB + 30 * GB);
+    let at = clock.next();
+    let figure = || 64 * GB - used.get();
+    cache.changes().back(|changing| {
+        // The slot's memory lands; its record has not.
+        used.set(4 * GB + 32 * GB);
+        assert!(Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).is_none(), "no sample stands between the backing and its record");
+        cache.backed(2 * GB, changing);
+    });
+    let (sampled, available) = Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).expect("a sample stands once the change ended");
+    ledger.read(sampled, Ok(Available::new(64 * GB, available, None).expect("a reading")));
+    let after = ledger.snapshot();
+    assert_eq!((after.others(), after.guarantee(0)), (Some(4 * GB), 0));
+}
+
+/// Blind readings still let go of every change no later sample can miss:
+/// the journal is bounded while the store cannot be read.
+#[test]
+fn blind_readings_bound_the_journal() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let mut held: Vec<Claim> = (0..32).map(|_| commit(&ledger, GB)).collect();
+    while let Some(claim) = held.pop() {
+        drop(claim);
+        ledger.read(ledger.sampled(clock.next()), Err(Blind("the OS refused the reading".into())));
+        assert!(ledger.state().journal.is_empty(), "a blind reading lets go of what every later sample shows");
+    }
+    read(&ledger, &mut clock, 64 * GB, 60 * GB, None);
+    assert_eq!(ledger.snapshot().others(), Some(4 * GB));
+}
+
+/// The user's rebounds (45→79, 52→114 within a second): a reading sampled
+/// before a growth reached the ledger after it, read others as having let
+/// go of the growth's bytes, and the next true reading as their rise. A
+/// growth never lowers others, and the reading after it raises nothing.
+#[test]
+fn a_growth_never_lowers_others() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 30 * GB, None);
+    let before = ledger.snapshot();
+    let mut bank = Vec::new();
+    for _ in 0..4 {
+        let held = ledger.snapshot().allocated();
+        let at = ledger.sampled(clock.next());
+        let sampled = Available::new(64 * GB, 64 * GB - 4 * GB - held, None).expect("a reading");
+        bank.push(ledger.cached(CacheKind::Bank, 5 * GB).expect("free room"));
+        ledger.read(at, Ok(sampled));
+        assert_eq!((ledger.snapshot().others(), ledger.snapshot().budget()), (Some(4 * GB), before.budget()));
+        read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - ledger.snapshot().allocated(), None);
+        let shown = ledger.snapshot();
+        assert_eq!((shown.others(), shown.guarantee(0), shown.budget()), (Some(4 * GB), 0, before.budget()));
+    }
+}
+
+/// Every store's figure shows a release of the process's at once: its
+/// bytes are free at the first sample after it, and others' memory stays
+/// exact across it.
+#[test]
+fn a_release_is_free_at_the_first_sample_after_it() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 20 * GB);
+    let scratch = commit(&ledger, 4 * GB);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 6 * GB - 24 * GB, None);
+    let before = ledger.snapshot();
+    drop(scratch);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 6 * GB - 20 * GB, None);
+    let shown = ledger.snapshot();
+    assert_eq!((shown.others(), shown.free()), (Some(6 * GB), before.free() + 4 * GB));
+}
+
+/// Other programs' allocation landing while a sample reads: the sample
+/// stands (no change of the process's is beside it) and shows their rise
+/// at once.
+#[test]
+fn an_outside_allocation_racing_a_sample_shows_at_once() {
+    let (_scope, ledger) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - 30 * GB, None);
+    let others = std::cell::Cell::new(4 * GB);
+    let at = clock.next();
+    let figure = || {
+        let figure = 64 * GB - others.get() - 30 * GB;
+        others.set(others.get() + 3 * GB);
+        figure
+    };
+    let (sampled, available) = Sampled::attempt(&ledger.store.changes, &|| at, &figure, 0).expect("others' change never stops a sample");
+    ledger.read(sampled, Ok(Available::new(64 * GB, available, None).expect("a reading")));
+    assert_eq!((ledger.snapshot().others(), ledger.snapshot().guarantee(0)), (Some(4 * GB), 0));
+    read(&ledger, &mut clock, 64 * GB, 64 * GB - 7 * GB - 30 * GB, None);
+    assert_eq!((ledger.snapshot().others(), ledger.snapshot().guarantee(0)), (Some(7 * GB), 3 * GB));
+}
+
+/// An allocation change recorded outside any change of its memory (a
+/// holder dropped where no sample is held off) is the invariant's
+/// violation, in the process's scope.
+#[test]
+#[should_panic(expected = "an allocation change recorded outside a change of its memory")]
+fn a_record_outside_a_change_panics() {
+    let scope = Ledgers::strict();
+    let _owner = scope.changes().own();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
+    read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, None);
+    let claim = ledger.change(|changing| {
+        let mut claim = ledger.claim(Need::Measurement { bytes: GB }).expect("the claim fits");
+        claim.allocated(GB, changing);
+        claim
+    });
+    drop(claim);
+}
+
+/// A sample a change lands beside at every try never stands: past a reading
+/// interval with no change under way, that is the invariant's violation,
+/// and the sample's wait is let go however it ends, so a step off the
+/// owner's thread waits for it no longer.
+#[test]
+fn a_sample_that_never_stands_panics_and_lets_its_wait_go() {
+    let (_scope, ledger) = host();
+    let changes = ledger.store.changes.clone();
+    let beside = || changes.change(|_| ());
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Sampled::steady(&changes, Instant::now, beside, || false)));
+    let payload = panicked.expect_err("no sample stands");
+    let message = payload.downcast_ref::<&str>().copied().unwrap_or_default();
+    assert!(message.contains("no sample stood within a reading interval"), "{message}");
+    assert_eq!(changes.meet().wanted, 0, "the panicked sample waits no more");
+    changes.back(|_| ());
+}
+
+/// A growth off the owner's thread longer than a reading interval, slot by
+/// slot, leaves every interval its sample: each slot begins only once no
+/// sample waits, and each sample stands within the interval.
+#[test]
+fn a_growth_longer_than_an_interval_leaves_every_interval_its_sample() {
+    let (_scope, ledger) = host();
+    let changes = ledger.store.changes.clone();
+    let growing = {
+        let changes = changes.clone();
+        std::thread::spawn(move || {
+            for _ in 0..30 {
+                changes.back(|_| std::thread::sleep(Duration::from_millis(15)));
+            }
+        })
+    };
+    for _ in 0..4 {
+        let began = Instant::now();
+        Sampled::steady(&changes, Instant::now, || (), || false).expect("never stopped");
+        assert!(began.elapsed() < crate::platform::READING_INTERVAL, "a sample stands within its interval");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    growing.join().expect("the growth ends");
 }
 
 /// A unit claim takes the most whole units free room, spare granules and
@@ -468,9 +765,9 @@ fn a_unit_claim_takes_whole_units_from_free_spare_and_bank_alone() {
     drop(few);
     // Fill the store: some free room, spare, bank and a prefix.
     let free = ledger.snapshot().budget() - ledger.snapshot().committed();
-    let prefix = ledger.cache(CacheKind::Prefix, 10 * GB).expect("room");
-    let spare = ledger.cache(CacheKind::Spare, 3 * GB).expect("room");
-    let bank = ledger.cache(CacheKind::Bank, free - 10 * GB - 3 * GB - GB / 2).expect("room");
+    let prefix = ledger.cached(CacheKind::Prefix, 10 * GB).expect("room");
+    let spare = ledger.cached(CacheKind::Spare, 3 * GB).expect("room");
+    let bank = ledger.cached(CacheKind::Bank, free - 10 * GB - 3 * GB - GB / 2).expect("room");
     let bank_bytes = bank.bytes();
     // Free room is half a unit: whole units come from spare, then the bank.
     let (scratch, taken) = ledger.claim_units(CommittedKind::Scratch, unit, u64::MAX);
@@ -500,7 +797,7 @@ fn a_blind_store_refuses_an_allocation_as_blind_not_short() {
     let demand = crate::memory::ClaimDemand { device: GB, ..crate::memory::ClaimDemand::default() };
     let store = ledgers.device().store();
     for ledger in [ledgers.device(), ledgers.host()] {
-        ledger.read(|| Err(Blind("the OS refused the reading".into())));
+        ledger.read(ledger.sampled(Instant::now()), Err(Blind("the OS refused the reading".into())));
     }
     let claim = |demand| ledgers.claim(&device, CommittedKind::Load, demand);
     assert_eq!(claim(demand).err(), Some(Short::Blind { store: store.clone(), reason: "the OS refused the reading".into() }));
@@ -536,7 +833,7 @@ fn a_loads_allocation_is_never_claimed_twice() {
     let import = crate::memory::ClaimDemand { device: FLOOR + ABOVE, ..Default::default() };
     let mut held = ledgers.claim(&device, CommittedKind::Load, import).expect("the import fits");
     // The import allocates; the next reading shows it.
-    held.allocated();
+    held.made();
     recorded.record(held);
     read(ledger, &mut clock, TOTAL, AVAILABLE, None);
     let imported = ledger.snapshot();
@@ -563,7 +860,7 @@ fn a_claim_not_yet_allocated_stays_out_of_free_room_across_a_reading() {
     read(&ledger, &mut clock, 64 * GB, 24 * GB, None);
     let after = ledger.snapshot();
     assert_eq!((after.others(), after.free(), after.guarantee(0)), (Some(40 * GB), 20 * GB, 0));
-    assert!(ledger.cache(CacheKind::Bank, 21 * GB).is_err(), "the bank never grows into the room");
+    assert!(ledger.cached(CacheKind::Bank, 21 * GB).is_err(), "the bank never grows into the room");
     drop(room);
 }
 
@@ -576,7 +873,7 @@ fn a_claim_turns_cache_in_place_and_yields_before_the_bank() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let class = commit(&ledger, 4 * GB);
-    let bank = ledger.cache(CacheKind::Bank, 60 * GB).expect("the rest");
+    let bank = ledger.cached(CacheKind::Bank, 60 * GB).expect("the rest");
     read(&ledger, &mut clock, 64 * GB, 0, None);
     let before = ledger.snapshot();
     let entries = ledger.entries().len();
@@ -596,15 +893,15 @@ fn a_claim_turns_cache_in_place_and_yields_before_the_bank() {
 fn a_blind_store_refuses_a_claim_as_blind_not_short() {
     let (_scope, ledger) = host();
     let blind = Short::Blind { store: ledger.store(), reason: "the OS refused the reading".into() };
-    ledger.read(|| Err(Blind("the OS refused the reading".into())));
+    ledger.read(ledger.sampled(Instant::now()), Err(Blind("the OS refused the reading".into())));
     let need = Need::Measurement { bytes: GB };
     assert_eq!(ledger.admit(&need), Err(blind.clone()));
     assert!(matches!(ledger.claim(need.clone()), Err(Refused::Short(refused)) if refused == blind));
-    assert!(matches!(ledger.cache(CacheKind::Prefix, GB), Err(refused) if refused == blind));
+    assert!(matches!(ledger.cached(CacheKind::Prefix, GB), Err(refused) if refused == blind));
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 8 * GB, 4 * GB, None);
     let mut state = ledger.claim(pages(1, 0, 1)).expect("room");
-    ledger.read(|| Err(Blind("the OS refused the reading".into())));
+    ledger.read(ledger.sampled(Instant::now()), Err(Blind("the OS refused the reading".into())));
     assert!(matches!(state.grow(pages(1, 1, 2)), Err(Refused::Short(refused)) if refused == blind));
     read(&ledger, &mut clock, 8 * GB, 4 * GB, None);
     let _held = ledger.claim(need).expect("a read store holds it");
@@ -620,7 +917,7 @@ fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 20 * GB);
-    let mut bank = ledger.cache(CacheKind::Bank, 40 * GB).expect("free room");
+    let mut bank = ledger.cached(CacheKind::Bank, 40 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     let _taken = ledger.claim(Need::Measurement { bytes: 10 * GB }).expect("cache yields to it");
     assert_eq!((bank.bytes(), bank.releasing()), (34 * GB, 6 * GB), "the bank yields 6 GB, still allocated");
@@ -629,7 +926,7 @@ fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     // The bank has not freed them: the next reading counts them the process's.
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     assert_eq!(ledger.snapshot().others(), Some(0), "the yielded bytes read as others' memory");
-    bank.released(6 * GB);
+    ledger.change(|changing| bank.released(6 * GB, changing));
     let freed = ledger.snapshot();
     assert_eq!((freed.allocated(), freed.releasing(), freed.allocatable()), (54 * GB, 0, 10 * GB), "the claim allocates them once freed");
     read(&ledger, &mut clock, 64 * GB, 10 * GB, None);
@@ -642,7 +939,7 @@ fn a_cache_holding_dropped_frees_what_it_yielded() {
     let (_scope, ledger) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let bank = ledger.cache(CacheKind::Bank, 64 * GB).expect("free room");
+    let bank = ledger.cached(CacheKind::Bank, 64 * GB).expect("free room");
     let _taken = ledger.claim(Need::Measurement { bytes: 8 * GB }).expect("cache yields to it");
     drop(bank);
     let snapshot = ledger.snapshot();
@@ -660,9 +957,9 @@ fn a_backing_is_allocated_as_it_backs_and_ends_as_cache_of_what_it_backed() {
     let mut backing = ledger.backing(8 * GB).expect("free room");
     assert!(ledger.backing(57 * GB).is_err(), "its bytes are held from the start");
     assert_eq!((ledger.snapshot().allocated(), ledger.snapshot().free()), (0, 56 * GB));
-    backing.backed(3 * GB);
+    ledger.change(|changing| backing.backed(3 * GB, changing));
     assert_eq!(ledger.snapshot().allocated(), 3 * GB);
-    let cache = backing.into_backed_cache(5 * GB, CacheKind::Bank);
+    let cache = ledger.change(|changing| backing.into_backed_cache(5 * GB, CacheKind::Bank, changing));
     let snapshot = ledger.snapshot();
     assert_eq!((cache.bytes(), snapshot.allocated(), snapshot.cache_of(CacheKind::Bank), snapshot.free()), (5 * GB, 5 * GB, 5 * GB, 59 * GB));
 }

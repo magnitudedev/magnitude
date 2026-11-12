@@ -184,8 +184,8 @@ impl NativeGraphPool {
     /// Allocate one more output slot under `held`, the claim of its
     /// [`Self::output_slot_bytes`], kept until the slot is released.
     pub(crate) fn grow_claimed_output(&mut self, held: crate::memory::ledger::Held) -> Result<(), seismic::TensorError> {
-        let slot = self.new_output()?;
-        self.push_output(Claimed::under(slot, held));
+        let slot = Claimed::allocate(held, || self.new_output())?;
+        self.push_output(slot);
         Ok(())
     }
 
@@ -357,11 +357,8 @@ impl VisionGraphPool {
     /// until the activation is released.
     pub(crate) fn grow_activation(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
-        let slot = class
-            .family
-            .new_slot(&class.upload_regions())
-            .map_err(VisionGrowth::Device)?;
-        class.workspace.borrow_mut().push(Claimed::under(slot, held));
+        let slot = Claimed::allocate(held, || class.family.new_slot(&class.upload_regions()).map_err(VisionGrowth::Device))?;
+        class.workspace.borrow_mut().push(slot);
         class.activations += 1;
         Ok(())
     }
@@ -371,11 +368,8 @@ impl VisionGraphPool {
     /// is released.
     pub(crate) fn grow_output(&mut self, patch_rows: u64, held: crate::memory::ledger::Held) -> Result<(), VisionGrowth> {
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
-        let slot = class
-            .family
-            .new_output_slot()
-            .map_err(VisionGrowth::Device)?;
-        class.output.borrow_mut().push(Claimed::under(slot, held));
+        let slot = Claimed::allocate(held, || class.family.new_output_slot().map_err(VisionGrowth::Device))?;
+        class.output.borrow_mut().push(slot);
         class.outputs += 1;
         Ok(())
     }
@@ -478,10 +472,11 @@ pub(crate) struct Claimed<S> {
 }
 
 impl<S> Claimed<S> {
-    /// A slot just allocated under `held`.
-    fn under(slot: S, mut held: crate::memory::ledger::Held) -> Self {
-        held.allocated();
-        Self { slot, claims: held.into_claims() }
+    /// A slot allocated by `make` under `held`, as one change with its
+    /// record (`memory::ledger::Held::allocate`).
+    fn allocate<E>(mut held: crate::memory::ledger::Held, make: impl FnOnce() -> Result<S, E>) -> Result<Self, E> {
+        let slot = held.allocate(make)?;
+        Ok(Self { slot, claims: held.into_claims() })
     }
 
     /// A slot of a held class, under its class's claim.
@@ -489,7 +484,8 @@ impl<S> Claimed<S> {
         Self { slot, claims: Vec::new() }
     }
 
-    /// Release the slot's storage by `release`, then its claims.
+    /// Release the slot's storage by `release`, then its claims, within
+    /// the change its release runs in (`AllocatedResources::release_idle_slots`).
     fn release(self, release: impl FnOnce(S) -> u64) -> u64 {
         let Self { slot, claims } = self;
         let released = release(slot);
@@ -684,10 +680,10 @@ mod tests {
         let ledgers = DeviceLedgers::open_in(&Ledgers::new(), &device, shape);
         let at = std::time::Instant::now();
         for ledger in [ledgers.device(), ledgers.host()] {
-            ledger.read(|| Ok(crate::memory::ledger::Available::new(8 << 30, 8 << 30, None, at).expect("a reading")));
+            ledger.read(ledger.sampled(at), Ok(crate::memory::ledger::Available::new(8 << 30, 8 << 30, None).expect("a reading")));
         }
         let held = ledgers.claim(&device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() }).expect("room");
-        let slot = super::Claimed::under((), held);
+        let slot = super::Claimed::allocate(held, || Ok::<_, ()>(())).expect("made");
         assert_eq!(ledgers.device().snapshot().allocated(), 1 << 20, "the freed slot's claim is held until its release");
         assert_eq!(slot.release(|()| 0), 0);
         assert_eq!(ledgers.device().snapshot().committed(), 0, "the released slot's claim is gone");

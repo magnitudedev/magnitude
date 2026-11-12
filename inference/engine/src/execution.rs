@@ -20,7 +20,7 @@ use magnitude_executor::{
     CatalogError, CatalogFailure, PlanError, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WorkKind,
-    memory::{ClaimDemand, ledger::{CommittedKind, DeviceLedgers, Held, LoadShape, Recorded, Short}},
+    memory::{ClaimDemand, ledger::{CommittedKind, DeviceLedgers, Held, Ledgers, LoadShape, OpenChange, Recorded, Short}},
     platform::{self, DeviceRequest, OpenedPlatform, PlatformConfig, PlatformError},
 };
 use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
@@ -442,7 +442,7 @@ fn prepare(
     }
     let PlannedModel {
         mut startup,
-        programs_claim,
+        mut programs_claim,
         qualification_claim,
         draft,
         resident,
@@ -456,7 +456,9 @@ fn prepare(
     let workers = Arc::new(seismic::Workers::of_the_host());
     opened.device().staff(Some(workers.clone()));
     let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, opened.device(), progress)?;
-    let mut programs = match AttestedPrograms::prepare_draft(
+    // The programs' storage is made under its claim, one change with its
+    // record.
+    let mut programs = match programs_claim.allocate(|| AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
         TuningContext {
@@ -468,7 +470,7 @@ fn prepare(
             settings: manifest.tuning,
         },
         unprepared,
-    ) {
+    )) {
         Ok(programs) => programs,
         Err(CatalogError {
             failure: CatalogFailure::Unprepared { entry, bindings },
@@ -488,7 +490,7 @@ fn prepare(
     };
     // Qualification ran, its fixtures freed; the programs' storage stays.
     drop(qualification_claim);
-    startup.record(programs_claim);
+    startup.recorded.record(programs_claim);
     let draft = draft
         .finalize_readout(&manifest.definition, programs.readout_choices())
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
@@ -581,6 +583,10 @@ fn build_held(
     progress: Rc<dyn Fn(LoadProgress)>,
     holding: Holding,
 ) -> Result<Built, LoadError> {
+    // The load is one change of the process's memory, until everything it
+    // leaves behind has dropped: the owner reads between its allocations,
+    // each recorded as it is made, and a failed load's frees are part of it.
+    let _load = OpenChange::begin(Ledgers::process().changes());
     let PreparedPrograms {
         mut startup,
         draft,
@@ -785,30 +791,33 @@ fn build_held(
     // The device's store ledgers as the planned load sizes its state; every
     // allocation from here is claimed on them.
     startup.ledgers = DeviceLedgers::open(&device, Arc::new(LoadShape::of(&execution_plan)));
-    let scratch = startup.claim_device("graph scratch", plan.bytes().scratch)?;
-    let resources = ResourceAllocator::allocate(
-        &execution_plan,
-        &device,
-        resource_identity.clone(),
-        target_graphs,
-        target_readout_graphs,
-        programs.drafter_graphs(),
-        programs.vision_graphs().map(|graphs| graphs.as_ref()),
-        state_graphs.as_ref(),
-        &startup.ledgers,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    startup.record(scratch);
+    let mut scratch = startup.claim_device("graph scratch", plan.bytes().scratch)?;
+    let resources = scratch
+        .allocate(|| {
+            ResourceAllocator::allocate(
+                &execution_plan,
+                &device,
+                resource_identity.clone(),
+                target_graphs,
+                target_readout_graphs,
+                programs.drafter_graphs(),
+                programs.vision_graphs().map(|graphs| graphs.as_ref()),
+                state_graphs.as_ref(),
+                &startup.ledgers,
+            )
+        })
+        .map_err(|error| internal(error.to_string()))?;
+    startup.recorded.record(scratch);
     // The load's release thread, which the pools' slots and the expert
     // bank's storage release on.
     let releases = resources.releases();
     report_load_phase("resource allocation", &mut phase_started);
     report_load_memory("resources allocated", &catalog, &device);
     let host_tables = execution_plan.load().host_table_bytes().map_err(|error| internal(error.to_string()))?;
-    let host_tables = startup.claim("host tables", ClaimDemand { host: host_tables, ..ClaimDemand::default() })?;
+    let mut host_tables = startup.claim("host tables", ClaimDemand { host: host_tables, ..ClaimDemand::default() })?;
     // The allocations after the target import are claimed before it, so the
     // import's bank holds what they leave.
-    let target_state_claim = startup.claim_device(
+    let mut target_state_claim = startup.claim_device(
         "initial target state",
         plan.target_state().initial_committed_bytes().map_err(internal)?,
     )?;
@@ -867,39 +876,44 @@ fn build_held(
         execution_plan.clone(),
         resource_identity.clone(),
         releases.clone(),
+        startup.ledgers.changes().clone(),
     )
     .map_err(|error| internal(error.to_string()))?;
     // The rows steps name of a streamed table are kept beside the kernels,
     // for the next load of the model.
+    // A linked host tier backs to its load-time slots from the bank's open
+    // (`ExpertBank::back_host`): its claim is kept apart and handed to the
+    // bank, allocated as each slot backs, never before it exists.
+    let tier = execution_plan.load().host_tier_bytes().map_err(internal)?;
+    if tier > 0 {
+        let store = startup.ledgers.of(magnitude_executor::BankTier::Host).store();
+        residency.back_host_tier(weights.split_backing(&store, tier));
+    }
     if let Some(cache) = &manifest.kernel_cache {
         residency.keep_table_rows(cache.join("table-rows"));
         residency.keep_cpu_site(stored_cpu_site(cache, &device, &site_requests).map_err(internal)?);
     }
     let import_progress = progress.clone();
-    let target = residency
-        .load_target(
-            &manifest.definition,
-            &package,
-            Box::new(move |completed_bytes, total_bytes| {
-                import_progress(LoadProgress::ImportingWeights {
-                    completed_bytes,
-                    total_bytes,
-                });
-            }),
-        )
-        .map_err(|error| import_refused(error, &device, &startup.ledgers))?;
+    // The import and its record, its host tables' with it, are one change.
+    let target = weights.allocate(|| {
+        host_tables.allocate(|| {
+            residency
+                .load_target(
+                    &manifest.definition,
+                    &package,
+                    Box::new(move |completed_bytes, total_bytes| {
+                        import_progress(LoadProgress::ImportingWeights {
+                            completed_bytes,
+                            total_bytes,
+                        });
+                    }),
+                )
+                .map_err(|error| import_refused(error, &device, &startup.ledgers))
+        })
+    })?;
     drop(upload_window);
-    // A linked host tier backs to its load-time slots after the import
-    // (`ExpertBank::back_host`): its claim is kept apart, allocated as each
-    // slot backs, never recorded as allocated before it exists.
-    let tier = execution_plan.load().host_tier_bytes().map_err(internal)?;
-    if tier > 0 {
-        let store = startup.ledgers.of(magnitude_executor::BankTier::Host).store();
-        startup.recorded.record_backing(weights.split_backing(&store, tier));
-    }
-    startup.record(weights);
-
-    startup.record(host_tables);
+    startup.recorded.record(weights);
+    startup.recorded.record(host_tables);
     tracing::info!(
         "resident target imported in {:.2} s ({} distinct weights)",
         phase_started.elapsed().as_secs_f64(),
@@ -936,19 +950,18 @@ fn build_held(
                 execution_plan.clone(),
                 resource_identity.clone(),
                 releases.clone(),
+                startup.ledgers.changes().clone(),
             )?;
             ComponentLoader::vision(store, definition.clone(), package.clone())
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let target_state = plan
-        .allocate_target_state(device.clone())
-        .map_err(internal)?;
-    startup.record(target_state_claim);
+    let target_state = target_state_claim.allocate(|| plan.allocate_target_state(device.clone()).map_err(internal))?;
+    startup.recorded.record(target_state_claim);
     let head_state = head_state_claim
-        .map(|(state, claim)| {
-            let allocated = state.allocate(device.clone()).map_err(internal)?;
-            startup.record(claim);
+        .map(|(state, mut claim)| {
+            let allocated = claim.allocate(|| state.allocate(device.clone()).map_err(internal))?;
+            startup.recorded.record(claim);
             Ok::<_, LoadError>(allocated)
         })
         .transpose()?;
@@ -1614,7 +1627,6 @@ fn load_memory_record(moment: &str, catalog: &Devices, device: &seismic::Device)
         Ok(host) => serde_json::json!({
             "allocatable_bytes": host.allocatable.value,
             "reclaimable_bytes": host.reclaimable,
-            "wired_bytes": host.held.map(|held| held.wired_bytes),
             "compressed_bytes": host.held.map(|held| held.compressed_bytes),
         }),
         Err(error) => serde_json::json!({ "unobserved": error.to_string() }),
@@ -1696,12 +1708,6 @@ impl Startup {
     /// [`Self::claim`] of `bytes` of device storage.
     fn claim_device(&self, purpose: &str, bytes: u64) -> Result<Held, LoadError> {
         self.claim(purpose, ClaimDemand { device: bytes, ..ClaimDemand::default() })
-    }
-
-    /// `held`'s allocation made: recorded as the load's.
-    fn record(&mut self, mut held: Held) {
-        held.allocated();
-        self.recorded.record(held);
     }
 
     /// Claim the target import of `load`: each weight allocation in the

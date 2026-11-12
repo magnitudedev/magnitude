@@ -149,6 +149,39 @@ fn idle_slots_a_claim_takes_are_released_at_the_next_follow() {
     }
 }
 
+/// A claim that took the cache of a closed group's idle slots, all of
+/// which a release let go meanwhile: the next follow lets the cache go as a
+/// change of its own, under the process's rule, which a record outside one
+/// breaks.
+#[test]
+fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
+    use crate::memory::ledger::CommittedKind;
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
+        let (places, _) = opened(&mut domain, 2);
+        assert_eq!(places, 3, "{backend:?}");
+        domain.close_group().unwrap();
+        let ledger = domain.resources.ledgers().device().clone();
+        let (all, _) = ledger.claim_units(CommittedKind::Measurement, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        assert!(domain.idle_slots_taken(), "{backend:?}: the claim took the idle slots' cache");
+        // The slots are released apart from their cache, which stays taken.
+        assert!(domain.resources.release_idle_slots(Vec::new(), crate::CompletionWake::new(|| {})), "{backend:?}");
+        while domain.advance_slot_release().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(domain.idle_slots_taken(), "{backend:?}: no slot idles, its cache still taken");
+        let changes = domain.resources.ledgers().changes().clone();
+        changes.strict();
+        assert_eq!(
+            domain.follow_cache_targets(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
+            crate::domain::Followed::Holds,
+            "{backend:?}: nothing left to release"
+        );
+        assert_eq!(idle_cache(&domain), 0, "{backend:?}: the cache is let go");
+        changes.change(|_| drop(all));
+    }
+}
+
 /// A group opening while a closed group's idle slots are being released
 /// claims its whole class: the released slots are not its, their cache
 /// goes with their release, allocated until it ends, and none of it is
@@ -313,7 +346,7 @@ fn an_imports_bytes_are_never_others_memory() {
         let read = |tick: u32| {
             let process = ledger.snapshot().allocated();
             let at = start + std::time::Duration::from_millis(100) * tick;
-            ledger.read(|| Ok(Available::new(total, total - others - process, None, at).expect("a reading")));
+            ledger.read(ledger.sampled(at), Ok(Available::new(total, total - others - process, None).expect("a reading")));
         };
         read(1);
         read(2);
@@ -321,7 +354,7 @@ fn an_imports_bytes_are_never_others_memory() {
         let mut import = domain
             .claim_growth(CommittedKind::Component, ClaimDemand { device: GB, ..Default::default() })
             .expect("the import fits");
-        import.allocated();
+        import.made();
         read(3);
         let after = ledger.snapshot();
         assert_eq!(after.others(), Some(others), "{backend:?}: the import read as others' memory");
@@ -338,7 +371,7 @@ const GIB: u64 = 1 << 30;
 /// A store's ledger, read at 64 GiB total and `available`, `at` ms in.
 fn read_at(ledger: &crate::memory::ledger::Ledger, available: u64, at: u64) {
     let at = std::time::Instant::now() + std::time::Duration::from_millis(at);
-    ledger.read(|| Ok(crate::memory::ledger::Available::new(64 * GIB, available, None, at).expect("a reading")));
+    ledger.read(ledger.sampled(at), Ok(crate::memory::ledger::Available::new(64 * GIB, available, None).expect("a reading")));
 }
 
 /// A load's ledger with 1 GiB free beside the bank at its floor, a
@@ -364,7 +397,7 @@ fn grown_rows() -> (
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape);
     read_at(&ledger, 2 * GIB, 0);
     let mut floor = ledger.claim(Need::BankFloor { bytes: GIB }).expect("the floor fits");
-    floor.allocated(GIB);
+    ledger.change(|changing| floor.allocated(GIB, changing));
     read_at(&ledger, GIB, 1);
     assert_eq!(ledger.snapshot().free(), GIB, "1 GiB free beside the bank at its floor");
     let sequence = crate::RequestId(1);
@@ -383,7 +416,7 @@ fn a_state_growth_is_not_admitted_beside_its_own_rows() {
     let (_scope, ledger, _floor, mut rows, mut slabs) = grown_rows();
     let growth = rows.bytes() + 16 * MIB;
     slabs.reserve(&ledger, growth, std::iter::once(&rows)).expect("the growth past the rows fits free room");
-    slabs.settle(&ledger, 64 * MIB + growth, std::iter::once(&mut rows));
+    ledger.change(|changing| slabs.settle(&ledger, 64 * MIB + growth, std::iter::once(&mut rows), changing));
     assert_eq!(rows.allocated_bytes(), rows.bytes(), "the slabs back the claimed rows");
     assert_eq!(ledger.snapshot().cache_of(CacheKind::Spare), 16 * MIB, "only the slab's excess is held anew");
     // A second growth past rows already backed is all spare, and refused
@@ -399,12 +432,12 @@ fn a_sequences_state_is_never_read_as_others_memory() {
     let others = ledger.snapshot().others();
     let growth = rows.bytes() + 16 * MIB;
     slabs.reserve(&ledger, growth, std::iter::once(&rows)).expect("the growth fits");
-    slabs.settle(&ledger, 64 * MIB + growth, std::iter::once(&mut rows));
+    ledger.change(|changing| slabs.settle(&ledger, 64 * MIB + growth, std::iter::once(&mut rows), changing));
     read_at(&ledger, GIB - growth, 2);
     assert_eq!(ledger.snapshot().others(), others, "the state's bytes read as the process's own");
     // Evicted, its rows' slab bytes stay the process's, as spare.
     drop(rows);
-    slabs.settle(&ledger, 64 * MIB + growth, std::iter::empty());
+    ledger.change(|changing| slabs.settle(&ledger, 64 * MIB + growth, std::iter::empty(), changing));
     read_at(&ledger, GIB - growth, 3);
     assert_eq!(ledger.snapshot().others(), others, "an evicted sequence's slabs read as the process's own");
 }

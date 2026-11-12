@@ -1,4 +1,4 @@
-//! macOS 15+: `sysctl hw.memsize` and Mach `HOST_VM_INFO64`.
+//! macOS 15+: `sysctl hw.memsize` and the kernel's live `vm.page_*` counts.
 //!
 //! macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA` against allocations, so
 //! no process memory limit applies.
@@ -131,11 +131,23 @@ pub(super) fn capacity() -> Result<Reported<u64>, String> {
     Ok(Reported::new(bytes, ReportedBy::MacOsMemsize))
 }
 
-/// One Mach `HOST_VM_INFO64` reading, the page size it counts in, and the
-/// machine's free-page target.
+/// One reading of the VM's page counts, the page size they count in, and
+/// the machine's free-page target. The counts are the kernel's live
+/// `vm.page_*` sysctls: `host_statistics64` serves an ordinary process a
+/// cached figure past a few calls a second (an M4 Pro's refreshed once a
+/// second against 10 ms reads, 2026-11-12), which no sample may pair with
+/// its instant.
 pub(super) struct VmReading {
     pub(super) page_size: u64,
-    pub(super) statistics: libc::vm_statistics64,
+    /// `vm.page_free_count`: free pages, read-ahead apart.
+    pub(super) free: u64,
+    /// `vm.page_purgeable_count`: volatile purgeable pages.
+    pub(super) purgeable: u64,
+    /// `vm.page_pageable_external_count`: file-backed pages.
+    pub(super) external: u64,
+    /// `vm.compressor_bytes_used`: the size of the data the compressor
+    /// stores, not the physical pages that hold it.
+    pub(super) compressed_bytes: u64,
     /// `vm.vm_page_free_target`: the free pages the pageout daemon keeps,
     /// compressing, swapping and evicting other pages whenever free pages
     /// fall below it.
@@ -155,33 +167,42 @@ fn free_target() -> Result<u64, ObservationError> {
         .map_err(ObservationError::Failed)
 }
 
-#[allow(deprecated)] // libc's Mach bindings are stable ABI; mach2 is not a dependency.
+/// The count `sysctl` `name` reports, zero included: a 32- or 64-bit
+/// integer by name and OS release.
+///
+/// # Panics
+/// Where this macOS defines no such name: the reader's names are each
+/// release's from 15 on, so one missing is the invariant's violation, never
+/// a zero or another source's figure.
+fn sysctl_count(name: &str) -> Result<u64, ObservationError> {
+    let mut bytes = [0u8; 8];
+    let length = match sysctl(name, Some(&mut bytes)) {
+        Ok(length) => length,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            let version = sysctl_bytes("kern.osproductversion").map(|bytes| String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_owned());
+            panic!("invariant violated: macOS {} defines no sysctl {name}", version.unwrap_or_else(|error| format!("of unknown version ({error})")))
+        }
+        Err(error) => return Err(ObservationError::Failed(failed(name, error))),
+    };
+    match length {
+        4 => Ok(u64::from(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))),
+        8 => Ok(u64::from_ne_bytes(bytes)),
+        _ => Err(ObservationError::Failed(format!("sysctl {name} returned {length} bytes"))),
+    }
+}
+
 pub(super) fn vm_reading() -> Result<VmReading, ObservationError> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = u64::try_from(page_size)
         .ok()
         .filter(|size| *size > 0)
         .ok_or_else(|| ObservationError::Failed(format!("page size query returned {page_size}")))?;
-    let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
-    let mut count = libc::HOST_VM_INFO64_COUNT;
-    let result = unsafe {
-        libc::host_statistics64(
-            libc::mach_host_self(),
-            libc::HOST_VM_INFO64,
-            statistics.as_mut_ptr().cast(),
-            &mut count,
-        )
-    };
-    if result != libc::KERN_SUCCESS {
-        return Err(ObservationError::Failed(format!(
-            "host_statistics64(HOST_VM_INFO64) returned {result}"
-        )));
-    }
-    // A kernel older than this libc fills its own prefix of the structure and
-    // reports that count; every field read from it is in the macOS 13 prefix.
     Ok(VmReading {
         page_size,
-        statistics: unsafe { statistics.assume_init() },
+        free: sysctl_count("vm.page_free_count")?,
+        purgeable: sysctl_count("vm.page_purgeable_count")?,
+        external: sysctl_count("vm.page_pageable_external_count")?,
+        compressed_bytes: sysctl_count("vm.compressor_bytes_used")?,
         free_target: free_target()?,
     })
 }
@@ -190,53 +211,36 @@ pub(super) fn sample() -> Result<HostStatus, ObservationError> {
     sample_of(&vm_reading()?)
 }
 
-/// The sample of one `HOST_VM_INFO64` reading.
+/// The sample of one reading of the VM's page counts.
 pub(super) fn sample_of(reading: &VmReading) -> Result<HostStatus, ObservationError> {
-    let statistics = &reading.statistics;
     // What can be taken without the OS reclaiming anything: free pages
-    // (`free_count`, which counts speculative read-ahead pages too, less
-    // `speculative_count`; vm_stat's "Pages free" is that difference
-    // already) and volatile purgeable pages (`purgeable_count`, purged at
-    // no one's cost), above the free-page target (`vm.vm_page_free_target`):
-    // macOS refills free pages up to that target by compressing, swapping
-    // and evicting other pages, so pages taken below it are never free
-    // without displacing someone (a bank that took them grew from 65 to 195
-    // slots while free pages stayed at the target, compressing a 24.7 GB
-    // program's 1.58M anonymous pages to 43k). File-backed pages
-    // (`external_page_count`) are not counted: macOS reclaims by page age
-    // across anonymous and file-backed pages alike, so taking them under
-    // pressure also compresses or swaps idle programs' anonymous pages.
-    let free_pages = u64::from(statistics.free_count)
-        .checked_sub(u64::from(statistics.speculative_count))
-        .ok_or_else(|| {
-            ObservationError::Failed("Mach speculative pages exceed free pages".into())
-        })?;
-    let allocatable = (free_pages + u64::from(statistics.purgeable_count))
+    // (`vm.page_free_count`, read-ahead pages apart, as vm_stat's "Pages
+    // free") and volatile purgeable pages, purged at no one's cost, above
+    // the free-page target (`vm.vm_page_free_target`): macOS refills free
+    // pages up to that target by compressing, swapping and evicting other
+    // pages, so pages taken below it are never free without displacing
+    // someone (a bank that took them grew from 65 to 195 slots while free
+    // pages stayed at the target, compressing a 24.7 GB program's 1.58M
+    // anonymous pages to 43k). File-backed pages are not counted: macOS
+    // reclaims by page age across anonymous and file-backed pages alike, so
+    // taking them under pressure also compresses or swaps idle programs'
+    // anonymous pages.
+    let allocatable = (reading.free + reading.purgeable)
         .saturating_sub(reading.free_target)
         .checked_mul(reading.page_size)
-        .ok_or_else(|| ObservationError::Failed("Mach allocatable overflow".into()))?;
+        .ok_or_else(|| ObservationError::Failed("macOS free pages overflow".into()))?;
     // The file-backed pages a load may count once (`Reclaim::CleanFileCache`).
-    let reclaimable = u64::from(statistics.external_page_count)
+    let reclaimable = reading
+        .external
         .checked_mul(reading.page_size)
-        .ok_or_else(|| ObservationError::Failed("Mach file-backed overflow".into()))?;
+        .ok_or_else(|| ObservationError::Failed("macOS file-backed pages overflow".into()))?;
     Ok(HostStatus {
-        allocatable: Reported::new(allocatable, ReportedBy::MachAllocatablePages),
+        allocatable: Reported::new(allocatable, ReportedBy::MacOsFreePages),
         reclaimable,
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
-        held: Some(HostHeld {
-            wired_bytes: pages_bytes(reading, statistics.wire_count, "wired")?,
-            compressed_bytes: pages_bytes(reading, statistics.compressor_page_count, "compressor")?,
-        }),
+        held: Some(HostHeld { compressed_bytes: reading.compressed_bytes }),
     })
-}
-
-/// The bytes of `pages` pages of `reading`'s size; an error naming `what`
-/// past the bytes a `u64` counts.
-fn pages_bytes(reading: &VmReading, pages: u32, what: &str) -> Result<u64, ObservationError> {
-    u64::from(pages)
-        .checked_mul(reading.page_size)
-        .ok_or_else(|| ObservationError::Failed(format!("Mach {what} bytes overflow")))
 }
 
 /// One memory node of every core: per performance level (`hw.nperflevels`,

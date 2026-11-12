@@ -126,7 +126,7 @@ fn pricing(machine: &str, backend: BackendName) -> Option<GraphPricing> {
 /// A recorded machine's reading before any load: stable fit reads no
 /// headroom (the engine's recorded setups, `tests/recorded`).
 fn unopened(topology: &DeviceTopology) -> Status {
-    let none = seismic::Reported::new(0, seismic::ReportedBy::MachAllocatablePages);
+    let none = seismic::Reported::new(0, seismic::ReportedBy::MacOsFreePages);
     Status {
         sample: seismic::Sample {
             taken: std::time::SystemTime::now(),

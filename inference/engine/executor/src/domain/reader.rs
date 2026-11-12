@@ -4,6 +4,7 @@
 //! which alone bound Seismic's ledgers. It holds the one right to bound
 //! them while it lives.
 
+use crate::memory::ledger::{Available, Blind, Changes, Sample};
 use crate::platform::{DomainReading, MemoryPolicyError, MemoryReserves};
 use seismic::{Device, Devices};
 use std::rc::Rc;
@@ -26,28 +27,30 @@ pub trait StatusReading {
         Instant::now()
     }
 
-    /// Host RAM's available memory at `at`, the ledgers' one OS input
+    /// Host RAM's available memory now, the ledgers' one OS input
     /// (`memory::ledger::DeviceLedgers::read`): the live machine's reading
-    /// ([`crate::memory::ledger::Available::host`]); a test's, its own.
-    fn available(&self, at: Instant) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
-        crate::memory::ledger::Available::host(at)
+    /// ([`Available::host`]); a test's, its own.
+    fn available(&self) -> Result<Available, Blind> {
+        Available::host()
     }
 
-    /// The periodic reading taken since the last one this returned, without
-    /// waiting for one ([`DeviceReader::refresh_published`]); none where none
-    /// was published since. By default it reads now: a test's readings are
-    /// taken where the test asks for them. The live machine's are read on a
-    /// thread of their own ([`MachineReading`]).
-    fn published(&self, device: &Device) -> Option<Published> {
-        Some(Published { status: self.status(device), at: self.now() })
+    /// One sample of `device`'s status and host RAM's available memory, at
+    /// one instant taken now on the owner's thread, which never waits
+    /// ([`Sample::try_now`]): none where a change off its thread is beside
+    /// it.
+    fn sample(&self, device: &Device, changes: &Changes) -> Option<Sample> {
+        Sample::try_now(changes, || self.now(), || self.status(device), || self.available())
     }
-}
 
-/// One periodic reading of the machine ([`StatusReading::published`]): its
-/// status and when it was read.
-pub struct Published {
-    pub status: seismic::Status,
-    pub at: Instant,
+    /// The periodic sample taken since the last one this returned, beside
+    /// `changes`, without waiting for one
+    /// ([`DeviceReader::refresh_published`]); none where none was published
+    /// since. By default it samples now: a test's readings are taken where
+    /// the test asks for them. The live machine's are sampled on a thread
+    /// of their own ([`MachineReading`]).
+    fn published(&self, device: &Device, changes: &Arc<Changes>) -> Option<Sample> {
+        self.sample(device, changes)
+    }
 }
 
 impl StatusReading for Devices {
@@ -61,7 +64,8 @@ impl StatusReading for Devices {
 /// [`crate::platform::READING_INTERVAL`], each published for
 /// the owner to take without waiting ([`StatusReading::published`]). A
 /// reading's system calls and driver queries never sit between a step and
-/// the next, however long either takes.
+/// the next, however long either takes; each sample's grants and host
+/// figures are of its one instant, which the ledgers pair it at.
 pub struct MachineReading {
     devices: Rc<Devices>,
     reader: std::cell::OnceCell<Reader>,
@@ -79,10 +83,10 @@ impl StatusReading for MachineReading {
     }
 
     /// The reader starts at the first ask, which therefore finds none yet.
-    fn published(&self, device: &Device) -> Option<Published> {
+    fn published(&self, device: &Device, changes: &Arc<Changes>) -> Option<Sample> {
         let reader = self.reader.get_or_init(|| {
             let devices = Devices::new(self.devices.inventory().clone());
-            Reader::start(devices, device.clone())
+            Reader::start(devices, device.clone(), changes.clone())
         });
         reader.shared.lock().latest.take()
     }
@@ -91,6 +95,7 @@ impl StatusReading for MachineReading {
 /// The thread [`MachineReading`] reads on, stopped and joined as it drops.
 struct Reader {
     shared: Arc<ReaderShared>,
+    changes: Arc<Changes>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -100,8 +105,8 @@ struct ReaderShared {
 }
 
 struct ReaderState {
-    /// The newest reading not yet taken: an older one untaken is replaced.
-    latest: Option<Published>,
+    /// The newest sample not yet taken: an older one untaken is replaced.
+    latest: Option<Sample>,
     stopped: bool,
 }
 
@@ -112,15 +117,20 @@ impl ReaderShared {
 }
 
 impl Reader {
-    fn start(devices: Devices, device: Device) -> Self {
+    fn start(devices: Devices, device: Device, changes: Arc<Changes>) -> Self {
         let shared = Arc::new(ReaderShared { state: Mutex::new(ReaderState { latest: None, stopped: false }), stop: Condvar::new() });
-        let reading = shared.clone();
+        let (reading, sampled) = (shared.clone(), changes.clone());
         let thread = std::thread::Builder::new()
             .name("magnitude-memory".into())
             .spawn(move || loop {
-                let status = devices.device_status(&device);
+                // Its invariant violated, no reading stands again: the
+                // process ends rather than serve blind.
+                let take = || Sample::take(&sampled, Instant::now, || devices.device_status(&device), Available::host, || reading.lock().stopped);
+                let Some(sample) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(take)).unwrap_or_else(|_| std::process::abort()) else {
+                    return;
+                };
                 let mut state = reading.lock();
-                state.latest = Some(Published { status, at: Instant::now() });
+                state.latest = Some(sample);
                 let (state, _) = reading
                     .stop
                     .wait_timeout_while(state, crate::platform::READING_INTERVAL, |state| !state.stopped)
@@ -130,7 +140,7 @@ impl Reader {
                 }
             })
             .expect("invariant violated: the memory reading thread could not start");
-        Self { shared, thread: Some(thread) }
+        Self { shared, changes, thread: Some(thread) }
     }
 }
 
@@ -138,6 +148,8 @@ impl Drop for Reader {
     fn drop(&mut self) {
         self.shared.lock().stopped = true;
         self.shared.stop.notify_all();
+        // A sample waiting on a change learns it is stopped at once.
+        self.changes.wake();
         if let Some(thread) = self.thread.take() {
             thread.join().expect("the memory reading thread does not panic");
         }
@@ -220,24 +232,29 @@ impl DeviceReader {
         self.observe(&status)
     }
 
-    /// [`Self::refresh`] from the periodic reading published since the last
-    /// ([`StatusReading::published`]), with the status and the time it was
-    /// read, which the device's ledgers read too
-    /// (`memory::ledger::DeviceLedgers::read`); none, refreshing nothing,
-    /// where none was published since.
-    pub fn refresh_published(&mut self) -> Option<(Result<Vec<DomainReading>, MemoryPolicyError>, seismic::Status, Instant)> {
-        let Published { status, at } = self.reading.published(&self.device)?;
-        Some((self.observe(&status), status, at))
+    /// [`Self::refresh`] from the periodic sample published since the last
+    /// ([`StatusReading::published`]), with the sample, which the device's
+    /// ledgers read too (`memory::ledger::DeviceLedgers::read`); none,
+    /// refreshing nothing, where none was published since.
+    pub fn refresh_published(&mut self, changes: &Arc<Changes>) -> Option<(Result<Vec<DomainReading>, MemoryPolicyError>, Sample)> {
+        let sample = self.reading.published(&self.device, changes)?;
+        Some((self.observe(sample.status()), sample))
     }
 
-    /// Read `ledgers` from a sample read now ([`Self::read_ledgers`]).
+    /// Read `ledgers` from a sample taken now on the owner's thread, which
+    /// never waits ([`StatusReading::sample`]): none standing beside a
+    /// change off its thread, they keep their last reading, still bound by
+    /// it, and the periodic reader's next sample stands
+    /// ([`Sample::take`]).
     pub fn read_ledgers_now(&self, ledgers: &crate::memory::ledger::DeviceLedgers) {
-        let at = self.reading.now();
-        self.read_ledgers(ledgers, &self.reading.status(&self.device), at);
+        match self.reading.sample(&self.device, ledgers.changes()) {
+            Some(sample) => self.read_ledgers(ledgers, &sample),
+            None => self.bind_ledgers(ledgers),
+        }
     }
 
-    /// Read `ledgers` from `status`, sampled at `at`, with host RAM's
-    /// available memory then, and bound Seismic's ledger of each store they
+    /// Read `ledgers` from `sample`, the device's status and host RAM's
+    /// available memory at one instant, and bound Seismic's ledger of each store they
     /// keep to what it claims now and what the ledger lets the process
     /// allocate beside it (`memory::ledger::Snapshot::allocatable`): the
     /// room its claims hold for allocations not yet made and the room it
@@ -245,8 +262,8 @@ impl DeviceReader {
     /// yet; none where the reading failed. The ledger is the one authority
     /// on room, so Seismic refuses no allocation it admits, nor takes one it
     /// refuses, and a claim that took cache allocates it as it is freed.
-    pub fn read_ledgers(&self, ledgers: &crate::memory::ledger::DeviceLedgers, status: &seismic::Status, at: Instant) {
-        ledgers.read(&self.device, status, self.reading.available(at), at);
+    pub fn read_ledgers(&self, ledgers: &crate::memory::ledger::DeviceLedgers, sample: &Sample) {
+        ledgers.read(&self.device, sample);
         self.bind_ledgers(ledgers);
     }
 
@@ -333,8 +350,8 @@ mod tests {
             status
         }
 
-        fn available(&self, at: Instant) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
-            Ok(crate::memory::ledger::Available::new(1 << 40, self.room, None, at)
+        fn available(&self) -> Result<Available, Blind> {
+            Ok(Available::new(1 << 40, self.room, None)
                 .expect("the room is within the total")
                 .with_reclaimable(self.reclaimable))
         }
@@ -394,7 +411,7 @@ mod tests {
             .expect("the ledger admits it");
         reader.read_ledgers_now(&ledgers);
         let _tensor = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]).expect("Seismic allocates what the claim holds");
-        held.allocated();
+        held.made();
     }
 
     /// A claim's room is Seismic's to allocate the moment it is charged, with
@@ -423,7 +440,7 @@ mod tests {
             .claim(&device, crate::memory::ledger::CommittedKind::Load, crate::memory::ClaimDemand { device: bytes, ..Default::default() })
             .expect("a load counts the clean file cache");
         let _tensor = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]).expect("Seismic allocates what the claim took");
-        held.allocated();
+        held.made();
     }
 
     /// A state growth reaches Seismic through the slab path with no reading
@@ -464,7 +481,7 @@ mod tests {
             .claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() })
             .expect("the weights are admitted");
         let _weights = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]).expect("Seismic allocates the import");
-        import.allocated();
+        import.made();
 
         let ledger = ledgers.device();
         let mut rows = ledger.claim(Need::StateRows { sequence: crate::RequestId(1), from: 0, to: 0 }).expect("an empty state claim");
@@ -473,7 +490,7 @@ mod tests {
         let growth = page + rounding;
         slabs.reserve(ledger, growth, std::iter::once(&rows)).expect("the rounding past the rows fits the free room");
         let _slab = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[growth]).expect("Seismic allocates the reserved slab");
-        slabs.settle(ledger, growth, std::iter::once(&mut rows));
+        ledger.change(|changing| slabs.settle(ledger, growth, std::iter::once(&mut rows), changing));
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.committed() + snapshot.cache(), snapshot.allocated(), "the charge equals the allocations once the slab exists");
     }
@@ -509,8 +526,8 @@ mod tests {
                 status
             }
 
-            fn available(&self, at: Instant) -> Result<crate::memory::ledger::Available, crate::memory::ledger::Blind> {
-                Ok(crate::memory::ledger::Available::new(1 << 40, self.room.get(), None, at)
+            fn available(&self) -> Result<Available, Blind> {
+                Ok(Available::new(1 << 40, self.room.get(), None)
                     .expect("the room is within the total")
                     .with_reclaimable(self.reclaimable))
             }
@@ -550,15 +567,18 @@ mod tests {
             .claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() })
             .expect("the weights, past the growth view, take the file cache");
         let _weights = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]).expect("Seismic allocates the import");
-        import.allocated();
+        import.made();
 
         // The first request draws its rows from the floor: nothing more held,
         // and the page it allocates is admitted.
         let ledger = ledgers.device();
         let mut state = ledger.claim(Need::StateRows { sequence: crate::RequestId(1), from: 0, to: 0 }).expect("an empty state claim");
         state.grow(first_page).expect("the first page draws from the floor");
-        let _page = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[page]).expect("Seismic allocates the first page");
-        state.allocated(page);
+        let _page = ledger.change(|changing| {
+            let made = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[page]).expect("Seismic allocates the first page");
+            state.allocated(page, changing);
+            made
+        });
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.committed(), snapshot.allocated(), "the charge equals the allocations: the floor is held once");
         assert_eq!(snapshot.committed(), weights + page);
@@ -577,8 +597,11 @@ mod tests {
         reader.read_ledgers_now(&ledgers);
         let (mut group, units) = ledger.claim_units(CommittedKind::GroupClass, unit, 1);
         assert_eq!(units, 1, "the room that came back holds the staging");
-        let _staging = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[staging]).expect("Seismic allocates the staging its claim admitted");
-        group.allocated(staging);
+        let _staging = ledger.change(|changing| {
+            let made = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[staging]).expect("Seismic allocates the staging its claim admitted");
+            group.allocated(staging, changing);
+            made
+        });
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.committed(), snapshot.allocated(), "the charge equals the allocations with the group's staging");
         drop(state_floor);
