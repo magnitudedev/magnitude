@@ -779,7 +779,7 @@ def _jobs(plan: Plan) -> None:
         side = work.sides[0]
         settings = [
             argument
-            for name, value in vars(replace(GATE, temperatures=run.remote.temperatures)).items()
+            for name, value in vars(replace(GATE, temperatures=plan.remote.temperatures)).items()
             for argument in (f"--{name.replace('_', '-')}", str(value))
         ]
         argv, env = plan.host_module(side, "gate", "--log", plan.remote.path("runs", plan.run_id, "thermal-gate.jsonl"), *settings)

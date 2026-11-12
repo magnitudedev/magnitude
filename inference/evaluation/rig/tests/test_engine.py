@@ -111,6 +111,20 @@ def test_a_run_reads_what_its_caller_staged_and_never_waits_on_it(rig):
     assert not list(outcome.results.glob("stage-*"))
 
 
+def test_a_timed_run_gates_with_its_hosts_temperature_setting(rig):
+    """A timed run plans the thermal gate before its jobs, passing whether its host has
+    temperature sensors."""
+    hosts, source, _ = rig
+    run = request(source, jobs=[("job", engine.Step("job", (PY, "-c", "pass")))], device="timed", host="alpha")
+    work = run.work("alpha")
+    candidate = engine.Candidate(connect(hosts.host("alpha")), {}, work,
+                                 {engine.build_key(work, side): 0 for side in work.sides}, 0.0, (60.0,))
+    ops = engine.plan_for(run, candidate, "planned").ops
+    (gate,) = [op for op in ops if op["op"] == "run" and "gate" in op["argv"]]
+    argv = list(gate["argv"])
+    assert argv[argv.index("--temperatures") + 1] == str(candidate.remote.temperatures)
+
+
 def test_a_side_releases_its_checkout_as_its_build_ends_unless_a_job_of_it_reads_the_checkout(rig):
     """A released side's jobs run from its output, without cargo's target or the recording
     wrapper, and naming its checkout is a planning error; a job that reads the checkout keeps it."""
