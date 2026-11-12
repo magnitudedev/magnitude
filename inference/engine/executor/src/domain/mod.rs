@@ -787,7 +787,8 @@ pub struct ExpertMeasures {
     /// holds and the GPU's its kernels' costs price
     /// (`assessment::ExpertLines::priced`): the decode is priced along them,
     /// and the route's policy words are written from them. Until measured,
-    /// every miss is served on the GPU's path, and nothing grows.
+    /// every miss is served on the GPU's path, and the experts' slots target
+    /// their ceiling (`ElasticBank::targets`).
     pub lines: crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>,
     /// The model store's read line the decode's file misses take, the
     /// measurement job's (`assessment::StreamedFigures`), which also prices

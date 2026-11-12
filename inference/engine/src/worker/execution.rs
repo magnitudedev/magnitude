@@ -256,17 +256,20 @@ mod tests {
 
     /// A live load priced on its executor's costs, which every load waits
     /// for, before the job stored the read line its streamed decode is
-    /// priced along, grows nothing, however long memory stays free; once
-    /// the measurement job stores it and the host asks it to reprice, the
-    /// execution owner prices the bank again from what is stored, and the
-    /// bank grows. On Metal, which every macOS host has: a device that does
+    /// priced along: its bank is cache, and grows into free memory to its
+    /// ceiling before its decode is priced (`ElasticBank::targets`). Once
+    /// the measurement job stores the read line and the host asks it to
+    /// reprice, the execution owner prices the load again from what is
+    /// stored, and the bank shrinks to where its decode's misses stop
+    /// falling. On Metal, which every macOS host has: a device that does
     /// not open fails the test.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "the required figures alone give the costs where the bank moves natively (Metal)")]
-    fn a_live_load_reprices_on_newly_stored_figures_and_grows() {
+    fn a_live_load_grows_its_bank_unpriced_and_reprices_on_newly_stored_figures() {
         let backend = seismic::BackendName::Metal;
         let (mut domain, bindings) = fixtures::banked(backend, 4, 2);
-        let decode = fixtures::misses_at(3, 100);
+        // Every step's reads lie 2 deep: a bank of 3 of the 4 rows hits them.
+        let decode = fixtures::misses_at(2, 100);
         fixtures::count_decode(&mut domain, decode);
         // The pricing: the streamed fixture model planned on this device,
         // its bank and resident plan, its costs kept in a cache that holds
@@ -285,17 +288,19 @@ mod tests {
         // Priced as the load is once its warm-up ends: the costs, no read line.
         owner.measure_load(load_measures(&pricing).unwrap());
         let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), pricing);
-        // Memory stays free well past the growth's recovery wait: a bank
-        // whose decode is unpriced grows nothing.
+        // Memory stays free well past the growth's recovery wait: the bank
+        // grows to its 4 rows, its decode unpriced.
         let now = observe(&mut execution, 0, 100);
-        assert_eq!(slots(&mut execution), (2, None), "an unpriced bank grows nothing");
+        let (grown, resize) = slots(&mut execution);
+        assert_eq!(grown, 4, "the unpriced bank grew to its ceiling");
+        assert!(matches!(resize, Some(BankResize::Grew { from: 2, .. })), "{resize:?}");
         // The measurement job stores the store's read line.
         store_read_line(&device, cache.path());
         assert!(matches!(execution.command(WorkerCommand::Reprice, now), Ok(WorkerReply::Acknowledged)));
         observe(&mut execution, now, 100);
-        let (grown, resize) = slots(&mut execution);
-        assert!(grown > 2, "the repriced bank grew: {grown} slots");
-        assert!(matches!(resize, Some(BankResize::Grew { .. })), "{resize:?}");
+        let (repriced, resize) = slots(&mut execution);
+        assert_eq!(repriced, 3, "the repriced bank shrank to where its misses stop falling");
+        assert!(matches!(resize, Some(BankResize::Shrank { to: 3, .. })), "{resize:?}");
     }
 
     /// A load without a bank chains its prompt as a base load does, priced

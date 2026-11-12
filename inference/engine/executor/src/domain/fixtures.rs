@@ -538,42 +538,30 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
     (domain, bindings)
 }
 
-/// A decode the fake bank counted ([`FakeBank::decode`]), and where its
-/// misses stop falling.
-#[derive(Clone, Debug)]
-pub struct FakeDecode {
-    pub live: crate::assessment::LiveDecode,
-    pub saturation: u64,
-}
-
 /// A decode of `steps` steps at the fake bank's one streamed layer of 4
 /// experts, each step reading all 4 of them, all `depth` deep in the
 /// bank's stack: a bank of `depth` slots misses them, one of `depth + 1`
 /// none, beside the generic model counted as one step. Reads take 0.4 ms and 0.5 ms a MB ([`READ`]); an
 /// all-hit step 15 ms.
-pub fn misses_at(depth: usize, steps: u64) -> FakeDecode {
+pub fn misses_at(depth: usize, steps: u64) -> crate::assessment::LiveDecode {
     misses_by(steps, &[(depth, 4)])
 }
 
 /// [`misses_at`] with each step's reads spread over the stack: `reads` of
 /// each `(depth, reads)`, which a bank of `depth` slots misses and one of
 /// `depth + 1` hits. The misses stop falling past the deepest.
-pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> FakeDecode {
+pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> crate::assessment::LiveDecode {
     let mut misses = [0; 5];
     let mut requests = [0; 5];
     for &(depth, count) in reads {
         misses[depth] = steps * count;
         requests[depth] = steps;
     }
-    let depth = reads.iter().map(|&(depth, _)| depth).max().expect("a decode reads");
-    FakeDecode {
-        live: crate::assessment::LiveDecode {
-            layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
-            steps,
-            rows: 1.,
-            depth: 100,
-        },
-        saturation: depth as u64 + 1,
+    crate::assessment::LiveDecode {
+        layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
+        steps,
+        rows: 1.,
+        depth: 100,
     }
 }
 
@@ -608,7 +596,7 @@ pub fn shrink_settled<F: ProgramFamily>(
 /// The growth rule's inputs: the decode the fake bank counted, the
 /// fixtures' read line, and the resident step it is priced on: 15 ms at every depth, its all-hit
 /// steps' time.
-pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: FakeDecode) {
+pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: crate::assessment::LiveDecode) {
     count_decode(domain, decode);
     measure_load(domain, bindings);
 }
@@ -685,7 +673,7 @@ pub fn bank_row(domain: &ExecutorDomain<TestFamily>) -> u64 {
 
 /// The fake bank of `domain` counted `decode`, which its growth is priced
 /// on.
-pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: FakeDecode) {
+pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: crate::assessment::LiveDecode) {
     domain.family.bank.as_mut().expect("a banked fixture").decode = Some(decode);
 }
 
@@ -901,7 +889,7 @@ pub struct TestFamily {
 pub struct FakeBank {
     pub(crate) tensor: seismic::Tensor,
     resize: std::sync::Mutex<Option<FakeResize>>,
-    pub(crate) decode: Option<FakeDecode>,
+    pub(crate) decode: Option<crate::assessment::LiveDecode>,
     steps: std::sync::atomic::AtomicUsize,
     /// A host tier's slots and the most it holds (none without a tier),
     /// each a byte of upload storage, and its growth's outcome until an
@@ -1135,14 +1123,14 @@ impl ElasticBank for FakeBank {
     }
 
     /// Its slots, a row of its tensor each, from one to where its decode's
-    /// misses stop falling (every row before it counted one), and its host
-    /// tier's, a byte of upload storage each, to its ceiling: derived from
-    /// the domain's ledgers as the served bank's are.
-    fn targets(&self, _price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
+    /// misses stop falling on `price` (every row before the load is
+    /// priced), and its host tier's, a byte of upload storage each, to its
+    /// ceiling: derived from the domain's ledgers as the served bank's are.
+    fn targets(&self, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<crate::experts::derived::HoldingTarget<'_>>, DomainError> {
         use crate::experts::derived::{BankShape, HoldingTarget};
         let rows = self.tensor.extents()[0];
         let unit = (self.tensor.byte_len() / rows).max(1);
-        let bound = self.decode.as_ref().map_or(rows, |decode| rows.min(decode.saturation));
+        let bound = price.and_then(crate::assessment::DecodePrice::saturation).unwrap_or(rows);
         let mut targets = vec![HoldingTarget {
             holding: crate::BankHolding::Experts,
             tier: crate::planning::BankTier::Bank,
@@ -1172,7 +1160,7 @@ impl ElasticBank for FakeBank {
     }
 
     fn live(&self) -> Option<crate::assessment::LiveDecode> {
-        self.decode.as_ref().map(|decode| decode.live.clone())
+        self.decode.clone()
     }
 
     /// Its one streamed layer of 4 experts, each step routing 4, on the

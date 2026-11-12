@@ -398,13 +398,13 @@ fn a_banks_counts_are_its_plans_derivations_at_every_count() {
 #[test]
 fn a_tiered_records_host_held_misses_are_priced_as_served() {
     use crate::assessment::{DecodePrice, ExpertLines, FormSeconds, HeldSlots, StreamedLayers};
-    let decode = crate::domain::fixtures::misses_at(3, 100);
-    let host = decode.saturation as usize;
-    assert_eq!(host, 4, "the misses stop falling at the decode's 4 slots");
-    let held = HeldSlots { slots: 1, host };
     let lines = ExpertLines::reference(1_000_000);
     let layers = StreamedLayers::new(vec![4], 4, std::sync::Arc::from([lines]));
-    let price = DecodePrice::new(layers, decode.live, crate::domain::fixtures::READ, FormSeconds { resident: 0.015, streamed: 0.015 });
+    let decode = crate::domain::fixtures::misses_at(3, 100);
+    let price = DecodePrice::new(layers, decode, crate::domain::fixtures::READ, FormSeconds { resident: 0.015, streamed: 0.015 });
+    let host = price.saturation().expect("the decode found its reads") as usize;
+    assert_eq!(host, 4, "the misses stop falling at the decode's 4 slots");
+    let held = HeldSlots { slots: 1, host };
     let step = |held| price.step(held);
     let (bank_alone, tiered) = (step(HeldSlots::bank(1)), step(held));
     assert!(tiered.total_seconds < bank_alone.total_seconds, "{tiered:?} against {bank_alone:?}");
