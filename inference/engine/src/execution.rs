@@ -884,10 +884,8 @@ fn build_held(
     // A linked host tier backs to its load-time slots from the bank's open
     // (`ExpertBank::back_host`): its claim is kept apart and handed to the
     // bank, allocated as each slot backs, never before it exists.
-    let tier = execution_plan.load().host_tier_bytes().map_err(internal)?;
-    if tier > 0 {
-        let store = startup.ledgers.of(magnitude_executor::BankTier::Host).store();
-        residency.back_host_tier(weights.split_backing(&store, tier));
+    if let Some(backing) = startup.ledgers.host_backing(&mut weights, execution_plan.load()).map_err(internal)? {
+        residency.back_host_tier(backing);
     }
     if let Some(cache) = &manifest.kernel_cache {
         residency.keep_table_rows(cache.join("table-rows"));

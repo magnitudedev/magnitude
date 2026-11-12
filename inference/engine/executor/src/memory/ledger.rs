@@ -986,6 +986,20 @@ impl DeviceLedgers {
             BankTier::Host => &self.host,
         }
     }
+
+    /// The claim `load`'s host tier backs its load-time slots in, split from
+    /// the load's `weights` ([`Held::split_backing`]): exactly where `load`
+    /// holds host slots, as its bank opens with them (`BankCache::opened`),
+    /// of the tier's bytes above its floor
+    /// ([`crate::planning::ModelLoadPlan::host_tier_bytes`]). Those may be
+    /// none: a tier is charged at least its landing reserve, in whole
+    /// granules, so its first slots may cost nothing more.
+    pub fn host_backing(&self, weights: &mut Held, load: &crate::planning::ModelLoadPlan) -> Result<Option<Claim>, String> {
+        if load.expert_bank().is_none_or(|bank| bank.host_slots == 0) {
+            return Ok(None);
+        }
+        Ok(Some(weights.split_backing(&self.host, load.host_tier_bytes()?)))
+    }
 }
 
 /// The committed claims of one allocation across the stores a device
@@ -1029,19 +1043,24 @@ impl Held {
         self.claims.iter().filter(|claim| claim.ledger.store.identity == *store).map(Claim::bytes).sum()
     }
 
-    /// Split off `bytes` claimed in `store`, before any is allocated, as a
-    /// [`CommittedKind::Backing`] claim: memory the allocation backs after
-    /// the rest is made (a host tier backed to its load-time slots, which
-    /// its bank allocates as each slot backs).
+    /// Split off `bytes` claimed in `ledger`'s store, before any is
+    /// allocated, as a [`CommittedKind::Backing`] claim: memory the
+    /// allocation backs after the rest is made (a host tier backed to its
+    /// load-time slots, which its bank allocates as each slot backs). An
+    /// allocation claiming nothing there claims no bytes there, and splits
+    /// off a backing of none.
     ///
     /// # Panics
     /// Where it claimed fewer unallocated bytes there.
-    pub fn split_backing(&mut self, store: &seismic::StoreIdentity, bytes: u64) -> Claim {
-        self.claims
-            .iter_mut()
-            .find(|claim| claim.ledger.store.identity == *store)
-            .unwrap_or_else(|| panic!("invariant violated: a backing split from an allocation claiming nothing in {store:?}"))
-            .split_backing(bytes)
+    pub fn split_backing(&mut self, ledger: &Ledger, bytes: u64) -> Claim {
+        match self.claims.iter_mut().find(|claim| Arc::ptr_eq(&claim.ledger.store, &ledger.store)) {
+            Some(claim) => claim.split_backing(bytes),
+            None => {
+                assert_eq!(bytes, 0, "invariant violated: a backing split from an allocation claiming nothing in {:?}", ledger.store.identity);
+                let id = ledger.state().insert(Holding::Committed(CommittedKind::Backing), 0);
+                Claim { ledger: ledger.clone(), id, kind: CommittedKind::Backing }
+            }
+        }
     }
 }
 

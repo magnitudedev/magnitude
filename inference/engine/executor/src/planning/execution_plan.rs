@@ -2569,13 +2569,9 @@ mod tests {
         }
     }
 
-    /// A weight cap bounds every weight byte the load holds, its host tier's
-    /// among them: Gemma 26B q4 on the recorded RTX 3090 with 64 GB of host
-    /// RAM free, capped at its weights less half its experts, holds within
-    /// the cap, its host tier ended by what the cap leaves beside the bank,
-    /// not by the host's room.
-    #[test]
-    fn a_weight_cap_bounds_the_host_tier_beside_the_bank() {
+    /// Gemma 26B q4 on the recorded RTX 3090 with 64 GB of host RAM free,
+    /// capped at its weights less half its experts, and the cap.
+    fn capped_gemma() -> (ExecutionPlanDraft, u64) {
         use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
         let (_, _, _, device) = rtx3090(64 << 30);
         let definition = gemma_moe_fixture_definition();
@@ -2595,7 +2591,16 @@ mod tests {
         let whole = plan(None);
         let bank = whole.load().expert_bank().expect("a routed load banks its experts");
         let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-        let capped = plan(Some(WeightBound::Cap(cap)));
+        (plan(Some(WeightBound::Cap(cap))), cap)
+    }
+
+    /// A weight cap bounds every weight byte the load holds, its host tier's
+    /// among them: Gemma 26B q4 capped at its weights less half its experts
+    /// ([`capped_gemma`]) holds within the cap, its host tier ended by what
+    /// the cap leaves beside the bank, not by the host's room.
+    #[test]
+    fn a_weight_cap_bounds_the_host_tier_beside_the_bank() {
+        let (capped, cap) = capped_gemma();
         let held = capped.load().expert_bank().unwrap();
         assert!(!held.whole() && held.host_ceiling().is_some(), "half the experts stream through a host tier");
         let bytes = capped.load().weight_bytes().unwrap();
@@ -2603,6 +2608,26 @@ mod tests {
         // The cap, not the host's room, ends the tier.
         let ceiling = held.host_ceiling().unwrap();
         assert!(ceiling < held.widest().get() && held.host_slots <= ceiling, "{} host slots under a ceiling of {ceiling}", held.host_slots);
+    }
+
+    /// A host tier's first slots cost nothing beyond its floor (it is charged
+    /// at least its landing reserve): the load still claims their backing,
+    /// of no bytes, which the bank opens holding as its host slots require,
+    /// even from weights that claim nothing in host RAM.
+    #[test]
+    fn a_host_tier_of_free_slots_claims_its_backing() {
+        use crate::memory::ledger::{CommittedKind, DeviceLedgers, Ledgers, LoadShape};
+        let mut load = capped_gemma().0.load().clone();
+        load.bank.as_mut().expect("a routed load banks its experts").host_slots = 1;
+        assert_eq!(load.host_tier_bytes().unwrap(), 0, "the tier's first slot costs nothing beyond its floor");
+        let scope = Ledgers::new();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).expect("the CPU backend opens");
+        let ledgers = DeviceLedgers::open_in(&scope, &device, std::sync::Arc::new(LoadShape { stores: Vec::new() }));
+        let mut weights = ledgers.claim(&device, CommittedKind::Load, crate::memory::ClaimDemand::default()).expect("nothing to claim");
+        // The claim `BankCache::opened` requires of a bank with host slots.
+        let backing = ledgers.host_backing(&mut weights, &load).unwrap();
+        assert_eq!(backing.as_ref().map(crate::memory::ledger::Claim::bytes), Some(0), "a tier of host slots is claimed at no bytes");
     }
 
     /// A device room bounds only what the device holds: Gemma 26B q4 on the
