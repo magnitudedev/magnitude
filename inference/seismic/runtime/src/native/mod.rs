@@ -32,6 +32,8 @@ pub(crate) fn engine_kernels() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod bundle_identity_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod cpu;
 mod cuda;
 pub mod dimension;

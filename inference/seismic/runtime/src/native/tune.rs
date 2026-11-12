@@ -2509,6 +2509,16 @@ impl plan::Domain for Declared<'_> {
         plan::TuningPartition::nearest(self.implementation, base, parameters, values)
     }
 
+    fn admissible(
+        &self,
+        base: &NativeSpecialization,
+        parameters: &[plan::ParameterAddress],
+        after: Option<&[u64]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u64>>, plan::PlanError> {
+        plan::TuningPartition::admissible(self.implementation, base, parameters, after, limit)
+    }
+
     fn forecast(
         &self,
         _point: usize,
@@ -5544,7 +5554,7 @@ impl Unit {
 }
 
 /// The entry-wide parameters of `implementation`, as recorded.
-fn entry_parameters(implementation: &NativeImplementation) -> Vec<DeclaredParameter> {
+pub(crate) fn entry_parameters(implementation: &NativeImplementation) -> Vec<DeclaredParameter> {
     implementation
         .params
         .iter()
@@ -6006,11 +6016,11 @@ struct Sweep {
     /// assignment, the seed's own among equals, so an unobserved group
     /// keeps it.
     best: (Vec<u64>, f64),
-    /// What the leaders' neighbourhoods do not reach, asked for once they
-    /// are measured ([`Rest`]), and whether all of it was asked for: the
-    /// group's declared assignments are then all measured, passed over as
-    /// inadmissible or inert, or awaiting measurement.
-    rest: Rest,
+    /// What the leaders' neighbourhoods do not reach, walked from what the
+    /// domain admits as it is asked for ([`RestWalk`]) from the seed, and
+    /// whether all of it was asked for: the group's admissible assignments
+    /// are then all measured, passed over as inert, or awaiting measurement.
+    rest: RestWalk,
     exhausted: bool,
     /// What awaits measurement was asked for from the rest, not by a
     /// leader's round.
@@ -6018,125 +6028,115 @@ struct Sweep {
 }
 
 /// The order in which a search asks for what its leaders' neighbourhoods
-/// did not reach: the one place that order is decided. Given where a sweep
-/// (or the boundaries) started, it yields every other assignment of the
-/// declared value lists, each once, and nothing else of the search reads
-/// how: a policy that orders them otherwise replaces this and
-/// [`Rest::next`] alone.
+/// did not reach: the one place that order is decided, walked lazily and
+/// never listed whole, since a group's admissible assignments can number
+/// the product of its parameters' values (16 values of each of 12
+/// parameters is 2.8e14). From where a sweep started, it yields every
+/// other admissible assignment once, and nothing else of the search reads
+/// how: a policy that orders them otherwise replaces this alone.
 ///
-/// The order here is the declared one nearest the start first: the
-/// assignments that change one coordinate, then two, and so on, each
-/// number's in the declaration's order of coordinates and values. Nothing
-/// is produced before it is asked for: the walk holds one position, and
-/// stepping it costs the number of coordinates. An assignment the domain
-/// does not admit is passed over by whoever asks ([`plan::Domain::place`]),
-/// so reaching the next admissible one costs one such check for each
-/// declared assignment between them, and a walk to the end costs the
-/// declared product of them, once.
-struct Rest {
-    start: Vec<u64>,
-    /// Each coordinate's other values, in declaration order.
-    others: Vec<Vec<u64>>,
-    /// The coordinates changed, ascending, and which other value each has.
-    changed: Vec<usize>,
-    choice: Vec<usize>,
-    ended: bool,
+/// The order is the declared one nearest the start first: the assignments
+/// that change one coordinate, then two, and so on; within a number, the
+/// sets of changed coordinates in lexicographic order ([`plan::Subsets`],
+/// the order [`plan::TuningPartition::nearest`] looks in); within a set, by
+/// the position of each changed coordinate's value in its declared values,
+/// the coordinates in order. Each set is asked of the domain alone, every
+/// other coordinate held at the start and every coordinate of the set
+/// changed from it ([`plan::Domain::admissible`]), a batch at a time
+/// resuming after the last assignment yielded: the domain's walk yields
+/// exactly this order, so nothing is sorted. The work of a batch is the
+/// declared assignments between the resume point and the batch's last item
+/// that no prefix of the declaration's `where` excludes, so it follows what
+/// the `where` leaves open: a `where` that decides no prefix (`A + B + C +
+/// D == 4`) walks them all to yield one item or none, and a walk to
+/// exhaustion reads at most the group's declared product, as listing it
+/// whole did. A set the domain admits nothing of costs the walk of what is
+/// undecided in it, there are at most 2^movable sets, and which are empty
+/// is known only by asking. A V4.1 attention_decode declaration names
+/// 129,024 assignments of which 28 are admissible.
+struct RestWalk {
+    /// The coordinates the start has other declared values of.
+    movable: Vec<usize>,
+    /// The sets of places in `movable` changed, nearest first, as nearest
+    /// configurations are looked for ([`plan::Subsets`]).
+    sets: plan::Subsets,
+    /// The coordinates the set being walked changes.
+    changing: Vec<usize>,
+    /// The values of the set's coordinates in the last assignment the
+    /// domain gave of it: where its next batch resumes; none before its
+    /// first.
+    last: Option<Vec<u64>>,
+    /// The domain has given every assignment of the set, or no set is
+    /// begun.
+    done: bool,
+    /// The set's assignments the domain gave and the walk has not yet
+    /// yielded, in order.
+    queue: std::collections::VecDeque<Vec<u64>>,
 }
 
-impl Rest {
-    fn new(values: &[Vec<u64>], start: Vec<u64>) -> Self {
-        let others = values
-            .iter()
-            .zip(&start)
-            .map(|(values, at)| {
-                values
-                    .iter()
-                    .copied()
-                    .filter(|value| value != at)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut rest = Self {
-            start,
-            others,
-            changed: Vec::new(),
-            choice: Vec::new(),
-            ended: false,
+impl RestWalk {
+    fn new(values: &[Vec<u64>], start: &[u64]) -> Self {
+        let movable = (0..start.len())
+            .filter(|&coordinate| values[coordinate].iter().any(|value| *value != start[coordinate]))
+            .collect::<Vec<_>>();
+        Self {
+            sets: plan::Subsets::nearest_first(movable.len()),
+            movable,
+            changing: Vec::new(),
+            last: None,
+            done: true,
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Begin the next set of changed coordinates; false after the last.
+    fn advance(&mut self) -> bool {
+        let Some(places) = self.sets.next() else {
+            return false;
         };
-        rest.widen();
-        rest
+        self.changing = places.into_iter().map(|place| self.movable[place]).collect();
+        self.last = None;
+        self.done = false;
+        true
     }
 
-    /// Whether every changed coordinate has another value to take.
-    fn stands(&self) -> bool {
-        self.changed
-            .iter()
-            .all(|coordinate| !self.others[*coordinate].is_empty())
-    }
-
-    /// Move to the first set of one more changed coordinates that stands;
-    /// the walk ends when there is none.
-    fn widen(&mut self) {
-        let count = self.changed.len() + 1;
-        self.changed = (0..count).collect();
-        self.choice = vec![0; count];
-        if count > self.others.len() {
-            self.ended = true;
-        } else if !self.stands() {
-            self.shift();
-        }
-    }
-
-    /// Move to the next set of as many changed coordinates that stands,
-    /// widening past the last.
-    fn shift(&mut self) {
-        let (count, coordinates) = (self.changed.len(), self.others.len());
+    /// The next admissible assignment of the rest: `at_start` is the base
+    /// with the group at `start`, `domain` what admits, and `batch` how
+    /// many assignments to ask the domain for at once (at least one).
+    fn next(
+        &mut self,
+        domain: &dyn plan::Domain,
+        group: &plan::Group,
+        at_start: &NativeSpecialization,
+        start: &[u64],
+        batch: usize,
+    ) -> Result<Option<Vec<u64>>, plan::PlanError> {
+        assert!(batch > 0, "the rest is asked for a batch at a time");
         loop {
-            // The last position that can still move right.
-            let Some(position) = (0..count)
-                .rev()
-                .find(|position| self.changed[*position] < coordinates - (count - position))
-            else {
-                return self.widen();
-            };
-            let next = self.changed[position] + 1;
-            for (offset, slot) in self.changed[position..].iter_mut().enumerate() {
-                *slot = next + offset;
+            if let Some(assignment) = self.queue.pop_front() {
+                return Ok(Some(assignment));
             }
-            self.choice = vec![0; count];
-            if self.stands() {
-                return;
+            if self.done && !self.advance() {
+                return Ok(None);
             }
-        }
-    }
-}
-
-impl Iterator for Rest {
-    type Item = Vec<u64>;
-
-    fn next(&mut self) -> Option<Vec<u64>> {
-        if self.ended {
-            return None;
-        }
-        let mut assignment = self.start.clone();
-        for (coordinate, choice) in self.changed.iter().zip(&self.choice) {
-            assignment[*coordinate] = self.others[*coordinate][*choice];
-        }
-        // The next choice of values for these coordinates, the last
-        // coordinate's fastest; past the last, the next coordinates.
-        let advanced = (0..self.choice.len()).rev().find(|position| {
-            self.choice[*position] + 1 < self.others[self.changed[*position]].len()
-        });
-        match advanced {
-            Some(position) => {
-                self.choice[position] += 1;
-                for later in &mut self.choice[position + 1..] {
-                    *later = 0;
+            let parameters = self
+                .changing
+                .iter()
+                .map(|&coordinate| group.parameters[coordinate].clone())
+                .collect::<Vec<_>>();
+            let given = domain.admissible(at_start, &parameters, self.last.as_deref(), batch)?;
+            self.done = given.len() < batch;
+            if let Some(last) = given.last() {
+                self.last = Some(last.clone());
+            }
+            for values in given {
+                let mut assignment = start.to_vec();
+                for (&coordinate, value) in self.changing.iter().zip(values) {
+                    assignment[coordinate] = value;
                 }
+                self.queue.push_back(assignment);
             }
-            None => self.shift(),
         }
-        Some(assignment)
     }
 }
 
@@ -6167,7 +6167,7 @@ impl Sweep {
             expanded: BTreeSet::new(),
             round: None,
             best: (seed.clone(), cost),
-            rest: Rest::new(&group.values, seed.clone()),
+            rest: RestWalk::new(&group.values, &seed),
             exhausted: false,
             resting: false,
             seed,
@@ -6244,7 +6244,7 @@ pub struct GroupSearch {
     /// finds missing.
     proposed: Option<Piece>,
     /// Passes of the sweeps so far: whose turn it is to ask for the rest of
-    /// its group ([`Rest`]).
+    /// its group ([`RestWalk`]).
     rest_turn: usize,
 }
 
@@ -6734,9 +6734,22 @@ impl GroupSearch {
                             break;
                         }
                         sweep.resting = true;
+                        // The rest is what the domain admits under this
+                        // sweep's base, walked as it is asked for: the
+                        // base of a sweep is its boundary's, one for its
+                        // life.
+                        let at_start = group
+                            .parameters
+                            .iter()
+                            .zip(&sweep.seed)
+                            .fold(base.clone(), |held, (address, value)| address.set(held, *value));
                         let asked = sweep.asked.len();
                         while sweep.pending.len() < wanted {
-                            let Some(assignment) = sweep.rest.next() else {
+                            let Some(assignment) = sweep
+                                .rest
+                                .next(domain, group, &at_start, &sweep.seed, wanted)
+                                .map_err(planning)?
+                            else {
                                 sweep.exhausted = true;
                                 break;
                             };
@@ -8164,26 +8177,7 @@ mod tests {
     use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
-    /// The Metal implementation of a one-entry module whose native
-    /// declaration body is `body`.
-    /// `body` declared for Metal, checked with a source whose kernels take
-    /// no template parameters.
-    fn declared(body: &str) -> NativeImplementation {
-        let module = seismic_lang::native_source::check_fixture(
-            SourceSet::new(vec![SourceFile {
-                path: "scale.seismic".into(),
-                text: format!(
-                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{body}"
-                ),
-            }]),
-            &[],
-        )
-        .unwrap();
-        module
-            .native_implementation(module.entries()[0].id, BackendName::Metal)
-            .unwrap()
-            .clone()
-    }
+    use super::super::test_support::{declared, CountedDomain, V41_ATTENTION_DECODE};
 
     fn shapes(rows: &[u64]) -> Vec<PointShape> {
         rows.iter()
@@ -8376,14 +8370,85 @@ mod tests {
         );
     }
 
-    /// What the leaders' neighbourhoods do not reach is every other
-    /// declared assignment, each once, those that change fewer coordinates
-    /// first, produced one at a time.
+    /// The rest of a one-group declaration's domain from its defaults, as
+    /// the walk asks for it, `batch` assignments at a time; and, to compare
+    /// it with, the same found by brute force: every declared assignment
+    /// the declaration places, but the start, in the order nearest the
+    /// start first (fewer changed coordinates, then the changed
+    /// coordinates' list, then their values' declared positions).
+    fn rest_of(body: &str, batch: usize) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
+        let implementation = declared(body);
+        let statics = NativeSpecialization::new();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
+        assert_eq!(partition.groups.len(), 1);
+        let group = &partition.groups[0];
+        let start = group.assignment(&seed);
+        let domain = Declared { implementation: &implementation, keying: &Keying::Launches(Vec::new()) };
+        let mut walk = RestWalk::new(&group.values, &start);
+        let mut rest = Vec::new();
+        while let Some(assignment) = walk.next(&domain, group, &seed, &start, batch).unwrap() {
+            rest.push(assignment);
+        }
+        let declared = group.values.iter().fold(vec![Vec::new()], |prefixes: Vec<Vec<u64>>, values| {
+            prefixes
+                .iter()
+                .flat_map(|prefix| {
+                    values.iter().map(move |value| {
+                        let mut longer = prefix.clone();
+                        longer.push(*value);
+                        longer
+                    })
+                })
+                .collect()
+        });
+        let mut eager = declared
+            .into_iter()
+            .filter(|assignment| *assignment != start)
+            .filter(|assignment| {
+                plan::TuningPartition::place(&implementation, &seed, &group.parameters, assignment)
+                    .unwrap()
+                    .is_some()
+            })
+            .map(|assignment| {
+                let changed = (0..start.len())
+                    .filter(|&coordinate| assignment[coordinate] != start[coordinate])
+                    .collect::<Vec<_>>();
+                let choice = changed
+                    .iter()
+                    .map(|&coordinate| {
+                        group.values[coordinate].iter().position(|value| *value == assignment[coordinate]).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                ((changed.len(), changed, choice), assignment)
+            })
+            .collect::<Vec<_>>();
+        eager.sort();
+        (rest, eager.into_iter().map(|(_, assignment)| assignment).collect())
+    }
+
+    /// What a search asks for after its leaders' neighbourhoods is the
+    /// admissible assignments but the start, the declared ones nearest the
+    /// start first: one coordinate changed, then two, each in the
+    /// declaration's order of coordinates and of values; exactly the order
+    /// of sorting them all, however many the domain is asked for at once.
     #[test]
-    fn the_rest_of_a_domain_is_every_other_assignment_once_nearest_first() {
-        let values = [vec![1, 2, 3], vec![7], vec![4, 5]];
+    fn the_rest_of_a_group_is_walked_nearest_the_start_first() {
+        let walked = |body: &str| {
+            let (rest, eager) = rest_of(body, 1);
+            for batch in [2, 3, 1000] {
+                assert_eq!(rest_of(body, batch).0, rest, "asked {batch} at a time");
+            }
+            assert_eq!(rest, eager, "the walk keeps the order of sorting the rest");
+            rest
+        };
         assert_eq!(
-            Rest::new(&values, vec![1, 7, 4]).collect::<Vec<_>>(),
+            walked(concat!(
+                "    launch gemv:\n",
+                "        params (A in [1, 2, 3] default 1, B in [7] default 7, C in [4, 5] default 4)\n",
+                "        threadgroups (ceil_div(N, A * B * C), 1, 1)\n",
+                "        threads_per_threadgroup (32, 1, 1)\n",
+            )),
             [
                 // One coordinate changed, then two; the second coordinate
                 // has no other value.
@@ -8394,14 +8459,126 @@ mod tests {
                 vec![3, 7, 5],
             ]
         );
-        assert_eq!(Rest::new(&[vec![1]], vec![1]).count(), 0);
-        assert_eq!(Rest::new(&[], Vec::new()).count(), 0);
-        // A start that is not the first declared value, and every
-        // assignment of a larger product exactly once.
-        let values = vec![vec![1, 2, 3, 4]; 5];
-        let rest = Rest::new(&values, vec![3; 5]).collect::<BTreeSet<_>>();
-        assert_eq!(rest.len(), 4usize.pow(5) - 1);
-        assert!(!rest.contains(&vec![3; 5]));
+        assert!(walked(concat!(
+            "    launch gemv:\n",
+            "        params (A in [1] default 1)\n",
+            "        threadgroups (ceil_div(N, A), 1, 1)\n",
+            "        threads_per_threadgroup (32, 1, 1)\n",
+        )).is_empty());
+        // A start that is not the first declared value; only what is
+        // admitted, the start's other values in declaration order.
+        let rest = walked(concat!(
+            "    params (A in [1, 2, 3, 4] default 2, B in [5, 6, 7] default 7, \
+             D in [8, 9] default 8, E in [1, 2, 3] default 3)\n",
+            "    where (A + B + E) % 3 == 0\n",
+            "    launch gemv:\n",
+            "        threadgroups (ceil_div(N, A * B * D * E), 1, 1)\n",
+            "        threads_per_threadgroup (32, 1, 1)\n",
+        ));
+        assert_eq!(rest.len(), 4 * 3 * 2 * 3 / 3 - 1, "every admitted assignment but the start");
+        assert_eq!(&rest[..3], [vec![2, 7, 9, 3], vec![1, 5, 8, 3], vec![3, 6, 8, 3]]);
+        // Declared values out of numeric order, a start in the middle of
+        // each, and restrictions coupling the coordinates, one of which
+        // empties the sets changing both A and B.
+        let rest = walked(concat!(
+            "    params (A in [3, 1, 2] default 1, B in [9, 5, 7] default 5, C in [2, 6, 4] default 6)\n",
+            "    where (A + B + C < 14 or A + B + C > 14) and (A == 1 or B == 5)\n",
+            "    launch gemv:\n",
+            "        threadgroups (ceil_div(N, A * B * C), 1, 1)\n",
+            "        threads_per_threadgroup (32, 1, 1)\n",
+        ));
+        assert_eq!(rest.len(), 1 + 1 + 2 + 4 + 3);
+        assert!(rest.iter().all(|assignment| assignment[0] == 1 || assignment[1] == 5));
+    }
+
+    /// The declaration's own walk of V4.1's attention_decode, which a
+    /// search's domain asks what it admits from, is pruned by its
+    /// restrictions: it yields exactly the assignments placing every
+    /// declared one admits, reading the restrictions at exactly 2,104
+    /// prefixes of the 129,024 declared, the number its deterministic walk
+    /// in declaration order reads; and searched to exhaustion it places a
+    /// few hundred configurations, not the declared product.
+    #[test]
+    fn a_search_over_v41_attention_decode_places_what_its_declaration_admits() {
+        let implementation = declared(V41_ATTENTION_DECODE);
+        let statics = NativeSpecialization::new();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
+        let parameters = partition
+            .groups
+            .iter()
+            .flat_map(|group| group.parameters.clone())
+            .chain(partition.boundary.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 8);
+        let (mut admitted, mut read) = (BTreeSet::new(), 0);
+        implementation
+            .walk_admissible_while(&statics, || { read += 1; true }, |configuration| {
+                admitted.insert(parameters.iter().map(|address| address.value(configuration)).collect::<Vec<_>>());
+                true
+            })
+            .unwrap();
+        assert_eq!(admitted.len(), 28);
+        assert_eq!(read, 2_104, "the declaration-order walk reads the restrictions at 2,104 prefixes");
+        // Exactly what placing every declared assignment admits.
+        let declared = parameters
+            .iter()
+            .map(|address| {
+                implementation
+                    .params
+                    .iter()
+                    .find(|parameter| plan::ParameterAddress::Entry(parameter.name.clone()) == *address)
+                    .expect("an entry parameter")
+                    .values
+                    .clone()
+            })
+            .fold(vec![Vec::new()], |prefixes: Vec<Vec<u64>>, values| {
+                prefixes
+                    .iter()
+                    .flat_map(|prefix| {
+                        values.iter().map(move |value| {
+                            let mut longer = prefix.clone();
+                            longer.push(*value);
+                            longer
+                        })
+                    })
+                    .collect()
+            });
+        assert_eq!(declared.len(), 129_024);
+        let placed = declared
+            .into_iter()
+            .filter(|assignment| {
+                plan::TuningPartition::place(&implementation, &seed, &parameters, assignment)
+                    .unwrap()
+                    .is_some()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(admitted, placed);
+        // The search to exhaustion.
+        let keying = launches(&partition);
+        let measurement = |specialization: &NativeSpecialization| PointMeasurement {
+            key: keying.key(&implementation, vec![0], specialization),
+            ..measured(1., 0.)
+        };
+        let domain = CountedDomain::new(Declared {
+            implementation: &implementation,
+            keying: &keying,
+        });
+        let mut search = GroupSearch::new(
+            partition,
+            seed.clone(),
+            vec![measurement(&seed)],
+            vec![1.],
+            Vec::new(),
+        );
+        while let Some(piece) = search.plan(&domain).unwrap() {
+            for challenger in piece.challengers() {
+                search.record(challenger, Some(vec![measurement(challenger)]));
+            }
+        }
+        assert!(search.exhausted());
+        assert!(search.swept.len() <= 27);
+        assert!(domain.placed.get() <= 1_000, "{} placed", domain.placed.get());
     }
 
     /// A search ends only when its domain is exhausted. The fastest

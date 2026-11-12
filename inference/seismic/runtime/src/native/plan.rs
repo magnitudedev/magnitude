@@ -9,9 +9,12 @@
 //! declaration gains multiplies it: a group is its parameters with their
 //! declared values and form flags ([`Group`]), what admits an assignment
 //! of it is asked of its domain ([`Domain`]), and an assignment exists only
-//! when the search asks for it, one step from one it holds. Planning
+//! when the search asks for it, one step from one it holds, or, for the
+//! rest of a group, when its domain yields it as admissible, a batch at a
+//! time from a walk the restrictions prune ([`Domain::admissible`]). Planning
 //! therefore takes time and memory in the number of declared parameters and
-//! values and in what the search measures, never in their product, and
+//! values, in what the restrictions leave open and in what the search
+//! measures, never in their product, and
 //! nothing bounds it by a count or an instant: neither would be a property
 //! of the declaration, and either would change which configurations exist.
 //!
@@ -51,6 +54,32 @@ pub trait Domain {
         parameters: &[ParameterAddress],
         values: &[u64],
     ) -> Result<Option<NativeSpecialization>, PlanError>;
+
+    /// The next at most `limit` assignments of `parameters` that change
+    /// every one of them from `base` and that [`Domain::place`] admits
+    /// under `base` (every other parameter as `base` has it), strictly
+    /// after `after` when given: in the order of the declaration's walk,
+    /// `parameters` in the order given, each over its declared values in
+    /// declaration order, the last varying fastest. What the rest of a
+    /// group is asked for from, one set of changed coordinates at a time,
+    /// so a search never places what does not exist. The work of a batch
+    /// is the declared assignments between the resume point and the
+    /// batch's last item that no prefix of the declaration's `where`
+    /// excludes (a `where` that decides no prefix, such as `A + B + C + D
+    /// == 4`, walks them all to yield one item or none): never the set's
+    /// whole product unless the walk is to exhaustion, and then at most
+    /// the group's declared product. V4.1's Metal
+    /// attention_decode declares 129,024 assignments of which 28 are
+    /// admissible; a walk that placed every declared one took the tuning
+    /// budget's planning time on a load, and over ten minutes in a
+    /// survey's replay of thousands of searches.
+    fn admissible(
+        &self,
+        base: &NativeSpecialization,
+        parameters: &[ParameterAddress],
+        after: Option<&[u64]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u64>>, PlanError>;
 
     /// The key `specialization` is expected to run under at timed point
     /// `point`, where the configuration it is a change of ran under
@@ -103,6 +132,15 @@ pub enum ParameterAddress {
 }
 
 impl ParameterAddress {
+    /// The address as a declaration's walk names a parameter: its launch's
+    /// ordinal, none for an entry parameter, and its name.
+    pub(crate) fn site(&self) -> (Option<usize>, &str) {
+        match self {
+            Self::Entry(name) => (None, name),
+            Self::Launch { ordinal, name } => (Some(*ordinal), name),
+        }
+    }
+
     pub(crate) fn value(&self, specialization: &NativeSpecialization) -> u64 {
         match self {
             Self::Entry(name) => specialization.param(name),
@@ -208,18 +246,22 @@ impl Iterator for Assignments<'_> {
     }
 }
 
-/// Every subset of `count` of the positions `0..of`, in lexicographic
-/// order, one at a time.
-struct Subsets {
+/// Every non-empty subset of the positions `0..of`, one at a time, nearest
+/// first: the fewer positions first and, of one number, in lexicographic
+/// order. The order in which a change of a configuration is looked for
+/// coordinate by coordinate, by [`TuningPartition::nearest`] and by a
+/// search asking for the rest of a group: one coordinate changed, then two,
+/// and so on.
+pub(crate) struct Subsets {
     of: usize,
     next: Option<Vec<usize>>,
 }
 
 impl Subsets {
-    fn new(of: usize, count: usize) -> Self {
+    pub(crate) fn nearest_first(of: usize) -> Self {
         Self {
             of,
-            next: (count <= of).then(|| (0..count).collect()),
+            next: (of > 0).then(|| vec![0]),
         }
     }
 }
@@ -230,18 +272,23 @@ impl Iterator for Subsets {
     fn next(&mut self) -> Option<Vec<usize>> {
         let current = self.next.take()?;
         let count = current.len();
-        // The last position that can still move right.
-        if let Some(moved) = (0..count)
+        // The last position that can still move right, those after it
+        // following it; past the last subset of a number, the first of one
+        // more.
+        self.next = match (0..count)
             .rev()
             .find(|&position| current[position] < self.of - (count - position))
         {
-            let mut following = current.clone();
-            following[moved] += 1;
-            for position in moved + 1..count {
-                following[position] = following[position - 1] + 1;
+            Some(moved) => {
+                let mut following = current.clone();
+                following[moved] += 1;
+                for position in moved + 1..count {
+                    following[position] = following[position - 1] + 1;
+                }
+                Some(following)
             }
-            self.next = Some(following);
-        }
+            None => (count < self.of).then(|| (0..=count).collect()),
+        };
         Some(current)
     }
 }
@@ -431,6 +478,36 @@ impl TuningPartition {
         }
     }
 
+    /// The next at most `limit` assignments changing every one of
+    /// `parameters` that the declaration admits with every other parameter
+    /// as `base` has it, after `after` ([`Domain::admissible`]): the
+    /// declaration's own walk of its admissible configurations
+    /// ([`NativeImplementation::walk_admissible_moving`]), which does not
+    /// extend a prefix its restrictions already exclude and resumes past
+    /// `after` without visiting what precedes it, so the work follows what
+    /// they leave open up to the batch, not the declared product. Each
+    /// assignment yielded is one [`Self::place`] admits.
+    pub fn admissible(
+        implementation: &NativeImplementation,
+        base: &NativeSpecialization,
+        parameters: &[ParameterAddress],
+        after: Option<&[u64]>,
+        limit: usize,
+    ) -> Result<Vec<Vec<u64>>, PlanError> {
+        let mut admitted = Vec::new();
+        if limit == 0 {
+            return Ok(admitted);
+        }
+        let moved = parameters.iter().map(ParameterAddress::site).collect::<Vec<_>>();
+        implementation
+            .walk_admissible_moving(base, &moved, after, || true, |configuration| {
+                admitted.push(parameters.iter().map(|address| address.value(configuration)).collect());
+                admitted.len() < limit
+            })
+            .map_err(PlanError::Declaration)?;
+        Ok(admitted)
+    }
+
     /// The admissible configuration that has `parameters` at `values`
     /// nearest `base`; none when no configuration has them.
     ///
@@ -510,45 +587,33 @@ impl TuningPartition {
                 (address, values)
             })
             .collect::<Vec<_>>();
-        for changed in 1..=free.len() {
-            let mut nearest = None::<((usize, usize), NativeSpecialization)>;
-            for moved in Subsets::new(free.len(), changed) {
-                let others = moved
-                    .iter()
-                    .map(|position| {
-                        let (address, values) = &free[*position];
-                        let held = address.value(&fixed);
-                        values
-                            .iter()
-                            .copied()
-                            .filter(|value| *value != held)
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                for assignment in Assignments::of(others.iter().map(Vec::as_slice).collect()) {
-                    let candidate = moved
-                        .iter()
-                        .zip(assignment)
-                        .fold(fixed.clone(), |candidate, (position, value)| {
-                            free[*position].0.set(candidate, value)
-                        });
-                    match implementation.validate(&candidate) {
-                        Ok(()) => {
-                            let distance = distance(&free, &fixed, &candidate);
-                            if nearest.as_ref().is_none_or(|(least, _)| distance < *least) {
-                                nearest = Some((distance, candidate));
-                            }
-                        }
-                        Err(NativeSpecializationError::Inadmissible) => {}
-                        Err(error) => return Err(PlanError::Declaration(error)),
+        // Each set of free parameters changed, nearest first, walked by the
+        // declaration's own walk of what it admits changing exactly that
+        // set ([`NativeImplementation::walk_admissible_moving`]), in the
+        // order of the tie-break: a set of one more changed parameter is
+        // farther than any change of fewer, so the first number that
+        // admits any decides.
+        let mut nearest = None::<((usize, usize), NativeSpecialization)>;
+        for moved in Subsets::nearest_first(free.len()) {
+            if nearest.as_ref().is_some_and(|((changed, _), _)| *changed < moved.len()) {
+                break;
+            }
+            let addresses = moved.iter().map(|position| &free[*position].0).collect::<Vec<_>>();
+            let sites = addresses.iter().map(|address| address.site()).collect::<Vec<_>>();
+            implementation
+                .walk_admissible_moving(&fixed, &sites, None, || true, |admitted| {
+                    let candidate = addresses.iter().fold(fixed.clone(), |candidate, address| {
+                        address.set(candidate, address.value(admitted))
+                    });
+                    let distance = distance(&free, &fixed, &candidate);
+                    if nearest.as_ref().is_none_or(|(least, _)| distance < *least) {
+                        nearest = Some((distance, candidate));
                     }
-                }
-            }
-            if let Some((_, nearest)) = nearest {
-                return Ok(Some(nearest));
-            }
+                    true
+                })
+                .map_err(PlanError::Declaration)?;
         }
-        Ok(None)
+        Ok(nearest.map(|(_, nearest)| nearest))
     }
 
     /// Every parameter the plan moves with its value in a configuration

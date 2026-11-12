@@ -2848,6 +2848,20 @@ impl NativeImplementation {
                 name: name.clone(),
             });
         }
+        match self.where_holds(specialization)? {
+            true => Ok(()),
+            false => Err(NativeSpecializationError::Inadmissible),
+        }
+    }
+
+    /// Whether the `where` condition holds of `specialization`, whose
+    /// statics and parameters are known to be the declaration's: a
+    /// parameter's name reads the entry parameter of that name, else the
+    /// one launch parameter of it.
+    fn where_holds(&self, specialization: &NativeSpecialization) -> Result<bool, NativeSpecializationError> {
+        let Some(constraint) = &self.constraint else {
+            return Ok(true);
+        };
         let dimension = |name: &str| specialization.static_value(name);
         let parameter = |name: &str| {
             specialization.param(name).or_else(|| {
@@ -2870,15 +2884,9 @@ impl NativeImplementation {
                     .flatten()
             })
         };
-        if let Some(constraint) = &self.constraint {
-            if !constraint
-                .holds(&dimension, &parameter)
-                .map_err(NativeSpecializationError::Evaluation)?
-            {
-                return Err(NativeSpecializationError::Inadmissible);
-            }
-        }
-        Ok(())
+        constraint
+            .holds(&dimension, &parameter)
+            .map_err(NativeSpecializationError::Evaluation)
     }
 
     /// Whether some call `specialization` admits activates launch `launch`:
@@ -3484,7 +3492,7 @@ impl NativeImplementation {
         keep_going: impl FnMut() -> bool,
         visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
-        self.walk(statics, None, keep_going, visit)
+        self.walk(statics, &[], false, &entry_held(statics), None, keep_going, visit)
     }
 
     /// Visit, until `visit` returns false, the first admissible
@@ -3501,19 +3509,77 @@ impl NativeImplementation {
         leading: &[String],
         visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
-        self.walk(statics, Some(leading), || true, visit)
+        let first = self
+            .params
+            .iter()
+            .filter(|parameter| leading.contains(&parameter.name))
+            .map(|parameter| (None, parameter.name.as_str()))
+            .collect::<Vec<_>>();
+        self.walk(statics, &first, true, &entry_held(statics), None, || true, visit)
     }
 
-    /// The walk of [`Self::walk_admissible_while`], or, with `leading`,
-    /// that of [`Self::walk_admitted_of`]: the named entry-wide parameters
-    /// walked first, and each admitted configuration ending the walk over
-    /// the parameters after them.
+    /// Visit, until `visit` returns false, the admissible specializations
+    /// that change from `base` exactly the `moved` parameters (each an
+    /// entry parameter, `None`, or a launch's, `Some(ordinal)`, with its
+    /// name): every other parameter as `base` values it, each moved one
+    /// walking its declared values other than `base`'s. What a caller
+    /// moving a few parameters of a configuration needs, with no walk over
+    /// the product of the others, nor over the assignments that keep some
+    /// moved parameter where it was. The moved parameters walk first in the
+    /// order given, each over its values in declaration order, the last
+    /// varying fastest.
+    ///
+    /// With `after` (the values of the moved parameters, in that order, of
+    /// an assignment the walk yields), the walk resumes strictly after it:
+    /// what sorts at or before it is passed over a depth at a time, never
+    /// visited, so a walk taken up in batches costs, per batch, the
+    /// prefixes it reads for the batch and no more. `keep_going` is asked
+    /// at every prefix the walk reads.
+    pub fn walk_admissible_moving(
+        &self,
+        base: &NativeSpecialization,
+        moved: &[(Option<usize>, &str)],
+        after: Option<&[u64]>,
+        keep_going: impl FnMut() -> bool,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        if let Some(after) = after {
+            assert_eq!(after.len(), moved.len(), "a walk resumes after an assignment of its moved parameters");
+        }
+        let walked = |launch: Option<usize>, parameter: &NativeParameter| {
+            let at = match launch {
+                None => base.param(&parameter.name),
+                Some(launch) => base.launch_param(launch, &parameter.name),
+            };
+            if moved.contains(&(launch, parameter.name.as_str())) {
+                return Ok(parameter.values.iter().copied().filter(|value| Some(*value) != at).collect());
+            }
+            held_at(parameter, at)
+        };
+        self.walk(base, moved, false, &walked, after, keep_going, visit)
+    }
+
+    /// The walk of [`Self::walk_admissible_while`], or, with `first` the
+    /// entry-wide parameters of [`Self::walk_admitted_of`] and `led`, or,
+    /// with `walked` and `after`, that of [`Self::walk_admissible_moving`]:
+    /// each parameter is walked over the values `walked` gives it, none
+    /// leaving nothing to walk; the `first` parameters walk first, in that
+    /// order, and with `led` each admitted configuration ends the walk over
+    /// the parameters after them; with `after`, an assignment of the first
+    /// parameters, what sorts at or before it is passed over. A prefix
+    /// is not extended once the `where` condition, read with the parameters
+    /// not yet walked unknown, is false ([`NativeCondition::decided`]): the
+    /// work follows what the condition leaves open, not the product of the
+    /// domains.
     fn walk(
         &self,
         statics: &NativeSpecialization,
-        leading: Option<&[String]>,
-        mut keep_going: impl FnMut() -> bool,
-        mut visit: impl FnMut(&NativeSpecialization) -> bool,
+        first: &[(Option<usize>, &str)],
+        led: bool,
+        walked: &dyn Fn(Option<usize>, &NativeParameter) -> Result<Vec<u64>, NativeSpecializationError>,
+        after: Option<&[u64]>,
+        keep_going: impl FnMut() -> bool,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
         self.enumerable()?;
         let mut base = NativeSpecialization::new();
@@ -3530,46 +3596,50 @@ impl NativeImplementation {
         {
             return Err(NativeSpecializationError::UnknownStatic(name.clone()));
         }
-        // The entry-wide parameters `leading` names first, in declared order.
-        let led = |parameter: &&NativeParameter| {
-            leading.is_some_and(|leading| leading.contains(&parameter.name))
-        };
-        let lead = leading.map(|_| self.params.iter().filter(led).count());
-        let domains = self
+        let declared = self
             .params
             .iter()
-            .filter(led)
-            .chain(self.params.iter().filter(|parameter| !led(parameter)))
             .map(|parameter| (None, parameter))
-            .chain(
-                self.launches
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(launch, declaration)| {
-                        declaration
-                            .params
-                            .iter()
-                            .map(move |parameter| (Some(launch), parameter))
-                    }),
-            )
+            .chain(self.launches.iter().enumerate().flat_map(|(launch, declaration)| {
+                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
+            }))
             .collect::<Vec<_>>();
-        // The values each parameter is walked over: an entry-wide parameter
-        // `statics` values is walked at that value alone.
+        let leading = first
+            .iter()
+            .filter_map(|(launch, name)| {
+                declared.iter().find(|(at, parameter)| at == launch && parameter.name == *name)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let lead = led.then_some(leading.len());
+        let domains = leading
+            .iter()
+            .copied()
+            .chain(declared.iter().copied().filter(|(launch, parameter)| {
+                !first.iter().any(|(at, name)| at == launch && *name == parameter.name)
+            }))
+            .collect::<Vec<_>>();
+        // The values each parameter is walked over.
         let values = domains
             .iter()
-            .map(|(launch, parameter)| {
-                match launch.is_none().then(|| statics.param(&parameter.name)).flatten() {
-                    Some(value) if parameter.values.contains(&value) => Ok(vec![value]),
-                    Some(value) => Err(NativeSpecializationError::OutsideDomain {
-                        parameter: parameter.name.clone(),
-                        value,
-                    }),
-                    None => Ok(parameter.values.clone()),
-                }
-            })
+            .map(|(launch, parameter)| walked(*launch, parameter))
             .collect::<Result<Vec<_>, _>>()?;
-        // Walk the product of the parameter domains in place (the last
-        // parameter varies fastest), keeping each admissible configuration.
+        if values.iter().any(Vec::is_empty) {
+            return Ok(());
+        }
+        // Where `after` takes each of the first parameters it assigns.
+        let after = after.map(|after| {
+            after
+                .iter()
+                .zip(&values)
+                .map(|(value, candidates)| {
+                    candidates
+                        .iter()
+                        .position(|candidate| candidate == value)
+                        .expect("a walk resumes after an assignment it yields")
+                })
+                .collect::<Vec<_>>()
+        });
         let mut configuration = base;
         for ((launch, parameter), values) in domains.iter().zip(&values) {
             configuration = match launch {
@@ -3579,11 +3649,8 @@ impl NativeImplementation {
                 }
             };
         }
-        // The `where` condition's top-level conjuncts, each with the last
-        // parameter of the walk it reads: a conjunct that fails rejects every
-        // configuration with the same values up to that parameter, so the
-        // walk steps over them at once rather than visiting the product of
-        // the parameters after it.
+        // The position a name in `where` is walked at; none when two
+        // parameters share it, which the condition then reads as unknown.
         let mut owners = std::collections::BTreeMap::<&str, Option<usize>>::new();
         for (position, (_, parameter)) in domains.iter().enumerate() {
             owners
@@ -3591,131 +3658,169 @@ impl NativeImplementation {
                 .and_modify(|owner| *owner = None)
                 .or_insert(Some(position));
         }
-        let owner = |name: &str| owners.get(name).copied().flatten();
-        let mut conjuncts = Vec::new();
-        if let Some(constraint) = &self.constraint {
-            constraint.conjuncts(&mut conjuncts);
-        }
-        // A conjunct that reads no parameter is decided by the statics alone.
-        let mut fixed = 0;
-        for conjunct in &conjuncts {
-            let mut names = Vec::new();
-            conjunct.parameters(&mut names);
-            if !names.is_empty() {
-                continue;
-            }
-            match conjunct.holds(&|name| configuration.static_value(name), &|_| None) {
-                Ok(true) => fixed += 1,
-                Ok(false) => return Ok(()),
-                Err(_) => {}
-            }
-        }
-        let total = conjuncts.len() - fixed;
-        let prefixes = conjuncts
-            .into_iter()
-            .filter_map(|conjunct| {
-                let mut names = Vec::new();
-                conjunct.parameters(&mut names);
-                let positions = names
-                    .iter()
-                    .map(|name| owner(name))
-                    .collect::<Option<Vec<_>>>()?;
-                Some((positions.into_iter().max()?, conjunct))
-            })
-            .collect::<Vec<_>>();
-        // The walk values every declared parameter from its domain, so a
-        // configuration no conjunct rejects is admissible once every
-        // conjunct is one of these; otherwise the whole condition decides.
-        let decided = prefixes.len() == total;
         let launch_keys = domains
             .iter()
             .map(|(launch, parameter)| launch.map(|launch| (launch, parameter.name.clone())))
             .collect::<Vec<_>>();
-        let mut steps = vec![0usize; domains.len()];
-        // The first parameter the last step changed: a conjunct that reads
-        // only parameters before it held on the configuration before, and
-        // still does.
-        let mut changed = 0;
-        loop {
-            if !keep_going() {
-                return Ok(());
-            }
-            let dimension = |name: &str| configuration.static_value(name);
-            let parameter = |name: &str| {
-                let (launch, _) = domains[owner(name)?];
-                match launch {
-                    None => configuration.param(name),
-                    Some(launch) => configuration.launch_param(launch, name),
-                }
-            };
-            // The shortest prefix the walk is done with: one a conjunct
-            // rejects, or the leading parameters of an admitted configuration.
-            let mut rejected: Option<usize> = None;
-            let mut failed = false;
-            for (last, conjunct) in &prefixes {
-                if *last < changed {
-                    continue;
-                }
-                match conjunct.holds(&dimension, &parameter) {
-                    Ok(true) => {}
-                    Ok(false) => rejected = Some(rejected.map_or(*last, |least| least.min(*last))),
-                    Err(_) => failed = true,
-                }
-            }
-            if rejected.is_none() {
-                let admitted = if decided && !failed {
-                    Ok(())
-                } else {
-                    self.validate_enumerable(&configuration)
-                };
-                match admitted {
-                    Ok(()) => {
-                        if !visit(&configuration) {
-                            return Ok(());
-                        }
-                        if let Some(lead) = lead {
-                            if lead == 0 {
-                                return Ok(());
-                            }
-                            rejected = Some(lead - 1);
-                        }
-                    }
-                    Err(NativeSpecializationError::Inadmissible) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            let Some(position) = (0..rejected.map_or(domains.len(), |last| last + 1))
-                .rev()
-                .find(|&position| steps[position] + 1 < values[position].len())
-            else {
-                return Ok(());
-            };
-            let next = steps[position] + 1;
-            let mut set = |position: usize, step: usize| {
-                steps[position] = step;
-                let (launch, parameter) = domains[position];
-                let value = values[position][step];
-                match launch {
-                    None => {
-                        *configuration
-                            .params
-                            .get_mut(&parameter.name)
-                            .expect("every parameter was valued") = value;
-                    }
-                    Some(_) => {
-                        *configuration
-                            .launch_params
-                            .get_mut(launch_keys[position].as_ref().expect("a launch parameter"))
-                            .expect("every launch parameter was valued") = value;
-                    }
-                }
-            };
-            for reset in position + 1..domains.len() {
-                set(reset, 0);
-            }
-            set(position, next);
-            changed = position;
+        let resuming = after.is_some();
+        let mut walk = Walk {
+            implementation: self,
+            configuration,
+            domains,
+            values,
+            owners,
+            launch_keys,
+            lead,
+            after: after.unwrap_or_default(),
+            keep_going,
+            visit,
+        };
+        let verdict = walk.verdict(0);
+        if verdict == Some(false) {
+            return Ok(());
         }
+        walk.descend(0, verdict, resuming).map(|_| ())
+    }
+}
+
+/// The values a walk takes `parameter` over: `held` alone when given, which
+/// must be one it declares, else every declared value.
+fn held_at(
+    parameter: &NativeParameter,
+    held: Option<u64>,
+) -> Result<Vec<u64>, NativeSpecializationError> {
+    match held {
+        Some(value) if parameter.values.contains(&value) => Ok(vec![value]),
+        Some(value) => Err(NativeSpecializationError::OutsideDomain {
+            parameter: parameter.name.clone(),
+            value,
+        }),
+        None => Ok(parameter.values.clone()),
+    }
+}
+
+/// The entry-wide parameters `statics` values, held at those values by a
+/// walk; launch parameters are not.
+fn entry_held(
+    statics: &NativeSpecialization,
+) -> impl Fn(Option<usize>, &NativeParameter) -> Result<Vec<u64>, NativeSpecializationError> + '_ {
+    |launch, parameter| {
+        held_at(parameter, launch.is_none().then(|| statics.param(&parameter.name)).flatten())
+    }
+}
+
+/// How a walk's frame ends: its caller goes on, the whole walk is over, or
+/// the frames below position `0` are over and that frame takes its next
+/// value.
+enum Flow {
+    Continue,
+    Stop,
+    Resume(usize),
+}
+
+/// One walk of an implementation's admissible configurations: the
+/// parameters in `domains` order, each over its `values`, the last varying
+/// fastest, in `configuration`.
+struct Walk<'w, K, V> {
+    implementation: &'w NativeImplementation,
+    configuration: NativeSpecialization,
+    domains: Vec<(Option<usize>, &'w NativeParameter)>,
+    values: Vec<Vec<u64>>,
+    owners: std::collections::BTreeMap<&'w str, Option<usize>>,
+    launch_keys: Vec<Option<(usize, String)>>,
+    lead: Option<usize>,
+    /// The position in `values` of each of the first parameters of the
+    /// assignment the walk resumes after; empty when it does not.
+    after: Vec<usize>,
+    keep_going: K,
+    visit: V,
+}
+
+impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V> {
+    /// Whether the `where` condition holds, does not, or is not yet decided,
+    /// with the parameters before position `assigned` walked and the rest
+    /// unknown, those of one value known throughout.
+    fn verdict(&self, assigned: usize) -> Option<bool> {
+        let Some(constraint) = &self.implementation.constraint else {
+            return Some(true);
+        };
+        let parameter = |name: &str| {
+            let position = self.owners.get(name).copied().flatten()?;
+            if position >= assigned && self.values[position].len() > 1 {
+                return None;
+            }
+            match self.domains[position].0 {
+                None => self.configuration.param(name),
+                Some(launch) => self.configuration.launch_param(launch, name),
+            }
+        };
+        constraint.decided(&|name| self.configuration.static_value(name), &parameter)
+    }
+
+    /// Walk the parameters from `depth` on, `verdict` being the condition's
+    /// at the prefix before it: a condition decided true stays so. On the
+    /// `edge` the prefix is that of the assignment the walk resumes after:
+    /// this depth's values before that assignment's are passed over, and
+    /// once the whole assignment is the prefix, all that extends it.
+    fn descend(
+        &mut self,
+        depth: usize,
+        verdict: Option<bool>,
+        edge: bool,
+    ) -> Result<Flow, NativeSpecializationError> {
+        if edge && depth == self.after.len() {
+            return Ok(Flow::Continue);
+        }
+        if depth == self.domains.len() {
+            // The walk holds the declared statics and values every
+            // parameter from its declaration, so the `where` condition
+            // alone admits: read whole, as validation reads it, never taken
+            // from a prefix's verdict.
+            if !self.implementation.where_holds(&self.configuration)? {
+                return Ok(Flow::Continue);
+            }
+            if !(self.visit)(&self.configuration) {
+                return Ok(Flow::Stop);
+            }
+            return Ok(match self.lead {
+                Some(0) => Flow::Stop,
+                Some(lead) => Flow::Resume(lead - 1),
+                None => Flow::Continue,
+            });
+        }
+        let first = if edge { self.after[depth] } else { 0 };
+        for step in first..self.values[depth].len() {
+            if !(self.keep_going)() {
+                return Ok(Flow::Stop);
+            }
+            let value = self.values[depth][step];
+            match &self.launch_keys[depth] {
+                None => {
+                    *self
+                        .configuration
+                        .params
+                        .get_mut(&self.domains[depth].1.name)
+                        .expect("every parameter was valued") = value;
+                }
+                Some(key) => {
+                    *self
+                        .configuration
+                        .launch_params
+                        .get_mut(key)
+                        .expect("every launch parameter was valued") = value;
+                }
+            }
+            let verdict = if verdict == Some(true) { verdict } else { self.verdict(depth + 1) };
+            if verdict == Some(false) {
+                continue;
+            }
+            match self.descend(depth + 1, verdict, edge && step == first)? {
+                Flow::Continue => {}
+                Flow::Resume(at) if at == depth => {}
+                flow => return Ok(flow),
+            }
+        }
+        Ok(Flow::Continue)
     }
 }
 
@@ -4289,6 +4394,76 @@ mod native_tests {
         for configuration in &configurations {
             native.validate(configuration).unwrap();
         }
+    }
+
+    /// A walk moving some parameters changes exactly those, in the order
+    /// given, each over its other declared values; taken up in batches,
+    /// each resuming after the last one's final assignment, it visits what
+    /// the whole walk does, in its order.
+    #[test]
+    fn a_moving_walk_resumes_where_its_last_batch_ended() {
+        let text = concat!(
+            "native scale for metal from \"scale.metal\":\n",
+            "    params (A in [1, 2, 3, 4, 5, 6] default 1, B in [5, 6, 7, 8] default 5, C in [1, 2, 3] default 2)\n",
+            "    where (A + B + C) % 2 == 0\n",
+            "    launch small:\n",
+            "        params (ROWS in [1, 2] default 1)\n",
+            "        threadgroups (ceil_div(N, A * B * C * ROWS), 1, 1)\n",
+            "        threads_per_threadgroup (32, 1, 1)\n",
+        );
+        let module = crate::native_source::check_fixture(source(text), &[]).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let base = native.admissible(&NativeSpecialization::new()).unwrap()[0].clone();
+        assert_eq!(
+            (base.param("A"), base.param("B"), base.param("C"), base.launch_param(0, "ROWS")),
+            (Some(1), Some(5), Some(2), Some(1))
+        );
+        let moved = [(None, "B"), (None, "A"), (Some(0), "ROWS")];
+        let walk = |after: Option<&[u64]>, limit: usize| {
+            let mut visited = Vec::new();
+            native
+                .walk_admissible_moving(&base, &moved, after, || true, |configuration| {
+                    assert_eq!(configuration.param("C"), Some(2), "what is not moved stays");
+                    visited.push(vec![
+                        configuration.param("B").unwrap(),
+                        configuration.param("A").unwrap(),
+                        configuration.launch_param(0, "ROWS").unwrap(),
+                    ]);
+                    visited.len() < limit
+                })
+                .unwrap();
+            visited
+        };
+        let whole = walk(None, usize::MAX);
+        assert_eq!(
+            whole,
+            [
+                [6, 2, 2],
+                [6, 4, 2],
+                [6, 6, 2],
+                [7, 3, 2],
+                [7, 5, 2],
+                [8, 2, 2],
+                [8, 4, 2],
+                [8, 6, 2],
+            ]
+        );
+        for size in [1, 3] {
+            let mut batched = Vec::new();
+            loop {
+                let batch = walk(batched.last().map(Vec::as_slice), size);
+                let ended = batch.len() < size;
+                batched.extend(batch);
+                if ended {
+                    break;
+                }
+            }
+            assert_eq!(batched, whole, "batches of {size}");
+        }
+        // After the last assignment, nothing is left.
+        assert!(walk(Some(&[8, 6, 2][..]), usize::MAX).is_empty());
     }
 
     /// A form only some statics admit is found by the search that takes its
