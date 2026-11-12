@@ -338,6 +338,9 @@ pub(crate) mod tests {
                     host_shared: true,
                 }
             }
+            fn release(&self) -> crate::platform::ReleaseRate {
+                crate::platform::ReleaseRate::new(1e9)
+            }
         }
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
         let selected = crate::platform::select_device(
@@ -439,9 +442,12 @@ pub(crate) mod tests {
         /// and none after: a neighbour took it.
         struct Taken<'a>(&'a Search);
         impl crate::TuningRoom for Taken<'_> {
-            fn now(&self, _: &seismic::Device) -> crate::RoomNow {
+            fn now(&self, device: &seismic::Device) -> crate::RoomNow {
                 let left = if self.0.mandatory.get() { 0 } else { 1 << 40 };
-                crate::RoomNow { device_bytes: left, host_bytes: left, host_shared: true }
+                crate::RoomNow { device_bytes: left, host_bytes: left, host_shared: crate::memory::ledger::shares_host(device) }
+            }
+            fn release(&self) -> crate::platform::ReleaseRate {
+                crate::platform::ReleaseRate::new(1e9)
             }
         }
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");

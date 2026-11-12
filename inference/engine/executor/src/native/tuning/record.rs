@@ -48,6 +48,11 @@ pub(crate) struct StoredChoice {
     pub first_rejection: Option<String>,
     pub chosen: ChosenEvidence,
     pub settled: bool,
+    /// The search budget the record was searched within, in milliseconds:
+    /// the record serves any load whose budget is no larger, since more time
+    /// could have reached no further than the search did
+    /// ([`Self::searched_within`]).
+    pub budget_ms: u64,
     /// Whether any of the result's points carried serving demand. A record
     /// made without demand settles a unit no load ran: a load that serves
     /// the unit searches it, and one that does not reads it.
@@ -142,8 +147,8 @@ impl ChosenEvidence {
 
 impl StoredChoice {
     /// The choice of `result`, as it stands under the requirement `result`
-    /// states.
-    pub(crate) fn of(result: &TuningResult) -> Self {
+    /// states, of a search that ran within `budget`.
+    pub(crate) fn of(result: &TuningResult, budget: std::time::Duration) -> Self {
         let measured = result
             .configurations
             .iter()
@@ -179,8 +184,17 @@ impl StoredChoice {
             first_rejection,
             chosen: ChosenEvidence::of(result),
             settled: true,
+            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
             demanded: result.points.iter().any(|point| point.weight > 0.),
         }
+    }
+
+    /// Whether the search that made the record reached as far as one within
+    /// `budget` could: its end was neither its budget's nor the memory
+    /// room's (it ran to its end, or was no search), or its budget was at
+    /// least as large.
+    pub(crate) fn searched_within(&self, budget: std::time::Duration) -> bool {
+        reached_within(self.stop, self.budget_ms, budget)
     }
 
     /// The choice as a search publishes it before its optional work stops:
@@ -221,5 +235,18 @@ impl Receipt {
             Self::Held(result) => Ok(result.clone()),
             Self::Stored(evidence) => evidence.read().map(Arc::new),
         }
+    }
+}
+
+/// Whether a search that stopped as `stop`, within `searched_ms`, reached as
+/// far as one within `budget` could: it did not stop at its budget, or its
+/// budget was at least as large.
+pub(crate) fn reached_within(stop: Option<SearchStop>, searched_ms: u64, budget: std::time::Duration) -> bool {
+    match stop {
+        // The room the search was given is the machine's moment, which the
+        // key does not hold: a search with room searches the unit again.
+        Some(SearchStop::NoRoom) => false,
+        Some(SearchStop::Expired) => u128::from(searched_ms) >= budget.as_millis(),
+        _ => true,
     }
 }

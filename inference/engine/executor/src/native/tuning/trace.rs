@@ -351,9 +351,10 @@ impl TuningTrace {
                     "host_margin_bytes": budget.memory.host_margin_bytes,
                     "host_admission": host_admission(&budget.memory),
                     "compile_host_bytes": budget.memory.compile_host_bytes,
-                    "host_added_by_unit": budget.memory.host_added_by_unit.iter().map(|(unit, bytes)| json!({
-                        "unit": unit,
-                        "bytes": bytes,
+                    "host_added_by_unit": budget.memory.host_added_by_unit.iter().map(|added| json!({
+                        "unit": added.unit,
+                        "resident": added.resident,
+                        "bytes": added.bytes,
                     })).collect::<Vec<_>>(),
                     "began_bytes": budget.memory.began_bytes,
                     "mandatory_bytes": budget.memory.mandatory_bytes,

@@ -178,8 +178,15 @@ impl crate::TuningRoom for LoadRoom<'_> {
             let snapshot = ledger.snapshot();
             snapshot.free().saturating_sub(snapshot.guarantee(0))
         };
-        let (device, host) = (self.ledgers.device(), self.ledgers.host());
-        crate::RoomNow { device_bytes: room(device), host_bytes: room(host), host_shared: device.store() == host.store() }
+        crate::RoomNow {
+            device_bytes: room(self.ledgers.device()),
+            host_bytes: room(self.ledgers.host()),
+            host_shared: crate::memory::ledger::shares_host(device),
+        }
+    }
+
+    fn release(&self) -> crate::platform::ReleaseRate {
+        self.reader.reserves.release_rate()
     }
 }
 

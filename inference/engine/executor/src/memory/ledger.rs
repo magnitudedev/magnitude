@@ -799,6 +799,14 @@ impl Recorded {
 
 }
 
+/// Whether `device`'s own memory and host RAM are one store: unified memory,
+/// where the device's room and host RAM share one ceiling. A discrete
+/// device's memory is apart from host RAM's. The one rule a search's room
+/// states it by ([`crate::RoomNow::host_shared`]).
+pub(crate) fn shares_host(device: &seismic::Device) -> bool {
+    placed_store(device, seismic::Contract::DeviceOnly) == placed_store(device, seismic::Contract::Shared)
+}
+
 /// The store `device` places `contract`'s fixed storage in.
 fn placed_store(device: &seismic::Device, contract: seismic::Contract) -> seismic::StoreIdentity {
     let topology = device.topology();

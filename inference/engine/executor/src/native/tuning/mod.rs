@@ -1352,6 +1352,10 @@ pub struct RoomNow {
 /// authorize allocation.
 pub trait TuningRoom {
     fn now(&self, device: &Device) -> RoomNow;
+    /// The rate the machine frees memory at, a generic figure of it
+    /// (`platform::MemoryReserves::release_rate`): what giving a unit's
+    /// inputs up is priced by before a give-up is observed.
+    fn release(&self) -> crate::platform::ReleaseRate;
 }
 
 /// What a search held, against the ceiling it is held to.
@@ -1405,8 +1409,9 @@ pub struct TuningMemory {
     pub footprint_margin_bytes: Option<i64>,
     /// Host RAM the platform lets the engine claim, including compiles and
     /// process growth, as last read: what the process had grown by then and
-    /// host RAM's room then. Shared device placement also obeys the coupled
-    /// `footprint_ceiling_bytes`.
+    /// host RAM's room then, where host RAM is a domain apart from the
+    /// device's memory. Where they are one, none: `footprint_ceiling_bytes`
+    /// holds all of it, and one room owns it.
     pub host_ceiling_bytes: Option<u64>,
     /// The most the process's footprint had grown since tuning began: the
     /// peak of the footprint ([`seismic::ProcessMemory::footprint_peak`])
@@ -1434,9 +1439,10 @@ pub struct TuningMemory {
     /// working set passed the load's planned host peak.
     pub host_margin_bytes: Option<i64>,
     /// The most one piece of each unit's work added to the process's
-    /// footprint: what the unit's next piece is taken to add to the host
-    /// ([`allocation::Unit::host_footprint`]).
-    pub host_added_by_unit: Vec<(String, u64)>,
+    /// footprint, apart for pieces with the unit's inputs resident and
+    /// pieces that build them: what the unit's next piece is taken to add
+    /// to the host ([`allocation::Unit::host_footprint`]).
+    pub host_added_by_unit: Vec<HostAdded>,
     /// The host bytes one thread of a compile holds while it runs: the
     /// most the host's room fell over compiles that ran at once
     /// ([`compile_wave_price`]), for each thread that compiled, wherever
@@ -1474,6 +1480,20 @@ pub struct TuningMemory {
     /// its process is carried by nothing and is not reported.
     pub returned_bytes: u64,
     pub returning_seconds: f64,
+}
+
+/// The most one piece of a unit's work added to the process's footprint:
+/// with the unit's inputs `resident`, beyond them, as Seismic prices a
+/// piece's device bytes beyond the inputs it keeps
+/// ([`seismic::NativeSearch::largest_footprint`]); otherwise building them
+/// as well. A unit's first piece built its inputs and was priced so, and a
+/// DeepSeek V4.1 routed_experts unit was held to that 4.9 GB for a 4.2 MB
+/// second point while its inputs stayed resident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostAdded {
+    pub unit: String,
+    pub resident: bool,
+    pub bytes: u64,
 }
 
 /// Work that added more to the host than it was priced at.
@@ -1600,32 +1620,24 @@ impl TuningMemory {
         Some(free.min(device.room(seismic::Contract::DeviceOnly)))
     }
 
-    /// The one rule by which host work shares the device's room: what host
-    /// work adding `host` bytes to the process's footprint, beside device
-    /// work charging `device` bytes, takes of [`Self::free`] beyond those
-    /// device bytes. Where device storage's placement includes host RAM
-    /// (`RoomNow::host_shared`), tuning's device charges and its host
-    /// growth share host RAM's ceiling (spec §2.8), which [`Self::free`]
-    /// holds the whole footprint to (`footprint_ceiling_bytes`): there,
-    /// where the device's allocations lie outside the process's footprint
-    /// (`device_separate`), all of `host` adds to `device`; where they lie
-    /// inside it (CPU, Metal), the footprint's growth already counts the
-    /// work's own device bytes, so only what exceeds them adds. Elsewhere
-    /// host RAM is a domain apart ([`Self::host_free`]) and host work takes
-    /// nothing of the device's room.
-    fn shared_host_bytes(&self, host: u64, device: u64) -> u64 {
-        if !self.shares_host_ceiling() {
-            0
-        } else if self.device_separate {
-            host
-        } else {
-            host.saturating_sub(device)
-        }
-    }
-
     /// Whether tuning's device charges and its host growth share host
     /// RAM's ceiling: device storage's placement includes host RAM
-    /// (`RoomNow::host_shared`).
+    /// (`RoomNow::host_shared`, spec §2.8), and [`Self::free`] holds the
+    /// whole footprint to it (`footprint_ceiling_bytes`). There host work
+    /// no piece prices takes of [`Self::free`] beside the pieces
+    /// ([`allocation::Unit::shared_host`]); elsewhere host RAM is a domain
+    /// apart ([`Self::host_free`]).
+    ///
+    /// A piece's own host bytes are never among that work: Seismic prices
+    /// a piece by everything it adds to what is held, the process's
+    /// footprint with the device's charges where they lie outside it
+    /// ([`seismic::PieceMemory`]), so its footprint already counts them.
+    /// Counting them again, at the unit's host price
+    /// ([`Self::host_added`]), which keeps the inputs its first piece built
+    /// and its unit has held resident since, refused a DeepSeek V4.1
+    /// routed_experts discovery point of 4.2 MB under 3.8 GB free on Metal
+    /// for its first point's 4.9 GB, and made every other unit give its
+    /// inputs up for it.
     fn shares_host_ceiling(&self) -> bool {
         self.footprint_ceiling_bytes.is_some()
     }
@@ -1640,47 +1652,55 @@ impl TuningMemory {
         Some(seismic::ProcessMemory::footprint_now()?.saturating_sub(self.process_began_bytes?))
     }
 
-    /// The host bytes tuning may still take of host RAM, as `room` reads
-    /// it now: everything held then, heap freed and not yet returned among
-    /// it, already taken. Exceeded where none is left above the reserve;
-    /// unbounded without a room.
+    /// The host bytes tuning may still take of host RAM where it is a
+    /// domain apart, as `room` reads it now: everything held then, heap
+    /// freed and not yet returned among it, already taken. Exceeded where
+    /// none is left above the reserve. Unbounded without a room, and where
+    /// the device's memory is the host's: there [`Self::free`] holds
+    /// everything tuning holds to the one room, which owns all of it, and
+    /// no second host room prices the same bytes again.
     fn host_free(&self, room: Option<RoomNow>) -> allocation::HostRoom {
         match room {
-            None => allocation::HostRoom::Unbounded,
+            None | Some(RoomNow { host_shared: true, .. }) => allocation::HostRoom::Unbounded,
             Some(RoomNow { host_bytes: 0, .. }) => allocation::HostRoom::Exceeded,
             Some(room) => allocation::HostRoom::Free(room.host_bytes),
         }
     }
 
     /// The most a piece of `unit`'s work has added to the process's
-    /// footprint; none before one has run.
-    fn host_added(&self, unit: &str) -> Option<u64> {
+    /// footprint with its inputs `resident`, or building them
+    /// ([`HostAdded`]); none before such a piece has run.
+    fn host_added(&self, unit: &str, resident: bool) -> Option<u64> {
         self.host_added_by_unit
             .iter()
-            .find(|(name, _)| name == unit)
-            .map(|(_, added)| *added)
+            .find(|added| added.unit == unit && added.resident == resident)
+            .map(|added| added.bytes)
     }
 
     /// Record what a piece of `unit`'s work added to the process's
-    /// footprint: the unit's price is the most one has added, and a piece
-    /// that added more than the price it was admitted on is kept as a
-    /// mispricing.
-    fn host_piece(&mut self, unit: &str, added: u64) {
+    /// footprint with its inputs `resident`, or building them: the price
+    /// is the most one has added, and a piece that added more than the
+    /// price it was admitted on is kept as a mispricing.
+    fn host_piece(&mut self, unit: &str, resident: bool, added: u64) {
         match self
             .host_added_by_unit
             .iter_mut()
-            .find(|(name, _)| name == unit)
+            .find(|price| price.unit == unit && price.resident == resident)
         {
-            Some((_, most)) if added > *most => {
+            Some(price) if added > price.bytes => {
                 self.mispriced.push(Mispricing {
                     kind: unit.to_owned(),
-                    priced_bytes: *most,
+                    priced_bytes: price.bytes,
                     added_bytes: added,
                 });
-                *most = added;
+                price.bytes = added;
             }
             Some(_) => {}
-            None => self.host_added_by_unit.push((unit.to_owned(), added)),
+            None => self.host_added_by_unit.push(HostAdded {
+                unit: unit.to_owned(),
+                resident,
+                bytes: added,
+            }),
         }
     }
 
@@ -1694,10 +1714,13 @@ impl TuningMemory {
     }
 
     /// Read `room` into the ceilings the report states: in each domain,
-    /// what tuning holds there now and what is left of it now.
+    /// what tuning holds there now and what is left of it now. Where the
+    /// device's memory is the host's, the two are one domain, whose ceiling
+    /// is the whole footprint's, and host RAM has none of its own.
     fn read_room(&mut self, device: &Device, room: RoomNow) {
         self.ceiling_bytes = Some(self.held(device).saturating_add(room.device_bytes));
-        self.host_ceiling_bytes = Some(self.host_grown().unwrap_or(0).saturating_add(room.host_bytes));
+        self.host_ceiling_bytes =
+            (!room.host_shared).then(|| self.host_grown().unwrap_or(0).saturating_add(room.host_bytes));
         self.footprint_ceiling_bytes =
             room.host_shared.then(|| self.held_whole(device).unwrap_or(0).saturating_add(room.host_bytes));
     }
@@ -1755,7 +1778,7 @@ impl TuningMemory {
     /// The threads the host's room affords compiles that run at once, each
     /// at the price a thread's compile was observed to hold
     /// (`compile_host_bytes`): within host RAM's own room, and within the
-    /// device's room where they share it ([`Self::shared_host_bytes`]);
+    /// device's room where they share it ([`Self::shares_host_ceiling`]);
     /// none where neither bounds them. Before a compile has been observed
     /// no room can be divided by its price, and compiles run one at a time.
     /// Owed work is not refused, so it is afforded one thread at the
@@ -1763,8 +1786,11 @@ impl TuningMemory {
     fn compile_threads(&self, device: &Device, room: Option<RoomNow>) -> Option<usize> {
         let price = self.compile_host_bytes;
         // Compiles are host work of no device bytes: where host RAM's
-        // ceiling is shared, all their bytes take of the device's room.
-        let shared = self.free(device, room).filter(|_| self.shares_host_ceiling());
+        // ceiling is shared, their bytes take of the device's room
+        // ([`allocation::shared_host`]).
+        let shared = self
+            .free(device, room)
+            .filter(|_| allocation::shared_host(self.shares_host_ceiling(), price) > 0);
         let host = match (self.host_free(room), shared) {
             (allocation::HostRoom::Free(host), Some(shared)) => {
                 allocation::HostRoom::Free(host.min(shared))
@@ -2762,6 +2788,11 @@ trait SearchedUnit<'a> {
         tuner: &mut Tuner<'a>,
         before: Duration,
     ) -> Result<Duration, CatalogFailure>;
+    /// The process's footprint once the last piece's inputs were built or
+    /// restored; none before a piece, or where the system reports none.
+    fn resident_footprint(&self) -> Option<u64> {
+        None
+    }
     /// What the unit owes when the optional work stops, priced
     /// ([`allocation::Unit::owed`]).
     fn owed(&self, _worked: bool) -> seismic::Quote {
@@ -2897,6 +2928,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         let device = tuner.device;
         let usage = || device.device_ledger();
         let charged_before = usage().charged;
+        let resident = <Self as allocation::Unit>::holding(self) > 0;
         let host_before = seismic::ProcessMemory::footprint_now();
         let peak_before = seismic::ProcessMemory::footprint_peak();
         device.restart_high_water();
@@ -2909,13 +2941,22 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         // What the piece added at its most: where the footprint's peak
         // rose while it ran, the peak over where it began (with what the
         // compiles in flight took meanwhile, which only prices it higher);
-        // otherwise what it left added when it ended.
+        // otherwise what it left added when it ended. A piece that began
+        // with its unit's inputs resident prices the pieces that will; one
+        // that built them prices building them again, and what it added
+        // beyond them once built prices the pieces that keep them.
         if let Some((before, after)) = host_before.zip(seismic::ProcessMemory::footprint_now()) {
             let most = peak_before
                 .zip(seismic::ProcessMemory::footprint_peak())
                 .filter(|(before, peak)| peak > before)
                 .map_or(after, |(_, peak)| peak.max(after));
-            tuner.memory.host_piece(&unit, most.saturating_sub(before));
+            if resident {
+                tuner.memory.host_piece(&unit, true, most.saturating_sub(before));
+            } else {
+                tuner.memory.host_piece(&unit, false, most.saturating_sub(before));
+                let built = (**self).resident_footprint().map_or(before, |built| built.max(before));
+                tuner.memory.host_piece(&unit, true, most.saturating_sub(built));
+            }
         }
         tuner
             .memory
@@ -2977,11 +3018,11 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
 
     /// The pool of activation noise, twice the largest activation built,
     /// where the host's growth counts against the device's room (the one
-    /// rule, `TuningMemory::shared_host_bytes`). It is generated again when
+    /// rule, [`allocation::Unit::shared_host`]). It is generated again when
     /// a point is next built; its values are pseudo-random either way, and
     /// a point built again is observed again.
     fn spare(tuner: &Tuner<'a>) -> u64 {
-        tuner.memory.shared_host_bytes(tuner.noise.bytes(), 0)
+        Self::shared_host(tuner, tuner.noise.bytes())
     }
 
     fn drop_spare(tuner: &mut Tuner<'a>) {
@@ -3033,12 +3074,19 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         tuner.memory.host_free(tuner.room_now())
     }
 
-    fn shared_host_extra(tuner: &Tuner<'a>, host: u64, device: u64) -> u64 {
-        tuner.memory.shared_host_bytes(host, device)
+    fn shares_host(tuner: &Tuner<'a>) -> bool {
+        tuner.memory.shares_host_ceiling()
+    }
+
+    fn release_rate(tuner: &Tuner<'a>) -> Option<f64> {
+        tuner.room.map(|room| room.release().bytes_per_second())
     }
 
     fn host_footprint(&self, tuner: &Tuner<'a>) -> Option<u64> {
-        tuner.memory.host_added(&unit_name((**self).key()))
+        tuner.memory.host_added(
+            &unit_name((**self).key()),
+            <Self as allocation::Unit>::holding(self) > 0,
+        )
     }
 
     fn compile_host(tuner: &Tuner<'a>) -> u64 {
@@ -3085,6 +3133,9 @@ struct CaseUnit<'a, T: EntryTuning> {
     spent: Duration,
     /// Pieces of optional work performed.
     stages: usize,
+    /// The process's footprint once the last piece's inputs were resident
+    /// ([`seismic::PieceMemory::resident_footprint`]).
+    resident_footprint: Option<u64>,
     /// The next piece's compile, which ran ahead of it, and its price when
     /// it was started.
     formed: Option<FormedAhead>,
@@ -3111,6 +3162,10 @@ fn unit_failure(key: &TuningKey, error: impl ToString) -> CatalogFailure {
 }
 
 impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
+    fn resident_footprint(&self) -> Option<u64> {
+        self.resident_footprint
+    }
+
     fn key(&self) -> &TuningKey {
         &self.key
     }
@@ -3282,6 +3337,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         tuner
             .memory
             .observe(tuner.device, performed.memory.ledger_peak_bytes, room);
+        self.resident_footprint = performed.memory.resident_footprint;
         // A promotion is published with the unit's record as it stands,
         // served from that instant. What a piece measures or
         // judges besides is the unit's in memory and published once, when
@@ -3379,7 +3435,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
                 .terminal()
                 .map_err(|error| unit_failure(&self.key, error))?,
         };
-        let mut tuned = searched_entry(self.key.0, self.key.1.clone(), result, Instant::now());
+        let mut tuned = searched_entry(self.key.0, self.key.1.clone(), result, tuner.budget(), Instant::now());
         if tuner.without_room.contains(&self.key) {
             tuned.stop = Some(SearchStop::NoRoom);
         }
@@ -3729,7 +3785,10 @@ impl<'a> Tuner<'a> {
             .footprint
             .forecast(unit.largest_footprint());
         // And on the host: the most a piece of its unit has added, with
-        // what its compile holds on each of its threads.
+        // what its compile holds on each of its threads. The footprint's
+        // room is bounded only where host RAM's ceiling is shared, so all of
+        // that compile takes of it beside the piece's footprint, which
+        // already counts its host bytes.
         let compile = unit.forming().map_or(0, |forming| {
             self.memory
                 .compile_host_bytes
@@ -3750,7 +3809,7 @@ impl<'a> Tuner<'a> {
                 "footprint",
                 self.memory.footprint_ceiling_bytes,
                 self.memory.held_whole(self.device),
-                charged,
+                charged.saturating_add(compile),
             ),
             room(
                 "host",
@@ -3920,7 +3979,7 @@ impl<'a> Tuner<'a> {
         let began = Instant::now();
         let result = record()?;
         if let (Some(cache), Some(slot)) = (self.context.cache, self.slots.get(key)) {
-            let choice = StoredChoice::of(&result);
+            let choice = StoredChoice::of(&result, self.budget());
             let choice = if self.without_room.contains(key) {
                 choice.without_room()
             } else {
@@ -4581,6 +4640,7 @@ impl<'a> Tuner<'a> {
             share: 0.,
             spent: mandatory,
             stages: 0,
+            resident_footprint: None,
             formed: None,
             forming_quote: Cell::new(None),
             publishing: self.publishing.clone(),
@@ -4672,7 +4732,7 @@ impl<'a> Tuner<'a> {
             // A surveyed unit takes no part in the division of the tuning
             // time: the most a search of it could be given is all of it.
             survey::record(&key, self.budget(), &result).map_err(failure)?;
-            let tuned = searched_entry(entry, bindings, result, began);
+            let tuned = searched_entry(entry, bindings, result, self.budget(), began);
             return Ok(self.finish(key, tuned));
         }
         #[cfg(not(feature = "tuning-survey"))]
@@ -4787,7 +4847,6 @@ impl<'a> Tuner<'a> {
             &digest,
             requirement.activation(),
             shapes,
-            self.budget(),
         ));
         // A fresh preparation searches again and replaces the stored record.
         // Any other serves the stored record under this load's requirement.
@@ -4807,8 +4866,9 @@ impl<'a> Tuner<'a> {
         // the unit's choice only for a load without demand for it: one that
         // serves the unit searches it. The store's key holds no demand.
         let demanded = shapes.iter().any(|shape| shape.weight > 0.);
-        let hit = match stored.filter(|(choice, _)| choice.settled && (choice.demanded || !demanded))
-        {
+        let hit = match stored.filter(|(choice, _)| {
+            choice.settled && (choice.demanded || !demanded) && choice.searched_within(self.budget())
+        }) {
             None => None,
             Some((choice, evidence)) if choice.requirement == requirement => {
                 Some((choice, Receipt::Stored(evidence)))
@@ -4821,7 +4881,7 @@ impl<'a> Tuner<'a> {
                 let choice = StoredChoice {
                     stop: stored.stop,
                     settled: stored.settled,
-                    ..StoredChoice::of(&result)
+                    ..StoredChoice::of(&result, Duration::from_millis(stored.budget_ms))
                 };
                 Some((choice, Receipt::Held(Arc::new(result))))
             }
@@ -5079,12 +5139,14 @@ fn survey_plan(_entry: &str) -> Option<seismic::SurveyPlan> {
 }
 
 /// What a stored tuning result is valid for (§C2), rendered canonically: the
-/// tuning version and budget, the device with its toolchain and driver, the
+/// tuning version, the device with its toolchain and driver, the
 /// unit, the implementation's digest, the definition of its measurements
 /// against the default (the comparison's version and the activation type
 /// subjects are measured against, `activation`), and the shapes it was
-/// measured at. The budget bounds how far the search could reach, so a
-/// result is read only under the budget it was searched within. How it was
+/// measured at. The budget bounds how far the search could reach, so the
+/// record states the one it was searched within and serves any load whose
+/// budget is no larger ([`StoredChoice::searched_within`]), not part of the
+/// key. How it was
 /// otherwise searched (settings, workload weights, the points timed) is not:
 /// a better search never invalidates a result that is still correct; see
 /// [`SEARCH_VERSION`]. Neither is the caller's α: it judges the stored
@@ -5098,7 +5160,6 @@ fn tuning_key_material(
     digest: &str,
     activation: Option<DType>,
     shapes: &[PointShape],
-    budget: Duration,
 ) -> String {
     let mut shapes = shapes
         .iter()
@@ -5106,9 +5167,8 @@ fn tuning_key_material(
         .collect::<Vec<_>>();
     shapes.sort_unstable();
     format!(
-        "tuning {SEARCH_VERSION}\nbudget {} ms\ndevice {}\nentry {entry}\nbindings {bindings}\n\
+        "tuning {SEARCH_VERSION}\ndevice {}\nentry {entry}\nbindings {bindings}\n\
          statics {}\nimplementation {digest}\ncomparison {} steps {activation:?}\nshapes {}",
-        budget.as_millis(),
         device.tuning_identity(),
         FixedValues::of(statics).key_text(),
         seismic::COMPARISON_VERSION,
@@ -5121,9 +5181,10 @@ fn searched_entry(
     entry: &'static str,
     bindings: String,
     result: TuningResult,
+    budget: Duration,
     began: Instant,
 ) -> TunedEntry {
-    let choice = StoredChoice::of(&result);
+    let choice = StoredChoice::of(&result, budget);
     let time = result.time.clone();
     tuned_entry(
         entry,

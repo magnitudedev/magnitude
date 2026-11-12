@@ -35,8 +35,8 @@
 //!   each at its class's price. A class the allocator has not yet run is
 //!   held at what bounds it from what the load has observed ([`Own`]): a
 //!   pass at the longest operation completed, a narrowing at a pass, and a
-//!   unit giving up its inputs at what building them took
-//!   ([`Unit::built`]). Inputs are given up after everything owed is
+//!   unit giving up its inputs at the bytes it frees at the machine's
+//!   rate of freeing memory ([`Own::releases`]). Inputs are given up after everything owed is
 //!   settled, so a release that outruns its price delays no publication.
 //! - Narrowing ([`Unit::narrow`]) is work of the allocator's: a unit's
 //!   piece is narrowed only while the narrowing and everything owed still
@@ -252,6 +252,18 @@ pub(crate) trait Clock {
     fn now(&self) -> Duration;
 }
 
+/// What `host` bytes of host work no piece prices take of the device's room:
+/// all of them where the ceiling is `shares`d, nothing where host RAM is a
+/// domain apart. The one rule, whoever asks: [`Unit::shared_host`] for a
+/// charge, the tuner's compile waves for the room they may fill.
+pub(super) fn shared_host(shares: bool, host: u64) -> u64 {
+    if shares {
+        host
+    } else {
+        0
+    }
+}
+
 /// One tuning unit's optional work. The unit holds a legal published choice
 /// before, between and after every piece of it.
 pub(crate) trait Unit {
@@ -327,7 +339,8 @@ pub(crate) trait Unit {
         givers.iter().map(|giver| units[*giver].holding()).sum()
     }
     /// What building the inputs the unit holds took, priced: what giving
-    /// them up is held to before the load has observed inputs given up.
+    /// them up is held to before the load has observed inputs given up,
+    /// where no rate of freeing memory is known ([`Unit::release_rate`]).
     fn built(&self) -> Quote {
         Quote::default()
     }
@@ -433,18 +446,41 @@ pub(crate) trait Unit {
     {
         HostRoom::Unbounded
     }
-    /// What host work adding `host` bytes, beside device work charging
-    /// `device` bytes, takes of [`Unit::free`] beyond those device bytes:
-    /// nothing where host RAM is a domain apart ([`Unit::host_free`]), and
-    /// where the device's room and host RAM share one ceiling, the host
-    /// bytes that ceiling does not already count among the device's (the
-    /// tuner's rule, `TuningMemory::shared_host_bytes`). A piece fits when
-    /// its device bytes and this together fit [`Unit::free`].
-    fn shared_host_extra(_context: &Self::Context, _host: u64, _device: u64) -> u64
+    /// Whether the device's room and host RAM share one ceiling, which
+    /// [`Unit::free`] then holds all of: host RAM is no domain apart
+    /// ([`Unit::host_free`] is unbounded), a piece's footprint prices
+    /// everything it adds under the ceiling, its host bytes among them, and
+    /// the host bytes of work no piece prices take of [`Unit::free`]
+    /// beside the pieces ([`Unit::shared_host`]).
+    fn shares_host(_context: &Self::Context) -> bool
     where
         Self: Sized,
     {
-        0
+        false
+    }
+    /// The one rule by which host work outside the pieces shares the
+    /// device's room: what `host` bytes added to the process's footprint
+    /// by work no piece's footprint prices (compiles, a spare) take of
+    /// [`Unit::free`]. Where the ceiling is shared ([`Unit::shares_host`])
+    /// all of `host` takes of it; elsewhere host RAM is a domain apart
+    /// ([`Unit::host_free`]) and host work takes nothing of the device's
+    /// room. A piece's own host bytes are never among `host`: its
+    /// footprint already counts them.
+    fn shared_host(context: &Self::Context, host: u64) -> u64
+    where
+        Self: Sized,
+    {
+        shared_host(Self::shares_host(context), host)
+    }
+    /// The bytes a second the machine frees memory at, a generic figure of
+    /// the machine: what giving inputs up is priced by before the load has
+    /// observed a give-up, the bytes it frees at this rate. None where no
+    /// rate is known.
+    fn release_rate(_context: &Self::Context) -> Option<f64>
+    where
+        Self: Sized,
+    {
+        None
     }
     /// What a piece of the unit's work is taken to add to that host domain:
     /// the most one has added. None before a piece of the unit has run:
@@ -662,12 +698,31 @@ impl Own {
         Self::observed(&self.narrowing).unwrap_or_else(|| self.pass(longest))
     }
 
-    /// What `unit` giving up its inputs is held to: the class's price, and
-    /// before any unit gave its inputs up what building them took
-    /// ([`Unit::built`]): it frees what that allocated and writes nothing,
-    /// so building bounds it.
-    fn release<U: Unit>(&self, unit: &U, longest: Duration) -> Duration {
-        Self::observed(&self.releasing).unwrap_or_else(|| forecast(&unit.built(), longest))
+    /// What `holders` giving their inputs up is held to: the class's price
+    /// for each, once a give-up was observed. Before, freeing them is
+    /// priced by the bytes it frees, what their inputs bind together by the
+    /// one account ([`Unit::returned`]), at the rate the machine frees
+    /// memory at ([`Unit::release_rate`]); without a rate, at what building
+    /// them took ([`Unit::built`]): they free what that allocated and write
+    /// nothing, so building bounds them. That bound held a DeepSeek V4.1
+    /// load on GB10 to 33 s of builds for give-ups that take milliseconds,
+    /// and it stopped with 15.5 s of its 60 unused.
+    fn releases<U: Unit>(
+        &self,
+        units: &[U],
+        holders: &[usize],
+        rate: Option<f64>,
+        longest: Duration,
+    ) -> Duration {
+        match (Self::observed(&self.releasing), rate) {
+            (Some(price), _) => price.saturating_mul(holders.len() as u32),
+            (None, Some(rate)) => {
+                Duration::from_secs_f64(U::returned(units, holders) as f64 / rate)
+            }
+            (None, None) => holders.iter().fold(Duration::ZERO, |sum, holder| {
+                sum.saturating_add(forecast(&units[*holder].built(), longest))
+            }),
+        }
     }
 }
 
@@ -954,12 +1009,10 @@ pub(crate) fn allocate<U: Unit>(
         // that then holds inputs giving them up, `working` among them.
         // A unit that holds none now is held to the class's price alone:
         // what its piece builds is in the piece's own price.
-        let releases = units
-            .iter()
-            .filter(|unit| unit.holding() > 0)
-            .fold(Duration::ZERO, |sum, unit| {
-                sum.saturating_add(own.release(unit, longest))
-            });
+        let holders = (0..units.len())
+            .filter(|unit| units[*unit].holding() > 0)
+            .collect::<Vec<_>>();
+        let releases = own.releases(units, &holders, U::release_rate(context), longest);
         let ending = (0..units.len())
             .map(|working| {
                 let joining = if units[working].holding() == 0 {
@@ -1057,6 +1110,12 @@ pub(crate) fn allocate<U: Unit>(
                     .forecast(units[flight.unit].largest_footprint()),
             )
         });
+        // What the compiles in flight hold on the host, which no piece's
+        // footprint prices: a compile that has ended holds nothing more.
+        let flying_compiles = flights
+            .iter()
+            .filter(|flight| flight.formed.is_none())
+            .fold(0u64, |sum, flight| sum.saturating_add(flight.compile_host));
         // A dependant's discovery reads nothing of its prerequisites. Its
         // other work reads their choices, once their defaults are measured,
         // no lead of theirs awaits conversion and no work of theirs is in
@@ -1187,10 +1246,12 @@ pub(crate) fn allocate<U: Unit>(
             let device = U::free(context).is_some()
                 && work.footprint.unpriced > 0
                 && units[unit].largest_footprint().is_none();
-            let host = U::host_free(context) != HostRoom::Unbounded
-                && (units[unit].host_footprint(context).is_none()
-                    || (ahead(&work) && U::compile_host(context).max(workers.compile_host()) == 0));
-            device || host
+            let host_apart = U::host_free(context) != HostRoom::Unbounded;
+            let host = host_apart && units[unit].host_footprint(context).is_none();
+            let compile = (host_apart || U::shares_host(context))
+                && ahead(&work)
+                && U::compile_host(context).max(workers.compile_host()) == 0;
+            device || host || compile
         });
         if let Some((unit, _)) = choice {
             if unpriced && flights.iter().any(|flight| flight.unpriced) {
@@ -1206,32 +1267,25 @@ pub(crate) fn allocate<U: Unit>(
             // piece in flight, which is no less than what each has yet to
             // add.
             let host = units[unit].host_footprint(context).unwrap_or(0);
-            let flying_host = flights.iter().fold(0u64, |sum, flight| {
-                // A compile that has ended holds nothing more.
+            let flying_host = flights.iter().fold(flying_compiles, |sum, flight| {
                 sum.saturating_add(units[flight.unit].host_footprint(context).unwrap_or(0))
-                    .saturating_add(if flight.formed.is_none() {
-                        flight.compile_host
-                    } else {
-                        0
-                    })
             });
-            let free = |context: &U::Context| {
-                let device = work.footprint.forecast(largest);
-                let extra = U::shared_host_extra(
-                    context,
-                    host.saturating_add(flying_host),
-                    device.saturating_add(flying_bytes),
-                );
-                U::free(context).map(|free| free.saturating_sub(flying_bytes).saturating_sub(extra))
+            // What is free for the piece once `returned` more is: the pieces
+            // in flight and, where the ceiling is shared, the compiles' host
+            // bytes are taken from what is free with it.
+            let extra = U::shared_host(context, flying_compiles);
+            let free = |context: &U::Context, returned: u64| {
+                U::free(context).map(|free| {
+                    free.saturating_add(returned).saturating_sub(flying_bytes).saturating_sub(extra)
+                })
             };
             let host_fits = |context: &U::Context| U::host_free(context).admits(host, flying_host);
             // Before any unit gives up inputs it would build again, the
             // load gives back what it holds for nothing.
-            if !work.footprint.fits(free(context), largest) || !host_fits(context) {
+            if !work.footprint.fits(free(context, 0), largest) || !host_fits(context) {
                 U::reclaim(context);
             }
-            let free = free(context);
-            if !work.footprint.fits(free, largest) || !host_fits(context) {
+            if !work.footprint.fits(free(context, 0), largest) || !host_fits(context) {
                 let worth = |holder: usize| {
                     offers
                         .iter()
@@ -1270,10 +1324,7 @@ pub(crate) fn allocate<U: Unit>(
                     .collect::<Vec<_>>();
                 let victim = (if returning.is_empty() { holders } else { returning })
                     .into_iter()
-                    .filter(|_| {
-                        work.footprint
-                            .fits(free.map(|free| free.saturating_add(given_up)), largest)
-                    })
+                    .filter(|_| work.footprint.fits(free(context, given_up), largest))
                     .min_by(|left, right| worth(*left).total_cmp(&worth(*right)));
                 // The unit whose own next work is worth least gives up
                 // first: its programs, and when it holds none, its inputs.
@@ -1285,16 +1336,15 @@ pub(crate) fn allocate<U: Unit>(
                             give_up_inputs(units, victim, context, clock, &mut own, &mut report);
                     }
                     None if spare > 0
-                        && work.footprint.fits(
-                            free.map(|free| free.saturating_add(given_up).saturating_add(spare)),
-                            largest,
-                        ) =>
+                        && work
+                            .footprint
+                            .fits(free(context, given_up.saturating_add(spare)), largest) =>
                     {
                         U::drop_spare(context);
                     }
                     None => {
                         starved[unit] = Some(Starved {
-                            free,
+                            free: free(context, 0),
                             given_up: given_up.saturating_add(spare),
                         })
                     }
@@ -1344,22 +1394,18 @@ pub(crate) fn allocate<U: Unit>(
                 .host_footprint(context)
                 .unwrap_or(0)
                 .saturating_add(compile_host);
-            let flying = flights.iter().fold(0u64, |sum, flight| {
+            let flying = flights.iter().fold(flying_compiles, |sum, flight| {
                 sum.saturating_add(units[flight.unit].host_footprint(context).unwrap_or(0))
-                    .saturating_add(if flight.formed.is_none() {
-                        flight.compile_host
-                    } else {
-                        0
-                    })
             });
             let fits = |context: &U::Context| {
                 let device = work
                     .footprint
                     .forecast(units[*unit].largest_footprint())
                     .saturating_add(flying_bytes);
-                let extra = U::shared_host_extra(context, piece.saturating_add(flying), device);
+                let extra = U::shared_host(context, compile_host.saturating_add(flying_compiles));
                 U::host_free(context).admits(piece, flying)
-                    && U::free(context).is_none_or(|free| device.saturating_add(extra) <= free)
+                    && U::free(context)
+                        .is_none_or(|free| device.saturating_add(extra) <= free)
             };
             if !fits(context) {
                 if !flights.is_empty() {
@@ -1905,7 +1951,9 @@ mod tests {
         programs_held: u64,
         given_up: usize,
         /// Host bytes the unit's inputs hold beside their bytes on the
-        /// device, where host RAM is a domain of its own.
+        /// device: a domain of their own, or where host RAM's ceiling is
+        /// shared ([`Memory::shared_host`]), in the piece's footprint that
+        /// builds them, as Seismic prices what a piece adds to what is held.
         host: u64,
         /// The inputs other units bind too that the unit's inputs bind
         /// ([`SHARED`]): held once while any unit binding them is
@@ -1914,6 +1962,9 @@ mod tests {
         /// The bytes each discovered point after the first adds to the
         /// unit's own inputs.
         later: u64,
+        /// What building the unit's inputs took, as its built quote
+        /// states it while they are resident ([`Unit::built`]).
+        rebuild: Duration,
     }
 
     /// The bytes the synthetic units hold, the most they held, the ceiling
@@ -1935,6 +1986,8 @@ mod tests {
         /// was dropped.
         spare: u64,
         dropped: usize,
+        /// The bytes a second the machine frees memory at, when known.
+        release_rate: Option<f64>,
     }
 
     thread_local! {
@@ -1954,6 +2007,7 @@ mod tests {
                 shared_host: false,
                 spare: 0,
                 dropped: 0,
+                release_rate: None,
             })
         };
     }
@@ -2013,6 +2067,7 @@ mod tests {
                 host: 0,
                 shared: Vec::new(),
                 later: 0,
+                rebuild: Duration::ZERO,
             }
         }
 
@@ -2033,13 +2088,18 @@ mod tests {
 
         /// What the next piece adds to the bytes held: the unit's inputs,
         /// when they are not resident, with what no resident unit binds of
-        /// those it shares; and a later point's own inputs when it
-        /// discovers one.
+        /// those it shares and, where host RAM's ceiling is shared, their
+        /// host bytes; and a later point's own inputs when it discovers one.
         fn footprint(&self) -> seismic::Footprint {
             let building = if self.resident {
                 0
             } else {
-                self.own() + self.unbound()
+                let host = if MEMORY.with(Cell::get).shared_host {
+                    self.host
+                } else {
+                    0
+                };
+                self.own() + self.unbound() + host
             };
             let point = if (1..self.points).contains(&self.discovered) {
                 self.later
@@ -2199,6 +2259,14 @@ mod tests {
             });
         }
 
+        fn built(&self) -> Quote {
+            priced(if self.resident {
+                self.rebuild
+            } else {
+                Duration::ZERO
+            })
+        }
+
         fn holding(&self) -> u64 {
             if !self.resident {
                 return 0;
@@ -2244,7 +2312,7 @@ mod tests {
 
         fn host_free(_: &Log) -> HostRoom {
             let memory = MEMORY.with(Cell::get);
-            match memory.host_ceiling {
+            match memory.host_ceiling.filter(|_| !memory.shared_host) {
                 None => HostRoom::Unbounded,
                 Some(ceiling) => ceiling
                     .checked_sub(memory.host)
@@ -2256,12 +2324,12 @@ mod tests {
             Some(if self.resident { 0 } else { self.host })
         }
 
-        fn shared_host_extra(_: &Log, host: u64, _: u64) -> u64 {
-            if MEMORY.with(Cell::get).shared_host {
-                host
-            } else {
-                0
-            }
+        fn shares_host(_: &Log) -> bool {
+            MEMORY.with(Cell::get).shared_host
+        }
+
+        fn release_rate(_: &Log) -> Option<f64> {
+            MEMORY.with(Cell::get).release_rate
         }
 
         fn programs(&self) -> u64 {
@@ -4240,6 +4308,117 @@ mod tests {
              gate_up's 1925 and down's 727 return nothing while \
              routed_experts binds them, and are kept"
         );
+    }
+
+    /// A load capped to the room its tuning needs still tunes in full:
+    /// under a ceiling host RAM shares with the device, every unit's
+    /// discovery is admitted, each unit's inputs are built once and none is
+    /// given up. routed_experts binds the expert weights routed_gate_up and
+    /// routed_down built, and its pieces' host bytes are priced once, in
+    /// their footprint: a DeepSeek V4.1 load on Metal priced its second
+    /// discovery point's 4.2 MB with its first point's 4.9 GB of host
+    /// growth again, refused it under 3.8 GB free, and every other unit
+    /// gave its inputs up for it, the expert weights among them.
+    #[test]
+    fn a_capped_load_admits_every_discovery_with_host_bytes_counted_once() {
+        let clock = Fake::default();
+        SHARED.with(|shared| {
+            *shared.borrow_mut() = BTreeMap::from([(0, (1925, 0)), (1, (727, 0))]);
+        });
+        let unit = |name, share, shared: &[usize]| Synthetic {
+            shared: shared.to_vec(),
+            ..Synthetic::new(name, &clock, share, &[1.])
+        };
+        let mut units = [
+            Synthetic {
+                host: 40,
+                ..unit(0, 0.3, &[0])
+            },
+            Synthetic {
+                host: 20,
+                ..unit(1, 0.2, &[1])
+            },
+            Synthetic {
+                inputs: 61,
+                host: 30,
+                ..unit(2, 0.1, &[])
+            },
+            Synthetic {
+                inputs: 250,
+                host: 240,
+                later: 4,
+                points: 6,
+                ..unit(3, 0.4, &[0, 1])
+            },
+        ];
+        // The cap: what every unit's inputs and host bytes take together,
+        // the expert weights once, and nothing more.
+        let ceiling = 1925 + 727 + 61 + 250 + 5 * 4 + 40 + 20 + 30 + 240;
+        MEMORY.with(|memory| {
+            memory.set(Memory {
+                ceiling: Some(ceiling),
+                shared_host: true,
+                ..Memory::default()
+            })
+        });
+        let (_, report) = run(&mut units, &clock, 600);
+        let memory = MEMORY.with(Cell::take);
+        SHARED.with(|shared| shared.borrow_mut().clear());
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(units[3].discovered, 6, "routed_experts discovered every point");
+        assert!(
+            units.iter().all(|unit| unit.measured.len() == 1),
+            "every unit was tuned"
+        );
+        assert!(
+            units.iter().all(|unit| unit.built == 1 && unit.given_up == 0),
+            "each unit built its inputs once and gave nothing up for another's piece"
+        );
+        assert!(
+            memory.peak + memory.host_peak <= ceiling,
+            "{} and {} held over {ceiling}",
+            memory.peak,
+            memory.host_peak
+        );
+    }
+
+    /// Before a give-up is observed, the ending holds giving inputs up
+    /// at the bytes it frees, at the machine's rate of freeing memory: a
+    /// DeepSeek V4.1 load on GB10 held 33 s of builds back for give-ups
+    /// that take milliseconds and stopped with 15.5 s of 60 unused. Three
+    /// units whose inputs took 10 s each to build: with their builds as the
+    /// bound, 30 s stand against the 17 s left once they are discovered and
+    /// nothing more starts; priced by the 3 kB they free at 1 MB/s, every
+    /// unit is tuned, and no unit gives up inputs to learn what that costs.
+    #[test]
+    fn an_unobserved_give_up_is_priced_by_the_bytes_it_frees() {
+        let tune = |release_rate: Option<f64>| {
+            let clock = Fake::default();
+            let mut units = (0..3)
+                .map(|name| Synthetic {
+                    inputs: 1000,
+                    rebuild: SECOND * 10,
+                    ..Synthetic::new(name, &clock, 0.3, &[0.5])
+                })
+                .collect::<Vec<_>>();
+            MEMORY.with(|memory| {
+                memory.set(Memory {
+                    release_rate,
+                    ..Memory::default()
+                })
+            });
+            let (_, report) = run(&mut units, &clock, 20);
+            MEMORY.with(Cell::take);
+            (units, report)
+        };
+        let (units, report) = tune(None);
+        assert!(!report.refused.is_empty(), "the builds as the bound leave nothing to start");
+        assert!(units.iter().all(|unit| unit.served == 1.));
+        let (units, report) = tune(Some(1e6));
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert!(units.iter().all(|unit| unit.served == 0.5), "every unit was tuned");
+        assert!(units.iter().all(|unit| unit.built == 1), "no inputs given up to learn a price");
+        assert!(report.ended <= SECOND * 20);
     }
 
     /// A unit stopped by the room, not by the budget, is told so, and what

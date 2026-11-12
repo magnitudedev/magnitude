@@ -993,6 +993,12 @@ pub struct PieceMemory {
     /// process is the process's footprint, from before the load's tuning
     /// began.
     pub ledger_peak_bytes: u64,
+    /// The process's footprint once the piece's inputs were built or
+    /// restored: what its operations added to the host beyond the inputs
+    /// it keeps resident is its footprint's peak over this, as
+    /// [`NativeSearch::largest_footprint`] prices them on the device. None
+    /// where the system reports no footprint.
+    pub resident_footprint: Option<u64>,
 }
 
 impl PieceMemory {
@@ -4492,18 +4498,22 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // there, its point priced at what the build demanded: the piece is
         // offered again at that price ([`build_point`]).
         let mut resident = self.held();
+        let mut resident_footprint = None;
         let attempted = (|| -> Result<(bool, bool), WorkError<TuneError>> {
             deadline.check(Duration::ZERO)?;
             let restored = work.stage == Stage::Discovery || self.restore(source, deadline)?;
-            host = host.max(ProcessMemory::footprint_now());
+            let restored_footprint = ProcessMemory::footprint_now();
+            host = host.max(restored_footprint);
             resident = self.held();
+            resident_footprint = restored_footprint;
             Ok(match work.stage {
                 _ if !restored => (false, false),
                 Stage::Discovery => match self.discover(source, deadline)? {
                     // Its inputs, once built, are resident: what the
                     // defaults' measurement adds is over them.
-                    Some(inputs) => {
+                    Some((inputs, footprint)) => {
                         resident = inputs;
+                        resident_footprint = footprint;
                         (true, false)
                     }
                     None => (false, false),
@@ -4582,6 +4592,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     .ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
+            resident_footprint,
         };
         // What the piece's operations added beyond the inputs it kept
         // resident.
@@ -4625,7 +4636,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         &mut self,
         source: &mut dyn PointSource<'a>,
         deadline: Deadline,
-    ) -> Result<Option<u64>, WorkError<TuneError>> {
+    ) -> Result<Option<(u64, Option<u64>)>, WorkError<TuneError>> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
@@ -4647,6 +4658,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         let built = building.elapsed().as_secs_f64();
         let resident = self.held();
+        let resident_footprint = ProcessMemory::footprint_now();
         self.builds[index].observe(built);
         self.time.building_seconds += built;
         let ground = self
@@ -4730,7 +4742,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             self.longest = self.longest.max(planning.elapsed().as_secs_f64());
             opened?;
         }
-        Ok(Some(resident))
+        Ok(Some((resident, resident_footprint)))
     }
 
     /// Every discovery point is measured: fix the objective and plan the

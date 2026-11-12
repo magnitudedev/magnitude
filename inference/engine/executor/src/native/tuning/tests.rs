@@ -449,7 +449,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
 fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
     let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
-    let measured = |shapes: &[PointShape], activation, budget: Duration| {
+    let measured = |shapes: &[PointShape], activation| {
         tuning_key_material(
             &device,
             "dense_output",
@@ -458,12 +458,9 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
             "same-implementation",
             activation,
             shapes,
-            budget,
         )
     };
-    let budgeted =
-        |shapes: &[PointShape], budget: Duration| measured(shapes, Some(DType::BF16), budget);
-    let key = |shapes: &[PointShape]| budgeted(shapes, STANDARD_TUNING_BUDGET);
+    let key = |shapes: &[PointShape]| measured(shapes, Some(DType::BF16));
     let shapes = row_points(LIMITS);
     // Weights and order steer how a search spends its time, not what its
     // result is valid for.
@@ -486,13 +483,8 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
         "comparison {} steps Some(BF16)\n",
         seismic::COMPARISON_VERSION
     )));
-    assert_ne!(
-        key(&shapes),
-        measured(&shapes, Some(DType::F16), STANDARD_TUNING_BUDGET)
-    );
+    assert_ne!(key(&shapes), measured(&shapes, Some(DType::F16)));
     assert!(!key(&shapes).contains("profile") && !key(&shapes).contains("alpha"));
-    // A result searched within one budget is never read under another.
-    assert_ne!(key(&shapes), budgeted(&shapes, STANDARD_TUNING_BUDGET * 2));
 }
 
 #[test]
@@ -2360,7 +2352,8 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     assert_eq!(researched.origin, TuningOrigin::Searched);
     assert!(started && progressed && !fresh.seen.borrow().is_empty());
     assert_eq!(stored_results(), 5);
-    // A result is read only under the budget it was searched within.
+    // A result serves a load whose budget is no larger than the one it was
+    // searched within, and nothing is stored for it.
     let rebudgeted = FakeCase::new(&implementation, &statics, "implementation a");
     let half = TuningSettings {
         budget: STANDARD_TUNING_BUDGET / 2,
@@ -2368,9 +2361,9 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     };
     assert_eq!(
         load_with(&rebudgeted, limits, half).0.origin,
-        TuningOrigin::Searched
+        TuningOrigin::Stored
     );
-    assert_eq!(stored_results(), 6);
+    assert_eq!(stored_results(), 5);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -3243,7 +3236,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         coverage: None,
         default_launches: Vec::new(),
     };
-    cache.store_tuning(&key, &StoredChoice::of(&record), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
     assert!(
         cache.tuning::<StoredChoice>(&key).is_some(),
         "the stored choice parses"
@@ -3257,7 +3250,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         "an invalid terminal choice must fail without another tuning allowance"
     );
     record.overall = configuration(&defaults);
-    cache.store_tuning(&key, &StoredChoice::of(&record), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
     assert!(
         tuner
             .stored(&case, &statics, &points)
@@ -3283,6 +3276,13 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     assert_eq!(
         hit.0.overall, record.overall,
         "the valid replacement remains a cache hit"
+    );
+    // A record whose search stopped for want of room is the machine's
+    // moment, not the unit's: a search searches the unit again.
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record);
+    assert!(
+        tuner.stored(&case, &statics, &inactive_points).unwrap().unwrap().2.is_none(),
+        "a record stopped for want of room is no cache hit"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -3744,33 +3744,41 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             magnitude_artifacts::gguf::Encoding::Q4_0,
             18,
         );
-        let draft = crate::ExecutionPlanner::prepare(
-            &selected,
-            &manifest,
-            &definition,
-            crate::ComponentSelection { head: false, vision: false },
-            crate::ExecutionPath::Native,
-            crate::PlannedMethod::Plain,
-            magnitude_state::KvCodec::Dense,
-            crate::ResourceLimits {
-                max_launch_rows: 2,
-                max_launch_slots: 2,
-                max_selected_rows: 2,
-                max_drafting_slots: 2,
-                exported_logits_rows: 0,
-                max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
-                max_image_cells: 0,
-                lookahead: false,
-                chain_capacity: std::num::NonZeroUsize::MIN,
-                conversations: std::num::NonZeroUsize::MIN,
-            },
-        )
-        .unwrap()
-        .streaming::<crate::AssessmentMemoryCharge>(&definition, None)
-        .unwrap()
-        .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
-        .unwrap()
-        .into_draft();
+        let plan = |bound: Option<crate::WeightBound>| {
+            crate::ExecutionPlanner::prepare(
+                &selected,
+                &manifest,
+                &definition,
+                crate::ComponentSelection { head: false, vision: false },
+                crate::ExecutionPath::Native,
+                crate::PlannedMethod::Plain,
+                magnitude_state::KvCodec::Dense,
+                crate::ResourceLimits {
+                    max_launch_rows: 2,
+                    max_launch_slots: 2,
+                    max_selected_rows: 2,
+                    max_drafting_slots: 2,
+                    exported_logits_rows: 0,
+                    max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                    max_image_cells: 0,
+                    lookahead: false,
+                    chain_capacity: std::num::NonZeroUsize::MIN,
+                    conversations: std::num::NonZeroUsize::MIN,
+                },
+            )
+            .unwrap()
+            .streaming::<crate::AssessmentMemoryCharge>(&definition, bound)
+            .unwrap()
+            .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
+            .unwrap()
+            .into_draft()
+        };
+        // The experts stream only where the weights do not all fit: capped at
+        // the load's weights less half its experts, so the bank holds half.
+        let whole = plan(None);
+        let experts = whole.load().expert_bank().expect("a routed load banks its experts");
+        let cap = whole.load().weight_bytes().unwrap() - experts.slot_bytes().unwrap() * (experts.widest().get() / 2);
+        let draft = plan(Some(crate::WeightBound::Cap(cap)));
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
         let observer = Finished(RefCell::new(Vec::new()));
         crate::AttestedPrograms::search_draft(
@@ -3904,4 +3912,54 @@ fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
     assert_eq!(compile_wave_price(Some(20 * GB), Some(20 * GB), 4), None);
     assert_eq!(compile_wave_price(None, Some(12 * GB), 4), None);
     assert_eq!(compile_wave_price(Some(20 * GB), None, 4), None);
+}
+
+/// A DeepSeek V4.1 load on Metal refused routed_experts' second discovery
+/// point, 4.2 MB, under 3.8 GB free: the room its host growth shares with
+/// the device was priced again at the unit's host price, and that price
+/// kept the 4.9 GB its first point added building the inputs it still
+/// held. Where the device's memory is the host's, one room holds
+/// everything (no host room of its own prices the same bytes again), and
+/// only host work no piece prices, the compiles', takes of it beside a
+/// piece; and a unit's host price with its inputs resident leaves them out.
+#[test]
+fn a_shared_ceiling_is_one_room_and_host_prices_leave_resident_inputs_out() {
+    const GB: u64 = 1 << 30;
+    const UNIT: &str = "routed_experts [EGW=mxfp4g32@rows32,EUW=mxfp4g32@rows32,EDW=mxfp4g32@rows32,A=bf16]";
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let shared_room = RoomNow { device_bytes: 35 * GB, host_bytes: 44 * GB, host_shared: true };
+    let mut shared = TuningMemory::default();
+    shared.read_room(&device, shared_room);
+    assert_eq!(shared.host_ceiling_bytes, None, "no second host ceiling");
+    assert_eq!(shared.host_free(Some(shared_room)), allocation::HostRoom::Unbounded, "no second host room");
+    assert!(shared.shares_host_ceiling(), "a compile takes of the one room");
+    let apart_room = RoomNow { device_bytes: 24 * GB, host_bytes: 44 * GB, host_shared: false };
+    let mut apart = TuningMemory::default();
+    apart.read_room(&device, apart_room);
+    assert!(apart.host_ceiling_bytes.is_some());
+    assert_eq!(apart.host_free(Some(apart_room)), allocation::HostRoom::Free(44 * GB));
+    assert!(!apart.shares_host_ceiling(), "host RAM a domain apart");
+
+    // The first point built the inputs; the pieces that keep them are
+    // priced by what they add beyond them.
+    shared.host_piece(UNIT, false, 4_875_716_312);
+    shared.host_piece(UNIT, true, 4_241_100);
+    assert_eq!(shared.host_added(UNIT, true), Some(4_241_100));
+    assert_eq!(shared.host_added(UNIT, false), Some(4_875_716_312));
+    assert!(shared.mispriced.is_empty());
+}
+
+/// A search that ended at its budget serves any load whose budget is no
+/// larger, and none whose budget is larger; one that ended for another
+/// reason (it ran to its end, or was no search) serves every budget.
+#[test]
+fn a_record_serves_any_budget_no_larger_than_the_one_searched() {
+    use super::record::reached_within;
+    let seconds = Duration::from_secs;
+    let expired = Some(SearchStop::Expired);
+    assert!(reached_within(expired, 900_000, seconds(60)) && reached_within(expired, 900_000, seconds(900)));
+    assert!(!reached_within(expired, 900_000, seconds(901)));
+    assert!(reached_within(Some(SearchStop::Exhausted), 60_000, seconds(3600)));
+    assert!(reached_within(None, 0, seconds(3600)));
 }
