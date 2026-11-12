@@ -1,7 +1,10 @@
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_decode: split-KV decode attention over dense history. The Vulkan
 // form of `metal/attention_decode.metal` over `lib/attention/attention.glsl`.
-#define ATTENTION_HEADS uint(SEISMIC_DIM_G / SEISMIC_TUNE_SLICES)
+// A workgroup's query heads: one of the vector form's GROUPS groups of the
+// kv head's G (all G at GROUPS 1); SLICES slices of them, one a subgroup.
+#define ATTENTION_HEAD_GROUP uint(SEISMIC_DIM_G / SEISMIC_TUNE_GROUPS)
+#define ATTENTION_HEADS (ATTENTION_HEAD_GROUP / uint(SEISMIC_TUNE_SLICES))
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
@@ -25,6 +28,10 @@
 // branch).
 #include "lib/attention/history.glsl"
 
+attention_history decode_history() {
+    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+}
+
 #if SEISMIC_TUNE_MATRIX
 // The grouped-query matrix form: the prefill body's L2 over decode rows
 // (`lib/attention/prefill.glsl`, PREFILL_DECODE), 16 matrix rows per
@@ -43,10 +50,6 @@
 #define PREFILL_PICK_PLANE SEISMIC_PTR(SEISMIC_BUFFER_SELECTED)
 #define PREFILL_PICK_SLAB_ROWS uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS)
 #include "lib/attention/prefill.glsl"
-
-attention_history decode_history() {
-    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
-}
 
 // L1's planes (`attention_decode_prepare`, which runs only where
 // PREFILL_PREPARED): the queries, the fresh keys and values.
@@ -70,67 +73,124 @@ void attention_decode_merge() { prefill_decode_merge(); }
 #endif
 
 // Keys each subgroup loads before scoring them, so their loads are in flight
-// together.
-#define DECODE_BATCH 4u
+// together (fewer for wide heads, whose key and value columns fill the
+// registers next to the queries and outputs).
+#define DECODE_BATCH (ATTENTION_E >= 16u ? 2u : 4u)
+// A row's index-list picks (KS), the last keys of its sequence.
+#define DECODE_PICKS uint(SEISMIC_DIM_KS)
 
-// L1: workgroup (kv head, partition, row). A row's visible keys, in order
-// (spans, then its fresh span), split into equal partitions of
-// attention_partition_span keys; each subgroup scans a contiguous sub-range
-// (its key group) of its partition for the query heads of its slice
-// (`attention_slice`), so each key/value row is loaded once per slice. Scores
-// are F32 in the exp2 domain (scale * log2e folded into the query). The
-// subgroup states merge in fixed order into one partial per (row, query head,
-// partition): the unnormalized output relative to the partition maximum, and
-// (maximum, denominator). Partition 0 of a layer with fresh rows also appends
-// the row's key and value at its destination.
+// Key `position` of `row`'s sequence (at or past the cursor's,
+// `attention_cursor`) for `kv_head`, lane `lane`'s E columns, into `k` and
+// `v`: a history row from the cursor's slab, whose kv head's key and value
+// rows start at `keys` and `values` (resolved again only when the cursor's
+// slab moves), a fresh row exactly as it is appended (`history_fresh_row`),
+// or a pick from the selected plane read as key and value. A stored-key value
+// is the key. Returns whether the key is attended: a pick of -1 is not (its
+// columns are zero).
+bool decode_read(inout attention_cursor c, inout uint64_t keys, inout uint64_t values, uint64_t row, uint kv_head,
+    uint position, out float k[ATTENTION_E], out float v[ATTENTION_E]) {
+    bool moved;
+    const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, DECODE_PICKS, uint64_t(SEISMIC_PARAM_SLAB_ROWS),
+        position, moved);
+    const uint lane = SEISMIC_LANE;
+    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const uint64_t head_bytes = uint64_t(ATTENTION_W) * act_bytes;
+    const uint64_t row_bytes = uint64_t(ATTENTION_KV) * head_bytes;
+    if (c.span < SEISMIC_DIM_R) {
+        if (moved) {
+            const attention_history h = decode_history();
+            keys = slab_region(h.key, c.slab) + uint64_t(kv_head) * head_bytes;
+            values = slab_region(h.value, c.slab) + uint64_t(kv_head) * head_bytes;
+        }
+        const uint64_t at = (index - c.slab_lo) * row_bytes;
+        attention_load_row(keys + at, uint64_t(lane) * ATTENTION_E, k);
+        if (ATTENTION_STORED_KEY)
+            v = k;
+        else
+            attention_load_row(values + at, uint64_t(lane) * ATTENTION_E, v);
+        return true;
+    }
+    if (c.span == SEISMIC_DIM_R) {
+        history_fresh_row(true, index, kv_head, lane, k);
+        if (ATTENTION_STORED_KEY)
+            v = k;
+        else
+            history_fresh_row(false, index, kv_head, lane, v);
+        return true;
+    }
+    const int pick = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED_ROWS) + (row * DECODE_PICKS + index) * 4ul);
+    if (pick < 0) {
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
+            k[i] = 0.0;
+            v[i] = 0.0;
+        }
+        return false;
+    }
+    attention_load_row(history_address(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(pick),
+        uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS), row_bytes, head_bytes, kv_head), uint64_t(lane) * ATTENTION_E, k);
+    v = k;
+    return true;
+}
+
+// L1: workgroup (kv head and head group, partition, row). A row's key
+// sequence (its visible spans, its fresh span, then its KS picks) splits into
+// equal partitions of attention_partition_span keys. The workgroup's group
+// of ATTENTION_HEAD_GROUP query heads (one of GROUPS groups of the kv head's
+// G) splits into SLICES slices of ATTENTION_HEADS heads; each subgroup scans a
+// contiguous sub-range (its key group) of its partition for the heads of its
+// slice (`attention_slice`), so each key/value row is loaded once per slice.
+// Scores are F32 in the exp2 domain (scale * log2e folded into the query).
+// The subgroup states merge in fixed order into one partial per (row, query
+// head, partition): the unnormalized output relative to the partition
+// maximum, and (maximum, denominator). Partition 0 of the first head group of
+// a layer with fresh rows also appends the row's key and value at its
+// destination.
 //
-// Shared words: the subgroup states [SIMDS][G / SLICES][2] (floats), then the
-// prepared queries [ceil(G / 2)][W] (two activation-dtype heads per word),
-// which the merge columns [SIMDS][W] (floats) alias: every subgroup has read
-// its queries before the publication's first barrier.
+// A key group's keys absorb in batches of DECODE_BATCH at fixed positions
+// first + i * DECODE_BATCH of its row's sequence, then one at a time: a key's
+// batch, and so the row's reduction order, depends on its position alone,
+// never on which keys are still fresh (how many rows share the launch) or
+// where its spans, slabs and picks fall; and a fresh key and value are
+// attended exactly as they are appended.
+//
+// Shared words: the subgroup states [SIMDS][ATTENTION_HEADS][2] (floats),
+// then the group's prepared queries [ceil(HEAD_GROUP / 2)][W] (two
+// activation-dtype heads per word), which the merge columns [SIMDS][W]
+// (floats) alias: every subgroup has read its queries before the
+// publication's first barrier.
 void attention_decode_partial() {
-    const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
-    const uint64_t value = SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
     const uint64_t query_norm = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM);
-    const uint64_t key_norm = SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM);
     const uint64_t components = SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS);
     const uint64_t frequencies = SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES);
     const uint64_t amplitudes = ATTENTION_AMPLITUDE_BUFFER;
-    const uint64_t coordinates = SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES);
     const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
     const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
-    const uint64_t destinations = SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS);
-    const uint64_t history_key = SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY);
-    const uint64_t history_value = SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE);
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
+    const uint GROUP = ATTENTION_HEAD_GROUP;
     const uint simds = SEISMIC_SUBGROUPS, sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
     const uint64_t spans = SEISMIC_DIM_R;
-    const uint kv_head = gl_WorkGroupID.x;
+    const uint kv_head = gl_WorkGroupID.x / (G / GROUP);
+    const uint head_base = gl_WorkGroupID.x % (G / GROUP) * GROUP;
     const uint part = gl_WorkGroupID.y;
     const uint64_t row = gl_WorkGroupID.z;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
-    const uint64_t row_coordinates = coordinates + row * 16ul;
+    const uint64_t row_coordinates = SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul;
     const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
 
-    if (ATTENTION_FRESH && part == 0u && sg < 2u) {
-        const int destination = element_i32_at(destinations + row * 4ul);
+    // Subgroup 0 appends the key, subgroup 1 the value (none for a
+    // stored-key history).
+    if (ATTENTION_FRESH && part == 0u && head_base == 0u && sg < (ATTENTION_STORED_KEY ? 1u : 2u)) {
+        const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
         if (destination >= 0) {
-            const uint64_t source = (row * KV + kv_head) * W;
             float x[ATTENTION_E];
-            if (sg == 0u)
-                attention_prepare(key + source * act_bytes, ATTENTION_NORM, key_norm,
-                    row_coordinates, components, frequencies, amplitudes, epsilon, lane, ATTENTION_KEY_ROUNDING, x);
-            else
-                attention_value(value + source * act_bytes, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
-            const uint64_t head_bytes = uint64_t(W) * act_bytes;
-            const uint64_t address = slab_row(sg == 0u ? history_key : history_value, uint64_t(destination),
-                SEISMIC_PARAM_SLAB_ROWS, uint64_t(KV) * head_bytes) + uint64_t(kv_head) * head_bytes;
-            attention_append(address, 0, 0u, lane, x);
+            history_fresh_row(sg == 0u, row, kv_head, lane, x);
+            history_append(decode_history(), sg == 0u, destination, kv_head, lane, x);
         }
     }
 
-    const uint total = attention_visible_total(visible, fresh, row, spans);
+    const uint total = attention_visible_total(visible, fresh, row, spans) + DECODE_PICKS;
     const uint span_keys = attention_partition_span(total, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
     const uint partition_lo = part * span_keys;
     if (partition_lo >= total)
@@ -143,16 +203,16 @@ void attention_decode_partial() {
     const float query_scale = scale * ATTENTION_LOG2E;
     // Head pair p's prepared queries share words: head 2p in the low half,
     // head 2p + 1 in the high half.
-    for (uint pair = sg; pair < (G + 1u) / 2u; pair += simds) {
+    for (uint pair = sg; pair < (GROUP + 1u) / 2u; pair += simds) {
+        const uint64_t head = row * KV * G + kv_head * G + head_base + 2u * pair;
         float low[ATTENTION_E];
         float high[ATTENTION_E];
-        attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair)
-            * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
-            row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), low);
-        if (2u * pair + 1u < G)
-            attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + kv_head * G + 2u * pair + 1u)
-                * ATTENTION_QUERY_STRIDE) * act_bytes, ATTENTION_QUERY_NORM, query_norm,
-                row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), high);
+        attention_prepare(ATTENTION_QUERY_BUFFER + head * ATTENTION_QUERY_STRIDE * act_bytes, ATTENTION_QUERY_NORM,
+            query_norm, row_coordinates, components, frequencies, amplitudes, epsilon, lane, rounding_none(), low);
+        if (2u * pair + 1u < GROUP)
+            attention_prepare(ATTENTION_QUERY_BUFFER + (head + 1ul) * ATTENTION_QUERY_STRIDE * act_bytes,
+                ATTENTION_QUERY_NORM, query_norm, row_coordinates, components, frequencies, amplitudes, epsilon,
+                lane, rounding_none(), high);
         else
             [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                 high[i] = 0.0;
@@ -179,83 +239,43 @@ void attention_decode_partial() {
 
     const uvec2 range = attention_key_range(partition_lo, partition_hi, attention_key_group(sg));
     const uint first = range.x, last = range.y;
-    // The walk starts on the span holding the group's first key.
-    const uvec2 located = attention_locate(visible, fresh, row, spans, first);
-    uint offset = located.y;
-    for (uint64_t span = located.x; span <= spans && offset < last; ++span) {
-        const bool historical = span < spans;
-        int lo, hi;
-        attention_span(visible, fresh, row, spans, span, lo, hi);
-        const uint length = uint(max(hi - lo, 0));
-        const uint begin = max(first, offset);
-        const uint end = min(last, offset + length);
-        uint position = begin;
-        const uint64_t head_bytes = uint64_t(W) * act_bytes;
-        const uint64_t row_bytes = uint64_t(KV) * head_bytes;
-        if (historical) {
-            // Each slab's part of the span: its key and value rows address
-            // from the slab's regions, resolved once per part; part position
-            // p is slab row (part token - slab start) + p - part start.
-            const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
-            while (position < end) {
-                const uint token = uint(lo) + (position - offset);
-                const uint slab = token / slab_rows;
-                const uint part_end = min(end, (slab + 1u) * slab_rows - uint(lo) + offset);
-                const uint64_t start = uint64_t(token - slab * slab_rows) * row_bytes + uint64_t(kv_head) * head_bytes;
-                const uint64_t key_rows = slab_region(history_key, uint64_t(slab)) + start;
-                const uint64_t value_rows = slab_region(history_value, uint64_t(slab)) + start;
-                const uint part_start = position;
-                for (; position + DECODE_BATCH <= part_end; position += DECODE_BATCH) {
-                    float k[4][ATTENTION_E];
-                    float v[4][ATTENTION_E];
-                    [[unroll]] for (uint j = 0u; j < DECODE_BATCH; ++j) {
-                        const uint64_t at = uint64_t(position + j - part_start) * row_bytes;
-                        attention_load_row(key_rows + at, lane * E, k[j]);
-                        attention_load_row(value_rows + at, lane * E, v[j]);
-                    }
-                    attention_absorb(DECODE_BATCH, q, k, v, maximum, denominator, result);
-                }
-                for (; position < part_end; ++position) {
-                    float k[4][ATTENTION_E];
-                    float v[4][ATTENTION_E];
-                    const uint64_t at = uint64_t(position - part_start) * row_bytes;
-                    attention_load_row(key_rows + at, lane * E, k[0]);
-                    attention_load_row(value_rows + at, lane * E, v[0]);
-                    attention_absorb(1u, q, k, v, maximum, denominator, result);
-                }
-            }
-        }
-        for (; position < end; ++position) {
-            const uint64_t token = uint64_t(lo) + (position - offset);
-            float k[4][ATTENTION_E];
-            float v[4][ATTENTION_E];
-            const uint64_t at = (token * KV + kv_head) * W;
-            attention_prepare(key + at * act_bytes, ATTENTION_NORM, key_norm, coordinates + token * 16ul, components,
-                frequencies, amplitudes, epsilon, lane, ATTENTION_KEY_ROUNDING, k[0]);
-            [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-                k[0][i] = element_round(ELEMENT_ACT, k[0][i]);
-            attention_value(value + at * act_bytes, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, v[0]);
-            attention_absorb(1u, q, k, v, maximum, denominator, result);
-        }
-        offset += length;
+    attention_cursor c = attention_cursor_at(visible, fresh, row, spans, DECODE_PICKS, first);
+    // The cursor's slab's key and value rows.
+    uint64_t keys = 0ul, values = 0ul;
+    uint position = first;
+    for (; position + DECODE_BATCH <= last; position += DECODE_BATCH) {
+        float k[4][ATTENTION_E];
+        float v[4][ATTENTION_E];
+        uint live = 0u;
+        [[unroll]] for (uint j = 0u; j < DECODE_BATCH; ++j)
+            live |= uint(decode_read(c, keys, values, row, kv_head, position + j, k[j], v[j])) << j;
+        attention_absorb(DECODE_BATCH, live, q, k, v, maximum, denominator, result);
+    }
+    for (; position < last; ++position) {
+        float k[4][ATTENTION_E];
+        float v[4][ATTENTION_E];
+        const uint live = uint(decode_read(c, keys, values, row, kv_head, position, k[0], v[0]));
+        attention_absorb(1u, live, q, k, v, maximum, denominator, result);
     }
 
     attention_publish(maximum, denominator, result, states, columns, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), (row * KV + kv_head) * G * SEISMIC_TUNE_PARTS + part,
-        SEISMIC_TUNE_PARTS);
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
+        ((row * KV + kv_head) * G + head_base) * SEISMIC_TUNE_PARTS + part, SEISMIC_TUNE_PARTS);
 }
 
 // L2: workgroup (query head, row), one invocation per column: the
-// fixed-order merge of the row's partitions and the output gate.
+// fixed-order merge of the row's partitions (of its visible keys and picks;
+// with the head's sink when SK = 1) and the output gate.
 void attention_decode_merge() {
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
         SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
-        gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
+        DECODE_PICKS, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN,
+        SEISMIC_TUNE_PARTS);
 }
 
-// The vector form holds no group too wide for its shared bytes (its `where`),
-// so its specializations never launch L1.
+// The vector form takes its queries in its own launch (its `where` and the
+// prepare launch's `when`), so its specializations never launch L1.
 void attention_decode_prepare() {}
 
 #endif

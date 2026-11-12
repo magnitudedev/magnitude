@@ -37,6 +37,11 @@
 #ifndef ATTENTION_HEADS
 #define ATTENTION_HEADS ATTENTION_G
 #endif
+// Query heads one decode workgroup holds: a group of the kv head's G (the
+// entry's head-group split, its GROUPS parameter), or all G.
+#ifndef ATTENTION_HEAD_GROUP
+#define ATTENTION_HEAD_GROUP ATTENTION_G
+#endif
 #define ATTENTION_LOG2E 1.4426950408889634
 
 #define ATTENTION_INF uintBitsToFloat(0x7f800000u)
@@ -172,6 +177,70 @@ uvec2 attention_locate(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t 
     return uvec2(uint(spans) + 1u, carried);
 }
 
+// A key group's cursor over its row's key sequence: its `spans` visible
+// spans, its fresh span (span `spans`), then its `picks` picks (span
+// `spans` + 1; a decode entry's KS). It is on span `span`, `count` keys from
+// row `lo` at key offset `offset`, and holds the slab `slab` of the last
+// history row it reached, rows [slab_lo, slab_hi) (none before one). The
+// vector forms read a key group's keys through it in position order, so
+// they take them in batches at fixed positions of the row's sequence,
+// whichever of its keys are still fresh and wherever its spans, slabs and
+// picks fall.
+struct attention_cursor {
+    uint64_t span;
+    uint offset;
+    uint count;
+    int lo;
+    uint64_t slab;
+    uint64_t slab_lo;
+    uint64_t slab_hi;
+};
+
+// Loads the cursor's span of `row`.
+void attention_cursor_span(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
+    uint64_t spans, uint picks) {
+    if (c.span > spans) {
+        c.lo = 0;
+        c.count = picks;
+        return;
+    }
+    int lo, hi;
+    attention_span(visible, fresh, row, spans, c.span, lo, hi);
+    c.lo = lo;
+    c.count = uint(max(hi - lo, 0));
+}
+
+// The cursor on key `position` of `row`'s sequence (`attention_locate`;
+// past the visible keys, on the picks). The whole subgroup calls it.
+attention_cursor attention_cursor_at(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint picks,
+    uint position) {
+    const uvec2 located = attention_locate(visible, fresh, row, spans, position);
+    attention_cursor c = attention_cursor(uint64_t(located.x), located.y, 0u, 0, 0ul, 1ul, 0ul);
+    attention_cursor_span(c, visible, fresh, row, spans, picks);
+    return c;
+}
+
+// Moves the cursor to key `position` (at or past its own) and returns the
+// key's index in its span: a history or fresh row, or the ordinal of a
+// pick. On a history row (span < spans) the cursor holds the row's slab of
+// `slab_rows` rows; `moved` is whether that changed it.
+uint64_t attention_cursor_seek(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
+    uint64_t spans, uint picks, uint64_t slab_rows, uint position, out bool moved) {
+    while (position >= c.offset + c.count) {
+        c.offset += c.count;
+        ++c.span;
+        attention_cursor_span(c, visible, fresh, row, spans, picks);
+    }
+    const uint64_t index = uint64_t(c.lo) + uint64_t(position - c.offset);
+    moved = c.span < spans && (index < c.slab_lo || index >= c.slab_hi);
+    if (moved) {
+        c.slab = index / slab_rows;
+        c.slab_lo = c.slab * slab_rows;
+        c.slab_hi = c.slab_lo + slab_rows;
+    }
+    return index;
+}
+
 // Keys per decode partition for a row seeing `total` keys: at least `span`,
 // and few enough that `parts` partitions cover the row. Never zero.
 uint attention_partition_span(uint total, uint span, uint parts) {
@@ -179,8 +248,10 @@ uint attention_partition_span(uint total, uint span, uint parts) {
 }
 
 // The online-softmax state of a subgroup's ATTENTION_HEADS query heads over
-// its keys, in the exp2 domain, absorbing `n` (1 or 4) keys at a time.
-void attention_absorb(const uint n, float q[ATTENTION_HEADS][ATTENTION_E], float k[4][ATTENTION_E],
+// its keys, in the exp2 domain, absorbing `n` (1 to 4) keys at a time. Key j
+// is attended where bit j of `live` is set; another (a pick of none) scores
+// -inf, so it adds nothing and a batch of none leaves the state as it is.
+void attention_absorb(const uint n, uint live, float q[ATTENTION_HEADS][ATTENTION_E], float k[4][ATTENTION_E],
     float v[4][ATTENTION_E], inout float maximum[ATTENTION_HEADS], inout float denominator[ATTENTION_HEADS],
     inout float result[ATTENTION_HEADS][ATTENTION_E]) {
     [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g) {
@@ -190,19 +261,19 @@ void attention_absorb(const uint n, float q[ATTENTION_HEADS][ATTENTION_E], float
                 float partial = 0.0;
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     partial = seismic_fma_rn(q[g][i], k[j][i], partial);
-                score[j] = seismic_subgroup_sum_f32(partial);
+                score[j] = ((live >> j) & 1u) != 0u ? seismic_subgroup_sum_f32(partial) : -ATTENTION_INF;
             }
         }
         float next = maximum[g];
         [[unroll]] for (uint j = 0u; j < 4u; ++j)
             if (j < n)
                 next = max(next, score[j]);
-        const float carry = exp2(maximum[g] - next);
+        const float carry = next == maximum[g] ? 1.0 : exp2(maximum[g] - next);
         float probability[4];
         float sum = 0.0;
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
             if (j < n) {
-                probability[j] = exp2(score[j] - next);
+                probability[j] = score[j] == -ATTENTION_INF ? 0.0 : exp2(score[j] - next);
                 sum += probability[j];
             }
         }
@@ -347,7 +418,7 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
 // sg / slices, one of subgroups / slices contiguous sub-ranges of the
 // partition (`attention_key_range`). Every key is read by one subgroup per
 // slice.
-uint attention_slices() { return ATTENTION_G / ATTENTION_HEADS; }
+uint attention_slices() { return ATTENTION_HEAD_GROUP / ATTENTION_HEADS; }
 uint attention_slice(uint sg) { return sg % attention_slices(); }
 uint attention_key_group(uint sg) { return sg / attention_slices(); }
 uint attention_key_groups() { return SEISMIC_SUBGROUPS / attention_slices(); }
@@ -440,14 +511,15 @@ void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint6
     element_put(ELEMENT_ACT, result, (row * heads + head) * ATTENTION_W + column, value);
 }
 
-// The decode merge of one (query head, row) column over the row's `spans`
-// visible spans: the row's non-empty partitions in partition order, then the
-// output gate. A row that sees no key attends to zero. Whole subgroups call it
-// (each finds the row's total keys).
+// The decode merge of one (query head, row) column over the row's key
+// sequence, its `spans` visible spans then its `picks` picks: the row's
+// non-empty partitions in partition order, then the output gate. A row that
+// sees no key attends to zero. Whole subgroups call it (each finds the row's
+// total keys).
 void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, uint64_t result,
-    uint64_t partials, uint64_t statistics, uint64_t spans, uint64_t head, uint64_t row, uint column, uint span,
-    uint parts) {
-    const uint total = attention_visible_total(visible, fresh, row, spans);
+    uint64_t partials, uint64_t statistics, uint64_t spans, uint picks, uint64_t head, uint64_t row, uint column,
+    uint span, uint parts) {
+    const uint total = attention_visible_total(visible, fresh, row, spans) + picks;
     const uint span_keys = attention_partition_span(total, span, parts);
     const uint used = (total + span_keys - 1u) / span_keys;
     const float attended = attention_merge(partials, statistics,

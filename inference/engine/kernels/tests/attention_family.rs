@@ -982,35 +982,23 @@ fn statics(device: &Device, form: Form, sinks: usize) -> NativeSpecialization {
     }
 }
 
-/// Vulkan grouped-query matrix decode configurations (PARTS, SIMDS) whose
-/// SIMDS * 16 matrix rows hold the query group, within the declaration's
-/// shared bytes.
-fn vulkan_matrix_configurations(
+/// The configurations of `configs` that the decode entry's declaration on
+/// `device` admits at `form`.
+fn decode_admitted(
+    device: &Device,
     form: Form,
-    configs: &[(u64, u64)],
+    configs: Vec<Vec<(&'static str, u64)>>,
 ) -> Vec<Vec<(&'static str, u64)>> {
-    let w = form.w() as u64;
+    let entry =
+        attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    let statics = statics(device, form, 0).with_static("KR", 0).with_static("KS", 0);
     configs
-        .iter()
-        .filter(|(_, simds)| {
-            // The K tile and subgroup scratch, then the query tile unless
-            // the group's queries alone exceed the shared bytes (they come
-            // from the prepare launch).
-            let tiles = 64 * (w.min(256) + 8) + simds * 2048;
-            form.g as u64 <= simds * 16
-                && (w <= 64 || w % 64 == 0)
-                && (w <= 256 || w % 256 == 0)
-                && tiles <= 32768
-                && (form.g as u64 * w * 2 > 32768 || tiles + simds * 16 * (w + 8) * 2 <= 32768)
-        })
-        .map(|&(parts, simds)| {
-            vec![
-                ("SPAN", 32),
-                ("PARTS", parts),
-                ("SIMDS", simds),
-                ("SLICES", 1),
-                ("MATRIX", 1),
-            ]
+        .into_iter()
+        .filter(|config| {
+            let specialization = config
+                .iter()
+                .fold(statics.clone(), |s, (n, v)| s.with_param(*n, *v));
+            entry.specialization_valid(device, &specialization).unwrap()
         })
         .collect()
 }
@@ -1333,27 +1321,40 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                 .into_iter()
                 .find(|s| form.g as u64 % s == 0)
                 .unwrap();
-            let mut configurations = vec![
+            // Those the declaration admits of: the vector form's whole group,
+            // at one slice and the most that divide it, and a group too wide
+            // for its shared bytes (V4.1's) in groups of 8 heads at 4, 2 (as
+            // timed) and 1 a subgroup, and of 16 heads at 4; the matrix form
+            // at 1, 2 and 4 subgroups.
+            let vector = [
+                (32, 16, 4, 1, 1),
+                (64, 8, 8, slices, 1),
+                (32, 16, 4, 2, 8),
+                (32, 32, 8, 4, 8),
+                (32, 16, 8, 8, 8),
+                (64, 32, 8, 4, 4),
+            ]
+            .map(|(span, parts, simds, slices, groups)| {
                 vec![
-                    ("SPAN", 32),
-                    ("PARTS", 16),
-                    ("SIMDS", 4),
-                    ("SLICES", 1),
-                    ("MATRIX", 0),
-                ],
-                vec![
-                    ("SPAN", 64),
-                    ("PARTS", 8),
-                    ("SIMDS", 8),
+                    ("SPAN", span),
+                    ("PARTS", parts),
+                    ("SIMDS", simds),
                     ("SLICES", slices),
                     ("MATRIX", 0),
-                ],
-            ];
-            configurations.extend(vulkan_matrix_configurations(
-                form,
-                &[(16, 1), (64, 2), (32, 4)],
-            ));
-            configurations
+                    ("GROUPS", groups),
+                ]
+            });
+            let matrix = [(16, 1), (64, 2), (32, 4)].map(|(parts, simds)| {
+                vec![
+                    ("SPAN", 32),
+                    ("PARTS", parts),
+                    ("SIMDS", simds),
+                    ("SLICES", 1),
+                    ("MATRIX", 1),
+                    ("GROUPS", 1),
+                ]
+            });
+            decode_admitted(device, form, vector.into_iter().chain(matrix).collect())
         }
         (BackendName::Vulkan, false) => vec![
             vec![("ROWS", 64), ("SPLIT_GROUPS", 256)],
@@ -1365,8 +1366,7 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
 
 /// [`configurations`] that can hold `case`: an index-list source runs in
 /// Metal's fragment prefill form alone (its declaration refuses DIRECT), and
-/// in Metal's matrix decode forms at one row a threadgroup; Vulkan's decode
-/// holds the forms past the base form in its matrix form alone.
+/// in Metal's matrix decode forms at one row a threadgroup.
 fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&'static str, u64)>> {
     if !decode && case.picks > 0 && device.backend() == BackendName::Metal {
         // A prefill with picks attends in the shared tile: attend's
@@ -1386,15 +1386,6 @@ fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&
             .collect();
     }
     let metal_decode = decode && device.backend() == BackendName::Metal;
-    let vulkan_decode = decode && device.backend() == BackendName::Vulkan;
-    let form = case.form;
-    let extended = form.query_norm != form.norm
-        || form.rotary.adjacent
-        || form.rotary.trailing
-        || form.rotary.inverse_output
-        || form.stored_key
-        || case.key_rounding.is_some()
-        || case.picks > 0;
     configurations(device, decode, case.form)
         .into_iter()
         .filter(|config| {
@@ -1404,7 +1395,6 @@ fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&
                         && !((config.contains(&("MATRIX", 1)) || config.contains(&("MATRIX", 2)))
                             && config.contains(&("TOKENS", 1)))))
         })
-        .filter(|config| !vulkan_decode || !extended || config.contains(&("MATRIX", 1)))
         .collect()
 }
 
@@ -2613,7 +2603,8 @@ fn v41_host_model_matches_reference() {
 
 /// At V4.1's shapes the CPU, Metal and Vulkan natives equal the F32
 /// reference: the decode entry on each (Metal's matrix form in head groups
-/// of 8, Vulkan's with its queries from its prepare launch), prefill rows on
+/// of 8, Vulkan's matrix form with its queries from its prepare launch and
+/// its vector form in head groups), prefill rows on
 /// each, and on CUDA, whose decode declaration refuses the forms.
 #[test]
 fn v41_natives_match_reference() {
@@ -3675,8 +3666,9 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
 /// `attention_decode_at_deepseek_v41_decode_shape_times`). It times both
 /// entries that can serve the row: `attention_prefill` at M = 1, which
 /// served it while the decode entry refused V4.1's forms (its picks one
-/// subgroup per query head), and `attention_decode`'s matrix form (picks as
-/// key tiles, queries from its prepare launch). Each configuration is timed
+/// subgroup per query head), `attention_decode`'s matrix form (picks as key
+/// tiles, queries from its prepare launch) and its vector form (head groups
+/// of query slices in registers, picks the last keys of the sequence). Each configuration is timed
 /// as the default of its own survey, its every parameter fixed. It prints
 /// each entry's default, then each configuration's median device seconds a
 /// call and, as context, the rate at which it reads its logical bytes (each
@@ -3813,9 +3805,34 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
             .map(|default| default.params().clone())
     );
     for parts in [16, 32, 64, 128] {
-        let configuration = [("SPAN", 32), ("PARTS", parts), ("SIMDS", 4), ("SLICES", 1), ("MATRIX", 1)]
+        let configuration = [("SPAN", 32), ("PARTS", parts), ("SIMDS", 4), ("SLICES", 1), ("MATRIX", 1), ("GROUPS", 1)]
             .into_iter()
             .fold(statics.clone(), |s, (n, v)| s.with_param(n, v));
         time!(attention_decode, format!("matrix SIMDS 4 PARTS {parts}"), configuration);
+    }
+    // The vector form in groups of 8 and 16 query heads (GROUPS 8 and 4),
+    // slices of 4, 2 and 1 heads a subgroup, its partitions of at least
+    // SPAN 32 keys over the row's 641.
+    for (groups, slices, simds, parts) in [
+        (8, 2, 4, 16),
+        (8, 2, 4, 32),
+        (8, 2, 8, 16),
+        (4, 4, 4, 16),
+        (4, 4, 8, 32),
+        (8, 4, 4, 16),
+        (8, 4, 8, 32),
+        (4, 8, 8, 16),
+        (8, 8, 8, 16),
+        (8, 8, 8, 32),
+    ] {
+        let configuration =
+            [("SPAN", 32), ("PARTS", parts), ("SIMDS", simds), ("SLICES", slices), ("MATRIX", 0), ("GROUPS", groups)]
+                .into_iter()
+                .fold(statics.clone(), |s, (n, v)| s.with_param(n, v));
+        time!(
+            attention_decode,
+            format!("vector GROUPS {groups} SLICES {slices} SIMDS {simds} PARTS {parts}"),
+            configuration
+        );
     }
 }

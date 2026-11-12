@@ -156,6 +156,26 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
 
 #endif
 // ---------------------------------------------------------------------------
+// The lane's E columns of batch row `row`'s prepared key (rounded by the
+// entry's key rounding and to A, as `history_append` takes it) or value for
+// `kv_head`: the one preparation of a fresh row, for its append and every
+// read of it. A stored-key value is the prepared key. The whole subgroup
+// calls it.
+void history_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane, out float x[ATTENTION_E]) {
+    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    if (is_key || ATTENTION_STORED_KEY) {
+        attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source, ATTENTION_NORM,
+            SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
+            SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
+            ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, ATTENTION_KEY_ROUNDING, x);
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            x[i] = element_round(ELEMENT_ACT, x[i]);
+    } else {
+        attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
+    }
+}
+
 // Appending one row (the subgroup's E columns per lane) at history row
 // `destination`: the key (prepared, already rounded to A) or the value. A
 // stored-key history stores the key alone.

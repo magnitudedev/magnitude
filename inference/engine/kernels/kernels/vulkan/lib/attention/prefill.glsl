@@ -124,24 +124,6 @@ struct prefill_picked {
 // ---------------------------------------------------------------------------
 // L1.
 
-// The lane's E columns of batch row `row`'s prepared key (rounded by the
-// entry's key rounding and to A, as history stores it) or value for
-// `kv_head`, one subgroup. A stored-key value is the prepared key.
-void prefill_fresh_row(const bool is_key, uint64_t row, uint kv_head, uint lane, out float x[ATTENTION_E]) {
-    const uint64_t source = (row * ATTENTION_KV + kv_head) * ATTENTION_W * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
-    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
-    if (is_key || ATTENTION_STORED_KEY) {
-        attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source, ATTENTION_NORM,
-            SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
-            SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
-            ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, ATTENTION_KEY_ROUNDING, x);
-        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_round(ELEMENT_ACT, x[i]);
-    } else {
-        attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
-    }
-}
-
 void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint lane = SEISMIC_LANE;
@@ -176,13 +158,13 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint kv_head = head - KV * G;
     const uint64_t source = (row * KV + kv_head) * W;
     float k[ATTENTION_E], v[ATTENTION_E];
-    prefill_fresh_row(true, row, kv_head, lane, k);
+    history_fresh_row(true, row, kv_head, lane, k);
     // A stored-key value is the prepared key.
     if (ATTENTION_STORED_KEY) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
             v[i] = k[i];
     } else {
-        prefill_fresh_row(false, row, kv_head, lane, v);
+        history_fresh_row(false, row, kv_head, lane, v);
     }
     const uint64_t keys = scratch_planes.keys;
     const uint64_t values = scratch_planes.values;
@@ -224,7 +206,7 @@ void prefill_stage(attention_history h, prefill_scratch scratch_planes, const bo
             const int t = first + int(r);
             float x[ATTENTION_E];
             if (t < end) {
-                prefill_fresh_row(is_key, uint64_t(t), kv_head, SEISMIC_LANE, x);
+                history_fresh_row(is_key, uint64_t(t), kv_head, SEISMIC_LANE, x);
             } else {
                 [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
                     x[i] = 0.0;
@@ -581,9 +563,9 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             if (destination < 0)
                 continue;
             float x[ATTENTION_E];
-            prefill_fresh_row(true, token, kv_head, lane, x);
+            history_fresh_row(true, token, kv_head, lane, x);
             history_append(h, true, destination, kv_head, lane, x);
-            prefill_fresh_row(false, token, kv_head, lane, x);
+            history_fresh_row(false, token, kv_head, lane, x);
             history_append(h, false, destination, kv_head, lane, x);
         }
     }

@@ -985,43 +985,61 @@ native attention_decode for cuda from "cuda/attention_decode.cu":
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# Vulkan: the Metal form (`vulkan/lib/attention/attention.glsl`), the G query
-# heads split into SLICES slices across subgroups. A lane owns W / 32
-# contiguous columns, with a whole number of lanes per rotary half.
+# Vulkan: the Metal form (`vulkan/lib/attention/attention.glsl`), the
+# vector form (MATRIX 0): a workgroup per (kv head and head group,
+# partition, row) holds one of GROUPS groups of G / GROUPS query heads,
+# split into SLICES slices across subgroups, a lane owning W / 32 contiguous
+# columns (a whole number of lanes per rotary half), its slice's queries and
+# outputs in registers. The group's prepared queries, G / GROUPS * W * 2
+# bytes, share the workgroup's memory with the merge columns. GROUPS 1 is
+# the whole group, of any width; more groups are admitted only where the
+# whole group's prepared queries alone exceed the 32768 shared bytes (V4.1's
+# G = 64 at W = 512: 65536), so every group that fits keeps its grid and
+# tuning space. Its keys absorb in batches of 4 (2 where W / 32 >= 16,
+# whose key and value columns fill the registers beside the queries and
+# outputs). It holds
+# the extended forms (rounded keys, adjacent or trailing rotary pairs, the
+# output rotary as its own launch, stored-key values) and each row's KS
+# index-list picks, which follow its visible keys in the sequence the
+# partitions split, each read from `selected` as key and value (a pick of
+# -1 adds nothing).
+#
 # MATRIX selects the grouped-query matrix form: the prefill's cooperative-matrix
 # L2 (`vulkan/lib/attention/prefill.glsl` with PREFILL_DECODE) over row tiles of
 # 16 * SIMDS / G rows, whose query heads are the matrix rows; each partition
 # takes an equal run of 32-key tiles. Shared bytes: the prefill's, then the
 # query tile [16 * SIMDS][W + 8] f16. A group whose prepared queries alone,
-# G * W * 2 bytes, exceed the 32768 shared bytes (V4.1's G = 64 at W = 512:
-# 65536), which no tile can hold, takes them from the prefill's L1 instead
-# (`attention_decode_prepare`: queries and fresh rows into f16 scratch, the
-# K/V append), so its whole group still shares each staged key tile; every
-# group that fits keeps its launches and tuning space. The matrix form holds
-# the extended forms as the prefill does (rounded keys, adjacent or trailing
-# rotary pairs, the output rotary as its own launch, stored-key values), and
-# each row's KS index-list picks: the tile rows' pick tiles, in row order,
-# follow the visible key tiles in the sequence the partitions split, each
-# gathered from `selected` and attended by its own row alone (a pick of -1
-# scores -inf), so picks add no launch.
+# G * W * 2 bytes, exceed the 32768 shared bytes, which no tile can hold,
+# takes them from the prefill's L1 instead (`attention_decode_prepare`:
+# queries and fresh rows into f16 scratch, the K/V append), so its whole
+# group still shares each staged key tile; every group that fits keeps its
+# launches and tuning space. The matrix form holds the extended forms as the
+# prefill does, and each row's KS index-list picks: the tile rows' pick
+# tiles, in row order, follow the visible key tiles in the sequence the
+# partitions split, each gathered from `selected` and attended by its own
+# row alone (a pick of -1 scores -inf), so picks add no launch.
+#
+# The vector form takes a row's keys in batches at fixed positions of its
+# key sequence (`attention_cursor`), history, fresh keys and picks alike, a
+# fresh key and value prepared exactly as they are appended.
 native attention_decode for vulkan from "vulkan/attention_decode.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 1, 2] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
-        arithmetic form MATRIX in [0, 1] default 0)
-    where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and VK <= 1 and (MATRIX == 1 or (KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0)) and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (RO == 0 or (P > 0 and I == 0 and U == 0)) and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or SIMDS >= 4) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 <= 32768 and (G * (2 * P + S) * 2 > 32768 or 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 <= 32768)))
+        arithmetic form MATRIX in [0, 1] default 0, arithmetic GROUPS in [1, 2, 4, 8, 16, 32, 64] default 1)
+    where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and VK <= 1 and G % GROUPS == 0 and (GROUPS == 1 or (MATRIX == 0 and G * (2 * P + S) * 2 > 32768)) and (RA == 0 or (2 * P + S) % 64 == 0 or (2 * P + S) == 32) and (RO == 0 or (P > 0 and I == 0 and U == 0)) and SK <= 1 and (I == 0 or I == (2 * P + S)) and (U == 0 or U == 1 or U == (2 * P + S)) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (G / GROUPS) % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or SIMDS >= 4) and (MATRIX == 1 or SIMDS * (G / GROUPS / SLICES) * 8 + max(SIMDS, ceil_div(G / GROUPS, 2)) * (2 * P + S) * 4 <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 <= 32768 and (G * (2 * P + S) * 2 > 32768 or 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 <= 32768)))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
-    scratch queries bytes ((ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * G + SIMDS * 16) * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
-    scratch keys bytes (M * KV * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
-    scratch values bytes (M * KV * (2 * P + S) * 2) when G * (2 * P + S) * 2 > 32768
-    launch attention_decode_prepare when G * (2 * P + S) * 2 > 32768:
+    scratch queries bytes ((ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * G + SIMDS * 16) * (2 * P + S) * 2) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
+    scratch keys bytes (M * KV * (2 * P + S) * 2) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
+    scratch values bytes (M * KV * (2 * P + S) * 2) when MATRIX == 1 and G * (2 * P + S) * 2 > 32768
+    launch attention_decode_prepare when MATRIX == 1 and G * (2 * P + S) * 2 > 32768:
         threadgroups (ceil_div(ceil_div(M, max(1, SIMDS * 16 / G)) * max(1, SIMDS * 16 / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_decode_partial:
-        threadgroups (KV, PARTS, (1 - MATRIX) * M + MATRIX * ceil_div(M, max(1, SIMDS * 16 / G)))
+        threadgroups (KV * GROUPS, PARTS, (1 - MATRIX) * M + MATRIX * ceil_div(M, max(1, SIMDS * 16 / G)))
         threads_per_threadgroup (SIMDS * 32, 1, 1)
-        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + (1 - min(1, G * (2 * P + S) * 2 / 32769)) * SIMDS * 16 * ((2 * P + S) + 8) * 2))
+        shared_bytes ((1 - MATRIX) * (SIMDS * (G / GROUPS / SLICES) * 8 + max(SIMDS, ceil_div(G / GROUPS, 2)) * (2 * P + S) * 4) + MATRIX * (64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + (1 - min(1, G * (2 * P + S) * 2 / 32769)) * SIMDS * 16 * ((2 * P + S) + 8) * 2))
     launch attention_decode_merge:
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
