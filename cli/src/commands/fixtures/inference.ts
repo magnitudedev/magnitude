@@ -20,6 +20,7 @@ import {
   type CandidateVersion,
   type CustomLocalModel,
   type DrafterCandidate,
+  type HuggingFaceRepositoryCheck,
   type HuggingFaceSearchResponse,
   localModelIntelligence,
   localModelPerformanceContexts,
@@ -36,6 +37,7 @@ import {
   type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
 import type { RecommendedCatalogModel } from "../inference-runtime"
+import type { CheckedSearchResult, SearchView } from "../hugging-face-runtime"
 
 const GIB = 1024 ** 3
 const GB = 1_000_000_000
@@ -362,11 +364,12 @@ export const catalogState = (
   hiddenLocalModels: hidden,
 })
 
-export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse> = {}): HuggingFaceSearchResponse => ({
+export const makeSearchResponse = (overrides: Partial<SearchView["response"]> = {}): SearchView["response"] => ({
   nextCursor: Option.none(),
   results: [
     {
       repository: TEST_REPOSITORY,
+      commit: "c".repeat(40),
       displayName: "Qwen Test Uncensored",
       uploader: "HauhauCS",
       variantOf: Option.some(TEST_CATALOG_MODEL_ID),
@@ -375,6 +378,7 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
       gated: false,
+      private: false,
       versionCount: Option.none(),
       base: Option.some({ repository: HuggingFaceRepositoryIdSchema.make("Qwen/Qwen-Test"), relation: "Finetune" }),
       recommended: Option.some({
@@ -387,6 +391,7 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
     },
     {
       repository: HuggingFaceRepositoryIdSchema.make("huihui-ai/Qwen-Test-abliterated-GGUF"),
+      commit: "d".repeat(40),
       displayName: "Qwen Test abliterated",
       uploader: "huihui-ai",
       variantOf: Option.none(),
@@ -395,6 +400,7 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
       gated: false,
+      private: false,
       versionCount: Option.none(),
       base: Option.none(),
       recommended: Option.none(),
@@ -403,8 +409,9 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
   ...overrides,
 })
 
-export const makeUnsupportedSearchResult = (): HuggingFaceSearchResponse["results"][number] => ({
+export const makeUnsupportedSearchResult = (): CheckedSearchResult => ({
   repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"),
+  commit: "e".repeat(40),
   displayName: "DeepSeek V4 Flash",
   uploader: "unsloth",
   variantOf: Option.none(),
@@ -413,10 +420,32 @@ export const makeUnsupportedSearchResult = (): HuggingFaceSearchResponse["result
   architecture: Option.some("deepseek4"),
   unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
   gated: false,
+  private: false,
   versionCount: Option.none(),
   base: Option.none(),
   recommended: Option.none(),
 })
+
+/** `response` as the service lists it, before any check. */
+export const listedSearch = (response: SearchView["response"]): HuggingFaceSearchResponse => ({
+  nextCursor: response.nextCursor,
+  results: response.results.map(({ variantOf: _variantOf, unsupported: _unsupported, recommended: _recommended, ...listed }) => listed),
+})
+
+/** Each of `response`'s results' check, as the service finds it. */
+export const searchChecks = (response: SearchView["response"]) => ({ repository }: { readonly repository: string }): HuggingFaceRepositoryCheck => {
+  const result = response.results.find((candidate) => candidate.repository === repository)
+  if (result === undefined) return { _tag: "NotAModel" }
+  return {
+    _tag: "Model",
+    architecture: result.architecture,
+    variantOf: result.variantOf,
+    developer: result.developer,
+    base: Option.none(),
+    unsupported: result.unsupported,
+    recommended: result.recommended,
+  }
+}
 
 const version = (
   label: string,

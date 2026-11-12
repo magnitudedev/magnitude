@@ -1818,20 +1818,8 @@ export const HuggingFaceModelSearchResult = S.Struct({
   lastModified: S.optionalWith(S.String, { exact: true, as: "Option" }),
   likes: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   private: S.Boolean,
-  recommended: S.optionalWith(
-    S.suspend(
-      (): S.Schema<HuggingFaceRecommendedVersion, HuggingFaceRecommendedVersionEncoded> =>
-        HuggingFaceRecommendedVersion,
-    ),
-    { exact: true, as: "Option" },
-  ),
   repository: S.String,
   tags: S.Array(S.String),
-  unsupported: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
-  variantOf: S.optionalWith(
-    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-    { exact: true, as: "Option" },
-  ),
   versionCount: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)), { exact: true, as: "Option" }),
 })
 export type HuggingFaceModelSearchResult = S.Schema.Type<typeof HuggingFaceModelSearchResult>
@@ -1857,6 +1845,47 @@ export const HuggingFaceRecommendedVersion = S.Struct({
 })
 export type HuggingFaceRecommendedVersion = S.Schema.Type<typeof HuggingFaceRecommendedVersion>
 export type HuggingFaceRecommendedVersionEncoded = S.Schema.Encoded<typeof HuggingFaceRecommendedVersion>
+
+export const HuggingFaceRepositoryCheck = S.Union(
+  S.extend(S.TaggedStruct("NotAModel", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Model", {
+      architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+      base: S.optionalWith(
+        S.suspend((): S.Schema<HuggingFaceModelBase, HuggingFaceModelBaseEncoded> => HuggingFaceModelBase),
+        { exact: true, as: "Option" },
+      ),
+      developer: S.optionalWith(
+        S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+        { exact: true, as: "Option" },
+      ),
+      recommended: S.optionalWith(
+        S.suspend(
+          (): S.Schema<HuggingFaceRecommendedVersion, HuggingFaceRecommendedVersionEncoded> =>
+            HuggingFaceRecommendedVersion,
+        ),
+        { exact: true, as: "Option" },
+      ),
+      unsupported: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+      variantOf: S.optionalWith(
+        S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HuggingFaceRepositoryCheck = S.Schema.Type<typeof HuggingFaceRepositoryCheck>
+export type HuggingFaceRepositoryCheckEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryCheck>
+
+export const HuggingFaceRepositoryCheckRequest = S.Struct({
+  architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  commit: S.String,
+  repository: S.String,
+  restricted: S.Boolean,
+})
+export type HuggingFaceRepositoryCheckRequest = S.Schema.Type<typeof HuggingFaceRepositoryCheckRequest>
+export type HuggingFaceRepositoryCheckRequestEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryCheckRequest>
 
 export const HuggingFaceRepositoryFile = S.Struct({
   content: S.suspend((): S.Schema<ContentIdentity, ContentIdentityEncoded> => ContentIdentity),

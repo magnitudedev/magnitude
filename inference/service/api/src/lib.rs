@@ -33,7 +33,8 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceCredential,
     HuggingFaceModelCatalog,
-    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest,
+    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults, HuggingFaceRepositoryCheck,
+    HuggingFaceRepositoryCheckRequest, HuggingFaceRepositoryRequest,
     HuggingFaceRepositorySnapshot, InventoryError,
 };
 use serde::{Deserialize, Serialize};
@@ -377,6 +378,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
         .route(
             "/api/v1/sources/hugging-face/search",
             post(search_hugging_face_models),
+        )
+        .route(
+            "/api/v1/sources/hugging-face/check",
+            post(check_hugging_face_repository),
         )
         .route(
             "/api/v1/sources/hugging-face/resolve",
@@ -923,6 +928,33 @@ async fn search_hugging_face_models(
         .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
     catalog
         .search(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/sources/hugging-face/check", operation_id = "checkHuggingFaceRepository", tag = "hugging-face",
+    request_body(content = HuggingFaceRepositoryCheckRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "What a listed repository holds on this machine", body = HuggingFaceRepositoryCheck),
+        (status = 400, description = "Invalid check request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "The check failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.check", skip_all, err(Debug))]
+async fn check_hugging_face_repository(
+    State(state): State<AppState>,
+    Json(request): Json<HuggingFaceRepositoryCheckRequest>,
+) -> Result<Json<HuggingFaceRepositoryCheck>, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    catalog
+        .check(request)
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
@@ -1885,6 +1917,7 @@ fn open_ai_model(
         acknowledge_model_download_failure,
         standard_models,
         search_hugging_face_models,
+        check_hugging_face_repository,
         resolve_hugging_face_repository,
         configure_hugging_face_credential,
         preview_model_load,
@@ -1931,6 +1964,8 @@ fn open_ai_model(
         OpenAiModelsResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
+        HuggingFaceRepositoryCheckRequest,
+        HuggingFaceRepositoryCheck,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
         HuggingFaceCredential,
@@ -2450,17 +2485,30 @@ mod tests {
                         private: false,
                         tags: vec!["gguf".to_owned()],
                         architecture: Some("qwen35moe".to_owned()),
-                        variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
                         developer: None,
                         version_count: Some(3),
-                        unsupported: Vec::new(),
                         base: Some(magnitude_service_contracts::HuggingFaceModelBase {
                             repository: "Qwen/Qwen3.6-35B-A3B".to_owned(),
                             relation: magnitude_service_contracts::HuggingFaceBaseRelation::Quantized,
                         }),
-                        recommended: None,
                     }],
                     next_cursor: None,
+                })
+            })
+        }
+
+        fn check(
+            &self,
+            request: HuggingFaceRepositoryCheckRequest,
+        ) -> BoxFuture<'_, Result<HuggingFaceRepositoryCheck, InventoryError>> {
+            Box::pin(async move {
+                Ok(HuggingFaceRepositoryCheck::Model {
+                    architecture: request.architecture,
+                    variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+                    developer: None,
+                    base: None,
+                    unsupported: Vec::new(),
+                    recommended: None,
                 })
             })
         }
@@ -2586,16 +2634,31 @@ mod tests {
             serde_json::from_slice(&search.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(search_body["results"][0]["repository"], "owner/model");
-        assert_eq!(
-            search_body["results"][0]["variantOf"],
-            "qwen3.6-35b-a3b:gguf:q4"
-        );
         assert!(search_body["results"][0].get("lastModified").is_none());
         assert_eq!(
             search_body["results"][0]["base"],
             serde_json::json!({ "repository": "Qwen/Qwen3.6-35B-A3B", "relation": "quantized" })
         );
-        assert!(search_body["results"][0].get("recommended").is_none());
+
+        let check = test_app(state.clone())
+            .oneshot(
+                Request::post("/api/v1/sources/hugging-face/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "repository": "owner/model", "commit": "a".repeat(40), "architecture": "qwen35moe", "restricted": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(check.status(), StatusCode::OK);
+        let check_body: Value =
+            serde_json::from_slice(&check.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(check_body["_tag"], "Model");
+        assert_eq!(check_body["variantOf"], "qwen3.6-35b-a3b:gguf:q4");
+        assert_eq!(check_body["unsupported"], json!([]));
+        assert!(check_body.get("recommended").is_none());
 
         let resolve = test_app(state)
             .oneshot(
@@ -2848,6 +2911,7 @@ mod tests {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
         for path in [
             "/api/v1/sources/hugging-face/search",
+            "/api/v1/sources/hugging-face/check",
             "/api/v1/sources/hugging-face/resolve",
             "/api/v1/candidates/inspect",
             "/api/v1/candidates/drafters",

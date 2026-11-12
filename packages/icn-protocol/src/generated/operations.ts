@@ -213,6 +213,57 @@ export const cancelModelDownloadOperation = {
   pathParameters: S.Struct({ download_id: S.String }),
 } as const
 
+export const checkHuggingFaceRepositoryOperation = {
+  operationId: "checkHuggingFaceRepository",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/sources/hugging-face/check",
+  group: "hugging-face",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.HuggingFaceRepositoryCheck, Schemas.HuggingFaceRepositoryCheckEncoded> =>
+          Schemas.HuggingFaceRepositoryCheck,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceRepositoryCheckRequest, Schemas.HuggingFaceRepositoryCheckRequestEncoded> =>
+      Schemas.HuggingFaceRepositoryCheckRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const configureHuggingFaceCredentialOperation = {
   operationId: "configureHuggingFaceCredential",
   transport: "http",

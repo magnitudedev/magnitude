@@ -829,13 +829,12 @@ pub struct HuggingFaceRecommendedVersion {
     pub assessment: crate::models::ModelAssessment,
 }
 
-/// One repository. `unsupported` is empty for a repository whose architecture the engine runs,
-/// else it names that architecture. `variant_of` is the catalog model whose shape fingerprint the
-/// repository's GGUF has. `version_count` is how many GGUFs the repository's file list offers
-/// (split shards counted once, projectors excluded), approximate since drafters are not told apart.
-/// `base` is the model the repository derives from: the Hub's `baseModels`, else its model file's
-/// `general.base_model.*`. `recommended` is the version inspection recommends on this machine,
-/// absent when none fits or the repository could not be inspected in time.
+/// One repository as the Hub lists it, before any of its files is read. `architecture` is the
+/// Hub's, from the GGUF it describes the repository by. `developer` is told by the repository's
+/// name. `version_count` is how many GGUFs the repository's file list offers (split shards counted
+/// once, projectors excluded), approximate since drafters are not told apart. `base` is the Hub's
+/// `baseModels`. What the repository holds on this machine is its check
+/// (`HuggingFaceRepositoryCheck`).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -859,24 +858,77 @@ pub struct HuggingFaceModelSearchResult {
     pub architecture: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub variant_of: Option<crate::models::ModelId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub developer: Option<crate::models::ModelDeveloper>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
     pub version_count: Option<u32>,
-    pub unsupported: Vec<crate::models::UnsupportedReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub base: Option<HuggingFaceModelBase>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub recommended: Option<HuggingFaceRecommendedVersion>,
 }
 
-/// One page of results of every architecture, unsupported ones last; catalog and drafter
-/// repositories excluded. `next_cursor` requests the page after it, absent on the last.
+/// A listed repository to check: what the search listed it as. `architecture` is the Hub's,
+/// which decides only when the repository's model file can't be read; `restricted` is whether the
+/// listing is gated or private, so its reads are kept for the credential that made them.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HuggingFaceRepositoryCheckRequest {
+    pub repository: String,
+    pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub architecture: Option<String>,
+    pub restricted: bool,
+}
+
+/// What a listed repository holds on this machine, from its model file's header and the version
+/// candidate inspection would recommend. `NotAModel` is a repository of drafters or projectors
+/// alone: nothing in it is offered. For a `Model`, `unsupported` is empty when the engine runs it;
+/// `architecture` is its header's, absent when the header couldn't be read; `variant_of` is the
+/// catalog model whose shape fingerprint it has; `base` is the Hub's `baseModels`, else its model
+/// file's `general.base_model.*`; `recommended` is the version inspection recommends, absent when
+/// the versions couldn't be assessed in time.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum HuggingFaceRepositoryCheck {
+    NotAModel,
+    #[serde(rename_all = "camelCase")]
+    Model {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        architecture: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        variant_of: Option<crate::models::ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        developer: Option<crate::models::ModelDeveloper>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        base: Option<HuggingFaceModelBase>,
+        unsupported: Vec<crate::models::UnsupportedReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        recommended: Option<HuggingFaceRecommendedVersion>,
+    },
+}
+
+impl HuggingFaceRepositoryCheck {
+    /// Whether the check found what the repository is: not a model, or a model that doesn't run
+    /// or whose recommended version was found. An incomplete check is one whose reads or
+    /// assessments failed or ran out of time.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::NotAModel => true,
+            Self::Model { unsupported, recommended, .. } => !unsupported.is_empty() || recommended.is_some(),
+        }
+    }
+}
+
+/// One page of the Hub's results, most downloaded first; catalog repositories excluded. `next_cursor` requests the page after it, absent on the last.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1128,6 +1180,12 @@ pub trait HuggingFaceModelCatalog: Send + Sync + 'static {
         &self,
         request: HuggingFaceModelSearchRequest,
     ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>>;
+
+    /// What a repository the search listed holds on this machine.
+    fn check(
+        &self,
+        request: HuggingFaceRepositoryCheckRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceRepositoryCheck, InventoryError>>;
 
     fn resolve(
         &self,

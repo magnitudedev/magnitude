@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
-    KnownUnsupportedReason, ModelFingerprint, ModelId, ModelPackage, UnsupportedReason,
+    KnownUnsupportedReason, ModelId, ModelPackage, UnsupportedReason,
 };
 use magnitude_artifacts::catalog_headers::ArtifactHeader;
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceCredential,
     HuggingFaceModelCatalog,
     HuggingFaceBaseRelation, HuggingFaceModelBase, HuggingFaceModelSearchRequest,
-    HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
-    HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
+    HuggingFaceModelSearchResult, HuggingFaceModelSearchResults, HuggingFaceRepositoryCheck,
+    HuggingFaceRepositoryCheckRequest, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation, ModelPreviewSource,
     ModelSource, ResolvedComponent, ResolvedModel,
 };
@@ -42,11 +42,15 @@ const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-/// A page's results are read and assessed at once: their time is the Hub's latency, not work.
-const SEARCH_SHAPE_CONCURRENCY: usize = MAX_HUB_SEARCH_RESULTS as usize;
 /// How long inspecting a result's repository for its recommended version may take before the
 /// result is shown without one.
 const RECOMMENDATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Repository checks run at once, whoever asks: more only slow each one down, and every check
+/// waiting its turn would spend its time limit waiting.
+const CONCURRENT_CHECKS: usize = 6;
+/// Times a check is run again after Hugging Face's rate limit cut it short, each once the limit's
+/// pause has passed.
+const RATE_LIMITED_CHECK_RETRIES: usize = 2;
 
 /// Live Hub search and immutable resolution for the service's API. Catalog publication and
 /// managed inventory do not depend on these queries.
@@ -58,6 +62,7 @@ pub struct HuggingFaceDiscovery {
     catalog: Arc<dyn CatalogFingerprints>,
     recommendations: Arc<dyn RecommendedVersions>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
+    checks: tokio::sync::Semaphore,
 }
 
 impl HuggingFaceDiscovery {
@@ -78,6 +83,7 @@ impl HuggingFaceDiscovery {
             catalog,
             recommendations,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
+            checks: tokio::sync::Semaphore::new(CONCURRENT_CHECKS),
         }
     }
 
@@ -153,146 +159,138 @@ impl HuggingFaceDiscovery {
             result.architecture = result
                 .architecture
                 .filter(|architecture| architecture != magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE);
-            if catalog_repositories.contains(&result.repository.to_lowercase())
-                || self
-                    .architectures
-                    .is_drafter_repository(result.architecture.as_deref(), &result.tags)
-            {
+            // A repository of drafters alone is told by its files' headers when it is checked,
+            // never by its Hub tags: a model built with a prediction head is tagged as a drafter.
+            if catalog_repositories.contains(&result.repository.to_lowercase()) {
                 continue;
-            }
-            if let Some(architecture) = result.architecture.clone().filter(|architecture| {
-                !self.architectures.admits_repository(Some(architecture))
-            }) {
-                result.unsupported = vec![UnsupportedReason::Known(
-                    KnownUnsupportedReason::Architecture { architecture },
-                )];
             }
             kept.push(result);
         }
-        let catalog = if kept.is_empty() {
-            Vec::new()
-        } else {
-            self.catalog.catalog_fingerprints().await
-        };
-        let catalog = &catalog;
-        // Every result's model file is read, an unsupported Hub architecture's too: the Hub names
-        // an architecture, never what its files are for, and a drafter of an architecture the
-        // engine doesn't know is told by its header alone.
         tracing::debug!(hub_ms = search_started.elapsed().as_millis(), results = kept.len(), "search hub query");
-        let mut results = futures_util::stream::iter(kept)
-            .map(|mut result| async move {
-                let shape = std::time::Instant::now();
-                if !self.read_model_file(&mut result, catalog).await {
-                    return None;
-                }
-                let shape_ms = shape.elapsed().as_millis();
-                let recommend = std::time::Instant::now();
-                if result.unsupported.is_empty() {
-                    match self.recommended_version(&result).await {
-                        crate::search_shape::SearchRecommendation::Version(version) => {
-                            result.recommended = Some(version);
-                        }
-                        crate::search_shape::SearchRecommendation::Unsupported(reasons) => {
-                            result.unsupported = reasons;
-                        }
-                        crate::search_shape::SearchRecommendation::Unknown => {}
-                    }
-                }
-                tracing::debug!(repository = %result.repository, shape_ms, recommend_ms = recommend.elapsed().as_millis(), found = result.recommended.is_some(), "search result");
-                Some(result)
-            })
-            .buffered(SEARCH_SHAPE_CONCURRENCY)
-            .filter_map(std::future::ready)
-            .collect::<Vec<_>>()
-            .await;
-        results.sort_by_key(|result| (!result.unsupported.is_empty(), std::cmp::Reverse(result.downloads.unwrap_or(0))));
         Ok(HuggingFaceModelSearchResults {
-            results,
+            results: kept,
             next_cursor,
         })
     }
 
-    /// What `result`'s model file says: its header's architecture, which replaces the Hub's and is
-    /// unsupported when the service doesn't serve it (the engine doesn't run it, or its family is
-    /// withheld), the engine's refusal of the header itself
-    /// (reasons that hold for every version, never weight types or this machine's), and the first
-    /// catalog model whose shape fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
-    /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
-    /// whatever the Hub's repository-level architecture says; a read that failed or timed out
-    /// (a gated repository's refused files among them) leaves the result as the Hub describes it,
-    /// without a projector's architecture, which never stands in for the model.
-    /// `false` for a repository whose files read are all drafters' (a separate drafter
-    /// architecture, one the engine doesn't run tagged for speculative decoding, or a prediction
-    /// head alone, as an MTP block): drafters are offered only in drafter lists, never as results.
-    /// `false` too for one whose only GGUFs are projectors: it holds no GGUF model.
-    async fn read_model_file(
+    /// What the listed repository at `request.commit` holds on this machine (see
+    /// `HuggingFaceRepositoryCheck`). Its model file's header comes first: its architecture, which
+    /// replaces the Hub's and is unsupported when the service doesn't serve it (the engine doesn't
+    /// run it, or its family is withheld), the engine's refusal of the header itself (reasons that
+    /// hold for every version, never weight types or this machine's), and the first catalog model
+    /// whose shape fingerprint it has. Names and declared lineage never decide. A repository whose
+    /// headers were read and hold no model file (no architecture, a projector's or a drafter's, or
+    /// a layer-split piece) is unreadable; when the read failed or timed out (a gated repository's
+    /// refused files among them), the Hub's architecture is all there is to judge. A repository whose files read are all drafters' (a
+    /// separate drafter architecture, one the engine doesn't run tagged for speculative decoding,
+    /// or a prediction head alone, as an MTP block) or projectors' is not a model: drafters are
+    /// offered only in drafter lists. Only a repository the engine may run has its versions
+    /// assessed, for the one inspection would recommend.
+    async fn check_repository(
         &self,
-        result: &mut HuggingFaceModelSearchResult,
-        catalog: &[(ModelId, ModelFingerprint)],
-    ) -> bool {
+        request: HuggingFaceRepositoryCheckRequest,
+    ) -> HuggingFaceRepositoryCheck {
+        let catalog = self.catalog.catalog_fingerprints().await;
+        let mut architecture = None;
+        let mut variant_of = None;
+        let mut base_repositories = Vec::new();
+        let mut unsupported = Vec::new();
         match crate::search_shape::repository_model(
             &self.models,
             &self.architectures,
             self.verdicts.as_ref(),
-            catalog,
-            &result.repository,
-            &result.commit,
-            result.gated || result.private,
+            &catalog,
+            &request.repository,
+            &request.commit,
+            request.restricted,
         )
         .await
         {
             Some(RepositoryModel::Model {
-                architecture,
+                architecture: read,
                 shape,
-                base_repositories,
-                unsupported,
+                base_repositories: bases,
+                unsupported: refused,
             }) => {
-                result.architecture = Some(architecture.clone());
-                if result.base.is_none() {
-                    result.base = base_repositories.first().map(|repository| HuggingFaceModelBase {
-                        repository: repository.clone(),
-                        relation: HuggingFaceBaseRelation::Unknown,
-                    });
-                }
-                let variant_of = shape.and_then(|shape| shape.variant_of(catalog));
-                result.developer = crate::model_developers().resolve(DeveloperEvidence {
-                    repository: Some(&result.repository),
-                    base_repositories: &base_repositories,
-                    variant_of: variant_of.as_ref(),
-                });
-                if !self.architectures.serves(&architecture) {
-                    result.unsupported = vec![UnsupportedReason::Known(
-                        KnownUnsupportedReason::Architecture { architecture },
-                    )];
-                    return true;
-                }
-                result.unsupported = unsupported;
-                result.variant_of = variant_of;
+                variant_of = shape.and_then(|shape| shape.variant_of(&catalog));
+                base_repositories = bases;
+                unsupported = if self.architectures.serves(&read) {
+                    refused
+                } else {
+                    vec![UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                        architecture: read.clone(),
+                    })]
+                };
+                architecture = Some(read);
             }
             Some(RepositoryModel::Unreadable) => {
-                result.unsupported = vec![UnsupportedReason::Known(
-                    KnownUnsupportedReason::Unreadable,
-                )];
+                unsupported = vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)];
             }
-            Some(RepositoryModel::Drafter | RepositoryModel::Projector) => return false,
-            None => {}
+            Some(RepositoryModel::Drafter | RepositoryModel::Projector) => {
+                return HuggingFaceRepositoryCheck::NotAModel;
+            }
+            None => {
+                if request
+                    .architecture
+                    .as_deref()
+                    .is_some_and(|listed| self.architectures.is_separate_drafter(listed))
+                {
+                    return HuggingFaceRepositoryCheck::NotAModel;
+                }
+                if let Some(listed) = request
+                    .architecture
+                    .clone()
+                    .filter(|listed| !self.architectures.admits_repository(Some(listed)))
+                {
+                    unsupported = vec![UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                        architecture: listed,
+                    })];
+                }
+            }
         }
-        true
+        let developer = crate::model_developers().resolve(DeveloperEvidence {
+            repository: Some(&request.repository),
+            base_repositories: &base_repositories,
+            variant_of: variant_of.as_ref(),
+        });
+        let mut recommended = None;
+        if unsupported.is_empty() {
+            match self.recommended_version(&request).await {
+                crate::search_shape::SearchRecommendation::Version(version) => {
+                    recommended = Some(version);
+                }
+                crate::search_shape::SearchRecommendation::Unsupported(reasons) => {
+                    unsupported = reasons;
+                }
+                crate::search_shape::SearchRecommendation::Unknown => {}
+            }
+        }
+        HuggingFaceRepositoryCheck::Model {
+            architecture,
+            variant_of: unsupported.is_empty().then_some(variant_of).flatten(),
+            developer,
+            base: base_repositories.first().map(|repository| HuggingFaceModelBase {
+                repository: repository.clone(),
+                relation: HuggingFaceBaseRelation::Unknown,
+            }),
+            unsupported,
+            recommended,
+        }
     }
 
-    /// What search shows of `result`'s versions at its commit; unknown when they can't be
-    /// assessed within [`RECOMMENDATION_TIMEOUT`].
+    /// The version inspection would recommend for `request`'s repository at its commit; unknown
+    /// when its versions can't be assessed within [`RECOMMENDATION_TIMEOUT`].
     async fn recommended_version(
         &self,
-        result: &HuggingFaceModelSearchResult,
+        request: &HuggingFaceRepositoryCheckRequest,
     ) -> crate::search_shape::SearchRecommendation {
         let inspect = self
             .recommendations
-            .recommended_version(result.repository.clone(), result.commit.clone());
+            .recommended_version(request.repository.clone(), request.commit.clone());
         tokio::time::timeout(RECOMMENDATION_TIMEOUT, inspect)
             .await
             .map_err(|_| {
-                tracing::debug!(repository = %result.repository, "search recommendation timed out");
+                tracing::debug!(repository = %request.repository, "search recommendation timed out");
             })
             .unwrap_or(crate::search_shape::SearchRecommendation::Unknown)
     }
@@ -387,6 +385,33 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
                 searches.remove(&oldest);
             }
             Ok(result)
+        })
+    }
+
+    fn check(
+        &self,
+        request: HuggingFaceRepositoryCheckRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceRepositoryCheck, InventoryError>> {
+        Box::pin(async move {
+            if request.repository.is_empty() || !valid_hub_revision(&request.commit) {
+                return Err(InventoryError::InvalidRequest(
+                    "a repository check requires a repository and a commit".to_owned(),
+                ));
+            }
+            let _turn = self.checks.acquire().await.map_err(|error| InventoryError::Internal(error.to_string()))?;
+            let endpoint = reqwest::Url::parse(self.models.client.endpoint())
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            let mut retries = 0;
+            loop {
+                if let Some(pause) = hub_pause(&endpoint) {
+                    tokio::time::sleep(pause).await;
+                }
+                let check = self.check_repository(request.clone()).await;
+                if check.is_complete() || retries == RATE_LIMITED_CHECK_RETRIES || hub_pause(&endpoint).is_none() {
+                    return Ok(check);
+                }
+                retries += 1;
+            }
         })
     }
 
@@ -575,15 +600,12 @@ impl HubSearchModel {
             private: self.private.unwrap_or(false),
             tags: self.tags,
             architecture,
-            variant_of: None,
             developer,
             version_count,
-            unsupported: Vec::new(),
             base: self
                 .base_models
                 .as_ref()
                 .and_then(crate::lineage::hub_base_model),
-            recommended: None,
         })
     }
 }
@@ -2572,6 +2594,7 @@ mod tests {
     use std::fs;
 
     use magnitude_service_contracts::{HuggingFaceRecommendedVersion, LocalDeclaration};
+    use magnitude_service_contracts::models::ModelFingerprint;
 
     #[test]
     fn a_pasted_reference_searches_for_its_repository() {
@@ -4016,7 +4039,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_lists_unknown_architectures_as_unsupported_and_excludes_the_catalog_and_drafters()
+    async fn search_lists_unknown_architectures_as_unsupported_and_excludes_the_catalog_and_drafter_architectures()
      {
         let (endpoint, _) = search_hub();
         let (_temporary, store) = stub_store(endpoint).await;
@@ -4040,14 +4063,15 @@ mod tests {
             StubCatalog::empty(),
             Arc::new(StubRecommendations(crate::search_shape::SearchRecommendation::Version(recommended.clone()))),
         );
-        let results = discovery
-            .search(HuggingFaceModelSearchRequest {
+        let results = search_checked(
+            &discovery,
+            HuggingFaceModelSearchRequest {
                 query: "llama".to_owned(),
                 limit: 10,
                 cursor: None,
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
         assert_eq!(
             results
                 .results
@@ -4055,28 +4079,29 @@ mod tests {
                 .map(|result| result.repository.as_str())
                 .collect::<Vec<_>>(),
             [
+                "unsloth/DeepSeek-V4-GGUF",
+                "someone/Llama-EAGLE3-GGUF",
                 "someone/Llama-MTP-GGUF",
                 "vision/Llama-Vision-GGUF",
                 "community/Llama-Finetune-GGUF",
                 "anonymous/Llama-Uncensored-GGUF",
-                "unsloth/DeepSeek-V4-GGUF",
             ],
-            "a repository whose name says MTP is a model result: names never decide; drafter \
-             repositories are never model results"
+            "a repository whose name says MTP is a model result: names never decide; a drafter \
+             architecture's repository is never a model result, and Hub tags never decide either"
         );
         assert!(
-            results.results[..4]
+            results.results[2..]
                 .iter()
                 .all(|result| result.unsupported.is_empty() && result.variant_of.is_none()),
             "declared lineage never makes a result a variant"
         );
         assert_eq!(
-            results.results[1].architecture, None,
+            results.results[3].architecture, None,
             "a repository the Hub describes by its projector, whose model file can't be read, is \
              shown without an architecture or a verdict: a projector never stands in for the model"
         );
         assert_eq!(
-            results.results[4].unsupported,
+            results.results[0].unsupported,
             [UnsupportedReason::Known(
                 KnownUnsupportedReason::Architecture {
                     architecture: "deepseek4".to_owned()
@@ -4085,24 +4110,78 @@ mod tests {
             "an unsupported architecture is listed with its reason"
         );
         assert_eq!(
-            results.results[2].base,
+            results.results[1].unsupported,
+            [UnsupportedReason::Known(
+                KnownUnsupportedReason::Architecture {
+                    architecture: "eagle3".to_owned()
+                }
+            )],
+            "a repository tagged for speculative decoding whose header can't be read is judged by \
+             the Hub's architecture alone"
+        );
+        assert_eq!(
+            results.results[4].base,
             Some(HuggingFaceModelBase {
                 repository: "base/Llama".to_owned(),
                 relation: HuggingFaceBaseRelation::Quantized,
             }),
             "a result's base is the Hub's baseModels with its relation"
         );
-        assert_eq!(results.results[0].base, None, "baseModels naming no model is no base");
+        assert_eq!(results.results[2].base, None, "baseModels naming no model is no base");
         assert!(
-            results.results[..4]
+            results.results[2..]
                 .iter()
                 .all(|result| result.recommended.as_ref() == Some(&recommended)),
             "a supported result carries its repository's recommended version"
         );
-        assert_eq!(
-            results.results[4].recommended, None,
+        assert!(
+            results.results[..2].iter().all(|result| result.recommended.is_none()),
             "an unsupported result is never inspected"
         );
+    }
+
+    /// A listed result with its check, as clients show it: a repository of drafters or projectors
+    /// alone is dropped, and the check's architecture and base stand in for what the Hub left out.
+    struct Checked {
+        repository: String,
+        gated: bool,
+        architecture: Option<String>,
+        base: Option<HuggingFaceModelBase>,
+        variant_of: Option<ModelId>,
+        unsupported: Vec<UnsupportedReason>,
+        recommended: Option<magnitude_service_contracts::HuggingFaceRecommendedVersion>,
+    }
+
+    struct CheckedPage {
+        results: Vec<Checked>,
+    }
+
+    async fn search_checked(discovery: &HuggingFaceDiscovery, request: HuggingFaceModelSearchRequest) -> CheckedPage {
+        let listed = discovery.search(request).await.unwrap().results;
+        let mut results = Vec::new();
+        for result in listed {
+            let check = discovery
+                .check(HuggingFaceRepositoryCheckRequest {
+                    repository: result.repository.clone(),
+                    commit: result.commit.clone(),
+                    architecture: result.architecture.clone(),
+                    restricted: result.gated || result.private,
+                })
+                .await
+                .unwrap();
+            if let HuggingFaceRepositoryCheck::Model { architecture, variant_of, base, unsupported, recommended, .. } = check {
+                results.push(Checked {
+                    repository: result.repository,
+                    gated: result.gated,
+                    architecture: architecture.or(result.architecture),
+                    base: result.base.or(base),
+                    variant_of,
+                    unsupported,
+                    recommended,
+                });
+            }
+        }
+        CheckedPage { results }
     }
 
     /// Each catalog model's fingerprint, supplied directly.
@@ -4408,16 +4487,17 @@ mod tests {
         )
     }
 
-    async fn search_all(discovery: &HuggingFaceDiscovery) -> BTreeMap<String, HuggingFaceModelSearchResult> {
-        discovery
-            .search(HuggingFaceModelSearchRequest {
+    async fn search_all(discovery: &HuggingFaceDiscovery) -> BTreeMap<String, Checked> {
+        search_checked(
+            discovery,
+            HuggingFaceModelSearchRequest {
                 query: "model".to_owned(),
                 limit: 10,
                 cursor: None,
-            })
-            .await
-            .unwrap()
-            .results
+            },
+        )
+        .await
+        .results
             .into_iter()
             .map(|result| (result.repository.clone(), result))
             .collect()
@@ -4467,7 +4547,7 @@ mod tests {
         let (_temporary, store) = stub_store(endpoint).await;
         let gemma: ModelId = "gemma-test:gguf:q4".parse().unwrap();
         let catalog = vec![(gemma.clone(), catalog_fingerprint("gemma-4-E2B-it-qat-UD-Q4_K_XL"))];
-        let variants = |results: BTreeMap<String, HuggingFaceModelSearchResult>| {
+        let variants = |results: BTreeMap<String, Checked>| {
             results
                 .into_iter()
                 .map(|(repository, result)| (repository, result.variant_of, result.unsupported.is_empty()))
@@ -4942,11 +5022,10 @@ mod tests {
     /// row stays as the Hub's search describes it, its refusal body is never read as a GGUF, the
     /// outcome isn't cached, and no further request goes to the Hub until its `Retry-After` passes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_rate_limit_leaves_rows_as_the_hub_describes_them_and_is_not_cached() {
+    async fn a_check_cut_short_by_a_rate_limit_runs_again_once_the_pause_passes() {
         use crate::test_gguf::fixture_header;
-        use std::sync::atomic::Ordering;
         let gemma = || Some(fixture_header("Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P"));
-        let (endpoint, requests, _) = serve_repositories(vec![
+        let (endpoint, _, _) = serve_repositories(vec![
             StubRepository::new("someone/Listing-Refused-GGUF", Some("gemma4"))
                 .file("model-Q4_K_M.gguf", 2_000_000_000, gemma())
                 .throttled(1, 0),
@@ -4959,42 +5038,15 @@ mod tests {
             "gemma-test:gguf:q4".parse::<ModelId>().unwrap(),
             catalog_fingerprint("gemma-4-E2B-it-qat-UD-Q4_K_XL"),
         )];
-        let state = |results: &BTreeMap<String, HuggingFaceModelSearchResult>, repository: &str| {
-            let result = &results[repository];
-            (result.architecture.clone(), result.unsupported.clone(), result.variant_of.clone())
-        };
-        let plain = (Some("gemma4".to_owned()), Vec::new(), None);
-        let results = search_all(&shape_discovery(&store, &["gemma4"], catalog.clone())).await;
-        assert_eq!(state(&results, "someone/Listing-Refused-GGUF"), plain, "a refused listing keeps the row");
-        assert_eq!(
-            state(&results, "someone/Header-Refused-GGUF"),
-            plain,
-            "a refused header read keeps the row, and its body is never read as a projector's header"
-        );
-        assert!(
-            requests.load(Ordering::SeqCst) <= 2,
-            "after the first refusal no request goes out until Retry-After passes"
-        );
-
-        // A refusal paused the host, so a read the pause stopped was never sent; its stub refusal
-        // may still be pending and pause the next search once more. Once each refusal is spent,
-        // every read happens: none was cached.
-        let mut variants = Vec::new();
-        for _ in 0..3 {
-            tokio::time::sleep(Duration::from_millis(1_100)).await;
-            let results = search_all(&shape_discovery(&store, &["gemma4"], catalog.clone())).await;
-            variants = ["someone/Listing-Refused-GGUF", "someone/Header-Refused-GGUF"]
-                .map(|repository| state(&results, repository).2)
-                .to_vec();
-            if variants.iter().all(Option::is_some) {
-                break;
-            }
+        let results = search_all(&shape_discovery(&store, &["gemma4"], catalog)).await;
+        for repository in ["someone/Listing-Refused-GGUF", "someone/Header-Refused-GGUF"] {
+            assert_eq!(
+                results[repository].variant_of,
+                Some("gemma-test:gguf:q4".parse::<ModelId>().unwrap()),
+                "{repository}: a refused read was never cached, and the check ran again once \
+                 Retry-After passed"
+            );
         }
-        assert_eq!(
-            variants,
-            vec![Some("gemma-test:gguf:q4".parse::<ModelId>().unwrap()); 2],
-            "a refusal was never cached, so each read happens once allowed"
-        );
     }
 
     /// The listing shapes of real large repositories: shard sets in subfolders whose first shard
@@ -5120,7 +5172,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_lists_results_by_downloads_and_unsupported_last() {
+    async fn search_lists_the_hubs_results_most_downloaded_first() {
         let (endpoint, _) = serve_hub(|path, query| {
             let result = |id: &str, seed: char, architecture: &str, downloads: u64| {
                 serde_json::json!({
@@ -5131,15 +5183,19 @@ mod tests {
                     "gguf": { "architecture": architecture },
                 })
             };
-            (path == "/api/models" && query.contains("search=")).then(|| {
-                serde_json::json!([
-                    result("unsupported/Llama-8B-GGUF", 'a', "deepseek4", 5_000),
-                    result("someone/Llama-8B-Uncensored-GGUF", 'b', "llama", 900),
-                    result("community/Llama-8B-GGUF", 'c', "llama", 100),
-                    result("bartowski/Meta_Llama-8B-GGUF", 'd', "llama", 50),
-                    result("other/Llama-8B-Instruct-GGUF", 'e', "llama", 70),
-                ])
-            })
+            (path == "/api/models"
+                && query.contains("search=")
+                && query.contains("sort=downloads")
+                && query.contains("direction=-1"))
+                .then(|| {
+                    serde_json::json!([
+                        result("unsupported/Llama-8B-GGUF", 'a', "deepseek4", 5_000),
+                        result("someone/Llama-8B-Uncensored-GGUF", 'b', "llama", 900),
+                        result("community/Llama-8B-GGUF", 'c', "llama", 100),
+                        result("other/Llama-8B-Instruct-GGUF", 'e', "llama", 70),
+                        result("bartowski/Meta_Llama-8B-GGUF", 'd', "llama", 50),
+                    ])
+                })
         });
         let (_temporary, store) = stub_store(endpoint).await;
         let discovery = HuggingFaceDiscovery::new(
@@ -5168,12 +5224,13 @@ mod tests {
                 .map(|result| result.repository.as_str())
                 .collect::<Vec<_>>(),
             [
+                "unsupported/Llama-8B-GGUF",
                 "someone/Llama-8B-Uncensored-GGUF",
                 "community/Llama-8B-GGUF",
                 "other/Llama-8B-Instruct-GGUF",
                 "bartowski/Meta_Llama-8B-GGUF",
-                "unsupported/Llama-8B-GGUF",
-            ]
+            ],
+            "the Hub's own order, most downloaded first: whether each runs is its check's"
         );
     }
 

@@ -60,6 +60,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),
       },
       huggingFace: {
+        checkHuggingFaceRepository: makeHttpOperation(http, options, Operations.checkHuggingFaceRepositoryOperation),
         configureHuggingFaceCredential: makeHttpOperation(
           http,
           options,

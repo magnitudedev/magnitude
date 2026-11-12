@@ -103,15 +103,6 @@ impl RecognizedArchitectures {
         self.is_separate_drafter(architecture)
             || (!self.targets.contains(architecture) && speculative_decoding_tags(tags))
     }
-
-    /// Whether a Hub repository holds a drafter rather than a model: it declares an architecture
-    /// the engine binds only as a drafter, or the Hub tags it for speculative decoding. Names
-    /// never decide. Drafters are offered in drafter lists, never as models.
-    #[must_use]
-    pub fn is_drafter_repository(&self, architecture: Option<&str>, tags: &[String]) -> bool {
-        speculative_decoding_tags(tags)
-            || architecture.is_some_and(|architecture| self.is_separate_drafter(architecture))
-    }
 }
 
 /// Whether tags (a Hub repository's, or a GGUF header's `general.tags`) mark a drafter for
@@ -788,40 +779,6 @@ mod tests {
         );
         assert_eq!(display_name("mradermacher/Qwen3.5-4B-Heretic-i1-GGUF"), "Qwen3.5 4B Heretic");
         assert_eq!(display_name("someone/Model-i1"), "Model i1");
-    }
-
-    #[test]
-    fn drafter_repositories_are_recognized_by_the_engines_drafter_architectures_or_hub_tags() {
-        let architectures = RecognizedArchitectures::new(
-            ["qwen35", "qwen4exp"],
-            ["dflash", "gemma4-assistant", "qwen4exp"],
-        );
-        let tags = |tags: &[&str]| tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
-        for architecture in ["dflash", "gemma4-assistant"] {
-            assert!(
-                architectures.is_drafter_repository(Some(architecture), &[]),
-                "{architecture}"
-            );
-        }
-        assert!(
-            architectures
-                .is_drafter_repository(Some("qwen3"), &tags(&["gguf", "speculative-decoding"]))
-        );
-        for architecture in [
-            "eagle3",
-            "qwen35_mtp",
-            "llama-assistant",
-            "qwen3-dflash-like",
-        ] {
-            assert!(
-                !architectures.is_drafter_repository(Some(architecture), &[]),
-                "names never decide: {architecture}"
-            );
-        }
-        assert!(!architectures.is_drafter_repository(Some("qwen35"), &tags(&["gguf"])));
-        assert!(!architectures.is_drafter_repository(Some("qwen4exp"), &[]));
-        assert!(!architectures.is_drafter_repository(Some("deepseek4"), &[]));
-        assert!(!architectures.is_drafter_repository(None, &[]));
     }
 
     #[test]

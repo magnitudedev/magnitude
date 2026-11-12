@@ -20,6 +20,7 @@ export * from './utils/local-model-radar'
 export * from './utils/hardware-memory'
 export * from './utils/model-streaming'
 export * from './utils/quant-presentation'
+export * from './utils/search-checks'
 
 // Local models and connections
 export * from './local-models/projection'

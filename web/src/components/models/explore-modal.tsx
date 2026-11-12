@@ -5,7 +5,8 @@ import { Button } from "../ui/button"
 import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { LabLogo, type ModelLab } from "../model-logo"
-import { Badge } from "./parts"
+import { Badge, LabMark, cardClass } from "./parts"
+import { SkeletonLine } from "../page-skeletons"
 import { MeasuringRecommendations, OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
 import type { QuantView } from "./view"
@@ -48,10 +49,16 @@ function SearchStatus({ children, className }: { children: ReactNode; className?
   </p>
 }
 
+/** A search result as its row shows it: while its check runs, its name alone; then the model it offers. */
+export type ExploreRow =
+  | { readonly _tag: "Checking"; readonly key: string; readonly name: string; readonly lab: ModelLab | undefined }
+  | { readonly _tag: "Unchecked"; readonly key: string; readonly name: string; readonly lab: ModelLab | undefined; readonly gated: boolean; readonly retry: () => void }
+  | { readonly _tag: "Offered"; readonly model: OfferedModel; readonly prefetched: boolean }
+
 export type ExploreResults =
   | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
   | { readonly _tag: "Searching" }
-  | { readonly _tag: "Results"; readonly models: readonly OfferedModel[]; readonly more: "Loading" | (() => void) | null }
+  | { readonly _tag: "Results"; readonly rows: readonly ExploreRow[]; readonly more: "Loading" | (() => void) | null }
   | { readonly _tag: "Failed"; readonly message: string }
 
 /** The end of a page of results: reaching it asks for the next page. */
@@ -67,26 +74,80 @@ function NextPage({ onReach }: { onReach: () => void }) {
   return <div ref={ref} className="mt-2 flex justify-center"><Button variant="ghost" size="sm" onClick={onReach}>More results</Button></div>
 }
 
-/** An offered model as opened: what opening it brings (a search result's every quant) is the model it shows. */
-function OfferedCard({ model, expanded, download, useOpened, ...rest }: Omit<Parameters<typeof ExpandingModel>[0], "footer"> & {
-  download: (model: OfferedModel, quant: QuantView) => ReactNode; useOpened: (model: OfferedModel, open: boolean) => OfferedModel
+/**
+ * An offered model as opened: what opening it brings (a search result's every quant) is the model it shows. A
+ * `prefetched` model is opened before it is shown open.
+ */
+function OfferedCard({ model, expanded, prefetched, download, useOpened, ...rest }: Omit<Parameters<typeof ExpandingModel>[0], "footer"> & {
+  prefetched: boolean; download: (model: OfferedModel, quant: QuantView) => ReactNode; useOpened: (model: OfferedModel, open: boolean) => OfferedModel
 }) {
-  const opened = useOpened(model, expanded)
+  const opened = useOpened(model, expanded || prefetched)
   return <ExpandingModel {...rest} model={opened} expanded={expanded} footer={quant => download(opened, quant)} />
 }
 
+/** Reports whether its row is on screen, so the rows in view are checked first. */
+function Seen({ id, onSeen, children }: { id: string; onSeen: (update: (seen: ReadonlySet<string>) => ReadonlySet<string>) => void; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const target = ref.current
+    if (!target) return
+    const change = (shown: boolean) => onSeen(seen => {
+      if (seen.has(id) === shown) return seen
+      const next = new Set(seen)
+      if (shown) next.add(id)
+      else next.delete(id)
+      return next
+    })
+    const observer = new IntersectionObserver(entries => change(entries.some(entry => entry.isIntersecting)))
+    observer.observe(target)
+    return () => { observer.disconnect(); change(false) }
+  }, [id, onSeen])
+  return <div ref={ref}>{children}</div>
+}
+
+/** A search result whose check failed or ran out of time: its name, why when it is gated, and a way to check it again. */
+function UncheckedCard({ name, lab, gated, retry }: { name: string; lab: ModelLab | undefined; gated: boolean; retry: () => void }) {
+  return <div className={cn(cardClass, "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3")}>
+    <LabMark lab={lab} className="size-10" />
+    <span className="min-w-0">
+      <span className="block truncate text-[14px] font-medium">{name}</span>
+      <span className="mt-0.5 block text-xs text-slate-500">{gated
+        ? "Gated on Hugging Face. Accept its terms there, signed in to Hugging Face in Magnitude, to check how it runs here."
+        : "Couldn't check how this runs here."}</span>
+    </span>
+    <Button size="sm" variant="outline" onClick={retry}>Try again</Button>
+  </div>
+}
+
+/** A search result whose check is still running, laid out as the card it becomes: its name, and what is being checked. */
+function CheckingCard({ name, lab }: { name: string; lab: ModelLab | undefined }) {
+  return <div className={cn(cardClass, "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3")}>
+    <LabMark lab={lab} className="size-10" />
+    <span className="min-w-0">
+      <span className="block truncate text-[14px] font-medium">{name}</span>
+      <span role="status" className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 motion-safe:animate-spin" />Checking how it runs here…</span>
+    </span>
+    <span className="grid grid-cols-[84px_64px] gap-4 pr-9">
+      <span><SkeletonLine className="ml-auto h-5 text-[15px]" width="3.5rem" /><SkeletonLine className="ml-auto h-4 text-[11px]" width="4rem" /></span>
+      <span><SkeletonLine className="ml-auto h-5 text-[15px]" width="3rem" /><SkeletonLine className="ml-auto h-4 text-[11px]" width="2.5rem" /></span>
+    </span>
+  </div>
+}
+
 /** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
-export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, useOpened }: {
+export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, useOpened, onSeen }: {
   open: boolean; setOpen: (open: boolean) => void; query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
   useOpened: (model: OfferedModel, open: boolean) => OfferedModel
+  onSeen: (update: (seen: ReadonlySet<string>) => ReadonlySet<string>) => void
 }) {
   const [chosen, setExpanded] = useState<string | null | undefined>(undefined)
   const [quantChoices, setQuantChoices] = useState<Readonly<Record<string, string>>>({})
-  const listed = (results._tag === "Recommended" && results.measuring === null) || results._tag === "Results" ? results.models : []
-  const expanded = chosen === undefined ? (results._tag === "Recommended" ? listed[0]?.key ?? null : null) : chosen
-  const card = (model: OfferedModel, note?: string) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
-    onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
+  const offered = results._tag === "Results" ? results.rows.flatMap(row => row._tag === "Offered" ? [row.model] : []) : []
+  const checking = results._tag === "Results" && results.rows.some(row => row._tag === "Checking")
+  const expanded = chosen === undefined ? (results._tag === "Recommended" && results.measuring === null ? results.models[0]?.key ?? null : null) : chosen
+  const card = (model: OfferedModel, note?: string, prefetched = false) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
+    prefetched={prefetched} onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
     onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} useOpened={useOpened} />
   return <Dialog open={open} onOpenChange={value => { setOpen(value); if (!value) setExpanded(undefined) }}>
     <DialogContent className="flex h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
@@ -105,14 +166,21 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
           {results.measuring ? <MeasuringRecommendations {...results.measuring} /> : <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>}
         </>}
         {results._tag === "Searching" && <>
-          <SearchStatus>Searching Hugging Face and checking how each result runs on your machine…</SearchStatus>
+          <SearchStatus>Searching Hugging Face…</SearchStatus>
           <OfferedModelsSkeleton />
         </>}
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
-          <p className="mb-3 text-xs font-medium text-slate-500">On Hugging Face, running in Magnitude ({results.models.length})</p>
-          {results.models.length > 0
-            ? <div className="space-y-2">{results.models.map(model => card(model))}</div>
+          <p className="mb-3 text-xs font-medium text-slate-500">On Hugging Face, running in Magnitude{checking ? "" : ` (${offered.length})`}</p>
+          {results.rows.length > 0
+            ? <div className="space-y-2">{results.rows.map(row => {
+              const key = row._tag === "Offered" ? row.model.key : row.key
+              return <Seen key={key} id={key} onSeen={onSeen}>
+                {row._tag === "Checking" ? <CheckingCard name={row.name} lab={row.lab} />
+                  : row._tag === "Unchecked" ? <UncheckedCard name={row.name} lab={row.lab} gated={row.gated} retry={row.retry} />
+                  : card(row.model, undefined, row.prefetched)}
+              </Seen>
+            })}</div>
             : results.more === null && <p className="max-w-lg text-[13px] text-slate-500">
               No models on Hugging Face that run in Magnitude match “{query.trim()}”. {runnableSummary(families)}
             </p>}

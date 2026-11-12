@@ -169,6 +169,13 @@ const SearchHuggingFaceModels = query(
   { staleTime: "1 minute" }
 );
 
+/** A listed repository's check, kept while its commit is the one listed: a commit's files never change. */
+const CheckHuggingFaceRepository = query(
+  Rpcs.checkHuggingFaceRepository,
+  (client) => client.models.checkHuggingFaceRepository,
+  { staleTime: "5 minutes", gcTime: "5 minutes" }
+);
+
 /**
  * The one candidate inspection, as it goes: the latest progress, then the inspection, which stays
  * cached so reopening the repository shows it at once.
@@ -177,6 +184,13 @@ const StreamModelCandidateInspection = streamQuery(
   Rpcs.streamModelCandidateInspection,
   (client) => client.models.streamModelCandidateInspection,
   { reduce: (_, update): CandidateInspectionUpdate => update, gcTime: "5 minutes" }
+);
+
+/** The candidate inspection once it is done, kept so reopening the repository shows it at once. */
+const InspectModelCandidate = query(
+  Rpcs.inspectModelCandidate,
+  (client) => client.models.inspectModelCandidate,
+  { staleTime: "5 minutes", gcTime: "5 minutes" }
 );
 
 const ListDrafterCandidates = query(
@@ -260,7 +274,9 @@ export const Models = Group.make({
   GetLocalEnvironment,
   PreviewSlotLoad,
   SearchHuggingFaceModels,
+  CheckHuggingFaceRepository,
   StreamModelCandidateInspection,
+  InspectModelCandidate,
   ListDrafterCandidates,
   ListModelLocations,
   RefreshCatalog,

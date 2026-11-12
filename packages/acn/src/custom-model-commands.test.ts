@@ -26,6 +26,7 @@ import {
   CustomFormModelIdSchema,
   DrafterReferenceSchema,
   HuggingFaceRepositoryIdSchema,
+  type HuggingFaceRepositoryId,
   LocalModelMutationFailed,
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
@@ -187,17 +188,8 @@ const harness = (options: {
         lastModified: Option.none(),
         likes: Option.none(),
         tags: [],
-        unsupported: [],
-        variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
         developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
         base: Option.some({ repository: "Qwen/Qwen3.6-35B-A3B", relation: "finetune" }),
-        recommended: Option.some({
-          label: "Q2_K",
-          modelId: "hf:HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/model-Q2_K.gguf",
-          sizeBytes: 50,
-          downloadBytes: 60,
-          assessment: Schema.decodeUnknownSync(NativeModelAssessment)(unsupportedQ2K),
-        }),
       }, {
         repository: "unsloth/DeepSeek-V4-Flash-GGUF",
         architecture: Option.some("deepseek4"),
@@ -209,13 +201,37 @@ const harness = (options: {
         lastModified: Option.none(),
         likes: Option.none(),
         tags: [],
-        unsupported: [{ _tag: "Architecture", architecture: "deepseek4" }],
-        variantOf: Option.none(),
         developer: Option.none(),
         base: Option.none(),
-        recommended: Option.none(),
       }],
     }) as never,
+    check: ({ repository }) => Effect.succeed(repository === "unsloth/DeepSeek-V4-Flash-GGUF"
+      ? {
+          _tag: "Model",
+          architecture: Option.some("deepseek4"),
+          unsupported: [{ _tag: "Architecture", architecture: "deepseek4" }],
+          variantOf: Option.none(),
+          developer: Option.none(),
+          base: Option.none(),
+          recommended: Option.none(),
+        }
+      : repository === "drafters/Qwen-DFlash-GGUF"
+        ? { _tag: "NotAModel" }
+        : {
+            _tag: "Model",
+            architecture: Option.some("qwen35moe"),
+            unsupported: [],
+            variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
+            developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
+            base: Option.none(),
+            recommended: Option.some({
+              label: "Q2_K",
+              modelId: "hf:HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive/model-Q2_K.gguf",
+              sizeBytes: 50,
+              downloadBytes: 60,
+              assessment: Schema.decodeUnknownSync(NativeModelAssessment)(unsupportedQ2K),
+            }),
+          }) as never,
     resolveRepository: () => Effect.die("unused"),
     inspect: () => options.inspectFailure === undefined
       ? Effect.succeed(options.inspect ?? inspection())
@@ -317,30 +333,38 @@ const harness = (options: {
 }
 
 describe("finding models", () => {
-  it("maps search results with uploader, variant, and an unsupported architecture's reason", async () => {
+  it("lists search results as Hugging Face does, with their uploader, developer, and base", async () => {
     const { run } = harness()
     const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none(), cursor: Option.none() }))
-    expect(result.results[1]).toMatchObject({
-      displayName: "DeepSeek V4 Flash",
-      variantOf: Option.none(),
-      developer: Option.none(),
-      unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
-      gated: true,
-    })
     expect(result.results[0]).toMatchObject({
+      repository: "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive",
+      commit: "c",
       displayName: "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive",
       uploader: "HauhauCS",
-      variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
       developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
       downloads: 12,
       architecture: Option.some("qwen35moe"),
-      unsupported: Option.none(),
       gated: false,
       base: Option.some({ repository: "Qwen/Qwen3.6-35B-A3B", relation: "Finetune" }),
     })
-    expect(result.results[0]?.recommended.pipe(Option.map(({ label, downloadBytes, assessment }) =>
+    expect(result.results[1]).toMatchObject({ displayName: "DeepSeek V4 Flash", developer: Option.none(), gated: true, base: Option.none() })
+  })
+
+  it("checks a listed repository: its variant and recommended version, an unsupported architecture's reason, or no model", async () => {
+    const { run } = harness()
+    const check = (repository: string) => run((commands) => commands.checkHuggingFace({
+      repository: repository as HuggingFaceRepositoryId, commit: "c", architecture: Option.none(), restricted: false,
+    }))
+    const qwen = await check("HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive")
+    expect(qwen).toMatchObject({ _tag: "Model", variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"), unsupported: Option.none() })
+    expect(qwen._tag === "Model" && qwen.recommended.pipe(Option.map(({ label, downloadBytes, assessment }) =>
       [label, downloadBytes, assessment._tag]))).toEqual(Option.some(["Q2_K", 60, "Unsupported"]))
-    expect(result.results[1]).toMatchObject({ base: Option.none(), recommended: Option.none() })
+    expect(await check("unsloth/DeepSeek-V4-Flash-GGUF")).toMatchObject({
+      _tag: "Model",
+      unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
+      recommended: Option.none(),
+    })
+    expect(await check("drafters/Qwen-DFlash-GGUF")).toEqual({ _tag: "NotAModel" })
   })
 
   it("inspects owner/repo:QUANT and selects that version", async () => {

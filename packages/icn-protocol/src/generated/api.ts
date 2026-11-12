@@ -138,6 +138,44 @@ export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "
     { status: 500 },
   )
 
+export const checkHuggingFaceRepository = HttpApiEndpoint.post(
+  "checkHuggingFaceRepository",
+  "/api/v1/sources/hugging-face/check",
+)
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceRepositoryCheckRequest, Schemas.HuggingFaceRepositoryCheckRequestEncoded> =>
+        Schemas.HuggingFaceRepositoryCheckRequest,
+    ),
+  )
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceRepositoryCheck, Schemas.HuggingFaceRepositoryCheckEncoded> =>
+        Schemas.HuggingFaceRepositoryCheck,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 422 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const configureHuggingFaceCredential = HttpApiEndpoint.put(
   "configureHuggingFaceCredential",
   "/api/v1/sources/hugging-face/credential",
@@ -833,6 +871,7 @@ export const DownloadsGroup = HttpApiGroup.make("downloads")
   .add(startModelDownload)
 
 export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
+  .add(checkHuggingFaceRepository)
   .add(configureHuggingFaceCredential)
   .add(resolveHuggingFaceRepository)
   .add(searchHuggingFaceModels)

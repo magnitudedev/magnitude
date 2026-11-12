@@ -33,6 +33,8 @@ import {
   makeLocations,
   makePreparation,
   makeSearchResponse,
+  listedSearch,
+  searchChecks,
   makeUnsupportedLocalModel,
   makeUnsupportedSearchResult,
   TEST_COMMIT,
@@ -1078,7 +1080,8 @@ describe("--json output", () => {
 
   it("prints one JSON document in place of the text output", async () => {
     const { client } = fakeClient({
-      searchHuggingFaceModels: () => Effect.succeed(makeSearchResponse()),
+      searchHuggingFaceModels: () => Effect.succeed(listedSearch(makeSearchResponse())),
+      checkHuggingFaceRepository: (request: { readonly repository: string }) => Effect.succeed(searchChecks(makeSearchResponse())(request)),
       getLocalEnvironment: () => Effect.succeed(makeHardware()),
     })
     const effect = readSearch(client, "qwen", Option.some(5))

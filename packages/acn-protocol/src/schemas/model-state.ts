@@ -1513,19 +1513,22 @@ export const HuggingFaceRecommendedVersionSchema = Schema.Struct({
 })
 export type HuggingFaceRecommendedVersion = typeof HuggingFaceRecommendedVersionSchema.Type
 
+/**
+ * One repository as Hugging Face lists it, before any of its files is read: `architecture` is the Hub's, and
+ * `developer` is told by its name. What it holds on this machine is its check (`HuggingFaceRepositoryCheckSchema`).
+ */
 export const HuggingFaceSearchResultSchema = Schema.Struct({
   repository: HuggingFaceRepositoryIdSchema,
+  commit: NonEmptyString,
   displayName: NonEmptyString,
   uploader: NonEmptyString,
-  variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
   developer: Schema.optionalWith(LocalModelDeveloperSchema, { as: "Option", exact: true }),
   downloads: NonNegativeSafeInteger,
   architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
-  unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
   gated: Schema.Boolean,
+  private: Schema.Boolean,
   versionCount: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
   base: Schema.optionalWith(HuggingFaceModelBaseSchema, { as: "Option", exact: true }),
-  recommended: Schema.optionalWith(HuggingFaceRecommendedVersionSchema, { as: "Option", exact: true }),
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
@@ -1538,7 +1541,26 @@ export const HuggingFaceSearchQuerySchema = Schema.String.pipe(Schema.filter(
   { message: () => `A Hugging Face search query is at most ${HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES} bytes` },
 ))
 
-/** One page of repositories of every architecture, unsupported ones last; `nextCursor` requests the next page. */
+/**
+ * What a listed repository holds on this machine. `NotAModel` is a repository of drafters or projectors alone. For a
+ * `Model`: `unsupported` when Magnitude can't run it; `architecture` from its model file's header; `variantOf` the
+ * catalog model whose shape it has; `developer` and `base` as its model file tells them; `recommended` the version its
+ * inspection would recommend, absent when its versions couldn't be assessed in time.
+ */
+export const HuggingFaceRepositoryCheckSchema = Schema.Union(
+  Schema.TaggedStruct("NotAModel", {}),
+  Schema.TaggedStruct("Model", {
+    architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+    variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+    developer: Schema.optionalWith(LocalModelDeveloperSchema, { as: "Option", exact: true }),
+    base: Schema.optionalWith(HuggingFaceModelBaseSchema, { as: "Option", exact: true }),
+    unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
+    recommended: Schema.optionalWith(HuggingFaceRecommendedVersionSchema, { as: "Option", exact: true }),
+  }),
+)
+export type HuggingFaceRepositoryCheck = typeof HuggingFaceRepositoryCheckSchema.Type
+
+/** One page of Hugging Face's repositories, most downloaded first; `nextCursor` requests the next page. */
 export const HuggingFaceSearchResponseSchema = Schema.Struct({
   results: Schema.Array(HuggingFaceSearchResultSchema),
   nextCursor: Schema.optionalWith(Schema.String.pipe(Schema.minLength(1)), { as: "Option", exact: true }),

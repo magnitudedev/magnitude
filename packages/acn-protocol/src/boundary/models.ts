@@ -20,10 +20,12 @@ import {
   AddedModelSchema,
   CatalogComponentSchema,
   CandidateInspectionUpdateSchema,
+  CandidateInspectionSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
   DrafterChoiceSchema,
   DrafterTargetSchema,
+  HuggingFaceRepositoryCheckSchema,
   HuggingFaceRepositoryIdSchema,
   HuggingFaceSearchQuerySchema,
   HuggingFaceSearchResponseSchema,
@@ -181,8 +183,8 @@ const optional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
 
 /**
- * One page of GGUF repositories on Hugging Face; those of architectures Magnitude doesn't run carry their reasons.
- * `cursor` is a previous page's `nextCursor`.
+ * One page of GGUF repositories on Hugging Face, as it lists them, without reading any file: each is checked on its own
+ * (`CheckHuggingFaceRepository`). `cursor` is a previous page's `nextCursor`.
  */
 const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
   payload: Schema.Struct({
@@ -191,6 +193,22 @@ const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
     cursor: optional(NonEmptyString),
   }),
   success: HuggingFaceSearchResponseSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/**
+ * What a repository search listed holds on this machine: its model file's header, then the version its inspection
+ * would recommend. `architecture` is the one the search listed, which decides only when the header can't be read;
+ * `restricted` is whether it listed the repository as gated or private.
+ */
+const CheckHuggingFaceRepository = Rpc.make("CheckHuggingFaceRepository", {
+  payload: Schema.Struct({
+    repository: HuggingFaceRepositoryIdSchema,
+    commit: NonEmptyString,
+    architecture: optional(NonEmptyString),
+    restricted: Schema.Boolean,
+  }),
+  success: HuggingFaceRepositoryCheckSchema,
   error: ModelCandidateError,
 }).pipe(replaySafe)
 
@@ -205,6 +223,16 @@ const StreamModelCandidateInspection = Rpc.make("StreamModelCandidateInspection"
   error: ModelCandidateError,
   stream: true,
 })
+
+/**
+ * The same inspection answered once it is done, without its progress: a request that ends, so it holds no connection
+ * after it is answered.
+ */
+const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
+  payload: Schema.Struct({ reference: NonEmptyString }),
+  success: CandidateInspectionSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
 
 /** Drafters for a target in preselection order; `other` adds any reference with the engine's verdict. */
 /** A target's drafter choices; with `other`, also the listed candidate that different drafter is. */
@@ -304,7 +332,9 @@ export const Models = {
   stopSlot: StopSlot,
   previewSlotLoad: PreviewSlotLoad,
   searchHuggingFaceModels: SearchHuggingFaceModels,
+  checkHuggingFaceRepository: CheckHuggingFaceRepository,
   streamModelCandidateInspection: StreamModelCandidateInspection,
+  inspectModelCandidate: InspectModelCandidate,
   listDrafterCandidates: ListDrafterCandidates,
   listModelLocations: ListModelLocations,
   addHuggingFaceModel: AddHuggingFaceModel,

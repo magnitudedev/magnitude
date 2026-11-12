@@ -24,6 +24,7 @@ import {
   preselectedDrafterCandidate,
   sameModelId,
   type AutomaticModelLocationKind,
+  type CandidateInspection,
   type CandidateInspectionProgress,
   type CandidateInspectionUpdate,
   type CatalogFormModelId,
@@ -39,6 +40,8 @@ import {
   type HuggingFaceFormModelId,
   type HuggingFaceRepositoryId,
   type HuggingFaceSearchResponse,
+  type HuggingFaceRepositoryCheck,
+  HuggingFaceRepositoryCheckSchema,
   type LocalInferenceError,
   type LocalModelSyncOutcome,
   type ModelCandidateError,
@@ -142,8 +145,17 @@ export interface CustomModelCommandsApi {
     readonly limit: Option.Option<number>
     readonly cursor: Option.Option<string>
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
+  /** What a repository search listed holds on this machine: its header's verdict, then the version it would recommend. */
+  readonly checkHuggingFace: (request: {
+    readonly repository: HuggingFaceRepositoryId
+    readonly commit: string
+    readonly architecture: Option.Option<string>
+    readonly restricted: boolean
+  }) => Effect.Effect<HuggingFaceRepositoryCheck, ModelCandidateError>
   /** A reference inspected without changes, as it goes: its progress in order, then the inspection itself. */
   readonly inspectCandidate: (reference: string) => Stream.Stream<CandidateInspectionUpdate, ModelCandidateError>
+  /** The same inspection once it is done. */
+  readonly inspectCandidateResult: (reference: string) => Effect.Effect<CandidateInspection, ModelCandidateError>
   /** The drafter choices, and the listed candidate a different drafter (`other`) resolves to. */
   readonly listDrafterCandidates: (
     target: DrafterTarget,
@@ -748,41 +760,71 @@ export const CustomModelCommandsLive: Layer.Layer<
       cursor,
     }).pipe(
       Effect.catchAll(candidateFailed(query)),
-      Effect.zip(assessmentsSnapshot),
-      Effect.map(([{ results, nextCursor }, snapshot]) => ({
+      Effect.map(({ results, nextCursor }) => ({
         nextCursor,
         results: results.flatMap((result) => {
           const repository = Schema.decodeUnknownOption(HuggingFaceRepositoryIdSchema)(result.repository)
           if (Option.isNone(repository)) return []
           return Option.toArray(Schema.decodeUnknownOption(HuggingFaceSearchResultSchema)({
             repository: repository.value,
+            commit: result.commit,
             displayName: repositoryDisplayName(repository.value, Option.getOrUndefined(Option.map(result.base, ({ repository }) => repository))),
             uploader: repository.value.split("/")[0],
-            ...presentField("variantOf", result.variantOf),
             ...presentField("developer", result.developer),
             downloads: Option.getOrElse(result.downloads, () => 0),
             gated: result.gated,
+            private: result.private,
             ...presentField("versionCount", result.versionCount),
             ...presentField("architecture", Option.filter(result.architecture, (value) => value.length > 0)),
-            ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
-              Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
             ...presentField("base", Option.map(result.base, ({ repository, relation }) => ({
               repository,
               relation: baseRelation[relation],
-            }))),
-            ...presentField("recommended", Option.map(result.recommended, (version) => ({
-              label: version.label,
-              modelId: version.modelId,
-              sizeBytes: version.sizeBytes,
-              downloadBytes: version.downloadBytes,
-              assessment: Schema.encodeSync(LocalModelAssessmentSchema)(projectAssessment(snapshot, version.assessment)),
             }))),
           }))
         }),
       })),
     ),
 
+    checkHuggingFace: ({ repository, commit, architecture, restricted }) => icn.check({ repository, commit, architecture, restricted }).pipe(
+      Effect.catchAll(candidateFailed(repository)),
+      Effect.zip(assessmentsSnapshot),
+      Effect.flatMap(([check, snapshot]) => check._tag === "NotAModel"
+        ? Effect.succeed<HuggingFaceRepositoryCheck>({ _tag: "NotAModel" })
+        : Schema.decodeUnknown(HuggingFaceRepositoryCheckSchema)({
+            _tag: "Model",
+            ...presentField("architecture", Option.filter(check.architecture, (value) => value.length > 0)),
+            ...presentField("variantOf", check.variantOf),
+            ...presentField("developer", check.developer),
+            ...presentField("base", Option.map(check.base, ({ repository, relation }) => ({
+              repository,
+              relation: baseRelation[relation],
+            }))),
+            ...presentField("unsupported", Option.some(check.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
+              Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
+            ...presentField("recommended", Option.map(check.recommended, (version) => ({
+              label: version.label,
+              modelId: version.modelId,
+              sizeBytes: version.sizeBytes,
+              downloadBytes: version.downloadBytes,
+              assessment: Schema.encodeSync(LocalModelAssessmentSchema)(projectAssessment(snapshot, version.assessment)),
+            }))),
+          }).pipe(Effect.orDie)),
+    ),
+
     inspectCandidate: inspect,
+
+    inspectCandidateResult: (reference) => inspect(reference).pipe(
+      Stream.filterMap((update) => update._tag === "Inspected" ? Option.some(update.inspection) : Option.none()),
+      Stream.runHead,
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.fail(new ModelSourceUnavailable({
+          reason: "Unreadable",
+          message: `The inspection of ${reference} ended without a result.`,
+          retryable: true,
+        })),
+        onSome: Effect.succeed,
+      })),
+    ),
 
     listDrafterCandidates,
 

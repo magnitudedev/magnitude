@@ -5604,13 +5604,13 @@ impl magnitude_service_models::RecommendedVersions for NoCatalogFingerprints {
     }
 }
 
-/// Search applies the engine's interpretation to the model file header it reads, so a repository
-/// whose header the engine refuses is shown disabled with the engine's reasons: a tokenizer the
+/// A listed repository's check applies the engine's interpretation to the model file header it
+/// reads, so a repository whose header the engine refuses is unsupported with the engine's reasons: a tokenizer the
 /// leading metadata declares, read from the first bytes alone, and a tensor no admitted role binds,
 /// seen when the whole header is read (here because the writer put the block count after the token
 /// list). Weight types never disable a row, since another version may have supported ones.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_disables_a_result_whose_header_the_engine_refuses() {
+async fn a_check_refuses_a_repository_whose_header_the_engine_refuses() {
     // The tokenizer scheme where writers put it, before the token list.
     let mut sentencepiece = llama(7, Encoding::Q8_0);
     for (key, value) in &mut sentencepiece.metadata {
@@ -5678,14 +5678,24 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
     )
     .await
     .expect("search");
-    let unsupported = |id: &str| {
-        results
-            .results
-            .iter()
-            .find(|result| result.repository == id)
-            .unwrap_or_else(|| panic!("{id} is a result"))
-            .unsupported
-            .clone()
+    let mut checks = std::collections::BTreeMap::new();
+    for result in results.results {
+        let check = magnitude_service_contracts::HuggingFaceModelCatalog::check(
+            &discovery,
+            magnitude_service_contracts::HuggingFaceRepositoryCheckRequest {
+                repository: result.repository.clone(),
+                commit: result.commit,
+                architecture: result.architecture,
+                restricted: result.gated || result.private,
+            },
+        )
+        .await
+        .expect("check");
+        checks.insert(result.repository, check);
+    }
+    let unsupported = |id: &str| match checks.get(id).unwrap_or_else(|| panic!("{id} is a result")) {
+        magnitude_service_contracts::HuggingFaceRepositoryCheck::Model { unsupported, .. } => unsupported.clone(),
+        magnitude_service_contracts::HuggingFaceRepositoryCheck::NotAModel => panic!("{id} is a model"),
     };
     assert_eq!(
         unsupported("someone/Sentencepiece-GGUF"),
@@ -5703,11 +5713,6 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
         )]
     );
     assert_eq!(unsupported("someone/Q2-GGUF"), []);
-    assert_eq!(
-        results.results.last().map(|result| result.repository.as_str()),
-        Some("someone/Biased-GGUF"),
-        "refused results are listed last"
-    );
 }
 
 // Declared Hub lineage -------------------------------------------------------------------------

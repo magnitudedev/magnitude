@@ -16,6 +16,7 @@ import {
   type UnsupportedReasonGroup,
   unsupportedReasonMessages,
   type ServingMemory,
+  QUICK_SEARCH_CHECKS,
 } from "@magnitudedev/client-common"
 import {
   CatalogComponentSchema,
@@ -33,7 +34,7 @@ import {
   type DrafterCandidate,
   type DrafterChoice,
   type DrafterTarget,
-  type HuggingFaceSearchResponse,
+  type HuggingFaceRecommendedVersion,
   type HuggingFaceSearchResult,
   type LocalModel,
   type LocalModelSyncOutcome,
@@ -80,9 +81,20 @@ const baseLabel = (result: HuggingFaceSearchResult): string => Option.match(resu
   },
 })
 
+/**
+ * A listed repository with what its check found: the catalog model it is a variant of, why it can't run, and the
+ * version it would recommend; its header's architecture and base stand in for what Hugging Face left out. All three are
+ * absent when the check couldn't be made.
+ */
+export interface CheckedSearchResult extends HuggingFaceSearchResult {
+  readonly variantOf: Option.Option<CatalogFormModelId>
+  readonly unsupported: Option.Option<readonly [UnsupportedReason, ...UnsupportedReason[]]>
+  readonly recommended: Option.Option<HuggingFaceRecommendedVersion>
+}
+
 export interface SearchView {
   readonly query: string
-  readonly response: HuggingFaceSearchResponse
+  readonly response: { readonly results: readonly CheckedSearchResult[]; readonly nextCursor: Option.Option<string> }
   readonly memory: ServingMemory
 }
 
@@ -157,19 +169,39 @@ const parseSearchLimit = (input: string | undefined) => {
     : Effect.fail(new ModelCommandError({ message: `Limit must be an integer from 1 to ${SEARCH_LIMIT_MAXIMUM}` }))
 }
 
+/** `result` as its check found it; unchecked when the check failed, and nothing for a repository that holds no model. */
+const checkedResult = (client: CliModelsClient, result: HuggingFaceSearchResult) =>
+  client.models.checkHuggingFaceRepository({ repository: result.repository, commit: result.commit, architecture: result.architecture, restricted: result.gated || result.private }).pipe(
+    Effect.map((check): readonly CheckedSearchResult[] => check._tag === "NotAModel" ? [] : [{
+      ...result,
+      architecture: Option.orElse(check.architecture, () => result.architecture),
+      developer: Option.orElse(check.developer, () => result.developer),
+      base: Option.orElse(result.base, () => check.base),
+      variantOf: check.variantOf,
+      unsupported: check.unsupported,
+      recommended: check.recommended,
+    }]),
+    Effect.orElseSucceed((): readonly CheckedSearchResult[] => [{
+      ...result, variantOf: Option.none(), unsupported: Option.none(), recommended: Option.none(),
+    }]),
+  )
+
+/** A page of search results, each checked, `QUICK_SEARCH_CHECKS` at a time: the page prints when every check is done. */
 export const readSearch = (
   client: CliModelsClient,
   query: string,
   limit: Option.Option<number>,
   cursor: Option.Option<string>,
 ) => Effect.all({
-  response: client.models.searchHuggingFaceModels({ query, limit, cursor }),
+  page: client.models.searchHuggingFaceModels({ query, limit, cursor }),
   hardware: readHardware(client),
-}).pipe(Effect.map(({ response, hardware }): SearchView => ({
-  query,
-  response,
-  memory: deriveHardwareRoles(hardware).servingMemory,
-})))
+}).pipe(Effect.flatMap(({ page, hardware }) => Effect.forEach(page.results, (result) => checkedResult(client, result), { concurrency: QUICK_SEARCH_CHECKS }).pipe(
+  Effect.map((checked): SearchView => ({
+    query,
+    response: { results: checked.flat(), nextCursor: page.nextCursor },
+    memory: deriveHardwareRoles(hardware).servingMemory,
+  })),
+)))
 
 export const searchHuggingFace = (
   query: string,

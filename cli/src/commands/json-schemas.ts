@@ -5,6 +5,7 @@ import {
   CustomLocalModelSchema,
   CustomLocalModelServingStateSchema,
   CustomModelAcquisitionStateSchema,
+  CatalogFormModelIdSchema,
   HuggingFaceRecommendedVersionSchema,
   HuggingFaceSearchResultSchema,
   LocalInferenceAcceleratorSchema,
@@ -27,6 +28,7 @@ import {
   StreamingHostStatusSchema,
   StreamingTierStatusSchema,
   CatalogLocalModelServingStateSchema,
+  UnsupportedReasonSchema,
 } from "@magnitudedev/sdk"
 import { Schema, Struct } from "effect"
 
@@ -191,9 +193,12 @@ export const CandidateInspectionJsonSchema = Schema.Struct({
   versions: Schema.Array(CandidateVersionJsonSchema),
 })
 
+/** A page of search results, each with what its check found: a repository of drafters or projectors alone is left out. */
 export const HuggingFaceSearchResponseJsonSchema = Schema.Struct({
   results: Schema.Array(Schema.Struct({
     ...HuggingFaceSearchResultSchema.fields,
+    variantOf: optional(CatalogFormModelIdSchema),
+    unsupported: optional(Schema.NonEmptyArray(UnsupportedReasonSchema)),
     recommended: optional(Schema.Struct({
       ...HuggingFaceRecommendedVersionSchema.fields,
       assessment: LocalModelAssessmentJsonSchema,

@@ -1942,6 +1942,86 @@
         }
       }
     },
+    "/api/v1/sources/hugging-face/check": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "checkHuggingFaceRepository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What a listed repository holds on this machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceRepositoryCheck"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid check request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository or revision not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/hugging-face/credential": {
       "put": {
         "tags": [
@@ -6714,14 +6794,13 @@
       },
       "HuggingFaceModelSearchResult": {
         "type": "object",
-        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has. `version_count` is how many GGUFs the repository's file list offers\n(split shards counted once, projectors excluded), approximate since drafters are not told apart.\n`base` is the model the repository derives from: the Hub's `baseModels`, else its model file's\n`general.base_model.*`. `recommended` is the version inspection recommends on this machine,\nabsent when none fits or the repository could not be inspected in time.",
+        "description": "One repository as the Hub lists it, before any of its files is read. `architecture` is the\nHub's, from the GGUF it describes the repository by. `developer` is told by the repository's\nname. `version_count` is how many GGUFs the repository's file list offers (split shards counted\nonce, projectors excluded), approximate since drafters are not told apart. `base` is the Hub's\n`baseModels`. What the repository holds on this machine is its check\n(`HuggingFaceRepositoryCheck`).",
         "required": [
           "repository",
           "commit",
           "gated",
           "private",
-          "tags",
-          "unsupported"
+          "tags"
         ],
         "properties": {
           "repository": {
@@ -6758,9 +6837,6 @@
           "architecture": {
             "type": "string"
           },
-          "variantOf": {
-            "$ref": "#/components/schemas/ModelId"
-          },
           "developer": {
             "$ref": "#/components/schemas/ModelDeveloper"
           },
@@ -6769,24 +6845,15 @@
             "format": "int32",
             "minimum": 1
           },
-          "unsupported": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UnsupportedReason"
-            }
-          },
           "base": {
             "$ref": "#/components/schemas/HuggingFaceModelBase"
-          },
-          "recommended": {
-            "$ref": "#/components/schemas/HuggingFaceRecommendedVersion"
           }
         },
         "additionalProperties": false
       },
       "HuggingFaceModelSearchResults": {
         "type": "object",
-        "description": "One page of results of every architecture, unsupported ones last; catalog and drafter\nrepositories excluded. `next_cursor` requests the page after it, absent on the last.",
+        "description": "One page of the Hub's results, most downloaded first; catalog repositories excluded. `next_cursor` requests the page after it, absent on the last.",
         "required": [
           "results"
         ],
@@ -6832,6 +6899,85 @@
           },
           "assessment": {
             "$ref": "#/components/schemas/ModelAssessment"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceRepositoryCheck": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotAModel"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "unsupported",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "variantOf": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "developer": {
+                "$ref": "#/components/schemas/ModelDeveloper"
+              },
+              "base": {
+                "$ref": "#/components/schemas/HuggingFaceModelBase"
+              },
+              "unsupported": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "recommended": {
+                "$ref": "#/components/schemas/HuggingFaceRecommendedVersion"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Model"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a listed repository holds on this machine, from its model file's header and the version\ncandidate inspection would recommend. `NotAModel` is a repository of drafters or projectors\nalone: nothing in it is offered. For a `Model`, `unsupported` is empty when the engine runs it;\n`architecture` is its header's, absent when the header couldn't be read; `variant_of` is the\ncatalog model whose shape fingerprint it has; `base` is the Hub's `baseModels`, else its model\nfile's `general.base_model.*`; `recommended` is the version inspection recommends, absent when\nthe versions couldn't be assessed in time."
+      },
+      "HuggingFaceRepositoryCheckRequest": {
+        "type": "object",
+        "description": "A listed repository to check: what the search listed it as. `architecture` is the Hub's,\nwhich decides only when the repository's model file can't be read; `restricted` is whether the\nlisting is gated or private, so its reads are kept for the credential that made them.",
+        "required": [
+          "repository",
+          "commit",
+          "restricted"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "restricted": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
