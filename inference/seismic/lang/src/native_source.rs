@@ -175,6 +175,8 @@ pub enum NativeReadError {
     /// The implementation's launches take code parameters from its source
     /// (a launch-scoped Metal or CUDA implementation), and none was given.
     Unsourced,
+    /// The implementation's sub-tile cannot be derived from its source.
+    SubTile(&'static str),
 }
 
 impl std::fmt::Display for NativeReadError {
@@ -185,11 +187,90 @@ impl std::fmt::Display for NativeReadError {
                 f,
                 "native parameter `{parameter}` is never read: no launch's source or declaration reads it"
             ),
+            Self::SubTile(detail) => write!(f, "sub-tile domain: {detail}"),
             Self::Unsourced => f.write_str(
                 "its launches take their code parameters from its source, and no source was given",
             ),
         }
     }
+}
+
+/// The sub-tile the Vulkan projection GEMM template (`projection.glsl`)
+/// states it cannot run: it defines `PROJECTION_GEMM_SPILLING_SUB_M` and
+/// `PROJECTION_GEMM_SPILLING_SUB_N`, and every implementation whose source
+/// includes the template and reads the tuned sub-tile
+/// (`SEISMIC_TUNE_SUB_M`, `SEISMIC_TUNE_SUB_N`) inherits that exclusion, so
+/// the template alone states its domain and no declaration can omit it. A
+/// source that reads the tuned sub-tile without the template, or the
+/// template without the tuned sub-tile (constant sub-tiles), is not
+/// constrained. A spilling pipeline is also the slowest to compile, which a
+/// compile that cannot be interrupted turns into a tuning budget overrun.
+fn inherit_projection_gemm_domain(
+    implementation: &mut NativeImplementation,
+    source: Option<&str>,
+    tokens: &[(&str, usize)],
+) -> Result<(), NativeReadError> {
+    use crate::checked::{NativeComparison, NativeCondition, NativeNatExpr};
+    let declares = ["SUB_M", "SUB_N"]
+        .iter()
+        .all(|name| implementation.params.iter().any(|parameter| parameter.name == *name));
+    if implementation.backend != BackendName::Vulkan || !declares {
+        return Ok(());
+    }
+    let Some(source) = source else {
+        return Err(NativeReadError::SubTile(
+            "it declares a sub-tile, whose domain the source states, and no source was given",
+        ));
+    };
+    let reads = |name: &str| tokens.iter().any(|(token, _)| *token == name);
+    if !(reads("SEISMIC_TUNE_SUB_M") && reads("SEISMIC_TUNE_SUB_N")) {
+        return Ok(());
+    }
+    let spilling = |name: &str| -> Option<u64> {
+        source.lines().find_map(|line| {
+            let mut words = line.trim_start().strip_prefix("#define")?.split_whitespace();
+            if words.next()? != name {
+                return None;
+            }
+            words.next()?.trim_end_matches(['u', 'U']).parse().ok()
+        })
+    };
+    // A define the source carries must parse as `#define NAME <integer>`: the
+    // rule is never skipped for one that does not.
+    let carried = |name: &str| reads(name);
+    let (m, n) = match (
+        carried("PROJECTION_GEMM_SPILLING_SUB_M"),
+        carried("PROJECTION_GEMM_SPILLING_SUB_N"),
+    ) {
+        (false, false) => return Ok(()),
+        (true, true) => match (
+            spilling("PROJECTION_GEMM_SPILLING_SUB_M"),
+            spilling("PROJECTION_GEMM_SPILLING_SUB_N"),
+        ) {
+            (Some(m), Some(n)) => (m, n),
+            _ => {
+                return Err(NativeReadError::SubTile(
+                    "PROJECTION_GEMM_SPILLING_SUB_M and _N must each be defined as `#define NAME <integer>`",
+                ));
+            }
+        },
+        _ => {
+            return Err(NativeReadError::SubTile(
+                "the template defines one of PROJECTION_GEMM_SPILLING_SUB_M and _N without the other",
+            ));
+        }
+    };
+    let differs = |name: &str, value: u64| NativeCondition::Compare {
+        comparison: NativeComparison::Ne,
+        left: NativeNatExpr::Parameter(name.to_owned()),
+        right: NativeNatExpr::Constant(value),
+    };
+    let rule = NativeCondition::Or(Box::new(differs("SUB_M", m)), Box::new(differs("SUB_N", n)));
+    implementation.constraint = Some(match implementation.constraint.take() {
+        Some(declared) => NativeCondition::And(Box::new(declared), Box::new(rule)),
+        None => rule,
+    });
+    Ok(())
 }
 
 /// Derive which of the implementation's parameters change generated code
@@ -219,6 +300,7 @@ pub fn derive_codes(
         if templated.is_some() {
             return Err(NativeReadError::Unsourced);
         }
+        inherit_projection_gemm_domain(implementation, None, &[])?;
         for parameter in implementation
             .params
             .iter_mut()
@@ -232,6 +314,7 @@ pub fn derive_codes(
         Some(_) => identifiers(source),
         None => Vec::new(),
     };
+    inherit_projection_gemm_domain(implementation, Some(source), &tokens)?;
     // Each launch's template header, where it has one.
     let mut headers: Vec<Option<Vec<String>>> = vec![None; implementation.launches.len()];
     if let Some(dialect) = templated {
@@ -455,6 +538,75 @@ mod tests {
         );
         let error = checked(&unread, SOURCE).unwrap_err();
         assert!(error.contains("native parameter `UNUSED` is never read"), "{error}");
+    }
+
+    /// The projection GEMM template states the sub-tile it cannot run
+    /// (`PROJECTION_GEMM_SPILLING_SUB_M`, `_SUB_N`); an implementation whose
+    /// source includes the template and tunes its sub-tile admits no such
+    /// sub-tile whatever its declaration lists. One that tunes the sub-tile
+    /// without the template, or is not Vulkan's, admits it; a Vulkan one
+    /// declaring the sub-tile without a source does not check.
+    #[test]
+    fn a_source_including_the_projection_gemm_inherits_its_sub_tile_domain() {
+        /// The test's directory, removed however the test ends.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(std::env::temp_dir().join(format!("sub-tile-domain-{}", std::process::id())));
+        let directory = scratch.0.clone();
+        std::fs::create_dir_all(directory.join("lib")).unwrap();
+        std::fs::write(
+            directory.join("lib/template.glsl"),
+            "#define PROJECTION_GEMM_SPILLING_SUB_M 64\n#define PROJECTION_GEMM_SPILLING_SUB_N 64\nvoid projection_gemm(uint tm, uint tn, uint wm, uint wn) {}\n",
+        )
+        .unwrap();
+        let body = "void main() { projection_gemm(SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N); }\n";
+        std::fs::write(directory.join("template.comp"), format!("#include \"lib/template.glsl\"\n{body}")).unwrap();
+        std::fs::write(directory.join("own.comp"), body).unwrap();
+        // Metal's includes are its own `.h` files.
+        std::fs::write(
+            directory.join("lib/template.h"),
+            "#define PROJECTION_GEMM_SPILLING_SUB_M 64\n#define PROJECTION_GEMM_SPILLING_SUB_N 64\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("template.metal"), format!("#include \"lib/template.h\"\n{body}")).unwrap();
+        let declaration = |backend: &str, file: &str| {
+            format!(
+                "native scale for {backend} from \"{file}\":\n    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)\n    where SUB_M <= TILE_M and SUB_N <= TILE_N\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let tiles = |backend: BackendName, file: &str| {
+            let module = crate::source::check_beside(sources(&declaration(backend.as_str(), file)), &directory)
+                .expect("the tile declaration checks");
+            module
+                .native_implementation(module.entries()[0].id, backend)
+                .unwrap()
+                .admissible(&crate::checked::NativeSpecialization::new())
+                .unwrap()
+                .iter()
+                .map(|point| (point.param("SUB_M").unwrap(), point.param("SUB_N").unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let vulkan = tiles(BackendName::Vulkan, "template.comp");
+        assert!(!vulkan.is_empty());
+        assert!(!vulkan.contains(&(64, 64)));
+        assert!(vulkan.contains(&(64, 32)) && vulkan.contains(&(32, 64)));
+        assert!(tiles(BackendName::Vulkan, "own.comp").contains(&(64, 64)), "not the template");
+        assert!(tiles(BackendName::Metal, "template.metal").contains(&(64, 64)), "not Vulkan's");
+        let error = crate::checked::check_source(sources(&declaration("vulkan", "template.comp"))).unwrap_err().to_string();
+        assert!(error.contains("no source was given"), "{error}");
+        std::fs::write(
+            directory.join("lib/template.glsl"),
+            "#define PROJECTION_GEMM_SPILLING_SUB_M (64)\n#define PROJECTION_GEMM_SPILLING_SUB_N 64\n",
+        )
+        .unwrap();
+        let error = crate::source::check_beside(sources(&declaration("vulkan", "template.comp")), &directory)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must each be defined"), "{error}");
     }
 
     /// A header states its launch's code parameters in declaration order;

@@ -805,6 +805,12 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 // on GB10 its recorded time is 1.12x the best of each GEMM entry (geometric
 // mean), where 128 x 128 / 32 x 32 was 1.15x.
 
+// The sub-tile (WM x WN) the template cannot run: the checker excludes it
+// from every implementation that includes this template and tunes its
+// sub-tile (SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N), whatever it declares.
+#define PROJECTION_GEMM_SPILLING_SUB_M 64
+#define PROJECTION_GEMM_SPILLING_SUB_N 64
+
 #define PROJECTION_GEMM_K 32u
 #define PROJECTION_GEMM_LDA 40u
 // Staged items per invocation and step: at most WM * WN / (8 TN) activation

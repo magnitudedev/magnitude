@@ -223,7 +223,12 @@ when the reserve is reached its piece is abandoned unmeasured, choices publish w
 and the abandoned work is reported. A promoted choice's program is the artifact its search
 already compiled and stored, which a load reads, so a promotion compiles nothing. A compile cannot
 be interrupted, so it starts only if it would end within the deadline at the longest compile the
-load has observed. A slower device explores less, not longer. No later request, changed traffic
+load has observed. That bound cannot hold for a candidate whose generated code spills, which also
+compiles far slower than its neighbours of the same program text. A candidate known to spill is
+therefore no candidate: the Vulkan projection GEMM's 64 x 64 sub-tile is removed once, by the
+checker (`inherit_projection_gemm_domain`), from every implementation whose source includes the
+template and tunes its sub-tile; the template states the excluded sub-tile itself
+(`PROJECTION_GEMM_SPILLING_SUB_M`, `_SUB_N`). A slower device explores less, not longer. No later request, changed traffic
 mix or cached incomplete search acquires another tuning allowance.
 
 ## Search and finalization

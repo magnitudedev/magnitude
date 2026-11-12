@@ -707,7 +707,7 @@ const MAPPINGS: [Mapping; 4] = [
         tile_m: 64,
         tile_n: 64,
         sub_m: 64,
-        sub_n: 64,
+        sub_n: 32,
         split: 1,
         tall: None,
         tiled: 0,

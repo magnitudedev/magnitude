@@ -1647,7 +1647,7 @@ fn grouped_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
                 ("SUB_M", 32),
                 ("SUB_N", 32),
             ],
-            vec![("TILE_M", 64), ("TILE_N", 64), ("SUB_M", 64), ("SUB_N", 64)],
+            vec![("TILE_M", 64), ("TILE_N", 128), ("SUB_M", 64), ("SUB_N", 32)],
         ],
         seismic::BackendName::Metal => vec![
             vec![("TILE_M", 32), ("TILE_N", 128)],
