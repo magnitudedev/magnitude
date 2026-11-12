@@ -1291,9 +1291,12 @@ fn checked_selection_readout_charges_shaping_controls() {
     };
     let plain = selection(false);
     let shaped = selection(true);
-    assert!(shaped.workspace > plain.workspace);
+    // Shaping's scratch is placed over the lifetimes of the buffers around it
+    // and can fit under the arena's peak, so the workspace need not grow.
+    assert!(shaped.workspace >= plain.workspace);
     assert_eq!(shaped.output, plain.output);
     assert!(shaped.upload > plain.upload);
+    assert!(shaped.recorded.launches > plain.recorded.launches);
 }
 
 #[test]
