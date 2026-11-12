@@ -50,6 +50,8 @@ harness = false
 [dev-dependencies]
 flate2.workspace = true
 hf-hub.workspace = true
+# The catalog's headers (`headers`), for the header-cache skeleton test.
+magnitude-family-common = { path = "../../engine/families/common", features = ["catalog-headers"] }
 http-body-util.workspace = true
 tempfile = "3.24.0"
 tower = { workspace = true, features = ["util"] }

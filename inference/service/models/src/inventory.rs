@@ -2429,6 +2429,25 @@ impl ManagedModelStore {
     pub fn cached_header(&self, digest: &str) -> Option<Vec<u8>> {
         self.cache.read_header(digest)
     }
+
+    /// Discards the GGUF header with this digest from the header cache: a payload of its skeleton
+    /// failed to read ([`magnitude_artifacts::gguf::Array::lost_payload`]).
+    pub fn discard_cached_header(&self, digest: &str) {
+        self.cache.discard_header(digest);
+    }
+
+    /// The directory of the GGUF header with this digest, as reading the header gives it, when
+    /// the header cache holds it: read from the header's skeleton, each large array's payload
+    /// read from the cache only when a reader needs its elements.
+    #[must_use]
+    pub fn cached_header_directory(
+        &self,
+        digest: &str,
+    ) -> Option<Result<magnitude_artifacts::gguf::Directory, magnitude_artifacts::Error>> {
+        self.cache
+            .read_header_skeleton(digest)
+            .map(magnitude_artifacts::gguf::read_skeleton)
+    }
 }
 
 /// Where a symlinked GGUF found under a root may lead. A cache keeps its files inside itself; a

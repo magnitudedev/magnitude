@@ -7,12 +7,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use magnitude_artifacts::Error as ArtifactError;
-use magnitude_artifacts::gguf::{Directory, FileHeader, HeaderSource};
+use magnitude_artifacts::gguf::{Array, Directory, FileHeader, HeaderSource};
 use magnitude_engine::assessment::{
     ModelPackagePaths, PreparedModelAssessment, finish_model_assessment,
     prepare_model_assessment_from,
@@ -95,39 +95,112 @@ struct DrafterMaterial {
 }
 
 /// GGUF headers for the engine from this service's caches: a header whose digest the material
-/// names comes from the content-addressed header cache, and any other file's through its identity
-/// cache, so assessing a file again never rereads it.
+/// names is read from its skeleton in the content-addressed header cache (its large payloads read
+/// only when the engine needs their elements), and any other file's through its identity cache,
+/// so assessing a file again never rereads it.
 struct StoredHeaders {
     store: Arc<ManagedModelStore>,
     known: BTreeMap<PathBuf, String>,
+    /// The digests whose skeleton lost a payload in an earlier pass of the same read: never
+    /// served again, whether or not discarding the cache entry took effect.
+    lost: BTreeSet<String>,
+    /// Each skeleton served, by its header's digest, with its arrays.
+    served: Mutex<Vec<(String, Vec<Array>)>>,
 }
 
 impl StoredHeaders {
-    fn bytes(&self, path: &Path) -> Result<Vec<u8>, ArtifactError> {
-        if let Some(bytes) = self
-            .known
-            .get(path)
-            .and_then(|digest| self.store.cached_header(digest))
-        {
-            return Ok(bytes);
+    /// Runs `read` on headers from `store`'s caches, the file of each digest in `known` read from
+    /// that header's skeleton: the one way anything is concluded from a cached skeleton. A result
+    /// never rests on a payload that failed to read: when one apart from a skeleton is lost (gone
+    /// or damaged), its header's cache entry is discarded and `read` runs again with that digest
+    /// not cached, its header read from its file, or, where none is known, not at all. A pass
+    /// that loses a payload adds its digest to those never served again, so the passes end.
+    fn read<T>(
+        store: &Arc<ManagedModelStore>,
+        known: BTreeMap<PathBuf, String>,
+        read: impl Fn(&Self) -> T,
+    ) -> T {
+        let mut headers = Self {
+            store: Arc::clone(store),
+            known,
+            lost: BTreeSet::new(),
+            served: Mutex::default(),
+        };
+        loop {
+            let result = read(&headers);
+            let lost = headers.newly_lost();
+            if lost.is_empty() {
+                return result;
+            }
+            for digest in &lost {
+                store.discard_cached_header(digest);
+            }
+            headers.lost.extend(lost);
+            headers.served = Mutex::default();
         }
-        self.store
-            .local_gguf_header(path)
-            .map(|(_, header)| header)
-            .map_err(|error| match error {
-                InventoryError::Integrity(detail) => ArtifactError::Invalid(detail),
-                other => ArtifactError::Io(std::io::Error::other(other.to_string())),
+    }
+
+    /// The digests of the skeletons served whose payload apart failed to read, none of them in
+    /// `lost`, which are never served.
+    fn newly_lost(&self) -> BTreeSet<String> {
+        self.served
+            .lock()
+            .expect("no reader panics holding the served skeletons")
+            .iter()
+            .filter(|(_, arrays)| arrays.iter().any(Array::lost_payload))
+            .map(|(digest, _)| digest.clone())
+            .collect()
+    }
+
+    /// The directory of the cached header with this digest, read from its skeleton and recorded
+    /// as served, or the error reading the whole header gives for one with tensors of types the
+    /// reader doesn't know, which carries it. `None` when the cache doesn't hold the header, when
+    /// it lost a payload earlier in this read, or when it holds a skeleton that doesn't read: that
+    /// entry is discarded and the header isn't cached.
+    fn cached(&self, digest: &str) -> Option<Result<Directory, ArtifactError>> {
+        if self.lost.contains(digest) {
+            return None;
+        }
+        let read = self.store.cached_header_directory(digest)?;
+        let directory = match &read {
+            Ok(directory) => directory,
+            Err(ArtifactError::UnknownTensorTypes { directory, .. }) => &**directory,
+            Err(_) => {
+                self.store.discard_cached_header(digest);
+                return None;
+            }
+        };
+        let arrays = directory
+            .metadata
+            .iter()
+            .filter_map(|entry| match &entry.value {
+                magnitude_artifacts::gguf::Value::Array(array) => Some(array.clone()),
+                magnitude_artifacts::gguf::Value::Scalar(_) => None,
             })
+            .collect();
+        self.served
+            .lock()
+            .expect("no reader panics holding the served skeletons")
+            .push((digest.to_owned(), arrays));
+        Some(read)
     }
 }
 
 impl HeaderSource for StoredHeaders {
     fn header(&self, path: &Path) -> Result<FileHeader, ArtifactError> {
         let size = std::fs::metadata(path)?.len();
-        Ok(FileHeader {
-            directory: magnitude_artifacts::gguf::read_header(self.bytes(path)?)?,
-            size,
-        })
+        let directory = match self.known.get(path).and_then(|digest| self.cached(digest)) {
+            Some(directory) => directory?,
+            None => {
+                let read = self.store.local_gguf_header(path);
+                let (_, header) = read.map_err(|error| match error {
+                    InventoryError::Integrity(detail) => ArtifactError::Invalid(detail),
+                    other => ArtifactError::Io(std::io::Error::other(other.to_string())),
+                })?;
+                magnitude_artifacts::gguf::read_header(header)?
+            }
+        };
+        Ok(FileHeader { directory, size })
     }
 }
 
@@ -856,32 +929,37 @@ impl ManagedModelCandidates {
             draft: drafter.map(|drafter| drafter.path.clone()),
             method,
         };
-        let headers = StoredHeaders {
-            store: Arc::clone(self.models()),
-            known: target
-                .headers
-                .iter()
-                .chain(drafter.iter().flat_map(|drafter| &drafter.headers))
-                .map(|(path, digest)| (path.clone(), digest.clone()))
-                .collect(),
-        };
+        let known = target
+            .headers
+            .iter()
+            .chain(drafter.iter().flat_map(|drafter| &drafter.headers))
+            .map(|(path, digest)| (path.clone(), digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let store = Arc::clone(self.models());
         let setup_environment = Arc::clone(&environment);
         let (prepared, fallback_context) = magnitude_service_utils::blocking::run(move || {
-            let prepared =
-                prepare_model_assessment_from(&paths, &headers, &setup_environment.setup.structure);
-            // An unsupported file is profiled at its training context when its header names one;
-            // without one it has no profile.
-            let fallback_context = match &prepared {
-                Ok(PreparedModelAssessment::Unsupported { .. }) => headers
-                    .header(&paths.target)
-                    .ok()
-                    .and_then(|header| {
-                        magnitude_service_models::gguf::training_context_length(&header.directory)
-                    })
-                    .unwrap_or_default(),
-                _ => 0,
-            };
-            (prepared, fallback_context)
+            StoredHeaders::read(&store, known, |headers| {
+                let prepared = prepare_model_assessment_from(
+                    &paths,
+                    headers,
+                    &setup_environment.setup.structure,
+                );
+                // An unsupported file is profiled at its training context when its header names
+                // one; without one it has no profile.
+                let fallback_context = match &prepared {
+                    Ok(PreparedModelAssessment::Unsupported { .. }) => headers
+                        .header(&paths.target)
+                        .ok()
+                        .and_then(|header| {
+                            magnitude_service_models::gguf::training_context_length(
+                                &header.directory,
+                            )
+                        })
+                        .unwrap_or_default(),
+                    _ => 0,
+                };
+                (prepared, fallback_context)
+            })
         })
         .await;
         let prepared = prepared.map_err(preparation_error)?;
@@ -1099,13 +1177,14 @@ impl ManagedModelCandidates {
     }
 
     /// `read` of the directory of the GGUF header with this digest, its tensors of types the
-    /// engine doesn't know left out, when the header cache holds it.
+    /// engine doesn't know left out, when the header cache holds it: read from its skeleton as
+    /// assessment reads it ([`StoredHeaders::read`]), so a payload that fails to read discards
+    /// the entry and the header counts as not cached.
     fn read_cached<T>(&self, digest: &str, read: impl Fn(&Directory) -> Option<T>) -> Option<T> {
-        let header = self.models().cached_header(digest)?;
-        let directory = magnitude_service_models::gguf::known_tensors(
-            magnitude_artifacts::gguf::read_header(header),
-        );
-        read(&directory.ok()?)
+        StoredHeaders::read(self.models(), BTreeMap::new(), |headers| {
+            let directory = magnitude_service_models::gguf::known_tensors(headers.cached(digest)?);
+            read(&directory.ok()?)
+        })
     }
 
     /// A resolved bundle's target (and projector) as material, identified by its exact package.

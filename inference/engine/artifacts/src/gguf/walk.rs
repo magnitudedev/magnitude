@@ -10,15 +10,16 @@
 //!
 //! A metadata array's payload is hopped by its length alone: a fixed-size element array by its
 //! count, a string array by its strings' length prefixes. Its elements are decoded and checked
-//! only when they are read ([`super::Array::elements`]). Whether the engine accepts the tensors
-//! themselves (their types, geometry and offsets) is decided on the complete header
+//! only when they are read ([`super::Array::elements`]). A header skeleton ([`Skeleton`]) lacks
+//! some array payloads; the walk passes each by its known length. Whether the engine accepts the
+//! tensors themselves (their types, geometry and offsets) is decided on the complete header
 //! ([`SharedHeader::directory`]).
 
 use super::{
     invalid, Array, ByteOrder, Element, Elements, Error, Kind, Metadata, Scalar, StoredType,
     Strings, Value, ValueType,
 };
-use std::{collections::HashSet, io::Read, ops::Range, sync::Arc};
+use std::{collections::HashSet, io::Read, ops::Range, path::PathBuf, sync::Arc};
 
 /// The largest GGUF header, through its aligned tensor-data offset.
 pub const HEADER_LIMIT: usize = 256 * 1024 * 1024;
@@ -107,12 +108,17 @@ pub struct Entry<'a> {
     head: EntryHead<'a>,
     /// Where the entry ends in the whole header.
     pub end: usize,
-    /// The bytes of the entry's value: everything after the value type (a scalar) or the element
-    /// count (an array).
-    value: &'a [u8],
-    /// Where `value` starts in the bytes walked.
-    at: usize,
+    value: Payload<'a>,
     order: ByteOrder,
+}
+
+/// The bytes of an entry's value: everything after the value type (a scalar) or the element count
+/// (an array), and where they start in the bytes walked; or, for an array read from a skeleton
+/// without its payload, where the payload is apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Payload<'a> {
+    Held { bytes: &'a [u8], at: usize },
+    Apart(&'a Absence),
 }
 
 impl<'a> Entry<'a> {
@@ -135,7 +141,8 @@ impl<'a> Entry<'a> {
     }
 
     /// The entry's value. `header` holds the bytes this entry was walked from: an array's payload
-    /// is a span of them, decoded when its elements are read.
+    /// is a span of them (or, read from a skeleton without it, the payload apart it names), decoded
+    /// when its elements are read.
     ///
     /// # Panics
     /// When `header` is not the bytes the entry was walked from.
@@ -144,30 +151,40 @@ impl<'a> Entry<'a> {
             return Value::Scalar(self.scalar().expect("a scalar entry holds its value"));
         };
         let count = usize::try_from(self.head.count).expect("a walked count fits usize");
-        let range = self.at..self.at + self.value.len();
-        assert!(
-            header
-                .get(range.clone())
-                .is_some_and(|held| std::ptr::eq(held, self.value)),
-            "an entry's value is read from the bytes it was walked from"
-        );
-        Value::Array(Array::held(
-            stored,
-            self.order,
-            count,
-            Arc::clone(header),
-            range,
-        ))
+        Value::Array(match self.value {
+            Payload::Apart(absence) => {
+                Array::apart(self.head.key, stored, self.order, count, absence.clone())
+            }
+            Payload::Held { bytes, at } => {
+                let range = at..at + bytes.len();
+                assert!(
+                    header
+                        .get(range.clone())
+                        .is_some_and(|held| std::ptr::eq(held, bytes)),
+                    "an entry's value is read from the bytes it was walked from"
+                );
+                Array::held(
+                    self.head.key,
+                    stored,
+                    self.order,
+                    count,
+                    Arc::clone(header),
+                    range,
+                )
+            }
+        })
     }
 
     /// The entry's value when it is a scalar.
     fn scalar(&self) -> Option<Scalar> {
-        let StoredType::Scalar(kind) = self.head.stored else {
+        let (StoredType::Scalar(kind), Payload::Held { bytes, .. }) =
+            (self.head.stored, self.value)
+        else {
             return None;
         };
         Some(
             Decoder {
-                bytes: self.value,
+                bytes,
                 order: self.order,
             }
             .scalar(kind)
@@ -197,31 +214,55 @@ impl TensorInfo<'_> {
     }
 }
 
+/// A metadata array's payload absent from a [`Skeleton`]: its offset in the whole header, its
+/// length, its sha256, and the file that holds it (read only when its elements are).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Absence {
+    pub offset: usize,
+    pub length: usize,
+    pub digest: [u8; 32],
+    pub file: PathBuf,
+}
+
+/// A GGUF header without some of its metadata arrays' payloads: the header's bytes with each
+/// absent payload cut out, and where each was, in order ([`super::read_skeleton`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skeleton {
+    pub bytes: Vec<u8>,
+    pub absent: Vec<Absence>,
+}
+
 /// The structure of the GGUF header `bytes` begin, or why they can't begin one.
 pub fn walk(bytes: &[u8]) -> Result<Walk<'_>, Error> {
     let mut walked = Progress::default();
-    walked.advance(bytes)?;
-    Ok(walked.view(bytes))
+    walked.advance(bytes, &[])?;
+    Ok(walked.view(bytes, &[]))
 }
 
 /// A whole GGUF header's bytes, shared with the metadata arrays of its directory
 /// ([`Self::directory`]), and their walk.
 pub struct SharedHeader {
     bytes: Arc<Vec<u8>>,
+    /// The payloads `bytes` lack.
+    absent: Vec<Absence>,
     walked: Progress,
 }
 
 impl SharedHeader {
-    /// The whole header `bytes` hold.
-    pub(super) fn walk(bytes: Arc<Vec<u8>>) -> Result<Self, Error> {
+    /// The whole header `bytes` hold, with the payloads `absent` lacks.
+    pub(super) fn walk(bytes: Arc<Vec<u8>>, absent: Vec<Absence>) -> Result<Self, Error> {
         let mut walked = Progress::default();
-        walked.advance(&bytes)?;
+        walked.advance(&bytes, &absent)?;
         if let Stop::Incomplete { .. } = walked.stop {
             return Err(Error::Truncated {
                 offset: bytes.len() as u64,
             });
         }
-        Ok(Self { bytes, walked })
+        Ok(Self {
+            bytes,
+            absent,
+            walked,
+        })
     }
 
     pub fn bytes(&self) -> &Arc<Vec<u8>> {
@@ -229,7 +270,7 @@ impl SharedHeader {
     }
 
     pub fn header(&self) -> Header<'_> {
-        match self.walked.view(&self.bytes) {
+        match self.walked.view(&self.bytes, &self.absent) {
             Walk::Complete(header) => header,
             Walk::Incomplete(_) => unreachable!("a shared header is whole"),
         }
@@ -271,8 +312,8 @@ impl HeaderBytes {
 
     /// The walk of the bytes in hand, continuing the walk of the bytes before.
     pub fn walk(&mut self) -> Result<Walk<'_>, Error> {
-        self.walked.advance(&self.bytes)?;
-        Ok(self.walked.view(&self.bytes))
+        self.walked.advance(&self.bytes, &[])?;
+        Ok(self.walked.view(&self.bytes, &[]))
     }
 
     /// Reads from `source` onto the bytes until they hold a whole GGUF header (padding aside),
@@ -280,7 +321,7 @@ impl HeaderBytes {
     /// past the header by up to the last estimate. A source that ends first is a truncated header.
     pub fn read(&mut self, source: &mut impl Read) -> Result<Header<'_>, Error> {
         loop {
-            self.walked.advance(&self.bytes)?;
+            self.walked.advance(&self.bytes, &[])?;
             let Stop::Incomplete { estimate, .. } = self.walked.stop else {
                 break;
             };
@@ -290,7 +331,7 @@ impl HeaderBytes {
                 });
             }
         }
-        match self.walked.view(&self.bytes) {
+        match self.walked.view(&self.bytes, &[]) {
             Walk::Complete(header) => Ok(header),
             Walk::Incomplete(_) => unreachable!("the reads end at a whole header"),
         }
@@ -318,6 +359,7 @@ impl HeaderBytes {
         self.bytes.truncate(length);
         Ok(SharedHeader {
             bytes: Arc::new(self.bytes),
+            absent: Vec::new(),
             walked: self.walked,
         })
     }
@@ -380,6 +422,10 @@ struct Progress {
     /// Where the walk continues in the whole header: the start of the next item, or of the next
     /// string of `array`.
     offset: usize,
+    /// The bytes of the absent payloads before `offset`, which the bytes walked lack.
+    shift: usize,
+    /// How many absent payloads lie before `offset`.
+    passed: usize,
     preamble: Option<Counted>,
     /// The keys of `entries`.
     keys: HashSet<Box<str>>,
@@ -399,6 +445,8 @@ impl Default for Progress {
     fn default() -> Self {
         Self {
             offset: 0,
+            shift: 0,
+            passed: 0,
             preamble: None,
             keys: HashSet::new(),
             entries: Vec::new(),
@@ -449,7 +497,8 @@ impl From<Error> for Halt {
     }
 }
 
-/// An [`EntryHead`], its key by where it ends.
+/// An [`EntryHead`], its key by where it ends. Positions are in the whole header; `shift` is the
+/// bytes of absent payloads before the entry, which the bytes walked lack.
 #[derive(Clone, Copy, Debug)]
 struct Head {
     key_end: usize,
@@ -457,13 +506,22 @@ struct Head {
     count: u64,
     start: usize,
     end: usize,
+    shift: usize,
 }
 
-/// An [`Entry`], its value from `value` to `end`.
+/// Where an entry's value lies: from `start` (in the whole header) to the entry's end, or apart,
+/// the `index`th absent payload.
+#[derive(Clone, Copy, Debug)]
+enum WalkedValue {
+    Held { start: usize },
+    Apart { index: usize },
+}
+
+/// An [`Entry`].
 #[derive(Clone, Copy, Debug)]
 struct Walked {
     head: Head,
-    value: usize,
+    value: WalkedValue,
     end: usize,
 }
 
@@ -487,7 +545,7 @@ impl Head {
     fn view(self, bytes: &[u8]) -> EntryHead<'_> {
         EntryHead {
             // A key's text follows its eight-byte length.
-            key: checked(&bytes[self.start + 8..self.key_end]),
+            key: checked(&bytes[self.start - self.shift + 8..self.key_end - self.shift]),
             stored: self.stored,
             count: self.count,
             start: self.start,
@@ -497,12 +555,18 @@ impl Head {
 }
 
 impl Walked {
-    fn view(self, bytes: &[u8], order: ByteOrder) -> Entry<'_> {
+    fn view<'a>(self, bytes: &'a [u8], absent: &'a [Absence], order: ByteOrder) -> Entry<'a> {
+        let shift = self.head.shift;
         Entry {
             head: self.head.view(bytes),
             end: self.end,
-            value: &bytes[self.value..self.end],
-            at: self.value,
+            value: match self.value {
+                WalkedValue::Held { start } => Payload::Held {
+                    bytes: &bytes[start - shift..self.end - shift],
+                    at: start - shift,
+                },
+                WalkedValue::Apart { index } => Payload::Apart(&absent[index]),
+            },
             order,
         }
     }
@@ -536,7 +600,7 @@ fn stop(held: usize, open: Option<Head>, minimum: usize, estimate: usize) -> Hal
 }
 
 /// The preamble `bytes` begin.
-fn preamble(bytes: &[u8]) -> Result<Counted, Halt> {
+fn preamble(bytes: &[u8], absent: &[Absence]) -> Result<Counted, Halt> {
     let short = || {
         let missing = PREAMBLE_BYTES - bytes.len();
         stop(bytes.len(), None, missing, missing)
@@ -544,6 +608,8 @@ fn preamble(bytes: &[u8]) -> Result<Counted, Halt> {
     let mut cursor = Cursor {
         bytes,
         offset: 0,
+        shift: 0,
+        absent,
         order: ByteOrder::Little,
     };
     let Some(magic) = cursor.take(4)? else {
@@ -582,10 +648,11 @@ fn preamble(bytes: &[u8]) -> Result<Counted, Halt> {
 }
 
 impl Progress {
-    /// Walks `bytes`, which extend the bytes walked before, from where that walk stopped.
-    fn advance(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    /// Walks `bytes`, which extend the bytes walked before, from where that walk stopped. The
+    /// bytes lack the payloads `absent` names (none, for a walk that may continue).
+    fn advance(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<(), Error> {
         if let Stop::Incomplete { .. } = self.stop {
-            self.stop = match self.walk(bytes) {
+            self.stop = match self.walk(bytes, absent) {
                 Ok(stop) | Err(Halt::Stopped(stop)) => stop,
                 Err(Halt::Invalid(error)) => return Err(error),
             };
@@ -593,15 +660,15 @@ impl Progress {
         Ok(())
     }
 
-    /// The walk of `bytes`, which are the bytes walked.
-    fn view<'a>(&self, bytes: &'a [u8]) -> Walk<'a> {
+    /// The walk of `bytes`, which are the bytes walked, lacking the payloads `absent` names.
+    fn view<'a>(&self, bytes: &'a [u8], absent: &'a [Absence]) -> Walk<'a> {
         let order = self
             .preamble
             .map_or(ByteOrder::Little, |counted| counted.preamble.byte_order);
         let entries = self
             .entries
             .iter()
-            .map(|walked| walked.view(bytes, order))
+            .map(|walked| walked.view(bytes, absent, order))
             .collect();
         match self.stop {
             Stop::Incomplete {
@@ -634,19 +701,28 @@ impl Progress {
     }
 
     /// A cursor at where the walk continues.
-    fn cursor<'a>(&self, bytes: &'a [u8], order: ByteOrder) -> Cursor<'a> {
+    fn cursor<'a>(&self, bytes: &'a [u8], absent: &'a [Absence], order: ByteOrder) -> Cursor<'a> {
         Cursor {
             bytes,
             offset: self.offset,
+            shift: self.shift,
+            absent: &absent[self.passed..],
             order,
         }
     }
 
-    fn walk(&mut self, bytes: &[u8]) -> Result<Stop, Halt> {
+    /// Moves the walk on to where `cursor` is.
+    fn pass(&mut self, cursor: &Cursor<'_>, absent: &[Absence]) {
+        self.offset = cursor.offset;
+        self.shift = cursor.shift;
+        self.passed = absent.len() - cursor.absent.len();
+    }
+
+    fn walk(&mut self, bytes: &[u8], absent: &[Absence]) -> Result<Stop, Halt> {
         let counted = match self.preamble {
             Some(counted) => counted,
             None => {
-                let counted = preamble(bytes)?;
+                let counted = preamble(bytes, absent)?;
                 self.preamble = Some(counted);
                 self.offset = PREAMBLE_BYTES;
                 counted
@@ -657,11 +733,16 @@ impl Progress {
         while self.entries.len() < counted.entries {
             let rest =
                 (counted.entries - self.entries.len() - 1) * ENTRY_ESTIMATE + tensors_estimate;
-            let mut cursor = self.cursor(bytes, order);
+            let mut cursor = self.cursor(bytes, absent, order);
             let (head, value) = match self.array {
                 Some(array) => {
                     self.strings(&mut cursor, array, rest)?;
-                    (array.head, array.head.end)
+                    (
+                        array.head,
+                        WalkedValue::Held {
+                            start: array.head.end,
+                        },
+                    )
                 }
                 None => self.entry(&mut cursor, rest)?,
             };
@@ -670,7 +751,7 @@ impl Progress {
                 value,
                 end: cursor.offset,
             };
-            let entry = walked.view(bytes, order);
+            let entry = walked.view(bytes, absent, order);
             if entry.head.key == ALIGNMENT_KEY {
                 self.alignment = super::alignment(
                     entry
@@ -683,13 +764,13 @@ impl Progress {
             self.keys.insert(entry.head.key.into());
             self.entries.push(walked);
             self.array = None;
-            self.offset = cursor.offset;
+            self.pass(&cursor, absent);
         }
         let alignment = usize::try_from(self.alignment).unwrap_or(usize::MAX);
         let tensors_start = *self.tensors_start.get_or_insert(self.offset);
         while self.tensors.len() < counted.tensors {
             let index = self.tensors.len();
-            let mut cursor = self.cursor(bytes, order);
+            let mut cursor = self.cursor(bytes, absent, order);
             let held = cursor.held();
             let before = cursor.offset;
             let left = counted.tensors - index;
@@ -704,7 +785,8 @@ impl Progress {
             let Some(name) = cursor.string()? else {
                 return Err(stop(held, None, 8, estimate));
             };
-            let name_range = before + 8..cursor.offset;
+            let shift = cursor.shift;
+            let name_range = before + 8 - shift..cursor.offset - shift;
             let Some(rank) = cursor.u32()? else {
                 return Err(stop(held, None, 4, estimate));
             };
@@ -720,14 +802,17 @@ impl Progress {
                 return Err(stop(held, None, fixed, estimate));
             };
             let (type_id, offset) = descriptor[dimensions..].split_at(4);
-            let descriptor_start = cursor.offset - fixed;
+            let descriptor_start = cursor.offset - fixed - shift;
             self.tensors.push(WalkedTensor {
                 name: name_range,
                 type_id: u32_of(order, type_id.try_into().expect("four bytes")),
                 offset: u64_of(order, offset.try_into().expect("eight bytes")),
                 dimensions: descriptor_start..descriptor_start + dimensions,
             });
-            self.offset = cursor.offset;
+            self.pass(&cursor, absent);
+        }
+        if self.passed < absent.len() {
+            return Err(invalid("an absent GGUF payload is not a metadata array's").into());
         }
         let data_offset = self
             .offset
@@ -741,9 +826,10 @@ impl Progress {
     }
 
     /// Walks the metadata entry `cursor` is at, returning its head and where its value lies.
-    fn entry(&mut self, cursor: &mut Cursor<'_>, rest: usize) -> Result<(Head, usize), Halt> {
+    fn entry(&mut self, cursor: &mut Cursor<'_>, rest: usize) -> Result<(Head, WalkedValue), Halt> {
         let held = cursor.held();
         let start = cursor.offset;
+        let shift = cursor.shift;
         let Some(key) = cursor.string()? else {
             return Err(stop(held, None, 12, ENTRY_ESTIMATE + rest));
         };
@@ -768,6 +854,7 @@ impl Progress {
                 count,
                 start,
                 end: cursor.offset,
+                shift,
             };
             // Every element takes at least its type's width, so the count is bounded before
             // anything is read.
@@ -779,6 +866,21 @@ impl Progress {
                         .is_some_and(|length| length <= HEADER_LIMIT - head.end)
                 })
                 .ok_or_else(|| invalid("nested or oversized GGUF array"))?;
+            if let Some(length) = cursor.absent()? {
+                // A string takes at least its length; any other element exactly its width.
+                let fits = if element == ValueType::String {
+                    length >= elements * element.width()
+                } else {
+                    length == elements * element.width()
+                };
+                if !fits {
+                    return Err(invalid(format!(
+                        "the absent payload of GGUF metadata {key:?} does not fit its count"
+                    ))
+                    .into());
+                }
+                return Ok((head, WalkedValue::Apart { index: self.passed }));
+            }
             if element == ValueType::String {
                 self.strings(
                     cursor,
@@ -796,7 +898,7 @@ impl Progress {
                     return Err(stop(held, Some(head), missing, missing + rest));
                 }
             }
-            return Ok((head, head.end));
+            return Ok((head, WalkedValue::Held { start: head.end }));
         }
         let kind = ValueType::from_id(value_type)?;
         let value_start = cursor.offset;
@@ -810,6 +912,7 @@ impl Progress {
                 count: 1,
                 start,
                 end: cursor.offset,
+                shift,
             };
             let length = usize::try_from(length)
                 .ok()
@@ -820,7 +923,7 @@ impl Progress {
                 return Err(stop(held, Some(head), missing, missing + rest));
             };
             utf8(text)?;
-            return Ok((head, value_start));
+            return Ok((head, WalkedValue::Held { start: value_start }));
         }
         let width = kind.width();
         let Some(value) = cursor.take(width)? else {
@@ -835,8 +938,9 @@ impl Progress {
             count: 1,
             start,
             end: value_start,
+            shift,
         };
-        Ok((head, value_start))
+        Ok((head, WalkedValue::Held { start: value_start }))
     }
 
     /// Hops the strings of `array` from its `read`th, which `cursor` is at, by their lengths.
@@ -876,18 +980,23 @@ impl Progress {
     }
 }
 
-/// Reads the bytes in hand. `None` is bytes that end first (the cursor then stays where it was);
-/// an error is a read that would end past [`HEADER_LIMIT`].
+/// Reads the bytes in hand, at a position in the whole header. `None` is bytes that end first (the
+/// cursor then stays where it was); an error is a read that would end past [`HEADER_LIMIT`], or
+/// into a payload the bytes lack.
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
+    /// The bytes of the absent payloads before `offset`, which `bytes` lack.
+    shift: usize,
+    /// The absent payloads from `offset` on.
+    absent: &'a [Absence],
     order: ByteOrder,
 }
 
 impl<'a> Cursor<'a> {
-    /// How far into the header the bytes in hand reach.
+    /// How far into the whole header the bytes in hand reach.
     fn held(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() + self.shift
     }
 
     fn take(&mut self, length: usize) -> Result<Option<&'a [u8]>, Error> {
@@ -896,11 +1005,36 @@ impl<'a> Cursor<'a> {
             .checked_add(length)
             .filter(|end| *end <= HEADER_LIMIT)
             .ok_or_else(beyond)?;
-        let Some(taken) = self.bytes.get(self.offset..end) else {
+        if self
+            .absent
+            .first()
+            .is_some_and(|absence| end > absence.offset)
+        {
+            return Err(invalid("an absent GGUF payload is not a metadata array's"));
+        }
+        let Some(taken) = self.bytes.get(self.offset - self.shift..end - self.shift) else {
             return Ok(None);
         };
         self.offset = end;
         Ok(Some(taken))
+    }
+
+    /// Passes the absent payload the cursor is at, returning its length, when one is.
+    fn absent(&mut self) -> Result<Option<usize>, Error> {
+        let Some((absence, rest)) = self.absent.split_first() else {
+            return Ok(None);
+        };
+        if absence.offset != self.offset {
+            return Ok(None);
+        }
+        self.offset = self
+            .offset
+            .checked_add(absence.length)
+            .filter(|end| *end <= HEADER_LIMIT)
+            .ok_or_else(beyond)?;
+        self.shift += absence.length;
+        self.absent = rest;
+        Ok(Some(absence.length))
     }
 
     fn u32(&mut self) -> Result<Option<u32>, Error> {
@@ -1324,6 +1458,36 @@ mod tests {
         }
     }
 
+    /// `header(tokens)`'s skeleton, its token list's payload apart in `file`, and that payload.
+    fn skeleton(tokens: usize, file: PathBuf) -> (Skeleton, Vec<u8>) {
+        let bytes = header(tokens);
+        let Ok(Walk::Complete(whole)) = walk(&bytes) else {
+            panic!("a whole header");
+        };
+        let list = whole.entries[1];
+        let payload = bytes[list.head.end..list.end].to_vec();
+        let mut held = bytes[..list.head.end].to_vec();
+        held.extend_from_slice(&bytes[list.end..]);
+        let absence = Absence {
+            offset: list.head.end,
+            length: payload.len(),
+            digest: crate::gguf::sha256(&payload),
+            file,
+        };
+        (
+            Skeleton {
+                bytes: held,
+                absent: vec![absence],
+            },
+            payload,
+        )
+    }
+
+    /// A file of this test process named `name`, in the system's temporary directory.
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("magnitude-walk-{}-{name}", std::process::id()))
+    }
+
     #[test]
     fn a_payload_must_hold_exactly_its_elements() {
         let order = ByteOrder::Little;
@@ -1373,6 +1537,72 @@ mod tests {
         assert!(matches!(
             element(ValueType::Bool, order, &[1, 2], 1),
             Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_payload_apart_that_is_not_its_bytes_is_damaged_and_lost() {
+        let file = temporary("damaged");
+        let (skeleton, payload) = skeleton(3_001, file.clone());
+        let directory = crate::gguf::read_skeleton(skeleton).unwrap();
+
+        let mut longer = payload.clone();
+        longer.push(0);
+        std::fs::write(&file, &longer).unwrap();
+        let list = tokens(&directory);
+        assert!(matches!(list.elements(), Err(Error::DamagedPayload { .. })));
+        assert!(list.lost_payload(), "a failed read is remembered");
+
+        let mut changed = payload.clone();
+        changed[20] ^= 1;
+        std::fs::write(&file, &changed).unwrap();
+        let list = tokens(&directory);
+        assert!(matches!(list.element(0), Err(Error::DamagedPayload { .. })));
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(list.element(0), Err(Error::PayloadRead { .. })));
+
+        std::fs::write(&file, &payload).unwrap();
+        assert_eq!(
+            list.element(3_000).unwrap(),
+            Some(Element::String("token-003000"))
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn an_absence_that_does_not_fit_its_array_is_refused() {
+        let file = temporary("unfit");
+        let (mut unfit, _) = skeleton(3_002, file.clone());
+        unfit.absent[0].length = 3_002 * 8 - 1;
+        assert!(matches!(
+            crate::gguf::read_skeleton(unfit),
+            Err(Error::Invalid(message)) if message.contains("does not fit its count")
+        ));
+
+        // An absence inside a scalar entry is no array's payload.
+        let bytes = header(10);
+        let absence = Absence {
+            offset: 30,
+            length: 4,
+            digest: [0; 32],
+            file: file.clone(),
+        };
+        let inside = Skeleton {
+            bytes: bytes.clone(),
+            absent: vec![absence.clone()],
+        };
+        assert!(matches!(
+            crate::gguf::read_skeleton(inside),
+            Err(Error::Invalid(message)) if message.contains("not a metadata array's")
+        ));
+
+        // Absences out of order: the second lies before the first.
+        let (mut unordered, _) = skeleton(3_003, file);
+        unordered.absent.push(absence);
+        assert!(matches!(
+            crate::gguf::read_skeleton(unordered),
+            Err(Error::Invalid(message)) if message.contains("not a metadata array's")
         ));
     }
 

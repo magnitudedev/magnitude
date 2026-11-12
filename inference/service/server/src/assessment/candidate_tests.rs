@@ -6277,3 +6277,153 @@ fn a_catalog_drafter_fit_is_news_once_known_or_unreachable() {
     assert!(!unreachable.record_catalog_drafter_fits_unreachable());
     assert!(knows(&unreachable, &other));
 }
+
+/// What an assessment concludes from a header: its fingerprint and its whole header's verdict.
+type HeaderAnswer = (
+    Result<
+        magnitude_engine::fingerprint::ModelFingerprint,
+        magnitude_engine::fingerprint::FingerprintError,
+    >,
+    Option<magnitude_engine::error::UnsupportedModel>,
+);
+
+fn header_answer(directory: &magnitude_artifacts::gguf::Directory) -> HeaderAnswer {
+    use magnitude_engine::assessment::{HeaderExtent, header_refusal};
+    (
+        magnitude_engine::fingerprint::ModelFingerprint::from_directory(directory),
+        header_refusal(directory, HeaderExtent::Whole),
+    )
+}
+
+/// A store whose header cache holds the header of the file `model.gguf` with every payload chunk
+/// damaged, with that file's path, the header's digest and the whole header's answer. Its token
+/// list is one no other test's header has, so no other reader holds its verified payload.
+async fn damaged_cached_header() -> (
+    tempfile::TempDir,
+    Arc<ManagedModelStore>,
+    PathBuf,
+    String,
+    HeaderAnswer,
+) {
+    let (directory, store) = bare_store().await;
+    let path = directory.path().join("model.gguf");
+    let mut header = fixture_file("headers/Qwen3.5-4B-Q6_K.gguf.gz", "model.gguf").header;
+    let first_token = match magnitude_artifacts::gguf::walk(&header) {
+        Ok(magnitude_artifacts::gguf::Walk::Complete(whole)) => {
+            let tokens = whole
+                .entries
+                .iter()
+                .find(|entry| entry.head().key == "tokenizer.ggml.tokens");
+            // The strings follow the array's head, each a u64 length and its text; the first
+            // token of this fixture is empty, so its first text byte is the first of a
+            // non-empty string.
+            let mut at = tokens.expect("a token list").head().end;
+            loop {
+                let length = u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+                at += 8;
+                if length > 0 {
+                    break at;
+                }
+            }
+        }
+        _ => panic!("a whole header"),
+    };
+    header[first_token] = b'~';
+    std::fs::write(&path, &header).unwrap();
+    let digest = store
+        .local_gguf_header(&path)
+        .unwrap()
+        .0
+        .inspection
+        .header_digest;
+    let whole = header_answer(&magnitude_artifacts::gguf::read_header(header).unwrap());
+    let chunks = walk_files(directory.path())
+        .into_iter()
+        .filter(|file| {
+            file.parent()
+                .is_some_and(|parent| parent.ends_with("gguf-header-chunks"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!chunks.is_empty(), "the header's large payloads are chunks");
+    for chunk in &chunks {
+        let mut bytes = std::fs::read(chunk).unwrap();
+        bytes[20] ^= 1;
+        std::fs::write(chunk, bytes).unwrap();
+    }
+    (directory, store, path, digest, whole)
+}
+
+/// A payload apart from a cached skeleton that turns out damaged never decides an assessment: the
+/// header is read again from its file, so the fingerprint and verdict are the whole header's, and
+/// its cache entry, discarded, is stored whole again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_skeleton_payload_is_assessed_from_the_header_s_file() {
+    use magnitude_artifacts::gguf::HeaderSource;
+    let (_directory, store, path, digest, whole) = damaged_cached_header().await;
+    let known = BTreeMap::from([(path.clone(), digest.clone())]);
+    let served = std::sync::atomic::AtomicUsize::new(0);
+    let assessed = super::StoredHeaders::read(&store, known, |headers| {
+        served.fetch_add(1, Ordering::Relaxed);
+        header_answer(&headers.header(&path).unwrap().directory)
+    });
+    assert_eq!(assessed, whole);
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        2,
+        "the skeleton's answer was discarded"
+    );
+    let Some(Ok(cached)) = store.cached_header_directory(&digest) else {
+        panic!("the header is cached whole again");
+    };
+    assert_eq!(header_answer(&cached), whole);
+}
+
+/// A skeleton that lost a payload is never served again in the same read, even when discarding
+/// its cache entry fails: every pass here puts the damaged entry back, as a cache whose entries
+/// can't be removed keeps it, and the read still ends with the whole header's answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_skeleton_is_not_served_again_when_its_discard_fails() {
+    use magnitude_artifacts::gguf::HeaderSource;
+    let (directory, store, path, digest, whole) = damaged_cached_header().await;
+    let cache = walk_files(directory.path())
+        .into_iter()
+        .filter(|file| {
+            file.parent().is_some_and(|parent| {
+                parent.ends_with("gguf-header-chunks") || parent.ends_with("gguf-headers")
+            })
+        })
+        .map(|file| {
+            let bytes = std::fs::read(&file).unwrap();
+            (file, bytes)
+        })
+        .collect::<Vec<_>>();
+    let known = BTreeMap::from([(path.clone(), digest)]);
+    let passes = std::sync::atomic::AtomicUsize::new(0);
+    let assessed = super::StoredHeaders::read(&store, known, |headers| {
+        let pass = passes.fetch_add(1, Ordering::Relaxed) + 1;
+        assert!(pass <= 2, "a skeleton found lost is served again");
+        for (file, bytes) in &cache {
+            std::fs::write(file, bytes).unwrap();
+        }
+        header_answer(&headers.header(&path).unwrap().directory)
+    });
+    assert_eq!(assessed, whole);
+    assert_eq!(passes.load(Ordering::Relaxed), 2);
+}
+
+/// Every file under `root`.
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_files(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}

@@ -217,6 +217,22 @@ impl ModelCache {
         self.headers.read(digest)
     }
 
+    /// The skeleton of the GGUF header with this sha256 (its large arrays' payloads absent), or
+    /// `None` when the header cache doesn't hold it.
+    #[must_use]
+    pub fn read_header_skeleton(
+        &self,
+        digest: &str,
+    ) -> Option<magnitude_artifacts::gguf::Skeleton> {
+        self.headers.read_skeleton(digest)
+    }
+
+    /// Discards the header with this sha256 from the header cache, a payload of its skeleton having
+    /// failed to read: it is stored again when next written.
+    pub fn discard_header(&self, digest: &str) {
+        self.headers.discard_header(digest);
+    }
+
     /// Whether the header cache holds this header, marking it used for the read that follows;
     /// `read_header` still verifies it.
     #[must_use]

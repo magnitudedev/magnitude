@@ -13,6 +13,16 @@ pub enum Error {
         types: Vec<(u32, u32)>,
         directory: Box<crate::gguf::Directory>,
     },
+    /// A metadata array read from a header skeleton whose payload, apart from it, can't be read.
+    PayloadRead {
+        key: String,
+        error: io::Error,
+    },
+    /// A metadata array read from a header skeleton whose payload, apart from it, is not the
+    /// bytes its length and digest name.
+    DamagedPayload {
+        key: String,
+    },
     /// A metadata array's payload that ends before the elements its count names.
     ShortPayload,
     /// A metadata array's payload that holds bytes past the elements its count names.
@@ -27,6 +37,12 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(f, "artifact source: {error}"),
             Self::Invalid(message) => f.write_str(message),
             Self::Truncated { offset } => write!(f, "truncated GGUF header at byte {offset}"),
+            Self::PayloadRead { key, error } => {
+                write!(f, "the payload of GGUF metadata {key:?}: {error}")
+            }
+            Self::DamagedPayload { key } => {
+                write!(f, "the payload of GGUF metadata {key:?} is damaged")
+            }
             Self::ShortPayload => {
                 f.write_str("a GGUF metadata array's payload ends before its elements")
             }
@@ -68,6 +84,8 @@ impl Error {
             Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
             Self::AmbiguousProjectors(_)
             | Self::UnknownTensorTypes { .. }
+            | Self::PayloadRead { .. }
+            | Self::DamagedPayload { .. }
             | Self::DigestOfNonText => false,
         }
     }
@@ -93,11 +111,12 @@ impl Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::PayloadRead { error, .. } => Some(error),
             Self::Invalid(_)
             | Self::Truncated { .. }
             | Self::AmbiguousProjectors(_)
             | Self::UnknownTensorTypes { .. }
+            | Self::DamagedPayload { .. }
             | Self::ShortPayload
             | Self::TrailingPayload
             | Self::DigestOfNonText => None,

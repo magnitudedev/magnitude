@@ -7,19 +7,22 @@ use crate::{ArtifactIdentity, Error, FileSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     io::{Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 
 mod walk;
 
 pub use walk::{
-    walk, Entry, EntryHead, Header, HeaderBytes, Preamble, Prefix, SharedHeader, TensorInfo, Walk,
-    HEADER_LIMIT,
+    walk, Absence, Entry, EntryHead, Header, HeaderBytes, Preamble, Prefix, SharedHeader, Skeleton,
+    TensorInfo, Walk, HEADER_LIMIT,
 };
 
 /// The `general.architecture` a multimodal projector declares.
@@ -52,9 +55,11 @@ pub enum Value {
 /// One GGUF metadata array: how many elements it holds, what kind ([`Self::kind`]), and the
 /// elements ([`Self::elements`]).
 ///
-/// An array read from a header holds its payload as the bytes it occupies there, a span of the
-/// header's bytes shared by every array read from them. It decodes and checks the payload the
-/// first time its elements are read, and its clones share that result. An array
+/// An array read from a header holds its payload as the bytes it occupies there: a span of the
+/// header's bytes shared by every array read from them, or, for an array read from a header
+/// skeleton ([`read_skeleton`]), the content-addressed file the skeleton names for it, read and
+/// checked against its sha256 when its elements are first needed. It decodes and checks the
+/// payload the first time its elements are read, and its clones share that result. An array
 /// built in code, or detached from its header ([`Directory::detach`]), holds its elements alone,
 /// shared by its clones.
 #[derive(Clone)]
@@ -66,15 +71,32 @@ enum Repr {
     Stored(Arc<Stored>),
 }
 
-/// An array read from a header: `count` elements stored as `stored` in `order`, its payload
-/// `bytes[range]`, shared with every other array read from them.
+/// An array read from a header: `count` elements stored as `stored` in `order`.
 struct Stored {
+    /// The entry's key, which a payload that can't be read is reported by.
+    key: String,
     stored: ValueType,
     order: ByteOrder,
     count: usize,
-    bytes: Arc<Vec<u8>>,
-    range: Range<usize>,
+    payload: Payload,
     decoded: OnceLock<Elements>,
+    /// Whether a payload apart from its skeleton failed to read ([`Array::lost_payload`]).
+    lost: AtomicBool,
+}
+
+/// Where a read array's payload is.
+enum Payload {
+    /// A range of the header's bytes, shared with every other array read from them.
+    Held {
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    },
+    /// Apart from the skeleton the array was read from ([`Absence`]), read when first needed
+    /// ([`verified`]).
+    Apart {
+        absence: Absence,
+        read: OnceLock<Arc<Vec<u8>>>,
+    },
 }
 
 /// What the elements of an array are, known whether or not its payload has been read.
@@ -209,28 +231,112 @@ impl Elements {
 }
 
 impl Stored {
-    fn payload(&self) -> &[u8] {
-        &self.bytes[self.range.clone()]
+    /// The payload's bytes: the header's, or the verified bytes a skeleton names for it
+    /// ([`verified`]), fetched once.
+    fn payload(&self) -> Result<&[u8], Error> {
+        match &self.payload {
+            Payload::Held { bytes, range } => Ok(&bytes[range.clone()]),
+            Payload::Apart { absence, read } => {
+                if let Some(bytes) = read.get() {
+                    return Ok(bytes);
+                }
+                let bytes = verified(&self.key, absence)
+                    .inspect_err(|_| self.lost.store(true, Ordering::Relaxed))?;
+                Ok(read.get_or_init(|| bytes))
+            }
+        }
     }
 }
 
+/// The bytes `absence` names for the array of `key`: its file's (no more of it read than one byte
+/// past its length), checked to be its length and to have its sha256, and so the bytes the header
+/// cache wrote ([`Error::PayloadRead`] when they can't be read, [`Error::DamagedPayload`] when
+/// they aren't those). Verified bytes are
+/// shared by their digest while any array holds them, so another header with the same payload
+/// (a tokenizer many models share) reads and hashes nothing; once no array holds them they are
+/// freed, and the next reader verifies them again. Nothing is remembered as verified apart from
+/// the bytes themselves.
+fn verified(key: &str, absence: &Absence) -> Result<Arc<Vec<u8>>, Error> {
+    static VERIFIED: OnceLock<Mutex<HashMap<[u8; 32], Weak<Vec<u8>>>>> = OnceLock::new();
+    let shared = VERIFIED.get_or_init(Mutex::default);
+    let held = |shared: &HashMap<[u8; 32], Weak<Vec<u8>>>| {
+        shared
+            .get(&absence.digest)
+            .and_then(Weak::upgrade)
+            .filter(|bytes| bytes.len() == absence.length)
+    };
+    let lock = || {
+        shared
+            .lock()
+            .expect("no reader panics holding the verified payloads")
+    };
+    if let Some(bytes) = held(&*lock()) {
+        return Ok(bytes);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&absence.file)
+        .and_then(|file| file.take(absence.length as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| Error::PayloadRead {
+            key: key.to_owned(),
+            error,
+        })?;
+    if bytes.len() != absence.length || sha256(&bytes) != absence.digest {
+        return Err(Error::DamagedPayload {
+            key: key.to_owned(),
+        });
+    }
+    let bytes = Arc::new(bytes);
+    let mut verified = lock();
+    if let Some(bytes) = held(&*verified) {
+        return Ok(bytes);
+    }
+    verified.retain(|_, bytes| bytes.strong_count() > 0);
+    verified.insert(absence.digest, Arc::downgrade(&bytes));
+    Ok(bytes)
+}
+
 impl Array {
-    /// The array of `count` elements stored as `stored` in `order`, whose payload is
+    /// The array of `key`, `count` elements stored as `stored` in `order`, whose payload is
     /// `bytes[range]`, which the walk hopped as that many such elements.
     fn held(
+        key: &str,
         stored: ValueType,
         order: ByteOrder,
         count: usize,
         bytes: Arc<Vec<u8>>,
         range: Range<usize>,
     ) -> Self {
+        Self::stored(key, stored, order, count, Payload::Held { bytes, range })
+    }
+
+    /// The array of `key`, read from a skeleton whose `absence` its payload is, which the walk
+    /// passed as `count` elements stored as `stored` in `order`.
+    fn apart(
+        key: &str,
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        absence: Absence,
+    ) -> Self {
+        let read = OnceLock::new();
+        Self::stored(key, stored, order, count, Payload::Apart { absence, read })
+    }
+
+    fn stored(
+        key: &str,
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        payload: Payload,
+    ) -> Self {
         Self(Repr::Stored(Arc::new(Stored {
+            key: key.to_owned(),
             stored,
             order,
             count,
-            bytes,
-            range,
+            payload,
             decoded: OnceLock::new(),
+            lost: AtomicBool::new(false),
         })))
     }
 
@@ -255,7 +361,9 @@ impl Array {
     }
 
     /// The array's elements, decoded from its payload (and checked: text must be UTF-8 and
-    /// booleans 0 or 1) the first time any clone of it reads them.
+    /// booleans 0 or 1) the first time any clone of it reads them. A payload apart from its
+    /// skeleton that can't be read is [`Error::PayloadRead`], one that isn't its bytes
+    /// [`Error::DamagedPayload`].
     pub fn elements(&self) -> Result<&Elements, Error> {
         match &self.0 {
             Repr::Decoded(elements) => Ok(elements.as_ref()),
@@ -264,7 +372,7 @@ impl Array {
                     return Ok(elements);
                 }
                 let elements =
-                    walk::decode(stored.stored, stored.order, stored.count, stored.payload())?;
+                    walk::decode(stored.stored, stored.order, stored.count, stored.payload()?)?;
                 Ok(stored.decoded.get_or_init(|| elements))
             }
         }
@@ -279,11 +387,18 @@ impl Array {
             Repr::Stored(stored) => match stored.decoded.get() {
                 Some(elements) => Ok(elements.get(index)),
                 None if index < stored.count => {
-                    walk::element(stored.stored, stored.order, stored.payload(), index).map(Some)
+                    walk::element(stored.stored, stored.order, stored.payload()?, index).map(Some)
                 }
                 None => Ok(None),
             },
         }
+    }
+
+    /// Whether this array was read from a header skeleton and its payload apart from it failed to
+    /// read (it was gone or not the bytes its digest names): whatever was concluded from the
+    /// header since rests on a read that failed.
+    pub fn lost_payload(&self) -> bool {
+        matches!(&self.0, Repr::Stored(stored) if stored.lost.load(Ordering::Relaxed))
     }
 
     /// Makes this array hold its elements alone ([`Directory::detach`]): elements already
@@ -296,7 +411,7 @@ impl Array {
         let elements = match Arc::get_mut(stored) {
             Some(owned) => match owned.decoded.take() {
                 Some(elements) => elements,
-                None => walk::decode(owned.stored, owned.order, owned.count, owned.payload())?,
+                None => walk::decode(owned.stored, owned.order, owned.count, owned.payload()?)?,
             },
             None => Self(Repr::Stored(Arc::clone(stored))).elements()?.clone(),
         };
@@ -305,8 +420,9 @@ impl Array {
     }
 
     /// The sha256 of a text array's payload stored little-endian, so one list of strings has one
-    /// digest however it was read or built: a little-endian header's payload is hashed as it is,
-    /// any other is encoded first. A non-text array is [`Error::DigestOfNonText`]: its stored width
+    /// digest however it was read or built: a little-endian header's payload is hashed as it is
+    /// (and a skeleton's absent one is named by the digest it carries, so nothing is read), any
+    /// other is encoded first. A non-text array is [`Error::DigestOfNonText`]: its stored width
     /// is part of its payload, so equal elements could digest differently.
     pub fn digest(&self) -> Result<[u8; 32], Error> {
         if self.kind() != Kind::String {
@@ -314,7 +430,10 @@ impl Array {
         }
         if let Repr::Stored(stored) = &self.0 {
             if stored.order == ByteOrder::Little {
-                return Ok(sha256(stored.payload()));
+                return Ok(match &stored.payload {
+                    Payload::Held { bytes, range } => sha256(&bytes[range.clone()]),
+                    Payload::Apart { absence, .. } => absence.digest,
+                });
             }
         }
         let mut payload = Vec::new();
@@ -327,7 +446,7 @@ impl Array {
     fn encode(&self, stored: ValueType, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Repr::Stored(read) = &self.0 {
             if read.stored == stored && read.order == ByteOrder::Little {
-                out.extend_from_slice(read.payload());
+                out.extend_from_slice(read.payload()?);
                 return Ok(());
             }
         }
@@ -389,7 +508,8 @@ impl Array {
 }
 
 /// Arrays are equal when their elements are; one whose payload can't be read or decoded equals
-/// none. Comparing decodes both, so it is for tests only (feature `equality`).
+/// none. Comparing decodes both (and may read a skeleton's payload apart from it), so it is for
+/// tests only (feature `equality`).
 #[cfg(any(test, feature = "equality"))]
 impl PartialEq for Array {
     fn eq(&self, other: &Self) -> bool {
@@ -404,18 +524,24 @@ impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             Repr::Decoded(elements) => fmt::Debug::fmt(elements, f),
-            Repr::Stored(stored) => f
-                .debug_struct("Array")
-                .field("stored", &stored.stored)
-                .field("count", &stored.count)
-                .field("payload", &stored.range)
-                .finish(),
+            Repr::Stored(stored) => {
+                let mut debug = f.debug_struct("Array");
+                debug
+                    .field("key", &stored.key)
+                    .field("stored", &stored.stored)
+                    .field("count", &stored.count);
+                match &stored.payload {
+                    Payload::Held { range, .. } => debug.field("payload", range),
+                    Payload::Apart { absence, .. } => debug.field("apart", &absence.file),
+                };
+                debug.finish()
+            }
         }
     }
 }
 
-/// The sha256 of `bytes`.
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+/// The sha256 of `bytes`: what a header, and a payload kept apart from its skeleton, is named by.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut digest = [0; 32];
     digest.copy_from_slice(&Sha256::digest(bytes));
     digest
@@ -893,7 +1019,7 @@ pub fn read_directory<R: Read + Seek>(source: &mut R) -> Result<Directory, Error
 /// offset); tensor payloads need not follow it. Its metadata arrays hold their
 /// payloads as spans of `bytes`, decoded when read.
 pub fn read_header(bytes: impl Into<Arc<Vec<u8>>>) -> Result<Directory, Error> {
-    SharedHeader::walk(bytes.into())?.directory()
+    SharedHeader::walk(bytes.into(), Vec::new())?.directory()
 }
 
 /// The metadata of a GGUF header's prefix `bytes`: its complete entries, as a header of their own
@@ -924,6 +1050,13 @@ pub fn read_prefix(
         },
         open,
     )))
+}
+
+/// Read a GGUF header skeleton: the header's directory, each of its arrays
+/// whose payload the skeleton lacks holding where that payload is apart, its
+/// count, length and digest known without reading it.
+pub fn read_skeleton(skeleton: Skeleton) -> Result<Directory, Error> {
+    SharedHeader::walk(Arc::new(skeleton.bytes), skeleton.absent)?.directory()
 }
 
 impl SharedHeader {
