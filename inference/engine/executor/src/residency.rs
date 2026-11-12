@@ -265,6 +265,64 @@ impl Stored {
         }
     }
 
+    /// The first `rows` of the tensor's leading dimension (an expert stack's
+    /// first `rows` experts), which lie first in the file: its bytes, and
+    /// its scale grid's, in proportion. None where the tensor's bytes do not
+    /// divide evenly into its leading rows.
+    fn leading(&self, rows: u64) -> Option<Self> {
+        let leading = *self.shape().first()?;
+        let part = |nbytes: u64| crate::planning::leading_bytes(nbytes, leading, rows);
+        match self {
+            Self::Dense(tensor) => Some(Self::Dense(StoredTensor {
+                nbytes: part(tensor.nbytes)?,
+                shape: [&[rows][..], &tensor.shape[1..]].concat(),
+                ..tensor.clone()
+            })),
+            Self::GgmlBlocks { source, offset, nbytes, shape, encoding, grid } => Some(Self::GgmlBlocks {
+                source: source.clone(),
+                offset: *offset,
+                nbytes: part(*nbytes)?,
+                shape: [&[rows][..], &shape[1..]].concat(),
+                encoding: *encoding,
+                grid: match grid {
+                    Some(grid) => Some(StoredGrid { nbytes: part(grid.nbytes)?, ..grid.clone() }),
+                    None => None,
+                },
+            }),
+        }
+    }
+
+    /// The stored tensor `weight` imports: the artifact's tensor `weight`
+    /// names ([`Self::from_gguf`]), of which, where `leading`, a plan of an
+    /// expert stack's first experts (`WeightPlan::leading`), only those first
+    /// rows. A dense weight's plan may differ from its stored rows by its
+    /// transforms, which no prefix of the stored bytes stands for.
+    pub fn of_plan(
+        artifact: &GgufArtifact,
+        weight: &crate::WeightPlan,
+        leading: bool,
+    ) -> Result<Self, WeightImportError> {
+        let stored = Self::from_gguf(artifact, &weight.descriptor)?;
+        if !leading {
+            return Ok(stored);
+        }
+        let (Some(&rows), Some(&stored_rows)) = (weight.shape.first(), stored.shape().first()) else {
+            return Err(invalid(format!("{:?} has no leading dimension", weight.descriptor.name)));
+        };
+        let name = &weight.descriptor.name;
+        let leading = stored
+            .leading(rows)
+            .ok_or_else(|| invalid(format!("{rows} leading rows of {name:?} ({stored_rows} stored)")))?;
+        match leading.shape()[1..] == weight.shape[1..] {
+            true => Ok(leading),
+            false => Err(invalid(format!(
+                "the planned shape {:?} of {name:?} differs from its stored {:?}",
+                weight.shape,
+                stored.shape()
+            ))),
+        }
+    }
+
     /// The stored tensor `descriptor` names, with its grid of block scales
     /// where it names one (bound and admitted with the weight,
     /// `Tensors::companion_scale`).
@@ -1509,10 +1567,12 @@ pub(crate) fn import_scale(
     let values = stored.read()?;
     let extent = usize::try_from(scale.extent)
         .map_err(|_| invalid("scale extent exceeds the host address range"))?;
-    let bytes = if scale.stored == scale.extent {
-        values
-    } else {
-        values.repeat(extent)
+    // One stored value serves every matrix; else one per matrix, of which a
+    // plan of an expert stack's first experts (`WeightPlan::leading`) takes
+    // the leading `extent`.
+    let bytes = match scale.stored {
+        1 => values.repeat(extent),
+        _ => values[..extent * size_of::<f32>()].to_vec(),
     };
     Tensor::from_host(device, Element::f32(), &[scale.extent], &bytes)
         .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))
@@ -1817,6 +1877,34 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An expert stack's first experts are a prefix of its bytes and of its
+    /// scale grid's: `leading` reads them alone, and refuses what does not
+    /// divide into its leading rows.
+    #[test]
+    fn a_stacks_leading_experts_are_a_prefix_of_its_bytes_and_its_grid() {
+        let path = std::env::temp_dir().join(format!("magnitude-leading-stack-{}.bin", std::process::id()));
+        // 8 experts of 6 bytes after 16 bytes of header, then 8 of 2 bytes.
+        let bytes = [vec![0xee; 16], (0..48).collect::<Vec<u8>>(), (100..116).collect::<Vec<u8>>()].concat();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = Arc::new(FileSource::open(&path).unwrap());
+        let stack = Stored::GgmlBlocks {
+            source: source.clone(),
+            offset: 16,
+            nbytes: 48,
+            shape: vec![8, 3, 2],
+            encoding: Encoding::Q4K,
+            grid: Some(StoredGrid { source, offset: 64, nbytes: 16, codes: ScaleCodes::Ue8m0 }),
+        };
+        let Some(Stored::GgmlBlocks { offset, nbytes, shape, grid: Some(grid), .. }) = stack.leading(3) else {
+            panic!("a stack of 8 experts has a leading 3");
+        };
+        assert_eq!((offset, nbytes, shape), (16, 18, vec![3, 3, 2]));
+        assert_eq!((grid.offset, grid.nbytes), (64, 6));
+        assert!(stack.leading(9).is_none(), "more experts than the stack holds");
+        assert!(stack.leading(8).is_some());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     /// A reserved stored table the bank shrinks after its import is read
     /// at what its slots are charged then: the importer's bytes fall with

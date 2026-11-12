@@ -182,7 +182,48 @@ pub enum TableFill {
     Stored,
 }
 
+/// The bytes of the first `leading` of `rows` leading rows of a tensor of
+/// `bytes`, which lie first: in proportion. None where there are fewer
+/// rows, or the bytes do not divide evenly into them. The one rule of every
+/// prefix of an expert stack, planned ([`WeightPlan::leading`]) and stored.
+pub(crate) fn leading_bytes(bytes: u64, rows: u64, leading: u64) -> Option<u64> {
+    (leading <= rows && bytes % rows == 0).then(|| bytes / rows * leading)
+}
+
 impl WeightPlan {
+    /// The plan of this expert stack's first `experts` experts: its shape,
+    /// its source and resident bytes, and its second-level scale, of that
+    /// many leading rows (one scale per expert, the first `experts` of its
+    /// stored values; a single stored one serves any number). None where it
+    /// has fewer experts, or its bytes or scales do not divide into its
+    /// rows.
+    pub fn leading(&self, experts: u64) -> Option<Self> {
+        let rows = *self.shape.first()?;
+        (experts <= rows).then_some(())?;
+        let part = |bytes: u64| leading_bytes(bytes, rows, experts);
+        let scale = match &self.scale {
+            None => None,
+            Some(scale) if scale.stored == 1 => Some(WeightScalePlan {
+                extent: experts,
+                resident_bytes: scale.resident_bytes / scale.extent * experts,
+                ..scale.clone()
+            }),
+            Some(scale) if scale.extent == rows => Some(WeightScalePlan {
+                extent: experts,
+                resident_bytes: part(scale.resident_bytes)?,
+                ..scale.clone()
+            }),
+            Some(_) => return None,
+        };
+        Some(Self {
+            shape: [&[experts][..], &self.shape[1..]].concat(),
+            source_bytes: part(self.source_bytes)?,
+            resident_bytes: part(self.resident_bytes)?,
+            scale,
+            ..self.clone()
+        })
+    }
+
     /// The rows of a gathered table that is streamed; `None` for a weight
     /// held otherwise.
     pub fn streamed(&self) -> Option<StreamedRows> {
@@ -420,7 +461,8 @@ fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
 pub struct WeightScalePlan {
     /// The stored scale tensor.
     pub tensor: String,
-    /// Its stored extent: 1, or the weight's matrix count.
+    /// Its stored extent: 1, or the weight's matrix count (of which a plan
+    /// of a stack's first experts takes the leading `extent`).
     pub stored: u64,
     /// Its resident extent: 1 for a matrix, the matrix count for a stacked
     /// weight (a stored `[1]` is repeated per matrix).

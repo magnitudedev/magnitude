@@ -13,11 +13,11 @@
 
 use super::cases::scale_extent;
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
     served_row_points,
 };
 use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
-use crate::planning::{BankBinding, HINT_LEADS, HintWeight};
+use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
 use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
     DECODE_GRIDS, MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS,
@@ -38,6 +38,19 @@ pub(crate) struct RoutedShape {
     pub shared: u64,
 }
 
+impl RoutedShape {
+    /// The geometry of the fused form's `binding`.
+    pub(crate) fn of(binding: &RoutedBinding) -> Self {
+        Self {
+            hidden: binding.hidden,
+            experts: binding.experts,
+            selected: binding.selected,
+            features: binding.features,
+            shared: binding.shared,
+        }
+    }
+}
+
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
     served_row_points(limits, |rows| rows <= DECODE_ROWS)
@@ -49,13 +62,18 @@ pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the
-/// expert of popularity rank r is (101 r) mod E (a permutation: 101 is prime
-/// and no expert count is a multiple of it) with popularity 1 / sqrt(r + 1),
+/// expert of popularity rank r is (p r) mod E, p the first of 101, 103 and 107
+/// that E is no multiple of (a permutation: p is prime; a bank's slot count
+/// may be a multiple of 101), with popularity 1 / sqrt(r + 1),
 /// and each row draws its choices by popularity without replacement from a
 /// fixed-seed generator. A grouped point then holds blocks of every live-row
 /// count, from one row to full tiles, and experts with no rows.
 pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
     let experts = shape.experts as usize;
+    let stride = [101, 103, 107]
+        .into_iter()
+        .find(|prime| experts % prime != 0)
+        .expect("an expert count is a multiple of none of 101, 103 and 107");
     let popularity = (0..experts)
         .map(|rank| 1.0 / ((rank + 1) as f64).sqrt())
         .collect::<Vec<_>>();
@@ -81,7 +99,7 @@ pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
             }
             taken[rank] = true;
             remaining -= popularity[rank];
-            routes.push(((rank * 101) % experts) as i32);
+            routes.push(((rank * stride) % experts) as i32);
         }
     }
     routes
@@ -870,6 +888,10 @@ pub(crate) struct RoutedExpandTuning {
     pub activation: Element,
     pub shape: RoutedShape,
     pub scopes: Vec<WeightScope>,
+    /// The experts its launches read their stacks at
+    /// ([`super::decode_experts`]): the bank's slots where the load serves
+    /// them.
+    pub experts: u64,
 }
 
 pub(crate) struct RoutedExpandCase {
@@ -905,12 +927,13 @@ impl EntryTuning for RoutedExpandTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "EGW={},EUW={},SGW={},SUW={},A={}",
+            "EGW={},EUW={},SGW={},SUW={},A={}{}",
             self.expert_gate.name(),
             self.expert_up.name(),
             self.shared_gate.name(),
             self.shared_up.name(),
-            self.activation.name()
+            self.activation.name(),
+            experts_text(self.experts, self.shape.experts)
         )
     }
 
@@ -936,6 +959,7 @@ impl EntryTuning for RoutedExpandTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.shape;
+        let routing = RoutedShape { experts: self.experts, ..shape };
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -947,9 +971,9 @@ impl EntryTuning for RoutedExpandTuning {
                         index as u64 + 1,
                     )?,
                     routes: inputs
-                        .i32s(&[point.rows, shape.selected], &routes(point.rows, shape))?,
-                    expert_gate: inputs.weight(scope, WeightKind::ExpertGate)?,
-                    expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
+                        .i32s(&[point.rows, shape.selected], &routes(point.rows, routing))?,
+                    expert_gate: inputs.decode_weight(scope, WeightKind::ExpertGate)?,
+                    expert_up: inputs.decode_weight(scope, WeightKind::ExpertUp)?,
                     shared_gate: inputs.weight(scope, WeightKind::SharedGate)?,
                     shared_up: inputs.weight(scope, WeightKind::SharedUp)?,
                     scales: ExpansionScales::at(inputs, scope, true)?,
@@ -995,6 +1019,9 @@ pub(crate) struct RoutedChoicesTuning {
     pub activation: Element,
     pub shape: RoutedShape,
     pub scopes: Vec<WeightScope>,
+    /// The experts its launches read their stacks at
+    /// ([`super::decode_experts`]).
+    pub experts: u64,
 }
 
 pub(crate) struct RoutedChoicesCase {
@@ -1022,10 +1049,11 @@ impl EntryTuning for RoutedChoicesTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "EGW={},EUW={},A={}",
+            "EGW={},EUW={},A={}{}",
             self.expert_gate.name(),
             self.expert_up.name(),
-            self.activation.name()
+            self.activation.name(),
+            experts_text(self.experts, self.shape.experts)
         )
     }
 
@@ -1051,12 +1079,13 @@ impl EntryTuning for RoutedChoicesTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.shape;
+        let routing = RoutedShape { experts: self.experts, ..shape };
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
-                let expert_gate = inputs.weight(scope, WeightKind::ExpertGate)?;
-                let expert_up = inputs.weight(scope, WeightKind::ExpertUp)?;
+                let expert_gate = inputs.decode_weight(scope, WeightKind::ExpertGate)?;
+                let expert_up = inputs.decode_weight(scope, WeightKind::ExpertUp)?;
                 Ok(RoutedChoicesCase {
                     normalized: inputs.activation(
                         self.activation,
@@ -1064,7 +1093,7 @@ impl EntryTuning for RoutedChoicesTuning {
                         index as u64 + 1,
                     )?,
                     routes: inputs
-                        .i32s(&[point.rows, shape.selected], &routes(point.rows, shape))?,
+                        .i32s(&[point.rows, shape.selected], &routes(point.rows, routing))?,
                     sources: no_sources(inputs, point.rows, shape.selected)?,
                     tier_gate: no_tier(&expert_gate)?,
                     tier_up: no_tier(&expert_up)?,
@@ -1110,6 +1139,9 @@ pub(crate) struct RoutedOutputTuning {
     pub activation: Element,
     pub shape: RoutedShape,
     pub scopes: Vec<WeightScope>,
+    /// The experts its launches read their stack at
+    /// ([`super::decode_experts`]).
+    pub experts: u64,
 }
 
 pub(crate) struct RoutedOutputCase {
@@ -1147,10 +1179,11 @@ impl EntryTuning for RoutedOutputTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "EDW={},SDW={},A={}",
+            "EDW={},SDW={},A={}{}",
             self.expert_down.name(),
             self.shared_down.name(),
-            self.activation.name()
+            self.activation.name(),
+            experts_text(self.experts, self.shape.experts)
         )
     }
 
@@ -1177,13 +1210,14 @@ impl EntryTuning for RoutedOutputTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
+        let routing = RoutedShape { experts: self.experts, ..shape };
         let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 8 * index as u64;
-                let expert_down = inputs.weight(scope, WeightKind::ExpertDown)?;
+                let expert_down = inputs.decode_weight(scope, WeightKind::ExpertDown)?;
                 Ok(RoutedOutputCase {
                     residual: inputs.activation(
                         Element::f32(),
@@ -1201,7 +1235,7 @@ impl EntryTuning for RoutedOutputTuning {
                         &[rows, shape.shared],
                         seed + 3,
                     )?,
-                    routes: inputs.i32s(&[rows, shape.selected], &routes(rows, shape))?,
+                    routes: inputs.i32s(&[rows, shape.selected], &routes(rows, routing))?,
                     sources: no_sources(inputs, rows, shape.selected)?,
                     scores: scores(inputs, rows, shape, seed + 4)?,
                     coefficient: inputs.activation(Element::f32(), &[rows], seed + 5)?,
@@ -1291,7 +1325,7 @@ impl EntryTuning for RoutedOutputProjectTuning {
         let mut over = self.resident.clone();
         over.scopes = self.layers.clone();
         let shape = self.resident.shape;
-        let table = routes(point.rows, shape);
+        let table = routes(point.rows, RoutedShape { experts: self.resident.experts, ..shape });
         over.rotation(inputs, point)?
             .into_iter()
             .map(|mut output| {

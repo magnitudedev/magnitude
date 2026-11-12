@@ -2,7 +2,7 @@ use super::specialization::{Specializer, Tuning};
 use super::readout::{ReadoutRecipe, RecipePreparation};
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
-    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
+    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights, decode_experts,
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
@@ -531,7 +531,7 @@ fn epsilon(definition: &ModelDefinition) -> Result<f32, CatalogFailure> {
 }
 
 /// Prepare the weight-import entries of `plan`'s import slots.
-fn imports(
+pub(super) fn imports(
     spec: &mut Specializer<'_>,
     plan: &ProgramPlan,
 ) -> Result<ImportKernels, CatalogFailure> {
@@ -2526,6 +2526,17 @@ impl<'a> Preparation<'a> {
             .map(|(project, residual)| PostNormKernels { project, residual }))
     }
 
+    /// The experts a decode launch of `scopes` reads its gate and up stacks
+    /// at, and its down stack at ([`decode_experts`]), of a layer of
+    /// `experts`: the bank's slots where the load serves them.
+    fn decode_reads(&self, scopes: &[WeightScope], experts: u64) -> (u64, u64) {
+        let load = self.tuning.model().load;
+        (
+            decode_experts(load, scopes, &[WeightKind::ExpertGate, WeightKind::ExpertUp], experts),
+            decode_experts(load, scopes, &[WeightKind::ExpertDown], experts),
+        )
+    }
+
     /// The general routed entries (`operators::routed`), with the shared
     /// expert and latent projections as dense entries over their own weight
     /// kinds.
@@ -2544,9 +2555,11 @@ impl<'a> Preparation<'a> {
         };
         let select = self.spec.tuned(&mut self.tuning, &resident_select)?;
         self.resident_selects.insert(binding, resident_select);
+        let (up_experts, down_experts) = self.decode_reads(&scopes, shape.experts);
         let decode = || RoutedExpandDecodeTuning {
             binding,
             scopes: scopes.clone(),
+            experts: up_experts,
         };
         let tiles = || RoutedExpertTilesTuning {
             binding,
@@ -2576,6 +2589,7 @@ impl<'a> Preparation<'a> {
         let resident_down = RoutedDownTuning {
             binding,
             scopes: scopes.clone(),
+            experts: down_experts,
         };
         let down = self.spec.tuned(&mut self.tuning, &resident_down)?;
         self.resident_downs.insert(binding, resident_down);
@@ -3003,13 +3017,8 @@ impl<'a> Preparation<'a> {
         b: RoutedBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<RoutedKernels>, CatalogFailure> {
-        let shape = RoutedShape {
-            hidden: b.hidden,
-            experts: b.experts,
-            selected: b.selected,
-            features: b.features,
-            shared: b.shared,
-        };
+        let shape = RoutedShape::of(&b);
+        let (up_experts, down_experts) = self.decode_reads(&scopes, b.experts);
         let form =
             DecodeForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
                 entry: "routed_route_shared",
@@ -3046,6 +3055,7 @@ impl<'a> Preparation<'a> {
                         activation: b.activation,
                         shape,
                         scopes: scopes.clone(),
+                        experts: up_experts,
                     },
                 )?
                 .map(RoutedDecodeKernels::Expand),
@@ -3065,6 +3075,7 @@ impl<'a> Preparation<'a> {
                         activation: b.activation,
                         shape,
                         scopes: scopes.clone(),
+                        experts: up_experts,
                     },
                 )?;
                 route
@@ -3078,6 +3089,7 @@ impl<'a> Preparation<'a> {
             activation: b.activation,
             shape,
             scopes: scopes.clone(),
+            experts: down_experts,
         };
         let output = self.spec.tuned(&mut self.tuning, &resident_output)?;
         self.resident_outputs.insert(b, resident_output);

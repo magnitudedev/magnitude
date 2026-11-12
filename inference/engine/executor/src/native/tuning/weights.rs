@@ -17,8 +17,9 @@ use std::collections::HashMap;
 /// Where tuning reads weights from.
 pub trait TuningWeightSource {
     /// The bytes of `weight` in its upload representation, on the host:
-    /// for a weight the host itself reads or places.
-    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String>;
+    /// for a weight the host itself reads or places. `leading`: as
+    /// [`Self::import_source`]'s.
+    fn source_bytes(&self, weight: &WeightPlan, leading: bool) -> Result<Vec<u8>, String>;
 
     /// The tensor an import entry reads `weight` from on `device`: its
     /// source in its upload representation, one row of every element.
@@ -27,16 +28,15 @@ pub trait TuningWeightSource {
     /// expert product row (`silu(gate) · up`), and its block scales branch
     /// on the values (`nvfp4::value`'s zero scale, `nvfp4::global_scale`'s
     /// binade corrections, `projection/stage.h`).
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError>;
+    fn import_source(&self, device: &Device, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError>;
 }
 
 impl TuningWeightSource for Package {
     /// The transformed (and dequantized) source bytes, as loading uploads
-    /// them.
-    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
+    /// them; of a leading plan, those of its first experts only.
+    fn source_bytes(&self, weight: &WeightPlan, leading: bool) -> Result<Vec<u8>, String> {
         let artifact = artifact(self, weight.component)?;
-        let stored =
-            Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+        let stored = Stored::of_plan(artifact, weight, leading).map_err(|error| error.to_string())?;
         let bytes = crate::programs::native_import::stored_source_bytes(&stored)
             .map_err(|error| error.to_string())?;
         crate::import_transforms::upload_bytes(weight, &stored, bytes)
@@ -46,11 +46,11 @@ impl TuningWeightSource for Package {
     /// ([`crate::resources::filled_import`]): an upload written from the
     /// stored range as it is read around the file cache. Tuning's import of
     /// a weight therefore holds on the host what the load's import of it
-    /// holds, and no copy of the source besides.
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError> {
+    /// holds, and no copy of the source besides; `leading`: the plan is of
+    /// an expert stack's first experts, a prefix of the stored tensor.
+    fn import_source(&self, device: &Device, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError> {
         let artifact = artifact(self, weight.component)?;
-        let stored =
-            Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+        let stored = Stored::of_plan(artifact, weight, leading).map_err(|error| error.to_string())?;
         Ok(crate::resources::filled_import(weight, &stored, device)?)
     }
 }
@@ -78,7 +78,7 @@ fn artifact(package: &Package, component: ArtifactComponent) -> Result<&GgufArti
 pub struct ZeroTuningWeights;
 
 impl TuningWeightSource for ZeroTuningWeights {
-    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
+    fn source_bytes(&self, weight: &WeightPlan, _leading: bool) -> Result<Vec<u8>, String> {
         let bytes = weight
             .upload
             .canonical_byte_len(&[logical_count(&weight.shape)?])
@@ -90,7 +90,7 @@ impl TuningWeightSource for ZeroTuningWeights {
         ])
     }
 
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError> {
+    fn import_source(&self, device: &Device, weight: &WeightPlan, _leading: bool) -> Result<Tensor, BuildError> {
         Ok(Tensor::zeros(device, weight.upload, &[logical_count(&weight.shape)?])?)
     }
 
@@ -128,11 +128,61 @@ pub(crate) struct TuningWeights<'a> {
     load: &'a ModelLoadPlan,
     source: &'a dyn TuningWeightSource,
     import: &'a ImportKernels,
-    resident: HashMap<WeightRole, Tensor>,
+    resident: HashMap<Stack, Tensor>,
     /// The packing bounds the imports made (`WeightPlan::bound`), kept for
     /// the tuning's duration: a bound is a few values, and outlives its
     /// weight's release.
-    bounds: HashMap<WeightRole, Tensor>,
+    bounds: HashMap<Stack, Tensor>,
+}
+
+/// One imported weight: a role, and for a banked expert stack the leading
+/// experts it holds ([`TuningWeights::decode_weight`]), none of a whole one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Stack {
+    role: WeightRole,
+    leading: Option<u64>,
+}
+
+/// The plan of the role's stack a decode launch of `scope` reads where
+/// `load`'s bank serves it: its first slots (`ExpertBankPlan::slots`), the
+/// records the launch's routes address, whatever the layer's expert count.
+/// None of a stack the load holds whole.
+fn decode_stack(load: &ModelLoadPlan, scope: WeightScope, kind: WeightKind) -> Option<WeightPlan> {
+    let bank = load.expert_bank()?;
+    let plan = bank.resident_plan(WeightRole { scope, kind })?;
+    (bank.slots < *plan.shape.first()?).then_some(())?;
+    // A bank is its stack's first `slots` records, so the stack divides into
+    // them: a stack that does not is an invariant violation, never a whole one.
+    Some(plan.leading(bank.slots).expect("a banked stack divides into its bank's slots"))
+}
+
+/// The experts a decode point's routes draw from, its stacks of `scopes`
+/// read as [`TuningWeights::decode_weight`] gives them: the fewest of any of
+/// them, `experts` where the load holds them whole. A unit's record is of
+/// the launch measured, so this is a fact of its key.
+pub(crate) fn decode_experts(
+    load: &ModelLoadPlan,
+    scopes: &[WeightScope],
+    kinds: &[WeightKind],
+    experts: u64,
+) -> u64 {
+    scopes
+        .iter()
+        .flat_map(|scope| kinds.iter().filter_map(|kind| decode_stack(load, *scope, *kind)))
+        .map(|stack| stack.shape[0])
+        .fold(experts, u64::min)
+}
+
+/// What a decode unit's bindings add for the `read` experts of a layer's
+/// `layer` its launches read ([`decode_experts`]): a record is of the
+/// launch measured, so a unit at the bank's slots is not one at every
+/// expert. Nothing where the load holds the stack whole, whose units keep
+/// their bindings.
+pub(crate) fn experts_text(read: u64, layer: u64) -> String {
+    match read < layer {
+        true => format!(",S={read}"),
+        false => String::new(),
+    }
 }
 
 impl<'a> TuningWeights<'a> {
@@ -180,30 +230,45 @@ impl<'a> TuningWeights<'a> {
         if self.plan(scope, kind)?.bound == 0 {
             return Ok(None);
         }
-        if !self.bounds.contains_key(&role) {
+        let stack = Stack { role, leading: None };
+        if !self.bounds.contains_key(&stack) {
             self.weight(scope, kind)?;
         }
-        Ok(self.bounds.get(&role).cloned())
+        Ok(self.bounds.get(&stack).cloned())
     }
 
     /// The resident weight of one role, imported once and shared while any
     /// built input holds it. An allocation the device refuses is
     /// [`BuildError::Refused`].
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
-        let role = WeightRole { scope, kind };
-        if let Some(tensor) = self.resident.get(&role) {
+        let plan = self.plan(scope, kind)?;
+        self.stack(Stack { role: WeightRole { scope, kind }, leading: None }, plan)
+    }
+
+    /// [`Self::weight`] of a decode launch's stack: a banked layer's, of the
+    /// slots it reads ([`decode_experts`]) and not of every expert.
+    pub fn decode_weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
+        match decode_stack(self.load, scope, kind) {
+            Some(plan) => self.stack(Stack { role: WeightRole { scope, kind }, leading: Some(plan.shape[0]) }, &plan),
+            None => self.weight(scope, kind),
+        }
+    }
+
+    /// The weight `stack` names, imported from `plan`: its role's, or the
+    /// plan of its leading experts.
+    fn stack(&mut self, stack: Stack, plan: &WeightPlan) -> Result<Tensor, BuildError> {
+        if let Some(tensor) = self.resident.get(&stack) {
             return Ok(tensor.clone());
         }
-        let plan = weight_plan(self.load, scope, kind)?;
         // A plane the host places is uploaded as placed, as loading
         // uploads it.
         if plan.placed_on_host() {
-            let bytes = self.source.source_bytes(plan)?;
+            let bytes = self.source.source_bytes(plan, stack.leading.is_some())?;
             let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)?;
-            self.resident.insert(role, tensor.clone());
+            self.resident.insert(stack, tensor.clone());
             return Ok(tensor);
         }
-        let source = self.source.import_source(self.device, plan)?;
+        let source = self.source.import_source(self.device, plan, stack.leading.is_some())?;
         let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)?;
         let mut bound = (plan.bound != 0)
             .then(|| Tensor::zeros(self.device, Element::f32(), &[plan.bound]))
@@ -221,9 +286,9 @@ impl<'a> TuningWeights<'a> {
         crate::programs::native_import::import_into(&handle, &source, &destination, bound.as_mut())
             .map_err(|error| error.to_string())?;
         if let Some(bound) = bound {
-            self.bounds.insert(role, bound);
+            self.bounds.insert(stack, bound);
         }
-        self.resident.insert(role, destination.clone());
+        self.resident.insert(stack, destination.clone());
         Ok(destination)
     }
 }

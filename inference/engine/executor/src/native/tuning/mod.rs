@@ -173,7 +173,7 @@ pub use record::Receipt;
 use record::StoredChoice;
 pub use trace::{TRACE_SCHEMA, TracedWork, TuningTrace};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
-pub(crate) use weights::{TuningWeights, weight_plan};
+pub(crate) use weights::{TuningWeights, decode_experts, experts_text, weight_plan};
 
 use super::CatalogFailure;
 use super::specialization::{UntunedEntries, UntunedFormation};
@@ -2347,6 +2347,13 @@ impl TuningInputs<'_, '_> {
     /// resident representation and layout.
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
         self.weights.weight(scope, kind)
+    }
+
+    /// The resident weight of one role as a decode launch of `scope` reads
+    /// it ([`TuningWeights::decode_weight`]): a banked layer's stack of the
+    /// bank's slots.
+    pub fn decode_weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
+        self.weights.decode_weight(scope, kind)
     }
 
     /// A weight's packing bound operand, as loading binds it: its bound, or

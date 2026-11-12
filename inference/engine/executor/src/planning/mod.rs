@@ -74,7 +74,9 @@ pub use weights::{
     rounding_args, source_element, stored_weights,
 };
 
-pub(crate) use weights::{activation_dtype, elements, packing_run, resident_storage, stored_row_ranges, value_packets};
+pub(crate) use weights::{
+    activation_dtype, elements, leading_bytes, packing_run, resident_storage, stored_row_ranges, value_packets,
+};
 use weights::{
     planned_element, planned_readout, planned_scalable,
     weight_bytes_by_component,

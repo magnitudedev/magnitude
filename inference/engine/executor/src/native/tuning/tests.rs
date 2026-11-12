@@ -3642,6 +3642,22 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
 /// test's own, so its plan never depends on the host it runs on.
 const TUNING_HOST_ROOM: u64 = 16 << 30;
 
+/// A bank's slot count may be a multiple of 101 (202): synthetic routes over
+/// it still draw distinct experts in every row, where a stride of 101 maps
+/// every popularity rank to expert 0 or 101.
+#[test]
+fn routes_over_a_multiple_of_101_slots_draw_distinct_experts_per_row() {
+    let (rows, selected) = (64, 8);
+    let shape = super::routed::RoutedShape { hidden: 128, experts: 202, selected, features: 128, shared: 0 };
+    let table = super::routed::routes(rows, shape);
+    assert_eq!(table.len() as u64, rows * selected);
+    for row in table.chunks(selected as usize) {
+        let distinct = row.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), row.len(), "a row's experts are distinct: {row:?}");
+        assert!(row.iter().all(|expert| (0..202).contains(expert)), "a row routes over the slots: {row:?}");
+    }
+}
+
 /// A search of a streamed load forms and runs every streamed tuning case
 /// on the device, its all-defaults configuration included, over operands
 /// bound as a step binds them: the fused route (`routed_route_streamed`)
@@ -3650,23 +3666,49 @@ const TUNING_HOST_ROOM: u64 = 16 << 30;
 /// three streamed layers route at a lead each (a route predicts only the
 /// layers that exist, `ExpertBankPlan::hints`), the second's experts' down
 /// stored in a form of its own, so its binding holds its lead alone: a lead
-/// none of a binding's layers launches builds no case.
+/// none of a binding's layers launches builds no case. Its bank holds fewer
+/// slots than any layer has experts, and the units preparation forms for
+/// the banked layers' decode launches are of those slots: their keys carry
+/// them, and their cases read the stacks' leading experts.
 /// A case whose operands alias where the kernel forbids it fails here, and
 /// so does one whose launch condition's word a timed pass's cold copies
-/// (CUDA's) do not keep where the host reads it. It runs on the device the
-/// host has.
+/// (CUDA's) do not keep where the host reads it, where the search's budget
+/// (which counts the mandatory compiles) leaves it the time to form them.
+/// What the test holds on any host is that every lead's unit finishes, the
+/// decode units are keyed at the bank's slots, and the decode stacks formed
+/// are the bank's leading experts. It runs on the device the host has.
 #[test]
 fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     use crate::planning::fixtures::{relaid_manifest, streamed_experts_manifest};
     use magnitude_family_contracts::{Operator, ScoreFunction};
     use std::collections::BTreeSet;
-    /// Each finished unit's entry and lead (`AHEAD`).
-    struct Finished(RefCell<Vec<(&'static str, Option<u64>)>>);
+    /// Each finished unit's entry, lead (`AHEAD`) and bindings.
+    struct Finished(RefCell<Vec<(&'static str, Option<u64>, String)>>);
     impl TuningObserver for Finished {
         fn event(&self, event: &TuningEvent) {
             if let TuningEvent::Finished(tuned) = event {
-                self.0.borrow_mut().push((tuned.entry, tuned.statics.get("AHEAD").copied()));
+                let ahead = tuned.statics.get("AHEAD").copied();
+                self.0.borrow_mut().push((tuned.entry, ahead, tuned.bindings.clone()));
             }
+        }
+    }
+    /// Zero weights, recording each import's role, leading extent, and
+    /// whether it is of a stack's leading experts.
+    struct Imports(RefCell<Vec<(magnitude_family_contracts::WeightRole, Option<u64>, bool)>>);
+    impl TuningWeightSource for Imports {
+        fn source_bytes(&self, weight: &crate::WeightPlan, leading: bool) -> Result<Vec<u8>, String> {
+            self.0.borrow_mut().push((weight.role, weight.shape.first().copied(), leading));
+            crate::ZeroTuningWeights.source_bytes(weight, leading)
+        }
+
+        fn import_source(
+            &self,
+            device: &seismic::Device,
+            weight: &crate::WeightPlan,
+            leading: bool,
+        ) -> Result<seismic::Tensor, seismic::BuildError> {
+            self.0.borrow_mut().push((weight.role, weight.shape.first().copied(), leading));
+            crate::ZeroTuningWeights.import_source(device, weight, leading)
         }
     }
     // Its search qualifies the bank's entries, a CPU site's among them,
@@ -3733,8 +3775,8 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     };
     // Metal's fused route routes over a multiple of 32 experts.
     let forms = [
-        ("routed_route_streamed", routed(32, ScoreFunction::Softmax, true)),
-        ("routed_select_streamed", routed(8, ScoreFunction::Sigmoid, false)),
+        ("routed_route_streamed", routed(256, ScoreFunction::Softmax, true)),
+        ("routed_select_streamed", routed(64, ScoreFunction::Sigmoid, false)),
     ];
     for (streamed, definition) in forms {
         // The second layer's down as Q4_0 blocks: a binding of its own.
@@ -3780,6 +3822,63 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let cap = whole.load().weight_bytes().unwrap() - experts.slot_bytes().unwrap() * (experts.widest().get() / 2);
         let draft = plan(Some(crate::WeightBound::Cap(cap)));
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
+        // A decode launch of a banked layer reads its stack as the bank's
+        // slots: the tuning weights' decode stack is those leading experts,
+        // in proportion of the whole stack's bytes.
+        let bank = draft.load().expert_bank().unwrap();
+        let slots = bank.slots;
+        for layer in bank.layers() {
+            let role = magnitude_family_contracts::WeightRole {
+                scope: layer.scope,
+                kind: WeightKind::ExpertUp,
+            };
+            let whole = bank.resident_plan(role).expect("a banked layer has its resident plan");
+            assert!(slots < whole.shape[0], "{streamed}: the bank holds {slots} of {} experts", whole.shape[0]);
+            assert_eq!(
+                super::decode_experts(draft.load(), &[layer.scope], &[WeightKind::ExpertUp], whole.shape[0]),
+                slots,
+                "{streamed}: a decode launch's stack"
+            );
+            let leading = whole.leading(slots).expect("a stack has leading experts");
+            assert_eq!(
+                leading.scale.as_ref().map(|scale| scale.extent),
+                whole.scale.as_ref().map(|_| slots),
+                "its scale of those experts"
+            );
+            assert_eq!(leading.shape, [&[slots][..], &whole.shape[1..]].concat());
+            assert_eq!(leading.resident_bytes * whole.shape[0], whole.resident_bytes * slots);
+        }
+        // The decode stacks as a case forms them (`TuningWeights::decode_weight`):
+        // each banked layer's are its bank's leading `slots` experts, and only
+        // those. They are formed here, not read off a search: the search's
+        // budget counts the mandatory compiles, so a host that compiles slowly
+        // ends every unit's optional work before any case is formed, and a
+        // result that depended on cases formed would depend on the host.
+        let weights = Imports(RefCell::new(Vec::new()));
+        let import = crate::native::preparation::imports(&mut crate::native::specialization::Specializer::new(&device), draft.programs())
+            .unwrap_or_else(|error| panic!("{streamed}: {error:?}"));
+        let mut decode = TuningWeights::new(&device, draft.load(), &weights, &import);
+        for layer in bank.layers() {
+            for kind in [WeightKind::ExpertGate, WeightKind::ExpertUp, WeightKind::ExpertDown] {
+                let role = magnitude_family_contracts::WeightRole { scope: layer.scope, kind };
+                if bank.resident_plan(role).is_some() {
+                    decode.decode_weight(layer.scope, kind).unwrap_or_else(|error| panic!("{streamed}: {error}"));
+                }
+            }
+        }
+        let imports = weights.0.borrow();
+        for kind in [WeightKind::ExpertGate, WeightKind::ExpertUp, WeightKind::ExpertDown] {
+            assert!(
+                imports.iter().any(|(role, rows, leading)| role.kind == kind && *leading && *rows == Some(slots)),
+                "{streamed}: a decode case reads its {kind:?} stack as the bank's slots: {imports:?}"
+            );
+        }
+        assert!(
+            imports.iter().all(|(_, rows, leading)| *leading && *rows == Some(slots)),
+            "{streamed}: a decode stack is the bank's leading slots: {imports:?}"
+        );
+        drop(imports);
+        drop(decode);
         let observer = Finished(RefCell::new(Vec::new()));
         crate::AttestedPrograms::search_draft(
             &draft,
@@ -3803,11 +3902,32 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let finished = observer.0.borrow();
         let leads = finished
             .iter()
-            .filter(|(entry, _)| *entry == streamed)
-            .map(|&(_, ahead)| ahead)
+            .filter(|(entry, ..)| *entry == streamed)
+            .map(|&(_, ahead, _)| ahead)
             .collect::<BTreeSet<_>>();
         let every = (0..crate::native::LEADS as u64).map(Some).collect::<BTreeSet<_>>();
         assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
+        // Every decode unit preparation formed for the banked layers is
+        // keyed at the bank's slots: units at two slot tables are two
+        // records. Both forms read the gate and up stacks, and the down.
+        let (ups, downs) = (
+            ["routed_expand", "routed_gate_up", "routed_up"],
+            ["routed_output", "routed_output_project", "routed_down", "routed_down_project"],
+        );
+        let decode = finished
+            .iter()
+            .filter(|(entry, ..)| ups.contains(entry) || downs.contains(entry))
+            .collect::<Vec<_>>();
+        for kinds in [&ups[..], &downs[..]] {
+            assert!(
+                decode.iter().any(|(entry, ..)| kinds.contains(entry)),
+                "{streamed}: a decode unit of {kinds:?} is searched: {finished:?}"
+            );
+        }
+        let at_slots = format!(",S={slots}");
+        for (entry, _, bindings) in &decode {
+            assert!(bindings.ends_with(&at_slots), "{streamed}: {entry} is keyed at the bank's slots: {bindings}");
+        }
     }
 }
 

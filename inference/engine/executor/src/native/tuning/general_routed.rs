@@ -12,7 +12,7 @@ use super::routed::{
     decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
 };
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
 };
 use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
@@ -321,6 +321,10 @@ impl EntryTuning for RoutedSelectStreamedTuning {
 pub(crate) struct RoutedExpandDecodeTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
+    /// The experts its launches read their stacks at
+    /// ([`super::decode_experts`]): the bank's slots where the load serves
+    /// them.
+    pub experts: u64,
 }
 
 pub(crate) struct RoutedExpandDecodeCase {
@@ -347,17 +351,19 @@ impl RoutedExpandDecodeTuning {
         point: &PointShape,
     ) -> Result<Vec<RoutedExpandDecodeCase>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
-        let table = routes(rows, routing_shape(&self.binding));
-        TuningInputs::rotation_scopes(&self.scopes, point)
+        let scopes = TuningInputs::rotation_scopes(&self.scopes, point);
+        let routing = RoutedShape { experts: self.experts, ..routing_shape(&self.binding) };
+        let table = routes(rows, routing);
+        scopes
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 let expert_gate = if shape.experts_expansion.gated {
-                    Some(inputs.weight(scope, WeightKind::ExpertGate)?)
+                    Some(inputs.decode_weight(scope, WeightKind::ExpertGate)?)
                 } else {
                     None
                 };
-                let expert_up = inputs.weight(scope, WeightKind::ExpertUp)?;
+                let expert_up = inputs.decode_weight(scope, WeightKind::ExpertUp)?;
                 Ok(RoutedExpandDecodeCase {
                     normalized: inputs.activation(
                         self.binding.activation,
@@ -405,10 +411,11 @@ impl EntryTuning for RoutedGateUpTuning {
     fn bindings(&self) -> String {
         let b = self.0.binding;
         format!(
-            "EGW={},EUW={},A={}",
+            "EGW={},EUW={},A={}{}",
             b.expert_gate.unwrap_or(b.expert_up).name(),
             b.expert_up.name(),
-            b.activation.name()
+            b.activation.name(),
+            experts_text(self.0.experts, b.shape.experts)
         )
     }
 
@@ -468,7 +475,12 @@ impl EntryTuning for RoutedUpTuning {
 
     fn bindings(&self) -> String {
         let b = self.0.binding;
-        format!("EUW={},A={}", b.expert_up.name(), b.activation.name())
+        format!(
+            "EUW={},A={}{}",
+            b.expert_up.name(),
+            b.activation.name(),
+            experts_text(self.0.experts, b.shape.experts)
+        )
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
@@ -511,6 +523,9 @@ impl EntryTuning for RoutedUpTuning {
 pub(crate) struct RoutedDownTuning {
     pub binding: GeneralRoutedBinding,
     pub scopes: Vec<WeightScope>,
+    /// The experts its launches read their stack at
+    /// ([`super::decode_experts`]).
+    pub experts: u64,
 }
 
 pub(crate) struct RoutedDownCase {
@@ -536,10 +551,11 @@ impl EntryTuning for RoutedDownTuning {
     fn bindings(&self) -> String {
         let b = self.binding;
         format!(
-            "EDW={},A={},R={}",
+            "EDW={},A={},R={}{}",
             b.expert_down.name(),
             b.activation.name(),
-            sum_element(&b).name()
+            sum_element(&b).name(),
+            experts_text(self.experts, b.shape.experts)
         )
     }
 
@@ -558,13 +574,15 @@ impl EntryTuning for RoutedDownTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
-        let table = routes(rows, routing_shape(&self.binding));
-        TuningInputs::rotation_scopes(&self.scopes, point)
+        let scopes = TuningInputs::rotation_scopes(&self.scopes, point);
+        let routing = RoutedShape { experts: self.experts, ..routing_shape(&self.binding) };
+        let table = routes(rows, routing);
+        scopes
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 3 * index as u64;
-                let expert_down = inputs.weight(scope, WeightKind::ExpertDown)?;
+                let expert_down = inputs.decode_weight(scope, WeightKind::ExpertDown)?;
                 Ok(RoutedDownCase {
                     base: inputs.activation(
                         Element::f32(),
@@ -655,7 +673,8 @@ impl EntryTuning for RoutedDownProjectTuning {
         let mut over = self.resident.clone();
         over.scopes = self.layers.clone();
         let shape = self.resident.binding.shape;
-        let table = routes(point.rows, routing_shape(&self.resident.binding));
+        let routing = RoutedShape { experts: self.resident.experts, ..routing_shape(&self.resident.binding) };
+        let table = routes(point.rows, routing);
         over.rotation(inputs, point)?
             .into_iter()
             .map(|mut down| {

@@ -131,7 +131,7 @@ fn source_f32s(
             plan.source.name()
         ));
     }
-    let bytes = tuning.weights.source_bytes(plan)?;
+    let bytes = tuning.weights.source_bytes(plan, false)?;
     if bytes.len() % 4 != 0 {
         return Err(format!("{role:?} holds {} bytes", bytes.len()));
     }
