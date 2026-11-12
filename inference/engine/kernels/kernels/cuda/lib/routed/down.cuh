@@ -41,7 +41,7 @@ struct ProjectedEpi {
 #ifdef SEISMIC_FORMING_ROUTED_DOWN
 template <int TPW, int KSPLIT>
 __global__ void routed_down(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     extern __shared__ uint4 dynamic_shared[];
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
@@ -98,7 +98,7 @@ struct ChoiceProjectedEpi {
 // every choice gets its one-row bits.
 template <int TPW, int KSPLIT>
 __global__ void routed_down_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Raw> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;

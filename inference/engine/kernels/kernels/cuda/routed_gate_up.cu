@@ -54,7 +54,7 @@ struct Weights {
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP
 template <int TPW, int KSPLIT>
 __global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     extern __shared__ uint4 dynamic_shared[];
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
@@ -121,7 +121,7 @@ struct ChoiceEpi {
 
 template <int TPW, int KSPLIT>
 __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Raw> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const unsigned at = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;

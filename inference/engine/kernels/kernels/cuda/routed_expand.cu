@@ -55,7 +55,7 @@ __global__ void routed_expand_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND
 template <int TPW, int KSPLIT>
 __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 group = Shape::tile_group();
@@ -99,7 +99,7 @@ struct ChoiceEpi {
 
 template <int TPW, int KSPLIT>
 __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 group = Shape::tile_group();

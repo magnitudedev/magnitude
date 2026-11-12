@@ -92,7 +92,7 @@ struct PublishEpi {
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT
 template <int TPW, int KSPLIT>
 __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K;
@@ -141,7 +141,7 @@ struct GatheredPublishEpi {
 
 template <int TPW, int KSPLIT>
 __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;
     __shared__ projection::GemvShared<Shape, routed::GatheredRows> shared;
     __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], published_at[SEISMIC_CONST_DECODE_ROWS];

@@ -11,6 +11,13 @@ using element::u32;
 using element::u64;
 using element::u8;
 
+// The decode GEMV kernels' block: DECODE_WARPS warps (the declarations' 128 threads). A kernel declares it as its
+// launch bound (`routed_up` does) so the compiler allocates registers for that block, not for the largest one the
+// hardware admits; the others adopt the bound where it is measured to pay.
+constexpr int DECODE_WARPS = 4;
+constexpr int DECODE_THREADS = DECODE_WARPS * 32;
+template <int TPW, int KSPLIT> using DecodeShape = projection::GemvShape<DECODE_WARPS, TPW, KSPLIT, 1>;
+
 // The live rows of a grouped block: its `order` entries are one expert's rows
 // followed by -1 padding, so the count is the index of the first -1.
 __device__ __forceinline__ u32 block_rows(const int *order, u64 stride, u32 rows) {
