@@ -1261,6 +1261,13 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             source_place.representation, recipe.source,
             "conversion source representation differs from its registered recipe"
         );
+        // The op addresses its source packet as one run of packets: a planar
+        // source (a companion grid of scales) is refused by the compiler's
+        // target domain before construction, so reaching here is a contradiction.
+        assert!(
+            recipe.source_layout.planes.is_none(),
+            "planar conversion source reached compiled construction, which refuses it"
+        );
         assert_eq!(
             destination_place.representation, recipe.destination,
             "conversion destination representation differs from its registered recipe"

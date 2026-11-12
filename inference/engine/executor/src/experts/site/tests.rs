@@ -389,7 +389,7 @@ fn packed(device: &seismic::Device, h: usize, f: usize, count: usize) -> SiteTen
         let placement = tensor.record_placement().unwrap();
         for index in 0..count as u32 {
             let bytes = (0..stored_bytes).map(|at| ((at as u32).wrapping_mul(2_654_435_761).wrapping_add(seed + index) >> 24) as u8).collect();
-            let stored = resident.finite_source(source, bytes).unwrap();
+            let stored = resident.finite_source(source, &record, bytes).unwrap();
             let converted = resident.repack_host(source, &record, &stored).unwrap();
             // SAFETY: no work uses the tensor.
             unsafe { tensor.write_shared(placement.offset(u64::from(index)), &converted).unwrap() };

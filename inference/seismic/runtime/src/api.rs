@@ -468,7 +468,8 @@ pub enum TensorError {
         end: u64,
     },
     /// A row-layout view may select whole rows only: never its packing axis,
-    /// and on an `mma16` row axis only whole 16-row tiles.
+    /// and on an `mma16` row axis only whole 16-row tiles; a view of a planar
+    /// source (rows sharing their matrix's grid) whole matrices only.
     UnalignedRowSlice {
         representation: &'static str,
         start: u64,
@@ -663,7 +664,7 @@ impl fmt::Display for TensorError {
                 end,
             } => write!(
                 f,
-                "`{representation}` slice {start}..{end} does not select whole rows or row tiles"
+                "`{representation}` slice {start}..{end} does not select whole rows, row tiles or matrices"
             ),
             Self::RowLayoutReshape {
                 representation,

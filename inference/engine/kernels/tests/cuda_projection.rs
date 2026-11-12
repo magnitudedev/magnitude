@@ -1304,10 +1304,7 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
         .collect::<Vec<_>>();
     let tokens = i32_tensor(&device, &[tokens_values.len() as u64, 2], &rows);
     let direct = i32_tensor(&device, &[0, 1], &[]);
-    let mut external = Vec::new();
-    for _ in 0..v * d / format.block_values() {
-        external.extend(format.block(&mut rng, WEIGHT_SCALE));
-    }
+    let external = format.external(&mut rng, &shape, WEIGHT_SCALE);
     let source = format.source();
     let read = |layout: Layout, normalize: i32| {
         let element = format.element(layout);

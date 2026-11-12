@@ -29,12 +29,13 @@
 //!
 //! Inputs and outputs are segments, each addressed from its own base when
 //! the program runs: the input's are the source packets of each of its rows
-//! and the value slots, the output's are the caller's (a destination's
-//! planes). A program so reads its source and writes its destination in
-//! place ([`RepackExecutor::run_into`]), or stages both in its own buffers
-//! ([`RepackExecutor::run`]).
+//! ([`SourceRows`]: a row's packets, or under a grid its codes and its
+//! scales) and the value slots, the output's are the caller's (a
+//! destination's planes). A program so reads its source and writes its
+//! destination in place ([`RepackExecutor::run_into`]), or stages both in
+//! its own buffers ([`RepackExecutor::run`]).
 
-use seismic_lang::registry::{self, RepresentationConversion};
+use seismic_lang::registry::{self, ExternalPacketLayout, RepresentationConversion};
 use seismic_lang::repack::{slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK};
 use std::num::NonZeroU32;
 
@@ -219,8 +220,9 @@ struct ValueGroup {
 /// computed values of its shape, which every packet holds one of each of
 /// (the group's members, packet by packet), the bytes of its field slots
 /// (whole blocks) and value slots, and the input bit the value slots start
-/// at, past every row's source packets.
+/// at, past every row's source packets (its source rows').
 struct SlotLayout<'a> {
+    source_rows: SourceRows<'a>,
     values: PacketValues<'a>,
     groups: Vec<(ValueGroup, Vec<usize>)>,
     field_bytes: u32,
@@ -241,6 +243,10 @@ pub struct RepackProgram {
     /// Source rows, and packets of each.
     rows: u32,
     packets: u32,
+    /// Input bytes of a source row, and where each of its segments starts
+    /// in them ([`SourceRows`]).
+    row_bytes: u32,
+    row_segments: Vec<u32>,
     /// Where each output segment starts in the output of a staged execution
     /// (the segments one after another), and that output's bytes.
     output_starts: Vec<u32>,
@@ -1088,11 +1094,57 @@ mod vector {
     }
 }
 
+/// A program's source rows as its input lays them: each the bytes of a
+/// matrix of that one row of `packets` packets, which the registry
+/// addresses (`ExternalPacketLayout::packet_byte`). A source of one plane's
+/// row is its packets one after another, one input segment; under a grid
+/// (`registry::GridPlanes`) its codes, then its scales, two segments, which
+/// an execution reads where the source holds them (the codes plane's, and
+/// the grid's), from its row's first packet: an execution starts on a scale
+/// of its own ([`starts_on_scales`]).
+struct SourceRows<'a> {
+    layout: &'a ExternalPacketLayout,
+    /// Values of a row.
+    columns: u64,
+    /// Bytes of a row, and where each of its segments starts in them.
+    bytes: u32,
+    segments: Vec<u32>,
+}
+
+impl<'a> SourceRows<'a> {
+    /// Rows of `packets` packets of `layout`; `None` where a row's bytes
+    /// leave `u32`.
+    fn of(layout: &'a ExternalPacketLayout, packets: u32) -> Option<Self> {
+        let columns = u64::from(packets) * u64::from(layout.logical_group);
+        let bytes = u32::try_from(layout.matrix_bytes(1, columns)?).ok()?;
+        // Under a grid, the scales start where packet 0's does.
+        let scales = layout.packet_pieces(1, columns, 0, 0).scale.map(|scale| scale as u32);
+        Some(Self { layout, columns, bytes, segments: std::iter::once(0).chain(scales).collect() })
+    }
+
+    /// The input bit of bit `bit` of packet `packet` of row `row`.
+    fn bit(&self, row: u32, packet: u32, bit: u32) -> u32 {
+        let byte = self.layout.packet_byte(1, self.columns, 0, u64::from(packet), bit / 8) as u32;
+        (row * self.bytes + byte) * 8 + bit % 8
+    }
+}
+
+/// Whether executions of `packets` packets of a row of `layout`, from the
+/// row's first packet, each start on a scale of their own: under a grid the
+/// first packet of a tile's columns, which a program's row assumes
+/// ([`SourceRows`]); always for a source of one plane.
+pub fn starts_on_scales(layout: &ExternalPacketLayout, packets: usize) -> bool {
+    layout.planes.is_none_or(|planes| {
+        (packets as u64 * u64::from(layout.logical_group)).is_multiple_of(u64::from(planes.tile[1]))
+    })
+}
+
 impl RepackProgram {
     /// The program of `conversion`'s recipe over `packets` consecutive
-    /// source packets of each of `rows` rows (an input segment each),
-    /// writing output segments of `outputs` bytes, each whole blocks: bit
-    /// `bit` of plane `plane` of the packet form of packet `p` of row `r`
+    /// source packets of each of `rows` rows (each its input segments,
+    /// [`SourceRows`]), writing output segments of `outputs` bytes, each
+    /// whole blocks: bit `bit` of plane `plane` of the packet form of
+    /// packet `p` of row `r`
     /// goes to bit `b` of output segment `s` for
     /// `destination(r, p, plane, bit) = Some((s, b))`, or nowhere for
     /// `None`. Output bits nothing maps to are zero. `None` where the
@@ -1111,6 +1163,7 @@ impl RepackProgram {
             "a repack output's segments are whole blocks"
         );
         let SlotLayout {
+            source_rows,
             values,
             groups,
             field_bytes,
@@ -1127,7 +1180,7 @@ impl RepackProgram {
         let source = conversion.source_layout;
         let packet = conversion.destination_layout.packet();
         let (row_packets, packets) = (packets, rows * packets);
-        let packet_bits = source.packet_size * 8;
+        let source_bit = |p: u32, bit| source_rows.bit(p / row_packets, p % row_packets, bit);
         let (shapes, computed) = (values.shapes(), values.computed());
         // A group's members: packet by packet, its shape's computed values;
         // the input bit of computed value `v` of packet `p` is
@@ -1154,7 +1207,7 @@ impl RepackProgram {
                 for ((prefix, bytes), field) in columns.zip(&computed[v].fields) {
                     let at = (group.fields + prefix * group.count + lane * bytes) * 8;
                     for (offset, bit) in field {
-                        field_inputs[(at + offset) as usize] = Some(p * packet_bits + bit);
+                        field_inputs[(at + offset) as usize] = Some(source_bit(p, *bit));
                     }
                 }
             }
@@ -1167,7 +1220,7 @@ impl RepackProgram {
             for (index, plane) in packet.planes.iter().enumerate() {
                 for bit in 0..plane.bytes_per_group * 8 {
                     let input = values.bit(index, bit).map(|input| match input {
-                        PacketBit::Source(bit) => p * packet_bits + bit,
+                        PacketBit::Source(bit) => source_bit(p, bit),
                         PacketBit::Value { value, bit } => {
                             slots[p as usize * computed.len() + value] + bit
                         }
@@ -1190,17 +1243,21 @@ impl RepackProgram {
                 }
             }
         }
-        // The input segments: each row's source packets, then the value
-        // slots.
+        // The input segments: each row's, then the value slots.
         let input_starts = (0..rows)
-            .map(|row| row * row_packets * source.packet_size)
-            .chain([packets * source.packet_size])
+            .flat_map(|row| {
+                let source_rows = &source_rows;
+                source_rows.segments.iter().map(move |start| row * source_rows.bytes + start)
+            })
+            .chain([values_at / 8])
             .collect::<Vec<_>>();
         let output = ByteMoves::of(&inputs, &input_starts, &output_starts);
         Some(Self {
             packet_bytes: source.packet_size,
             rows,
             packets: row_packets,
+            row_bytes: source_rows.bytes,
+            row_segments: source_rows.segments,
             output_starts,
             output_bytes: outputs.iter().sum(),
             shapes: values.shapes().to_vec(),
@@ -1240,9 +1297,9 @@ impl RepackProgram {
             .iter()
             .try_fold(0u32, |bytes, segment| bytes.checked_add(*segment))?
             .checked_mul(8)?;
-        let source = conversion.source_layout;
+        let source_rows = SourceRows::of(conversion.source_layout, packets)?;
+        let values_at = rows.checked_mul(source_rows.bytes)?.checked_mul(8)?;
         let packets = rows.checked_mul(packets)?;
-        let values_at = packets.checked_mul(source.packet_size)?.checked_mul(8)?;
         let values = PacketValues::of(&conversion.recipe, conversion.destination_layout.packet());
         let computed = values.computed();
         let mut groups = Vec::new();
@@ -1277,6 +1334,7 @@ impl RepackProgram {
         field_bytes.checked_mul(8)?;
         values_at.checked_add(value_bytes.checked_mul(8)?)?;
         Some(SlotLayout {
+            source_rows,
             values,
             groups,
             field_bytes,
@@ -1312,9 +1370,15 @@ impl RepackProgram {
         self.value_bytes as usize
     }
 
-    /// Bytes of one row's source packets.
+    /// Input bytes of one source row ([`SourceRows`]).
     fn row_bytes(&self) -> usize {
-        self.packet_bytes() * self.packets()
+        self.row_bytes as usize
+    }
+
+    /// Input segments of one source row: one, or under a grid its codes
+    /// and its scales ([`SourceRows`]).
+    pub fn row_segments(&self) -> usize {
+        self.row_segments.len()
     }
 
     /// An executor of this program, holding its working memory.
@@ -1331,8 +1395,8 @@ impl RepackProgram {
             slots: vec![0u8; self.value_bytes() + PADDING],
             fields: vec![0; self.field_bytes() + PADDING],
             output: vec![0u8; self.output_bytes()],
-            inputs: vec![std::ptr::null(); self.rows() + 1],
-            staged_sources: Vec::with_capacity(self.rows()),
+            inputs: vec![std::ptr::null(); self.rows() * self.row_segments() + 1],
+            staged_sources: Vec::with_capacity(self.rows() * self.row_segments()),
             staged_outputs: Vec::with_capacity(self.output_starts.len()),
             prepared: self
                 .ops
@@ -1368,7 +1432,8 @@ impl RepackProgram {
 
 /// A program of one source row of consecutive packets into one output
 /// segment: it executes over a stream of source units, one execution after
-/// another ([`execute`](Self::execute)).
+/// another ([`execute`](Self::execute)). Its source is of one plane, whose
+/// packets are a stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StreamProgram(RepackProgram);
 
@@ -1396,6 +1461,10 @@ impl StreamProgram {
         output: u32,
         destination: impl Fn(u32, usize, u32) -> Option<u32>,
     ) -> Option<Self> {
+        assert!(
+            conversion.source_layout.planes.is_none(),
+            "a stream of packets is a source of one plane"
+        );
         RepackProgram::compile(conversion, 1, packets, &[output], |_, p, plane, bit| {
             destination(p, plane, bit).map(|at| (0, at))
         })
@@ -1549,39 +1618,107 @@ fn flip_units(to: &mut [u8], from: &[u8], flip: &[u8]) {
 }
 
 /// A recipe's program writing the packet forms (alignment padding zero) of
-/// consecutive source packets, one after another.
-pub struct PacketForms {
-    program: StreamProgram,
+/// a source tensor's packets, one after another (rows in turn, a row's
+/// packets in turn).
+pub struct PacketForms(Forms);
+
+/// The program of a [`PacketForms`].
+enum Forms {
+    /// A source of one plane's: its packets a stream.
+    Stream(StreamProgram),
+    /// A source's under a grid: each row's packets, in executions of the
+    /// program's packets from its first, where the source holds their codes
+    /// and their scales (a row's last execution, of fewer, staged).
+    Rows(RepackProgram),
 }
 
 impl PacketForms {
     /// The program of `conversion`'s recipe over the packets of one execution:
     /// at least [`EXECUTION_BYTES`] source bytes, and whole blocks of packet
-    /// forms.
+    /// forms, from a scale of its own ([`starts_on_scales`]).
     pub fn compile(conversion: &RepresentationConversion) -> Self {
-        let packet = conversion.destination_layout.packet();
-        let least = EXECUTION_BYTES.div_ceil(conversion.source_layout.packet_size as usize) as u32;
+        let (source, packet) = (conversion.source_layout, conversion.destination_layout.packet());
+        let least = EXECUTION_BYTES.div_ceil(source.packet_size as usize) as u32;
         let form = packet.packet_size;
         let packets = (1..)
             .map(|times| times * least)
-            .find(|packets| ((packets * form) as usize).is_multiple_of(BLOCK))
-            .expect("some multiple of an execution is whole blocks");
-        Self {
-            program: StreamProgram::compile(
-                conversion,
-                packets,
-                packets * form,
-                |p, plane, bit| Some((p * form + packet.planes[plane].offset) * 8 + bit),
-            )
-            .expect("an execution's packets fit a program"),
+            .find(|packets| {
+                ((packets * form) as usize).is_multiple_of(BLOCK) && starts_on_scales(source, *packets as usize)
+            })
+            .expect("some multiple of an execution is whole blocks from a scale");
+        let place = |p: u32, plane: usize, bit| Some((p * form + packet.planes[plane].offset) * 8 + bit);
+        const FITS: &str = "an execution's packets fit a program";
+        Self(match source.planes {
+            None => Forms::Stream(StreamProgram::compile(conversion, packets, packets * form, place).expect(FITS)),
+            Some(_) => Forms::Rows(
+                RepackProgram::compile(conversion, 1, packets, &[packets * form], |_, p, plane, bit| {
+                    place(p, plane, bit).map(|at| (0, at))
+                })
+                .expect(FITS),
+            ),
+        })
+    }
+
+    /// Source packets of an execution.
+    #[cfg(test)]
+    fn packets(&self) -> usize {
+        match &self.0 {
+            Forms::Stream(program) => program.0.packets(),
+            Forms::Rows(program) => program.packets(),
         }
     }
 
-    /// The packet forms of the source packets `source`, across threads when
-    /// there are many.
-    pub fn execute(&self, source: &[u8]) -> Vec<u8> {
-        self.program
-            .execute(source, self.program.0.packet_bytes(), None)
+    /// The packet forms of the packets of `source`, the bytes of a source
+    /// tensor of `matrices`, across threads when there are many.
+    pub fn execute(&self, matrices: &registry::SourceMatrices<'_>, source: &[u8]) -> Vec<u8> {
+        assert_eq!(source.len() as u64, matrices.tensor_bytes(), "a source tensor's bytes");
+        let program = match &self.0 {
+            Forms::Stream(program) => return program.execute(source, program.0.packet_bytes(), None),
+            Forms::Rows(program) => program,
+        };
+        let form = program.output_bytes() / program.packets();
+        let (rows, row_packets) = (matrices.tensor_rows() as usize, matrices.row_packets() as usize);
+        let mut output = vec![0u8; rows * row_packets * form];
+        if output.is_empty() {
+            return output;
+        }
+        let per_thread = rows.div_ceil(threads(source.len()));
+        std::thread::scope(|scope| {
+            for (index, output) in output.chunks_mut(per_thread * row_packets * form).enumerate() {
+                scope.spawn(move || {
+                    let mut executor = program.executor();
+                    let mut sources = Vec::with_capacity(program.row_segments());
+                    for (row, out) in output.chunks_mut(row_packets * form).enumerate() {
+                        let row = (index * per_thread + row) as u64;
+                        for (first, out) in out.chunks_mut(program.packets() * form).enumerate() {
+                            let first = (first * program.packets()) as u64;
+                            let spans = matrices.packet_spans(row, first..first + (out.len() / form) as u64);
+                            // In place when the execution's packets are all
+                            // the program's and each span and a block past
+                            // it lie in the source.
+                            sources.clear();
+                            if out.len() == program.output_bytes()
+                                && spans.clone().all(|span| span.end as usize + BLOCK <= source.len())
+                            {
+                                sources.extend(spans.map(|span| source[span.start as usize..].as_ptr()));
+                                // SAFETY: each segment and a block past it lie
+                                // in `source`, and the output is `out`.
+                                unsafe { executor.run_into(&sources, &[out.as_mut_ptr()]) };
+                                continue;
+                            }
+                            // Past the packets, the staging holds what an
+                            // earlier execution left: packets convert apart,
+                            // and the output past them is not kept.
+                            for (segment, span) in spans.enumerate() {
+                                executor.stage(0, segment, &source[span.start as usize..span.end as usize]);
+                            }
+                            out.copy_from_slice(&executor.run()[..out.len()]);
+                        }
+                    }
+                });
+            }
+        });
+        output
     }
 }
 
@@ -1599,8 +1736,9 @@ pub struct ScaledCodeRows {
 
 impl ScaledCodeRows {
     /// Rows of `columns` values through `conversion`; `None` when the
-    /// destination's values are not scaled codes, or the rows not whole
-    /// source packets.
+    /// destination's values are not scaled codes, the rows not whole source
+    /// packets, or the source under a grid (whose rows' scales lie apart
+    /// from them: rows of a stream are a source of one plane's).
     pub fn admit(
         conversion: &'static RepresentationConversion,
         columns: NonZeroU32,
@@ -1608,9 +1746,9 @@ impl ScaledCodeRows {
         let destination = registry::representation_info(conversion.destination);
         let recipe = registry::decode_recipe(conversion.destination, destination.decoded)?;
         let reads = recipe.scaled_codes()?;
-        columns
-            .get()
-            .is_multiple_of(conversion.source_layout.logical_group)
+        // Rows of a stream: a source of one plane's.
+        (conversion.source_layout.planes.is_none()
+            && columns.get().is_multiple_of(conversion.source_layout.logical_group))
             .then_some(Self {
                 conversion,
                 recipe,
@@ -1771,8 +1909,9 @@ impl ScaledCodesPlacement {
 /// Executes one [`RepackProgram`].
 pub struct RepackExecutor<'a> {
     program: &'a RepackProgram,
-    /// The source rows of a staged execution, one after another, then a
-    /// block; the value slots, then [`PADDING`] bytes.
+    /// The source rows of a staged execution (each its segments, one after
+    /// another), one after another, then a block; the value slots, then
+    /// [`PADDING`] bytes.
     staging: Vec<u8>,
     slots: Vec<u8>,
     /// The field slots, to whole blocks, then [`PADDING`] bytes; a staged
@@ -1780,9 +1919,9 @@ pub struct RepackExecutor<'a> {
     fields: Vec<u8>,
     output: Vec<u8>,
     /// The bases of the input segments of the execution running (its
-    /// source rows', then the value slots'), and of a staged execution's
-    /// source rows and output segments: each set afresh for its execution
-    /// (the buffers are only their storage).
+    /// source rows' segments, then the value slots'), and of a staged
+    /// execution's source segments and output segments: each set afresh for
+    /// its execution (the buffers are only their storage).
     inputs: Vec<*const u8>,
     staged_sources: Vec<*const u8>,
     staged_outputs: Vec<*mut u8>,
@@ -1810,10 +1949,23 @@ enum Prepared {
 
 impl RepackExecutor<'_> {
     /// The source rows the next [`run`](Self::run) reads, one after another,
-    /// as the last one left them: the caller writes them.
+    /// each its segments one after another, as the last one left them: the
+    /// caller writes them.
     pub fn source(&mut self) -> &mut [u8] {
         let bytes = self.program.rows() * self.program.row_bytes();
         &mut self.staging[..bytes]
+    }
+
+    /// Writes `bytes` from the first byte of segment `segment` of source row
+    /// `row` the next [`run`](Self::run) reads; panics past the segment.
+    pub fn stage(&mut self, row: usize, segment: usize, bytes: &[u8]) {
+        let program = self.program;
+        let segments = &program.row_segments;
+        let start = segments[segment] as usize;
+        let end = segments.get(segment + 1).map_or(program.row_bytes(), |end| *end as usize);
+        assert!(bytes.len() <= end - start, "staged bytes lie in their segment");
+        let start = row * program.row_bytes() + start;
+        self.staging[start..start + bytes.len()].copy_from_slice(bytes);
     }
 
     /// The program's output of the staged source rows, its segments one
@@ -1823,9 +1975,14 @@ impl RepackExecutor<'_> {
         // The bases derive from the buffer's own pointer (`Vec::as_ptr`,
         // which makes no reference to its elements), for this run alone: no
         // reference to `staging` is made while the run reads through them.
-        let (staging, row_bytes) = (self.staging.as_ptr(), self.program.row_bytes());
+        let (staging, program) = (self.staging.as_ptr(), self.program);
         sources.clear();
-        sources.extend((0..self.program.rows()).map(|row| staging.wrapping_add(row * row_bytes)));
+        sources.extend((0..program.rows()).flat_map(|row| {
+            program
+                .row_segments
+                .iter()
+                .map(move |start| staging.wrapping_add(row * program.row_bytes() + *start as usize))
+        }));
         // SAFETY: `staging` holds the rows and a block past each, and is
         // otherwise unreferenced during the run (above).
         unsafe { self.run_from(&sources) };
@@ -1833,8 +1990,8 @@ impl RepackExecutor<'_> {
         &self.output
     }
 
-    /// The program's output of the source rows at `sources`, its segments
-    /// one after another.
+    /// The program's output of the source segments at `sources` (each row's
+    /// in turn), its segments one after another.
     ///
     /// # Safety
     /// As [`run_into`](Self::run_into)'s for the sources.
@@ -1858,14 +2015,19 @@ impl RepackExecutor<'_> {
         &self.output
     }
 
-    /// Runs the program over the source rows at `sources` into the output
-    /// segments at `outputs`, writing every byte of each segment.
+    /// Runs the program over the source segments at `sources` (each row's
+    /// in turn, [`SourceRows`]) into the output segments at `outputs`,
+    /// writing every byte of each segment.
     ///
     /// # Safety
-    /// Each source row's bytes and a [`BLOCK`] past them are readable, and
-    /// each output segment's bytes writable and no other reference's.
+    /// Each source segment's bytes and a [`BLOCK`] past them are readable,
+    /// and each output segment's bytes writable and no other reference's.
     pub unsafe fn run_into(&mut self, sources: &[*const u8], outputs: &[*mut u8]) {
-        assert_eq!(sources.len(), self.program.rows(), "a source base per row");
+        assert_eq!(
+            sources.len(),
+            self.program.rows() * self.program.row_segments(),
+            "a source base per row's segment"
+        );
         assert_eq!(
             outputs.len(),
             self.program.output_starts.len(),
@@ -2165,27 +2327,28 @@ mod tests {
 
     /// Every registered conversion's program writes the interpreter's bytes
     /// for random source packets in the conversion's domain, in every
-    /// layout, on rows whose last packet is partial and over more packets
-    /// than an execution's.
+    /// layout, on rows whose last packet is partial, over more packets than
+    /// an execution's, and of stacked matrices (under a grid, each its
+    /// codes then its grid).
     #[test]
     fn programs_repack_random_packets_as_the_interpreter() {
         for conversion in registry::representation_conversions() {
             let layout = conversion.source_layout;
             let group = u64::from(layout.logical_group);
-            let execution =
-                super::PacketForms::compile(conversion).program.0.packets() as u64 * group;
+            let execution = super::PacketForms::compile(conversion).packets() as u64 * group;
             for extents in [
-                [3, group],
-                [5, 2 * group + group.div_ceil(3)],
-                [3, 2 * execution + group.div_ceil(3)],
+                &[3, group][..],
+                &[5, 2 * group + group.div_ceil(3)][..],
+                &[3, 2 * execution + group.div_ceil(3)][..],
+                // Matrices of several of a grid's tile rows, a partial last.
+                &[2, 128 + 5, 2 * group][..],
             ] {
-                let packets = extents[0] * extents[1].div_ceil(group);
                 let mut source = registry::pseudo_random_bytes(
-                    conversion.id.position() as u64 ^ extents[1],
-                    (packets * u64::from(layout.packet_size)) as usize,
+                    conversion.id.position() as u64 ^ extents[extents.len() - 1],
+                    layout.matrices(extents).unwrap().tensor_bytes() as usize,
                 );
-                conversion.admit_source(&mut source);
-                assert_matches_the_interpreter(conversion, &extents, &source, "random");
+                conversion.admit_source(extents, &mut source);
+                assert_matches_the_interpreter(conversion, extents, &source, "random");
             }
         }
     }
@@ -2231,9 +2394,14 @@ mod tests {
             let Some(reads) = recipe.scaled_codes() else {
                 continue;
             };
+            let layout = conversion.source_layout;
+            if layout.planes.is_some() {
+                // Rows under a grid are no stream's.
+                assert!(super::ScaledCodeRows::admit(conversion, NonZeroU32::new(1024).unwrap()).is_none());
+                continue;
+            }
             let scale_plane = &recipe.planes()[reads.scale.plane as usize];
             let (scale_bits, scale_group) = (scale_plane.entry_bits, scale_plane.group);
-            let layout = conversion.source_layout;
             for columns in [1024, 6144] {
                 let groups = columns / scale_group;
                 let row_bytes = columns + groups * scale_bits / 8;
@@ -2247,12 +2415,11 @@ mod tests {
                         );
                 let rows = 5u64;
                 let extents = [rows, u64::from(columns)];
-                let packets = rows * u64::from(columns / layout.logical_group);
                 let mut source = registry::pseudo_random_bytes(
                     conversion.id.position() as u64,
-                    (packets * u64::from(layout.packet_size)) as usize,
+                    layout.matrices(&extents).unwrap().tensor_bytes() as usize,
                 );
-                conversion.admit_source(&mut source);
+                conversion.admit_source(&extents, &mut source);
                 let actual = placement.execute(&source);
                 let mapped =
                     placement.execute_mapped(&source, row_bytes as usize, |placed, mapped| {
@@ -2335,9 +2502,9 @@ mod tests {
 
     /// Every registered conversion's program writes the interpreter's bytes
     /// for the reference blocks of its GGUF type
-    /// (`engine/kernels/tests/support/gguf_vectors`), and for arbitrary
-    /// assembled blocks of a GGUF type under a companion scale grid, which
-    /// no ggml type's vectors hold.
+    /// (`engine/kernels/tests/support/gguf_vectors`), and for an arbitrary
+    /// matrix of a GGUF type under a companion scale grid (its codes, then
+    /// its grid), which no ggml type's vectors hold.
     #[test]
     fn programs_repack_reference_blocks_as_the_interpreter() {
         use registry::GgufScales;
@@ -2358,12 +2525,12 @@ mod tests {
                     GgufScales::ALL.into_iter().any(|scales| source(scales).is_some()),
                     "a conversion's source is a GGUF type's"
                 );
-                let packets = 64;
-                let blocks = registry::pseudo_random_bytes(
+                let extents = [64, group];
+                let planes = registry::pseudo_random_bytes(
                     conversion.id.position() as u64,
-                    (packets * u64::from(layout.packet_size)) as usize,
+                    layout.matrices(&extents).unwrap().tensor_bytes() as usize,
                 );
-                assert_matches_the_interpreter(conversion, &[packets, group], &blocks, "assembled");
+                assert_matches_the_interpreter(conversion, &extents, &planes, "planar");
                 continue;
             };
             let path = vectors.join(format!("{}.bin", encoding.ggml_name()));

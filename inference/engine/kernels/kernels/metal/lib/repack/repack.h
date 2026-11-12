@@ -71,14 +71,51 @@ template <class B> constexpr uint exchange_words() {
                : 1u;
 }
 
+// A planar source (`B::planar()`, `ExternalPacketLayout::planes`) holds each
+// matrix's rows' packets' codes, then the grid of its tiles' scales,
+// byte-packed: a matrix's bytes, and where its codes and scales lie.
+namespace planar {
+template <class B> inline ulong row_packets(constant ulong *seismic_words) {
+    return (B::k(seismic_words) + B::group() - 1) / B::group();
+}
+template <class B> inline ulong codes_bytes(constant ulong *seismic_words) {
+    return B::n(seismic_words) * row_packets<B>(seismic_words) * B::code_bytes();
+}
+template <class B> inline ulong grid_columns(constant ulong *seismic_words) {
+    return (B::k(seismic_words) + B::grid_tile_columns() - 1) / B::grid_tile_columns();
+}
+template <class B> inline ulong matrix_bytes(constant ulong *seismic_words) {
+    return codes_bytes<B>(seismic_words) +
+           (B::n(seismic_words) + B::grid_tile_rows() - 1) / B::grid_tile_rows() * grid_columns<B>(seismic_words) *
+               B::grid_scale_bytes();
+}
+} // namespace planar
+
 // Addressing of the bound source tensor: packet `packet` of row `n` of
-// matrix `b`.
+// matrix `b` (a planar source's codes), and the scale of the tile holding it
+// (a source with none: the source, unread).
 template <class B> struct Strided {
     template <typename In>
     static REPACK_INLINE In packet(In source, constant ulong *seismic_words, ulong b, ulong n, ulong packet) {
-        return source + (b * B::source_stride_0(seismic_words) + n * B::source_stride_1(seismic_words) +
-                         packet * B::source_stride_2(seismic_words)) *
-                            B::source_packet_size();
+        if constexpr (B::planar()) {
+            return source + b * planar::matrix_bytes<B>(seismic_words) +
+                   (n * planar::row_packets<B>(seismic_words) + packet) * B::code_bytes();
+        } else {
+            return source + (b * B::source_stride_0(seismic_words) + n * B::source_stride_1(seismic_words) +
+                             packet * B::source_stride_2(seismic_words)) *
+                                B::source_packet_size();
+        }
+    }
+    template <typename In>
+    static REPACK_INLINE In scale(In source, constant ulong *seismic_words, ulong b, ulong n, ulong packet) {
+        if constexpr (B::planar()) {
+            return source + b * planar::matrix_bytes<B>(seismic_words) + planar::codes_bytes<B>(seismic_words) +
+                   ((n / B::grid_tile_rows()) * planar::grid_columns<B>(seismic_words) +
+                    packet * B::group() / B::grid_tile_columns()) *
+                       B::grid_scale_bytes();
+        } else {
+            return source;
+        }
     }
 };
 
@@ -132,17 +169,18 @@ REPACK_INLINE void packet_tile(In source, device uchar *destination, constant ul
     const uint packet = column0 / group;
     const uint within = column0 % group;
     auto in = A::packet(source, seismic_words, b, n, packet);
+    auto scale = A::scale(source, seismic_words, b, n, packet);
     device uchar *out = destination_packet<B>(destination, seismic_words, b, n, packet);
     const uint unit = within / TILE_COLUMNS;
     uint words[B::words()];
-    B::unit(in, unit, words);
+    B::unit(in, scale, unit, words);
     store(out + 4 * (codes_word + unit * codes_words), words, 4 * codes_words, B::codes_alignment());
     if (within != 0) return;
     // Every other record word: the other planes, and the gaps (zero), to
     // the packet's end.
     constexpr uint codes_end = codes_word + group / TILE_COLUMNS * codes_words;
     constexpr uint end = 4 * B::words() < B::packet_size() ? 4 * B::words() : B::packet_size();
-    B::fixed(in, words);
+    B::fixed(in, scale, words);
     store(out, words, 4 * codes_word, B::leading_alignment());
     store(out + 4 * codes_end, words + codes_end, end - 4 * codes_end, B::trailing_alignment());
 }
@@ -301,6 +339,7 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     const ulong n = row0 + lane;
     const bool real = n < dim_n && occupied;
     auto in = A::packet(source, seismic_words, b, real ? n : 0ul, real ? group_index : 0u);
+    auto scale = A::scale(source, seismic_words, b, real ? n : 0ul, real ? group_index : 0u);
 
     // Code planes: the tile's unit of each, every word computed before any
     // is stored (a store could alias the source, and the planes' words read
@@ -309,7 +348,7 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     uint words[B::words()];
     if constexpr (B::layout() == Layout::mma16) {
         if (lane < TILE_ROWS) {
-            B::unit(in, unit, words);
+            B::unit(in, scale, unit, words);
             if (!real)
                 for (uint word = 0; word < unit_words; ++word) words[word] = 0;
         }
@@ -336,7 +375,7 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     } else {
         // A unit of each code plane of one row.
         if (lane < rows) {
-            B::unit(in, unit, words);
+            B::unit(in, scale, unit, words);
             if (!real)
                 for (uint word = 0; word < unit_words; ++word) words[word] = 0;
             const ulong stored_unit = column0 / B::chunk_columns();
@@ -354,7 +393,7 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     // role's share stored.
     if (within == 0) {
         if (real) {
-            B::fixed(in, words);
+            B::fixed(in, scale, words);
         } else {
             for (uint word = 0; word < B::words(); ++word) words[word] = 0;
         }
@@ -417,6 +456,10 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
 // only the branch their probe selects). A binding of two dense float tensors
 // has no conversion (`dense()`: the includer converts each element).
 
+#define REPACK_PLANAR_1(planar, plain) planar
+#define REPACK_PLANAR_0(planar, plain) plain
+#define REPACK_PLANAR_(flag) REPACK_PLANAR_##flag
+#define REPACK_PLANAR(flag) REPACK_PLANAR_(flag)
 #define REPACK_PICK_1(yes, no) yes
 #define REPACK_PICK_0(yes, no) no
 #define REPACK_PICK_(flag) REPACK_PICK_##flag
@@ -450,6 +493,19 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
         static constexpr int destination_kind() { return ELEMENT_KIND(D); }                                 \
         static constexpr uint group() { return uint(ELEMENT_CAT(S, _LOGICAL_GROUP)); }                      \
         static constexpr uint source_packet_size() { return uint(ELEMENT_CAT(S, _PACKET_SIZE)); }           \
+        /* A source under a companion grid (`planar`): its scales' bytes and the tile of values each */    \
+        /* scales, 0 without; its packets' codes are the rest. */                                          \
+        static constexpr uint grid_scale_bytes() {                                                          \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_SCALE_BYTES)), 0u);             \
+        }                                                                                                   \
+        static constexpr uint grid_tile_rows() {                                                            \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_ROWS)), 0u);               \
+        }                                                                                                   \
+        static constexpr uint grid_tile_columns() {                                                         \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, uint(ELEMENT_CAT(S, _GRID_TILE_COLUMNS)), 0u);            \
+        }                                                                                                   \
+        static constexpr bool planar() { return grid_scale_bytes() != 0u; }                                 \
+        static constexpr uint code_bytes() { return source_packet_size() - grid_scale_bytes(); }            \
         static constexpr repack::Layout layout() {                                                          \
             return ELEMENT_HAS(D, _LAYOUT_PACKET)   ? repack::Layout::packet                                \
                  : ELEMENT_HAS(D, _LAYOUT_ROWS16)   ? repack::Layout::rows16                                \
@@ -488,8 +544,16 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
         static ulong n(constant ulong *seismic_words) { return ulong(DIM_N); }                              \
         static ulong k(constant ulong *seismic_words) { return ulong(DIM_K); }                              \
         static ulong source_stride_0(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(S, _STRIDE_0)); } \
-        static ulong source_stride_1(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(S, _STRIDE_1)); } \
-        static ulong source_stride_2(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(S, _STRIDE_2)); } \
+        /* A planar source strides by matrices (its tensor's last two axes are one unit): its rows and */ \
+        /* packets are those of its codes plane, a row's `row_packets` packets of `code_bytes`. */        \
+        static ulong source_stride_1(constant ulong *seismic_words) {                                       \
+            if (planar()) return repack::planar::row_packets<Name>(seismic_words);                          \
+            return ulong(ELEMENT_CAT(S, _STRIDE_1));                                                        \
+        }                                                                                                   \
+        static ulong source_stride_2(constant ulong *seismic_words) {                                       \
+            if (planar()) return 1ul;                                                                       \
+            return ulong(ELEMENT_CAT(S, _STRIDE_2));                                                        \
+        }                                                                                                   \
         static ulong out_stride_0(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(D, _STRIDE_0)); }    \
         static ulong out_stride_1(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(D, _STRIDE_1)); }    \
         static ulong out_stride_2(constant ulong *seismic_words) { return ulong(ELEMENT_CAT(D, _STRIDE_2)); }    \
@@ -569,12 +633,15 @@ REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ul
                 return REPACK_WHEN(D, _LAYOUT_PACKET, 0u, uint(C##_SUPERS_ALIGNMENT));                      \
             }                                                                                               \
             /* The record's code words of unit `index` of the source packet at `in`; its other words. */   \
+            /* A planar source reads the packet's codes at `in` and the tile's scale at `scale`. */       \
             template <typename In>                                                                          \
-            static REPACK_INLINE void unit(In in, uint index, thread uint *words) {                         \
-                C##_UNIT(in, index, words);                                                                 \
+            static REPACK_INLINE void unit(In in, In scale, uint index, thread uint *words) {               \
+                REPACK_PLANAR(ELEMENT_CAT(S, _GRID_PLANAR))(C##_UNIT(in, scale, index, words),              \
+                                                            C##_UNIT(in, index, words));                    \
             }                                                                                               \
-            template <typename In> static REPACK_INLINE void fixed(In in, thread uint *words) {             \
-                C##_FIXED(in, words);                                                                       \
+            template <typename In> static REPACK_INLINE void fixed(In in, In scale, thread uint *words) {   \
+                REPACK_PLANAR(ELEMENT_CAT(S, _GRID_PLANAR))(C##_FIXED(in, scale, words),                    \
+                                                            C##_FIXED(in, words));                          \
             }                                                                                               \
         )                                                                                                   \
     };

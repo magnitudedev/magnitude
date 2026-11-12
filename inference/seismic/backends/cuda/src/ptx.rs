@@ -1760,6 +1760,7 @@ impl<'a> Emitter<'a> {
         packet: ErasedValue,
     ) {
         let source_layout = &source.geometry.layout;
+        assert!(source_layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
         let destination_layout = &destination.geometry.layout;
         let source_base = self.buffer(source.buffer_ordinal as usize);
         let source_packet = self.t64();

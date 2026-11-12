@@ -1,7 +1,7 @@
 use super::{ExpertBank, PoolConveyor, allocate_placed, homes, host_views, landed_tensors, placed_words, slot_maps, write_blocks};
 use crate::experts::conveyor::{Carrier, LentPool, Lending};
 use crate::experts::source::{ExpertSource, Records};
-use crate::experts::watcher::{Copier, CopyTensor, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredTensor, Watcher, WatcherParts};
+use crate::experts::watcher::{Copier, CopyTensor, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredPart, StoredTensor, Watcher, WatcherParts};
 use crate::experts::directory::{HostTier as TierStart, Placement};
 use crate::experts::landing::{LandingList, TierTensor};
 use crate::experts::map::{LandingMap, StampedMap};
@@ -306,20 +306,21 @@ fn watch(
             .zip(stacks[index].iter())
             .zip(pool_of[index].iter())
             .map(|(((_, tensor), (_, stack)), (_, &pool))| {
-                let file = match files.iter().position(|path| *path == stack.path) {
-                    Some(file) => file,
-                    None => {
-                        files.push(stack.path.clone());
-                        files.len() - 1
-                    }
-                };
-                Ok::<_, String>(StoredTensor {
-                    file,
-                    base: stack.offset + stack.first,
-                    pitch: stack.pitch,
-                    bytes: tensor.stored_bytes()?,
-                    pool,
-                })
+                let parts = stack
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        let file = match files.iter().position(|path| *path == part.path) {
+                            Some(file) => file,
+                            None => {
+                                files.push(part.path.clone());
+                                files.len() - 1
+                            }
+                        };
+                        StoredPart { file, base: part.offset + part.first, pitch: part.pitch, bytes: part.bytes }
+                    })
+                    .collect();
+                Ok::<_, String>(StoredTensor { parts, pool })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let experts = plan.layers()[index].experts;
@@ -337,7 +338,7 @@ fn watch(
             })
             .transpose()?
             // A layer whose stored expert outgrows its slot lends none.
-            .filter(|slots: &Vec<Records>| stored.iter().zip(slots).all(|(stored, records)| stored.bytes <= records.bytes()));
+            .filter(|slots: &Vec<Records>| stored.iter().zip(slots).all(|(stored, records)| stored.bytes() <= records.bytes()));
         let scratch_form = scratch_forms[index].iter().map(|(_, &form)| form).collect();
         // Every entry unmapped, its one writer the bank's records beside a
         // host tier (`experts::records`), where the host places the one

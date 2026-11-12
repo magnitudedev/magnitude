@@ -23,7 +23,7 @@
 
 use magnitude_ggml::Encoding;
 use magnitude_kernels::{embedding_rows, project_rows};
-use seismic::{BackendName, Device, Element, GgufScales, GridScale, Layout, NativeSpecialization, Tensor};
+use seismic::{BackendName, Device, Element, GgufScales, Grid, GridScale, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 
 mod e4m3;
@@ -65,22 +65,22 @@ enum Scale {
 }
 
 impl Scale {
-    fn grid(self) -> GridScale {
+    /// The registered grid of its kind a table is stored under: E8M0 scales
+    /// per row of 32 (`gguf_f8_e4m3_e8m0_1x32`), F32 ones per 128×128 tile
+    /// (`gguf_f8_e4m3_f32_128x128`).
+    fn grid(self) -> Grid {
         match self {
-            Self::E8m0(_) => GridScale::E8m0,
-            Self::F32(_) => GridScale::F32,
+            Self::E8m0(_) => Grid { scale: GridScale::E8m0, tile: [1, 32] },
+            Self::F32(_) => Grid { scale: GridScale::F32, tile: [128, 128] },
         }
     }
 
-    /// The codes it scales in an assembled block.
-    fn group(self) -> usize {
-        match self {
-            Self::E8m0(_) => 32,
-            Self::F32(_) => 128,
-        }
+    /// The rows of a tile of its grid, which share their scales.
+    fn tile_rows(self) -> usize {
+        self.grid().tile[0] as usize
     }
 
-    /// Its bytes at the head of an assembled block.
+    /// Its bytes in the grid.
     fn bytes(self) -> Vec<u8> {
         match self {
             Self::E8m0(exponent) => vec![exponent],
@@ -97,25 +97,30 @@ impl Scale {
     }
 }
 
-/// A table of one row per `(scale, codes)`, every scale of one kind: each
-/// of its assembled blocks (`gguf_f8_e4m3_e8m0`, `gguf_f8_e4m3_f32`: the
-/// scale, then its group of codes) under the row's scale.
+/// A table of one tile of rows of its scales' grid ([`Scale::grid`]) per
+/// `(scale, codes)`, every scale of one kind: each of the tile's rows the
+/// codes, its every scale the scale. Its source is planar, as a file
+/// stores it: every row's codes, then the grid.
 struct Table {
+    /// Every row of the table, with its scale.
     rows: Vec<(Scale, [u8; K])>,
-    blocks: Vec<u8>,
+    source: Vec<u8>,
 }
 
 impl Table {
-    fn new(rows: Vec<(Scale, [u8; K])>) -> Self {
-        let mut blocks = Vec::new();
-        for (scale, codes) in &rows {
-            assert_eq!(scale.grid(), rows[0].0.grid(), "a table's scales are of one kind");
-            for block in codes.chunks_exact(scale.group()) {
-                blocks.extend(scale.bytes());
-                blocks.extend_from_slice(block);
+    fn new(tiles: Vec<(Scale, [u8; K])>) -> Self {
+        let grid = tiles[0].0.grid();
+        let mut rows = Vec::new();
+        let mut scales = Vec::new();
+        for (scale, codes) in tiles {
+            assert_eq!(scale.grid(), grid, "a table's scales are of one kind");
+            rows.extend(std::iter::repeat((scale, codes)).take(scale.tile_rows()));
+            for _ in 0..K / grid.tile[1] as usize {
+                scales.extend(scale.bytes());
             }
         }
-        Self { rows, blocks }
+        let source = rows.iter().flat_map(|(_, codes)| *codes).chain(scales).collect();
+        Self { rows, source }
     }
 
     fn shape(&self) -> [u64; 2] {
@@ -156,7 +161,7 @@ impl Table {
         let grid = self.rows[0].0.grid();
         let source = Element::gguf_packet_source(Encoding::F8E4M3, GgufScales::Grid(grid)).unwrap();
         let element = source.converted(layout, seismic::OperandRecipe::Rounded).unwrap();
-        let bytes = element.repack_host(source, &self.shape(), &self.blocks).unwrap();
+        let bytes = element.repack_host(source, &self.shape(), &self.source).unwrap();
         let host = element
             .decode_host(&self.shape(), &bytes)
             .unwrap()
@@ -376,7 +381,7 @@ fn e4m3_gemv_products_match_the_reference_under_f32_scales() {
 }
 
 /// The GEMV of a table of every finite code under each of `scales`, then a
-/// row of one NaN code of each sign under `one` (a scale of 1).
+/// tile of rows of one NaN code of each sign under `one` (a scale of 1).
 fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>, one: Scale) {
     let finite = (0..=u8::MAX)
         .filter(|code| code & 0x7f != 0x7f)
@@ -396,6 +401,7 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
     negative[200] = 0xff;
     rows.extend([(one, positive), (one, negative)]);
     let table = Table::new(rows);
+    let nan_rows = nan_rows * one.tile_rows();
     let n = table.rows.len();
     let values = table.values();
     let kept = table.kept(device);

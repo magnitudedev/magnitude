@@ -465,6 +465,11 @@ pub fn tensor_bytes(
             let bytes = arena.nat(u64::from(layout.packet_size));
             arena.nat_mul(count, bytes)
         }
+        RepresentationKind::External(layout) if layout.planes.is_some() => {
+            let (bytes, units) = planar_units(arena, layout, extents);
+            let count = arena.nat_product(&units);
+            arena.nat_mul(count, bytes)
+        }
         RepresentationKind::External(layout) => {
             let packets = packed_extents(arena, extents, layout.logical_group);
             let count = arena.nat_product(&packets);
@@ -473,6 +478,35 @@ pub fn tensor_bytes(
         }
         RepresentationKind::PackedRows(_) => panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY),
     }
+}
+
+/// A source under a companion grid, as storage counts it
+/// (`concrete_storage_units`): a matrix's bytes (its rows' packets' codes,
+/// then its grid of scales) and the units, the leading axes and then the
+/// matrix itself as one.
+fn planar_units(
+    arena: &mut ExprArena,
+    layout: &registry::ExternalPacketLayout,
+    extents: &[NatExpr],
+) -> (NatExpr, Vec<NatExpr>) {
+    let planes = layout.planes.expect("a planar source has its grid");
+    let [leading @ .., rows, columns] = extents else {
+        panic!("a planar source is a matrix or a stack of them");
+    };
+    let (group, code_bytes) = (arena.nat(u64::from(layout.logical_group)), arena.nat(u64::from(layout.code_bytes())));
+    let packets = arena.nat_ceil_div(*columns, group);
+    let rows_of_packets = arena.nat_mul(*rows, packets);
+    let codes = arena.nat_mul(rows_of_packets, code_bytes);
+    let (tile_rows, tile_columns) = (arena.nat(u64::from(planes.tile[0])), arena.nat(u64::from(planes.tile[1])));
+    let (grid_rows, grid_columns) = (arena.nat_ceil_div(*rows, tile_rows), arena.nat_ceil_div(*columns, tile_columns));
+    let scales = arena.nat_mul(grid_rows, grid_columns);
+    let scale_bytes = arena.nat(u64::from(planes.scale_bytes));
+    let grid = arena.nat_mul(scales, scale_bytes);
+    let bytes = arena.nat_add(codes, grid);
+    let one = arena.nat(1);
+    let mut units = leading.to_vec();
+    units.extend([one, one]);
+    (bytes, units)
 }
 
 /// Extents in packets: the packing axis (last) is divided into groups.
@@ -1289,7 +1323,7 @@ pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatE
     let (unit_bytes, logical_extents) =
         match &registry::representation_info(layout.representation).kind {
             registry::RepresentationKind::Dense(dtype) => {
-                (dtype.bytes() as u64, layout.extents.clone())
+                (arena.nat(dtype.bytes() as u64), layout.extents.clone())
             }
             registry::RepresentationKind::Packed(packet) => {
                 let mut extents = layout.extents.clone();
@@ -1297,7 +1331,10 @@ pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatE
                     let group = arena.nat(u64::from(packet.group));
                     *last = arena.nat_ceil_div(*last, group);
                 }
-                (u64::from(packet.packet_size), extents)
+                (arena.nat(u64::from(packet.packet_size)), extents)
+            }
+            registry::RepresentationKind::External(packet) if packet.planes.is_some() => {
+                planar_units(arena, packet, &layout.extents)
             }
             registry::RepresentationKind::External(packet) => {
                 let mut extents = layout.extents.clone();
@@ -1305,7 +1342,7 @@ pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatE
                     let group = arena.nat(u64::from(packet.logical_group));
                     *last = arena.nat_ceil_div(*last, group);
                 }
-                (u64::from(packet.packet_size), extents)
+                (arena.nat(u64::from(packet.packet_size)), extents)
             }
             registry::RepresentationKind::PackedRows(_) => {
                 panic!("{}", registry::ROW_LAYOUT_IS_NATIVE_ONLY)
@@ -1324,7 +1361,7 @@ pub fn addressed_bytes(arena: &mut ExprArena, layout: &BufferViewLayout) -> NatE
         let axis = addressed_axis_span(arena, extent, stride);
         span = arena.nat_add(span, axis);
     }
-    let element_bytes = arena.nat(unit_bytes);
+    let element_bytes = unit_bytes;
     let span_with_element = arena.nat_add(span, one);
     let payload_end = arena.nat_mul(span_with_element, element_bytes);
     let end = arena.nat_add(layout.offset, payload_end);

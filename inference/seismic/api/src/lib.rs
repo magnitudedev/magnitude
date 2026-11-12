@@ -218,7 +218,7 @@ pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
 pub use seismic_lang::registry::{
-    f16_bits, f16_to_f32, record_table_bytes, BackendName, GgufScales, GridScale, Layout, OperandRecipe,
+    f16_bits, f16_to_f32, record_table_bytes, BackendName, GgufScales, Grid, GridScale, Layout, OperandRecipe,
 };
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
@@ -835,26 +835,29 @@ impl Element {
             .collect::<Option<Vec<_>>>()?;
         seismic_lang::interp::repack(conversion.id, &shape, bytes)
     }
-    /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
-    /// the domain of the registered conversion from `source` into this
-    /// storage (`RepresentationConversion::admit_source`): what a check of a
-    /// repack against [`Element::repack_host`] may convert. `None` when no
-    /// conversion is registered or `bytes` is not whole source packets.
-    pub fn repack_source(self, source: Element, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    /// `bytes`, arbitrary bytes of a tensor of `extents` of `source`,
+    /// brought into the domain of the registered conversion from `source`
+    /// into this storage (`RepresentationConversion::admit_source`): what a
+    /// check of a repack against [`Element::repack_host`] may convert.
+    /// `None` when no conversion is registered or `bytes` is not the
+    /// source's canonical bytes of `extents`.
+    pub fn repack_source(self, source: Element, extents: &[u64], bytes: Vec<u8>) -> Option<Vec<u8>> {
         self.sourced(
             source,
+            extents,
             bytes,
             seismic_lang::registry::RepresentationConversion::admit_source,
         )
     }
-    /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
-    /// the domain of the registered conversion from `source` into this
-    /// storage with every number this storage reads from them finite
-    /// (`RepresentationConversion::finite_source`): a record whose
+    /// `bytes`, arbitrary bytes of a tensor of `extents` of `source`,
+    /// brought into the domain of the registered conversion from `source`
+    /// into this storage with every number this storage reads from them
+    /// finite (`RepresentationConversion::finite_source`): a record whose
     /// arithmetic compares. `None` as [`Element::repack_source`].
-    pub fn finite_source(self, source: Element, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    pub fn finite_source(self, source: Element, extents: &[u64], bytes: Vec<u8>) -> Option<Vec<u8>> {
         self.sourced(
             source,
+            extents,
             bytes,
             seismic_lang::registry::RepresentationConversion::finite_source,
         )
@@ -862,17 +865,15 @@ impl Element {
     fn sourced(
         self,
         source: Element,
+        extents: &[u64],
         mut bytes: Vec<u8>,
-        admit: fn(&seismic_lang::registry::RepresentationConversion, &mut [u8]),
+        admit: fn(&seismic_lang::registry::RepresentationConversion, &[u64], &mut [u8]),
     ) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        if !bytes
-            .len()
-            .is_multiple_of(conversion.source_layout.packet_size as usize)
-        {
+        if seismic_lang::registry::canonical_bytes(source.0, extents)? != bytes.len() as u64 {
             return None;
         }
-        admit(conversion, &mut bytes);
+        admit(conversion, extents, &mut bytes);
         Some(bytes)
     }
     /// Host reference decode of canonical packed or dense bytes of a tensor
@@ -900,8 +901,8 @@ impl Element {
     /// conversion of `source` into this storage, whose values are integer
     /// codes times one stored scale (`ScaledCodeRows::admit`), placed by
     /// [`ScaledCodeRows::placement`]. `None` when no conversion is
-    /// registered, this storage's values are not such codes, or the rows
-    /// are not whole packets of `source`.
+    /// registered, this storage's values are not such codes, the rows are
+    /// not whole packets of `source`, or `source` lies under a grid.
     pub fn scaled_code_rows(
         self,
         source: Element,
@@ -928,6 +929,31 @@ impl Element {
     /// logical extents, including per-row packets and packet alignment.
     pub fn canonical_byte_len(self, extents: &[u64]) -> Result<u64, TensorError> {
         seismic_runtime::api::tensor::TensorInner::canonical_byte_len(self.id(), extents)
+    }
+    /// Whether this is a source under a companion grid of scales, which a
+    /// file keeps apart from its codes (`ExternalPacketLayout::planes`).
+    pub fn is_planar(self) -> bool {
+        matches!(
+            &seismic_lang::registry::representation_info(self.0).kind,
+            seismic_lang::registry::RepresentationKind::External(layout) if layout.planes.is_some()
+        )
+    }
+    /// The bytes of each part one record's `extents` (`[1, rows, columns]`)
+    /// are stored as, in the order they lie: its codes, then under a
+    /// companion grid of scales its grid, which a file keeps apart
+    /// (`ExternalPacketLayout::planes`); one part, the whole, otherwise.
+    /// `None` where the extents are not one matrix of a planar source, or
+    /// overflow.
+    pub fn record_parts(self, extents: &[u64]) -> Option<Vec<u64>> {
+        let whole = self.canonical_byte_len(extents).ok()?;
+        match &seismic_lang::registry::representation_info(self.0).kind {
+            seismic_lang::registry::RepresentationKind::External(layout) if layout.planes.is_some() => {
+                let matrix = layout.matrices(extents).filter(|matrix| matrix.count == 1)?;
+                let codes = matrix.rows * matrix.row_packets() * u64::from(layout.code_bytes());
+                Some(vec![codes, whole.checked_sub(codes)?])
+            }
+            _ => Some(vec![whole]),
+        }
     }
     pub fn f32() -> Element {
         Element(seismic_lang::registry::dense(

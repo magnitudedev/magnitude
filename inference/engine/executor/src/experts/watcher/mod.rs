@@ -111,7 +111,7 @@ mod telemetry;
 mod tests;
 
 pub(in crate::experts) use self::core::{
-    Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredTensor,
+    Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredPart, StoredTensor,
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
 pub(in crate::experts) use promotions::{Copier, CopyTensor};
@@ -531,10 +531,10 @@ impl Watcher {
                 .get(stored.pool)
                 .ok_or_else(|| format!("a routed tensor reads staging pool {} of {}", stored.pool, pools.len()))?;
             let carried = conveyors[stored.pool].bytes();
-            if stored.bytes > pool.staging.bytes() || stored.bytes > carried {
+            if stored.bytes() > pool.staging.bytes() || stored.bytes() > carried {
                 return Err(format!(
                     "a stored expert of {} bytes exceeds its pool's records of {} or the conveyor's of {carried}",
-                    stored.bytes,
+                    stored.bytes(),
                     pool.staging.bytes(),
                 ));
             }

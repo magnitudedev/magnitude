@@ -29,7 +29,7 @@ pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankLayers, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
     HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
-    ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredStack,
+    ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredPart, StoredStack,
     growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer,
 };
 pub(crate) use bank::{layer_homes, releasing};
@@ -86,6 +86,9 @@ use weights::{resident_dtype, validate_unique_roles};
 
 #[cfg(any(test, feature = "fixtures"))]
 pub(crate) mod fixtures;
+
+#[cfg(test)]
+mod grid_records_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

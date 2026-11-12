@@ -634,6 +634,206 @@ pub struct ExternalPacketLayout {
     pub packet_alignment: u32,
     pub logical_group: u32,
     pub packing_axis: PackingAxis,
+    /// Where a packet's bytes lie: `None` one after another, a row's packets
+    /// in turn; under a companion grid its two planes.
+    pub planes: Option<GridPlanes>,
+}
+
+/// The planes of a source under a companion grid of scales, as a file
+/// stores the codes and their grid: each matrix's codes, a row's after the
+/// row before, then its grid of one scale per `tile` of values, a tile row's
+/// after the one before. A packet (its scale's `scale_bytes`, then its
+/// group's codes) gathers its scale from the grid and its codes from the
+/// codes plane, which [`ExternalPacketLayout::packet_byte`] addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridPlanes {
+    pub scale_bytes: u32,
+    /// `[rows, columns]` of values each scale scales: a whole number of
+    /// packets along a row.
+    pub tile: [u32; 2],
+}
+
+/// Where a packet's bytes start within its matrix ([`ExternalPacketLayout::
+/// packet_pieces`]): its codes, and under a grid its scale apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketPieces {
+    /// The packet's first byte, or under a grid its first code's.
+    pub codes: u64,
+    /// Its scale's first byte, under a grid.
+    pub scale: Option<u64>,
+}
+
+impl ExternalPacketLayout {
+    /// The bytes a packet's codes take: all of it, or under a grid all but
+    /// its scale.
+    pub const fn code_bytes(&self) -> u32 {
+        match self.planes {
+            None => self.packet_size,
+            Some(planes) => self.packet_size - planes.scale_bytes,
+        }
+    }
+
+    /// The bytes of one `[rows, columns]` matrix: its rows' packets, and
+    /// under a grid its grid of scales after them (whole tiles, a partial
+    /// last one counted whole). `None` on overflow.
+    pub fn matrix_bytes(&self, rows: u64, columns: u64) -> Option<u64> {
+        let packets = rows.checked_mul(columns.div_ceil(u64::from(self.logical_group)))?;
+        let codes = packets.checked_mul(u64::from(self.code_bytes()))?;
+        match self.planes {
+            None => Some(codes),
+            Some(planes) => rows
+                .div_ceil(u64::from(planes.tile[0]))
+                .checked_mul(columns.div_ceil(u64::from(planes.tile[1])))?
+                .checked_mul(u64::from(planes.scale_bytes))?
+                .checked_add(codes),
+        }
+    }
+
+    /// Where packet `packet` of row `row` of a `[rows, columns]` matrix
+    /// lies, from the matrix's first byte: the addressing of a source's
+    /// packets the interpreter and the CPU's conversions take (through
+    /// [`SourceMatrices`]). The devices' conversion code and streaming
+    /// windows lay and read the same planes; their tests compare their bytes
+    /// with the host's conversion.
+    pub fn packet_pieces(&self, rows: u64, columns: u64, row: u64, packet: u64) -> PacketPieces {
+        let row_packets = columns.div_ceil(u64::from(self.logical_group));
+        let codes = (row * row_packets + packet) * u64::from(self.code_bytes());
+        PacketPieces {
+            codes,
+            scale: self.planes.map(|planes| {
+                let [tile_rows, tile_columns] = planes.tile.map(u64::from);
+                let tile = row / tile_rows * columns.div_ceil(tile_columns)
+                    + packet * u64::from(self.logical_group) / tile_columns;
+                rows * row_packets * u64::from(self.code_bytes()) + tile * u64::from(planes.scale_bytes)
+            }),
+        }
+    }
+
+    /// Where byte `byte` of packet `packet` of row `row` of a `[rows,
+    /// columns]` matrix lies, from the matrix's first byte
+    /// ([`Self::packet_pieces`]): a packet's bytes in order, under a grid
+    /// its scale's then its codes'.
+    pub fn packet_byte(&self, rows: u64, columns: u64, row: u64, packet: u64, byte: u32) -> u64 {
+        let pieces = self.packet_pieces(rows, columns, row, packet);
+        match (self.planes, pieces.scale) {
+            (Some(planes), Some(scale)) if byte < planes.scale_bytes => scale + u64::from(byte),
+            (Some(planes), _) => pieces.codes + u64::from(byte - planes.scale_bytes),
+            (None, _) => pieces.codes + u64::from(byte),
+        }
+    }
+}
+
+/// A source tensor as its packets lie ([`ExternalPacketLayout::matrices`]):
+/// `count` matrices of `rows` rows of `columns` values, each `bytes` bytes
+/// after the one before. A source of one plane is one matrix of all its
+/// rows (its packets one after another, whatever its axes); under a grid
+/// every axis before the last two counts matrices, and a tensor of one axis
+/// is one row.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceMatrices<'a> {
+    pub layout: &'a ExternalPacketLayout,
+    pub count: u64,
+    pub rows: u64,
+    pub columns: u64,
+    pub bytes: u64,
+}
+
+impl ExternalPacketLayout {
+    /// The matrices of a tensor of `extents` of this source; `None` for a
+    /// tensor of no axes, or on overflow.
+    pub fn matrices(&self, extents: &[u64]) -> Option<SourceMatrices<'_>> {
+        let (&columns, leading) = extents.split_last()?;
+        let product = |extents: &[u64]| extents.iter().try_fold(1u64, |product, extent| product.checked_mul(*extent));
+        let (count, rows) = match self.planes {
+            None => (1, product(leading)?),
+            // A matrix has rows: fewer than two axes is no planar tensor.
+            Some(_) => {
+                let (rows, matrices) = leading.split_last()?;
+                (product(matrices)?, *rows)
+            }
+        };
+        let bytes = self.matrix_bytes(rows, columns)?;
+        count.checked_mul(bytes)?;
+        count.checked_mul(rows)?;
+        Some(SourceMatrices { layout: self, count, rows, columns, bytes })
+    }
+}
+
+impl SourceMatrices<'_> {
+    /// Packets of each row.
+    pub fn row_packets(&self) -> u64 {
+        self.columns.div_ceil(u64::from(self.layout.logical_group))
+    }
+
+    /// Rows of the tensor, every matrix's.
+    pub fn tensor_rows(&self) -> u64 {
+        self.count * self.rows
+    }
+
+    /// Bytes of the tensor.
+    pub fn tensor_bytes(&self) -> u64 {
+        self.count * self.bytes
+    }
+
+    /// Where packet `packet` of row `row` of the tensor (its matrices' rows
+    /// in turn) lies from the tensor's first byte: its matrix's, then
+    /// [`ExternalPacketLayout::packet_pieces`] within it.
+    pub fn packet_pieces(&self, row: u64, packet: u64) -> PacketPieces {
+        let matrix = row / self.rows * self.bytes;
+        let pieces = self.layout.packet_pieces(self.rows, self.columns, row % self.rows, packet);
+        PacketPieces { codes: matrix + pieces.codes, scale: pieces.scale.map(|scale| matrix + scale) }
+    }
+
+    /// The bytes packets `packets` (not none) of row `row` of the tensor
+    /// take, from its first byte ([`Self::packet_pieces`]): their packets',
+    /// or under a grid their codes', then their scales'.
+    pub fn packet_spans(
+        &self,
+        row: u64,
+        packets: std::ops::Range<u64>,
+    ) -> impl Iterator<Item = std::ops::Range<u64>> + Clone {
+        assert!(!packets.is_empty(), "a span of packets holds one");
+        let (first, last) = (self.packet_pieces(row, packets.start), self.packet_pieces(row, packets.end - 1));
+        let code_bytes = self.layout.code_bytes();
+        let scale_bytes = u64::from(self.layout.packet_size - code_bytes);
+        let scales = first.scale.zip(last.scale).map(|(first, last)| first..last + scale_bytes);
+        std::iter::once(first.codes..last.codes + u64::from(code_bytes)).chain(scales)
+    }
+
+    /// The tensor's packets of `bytes`, its stored bytes, one after another
+    /// (rows in turn, a row's packets in turn), each its bytes in order:
+    /// `bytes` itself for a source of one plane, gathered from its pieces
+    /// under a grid. Panics unless `bytes` is the tensor's.
+    pub fn packets<'b>(&self, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
+        assert_eq!(bytes.len() as u64, self.tensor_bytes(), "a source tensor's bytes");
+        if self.layout.planes.is_none() {
+            return std::borrow::Cow::Borrowed(bytes);
+        }
+        let (code_bytes, packet_size) = (self.layout.code_bytes() as usize, self.layout.packet_size as usize);
+        let mut packets = Vec::with_capacity((self.tensor_rows() * self.row_packets()) as usize * packet_size);
+        for row in 0..self.tensor_rows() {
+            for packet in 0..self.row_packets() {
+                let pieces = self.packet_pieces(row, packet);
+                let scale = pieces.scale.expect("a packet under a grid has a scale") as usize;
+                let codes = pieces.codes as usize;
+                packets.extend_from_slice(&bytes[scale..scale + packet_size - code_bytes]);
+                packets.extend_from_slice(&bytes[codes..codes + code_bytes]);
+            }
+        }
+        std::borrow::Cow::Owned(packets)
+    }
+
+    /// Byte `byte` of every packet of the tensor, from its first byte
+    /// ([`ExternalPacketLayout::packet_byte`]): under a grid a scale's
+    /// bytes once for each packet it scales.
+    fn packet_bytes(&self, byte: u32) -> impl Iterator<Item = u64> + '_ {
+        (0..self.tensor_rows()).flat_map(move |row| {
+            let matrix = row / self.rows * self.bytes;
+            (0..self.row_packets()).map(move |packet| {
+                matrix + self.layout.packet_byte(self.rows, self.columns, row % self.rows, packet, byte)
+            })
+        })
+    }
 }
 
 /// One registered exact conversion from an external source into resident
@@ -680,27 +880,29 @@ impl ConversionLayout {
 }
 
 impl RepresentationConversion {
-    /// Brings `packets`, whole source packets of arbitrary bytes, into the
-    /// conversion's domain, changing as few bits as that takes. The domain
-    /// is the source packets whose binary16 fields the recipe converts as
-    /// numbers ([`PacketRepackRecipe::converted_f16_fields`]) are finite: a
-    /// NaN's payload is not part of the contract, since a device's
-    /// conversion quiets a signaling NaN where the host reference widens its
-    /// bits. Each such field has the high bit of its exponent cleared.
-    pub fn admit_source(&self, packets: &mut [u8]) {
+    /// Brings `source`, the arbitrary bytes of a source tensor of `extents`,
+    /// into the conversion's domain, changing as few bits as that takes.
+    /// The domain is the source packets whose binary16 fields the recipe
+    /// converts as numbers ([`PacketRepackRecipe::converted_f16_fields`])
+    /// are finite: a NaN's payload is not part of the contract, since a
+    /// device's conversion quiets a signaling NaN where the host reference
+    /// widens its bits. Each such field has the high bit of its exponent
+    /// cleared. Panics unless `source` is the tensor's canonical bytes.
+    pub fn admit_source(&self, extents: &[u64], source: &mut [u8]) {
         let bits = self.recipe.converted_f16_fields().iter().map(|field| field + 14).collect::<Vec<_>>();
-        self.clear(packets, &bits);
+        self.clear(extents, source, &bits);
     }
 
-    /// Brings `packets`, whole source packets of arbitrary bytes, into the
-    /// conversion's domain ([`Self::admit_source`]) with every number the
-    /// destination reads from them finite: also each floating-point field
-    /// it carries bit for bit into a plane of floating-point numbers (a
-    /// GGUF scale it keeps as stored) has the high bit of its exponent
-    /// cleared. A record of such packets has a finite value everywhere, so
-    /// arithmetic over it compares; one of a carried NaN or infinity does
-    /// not.
-    pub fn finite_source(&self, packets: &mut [u8]) {
+    /// Brings `source`, the arbitrary bytes of a source tensor of
+    /// `extents`, into the conversion's domain ([`Self::admit_source`]) with
+    /// every number the destination reads from them finite: also each
+    /// floating-point field it carries bit for bit into a plane of
+    /// floating-point numbers (a GGUF scale it keeps as stored) has the high
+    /// bit of its exponent cleared, and each E4M3 code that is NaN is made
+    /// finite ([`PlaneEncoding::nan_pattern`]); every finite code is kept.
+    /// A record of such packets has a finite value everywhere, so arithmetic
+    /// over it compares; one of a carried NaN or infinity does not.
+    pub fn finite_source(&self, extents: &[u64], source: &mut [u8]) {
         let mut bits = self.recipe.converted_f16_fields().iter().map(|field| field + 14).collect::<Vec<_>>();
         for (plane, recipe) in self.destination_layout.packet().planes.iter().zip(&self.recipe.planes) {
             // A typed recipe's numbers are converted (above) or a
@@ -713,14 +915,52 @@ impl RepresentationConversion {
                 );
             }
         }
-        self.clear(packets, &bits);
+        let mut nans = Vec::new();
+        for (plane, recipe) in self.destination_layout.packet().planes.iter().zip(&self.recipe.planes) {
+            if let (Some((mask, clear)), PlaneRepackRecipe::BitRoutes(routes)) = (plane.encoding.nan_pattern(), recipe) {
+                for entry in routes.chunks_exact(plane.encoding.entry_bits() as usize) {
+                    let pattern = (0..entry.len() as u32).filter(|bit| mask >> bit & 1 == 1).map(|bit| entry[bit as usize]).collect::<Option<Vec<_>>>();
+                    if let (Some(pattern), Some(clear)) = (pattern, entry[clear as usize]) {
+                        nans.push((pattern, clear));
+                    }
+                }
+            }
+        }
+        self.clear(extents, source, &bits);
+        self.clear_nans(extents, source, &nans);
     }
 
-    /// Clear source bits `bits` of every packet of `packets`.
-    fn clear(&self, packets: &mut [u8], bits: &[u32]) {
-        for packet in packets.chunks_exact_mut(self.source_layout.packet_size as usize) {
-            for &bit in bits {
-                packet[bit as usize / 8] &= !(1 << (bit % 8));
+    /// Each pattern of packet bits `nans` (its bits, and the one that
+    /// clearing leaves any other entry's bits alone) wherever all of its
+    /// bits are set in a packet of `source`, the bytes of a source tensor
+    /// of `extents`, has that one bit cleared: a NaN code made finite and no
+    /// finite code changed.
+    fn clear_nans(&self, extents: &[u64], source: &mut [u8], nans: &[(Vec<u32>, u32)]) {
+        let matrices = self.source_layout.matrices(extents).expect("a source tensor's extents");
+        for (pattern, clear) in nans {
+            let mut bits = pattern.iter().map(|&bit| matrices.packet_bytes(bit / 8)).collect::<Vec<_>>();
+            let mut cleared = matrices.packet_bytes(clear / 8);
+            loop {
+                let at = bits.iter_mut().map(Iterator::next).collect::<Option<Vec<_>>>();
+                let (Some(at), Some(cleared)) = (at, cleared.next()) else {
+                    break;
+                };
+                if pattern.iter().zip(&at).all(|(bit, at)| source[*at as usize] >> (bit % 8) & 1 == 1) {
+                    source[cleared as usize] &= !(1 << (clear % 8));
+                }
+            }
+        }
+    }
+
+    /// Clear packet bits `bits` of every packet of `source`, the bytes of a
+    /// source tensor of `extents`, where each lies
+    /// ([`SourceMatrices::packet_bytes`]).
+    fn clear(&self, extents: &[u64], source: &mut [u8], bits: &[u32]) {
+        let matrices = self.source_layout.matrices(extents).expect("a source tensor's extents");
+        assert_eq!(source.len() as u64, matrices.tensor_bytes(), "a source tensor's bytes");
+        for &bit in bits {
+            for at in matrices.packet_bytes(bit / 8) {
+                source[at as usize] &= !(1 << (bit % 8));
             }
         }
     }
@@ -986,6 +1226,12 @@ pub enum PlaneAssemblyError {
         actual: u64,
     },
 }
+
+/// A source under a companion grid keeps its codes and its grid apart, so no
+/// per-packet address reaches them: only its registered conversion reads
+/// it, addressing both planes itself.
+pub const PLANAR_SOURCE_IS_CONVERSION_ONLY: &str =
+    "a source under a companion grid reached a per-packet address, which only its conversion may read";
 
 /// Row layouts are consumed by native implementations, the host oracle and
 /// host transfers. Compiled construction admits only `packet` storage: the
@@ -2056,20 +2302,47 @@ pub fn representation_conversions() -> &'static [RepresentationConversion] {
 pub enum GgufScales {
     /// In the tensor's blocks (`magnitude_ggml` geometry), or none.
     Own,
-    /// A companion grid of `GridScale` scales, one per tile of whole row
-    /// blocks of the source's packet values, over a tensor of single-value
-    /// blocks. The importer assembles each block of a row as its tile's
-    /// scale, then its values' blocks: the source's packet.
-    Grid(GridScale),
+    /// A companion grid of scales, one per tile of the source's values,
+    /// over a tensor of single-value blocks: stored planar, each matrix's
+    /// codes then its grid, as the file stores the two tensors
+    /// ([`GridPlanes`]).
+    Grid(Grid),
 }
 
 impl GgufScales {
-    /// Every place scales can be: a tensor's own blocks, then each grid.
-    pub const ALL: [Self; 3] = [Self::Own, Self::Grid(GridScale::E8m0), Self::Grid(GridScale::F32)];
+    /// Every place scales can be: a tensor's own blocks, then each
+    /// registered grid.
+    pub const ALL: [Self; 4] = [
+        Self::Own,
+        Self::Grid(Grid::REGISTERED[0]),
+        Self::Grid(Grid::REGISTERED[1]),
+        Self::Grid(Grid::REGISTERED[2]),
+    ];
 }
 
-/// The scale element of a companion grid (`GgufScales::Grid`), as the
-/// source's assembled packet holds it, before its values' blocks.
+/// A companion grid: the element of its scales and the `[rows, columns]`
+/// tile of values each one scales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Grid {
+    pub scale: GridScale,
+    pub tile: [u64; 2],
+}
+
+impl Grid {
+    /// The grids real files carry, each a source of its own: UE8M0 scales
+    /// per row of 32 (DeepSeek V4.1's n-gram table) and per 32×32 tile
+    /// (its other FP8 weights), and F32 scales per 128×128 tile (an FP8
+    /// checkpoint's `weight_scale_inv`). A tile is registered when a file
+    /// needs it; a weight under any other is refused when planned.
+    pub const REGISTERED: [Self; 3] = [
+        Self { scale: GridScale::E8m0, tile: [1, 32] },
+        Self { scale: GridScale::E8m0, tile: [32, 32] },
+        Self { scale: GridScale::F32, tile: [128, 128] },
+    ];
+}
+
+/// The scale element of a companion grid (`GgufScales::Grid`), the first
+/// bytes of a source packet (the scale, then the codes it scales).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GridScale {
     /// One E8M0 byte, `2^(e - 127)`, 0xff NaN (OCP MX).
@@ -2087,7 +2360,8 @@ impl GridScale {
         }
     }
 
-    /// Its short name, as a source's name carries it (`gguf_f8_e4m3_e8m0`).
+    /// Its short name, as a source's name carries it
+    /// (`gguf_f8_e4m3_e8m0_32x32`).
     pub const fn name(self) -> &'static str {
         match self {
             Self::E8m0 => "e8m0",
@@ -2099,8 +2373,9 @@ impl GridScale {
 /// A GGUF source the registry converts from: its ggml type, where its
 /// scales are, its storage name, and the resident representation its
 /// conversion writes. A source packet is one block of the type
-/// (`magnitude_ggml` geometry), or one assembled grid block
-/// (`GgufScales::Grid`).
+/// (`magnitude_ggml` geometry), or under a grid (`GgufScales::Grid`) a
+/// scale and the codes it scales, which lie in two planes
+/// ([`GridPlanes`]).
 #[derive(Clone, Copy, Debug)]
 struct GgufSource {
     encoding: Encoding,
@@ -2122,7 +2397,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 27] = [
+const GGUF_SOURCES: [GgufSource; 28] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -2152,33 +2427,40 @@ const GGUF_SOURCES: [GgufSource; 27] = [
     // more to decode than a bit field, and no backend's product is bound by
     // the 18% of bytes they save (spec 26-10-30 §13).
     gguf_source_spec(Encoding::Tq1_0, "gguf_tq1_0", "q2g256"),
-    // E4M3 codes under their companion grid (a block: the scale, then a
+    // E4M3 codes under their companion grid (a packet: the scale, then a
     // group of codes), moved bit for bit: under E8M0 scales OCP MXFP8's
     // block; under F32 scales (an FP8 checkpoint's `weight_scale_inv`) a
-    // stored F32 scale per 128, every scale of a 128-column tile.
+    // stored F32 scale per 128, every scale of a 128-column tile. A
+    // source's name states its grid's scale and tile.
     GgufSource {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::Grid(GridScale::E8m0),
-        name: "gguf_f8_e4m3_e8m0",
+        scales: GgufScales::Grid(Grid::REGISTERED[0]),
+        name: "gguf_f8_e4m3_e8m0_1x32",
         resident: "mxfp8g32",
     },
     GgufSource {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::Grid(GridScale::F32),
-        name: "gguf_f8_e4m3_f32",
+        scales: GgufScales::Grid(Grid::REGISTERED[1]),
+        name: "gguf_f8_e4m3_e8m0_32x32",
+        resident: "mxfp8g32",
+    },
+    GgufSource {
+        encoding: Encoding::F8E4M3,
+        scales: GgufScales::Grid(Grid::REGISTERED[2]),
+        name: "gguf_f8_e4m3_f32_128x128",
         resident: "fp8g128",
     },
 ];
 
 impl GgufSource {
     /// The bytes and the values of one source packet: a block of the type,
-    /// or under a grid an assembled block, its scale code then the codes of
-    /// one group of the resident representation (the values a scale of it
-    /// scales).
+    /// or under a grid its scale code then the codes of one group of the
+    /// resident representation (the values a scale of it scales), which
+    /// lie in two planes ([`GridPlanes`]).
     fn packet(&self) -> (u64, u64) {
         match self.scales {
             GgufScales::Own => (self.encoding.block_bytes(), self.encoding.block_elements()),
-            GgufScales::Grid(scale) => {
+            GgufScales::Grid(Grid { scale, .. }) => {
                 assert_eq!(self.encoding.block_elements(), 1, "a scale grid scales single values");
                 let group = crate::repr::REPRS
                     .iter()
@@ -2343,11 +2625,7 @@ pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
             layout.bytes(rows, last)
         }
         RepresentationKind::PackedRows(layout) => layout.bytes(extents),
-        RepresentationKind::External(layout) => {
-            let (rows, last) = rows_and_last()?;
-            rows.checked_mul(last.div_ceil(u64::from(layout.logical_group)))?
-                .checked_mul(u64::from(layout.packet_size))
-        }
+        RepresentationKind::External(layout) => layout.matrices(extents).map(|matrices| matrices.tensor_bytes()),
     }
 }
 
@@ -2363,7 +2641,13 @@ pub fn record_bytes(id: RepresentationId, extents: &[u64]) -> Option<std::num::N
     let (_, trailing) = extents.split_first()?;
     let own = match &representation_info(id).kind {
         RepresentationKind::Dense(_) => true,
-        RepresentationKind::Packed(_) | RepresentationKind::External(_) => !trailing.is_empty(),
+        RepresentationKind::Packed(_) => !trailing.is_empty(),
+        // A planar source's rows share its matrix's grid, so its records are
+        // matrices.
+        RepresentationKind::External(layout) => match layout.planes {
+            None => !trailing.is_empty(),
+            Some(_) => trailing.len() >= 2,
+        },
         RepresentationKind::PackedRows(layout) => {
             trailing.len() >= 2 || (trailing.len() == 1 && layout.tile_rows() == 1)
         }
@@ -2636,7 +2920,20 @@ pub(crate) mod internals {
             let packet_size = u32::try_from(bytes).expect("a GGUF source packet fits u32 bytes");
             let logical_group =
                 u32::try_from(values).expect("a GGUF source packet fits u32 values");
-            (source.name, packet_size, logical_group, source.resident)
+            let planes = match source.scales {
+                GgufScales::Own => None,
+                GgufScales::Grid(Grid { scale, tile }) => {
+                    let tile = tile.map(|extent| u32::try_from(extent).expect("a grid tile fits u32"));
+                    assert!(tile[1].is_multiple_of(logical_group), "a grid tile is whole packets of a row");
+                    // Every window groups a tile's rows by 16-row tiles.
+                    assert!(tile[0] == 1 || tile[0].is_multiple_of(16), "a grid tile's rows are one or whole 16-row tiles");
+                    Some(GridPlanes {
+                        scale_bytes: u32::try_from(scale.bytes()).expect("a scale fits u32 bytes"),
+                        tile,
+                    })
+                }
+            };
+            (source.name, packet_size, logical_group, source.resident, planes)
         });
         // A GGUF packet is declared aligned to the largest power of two, to
         // 4 (the widest unit a kernel reads a source packet in), dividing
@@ -2645,7 +2942,7 @@ pub(crate) mod internals {
         // of two, so a view of the file's pages that falls short is not
         // made, and the importer uploads the tensor instead (the engine's
         // `ImportSource::acquire`).
-        for (name, packet_size, logical_group, _) in external_specs {
+        for (name, packet_size, logical_group, _, planes) in external_specs {
             representations.push(RepresentationInfo {
                 id: representation_id(name, representations.len()),
                 name,
@@ -2656,6 +2953,7 @@ pub(crate) mod internals {
                     packet_alignment: crate::repack::alignment(packet_size).min(4),
                     logical_group,
                     packing_axis: PackingAxis::Last,
+                    planes,
                 }),
                 decoded: DType::F32,
                 access: RepresentationAccess::ConversionSource,
@@ -2666,7 +2964,7 @@ pub(crate) mod internals {
         // Row layouts exist for every resident representation of an external
         // source: the resident forms the engine imports.
         let mut residents: Vec<&str> = Vec::new();
-        for (_, _, _, resident) in external_specs {
+        for (_, _, _, resident, _) in external_specs {
             if !residents.contains(&resident) {
                 residents.push(resident);
             }
@@ -3692,18 +3990,18 @@ pub(crate) mod internals {
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
                 ));
             }
-            "gguf_f8_e4m3_e8m0" => {
-                // The assembled block: e (E8M0) | qs[32] (E4M3), value p
-                // qs[p]; every byte moves bit for bit.
+            "gguf_f8_e4m3_e8m0_1x32" | "gguf_f8_e4m3_e8m0_32x32" => {
+                // The packet: e (E8M0) | qs[32] (E4M3), value p qs[p]; every
+                // byte moves bit for bit.
                 push(plane("words", PlaneRepackRecipe::BitRoutes(direct_bits(1, 32))));
                 push(plane(
                     "block_scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
                 ));
             }
-            "gguf_f8_e4m3_f32" => {
-                // The assembled block: s (F32) | qs[128] (E4M3), value p
-                // qs[p]; every byte moves bit for bit.
+            "gguf_f8_e4m3_f32_128x128" => {
+                // The packet: s (F32) | qs[128] (E4M3), value p qs[p]; every
+                // byte moves bit for bit.
                 push(plane("words", PlaneRepackRecipe::BitRoutes(direct_bits(4, 128))));
                 push(plane("scale", PlaneRepackRecipe::BitRoutes(direct_bits(0, 4))));
             }
@@ -4515,7 +4813,7 @@ mod tests {
                 panic!("{source} is external storage")
             };
             let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
-            conversion.admit_source(&mut packets);
+            conversion.admit_source(&[2, u64::from(layout.logical_group)], &mut packets);
             for (packet, bytes) in packets
                 .chunks_exact(layout.packet_size as usize)
                 .enumerate()
@@ -4554,7 +4852,7 @@ mod tests {
                 panic!("{source} is external storage")
             };
             let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
-            conversion.finite_source(&mut packets);
+            conversion.finite_source(&[2, u64::from(layout.logical_group)], &mut packets);
             for (packet, bytes) in packets.chunks_exact(layout.packet_size as usize).enumerate() {
                 for (index, byte) in bytes.iter().enumerate() {
                     let expected = if index == cleared.0 { cleared.1 } else { 0xff };
@@ -5117,27 +5415,33 @@ mod tests {
         );
     }
 
-    /// F8_E4M3 has a source only under a grid of block scales: an
-    /// assembled block, the scale then a group of codes, converting under
-    /// E8M0 scales (one byte, 32 codes) into mxfp8g32, under F32 scales
-    /// (four bytes, 128 codes) into fp8g128, whose decoders read E4M3 bytes
-    /// as their values (the profile's integers under exponent -9) under that
-    /// scale; no other encoding is read under a grid.
+    /// F8_E4M3 has a source only under a registered grid of block scales,
+    /// one source a grid, named for its scale and tile: a packet the scale
+    /// then a group of codes, converting under E8M0 scales (one byte, 32
+    /// codes) into mxfp8g32, under F32 scales (four bytes, 128 codes) into
+    /// fp8g128, whose decoders read E4M3 bytes as their values (the
+    /// profile's integers under exponent -9) under that scale; no other
+    /// encoding is read under a grid, and no other tile is a source.
     #[test]
     fn f8_e4m3_is_sourced_by_its_scale_grid() {
         use crate::repr::ValueCodes;
         assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::Own, 256), None);
-        for (scale, name, resident, packet_size, group, encoding) in [
-            (GridScale::E8m0, "gguf_f8_e4m3_e8m0", "mxfp8g32", 33, 32, ScaleEncoding::E8M0),
-            (GridScale::F32, "gguf_f8_e4m3_f32", "fp8g128", 132, 128, ScaleEncoding::F32),
+        let unregistered = Grid { scale: GridScale::F32, tile: [32, 128] };
+        assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::Grid(unregistered), 256), None);
+        for (grid, name, resident, packet_size, group, encoding) in [
+            (Grid::REGISTERED[0], "gguf_f8_e4m3_e8m0_1x32", "mxfp8g32", 33, 32, ScaleEncoding::E8M0),
+            (Grid::REGISTERED[1], "gguf_f8_e4m3_e8m0_32x32", "mxfp8g32", 33, 32, ScaleEncoding::E8M0),
+            (Grid::REGISTERED[2], "gguf_f8_e4m3_f32_128x128", "fp8g128", 132, 128, ScaleEncoding::F32),
         ] {
-            let scales = GgufScales::Grid(scale);
+            let scales = GgufScales::Grid(grid);
             assert_eq!(gguf_source(Encoding::F8E4M3, scales, 48), None);
             assert_eq!(gguf_source(Encoding::Q8_0, scales, 256), None);
             let source = gguf_source(Encoding::F8E4M3, scales, 256).unwrap();
             assert_eq!(representation_info(source).name, name);
             let packet = external_packet(source).unwrap();
             assert_eq!((packet.packet_size, packet.logical_group), (packet_size, group));
+            let tile = grid.tile.map(|extent| extent as u32);
+            assert_eq!(packet.planes, Some(GridPlanes { scale_bytes: grid.scale.bytes() as u32, tile }));
             for layout in Layout::ALL {
                 let element = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
                 assert_eq!(representation_info(element).representation, resident);
@@ -5150,6 +5454,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A grid source is planar, each matrix its codes then its grid, as a
+    /// file stores them: a packet's scale is its tile's in the grid after
+    /// the matrix's codes, its codes its row's in the codes plane, and a
+    /// tensor's bytes are its matrices', a matrix of `[N, K]` `N·K` code
+    /// bytes and `N/r · K/c` scales. A source of its own scales is its
+    /// packets one after another.
+    #[test]
+    fn a_grid_source_addresses_its_packets_in_its_planes() {
+        let f32 = external_packet(representation("gguf_f8_e4m3_f32_128x128").unwrap()).unwrap();
+        let (rows, columns) = (256u64, 512u64);
+        let codes = rows * columns;
+        assert_eq!(f32.matrix_bytes(rows, columns), Some(codes + 2 * 4 * 4));
+        // A matrix has rows: a planar tensor of one axis is no tensor.
+        assert!(f32.matrices(&[columns]).is_none());
+        assert_eq!(f32.matrices(&[rows, columns]).map(|matrices| matrices.count), Some(1));
+        // Row 130, packet 3: codes at row 130's fourth group; its scale the
+        // grid's row 1 (rows 128..256), column 3 (values 384..512).
+        assert_eq!(
+            f32.packet_pieces(rows, columns, 130, 3),
+            PacketPieces { codes: 130 * columns + 3 * 128, scale: Some(codes + (4 + 3) * 4) }
+        );
+        assert_eq!(f32.packet_byte(rows, columns, 130, 3, 2), codes + 7 * 4 + 2);
+        assert_eq!(f32.packet_byte(rows, columns, 130, 3, 4), 130 * columns + 3 * 128);
+        let source = representation("gguf_f8_e4m3_f32_128x128").unwrap();
+        assert_eq!(canonical_bytes(source, &[3, rows, columns]), Some(3 * (codes + 32)));
+        assert_eq!(record_bytes(source, &[3, rows, columns]).map(|bytes| bytes.get()), Some(codes + 32));
+        assert_eq!(record_bytes(source, &[rows, columns]), None, "a planar matrix's rows share its grid");
+        // Per row of 32: packet 5 of row 9 takes scale 9 · 16 + 5.
+        let row = external_packet(representation("gguf_f8_e4m3_e8m0_1x32").unwrap()).unwrap();
+        assert_eq!(row.matrix_bytes(64, 512), Some(64 * 512 + 64 * 16));
+        assert_eq!(row.packet_byte(64, 512, 9, 5, 0), 64 * 512 + 9 * 16 + 5);
+        assert_eq!(row.packet_byte(64, 512, 9, 5, 1), 9 * 512 + 5 * 32);
+        let q8 = external_packet(representation("gguf_q8_0").unwrap()).unwrap();
+        assert_eq!(q8.planes, None);
+        assert_eq!(q8.packet_byte(4, 64, 3, 1, 5), (3 * 2 + 1) * 34 + 5);
+    }
+
+    /// The host reference converts a grid source as its packets gathered
+    /// byte by byte where the registry addresses them, over stacked
+    /// matrices of several tile rows (a partial last); a source's admission
+    /// clears a packet's bits where they lie, a scale's in the grid; and a
+    /// source of one plane's packets are its bytes.
+    #[test]
+    fn a_grid_source_converts_as_its_gathered_packets() {
+        for source in ["gguf_f8_e4m3_e8m0_1x32", "gguf_f8_e4m3_e8m0_32x32", "gguf_f8_e4m3_f32_128x128"] {
+            let source = representation(source).unwrap();
+            let layout = external_packet(source).unwrap();
+            let (matrices, rows, columns) = (2u64, 133u64, 512u64);
+            let extents = [matrices, rows, columns];
+            let tensor = layout.matrices(&extents).unwrap();
+            assert_eq!(Some(tensor.tensor_bytes()), canonical_bytes(source, &extents));
+            let bytes = pseudo_random_bytes(source.position() as u64, tensor.tensor_bytes() as usize);
+            let gathered = (0..matrices * rows)
+                .flat_map(|row| {
+                    (0..tensor.row_packets()).flat_map(move |packet| {
+                        (0..layout.packet_size).map(move |byte| {
+                            row / rows * tensor.bytes + layout.packet_byte(rows, columns, row % rows, packet, byte)
+                        })
+                    })
+                })
+                .map(|at| bytes[at as usize])
+                .collect::<Vec<_>>();
+            assert_eq!(&*tensor.packets(&bytes), &gathered[..]);
+            let shape = extents.map(|extent| extent as usize);
+            for conversion in representation_conversions().iter().filter(|conversion| conversion.source == source) {
+                assert_eq!(
+                    crate::interp::repack(conversion.id, &shape, &bytes).unwrap(),
+                    crate::interp::repack_packets(conversion.id, &extents, &gathered),
+                    "{}",
+                    representation_info(conversion.destination).name
+                );
+                // A finite source clears bits of the carried scales where
+                // they lie in each grid, and of a code only where it is NaN
+                // (E4M3's S.1111.111), its lowest bit: every finite code
+                // kept.
+                let mut finite = bytes.clone();
+                conversion.finite_source(&extents, &mut finite);
+                assert!(finite.iter().zip(&bytes).all(|(finite, byte)| finite & !byte == 0));
+                let codes = rows * tensor.row_packets() * u64::from(layout.code_bytes());
+                for matrix in 0..matrices {
+                    let codes = (matrix * tensor.bytes) as usize..(matrix * tensor.bytes + codes) as usize;
+                    for (finite, byte) in finite[codes.clone()].iter().zip(&bytes[codes]) {
+                        let expected = if byte & 0x7f == 0x7f { byte & !1 } else { *byte };
+                        assert_eq!(*finite, expected, "only a NaN code changes");
+                    }
+                }
+            }
+        }
+        let q8 = representation("gguf_q8_0").unwrap();
+        let tensor = external_packet(q8).unwrap().matrices(&[2, 3, 64]).unwrap();
+        let bytes = pseudo_random_bytes(0, tensor.tensor_bytes() as usize);
+        assert!(matches!(tensor.packets(&bytes), std::borrow::Cow::Borrowed(packets) if packets == &bytes[..]));
     }
 }
 

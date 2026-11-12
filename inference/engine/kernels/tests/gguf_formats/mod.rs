@@ -6,7 +6,7 @@
 #![allow(dead_code, unused_macros)]
 
 use magnitude_ggml::Encoding;
-use seismic::{Element, GgufScales, GridScale, Layout, OperandRecipe};
+use seismic::{Element, GgufScales, Grid, GridScale, Layout, OperandRecipe};
 use seismic_lang::registry::f16_bits;
 
 include!("widths.rs");
@@ -48,16 +48,18 @@ impl Format {
         scales: GgufScales::Own,
         operands: OperandRecipe::Nvfp4Rows,
     };
-    /// GGUF F8_E4M3 under its grid of E8M0 block scales: mxfp8g32.
+    /// GGUF F8_E4M3 under its grid of E8M0 scales per 32×32 tile (V4.1's
+    /// FP8 weights, `gguf_f8_e4m3_e8m0_32x32`): mxfp8g32.
     pub const F8_E4M3: Format = Format {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::Grid(GridScale::E8m0),
+        scales: GgufScales::Grid(Grid { scale: GridScale::E8m0, tile: [32, 32] }),
         operands: OperandRecipe::Rounded,
     };
-    /// GGUF F8_E4M3 under its grid of F32 tile scales: fp8g128.
+    /// GGUF F8_E4M3 under its grid of F32 scales per 128×128 tile
+    /// (`gguf_f8_e4m3_f32_128x128`): fp8g128.
     pub const F8_E4M3_F32: Format = Format {
         encoding: Encoding::F8E4M3,
-        scales: GgufScales::Grid(GridScale::F32),
+        scales: GgufScales::Grid(Grid { scale: GridScale::F32, tile: [128, 128] }),
         operands: OperandRecipe::Rounded,
     };
 
@@ -76,14 +78,14 @@ impl Format {
             .filter(|format| format.converted(layout).is_some())
             .collect()
     }
-    /// The registry's source of this format's GGUF blocks (assembled
-    /// blocks, under a scale grid).
+    /// The registry's source of this format's GGUF blocks (under a scale
+    /// grid planar: each matrix's codes, then its grid).
     pub fn source(self) -> Element {
         Element::gguf_packet_source(self.encoding, self.scales)
             .unwrap_or_else(|| panic!("{:?} {:?}: no registered GGUF source", self.encoding, self.scales))
     }
-    /// The values of one source packet: a block of the type, or an
-    /// assembled grid block.
+    /// The values of one source packet: a block of the type, or under a
+    /// grid one group of codes under one scale.
     fn packet_values(self) -> u64 {
         self.source().logical_group().expect("a source has packets")
     }
@@ -110,14 +112,44 @@ impl Format {
     pub fn block_values(self) -> usize {
         self.packet_values() as usize
     }
+    /// The bytes of one source packet ([`Self::block`]).
     pub fn block_bytes(self) -> usize {
-        self.source()
-            .canonical_byte_len(&[1, self.packet_values()])
-            .expect("a source packet's bytes") as usize
+        self.layout().packet_size as usize
+    }
+    /// The registry's layout of this format's source packets.
+    fn layout(self) -> &'static seismic_lang::registry::ExternalPacketLayout {
+        seismic_lang::registry::representation(self.source().name())
+            .and_then(seismic_lang::registry::external_packet)
+            .expect("a GGUF source is external storage")
+    }
+    /// Random source bytes of a `shape` tensor of this format whose values
+    /// reach about `scale`: a random block ([`Self::block`]) a packet, each
+    /// where the source lays it (`SourceMatrices::packet_pieces`): one
+    /// after another, or under a grid its codes in the codes plane and its
+    /// scale in the grid, a tile's scale its last packet's.
+    pub fn external(self, rng: &mut Rng, shape: &[u64], scale: f32) -> Vec<u8> {
+        let layout = self.layout();
+        let matrices = layout.matrices(shape).expect("a source tensor's extents");
+        let (codes, scale_bytes) = (layout.code_bytes() as usize, (layout.packet_size - layout.code_bytes()) as usize);
+        let mut bytes = vec![0u8; matrices.tensor_bytes() as usize];
+        for row in 0..matrices.tensor_rows() {
+            for packet in 0..matrices.row_packets() {
+                let block = self.block(rng, scale);
+                let pieces = matrices.packet_pieces(row, packet);
+                let at = pieces.codes as usize;
+                bytes[at..at + codes].copy_from_slice(&block[scale_bytes..]);
+                if let Some(at) = pieces.scale {
+                    let at = at as usize;
+                    bytes[at..at + scale_bytes].copy_from_slice(&block[..scale_bytes]);
+                }
+            }
+        }
+        bytes
     }
     /// One random GGUF block whose values reach about `scale`: random codes
     /// and sub-scales, with the scale fields set so the values reach a
-    /// random 0.5 to 1.5 times `scale`.
+    /// random 0.5 to 1.5 times `scale`; under a grid a packet, its scale
+    /// then its codes.
     pub fn block(self, rng: &mut Rng, scale: f32) -> Vec<u8> {
         let mut block = (0..self.block_bytes())
             .map(|_| rng.byte())
@@ -199,18 +231,18 @@ impl Format {
                     *field = (exponent << 3) | (rng.next() % 8) as u8;
                 }
             }
-            // An assembled block: its scale, of factor / 448 (the E4M3
-            // range), then random finite E4M3 codes (a NaN code,
-            // S.1111.111, loses its exponent's top bit). An E8M0 scale is
-            // the power of two nearest it (32 codes follow), an F32 one it
-            // (128 codes follow).
+            // A packet: its scale, of factor / 448 (the E4M3 range), then
+            // random finite E4M3 codes (a NaN code, S.1111.111, loses its
+            // exponent's top bit). An E8M0 scale is the power of two
+            // nearest it (32 codes follow), an F32 one it (128 codes
+            // follow).
             Encoding::F8E4M3 => {
                 let codes = match self.scales {
-                    GgufScales::Grid(GridScale::E8m0) => {
+                    GgufScales::Grid(Grid { scale: GridScale::E8m0, .. }) => {
                         block[0] = (127.0 + (factor / 448.0).log2().round()) as u8;
                         1
                     }
-                    GgufScales::Grid(GridScale::F32) => {
+                    GgufScales::Grid(Grid { scale: GridScale::F32, .. }) => {
                         block[..4].copy_from_slice(&(factor / 448.0).to_le_bytes());
                         4
                     }

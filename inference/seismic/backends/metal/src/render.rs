@@ -579,6 +579,7 @@ impl<'a> Renderer<'a> {
                         format!("({units}) * {}ul", layout.packet_size)
                     }
                     RepresentationKind::External(layout) => {
+                        assert!(layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
                         format!("({units}) * {}ul", layout.packet_size)
                     }
                     RepresentationKind::PackedRows(_) => {
@@ -638,6 +639,7 @@ impl<'a> Renderer<'a> {
                         format!("({units}) * {}ul", layout.packet_size)
                     }
                     RepresentationKind::External(layout) => {
+                        assert!(layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
                         format!("({units}) * {}ul", layout.packet_size)
                     }
                     RepresentationKind::PackedRows(_) => {
@@ -1414,6 +1416,7 @@ impl<'a> Renderer<'a> {
         lines: &mut Vec<String>,
     ) {
         let source_layout = &source.geometry.layout;
+        assert!(source_layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
         let destination_layout = &destination.geometry.layout;
         let source_pointer = self.globals[source.buffer_ordinal as usize].pointer.clone();
         let destination_pointer = self.globals[destination.buffer_ordinal as usize]

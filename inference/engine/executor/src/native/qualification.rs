@@ -142,6 +142,7 @@ impl<'a> QualificationView<'a> {
             let bytes = target_element
                 .repack_source(
                     *source_element,
+                    &shape,
                     (0..length)
                         .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
                         .collect(),

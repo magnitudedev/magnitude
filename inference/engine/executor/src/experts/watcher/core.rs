@@ -15,15 +15,39 @@ use magnitude_kernels::constants;
 use std::sync::Arc;
 
 /// One routed tensor of a streamed layer as the model file stores it:
-/// expert `e`'s record is `bytes` at `base + e · pitch` of file `file`
-/// (`planning::StoredStack`), read into staging pool `pool`.
-#[derive(Clone, Copy, Debug)]
+/// expert `e`'s record is its `parts`, each read into staging pool `pool`,
+/// one after another (`planning::StoredStack`).
+#[derive(Clone, Debug)]
 pub(in crate::experts) struct StoredTensor {
+    pub parts: Vec<StoredPart>,
+    pub pool: usize,
+}
+
+/// One part of a stored record: expert `e`'s `bytes` at `base + e · pitch`
+/// of file `file` (`planning::StoredPart`).
+#[derive(Clone, Copy, Debug)]
+pub(in crate::experts) struct StoredPart {
     pub file: usize,
     pub base: u64,
     pub pitch: u64,
     pub bytes: u64,
-    pub pool: usize,
+}
+
+impl StoredTensor {
+    /// One expert's record as stored: its parts' bytes.
+    pub fn bytes(&self) -> u64 {
+        self.parts.iter().map(|part| part.bytes).sum()
+    }
+
+    /// The reads that bring expert `expert`'s record into record `record`
+    /// of `records`: one a part, each where the parts before it end.
+    pub fn reads<'a>(&'a self, expert: usize, records: &'a Records, record: u64) -> impl Iterator<Item = Read> + 'a {
+        self.parts.iter().scan(0, move |within, part| {
+            let at = *within;
+            *within += part.bytes;
+            Some(Read::new(part.file, part.base + expert as u64 * part.pitch, part.bytes, records, record, at))
+        })
+    }
 }
 
 /// A streamed layer's words and records.
@@ -105,7 +129,7 @@ pub(in crate::experts) struct ListRecords {
 impl Layer {
     /// The stored bytes of one of its experts.
     pub fn expert_bytes(&self) -> u64 {
-        self.stored.iter().map(|stored| stored.bytes).sum()
+        self.stored.iter().map(StoredTensor::bytes).sum()
     }
 }
 
@@ -320,10 +344,9 @@ impl ReadTable {
     pub(super) fn reads_into<'a>(&self, layer: usize, expert: usize, into: impl Fn(usize) -> (&'a Records, u64)) -> Vec<Read> {
         self.stored[layer]
             .iter()
-            .map(|stored| {
+            .flat_map(|stored| {
                 let (records, record) = into(stored.pool);
-                let offset = stored.base + expert as u64 * stored.pitch;
-                Read::new(stored.file, offset, stored.bytes, records, record)
+                stored.reads(expert, records, record)
             })
             .collect()
     }
@@ -498,7 +521,7 @@ impl Core {
                 .zip(tensors)
                 .map(|(stored, tensor)| {
                     let (records, record) = from(stored.pool);
-                    (records.clone(), record, stored.bytes, tensor.landed(landed))
+                    (records.clone(), record, stored.bytes(), tensor.landed(landed))
                 })
                 .collect(),
             grant,
@@ -517,10 +540,7 @@ impl Core {
                     .stored
                     .iter()
                     .zip(slots)
-                    .map(|(stored, records)| {
-                        let offset = stored.base + expert as u64 * stored.pitch;
-                        Read::new(stored.file, offset, stored.bytes, records, u64::from(slot))
-                    })
+                    .flat_map(|(stored, records)| stored.reads(expert, records, u64::from(slot)))
                     .collect()
             }
         }

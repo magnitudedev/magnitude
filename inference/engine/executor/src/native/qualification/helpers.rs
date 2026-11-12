@@ -831,12 +831,11 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         "q5g32" => unit_packet(size, &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])]),
         // E2M1 code 2 (value 1) and E8M0 scale 127 (2^0).
         "mxfp4g32" => unit_packet(size, &[(0, &[127]), (1, &[0x22; 16])]),
-        // An assembled block: E8M0 scale 127 (2^0), then E4M3 codes 0x38
-        // (value 1).
-        "mxfp8g32" => unit_packet(size, &[(0, &[127]), (1, &[0x38; 32])]),
-        // An assembled block: F32 scale 1.0, then E4M3 codes 0x38 (value
-        // 1).
-        "fp8g128" => unit_packet(size, &[(0, &1.0f32.to_le_bytes()), (4, &[0x38; 128])]),
+        // A planar block (`pattern_bytes`): E4M3 codes 0x38 (value 1), then
+        // their E8M0 scale 127 (2^0).
+        "mxfp8g32" => unit_packet(size, &[(0, &[0x38; 32]), (32, &[127])]),
+        // A planar block: E4M3 codes 0x38 (value 1), then their F32 scale 1.0.
+        "fp8g128" => unit_packet(size, &[(0, &[0x38; 128]), (128, &1.0f32.to_le_bytes())]),
         // E2M1 code 2 (value 1) and four UE4M3 scales 0x38 (1.0).
         "nvfp4g16" => unit_packet(size, &[(0, &[0x38; 4]), (4, &[0x22; 32])]),
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 (odd
@@ -924,20 +923,24 @@ fn gguf_source(representation: &str) -> Option<Element> {
 }
 
 /// The host-converted fixture of `extents`: `packet` repeated over the
-/// source's canonical bytes and converted into `element`.
+/// source's canonical bytes and converted into `element`. A planar source's
+/// packet is its codes then its scale (`Element::record_parts` of one row of
+/// a group): its codes plane repeats the codes, its grid the scale.
 fn pattern_bytes(
     element: Element,
     source: Element,
     packet: &[u8],
     extents: &[u64],
 ) -> Option<Vec<u8>> {
-    let length = usize::try_from(source.canonical_byte_len(extents).ok()?).ok()?;
-    let source_bytes = packet
-        .iter()
-        .copied()
-        .cycle()
-        .take(length)
-        .collect::<Vec<_>>();
+    let parts = source.record_parts(extents)?;
+    let packet_parts = source.record_parts(&[1, source.logical_group()?])?;
+    let mut at = 0;
+    let mut source_bytes = Vec::new();
+    for (part, packet_part) in parts.into_iter().zip(packet_parts) {
+        let piece = &packet[at..at + usize::try_from(packet_part).ok()?];
+        at += piece.len();
+        source_bytes.extend(piece.iter().copied().cycle().take(usize::try_from(part).ok()?));
+    }
     element.repack_host(source, extents, &source_bytes)
 }
 

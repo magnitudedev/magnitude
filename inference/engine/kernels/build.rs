@@ -373,8 +373,8 @@ fn main() {
 /// [..]`) expands to `mod gguf` with one module for each storage the
 /// registry converts GGUF formats into in that layout, holding one module
 /// for each such format, in ggml id order, a format under a scale grid
-/// named for it too (`gguf::q2g256::tq2_0`, `gguf::mxfp8g32::f8_e4m3_e8m0`,
-/// `gguf::fp8g128::f8_e4m3_f32`).
+/// named for it too (`gguf::q2g256::tq2_0`, `gguf::mxfp8g32::f8_e4m3_e8m0_32x32`,
+/// `gguf::fp8g128::f8_e4m3_f32_128x128`).
 /// A format's module has a test for each of the `every` functions, and for
 /// each `partial_block` function when whole blocks of it fill a
 /// `PARTIAL_BLOCK_WIDTHS` width (`partial_block_widths`). A storage's
@@ -384,7 +384,7 @@ fn main() {
 /// format's `crate::Format`.
 fn gguf_format_tests(out: &Path) {
     use magnitude_ggml::Encoding;
-    use seismic_lang::registry::{self, GgufScales, Layout, OperandRecipe};
+    use seismic_lang::registry::{self, GgufScales, Grid, Layout, OperandRecipe};
     let mut arms = String::new();
     for layout in Layout::ALL {
         // Each storage's modules, in the order its first format comes.
@@ -398,13 +398,23 @@ fn gguf_format_tests(out: &Path) {
             };
             let packet = registry::external_packet(source).expect("a GGUF source is external storage");
             let block = u64::from(packet.logical_group);
-            // The suffix of its modules' names, and its `GgufScales`
-            // expression.
-            let (suffix, scales) = match scales {
-                GgufScales::Own => (String::new(), "::seismic::GgufScales::Own".to_owned()),
-                GgufScales::Grid(grid) => (
-                    format!("_{}", grid.name()),
-                    format!("::seismic::GgufScales::Grid(::seismic::GridScale::{grid:?})"),
+            // Its modules' name, and its `GgufScales` expression: under its
+            // own scales its type's, under a grid its source's, which
+            // states the grid (`gguf_f8_e4m3_e8m0_32x32`: `f8_e4m3_e8m0_32x32`).
+            let (module, scales) = match scales {
+                GgufScales::Own => (
+                    encoding.ggml_name().to_ascii_lowercase(),
+                    "::seismic::GgufScales::Own".to_owned(),
+                ),
+                GgufScales::Grid(Grid { scale, tile: [rows, columns] }) => (
+                    registry::representation_info(source)
+                        .name
+                        .strip_prefix("gguf_")
+                        .expect("a GGUF source's name is `gguf_` and its own")
+                        .to_owned(),
+                    format!(
+                        "::seismic::GgufScales::Grid(::seismic::Grid {{ scale: ::seismic::GridScale::{scale:?}, tile: [{rows}, {columns}] }})"
+                    ),
                 ),
             };
             for operands in OperandRecipe::ALL {
@@ -436,8 +446,7 @@ fn gguf_format_tests(out: &Path) {
                     tests.push_str(" $($partial)*");
                 }
                 storages[index].1.push_str(&format!(
-                    " pub mod {}{suffix} {{ crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: {tests}); }}",
-                    encoding.ggml_name().to_ascii_lowercase()
+                    " pub mod {module} {{ crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: {tests}); }}"
                 ));
             }
         }

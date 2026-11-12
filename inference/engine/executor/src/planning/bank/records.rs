@@ -253,6 +253,15 @@ pub struct RecordTensor {
 }
 
 impl RecordTensor {
+    /// One expert as stored: a record of the staging it is read into, its
+    /// parts in the order they lie in it (`Element::record_parts`).
+    pub fn stored_parts(&self) -> Result<Vec<u64>, String> {
+        let [rows, columns] = self.matrix;
+        self.source
+            .record_parts(&[1, rows, columns])
+            .ok_or_else(|| format!("{} is not one matrix's parts of {rows}×{columns}", self.source.name()))
+    }
+
     /// One expert as stored: a record of the staging it is read into.
     pub fn stored_bytes(&self) -> Result<u64, String> {
         record_bytes(self.source, self.matrix)

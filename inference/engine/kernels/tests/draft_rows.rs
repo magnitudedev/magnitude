@@ -134,7 +134,7 @@ fn table_weight(
     let external = Element::named(external).unwrap();
     let shape = [rows as u64, columns as u64];
     let host = Element::stored(resident, Layout::Rows16).unwrap();
-    let bytes = host.repack_source(external, bytes).unwrap();
+    let bytes = host.repack_source(external, &shape, bytes).unwrap();
     let values = host
         .decode_host(&shape, &host.repack_host(external, &shape, &bytes).unwrap())
         .unwrap()

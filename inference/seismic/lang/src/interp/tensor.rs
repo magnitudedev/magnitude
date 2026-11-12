@@ -355,10 +355,10 @@ pub(super) fn encoded_bytes(
                     .collect::<Vec<_>>(),
             )
             .ok_or("row-layout tensor size overflow or rank below its layout's")?,
-        RepresentationKind::External(layout) => rows
-            .checked_mul((*last as u64).div_ceil(u64::from(layout.logical_group)))
-            .and_then(|packets| packets.checked_mul(u64::from(layout.packet_size)))
-            .ok_or("external tensor size overflow")?,
+        RepresentationKind::External(layout) => layout
+            .matrices(&shape.iter().map(|extent| *extent as u64).collect::<Vec<_>>())
+            .ok_or("external tensor size overflow")?
+            .tensor_bytes(),
         RepresentationKind::Dense(dtype) => rows
             .checked_mul(*last as u64)
             .and_then(|elements| elements.checked_mul(u64::from(dtype.bytes())))

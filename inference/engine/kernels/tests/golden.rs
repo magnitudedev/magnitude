@@ -414,10 +414,7 @@ impl Ctx {
             return self.dense_weight(shape, seed, element);
         }
         let mut rng = Rng::keyed(seed);
-        let values = shape.iter().product::<u64>() as usize;
-        let external = (0..values / format.block_values())
-            .flat_map(|_| format.block(&mut rng, WEIGHT_SCALE))
-            .collect::<Vec<_>>();
+        let external = format.external(&mut rng, shape, WEIGHT_SCALE);
         self.packed(format, shape, &external)
     }
     fn norm(&self, name: &str, element: Element) -> Arg {
@@ -1892,10 +1889,7 @@ fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
             let cases = [[1u64, 48, 512], [1, 37, 768], [3, 16, 256], [1, 1, 2560]]
                 .into_iter()
                 .map(|shape| {
-                    let n = shape.iter().product::<u64>() as usize;
-                    let external = (0..n / format.block_values())
-                        .flat_map(|_| format.block(&mut rng, WEIGHT_SCALE))
-                        .collect::<Vec<_>>();
+                    let external = format.external(&mut rng, &shape, WEIGHT_SCALE);
                     Case {
                         label: format!("{shape:?}"),
                         args: vec![Arg::Shared(ctx.tensor(format.source(), &shape, &external))],

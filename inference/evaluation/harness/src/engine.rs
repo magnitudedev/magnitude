@@ -700,8 +700,7 @@ pub fn expert_ranges(
     let mut ranges = std::collections::BTreeSet::new();
     for layer in bank.map(|bank| bank.stored_stacks(artifact)).transpose()?.into_iter().flatten() {
         for stack in layer {
-            let bytes = stack.bytes();
-            ranges.insert((stack.path, stack.offset, bytes));
+            ranges.extend(stack.file_ranges());
         }
     }
     Ok(ranges.into_iter().collect())

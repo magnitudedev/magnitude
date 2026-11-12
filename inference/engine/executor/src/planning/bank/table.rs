@@ -121,13 +121,17 @@ pub(super) fn stored_table_heads(definition: &ModelDefinition, role: WeightRole)
 /// for a stack stored whole, the range's first for a range of each expert's
 /// rows (`ImportTransform::Rows`, Gemma's gate‖up halves); `None` for a
 /// stack whose host-prepared bytes are not one range of each stored expert.
-/// A second-level scale leaves the bytes as stored.
+/// A second-level scale leaves the bytes as stored, as does a grid of block
+/// scales (`ScaleBlocks`: the source's own second part), which no range of
+/// rows is taken under: its grid is not rows of the stack.
 pub(super) fn stored_rows(descriptor: &magnitude_family_contracts::WeightDescriptor) -> Option<u64> {
     let mut start = 0;
     let mut ranges = 0;
+    let mut grid = false;
     for transform in &descriptor.transforms {
         match transform {
             ImportTransform::ScaleByTensor { .. } => {}
+            ImportTransform::ScaleBlocks { .. } => grid = true,
             ImportTransform::Rows(range) => {
                 start = range.start;
                 ranges += 1;
@@ -135,5 +139,5 @@ pub(super) fn stored_rows(descriptor: &magnitude_family_contracts::WeightDescrip
             _ => return None,
         }
     }
-    (ranges <= 1).then_some(start)
+    (ranges <= 1 && !(grid && ranges == 1)).then_some(start)
 }

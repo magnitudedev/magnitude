@@ -44,11 +44,8 @@ pub struct Weight {
 }
 
 pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut Rng) -> Weight {
-    let mut external = Vec::new();
-    for _ in 0..rows * k / format.block_values() {
-        external.extend(format.block(rng, WEIGHT_SCALE));
-    }
     let shape = [rows as u64, k as u64];
+    let external = format.external(rng, &shape, WEIGHT_SCALE);
     let resident = format.resident();
     let bytes = resident
         .repack_host(format.source(), &shape, &external)

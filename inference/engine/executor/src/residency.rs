@@ -20,9 +20,9 @@ use magnitude_artifacts::{
     Error as ArtifactError, FileSource,
     gguf::{Encoding, GgufArtifact},
 };
-use magnitude_family_contracts::{ScaleCodes, WeightDescriptor, WeightRole};
+use magnitude_family_contracts::{WeightDescriptor, WeightRole};
 use seismic::{
-    DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission,
+    DType, Device, Element, GgufScales, Grid, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission,
 };
 use std::{
     cell::RefCell,
@@ -154,13 +154,13 @@ impl StoredTensor {
 }
 
 /// The byte range of a stored grid of block scales
-/// (`ImportTransform::ScaleBlocks`), one code of `codes` a tile.
+/// (`ImportTransform::ScaleBlocks`), one scale of `grid` a tile.
 #[derive(Clone, Debug)]
 pub struct StoredGrid {
     pub source: Arc<FileSource>,
     pub offset: u64,
     pub nbytes: u64,
-    pub codes: ScaleCodes,
+    pub grid: Grid,
 }
 
 impl StoredGrid {
@@ -234,10 +234,12 @@ impl Stored {
         }
     }
 
+    /// The bytes of the source: the stored tensor's, and under a grid its
+    /// grid's too, which the source lays planar beside its codes.
     pub fn source_bytes(&self) -> u64 {
         match self {
             Self::Dense(tensor) => tensor.nbytes,
-            Self::GgmlBlocks { nbytes, .. } => *nbytes,
+            Self::GgmlBlocks { nbytes, grid, .. } => nbytes + grid.as_ref().map_or(0, |grid| grid.nbytes),
         }
     }
 
@@ -259,7 +261,7 @@ impl Stored {
                 ..
             } => crate::planning::scaled_source_element(
                 *encoding,
-                crate::import_transforms::scales_of(grid.as_ref().map(|grid| grid.codes)),
+                grid.as_ref().map_or(GgufScales::Own, |grid| GgufScales::Grid(grid.grid)),
                 shape.last().copied().unwrap_or(1),
             ),
         }
@@ -331,13 +333,13 @@ impl Stored {
         descriptor: &WeightDescriptor,
     ) -> Result<Self, WeightImportError> {
         let grid = crate::import_transforms::grid(descriptor)
-            .map(|(name, _, codes)| {
-                let grid = artifact.tensor(name)?;
+            .map(|(name, grid)| {
+                let stored = artifact.tensor(name)?;
                 Ok::<_, WeightImportError>(StoredGrid {
-                    source: grid.source,
-                    offset: grid.offset,
-                    nbytes: grid.nbytes,
-                    codes,
+                    source: stored.source,
+                    offset: stored.offset,
+                    nbytes: stored.nbytes,
+                    grid,
                 })
             })
             .transpose()?;
@@ -1939,7 +1941,7 @@ mod tests {
             nbytes: 48,
             shape: vec![8, 3, 2],
             encoding: Encoding::Q4K,
-            grid: Some(StoredGrid { source, offset: 64, nbytes: 16, codes: ScaleCodes::Ue8m0 }),
+            grid: Some(StoredGrid { source, offset: 64, nbytes: 16, grid: Grid::REGISTERED[0] }),
         };
         let Some(Stored::GgmlBlocks { offset, nbytes, shape, grid: Some(grid), .. }) = stack.leading(3) else {
             panic!("a stack of 8 experts has a leading 3");

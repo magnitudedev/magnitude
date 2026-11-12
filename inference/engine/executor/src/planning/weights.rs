@@ -19,7 +19,7 @@ use magnitude_state::KvCodec;
 use crate::operators::{code, scalar};
 use crate::programs::graph::GraphError;
 use crate::programs::graph::facts::{Numbers, constant};
-use seismic::{Argument, BackendName, DType, Dim, Element, GgufScales, Layout, MetalPacking, OperandRecipe};
+use seismic::{Argument, BackendName, DType, Dim, Element, GgufScales, Grid, Layout, MetalPacking, OperandRecipe};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3042,11 +3042,19 @@ fn push_weight(
         })?;
     let width = stored.shape.last().copied().unwrap_or(1);
     let scales = crate::import_transforms::stored_scales(descriptor);
-    let source = scaled_source_element(stored.encoding, scales, width).ok_or_else(|| {
-        format!(
+    let source = scaled_source_element(stored.encoding, scales, width).ok_or_else(|| match scales {
+        // A file's grid is read only under a tile some source registers.
+        GgufScales::Grid(grid) if !Grid::REGISTERED.contains(&grid) => format!(
+            "weight {:?}: its {} scale grid tiles it by {:?}, under which no source is \
+             registered",
+            descriptor.name,
+            grid.scale.name(),
+            grid.tile
+        ),
+        _ => format!(
             "weight {:?}: unsupported source encoding {:?} with {scales:?} scales",
             descriptor.name, stored.encoding
-        )
+        ),
     })?;
     // The logical shape the importer's exact transforms make of the stored
     // tensor (the stored shape when there are none).
@@ -3092,8 +3100,7 @@ fn push_weight(
         ),
     };
     // The bytes the tensor stores: its source's, or under a grid of block
-    // scales its codes', one block of its encoding a value (the grid is the
-    // binder's, `Tensors::companion_scale`).
+    // scales its codes', one block of its encoding a value.
     let source_bytes = match scales {
         GgufScales::Own => representation_bytes(source, &stored.shape)?,
         GgufScales::Grid(_) => {
@@ -3107,6 +3114,26 @@ fn push_weight(
             "weight {:?} ({role:?}) stores {} bytes, but its {:?} shape {:?} is {source_bytes}",
             descriptor.name, stored.nbytes, stored.encoding, stored.shape
         ));
+    }
+    // Under a grid (the binder's, `Tensors::companion_scale`) the source is
+    // the codes and the grid planar, every byte of each as stored.
+    if let Some((name, _)) = crate::import_transforms::grid(descriptor) {
+        let grid = inventory
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .ok_or_else(|| format!("weight {:?}: its scale grid {name:?} is absent from its component", descriptor.name))?;
+        let planar = representation_bytes(source, &stored.shape)?;
+        if stored.nbytes.checked_add(grid.nbytes) != Some(planar) {
+            return Err(format!(
+                "weight {:?} ({role:?}) stores {} bytes of codes and its grid {name:?} {}, but \
+                 its {} source of shape {:?} is {planar}",
+                descriptor.name,
+                stored.nbytes,
+                grid.nbytes,
+                source.name(),
+                stored.shape
+            ));
+        }
     }
     let resident_bytes = representation_bytes(resident, &logical)?;
     let scale = weight_scale(inventory, descriptor, &logical)?;
@@ -3389,8 +3416,10 @@ pub fn held_storage(
 /// is read under one ([`ImportTransform::scale_grid`], the rule the binder
 /// binds it by, `Tensors::companion_scale`, which also checks the grid),
 /// of the codes its stored type names (`ScaleCodes::of_stored`, as the
-/// binder reads them), else its own; `None` for a weight whose grid is
-/// absent or of a type that names no codes, whose scales are read nowhere.
+/// binder reads them) over the tile its shape gives
+/// (`ImportTransform::grid_tile`), else its own; `None` for a weight whose
+/// grid is absent, of a type that names no codes, or tiles it by no tile,
+/// whose scales are read nowhere.
 /// A grid is read only with its weight, so it is not among them.
 pub fn stored_weights(
     tensors: &[TensorDescriptor],
@@ -3405,8 +3434,11 @@ pub fn stored_weights(
                 Some(name) => tensors
                     .iter()
                     .find(|stored| stored.name == name)
-                    .and_then(|stored| ScaleCodes::of_stored(stored.encoding))
-                    .map(|codes| crate::import_transforms::scales_of(Some(codes))),
+                    .and_then(|stored| {
+                        let codes = ScaleCodes::of_stored(stored.encoding)?;
+                        let tile = ImportTransform::grid_tile(&tensor.shape, &stored.shape)?;
+                        Some(GgufScales::Grid(crate::import_transforms::scale_grid(codes, tile)))
+                    }),
                 None => Some(GgufScales::Own),
             };
             (tensor, scales)
@@ -3773,9 +3805,10 @@ mod stored_table_tests {
     }
 
     /// V4.1's n-gram table (384,006,168 E4M3 rows 256 wide under a `[1, 32]`
-    /// UE8M0 grid, slice B's) plans as a stored table of the assembled
-    /// 264-byte rows of mxfp8g32, each read as 256 bytes of codes and 8 of
-    /// scales, in the bytes of `NGRAM_TABLE_STORED_ROWS` assembled rows. A
+    /// UE8M0 grid, slice B's) plans as a stored table of the planar 264-byte
+    /// rows of `gguf_f8_e4m3_e8m0_1x32` (a row's 256 bytes of codes, then
+    /// its 8 scales, each read from its own tensor) converted into
+    /// mxfp8g32, in the bytes of `NGRAM_TABLE_STORED_ROWS` such rows. A
     /// grid that one row's scales do not tile alone, and a grid absent from
     /// the component, are refused, naming it.
     #[test]
@@ -3804,7 +3837,7 @@ mod stored_table_tests {
             push_stored_table(&mut out, inventory, component, ngram_role(), &descriptor(tile), form).map(|()| out.remove(0))
         };
         let table = plan(&inventory, [1, 32]).unwrap();
-        assert_eq!(table.upload, Element::gguf_source(Encoding::F8E4M3, GgufScales::Grid(seismic::GridScale::E8m0), 32).unwrap());
+        assert_eq!(table.upload, Element::named("gguf_f8_e4m3_e8m0_1x32").unwrap());
         assert_eq!(table.resident, Element::stored("mxfp8g32", Layout::Rows16).unwrap());
         assert_eq!(table.streamed().unwrap().fill, TableFill::Stored);
         let row = representation_bytes(table.upload, &[1, 256]).unwrap();
@@ -3875,6 +3908,11 @@ mod scale_grid_tests {
     use magnitude_family_contracts::ScaleCodes;
     use seismic::GridScale;
     use magnitude_artifacts::gguf::{GgufArtifact, StoredHeader};
+
+    /// The grid of `scale` scales per `tile`.
+    fn grid(scale: GridScale, tile: [u64; 2]) -> GgufScales {
+        GgufScales::Grid(Grid { scale, tile })
+    }
 
     const WEIGHT: &str = "blk.0.attn_q_b.weight";
     const SCALE: &str = "blk.0.attn_q_b.scale";
@@ -4027,15 +4065,18 @@ mod scale_grid_tests {
         let path = gguf(&[UE8M0_WEIGHT], "ue8m0");
         let (plan, values) = import(&path, Layout::Rows8, &UE8M0_WEIGHT).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(plan.source, Element::gguf_source(Encoding::F8E4M3, GgufScales::Grid(GridScale::E8m0), 32).unwrap());
+        assert_eq!(plan.source, Element::named("gguf_f8_e4m3_e8m0_32x32").unwrap());
         assert_eq!(plan.upload, plan.source);
         assert_eq!(plan.resident, Element::stored("mxfp8g32", Layout::Rows8).unwrap());
-        // The upload: one 33-byte block (scale, 32 codes) a row's 32 values.
-        assert_eq!(plan.source_bytes, SHAPE[0] * SHAPE[1] / 32 * 33);
+        // The upload is planar as the file stores it: the codes, a byte a
+        // value, then the grid, a byte a 32×32 tile.
+        assert_eq!(plan.source_bytes, SHAPE[0] * SHAPE[1] + SHAPE[0] * SHAPE[1] / (32 * 32));
         assert_bits("ue8m0", &values, &ue8m0_reference());
     }
 
-    fn gridded(tile: [u64; 2]) -> (WeightDescriptor, TensorDescriptor) {
+    /// [`WEIGHT`] under a UE8M0 grid of `tile`, and the inventory of it
+    /// and its grid.
+    fn gridded(tile: [u64; 2]) -> (WeightDescriptor, [TensorDescriptor; 2]) {
         let descriptor = WeightDescriptor {
             name: WEIGHT.into(),
             shape: SHAPE.to_vec(),
@@ -4052,34 +4093,47 @@ mod scale_grid_tests {
             offset: 0,
             nbytes: SHAPE[0] * SHAPE[1],
         };
-        (descriptor, weight)
+        let grid = [SHAPE[0] / tile[0], SHAPE[1] / tile[1]];
+        let scale = TensorDescriptor {
+            name: SCALE.into(),
+            shape: grid.to_vec(),
+            encoding: Encoding::I8,
+            offset: 0,
+            nbytes: grid[0] * grid[1],
+        };
+        (descriptor, [weight, scale])
     }
 
     /// A component's weights are read with their scales: an F8_E4M3 matrix
     /// under its `.scale` grid, which is read only with it, of E8M0 scales
-    /// stored as I8 and F32 ones as F32, and under none when its grid is
-    /// absent or stored otherwise; an NVFP4
-    /// weight's F32 `.scale` is a weight of its own, and so its weight's
-    /// scales are its blocks'.
+    /// stored as I8 and F32 ones as F32, over the tile the shapes give (a
+    /// registered one or not), and under none when its grid is absent,
+    /// stored otherwise, or tiles it by no tile; an NVFP4 weight's F32
+    /// `.scale` is a weight of its own, and so its weight's scales are its
+    /// blocks'.
     #[test]
     fn stored_weights_read_a_grid_with_its_weight() {
-        let tensor = |name: &str, encoding| TensorDescriptor {
+        let tensor = |name: &str, shape: &[u64], encoding| TensorDescriptor {
             name: name.into(),
-            shape: vec![64, 256],
+            shape: shape.to_vec(),
             encoding,
             offset: 0,
             nbytes: 0,
         };
         let tensors = [
-            tensor(WEIGHT, Encoding::F8E4M3),
-            tensor(SCALE, Encoding::I8),
-            tensor("blk.0.ffn_up.weight", Encoding::Nvfp4),
-            tensor("blk.0.ffn_up.scale", Encoding::F32),
-            tensor("blk.1.attn_q_b.weight", Encoding::F8E4M3),
-            tensor("blk.1.attn_q_b.scale", Encoding::F32),
-            tensor("blk.2.attn_q_b.weight", Encoding::F8E4M3),
-            tensor("blk.2.attn_q_b.scale", Encoding::F16),
-            tensor("blk.3.attn_q_b.weight", Encoding::F8E4M3),
+            tensor(WEIGHT, &SHAPE, Encoding::F8E4M3),
+            tensor(SCALE, &[2, 8], Encoding::I8),
+            tensor("blk.0.ffn_up.weight", &SHAPE, Encoding::Nvfp4),
+            tensor("blk.0.ffn_up.scale", &[1], Encoding::F32),
+            tensor("blk.1.attn_q_b.weight", &[256, 256], Encoding::F8E4M3),
+            tensor("blk.1.attn_q_b.scale", &[2, 2], Encoding::F32),
+            tensor("blk.2.attn_q_b.weight", &SHAPE, Encoding::F8E4M3),
+            tensor("blk.2.attn_q_b.scale", &[2, 8], Encoding::F16),
+            tensor("blk.3.attn_q_b.weight", &SHAPE, Encoding::F8E4M3),
+            tensor("blk.4.attn_q_b.weight", &SHAPE, Encoding::F8E4M3),
+            tensor("blk.4.attn_q_b.scale", &[3, 8], Encoding::I8),
+            tensor("blk.5.attn_q_b.weight", &SHAPE, Encoding::F8E4M3),
+            tensor("blk.5.attn_q_b.scale", &[64, 4], Encoding::I8),
         ];
         let read = stored_weights(&tensors)
             .map(|(tensor, scales)| (tensor.name.as_str(), scales))
@@ -4087,22 +4141,52 @@ mod scale_grid_tests {
         assert_eq!(
             read,
             [
-                (WEIGHT, Some(GgufScales::Grid(GridScale::E8m0))),
+                (WEIGHT, Some(grid(GridScale::E8m0, [32, 32]))),
                 ("blk.0.ffn_up.weight", Some(GgufScales::Own)),
                 ("blk.0.ffn_up.scale", Some(GgufScales::Own)),
-                ("blk.1.attn_q_b.weight", Some(GgufScales::Grid(GridScale::F32))),
+                ("blk.1.attn_q_b.weight", Some(grid(GridScale::F32, [128, 128]))),
                 ("blk.2.attn_q_b.weight", None),
                 ("blk.3.attn_q_b.weight", None),
+                ("blk.4.attn_q_b.weight", None),
+                ("blk.5.attn_q_b.weight", Some(grid(GridScale::E8m0, [1, 64]))),
             ]
         );
     }
 
-    /// A tile whose columns are no whole packets of the source (32 values,
-    /// one assembled block each) is refused, naming the weight and grid.
+    /// A weight under a grid whose tile no source registers is refused when
+    /// planned, naming the weight and its tile: UE8M0 scales per `[32, 16]`
+    /// or `[1, 64]`, F32 ones per `[32, 64]` or `[1, 128]`.
     #[test]
-    fn a_tile_of_partial_source_packets_is_refused() {
-        let (descriptor, weight) = gridded([32, 16]);
-        let error = plan(&[weight], &descriptor, Layout::Rows8).unwrap_err();
+    fn a_grid_of_an_unregistered_tile_is_refused_naming_the_weight_and_tile() {
+        for (codes, tile) in [
+            (ScaleCodes::Ue8m0, [32, 16]),
+            (ScaleCodes::Ue8m0, [1, 64]),
+            (ScaleCodes::F32, [32, 64]),
+            (ScaleCodes::F32, [1, 128]),
+        ] {
+            let (mut descriptor, inventory) = gridded(tile);
+            let ImportTransform::ScaleBlocks { codes: at, .. } = &mut descriptor.transforms[0] else {
+                unreachable!("a gridded weight");
+            };
+            *at = codes;
+            let error = plan(&inventory, &descriptor, Layout::Rows8).unwrap_err();
+            assert!(
+                error.contains(WEIGHT) && error.contains(&format!("{tile:?}")) && error.contains("no source is registered"),
+                "{codes:?} {tile:?}: {error}"
+            );
+        }
+    }
+
+    /// A weight whose grid is absent from its component, or stores other
+    /// bytes than the planar source's beside its codes, is refused, naming
+    /// the grid.
+    #[test]
+    fn a_grid_absent_or_of_other_bytes_is_refused_naming_it() {
+        let (descriptor, [weight, mut scale]) = gridded([32, 32]);
+        let error = plan(std::slice::from_ref(&weight), &descriptor, Layout::Rows8).unwrap_err();
+        assert!(error.contains(WEIGHT) && error.contains(SCALE) && error.contains("absent"), "{error}");
+        scale.nbytes += 1;
+        let error = plan(&[weight, scale], &descriptor, Layout::Rows8).unwrap_err();
         assert!(error.contains(WEIGHT) && error.contains(SCALE), "{error}");
     }
 
@@ -4110,11 +4194,11 @@ mod scale_grid_tests {
     /// layout.
     #[test]
     fn mxfp8_is_planned_and_measured_on_every_backend() {
-        let (descriptor, weight) = gridded([32, 32]);
+        let (descriptor, inventory) = gridded([32, 32]);
         for backend in BackendName::ALL {
             let layout = backend.resident_layout();
             let resident = Element::stored("mxfp8g32", layout).unwrap();
-            let planned = plan(std::slice::from_ref(&weight), &descriptor, layout);
+            let planned = plan(&inventory, &descriptor, layout);
             assert_eq!(planned.unwrap().resident, resident, "{backend:?}");
             assert!(resident_elements(layout).contains(&resident), "{backend:?}");
         }
@@ -4170,10 +4254,11 @@ mod scale_grid_tests {
     /// tile (an FP8 checkpoint's `weight_scale_inv`). In every backend's
     /// layout each imports in its own grid's codes: the UE8M0 one as
     /// mxfp8g32, every value its reference's (`ue8m0_reference`), and the
-    /// F32 ones as fp8g128, the codes bit for bit (a block of 128 of a
-    /// row's codes after its tile's scale, 132 bytes) and every value the
-    /// F32 reference's (`f32_reference`), E4M3 subnormals, −0 and NaN
-    /// codes, the least scale and products past F32's range included.
+    /// F32 ones from `gguf_f8_e4m3_f32_128x128` as fp8g128, uploaded planar
+    /// as stored (each matrix's codes, then its grid of a 4-byte scale per
+    /// 128×128 tile) and every value the F32 reference's
+    /// (`f32_reference`), E4M3 subnormals, −0 and NaN codes, the least
+    /// scale and products past F32's range included.
     #[test]
     fn one_file_imports_ue8m0_and_f32_grids_to_their_exact_values() {
         let scales = f32_bytes(&F32_SCALES);
@@ -4195,11 +4280,13 @@ mod scale_grid_tests {
             assert_bits(&format!("ue8m0 on {backend:?}"), &values, &ue8m0_reference());
             for weight in &f32_weights {
                 let (plan, values) = import(&path, layout, weight).unwrap();
-                let source = Element::gguf_source(Encoding::F8E4M3, GgufScales::Grid(GridScale::F32), 128).unwrap();
+                let source = Element::named("gguf_f8_e4m3_f32_128x128").unwrap();
                 assert_eq!((plan.source, plan.upload), (source, source));
                 assert_eq!(plan.resident, Element::stored("fp8g128", layout).unwrap(), "{backend:?}");
+                assert!(resident_elements(layout).contains(&plan.resident), "{backend:?}");
                 assert_eq!(plan.shape, weight.shape);
-                assert_eq!(plan.source_bytes, weight.shape.iter().product::<u64>() / 128 * 132);
+                let count = weight.shape.iter().product::<u64>();
+                assert_eq!(plan.source_bytes, count + count / (128 * 128) * 4);
                 let name = format!("{} on {backend:?}", weight.stem);
                 assert_bits(&name, &values, &f32_reference(weight.shape, &F32_SCALES));
             }
@@ -4233,32 +4320,5 @@ mod scale_grid_tests {
             assert!(error.contains("scale 5 of the grid") && error.contains(reason), "{bad:e}: {error}");
         }
     }
-
-    /// Under F32 scales a source block is 128 values, so a tile narrower
-    /// than 128 columns is refused, naming the weight and grid; a 128-wide
-    /// tile of any power-of-two rows plans, in every backend's layout.
-    #[test]
-    fn an_f32_grid_tiles_by_whole_128_value_blocks() {
-        let (mut descriptor, weight) = gridded([32, 32]);
-        let ImportTransform::ScaleBlocks { codes, .. } = &mut descriptor.transforms[0] else {
-            unreachable!("a gridded weight");
-        };
-        *codes = ScaleCodes::F32;
-        let tiled = |tile| {
-            let mut descriptor = descriptor.clone();
-            let ImportTransform::ScaleBlocks { tile: at, .. } = &mut descriptor.transforms[0] else {
-                unreachable!("a gridded weight");
-            };
-            *at = tile;
-            descriptor
-        };
-        let error = plan(std::slice::from_ref(&weight), &tiled([32, 64]), Layout::Rows8).unwrap_err();
-        assert!(error.contains(WEIGHT) && error.contains(SCALE), "{error}");
-        for backend in BackendName::ALL {
-            let layout = backend.resident_layout();
-            let planned = plan(std::slice::from_ref(&weight), &tiled([1, 128]), layout).unwrap();
-            assert_eq!(planned.resident, Element::stored("fp8g128", layout).unwrap(), "{backend:?}");
-            assert!(resident_elements(layout).contains(&planned.resident), "{backend:?}");
-        }
-    }
 }
+

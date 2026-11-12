@@ -255,8 +255,10 @@ pub enum ImportTransform {
     /// blocks) under the stored grid `tensor` of block scales: one scale of
     /// `codes` per `tile` (`[rows, columns]`, [`Self::tiles`]) of each
     /// matrix, the grid shaped `[rows / tile[0], columns / tile[1]]` (with
-    /// the stack's leading extent). The importer places each tile's scale
-    /// beside each block of its rows' values, which replicates it exactly.
+    /// the stack's leading extent). The importer reads the two planar, as
+    /// the file stores them, each matrix's codes then its grid: the source
+    /// of the grid's scale and tile (`seismic::GgufScales::Grid`), which a
+    /// weight under an unregistered tile has none of.
     ScaleBlocks {
         tensor: String,
         tile: [u64; 2],

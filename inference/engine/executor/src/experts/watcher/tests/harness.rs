@@ -346,10 +346,7 @@ pub(super) fn lending_bank(
     let staging =
         Tensor::shared(&device, Element::i32(), &[u64::from(staging_records) * 3 * 4]).unwrap();
     let stored_tensor = |kind: usize| StoredTensor {
-        file: 0,
-        base: kind as u64 * stored as u64 * RECORD,
-        pitch: RECORD,
-        bytes: RECORD,
+        parts: vec![StoredPart { file: 0, base: kind as u64 * stored as u64 * RECORD, pitch: RECORD, bytes: RECORD }],
         pool: kind,
     };
     // The steps, under whose lock every map entry is written, and whose
@@ -740,7 +737,7 @@ impl AheadLine {
         const REGISTERED: u8 = 1;
         const ENDED: u8 = 2;
         while !self.done.load(Ordering::Acquire) {
-            let read = Read::new(0, 0, self.bytes, &self.records.lock().unwrap(), 0);
+            let read = Read::new(0, 0, self.bytes, &self.records.lock().unwrap(), 0, 0);
             let ticket = self.source.request(vec![read], seismic_io::Want::now()).unwrap();
             let (line, state) = (self.clone(), Arc::new(AtomicU8::new(REGISTERING)));
             let ending = state.clone();
@@ -798,7 +795,7 @@ impl Ahead {
         let mut growing = Vec::new();
         loop {
             let workers = seismic_io::read_workers();
-            let read = Read::new(0, 0, Self::FILE, &records, 0);
+            let read = Read::new(0, 0, Self::FILE, &records, 0, 0);
             growing.push(source.request(vec![read], seismic_io::Want::undated(0.)).unwrap());
             if seismic_io::read_workers() == workers {
                 break;
@@ -819,7 +816,7 @@ impl Ahead {
     /// A read of the line's file behind it, wanted as `want`, outside the
     /// line: the test's to observe and to end.
     pub(super) fn read(&self, want: seismic_io::Want) -> Ticket {
-        let read = Read::new(0, 0, Self::FILE, &self.line.records.lock().unwrap(), 0);
+        let read = Read::new(0, 0, Self::FILE, &self.line.records.lock().unwrap(), 0, 0);
         self.line.source.request(vec![read], want).unwrap()
     }
 

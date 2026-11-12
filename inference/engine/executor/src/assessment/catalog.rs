@@ -453,21 +453,21 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         let conversion = seismic::cpu::repack::resolve(source.name(), resident.name())
             .unwrap_or_else(|| panic!("{context}: no host conversion into a row layout"));
         let (n, k) = (*n as usize, *k as usize);
-        let (tile, row) = (conversion.tile(), conversion.source_row_bytes(k));
-        let bytes = (0..n * row)
+        let (tile, record) = (conversion.tile(), conversion.source_bytes(n, k));
+        let bytes = (0..record)
             .map(|index| (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29) as u8)
             .collect();
-        let stored = resident.repack_source(source, bytes).unwrap();
+        let stored = resident.repack_source(source, &[n as u64, k as u64], bytes).unwrap();
         let expected = resident
             .repack_reference(source, &[n as u64, k as u64], &stored)
             .unwrap_or_else(|| panic!("{context}: no reference"));
-        let largest = ((128 << 10) / (tile * row)).max(1);
+        let largest = ((128 << 10) / conversion.source_bytes(tile, k)).max(1);
         for tiles in [1, largest] {
             let mut converted = vec![0xa5; expected.len()];
             let pieces = std::num::NonZeroUsize::new(tiles).unwrap();
-            for (from, to) in conversion.pieces(k, n, pieces).expect("a stored row") {
+            for (rows, to) in conversion.pieces(k, n, pieces).expect("a stored row") {
                 conversion
-                    .piece(k, &stored[from], &mut converted[to])
+                    .piece(k, n, rows, &stored, &mut converted[to])
                     .unwrap_or_else(|| panic!("{context}: a piece of {tiles} tiles"));
             }
             assert!(

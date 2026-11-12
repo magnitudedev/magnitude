@@ -1329,6 +1329,15 @@ fn render_representation(
                 "#define {prefix}_PACKET_SIZE {}\n#define {prefix}_PACKET_ALIGNMENT {}\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_PLANE_COUNT 0\n",
                 layout.packet_size, layout.packet_alignment, layout.logical_group
             ));
+            // The grid a planar source's scales lie in (`GridPlanes`), none
+            // (zeros) where each packet holds its own.
+            let (scale_bytes, tile) = layout.planes.map_or((0, [0, 0]), |planes| (planes.scale_bytes, planes.tile));
+            out.push_str(&format!(
+                "#define {prefix}_GRID_PLANAR {}\n#define {prefix}_GRID_SCALE_BYTES {scale_bytes}\n#define {prefix}_GRID_TILE_ROWS {}\n#define {prefix}_GRID_TILE_COLUMNS {}\n",
+                u32::from(scale_bytes != 0),
+                tile[0],
+                tile[1]
+            ));
         }
     }
 }
@@ -2410,22 +2419,32 @@ void probe() {
     /// seals and validates.
     #[test]
     fn vulkan_conversion_code_compiles_for_every_conversion() {
-        const ASSET: &str = "
+        // The probe's source: a packet's address (or byte offset in the group
+        // memory), or a planar source's two pieces, its codes and its scale.
+        let asset = |planar: bool| {
+            let (device, shared) = match planar {
+                false => ("packet", "gl_WorkGroupID.y * 256u"),
+                true => ("packet, packet + 2048ul", "gl_WorkGroupID.y * 256u, gl_WorkGroupID.y * 256u + 128u"),
+            };
+            format!(
+                "
 layout(local_size_x = 1) in;
-void probe() {
+void probe() {{
     const uint64_t packet = uint64_t(gl_WorkGroupID.x) * 4096ul;
     uint words[SEISMIC_CONVERSION_E_U_WORDS];
-    SEISMIC_CONVERSION_E_U_UNIT(packet, gl_WorkGroupID.z, words);
+    SEISMIC_CONVERSION_E_U_UNIT({device}, gl_WorkGroupID.z, words);
     uint value = words[0];
-    SEISMIC_CONVERSION_E_U_FIXED(packet, words);
+    SEISMIC_CONVERSION_E_U_FIXED({device}, words);
     value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
-    SEISMIC_CONVERSION_E_U_UNIT_SHARED(gl_WorkGroupID.y * 256u, gl_WorkGroupID.z, words);
+    SEISMIC_CONVERSION_E_U_UNIT_SHARED({shared}, gl_WorkGroupID.z, words);
     value |= words[0];
-    SEISMIC_CONVERSION_E_U_FIXED_SHARED(gl_WorkGroupID.y * 256u, words);
+    SEISMIC_CONVERSION_E_U_FIXED_SHARED({shared}, words);
     value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
     seismic_u32(uint64_t(gl_WorkGroupID.y) * 4ul).v = value;
-}
-";
+}}
+"
+            )
+        };
         for conversion in registry::representation_conversions() {
             let mut source = vulkan::header(VULKAN_FEATURES) + vulkan::shared_views().as_str();
             render_conversion(
@@ -2434,7 +2453,7 @@ void probe() {
                 conversion,
                 Dialect::Vulkan(VULKAN_FEATURES),
             );
-            source.push_str(ASSET);
+            source.push_str(&asset(conversion.source_layout.planes.is_some()));
             source.push_str(vulkan::SUFFIX);
             let environment = seismic_vulkan::seal::Environment {
                 float16: true,

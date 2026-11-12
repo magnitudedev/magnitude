@@ -173,7 +173,7 @@ fn held_records(device: &Device, tensor: RecordTensor, count: u64, seed: u64) ->
             }
             _ => {
                 let bytes = pattern(stored_bytes, seed, 1.0).iter().map(|value| (value * 127.0) as i8 as u8).collect();
-                tensor.resident.finite_source(tensor.source, bytes)
+                tensor.resident.finite_source(tensor.source, &record, bytes)
             }
         }
         .ok_or_else(|| failed(&format!("no representative {} record", tensor.source.name())))?;

@@ -28,12 +28,34 @@
 
 REPACK_TILE(repack, SEISMIC_CONVERSION_E_U, SEISMIC_ELEMENT_E, SEISMIC_RESULT_0)
 
+#if SEISMIC_ELEMENT_E_GRID_SCALE_BYTES != 0
+// A planar source (`ExternalPacketLayout::planes`): each matrix holds its
+// rows' packets' codes, then the grid of its tiles' scales, byte-packed
+// (lib/repack/planar.glsl, the matrix's extents the binding's).
+REPACK_PLANAR_SOURCE(source, SEISMIC_ELEMENT_E, SEISMIC_DIM_N, SEISMIC_DIM_K)
+
+// The codes of source packet `index` of row `n` of matrix `b`.
+uint64_t source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
+    return source + b * source_matrix_bytes() + source_code_at(n, index);
+}
+
+// The scale of the tile holding that packet.
+uint64_t source_scale(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
+    return source + b * source_matrix_bytes() + source_scale_at(n, index);
+}
+#else
 // Source packet `index` of row `n` of matrix `b`.
 uint64_t source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
     return source
         + (b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + index * SEISMIC_SOURCE_STRIDE_2)
         * uint64_t(SEISMIC_ELEMENT_E_PACKET_SIZE);
 }
+
+// No scale beside the packet.
+uint64_t source_scale(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
+    return 0ul;
+}
+#endif
 
 // Start of stored row `n` of matrix `b`, from its record's base in the
 // result's record table.
@@ -51,6 +73,7 @@ void repack_weight() {
     const uint64_t stored_columns = SEISMIC_RESULT_0_ROW_GROUPS * uint64_t(SEISMIC_ELEMENT_E_LOGICAL_GROUP);
     if (lane >= REPACK_TILE_ROWS || n >= SEISMIC_DIM_N || column0 >= stored_columns)
         return;
-    repack_place(source_packet(source, b, n, column0 / uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)), row_base(destination, b, n),
+    const uint64_t index = column0 / uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP);
+    repack_place(source_packet(source, b, n, index), source_scale(source, b, n, index), row_base(destination, b, n),
         column0);
 }

@@ -109,14 +109,14 @@ fn conversions_equal_on(device: &Device) {
             }
             let form = format!("{:?}: {} -> {} [{rows}, {k}]", device.backend(), conversion.source(), conversion.target());
             let mut rng = Rng::new(0x5eed ^ (rows * k) as u64);
-            assert_eq!(conversion.source_row_bytes(conversion.group()), streamed.packet, "{form}: packet bytes");
+            assert_eq!(conversion.source_bytes(1, conversion.group()), streamed.packet, "{form}: packet bytes");
             let stored = streamed.record(rows * k / conversion.group(), &mut rng);
             // The host's, as a landing converts a stored record.
             let row = conversion.stored_row_bytes(k).unwrap_or_else(|| panic!("{form}: the target holds no such row"));
             let mut host = vec![0u8; rows.next_multiple_of(conversion.tile()) * row];
-            let tiles = std::num::NonZeroUsize::new((CONVERSION_PIECE / (conversion.source_row_bytes(k) * conversion.tile())).max(1)).unwrap();
+            let tiles = std::num::NonZeroUsize::new((CONVERSION_PIECE / conversion.source_bytes(conversion.tile(), k)).max(1)).unwrap();
             for (from, to) in conversion.pieces(k, rows, tiles).unwrap() {
-                conversion.piece(k, &stored[from], &mut host[to]).unwrap_or_else(|| panic!("{form}: a piece did not convert"));
+                conversion.piece(k, rows, from, &stored, &mut host[to]).unwrap_or_else(|| panic!("{form}: a piece did not convert"));
             }
             // The device's.
             let tensor = seismic::Tensor::from_host(device, source, &[1, rows as u64, k as u64], &stored).unwrap();

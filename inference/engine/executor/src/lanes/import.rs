@@ -101,10 +101,9 @@ impl ValidatedImportLaunch {
         inputs: ImportLaunchInputs,
         domain: &ResourceDomainId,
     ) -> Result<Self, (ImportLaunchInputs, InvariantError)> {
-        let count = crate::planning::elements(&inputs.plan.shape);
         let source_tensor = inputs.workspace.source();
         let source_matches = source_tensor.element() == inputs.plan.upload
-            && count.is_some_and(|count| source_tensor.extents() == [count])
+            && crate::resources::source_extents(&inputs.plan).is_ok_and(|extents| source_tensor.extents() == extents)
             && source_tensor.byte_len() == inputs.plan.source_bytes
             && source_tensor.belongs_to(&inputs.destination.tensor().device());
         // A transformed weight uploads the transformed bytes of the stored

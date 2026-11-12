@@ -1488,22 +1488,47 @@ pub(crate) fn repack_bytes(
     source_bytes: &[u8],
 ) -> Vec<u8> {
     let conversion = registry::representation_conversion_info(conversion);
-    let forms = packet_forms(conversion, source_bytes);
+    let extents = shape
+        .iter()
+        .map(|extent| *extent as u64)
+        .collect::<Vec<_>>();
+    let forms = packet_forms(conversion, &extents, source_bytes);
+    place_forms(conversion, &extents, forms)
+}
+
+/// `forms`, the packet forms of a tensor of `extents` one after another,
+/// placed by `conversion`'s destination layout.
+pub(crate) fn place_forms(
+    conversion: &RepresentationConversion,
+    extents: &[u64],
+    forms: Vec<u8>,
+) -> Vec<u8> {
     match conversion.destination_layout {
-        ConversionLayout::Rows(layout) => layout.place(
-            &shape
-                .iter()
-                .map(|extent| *extent as u64)
-                .collect::<Vec<_>>(),
-            &forms,
-        ),
+        ConversionLayout::Rows(layout) => layout.place(extents, &forms),
         ConversionLayout::Packet(_) => forms,
     }
 }
 
-/// The packet forms of the source packets `source_bytes` through
-/// `conversion`'s recipe, one after another.
-pub(crate) fn packet_forms(conversion: &RepresentationConversion, source_bytes: &[u8]) -> Vec<u8> {
+/// The packet forms through `conversion`'s recipe of the packets of
+/// `source_bytes`, the bytes of a source tensor of `extents`, one after
+/// another: each packet's bytes where the source lays them
+/// (`SourceMatrices::packets`).
+pub(crate) fn packet_forms(
+    conversion: &RepresentationConversion,
+    extents: &[u64],
+    source_bytes: &[u8],
+) -> Vec<u8> {
+    let packets = conversion
+        .source_layout
+        .matrices(extents)
+        .expect("a source tensor's extents")
+        .packets(source_bytes);
+    forms_of_packets(conversion, &packets)
+}
+
+/// The packet forms through `conversion`'s recipe of `source_bytes`, whole
+/// source packets one after another, each its bytes in order.
+pub(crate) fn forms_of_packets(conversion: &RepresentationConversion, source_bytes: &[u8]) -> Vec<u8> {
     let source_layout = conversion.source_layout;
     let destination_layout = conversion.destination_layout.packet();
     let packet_count = source_bytes.len() / source_layout.packet_size as usize;

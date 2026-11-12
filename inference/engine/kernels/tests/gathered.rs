@@ -251,7 +251,7 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
             .collect(),
     };
     let stored_slots = resident_element
-        .repack_source(source_element, stored_slots)
+        .repack_source(source_element, &[slots as u64, width as u64], stored_slots)
         .unwrap();
     let resident_slots = resident_element
         .repack_host(source_element, &[slots as u64, width as u64], &stored_slots)
@@ -468,7 +468,7 @@ fn a_row_that_names_no_table_row_reads_zeros() {
         .repack_host(
             source,
             &[slots as u64, width as u64],
-            &resident.repack_source(source, stored_slots.clone()).unwrap(),
+            &resident.repack_source(source, &[slots as u64, width as u64], stored_slots.clone()).unwrap(),
         )
         .unwrap();
     // Rows 0 and 2 have no slot; the fourth selection's row has slot 3.

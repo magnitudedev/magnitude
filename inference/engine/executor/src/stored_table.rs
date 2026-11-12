@@ -37,8 +37,8 @@
 //! A row as stored is read from one range of each of its tensors
 //! (`RowRange`, `import_transforms::row_tensors`: the table's codes, and its
 //! scale grid's row where it has one), each in any file, and assembled by
-//! the importer's own transforms (`import_transforms::assemble_row`) before
-//! it is converted.
+//! the importer's own transforms (`import_transforms::assemble_row`: under a
+//! grid planar, the row's codes then its scales) before it is converted.
 //!
 //! A request's prompt rows are prefetched (`StoredTable::prefetch`) when its
 //! state opens: the filler reads them into free slots while no step waits,
@@ -457,7 +457,6 @@ struct Shared {
     /// The table's weight, whose transforms assemble a row as stored from
     /// its ranges (`import_transforms::assemble_row`).
     descriptor: WeightDescriptor,
-    stored: Element,
     /// How a row as stored becomes a slot's row.
     conversion: &'static RowConversion,
     width: u64,
@@ -531,7 +530,7 @@ impl StoredTable {
         let (slot_bytes, row_bytes) = (row_bytes(resident)?, row_bytes(stored)?);
         // A stored row and a slot's row are one piece of the conversion.
         let values = usize::try_from(width).map_err(|error| failed(&error))?;
-        let piece = (conversion.source_row_bytes(values), conversion.stored_row_bytes(values));
+        let piece = (conversion.source_bytes(1, values), conversion.stored_row_bytes(values));
         if piece != (row_bytes as usize, Some(slot_bytes as usize)) {
             return Err(failed(&"a stored row does not convert into one slot's row"));
         }
@@ -543,7 +542,6 @@ impl StoredTable {
         let zeros = ranges.iter().map(|range| vec![0u8; range.bytes]).collect::<Vec<_>>();
         let assembled = crate::import_transforms::assemble_row(
             descriptor,
-            stored,
             width,
             &zeros.iter().map(Vec::as_slice).collect::<Vec<_>>(),
         )
@@ -590,7 +588,6 @@ impl StoredTable {
             directory: directory_tensor,
             fields,
             descriptor: descriptor.clone(),
-            stored,
             conversion,
             width,
             slot_bytes: slot_bytes as usize,
@@ -1262,7 +1259,7 @@ impl Shared {
                 .map(|(range, bytes)| &bytes[index * range.bytes..][..range.bytes])
                 .collect::<Vec<_>>();
             // `new` assembled a row of these ranges.
-            let stored = crate::import_transforms::assemble_row(&self.descriptor, self.stored, self.width, &pieces)
+            let stored = crate::import_transforms::assemble_row(&self.descriptor, self.width, &pieces)
                 .expect("a row's ranges assemble into one row as stored");
             self.convert(&stored, &mut converted);
             // SAFETY: the slot's previous row has been read by every step
@@ -1283,11 +1280,11 @@ impl Shared {
 
     /// The slot row of the row `stored` as stored (`row_conversion`).
     fn convert(&self, stored: &[u8], slot: &mut [u8]) {
-        // `stored` is an assembled row, one row of `width` values as stored,
-        // and `slot` a buffer of `slot_bytes`, one resident row:
-        // one piece of the conversion (`Shared::new`).
+        // `stored` is an assembled row, the record of a matrix of one row
+        // of `width` values as stored, and `slot` a buffer of `slot_bytes`,
+        // one resident row: one piece of the conversion (`Shared::new`).
         self.conversion
-            .piece(self.width as usize, stored, slot)
+            .piece(self.width as usize, 1, 0..1, stored, slot)
             .expect("a stored row is one piece of the conversion into a slot's row");
     }
 
@@ -1356,7 +1353,7 @@ mod tests {
         let bytes = (0..ROW_BYTES)
             .map(|byte| (row as usize * 7 + byte * 13) as u8)
             .collect();
-        resident().repack_source(stored(), bytes).unwrap()
+        resident().repack_source(stored(), &[1, WIDTH], bytes).unwrap()
     }
 
     /// Table row `row` as its slot holds it: the registry's host reference
@@ -1665,7 +1662,7 @@ mod tests {
     }
 
     /// A table of E4M3 rows 256 wide under a `[1, 32]` UE8M0 grid, its codes
-    /// and its scales in two files (V4.1's n-gram table, `gguf_f8_e4m3_e8m0`):
+    /// and its scales in two files (V4.1's n-gram table, `gguf_f8_e4m3_e8m0_1x32`):
     /// each slot row read through `stored_rows` decodes to exactly
     /// `code·2^(e−127)`, its codes' and its own scales', every code (NaN
     /// codes NaN) under scales from 2^−27 to 2^12, on the CPU and Metal.
@@ -1704,7 +1701,7 @@ mod tests {
             let table = StoredTable::new(
                 &device,
                 &descriptor,
-                Element::named("gguf_f8_e4m3_e8m0").unwrap(),
+                Element::named("gguf_f8_e4m3_e8m0_1x32").unwrap(),
                 resident,
                 ROWS,
                 WIDTH,

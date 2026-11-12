@@ -32,6 +32,18 @@
 //! overlaps the unit's): `{prefix}_FIXED_LOAD(stage, loaded)` loads the
 //! `{prefix}_FIXED_LOADS` units into `loaded`, and `{prefix}_FIXED(stage,
 //! loaded, words)` stages them and places the words.
+//!
+//! A source under a companion grid (`registry::GridPlanes`) is planar: its
+//! packet (its scale's bytes, then its codes') lies in two pieces apart, its
+//! scale in the matrix's grid and its codes in the codes plane
+//! (`ExternalPacketLayout::packet_pieces`), which the code reads each from
+//! its own base, no word across the two (`Piece`). Metal's and Vulkan's
+//! functions take the two bases in the packet's place, `codes` (the packet's
+//! byte `scale_bytes` on) then `scale` (its bytes before it):
+//! `{prefix}_UNIT(codes, scale, unit, words)` and `{prefix}_FIXED(codes,
+//! scale, words)`. CUDA's code stages each segment from its piece, by
+//! `stage.load_codes` and `stage.load_scale` in `stage.load`'s place (the
+//! same arguments, `first` a byte of the piece, not of the packet).
 
 use super::Dialect;
 use seismic_lang::registry;
@@ -195,17 +207,138 @@ enum Source {
     Stage(TilePlans),
 }
 
+/// What the code reads a run of a source packet's bytes from: the packet
+/// whole (a source of one plane, or a CUDA stage's row, which holds every
+/// piece's staged bytes), or a planar source's scale or codes, each from its
+/// own base (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Piece {
+    Whole,
+    Scale,
+    Codes,
+}
+
+impl Piece {
+    /// The parameter holding its base (Metal, Vulkan).
+    fn base(self) -> &'static str {
+        match self {
+            Self::Whole => "packet",
+            Self::Scale => "scale",
+            Self::Codes => "codes",
+        }
+    }
+
+    /// The local viewing it in words of `size` bytes at `alignment`, moved
+    /// by slot `slot`'s byte displacement where a unit moves its runs.
+    fn view(self, slot: Option<u32>, size: u32, alignment: u32) -> String {
+        match (self, slot) {
+            (Self::Whole, None) => format!("source{size}_{alignment}"),
+            (Self::Whole, Some(slot)) => format!("moved{slot}_{size}_{alignment}"),
+            (piece, None) => format!("{}{size}_{alignment}", piece.base()),
+            (piece, Some(slot)) => format!("{}_moved{slot}_{size}_{alignment}", piece.base()),
+        }
+    }
+
+    /// The stage's load of its bytes (CUDA).
+    fn load(self) -> &'static str {
+        match self {
+            Self::Whole => "load",
+            Self::Scale => "load_scale",
+            Self::Codes => "load_codes",
+        }
+    }
+}
+
+/// A piece's bytes of a source packet: `bytes` of them from the packet's
+/// byte `first`, read in words of at most `alignment` bytes.
+#[derive(Clone, Copy)]
+struct PieceSpan {
+    piece: Piece,
+    first: u32,
+    bytes: u32,
+    alignment: u32,
+}
+
+/// A source's packet by the pieces holding its bytes (`Piece`), from its
+/// layout: the packet whole, or a planar source's scale then its codes.
+#[derive(Clone, Copy)]
+enum Pieces {
+    Whole(PieceSpan),
+    Planar { scale: PieceSpan, codes: PieceSpan },
+}
+
+impl Pieces {
+    fn of(layout: &registry::ExternalPacketLayout) -> Self {
+        let whole = PieceSpan {
+            piece: Piece::Whole,
+            first: 0,
+            bytes: layout.packet_size,
+            alignment: layout.packet_alignment,
+        };
+        let Some(planes) = layout.planes else {
+            return Self::Whole(whole);
+        };
+        // A piece's reads keep the alignment of the source's base and of
+        // the bytes before the piece in its plane: whole packets' codes, and
+        // before a scale the codes plane and whole scales.
+        let codes = layout.code_bytes();
+        let kept = |bytes: &[u32]| bytes.iter().copied().map(alignment).fold(layout.packet_alignment, u32::min);
+        Self::Planar {
+            scale: PieceSpan {
+                piece: Piece::Scale,
+                first: 0,
+                bytes: planes.scale_bytes,
+                alignment: kept(&[codes, planes.scale_bytes]),
+            },
+            codes: PieceSpan {
+                piece: Piece::Codes,
+                first: planes.scale_bytes,
+                bytes: codes,
+                alignment: kept(&[codes]),
+            },
+        }
+    }
+
+    /// Whether the code reads the packet from two bases (module docs).
+    fn planar(self) -> bool {
+        matches!(self, Self::Planar { .. })
+    }
+
+    /// The piece holding the packet's bytes `first..=last`. A run of a
+    /// planar source lies in one (its recipe reads a scale's bytes and its
+    /// codes' apart): one across two would be read across two bases.
+    fn holding(self, first: u32, last: u32) -> PieceSpan {
+        match self {
+            Self::Whole(whole) => whole,
+            Self::Planar { scale, codes } => {
+                let span = if last < codes.first { scale } else { codes };
+                assert!(
+                    span.first <= first && last < span.first + span.bytes,
+                    "a planar source's run lies in one piece"
+                );
+                span
+            }
+        }
+    }
+}
+
 impl Source {
-    /// The parameter of the source.
-    fn parameter(&self) -> &'static str {
+    /// The parameters of the source: a packet, or a planar source's two
+    /// pieces (`planar`, module docs).
+    fn parameter(&self, planar: bool) -> &'static str {
         match self {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Packet(PacketDialect::Glsl) => "uint64_t packet",
-            // A byte offset in the group memory.
+            Self::Packet(PacketDialect::Glsl) if !planar => "uint64_t packet",
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Packet(PacketDialect::GlslShared) => "uint packet",
+            Self::Packet(PacketDialect::Glsl) => "uint64_t codes, uint64_t scale",
+            // Byte offsets in the group memory.
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Packet(PacketDialect::GlslShared) if !planar => "uint packet",
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Packet(PacketDialect::GlslShared) => "uint codes, uint scale",
             // Metal: any address space's packet (`{name}_view`).
-            Self::Packet(PacketDialect::Msl) => "P packet",
+            Self::Packet(PacketDialect::Msl) if !planar => "P packet",
+            Self::Packet(PacketDialect::Msl) => "P codes, P scale",
             Self::Stage(_) => "const S &stage",
         }
     }
@@ -234,15 +367,14 @@ const WARP_LANES: u32 = 32;
 /// its group's members', from the lowest to the highest, so a member's
 /// staged bits lie as far from its representative's as in the packet (a
 /// unit moves each member within the bytes it spans). The lanes stage
-/// exactly those, coalesced, part by part, each maximal run of used bytes (a
-/// segment) at a position aligned to its copy unit: the widest that the
-/// source's packet alignment (at most 4, the widest unit a kernel reads a
-/// source packet in), the segment's first byte and length and its part's
-/// displacements allow.
+/// exactly those, coalesced, part by part, each maximal run of used bytes
+/// within a piece (a segment) at a position aligned to its copy unit: the
+/// widest that its piece's alignment (at most the packet alignment, at most
+/// 4, the widest unit a kernel reads a source packet in), the segment's first
+/// byte of its piece and length and its part's displacements allow.
 struct TilePlans {
-    /// Per plan its segments, each `[part, first byte, length, position,
-    /// copy unit]`.
-    segments: Vec<Vec<[u32; 5]>>,
+    /// Per plan its segments.
+    segments: Vec<Vec<Segment>>,
     /// Per class the staged bit of each run its representative visits, in
     /// visiting order.
     positions: Vec<Vec<u32>>,
@@ -253,9 +385,23 @@ struct TilePlans {
     stage_words: u32,
 }
 
+/// A segment of a tile plan: `length` bytes of part `part`, from byte
+/// `first` of piece `piece`, staged at byte `position` of a row's stage in
+/// copy units of `unit` bytes.
+#[derive(Clone, Copy)]
+struct Segment {
+    piece: Piece,
+    part: u32,
+    first: u32,
+    length: u32,
+    position: u32,
+    unit: u32,
+}
+
 impl TilePlans {
     fn of(words: &WordTable, source: &registry::ExternalPacketLayout) -> Self {
         let packet_size = source.packet_size;
+        let pieces = Pieces::of(source);
         let span = words.span();
         let mut segments = Vec::new();
         let mut positions: Vec<Vec<u32>> = Vec::new();
@@ -290,6 +436,9 @@ impl TilePlans {
                         });
                         let low = firsts.clone().min().unwrap() / 8;
                         let high = (firsts.max().unwrap() + source.length - 1) / 8;
+                        // (Its members' bytes in one piece, so the segments
+                        // of each piece stage every run whole.)
+                        pieces.holding(low, high);
                         if used.len() <= part {
                             used.resize(part + 1, vec![false; packet_size as usize]);
                         }
@@ -312,16 +461,25 @@ impl TilePlans {
                     if !used[byte as usize] {
                         continue;
                     }
-                    if byte == 0 || !used[byte as usize - 1] {
-                        let length = (byte..packet_size)
+                    let piece = pieces.holding(byte, byte);
+                    if byte == piece.first || !used[byte as usize - 1] {
+                        let length = (byte..piece.first + piece.bytes)
                             .take_while(|at| used[*at as usize])
                             .count() as u32;
-                        let unit = [byte, length, moved]
+                        let first = byte - piece.first;
+                        let unit = [first, length, moved]
                             .into_iter()
                             .map(alignment)
-                            .fold(source.packet_alignment, u32::min);
+                            .fold(piece.alignment, u32::min);
                         cursor = cursor.div_ceil(unit) * unit;
-                        plan.push([part as u32, byte, length, cursor, unit]);
+                        plan.push(Segment {
+                            piece: piece.piece,
+                            part: part as u32,
+                            first,
+                            length,
+                            position: cursor,
+                            unit,
+                        });
                     }
                     position[part][byte as usize] = cursor;
                     cursor += 1;
@@ -367,7 +525,7 @@ pub(super) fn render_conversion_code(
     dialect: Dialect,
 ) {
     let name = prefix.to_ascii_lowercase();
-    let (alignment, packet_size) = (layout.packet_alignment, layout.packet_size);
+    let pieces = Pieces::of(layout);
     // The source, after the views or readers its code reads through.
     let source = match dialect {
         Dialect::Cuda(_) => {
@@ -386,8 +544,9 @@ pub(super) fn render_conversion_code(
         // Device memory's views; the group memory's are the prefix's.
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(_) => {
-            // A read's alignment is a size's the packet alignment allows.
-            for read in [1u32, 2, 4].into_iter().filter(|size| *size <= alignment) {
+            // A read's alignment is a size's the packet alignment allows
+            // (every piece's at most it).
+            for read in [1u32, 2, 4].into_iter().filter(|size| *size <= layout.packet_alignment) {
                 for size in [1, 2, 4].into_iter().filter(|size| *size <= read) {
                     out.push_str(&format!(
                         "layout(buffer_reference, scalar, buffer_reference_align = {read}) readonly buffer {name}_{size}_{read} {{ uint{bits}_t v[]; }};\n",
@@ -413,12 +572,12 @@ pub(super) fn render_conversion_code(
     let function = spelling.function();
     // `{prefix}_UNIT{suffix}` and `{prefix}_FIXED{suffix}` reading `source`.
     let render = |out: &mut String, suffix: &str, source: &Source| {
-        let new = |reads| Code::new(words, &name, reads, &lookups, alignment, packet_size);
+        let new = |reads| Code::new(words, &name, reads, &lookups, pieces);
 
         // The span's units, each one's class and displacements.
         out.push_str(&format!(
             "{template}{function}void {prefix}_UNIT{suffix}({}, {} unit, {}) {{\n    switch (unit) {{\n",
-            source.parameter(),
+            source.parameter(pieces.planar()),
             spelling.word_type(),
             spelling.words_parameter(words.words())
         ));
@@ -472,7 +631,7 @@ pub(super) fn render_conversion_code(
         };
         out.push_str(&format!(
             "{template}{function}void {prefix}_FIXED{suffix}({}{loaded}, {}) {{\n",
-            source.parameter(),
+            source.parameter(pieces.planar()),
             spelling.words_parameter(words.words())
         ));
         for line in lines {
@@ -665,7 +824,7 @@ impl<'a> Plan<'a> {
         }
     }
 
-    fn segments(self) -> &'a [[u32; 5]] {
+    fn segments(self) -> &'a [Segment] {
         let plans = self.plans();
         match self {
             Self::Unit(_, class) => &plans.segments[class as usize],
@@ -700,11 +859,13 @@ struct Placement {
     reads: Vec<Read>,
 }
 
-/// A run a placement reads: its slot where a unit moves it (and whether by
-/// whole bytes), its address (its first bit in the source packet, or in a
-/// stage's row) and length.
+/// A run a placement reads: the piece it is read from, its slot where a
+/// unit moves it (and whether by whole bytes), its address (its first bit in
+/// the source packet, whichever piece holds it, or in a stage's row) and
+/// length.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Read {
+    piece: Piece,
     slot: Option<(u32, bool)>,
     at: i64,
     length: u32,
@@ -723,19 +884,21 @@ impl Placement {
                 Some(_) => next.from == self.from + self.length && next.reads == self.reads,
                 None => {
                     let (read, following) = (self.reads[0], next.reads[0]);
-                    following.slot == read.slot && following.at == read.at + length
+                    following.piece == read.piece
+                        && following.slot == read.slot
+                        && following.at == read.at + length
                 }
             }
     }
 
     /// The pieces placed alike, up to where they read and place: the same
-    /// value's bits, from runs of the same slots and lengths.
-    fn shape(&self) -> (Option<u32>, u32, u32, Vec<(Option<(u32, bool)>, u32)>) {
+    /// value's bits, from runs of the same pieces, slots and lengths.
+    fn shape(&self) -> PlacementShape {
         (
             self.record,
             self.from,
             self.length,
-            self.reads.iter().map(|read| (read.slot, read.length)).collect(),
+            self.reads.iter().map(|read| (read.piece, read.slot, read.length)).collect(),
         )
     }
 
@@ -749,6 +912,10 @@ impl Placement {
         self.reads.iter().map(|read| read.at).collect()
     }
 }
+
+/// What [`Placement::shape`] compares: the record, where it reads and how
+/// long, and its reads' pieces, slots and lengths.
+type PlacementShape = (Option<u32>, u32, u32, Vec<(Piece, Option<(u32, bool)>, u32)>);
 
 /// A placement's parameter in emitted code: a constant, or (a nest's
 /// member) an expression of the nest's counters with the values it takes.
@@ -796,9 +963,8 @@ struct Code<'a> {
     reads: Reads<'a>,
     /// Each lookup table's width (`render_lookups`).
     lookups: &'a [(WordLookup, u32)],
-    /// A source packet's alignment and bytes.
-    alignment: u32,
-    packet_size: u32,
+    /// The pieces holding a source packet's bytes.
+    pieces: Pieces,
     moves: Option<Moves<'a>>,
     /// The runs visited so far (`WordSpan`'s order).
     visited: usize,
@@ -825,16 +991,14 @@ impl<'a> Code<'a> {
         name: &'a str,
         reads: Reads<'a>,
         lookups: &'a [(WordLookup, u32)],
-        alignment: u32,
-        packet_size: u32,
+        pieces: Pieces,
     ) -> Self {
         Self {
             words,
             name,
             reads,
             lookups,
-            alignment,
-            packet_size,
+            pieces,
             moves: None,
             visited: 0,
             terms: Vec::new(),
@@ -908,7 +1072,7 @@ impl<'a> Code<'a> {
             let mut units = plan
                 .segments()
                 .iter()
-                .flat_map(|&[part, first, length, position, unit]| {
+                .flat_map(|&Segment { piece, part, first, length, position, unit }| {
                     let moved = match part {
                         0 => String::from("0"),
                         part => {
@@ -925,7 +1089,7 @@ impl<'a> Code<'a> {
                         (
                             WARP_LANES * index >= count,
                             (
-                                format!("{first}u, {length}u, {unit}u, {moved}, {index}u"),
+                                format!("{}({first}u, {length}u, {unit}u, {moved}, {index}u)", piece.load()),
                                 format!("{length}u, {position}u, {unit}u, {index}u"),
                             ),
                         )
@@ -940,7 +1104,7 @@ impl<'a> Code<'a> {
                     for (batch, units) in units.chunks(STAGE_BATCH).enumerate() {
                         for (index, (load, _)) in units.iter().enumerate() {
                             lines.push(format!(
-                                "const unsigned s{batch}_{index} = stage.load({load});"
+                                "const unsigned s{batch}_{index} = stage.{load};"
                             ));
                         }
                         for (index, (_, store)) in units.iter().enumerate() {
@@ -950,7 +1114,7 @@ impl<'a> Code<'a> {
                 }
                 Plan::Fixed(_) => {
                     for (index, (load, store)) in units.iter().enumerate() {
-                        loads.push(format!("loaded[{index}] = stage.load({load});"));
+                        loads.push(format!("loaded[{index}] = stage.{load};"));
                         lines.push(format!("stage.store(loaded[{index}], {store});"));
                     }
                 }
@@ -1047,23 +1211,26 @@ impl<'a> Code<'a> {
     }
 
     /// A run from a source packet in memory (straight-line code): the
-    /// aligned source words holding it (of one size, the widest within the
-    /// packet wherever a unit moves them), little-endian, shifted down and
+    /// aligned words of the piece holding it (of one size, the widest within
+    /// the piece wherever a unit moves them), little-endian, shifted down and
     /// masked unless the words end with the run. A moved run's words are
-    /// read from the packet moved by its slot's byte displacement, and
+    /// read from the piece moved by its slot's byte displacement, and
     /// shifted by its bit displacement more.
     fn packet_run(&mut self, bit: u32, length: u32, moved: Option<Moved>) -> String {
         let spelling = self.spelling();
+        // Its piece, and its first bit there.
+        let piece = self.pieces.holding(bit / 8, (bit + length - 1) / 8);
+        let bit = bit - 8 * piece.first;
         let (low_byte, high_byte) = moved.as_ref().map_or((0, 0), |moved| {
             (
                 *moved.bytes.iter().min().unwrap(),
                 *moved.bytes.iter().max().unwrap(),
             )
         });
-        // Alignment the moved packets keep.
+        // Alignment the moved pieces keep.
         let alignment = moved
             .as_ref()
-            .map_or(self.alignment, |moved| self.alignment.min(moved.alignment));
+            .map_or(piece.alignment, |moved| piece.alignment.min(moved.alignment));
         let (first, last) = (bit / 8, (bit + length - 1) / 8);
         let (start, size) = [4u32, 2, 1]
             .into_iter()
@@ -1071,7 +1238,7 @@ impl<'a> Code<'a> {
             .map(|size| (first / size * size, size))
             .find(|(start, size)| {
                 let end = (last / size + 1) * size;
-                *start as i32 + low_byte >= 0 && end as i32 + high_byte <= self.packet_size as i32
+                *start as i32 + low_byte >= 0 && end as i32 + high_byte <= piece.bytes as i32
             })
             .expect("a byte is a word");
         let end = (last / size + 1) * size;
@@ -1079,7 +1246,7 @@ impl<'a> Code<'a> {
         let wide = span > 32;
         let words = (start / size..end / size)
             .map(|index| {
-                let load = self.packet_word(moved.as_ref(), size, alignment, index);
+                let load = self.packet_word(piece.piece, moved.as_ref(), size, alignment, index);
                 let load = if wide { spelling.wide(&load) } else { load };
                 match 8 * (index * size - start) {
                     0 => load,
@@ -1110,32 +1277,30 @@ impl<'a> Code<'a> {
     }
 
     /// Word `index` of `size` bytes (aligned to `alignment`) of a source
-    /// packet, moved by `moved`'s slot: a local, read once.
-    fn packet_word(&mut self, moved: Option<&Moved>, size: u32, alignment: u32, index: u32) -> String {
+    /// packet's piece `piece`, moved by `moved`'s slot: a local, read once.
+    fn packet_word(&mut self, piece: Piece, moved: Option<&Moved>, size: u32, alignment: u32, index: u32) -> String {
         let spelling = self.spelling();
-        let view = match moved {
-            None => format!("source{size}_{alignment}"),
-            Some(moved) => format!("moved{}_{size}_{alignment}", moved.slot),
-        };
+        let view = piece.view(moved.map(|moved| moved.slot), size, alignment);
+        let base = piece.base();
         let declaration = match (self.reads, moved) {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            (Reads::Packet(PacketDialect::Glsl), None) => format!("{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}(packet);", name = self.name),
+            (Reads::Packet(PacketDialect::Glsl), None) => format!("{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}({base});", name = self.name),
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
             (Reads::Packet(PacketDialect::Glsl), Some(moved)) => format!(
-                "{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}(packet + uint64_t(int64_t(d{}b)));",
+                "{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}({base} + uint64_t(int64_t(d{}b)));",
                 moved.slot,
                 name = self.name
             ),
             // The view's first element: the packet's byte offset (a
             // multiple of the alignment) in `size`-byte elements.
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            (Reads::Packet(PacketDialect::GlslShared), None) => format!("const uint {view} = packet / {size}u;"),
+            (Reads::Packet(PacketDialect::GlslShared), None) => format!("const uint {view} = {base} / {size}u;"),
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
             (Reads::Packet(PacketDialect::GlslShared), Some(moved)) => {
-                format!("const uint {view} = uint(int(packet) + d{}b) / {size}u;", moved.slot)
+                format!("const uint {view} = uint(int({base}) + d{}b) / {size}u;", moved.slot)
             }
             (_, moved) => {
-                let base = moved.map_or_else(|| String::from("packet"), |moved| format!("packet + d{}b", moved.slot));
+                let base = moved.map_or_else(|| String::from(base), |moved| format!("{base} + d{}b", moved.slot));
                 let word = ["uchar", "ushort", "", "uint"][size as usize - 1];
                 format!("const auto {view} = {name}_view<{word}>({base});", name = self.name)
             }
@@ -1312,6 +1477,7 @@ impl<'a> Code<'a> {
                             let run_index = self.visited + index;
                             let bit = run.bit.wrapping_add(group.displacement(m, *parameter) as u32);
                             Read {
+                                piece: self.piece(bit, run.length),
                                 slot: self.slot(run_index),
                                 at: self.address(run_index, run.bit, bit),
                                 length: run.length,
@@ -1377,6 +1543,15 @@ impl<'a> Code<'a> {
             }
             let together = together.iter().map(|index| &gatherings[*index]).collect::<Vec<_>>();
             self.place(&together);
+        }
+    }
+
+    /// The piece a member's run of `length` bits from source bit `bit` is
+    /// read from: the packet's piece holding it, or a stage's row (CUDA).
+    fn piece(&self, bit: u32, length: u32) -> Piece {
+        match self.reads {
+            Reads::Packet(_) => self.pieces.holding(bit / 8, (bit + length - 1) / 8).piece,
+            Reads::Stage(_) => Piece::Whole,
         }
     }
 
@@ -1571,13 +1746,20 @@ impl<'a> Code<'a> {
 
     /// A run from a source packet in memory in a loop's body (Metal): the
     /// same number of aligned words for every member the loop visits (the
-    /// most any needs), of the widest size the packet's (and a moved
-    /// slot's) alignment allows that keeps every member's words within the
-    /// packet, from the word holding the member's first bit, shifted down
-    /// by its bit within it (and a bit-moved slot's displacement more: it
-    /// stays within the bytes the member's run spans), masked.
+    /// most any needs), of the widest size the alignment of the piece
+    /// holding them (and of a moved slot) allows that keeps every member's
+    /// words within the piece, from the word holding the member's first bit,
+    /// shifted down by its bit within it (and a bit-moved slot's
+    /// displacement more: it stays within the bytes the member's run spans),
+    /// masked.
     fn packet_bits(&mut self, at: &Parameter, length: u32, moved: Option<Moved>) -> String {
         let firsts = at.values();
+        // Their piece, and their first bits there.
+        let piece = self.pieces.holding(
+            (*firsts.iter().min().expect("a run has members") / 8) as u32,
+            ((*firsts.iter().max().expect("a run has members") + i64::from(length) - 1) / 8) as u32,
+        );
+        let firsts = firsts.iter().map(|first| first - 8 * i64::from(piece.first)).collect::<Vec<_>>();
         let (low, high) = moved.as_ref().map_or((0, 0), |moved| {
             (
                 i64::from(*moved.bytes.iter().min().unwrap()),
@@ -1586,7 +1768,7 @@ impl<'a> Code<'a> {
         });
         let alignment = moved
             .as_ref()
-            .map_or(self.alignment, |moved| self.alignment.min(moved.alignment));
+            .map_or(piece.alignment, |moved| piece.alignment.min(moved.alignment));
         let (size, count) = [4u32, 2, 1]
             .into_iter()
             .filter(|size| *size <= alignment)
@@ -1603,17 +1785,21 @@ impl<'a> Code<'a> {
                 let unit = i64::from(8 * size);
                 firsts.iter().all(|first| {
                     let start = first / unit * i64::from(*size);
-                    start + low >= 0 && start + count * i64::from(*size) + high <= i64::from(self.packet_size)
+                    start + low >= 0 && start + count * i64::from(*size) + high <= i64::from(piece.bytes)
                 })
             })
-            .expect("a byte's words stay within the packet");
+            .expect("a byte's words stay within the piece");
         let base = match &moved {
-            None => String::from("packet"),
-            Some(moved) => format!("packet + d{}b", moved.slot),
+            None => String::from(piece.piece.base()),
+            Some(moved) => format!("{} + d{}b", piece.piece.base(), moved.slot),
         };
         let local = format!("r{}", self.locals);
         self.locals += 1;
-        self.lines.push(format!("const uint {local} = {};", at.text()));
+        let at = match piece.first {
+            0 => at.text(),
+            first => format!("{} - {}u", at.text(), 8 * first),
+        };
+        self.lines.push(format!("const uint {local} = {at};"));
         let unit = 8 * size;
         let wide = count * i64::from(unit) > 32;
         let word = ["uchar", "ushort", "", "uint"][size as usize - 1];

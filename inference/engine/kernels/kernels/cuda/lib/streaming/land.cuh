@@ -37,6 +37,9 @@ struct Lander {
     Held held;
     Span span;
     u32 pitch;
+    // The window's scales (a planar source's): in registers, and where they go.
+    HeldScales<most(scale_iters<GateBinding>(), scale_iters<UpBinding>(), scale_iters<DownBinding>())> scales;
+    ScaleSpan scale_span;
 };
 
 // Load window `window_index` of row tile `row_tile` of entry (from, to)'s
@@ -44,16 +47,20 @@ struct Lander {
 template <class B>
 __device__ __forceinline__ void land_load(Lander &land, u32 tensor, int from, int to, u64 row_tile, u64 window_index) {
     const Window<B> window(land.words);
-    land.span = span_of(window, place_of<B>(window, land.source[tensor], land.destination[tensor], land.words, from, to,
-                                            row_tile, window_index));
+    const Placed<B> placed =
+        place_of<B>(window, land.source[tensor], land.destination[tensor], land.words, from, to, row_tile, window_index);
+    land.span = span_of(window, placed);
     land.pitch = window.pitch;
     land.held.load(land.span);
+    land.scale_span = scale_span_of(placed);
+    land.scales.load(land.scale_span);
 }
 
 // The held window into the block's window, between barriers.
 __device__ __forceinline__ void land_store(Lander &land) {
     __syncthreads();
     land.held.store(land.span, land.pitch, land.shared.window);
+    land.scales.store(land.scale_span, land.shared.window);
     __syncthreads();
 }
 

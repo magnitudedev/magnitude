@@ -277,6 +277,12 @@ scales' encoding, so each grid is read in its own and one file can hold both. (P
 files also carry a file-wide `magnitude.scale_encoding`, `"ue8m0"` or `"f32"`; it agrees with
 their grids' type, and no reader reads it.)
 
+The importer reads a weight as the file stores it, planar: each matrix's codes, then its grid.
+Each registered grid is a source of its own, named for its scales and tile
+(`gguf_f8_e4m3_e8m0_1x32`, `gguf_f8_e4m3_e8m0_32x32`, `gguf_f8_e4m3_f32_128x128`), which the
+resident conversion reads in place. A weight under any other tile has no source, and planning
+refuses it, naming the weight and its tile.
+
 - I8: UE8M0 bytes b, the scale 2^(b − 127) (OCP MX's E8M0: 255 is NaN). DeepSeek V4.1's
   dense FP8 weights have 32 × 32 tiles, and its Engram table 1 × 32. The weight is resident as
   `mxfp8g32`, with one E8M0 scale per 32 values of a row.

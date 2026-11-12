@@ -151,19 +151,64 @@ template <class B> __device__ __forceinline__ u64 tiles_y(const seismic_words_t 
     return (B::n(seismic_words_value) + Shape<B>::TILE_ROWS - 1) / Shape<B>::TILE_ROWS;
 }
 
+// A planar source's geometry (`ExternalPacketLayout::planes`): each matrix
+// its codes plane (a row's packets' codes after the row before's), then its
+// grid of one scale per tile, a tile row's after the one before's.
+namespace planar {
+template <class B> __device__ __forceinline__ u64 row_packets(const seismic_words_t &seismic_words_value) {
+    return (B::k(seismic_words_value) + B::group() - 1) / B::group();
+}
+template <class B> __device__ __forceinline__ u64 codes_bytes(const seismic_words_t &seismic_words_value) {
+    return B::n(seismic_words_value) * row_packets<B>(seismic_words_value) * B::code_bytes();
+}
+template <class B> __device__ __forceinline__ u64 grid_columns(const seismic_words_t &seismic_words_value) {
+    return (B::k(seismic_words_value) + B::grid_tile_columns() - 1) / B::grid_tile_columns();
+}
+template <class B> __device__ __forceinline__ u64 grid_bytes(const seismic_words_t &seismic_words_value) {
+    return (B::n(seismic_words_value) + B::grid_tile_rows() - 1) / B::grid_tile_rows() * grid_columns<B>(seismic_words_value) *
+           B::scale_bytes();
+}
+// The byte of the scale of packet `packet` of row `n` in the grid.
+template <class B> __device__ __forceinline__ u64 scale_at(const seismic_words_t &seismic_words_value, u64 n, u64 packet) {
+    return (n / B::grid_tile_rows() * grid_columns<B>(seismic_words_value) + packet * B::group() / B::grid_tile_columns()) *
+           B::scale_bytes();
+}
+} // namespace planar
+
 // Addressing of the bound source tensor at `source`: packet `packet` of row
 // `n` of matrix `b`, and the bytes between rows.
 template <class B> struct Strided {
     const u8 *source;
 
+    // The packet's codes, or its bytes whole of a source of one plane.
     __device__ __forceinline__ const u8 *packet(const seismic_words_t &seismic_words_value, u64 b, u64 n,
                                                 u64 packet) const {
-        return source + (b * B::source_stride_0(seismic_words_value) + n * B::source_stride_1(seismic_words_value) +
-                         packet * B::source_stride_2(seismic_words_value)) *
-                            B::source_packet_size();
+        if constexpr (B::planar()) {
+            return source + b * B::source_matrix_bytes(seismic_words_value) +
+                   (n * planar::row_packets<B>(seismic_words_value) + packet) * B::code_bytes();
+        } else {
+            return source + (b * B::source_stride_0(seismic_words_value) + n * B::source_stride_1(seismic_words_value) +
+                             packet * B::source_stride_2(seismic_words_value)) *
+                                B::source_packet_size();
+        }
     }
     __device__ __forceinline__ u64 row_bytes(const seismic_words_t &seismic_words_value) const {
-        return B::source_stride_1(seismic_words_value) * B::source_packet_size();
+        if constexpr (B::planar())
+            return planar::row_packets<B>(seismic_words_value) * B::code_bytes();
+        else
+            return B::source_stride_1(seismic_words_value) * B::source_packet_size();
+    }
+    // A planar source's scale of the tile holding packet `packet` of row
+    // `n`, in its grid after the matrix's codes.
+    __device__ __forceinline__ const u8 *scale(const seismic_words_t &seismic_words_value, u64 b, u64 n,
+                                               u64 packet) const {
+        return source + b * B::source_matrix_bytes(seismic_words_value) + planar::codes_bytes<B>(seismic_words_value) +
+               planar::scale_at<B>(seismic_words_value, n, packet);
+    }
+    // The bytes between the scales of consecutive rows of a tile: its rows'
+    // own where a tile is a row, none where it spans the tile's rows.
+    __device__ __forceinline__ u64 scale_row_bytes(const seismic_words_t &seismic_words_value) const {
+        return B::grid_tile_rows() == 1u ? planar::grid_columns<B>(seismic_words_value) * B::scale_bytes() : 0u;
     }
 };
 
@@ -188,6 +233,10 @@ template <class B, u32 LANES> struct Stage {
     u64 row_bytes;
     u32 real, lane, mask;
     u32 *rows;
+    // A planar source's grid: the first row's scale of the tile, and the
+    // bytes between its rows' (`Strided::scale`).
+    const u8 *scale;
+    u64 scale_row_bytes;
 
     // Whether staged unit `index` of a segment of `length` bytes, copied in
     // units of `unit`, lies past the tile's: the plans deal its units to a
@@ -217,11 +266,24 @@ template <class B, u32 LANES> struct Stage {
     // between its stores: measured against A7, iq3_s 1.09x, q3_k packet
     // 1.09x its time).
     __device__ __forceinline__ u32 load(u32 first, u32 length, u32 unit, int moved, u32 index) const {
+        return read(source, row_bytes, first, length, unit, moved, index);
+    }
+    // A planar source's piece: its codes' bytes `first` on (a packet's, the
+    // codes plane's), or its scale's.
+    __device__ __forceinline__ u32 load_codes(u32 first, u32 length, u32 unit, int moved, u32 index) const {
+        return read(source, row_bytes, first, length, unit, moved, index);
+    }
+    __device__ __forceinline__ u32 load_scale(u32 first, u32 length, u32 unit, int moved, u32 index) const {
+        return read(scale, scale_row_bytes, first, length, unit, moved, index);
+    }
+    // The unit of `base`'s row `r` (rows `row_step` apart).
+    __device__ __forceinline__ u32 read(const u8 *base, u64 row_step, u32 first, u32 length, u32 unit, int moved,
+                                        u32 index) const {
         if (past(length, unit, index))
             return 0u;
         u32 r, k;
         locate(length, unit, index, r, k);
-        const u8 *from = source + r * row_bytes + moved + first + k * unit;
+        const u8 *from = base + r * row_step + moved + first + k * unit;
         u32 value = 0;
         if (r < real) {
             if (unit == 4) value = *reinterpret_cast<const u32 *>(from);
@@ -296,8 +358,24 @@ template <class B, class A, u32 LANES> struct Tile {
     }
 
     __device__ __forceinline__ Stage<B, LANES> staging() const {
-        return Stage<B, LANES>{source.packet(seismic_words_value, b, row0, packet), source.row_bytes(seismic_words_value),
-                               real(), lane, mask, stage};
+        if constexpr (B::planar())
+            return Stage<B, LANES>{source.packet(seismic_words_value, b, row0, packet),
+                                   source.row_bytes(seismic_words_value),
+                                   real(),
+                                   lane,
+                                   mask,
+                                   stage,
+                                   source.scale(seismic_words_value, b, row0, packet),
+                                   source.scale_row_bytes(seismic_words_value)};
+        else
+            return Stage<B, LANES>{source.packet(seismic_words_value, b, row0, packet),
+                                   source.row_bytes(seismic_words_value),
+                                   real(),
+                                   lane,
+                                   mask,
+                                   stage,
+                                   nullptr,
+                                   0u};
     }
 
     // Row `lane`'s record words (zero where its row holds no source
@@ -761,6 +839,21 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
         __host__ __device__ static constexpr repack::u32 source_packet_size() {                             \
             return (repack::u32)ELEMENT_CAT(S, _PACKET_SIZE);                               \
         }                                                                                                   \
+        /* A source under a companion grid (`ExternalPacketLayout::planes`): its scales' bytes and the */ \
+        /* tile of values each scales, 0 without; its packets' codes are the rest. */                      \
+        __host__ __device__ static constexpr repack::u32 scale_bytes() {                                    \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, (repack::u32)ELEMENT_CAT(S, _GRID_SCALE_BYTES), 0u);     \
+        }                                                                                                   \
+        __host__ __device__ static constexpr repack::u32 grid_tile_rows() {                                      \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, (repack::u32)ELEMENT_CAT(S, _GRID_TILE_ROWS), 0u);       \
+        }                                                                                                   \
+        __host__ __device__ static constexpr repack::u32 grid_tile_columns() {                                 \
+            return REPACK_WHEN(S, _KIND_EXTERNAL, (repack::u32)ELEMENT_CAT(S, _GRID_TILE_COLUMNS), 0u);    \
+        }                                                                                                   \
+        __host__ __device__ static constexpr bool planar() { return scale_bytes() != 0u; }                  \
+        __host__ __device__ static constexpr repack::u32 code_bytes() {                                     \
+            return source_packet_size() - scale_bytes();                                                    \
+        }                                                                                                   \
         __host__ __device__ static constexpr repack::u32 packet_size() {                                    \
             return REPACK_WHEN(D, _LAYOUT_PACKET,                                           \
                                (repack::u32)ELEMENT_CAT(D, _PACKET_SIZE), 0u);              \
@@ -906,10 +999,14 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
         __device__ static __forceinline__ repack::u64 source_stride_0(const seismic_words_t &seismic_words_value) { \
             return (repack::u64)ELEMENT_CAT(S, _STRIDE_0);                                                  \
         }                                                                                                   \
+        /* A planar source strides by matrices (its tensor's last two axes are one unit): its rows and */   \
+        /* packets are those of its codes plane, a row's `row_packets` packets of `code_bytes`. */           \
         __device__ static __forceinline__ repack::u64 source_stride_1(const seismic_words_t &seismic_words_value) { \
+            if (planar()) return (k(seismic_words_value) + group() - 1) / group();                          \
             return (repack::u64)ELEMENT_CAT(S, _STRIDE_1);                                                  \
         }                                                                                                   \
         __device__ static __forceinline__ repack::u64 source_stride_2(const seismic_words_t &seismic_words_value) { \
+            if (planar()) return 1u;                                                                        \
             return (repack::u64)ELEMENT_CAT(S, _STRIDE_2);                                                  \
         }                                                                                                   \
         __device__ static __forceinline__ repack::u64 out_stride_0(const seismic_words_t &seismic_words_value) { \
@@ -934,7 +1031,11 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
         }                                                                                                   \
         __device__ static __forceinline__ repack::u64 source_matrix_bytes(                                  \
             const seismic_words_t &seismic_words_value) {                                                   \
-            return REPACK_MATRIX_BYTES(S);                                                                  \
+            if constexpr (planar())                                                                         \
+                return repack::planar::codes_bytes<Name>(seismic_words_value) +                          \
+                       repack::planar::grid_bytes<Name>(seismic_words_value);                           \
+            else                                                                                            \
+                return REPACK_MATRIX_BYTES(S);                                                              \
         }                                                                                                   \
         __device__ static __forceinline__ repack::u64 out_row_groups(const seismic_words_t &seismic_words_value) { \
             return REPACK_ROW_WORD(D, _ROW_GROUPS);                                                         \

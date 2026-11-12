@@ -109,28 +109,37 @@ pub struct HintWeight {
     pub element: Option<Element>,
 }
 
-/// One expert stack as its model file stores it: the stored tensor of one
-/// routed tensor of one layer, from `offset` in `path`, each of its
-/// `experts` experts' `pitch` bytes in turn; each expert's record lies
-/// `first` bytes into its own, and within it. A stack stored whole reads
-/// its experts whole (`first` 0); a range of each stored expert's rows
-/// (`ImportTransform::Rows`, Gemma 4's gate‖up halves) from the range's
-/// first row.
+/// One expert stack as its model file stores it: `experts` experts of one
+/// routed tensor of one layer, each one's record its `parts` read in turn
+/// (`Element::record_parts`: its codes, then under a grid of block scales
+/// its grid, which the file keeps as a tensor of its own).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredStack {
-    pub path: std::path::PathBuf,
-    pub offset: u64,
     pub experts: u64,
-    pub pitch: u64,
-    pub first: u64,
+    pub parts: Vec<StoredPart>,
 }
 
 impl StoredStack {
-    /// The stack's bytes in its file: never past the stored tensor's, whose
-    /// bytes `pitch` divides among its experts.
-    pub fn bytes(&self) -> u64 {
-        self.experts * self.pitch
+    /// The range of its file each part's experts lie in, in order: the path,
+    /// the offset and the bytes of the experts' whole stored tensor.
+    pub fn file_ranges(&self) -> impl Iterator<Item = (std::path::PathBuf, u64, u64)> + '_ {
+        self.parts.iter().map(|part| (part.path.clone(), part.offset, self.experts * part.pitch))
     }
+}
+
+/// One part of a stored stack: the stored tensor from `offset` in `path`,
+/// each expert's `pitch` bytes in turn; each expert's `bytes` of the part
+/// lie `first` bytes into its own. A stack stored whole reads its experts
+/// whole (`first` 0); a range of each stored expert's rows
+/// (`ImportTransform::Rows`, Gemma 4's gate‖up halves) from the range's
+/// first row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPart {
+    pub path: std::path::PathBuf,
+    pub offset: u64,
+    pub pitch: u64,
+    pub first: u64,
+    pub bytes: u64,
 }
 
 /// A streamed load's expert bank.
@@ -420,7 +429,10 @@ impl ExpertBankPlan {
         let mut widest = None::<(u64, Vec<u64>)>;
         for group in self.groups() {
             let record = &group.record;
-            let parts = record.gate.iter().chain([&record.up, &record.down]).map(|tensor| tensor.stored_bytes()).collect::<Result<Vec<_>, _>>()?;
+            let mut parts = Vec::new();
+            for tensor in record.gate.iter().chain([&record.up, &record.down]) {
+                parts.extend(tensor.stored_parts()?);
+            }
             let bytes = parts.iter().sum::<u64>();
             if widest.as_ref().is_none_or(|(most, _)| bytes > *most) {
                 widest = Some((bytes, parts));
@@ -449,29 +461,37 @@ impl ExpertBankPlan {
                 layer.resident.as_ref().try_map(|kind, weight| {
                     let stored = crate::residency::Stored::from_gguf(artifact, &weight.descriptor)
                         .map_err(|error| error.to_string())?;
-                    let (source, offset, bytes) = stored.file_range();
                     let name = &weight.descriptor.name;
-                    if bytes % layer.experts != 0 {
-                        return Err(format!("{name:?} stores {bytes} bytes, not {} experts", layer.experts));
-                    }
                     let tensor = record.get(kind).ok_or("a layer's stacks disagree with its group's record")?;
                     let start = stored_rows(&weight.descriptor)
                         .ok_or_else(|| format!("{name:?}: a banked stack is stored whole or as a row range"))?;
-                    let record_bytes = tensor.stored_bytes()?;
-                    let first = start
-                        .checked_mul(record_bytes / tensor.matrix[0])
-                        .ok_or_else(|| format!("{name:?}: its first row's offset overflows"))?;
-                    let pitch = bytes / layer.experts;
-                    if first.checked_add(record_bytes).is_none_or(|end| end > pitch) {
-                        return Err(format!("{name:?}: its rows lie past each stored expert"));
+                    // Each part of the record is a stored tensor of its own:
+                    // the codes, then under a grid the grid's.
+                    let (source, offset, bytes) = stored.file_range();
+                    let files = std::iter::once((source, offset, bytes))
+                        .chain(stored.grid().map(|grid| (&grid.source, grid.offset, grid.nbytes)));
+                    let record_parts = tensor.stored_parts()?;
+                    let stored_files = 1 + usize::from(stored.grid().is_some());
+                    if stored_files != record_parts.len() {
+                        return Err(format!("{name:?} stores {stored_files} parts, its record has {}", record_parts.len()));
                     }
-                    Ok(StoredStack {
-                        path: source.path().to_owned(),
-                        offset,
-                        experts: layer.experts,
-                        pitch,
-                        first,
-                    })
+                    let parts = files
+                        .zip(&record_parts)
+                        .map(|((source, offset, bytes), &record_bytes)| {
+                            if bytes % layer.experts != 0 {
+                                return Err(format!("{name:?} stores {bytes} bytes, not {} experts", layer.experts));
+                            }
+                            let first = start
+                                .checked_mul(record_bytes / tensor.matrix[0])
+                                .ok_or_else(|| format!("{name:?}: its first row's offset overflows"))?;
+                            let pitch = bytes / layer.experts;
+                            if first.checked_add(record_bytes).is_none_or(|end| end > pitch) {
+                                return Err(format!("{name:?}: its rows lie past each stored expert"));
+                            }
+                            Ok(StoredPart { path: source.path().to_owned(), offset, pitch, first, bytes: record_bytes })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(StoredStack { experts: layer.experts, parts })
                 })
             })
             .collect()

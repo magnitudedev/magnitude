@@ -463,9 +463,7 @@ fn gguf_weight(format: Format, rows: usize, k: usize, rng: &mut Rng, scale: f32)
         0,
         "{repr:?} rows of whole GGUF blocks"
     );
-    let external = (0..rows * k / format.block_values())
-        .flat_map(|_| format.block(rng, scale))
-        .collect::<Vec<_>>();
+    let external = format.external(rng, &[rows as u64, k as u64], scale);
     gguf_weight_of(format, rows, k, &external)
 }
 

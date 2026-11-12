@@ -1032,6 +1032,10 @@ mod internals {
                 }
                 registry::RepresentationKind::External(_) => {
                     symbols.insert(format!("{prefix}_KIND_EXTERNAL"));
+                    symbols.insert(format!("{prefix}_GRID_PLANAR"));
+                    symbols.insert(format!("{prefix}_GRID_SCALE_BYTES"));
+                    symbols.insert(format!("{prefix}_GRID_TILE_ROWS"));
+                    symbols.insert(format!("{prefix}_GRID_TILE_COLUMNS"));
                 }
                 // The row-layout ABI of the frozen weight-storage interface
                 // (native-program-execution.md, "Weight storage").

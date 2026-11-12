@@ -14,7 +14,9 @@ pub fn representation_alignment(representation: RepresentationId) -> u64 {
 /// Concrete per-axis storage units and the byte width of one unit.
 /// Packed/external final axes count packets rather than logical elements.
 /// Row layouts count rows: the final axis is one unit of the row stride, and
-/// `mma16` pads the row axis to whole 16-row tiles.
+/// `mma16` pads the row axis to whole 16-row tiles. A source under a
+/// companion grid (`ExternalPacketLayout::planes`) counts matrices: its
+/// last two axes are one unit, the matrix's codes and then its grid.
 pub fn concrete_storage_units(
     representation: RepresentationId,
     extents: &[u64],
@@ -25,6 +27,13 @@ pub fn concrete_storage_units(
         RepresentationKind::Packed(packet) => {
             *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.group));
             u64::from(packet.packet_size)
+        }
+        RepresentationKind::External(packet) if packet.planes.is_some() => {
+            let matrices = packet.matrices(extents)?;
+            let leading = extents.len().checked_sub(2)?;
+            units.truncate(leading);
+            units.extend([1, 1]);
+            matrices.bytes
         }
         RepresentationKind::External(packet) => {
             *units.last_mut()? = extents.last()?.div_ceil(u64::from(packet.logical_group));

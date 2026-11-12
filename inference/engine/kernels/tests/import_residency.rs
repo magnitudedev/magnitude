@@ -53,54 +53,63 @@ fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) 
     (file[4..4 + bytes].to_vec(), values)
 }
 
-/// Assembled blocks of every E4M3 code under E8M0 scales across their range
-/// (0, the F32 subnormal 2^-127; 254, where the largest codes overflow; 255,
-/// NaN), and each value as OCP MX defines it: the code's value
-/// (`e4m3::value`) times 2^(scale - 127), one F32 product.
-fn e8m0_grid_vectors() -> (Vec<u8>, Vec<f32>) {
+/// E8M0 scales across their range (0, the F32 subnormal 2^-127; 254, where
+/// the largest codes overflow; 255, NaN), each its byte and its value as
+/// OCP MX defines it, 2^(scale - 127).
+fn e8m0_scales() -> Vec<(Vec<u8>, f32)> {
     let e8m0 = |scale: u8| match scale {
         255 => f32::NAN,
         0 => f32::from_bits(0x0040_0000),
         scale => f32::from_bits(u32::from(scale) << 23),
     };
-    let (mut bytes, mut values) = (Vec::new(), Vec::new());
-    for scale in [0u8, 1, 100, 120, 127, 140, 254, 255] {
-        for codes in (0..=u8::MAX).collect::<Vec<_>>().chunks_exact(32) {
-            bytes.push(scale);
-            bytes.extend_from_slice(codes);
-            values.extend(codes.iter().map(|code| e4m3::value(*code) * e8m0(scale)));
-        }
-    }
-    (bytes, values)
+    [0u8, 1, 100, 120, 127, 140, 254, 255].map(|scale| (vec![scale], e8m0(scale))).to_vec()
 }
 
-/// Assembled blocks of every E4M3 code under F32 scales (four bytes, then
-/// 128 codes) across the range the importer admits (`f32_scale`: zero, ±0,
+/// F32 scales across the range the importer admits (`f32_scale`: zero, ±0,
 /// 2^-117, amax / 448 values, values whose products round, one whose
-/// largest products overflow), and each value as the F32 reference holds
-/// it: the code's value (`e4m3::value`) times the scale, one F32 product.
-fn f32_grid_vectors() -> (Vec<u8>, Vec<f32>) {
+/// largest products overflow), each its bytes and itself.
+fn f32_scales() -> Vec<(Vec<u8>, f32)> {
     let least = f32::from_bits(10 << 23);
-    let (mut bytes, mut values) = (Vec::new(), Vec::new());
-    for scale in [0.0f32, -0.0, least, -least, 2.232_142_9e-3, 0.1, -0.333_333_34, 1.000_000_1, 1234.567, 3.0e38] {
-        for codes in (0..=u8::MAX).collect::<Vec<_>>().chunks_exact(128) {
-            bytes.extend_from_slice(&scale.to_le_bytes());
-            bytes.extend_from_slice(codes);
-            values.extend(codes.iter().map(|code| e4m3::value(*code) * scale));
+    [0.0f32, -0.0, least, -least, 2.232_142_9e-3, 0.1, -0.333_333_34, 1.000_000_1, 1234.567, 3.0e38]
+        .map(|scale| (scale.to_le_bytes().to_vec(), scale))
+        .to_vec()
+}
+
+/// Every E4M3 code under each scale of `grid`'s kind (`e8m0_scales`,
+/// `f32_scales`), as the planar source of `grid` stores them: a tile's rows
+/// of 256 values per scale, every row every code once, every tile of them
+/// under the scale. Its bytes (the codes, then the grid), its shape, and
+/// each value as the reference holds it: the code's value
+/// (`e4m3::value`) times the scale, one F32 product.
+fn grid_vectors(grid: seismic::Grid) -> (Vec<u8>, [u64; 2], Vec<f32>) {
+    const COLUMNS: u64 = 256;
+    let scales = match grid.scale {
+        seismic::GridScale::E8m0 => e8m0_scales(),
+        seismic::GridScale::F32 => f32_scales(),
+    };
+    let [tile_rows, tile_columns] = grid.tile;
+    let (mut codes, mut scale_bytes, mut values) = (Vec::new(), Vec::new(), Vec::new());
+    for (bytes, scale) in &scales {
+        for _ in 0..tile_rows {
+            codes.extend(0..=u8::MAX);
+            values.extend((0..=u8::MAX).map(|code| e4m3::value(code) * scale));
+        }
+        for _ in 0..COLUMNS / tile_columns {
+            scale_bytes.extend_from_slice(bytes);
         }
     }
-    (bytes, values)
+    ([codes, scale_bytes].concat(), [scales.len() as u64 * tile_rows, COLUMNS], values)
 }
 
 /// Every GGUF source the registry converts from imports, in every layout and
 /// for every operand recipe, to exactly the reference dequantization of its
-/// type's vectors, in rows of 128 values (of one source packet, when
-/// wider): a GGUF type's gguf-py's, and a scale grid's assembled blocks'
-/// as OCP MX defines them (`e8m0_grid_vectors`) or the F32 reference does
-/// (`f32_grid_vectors`), NaN where it is NaN.
+/// type's vectors: a GGUF type's gguf-py's, in rows of 128 values (of one
+/// source packet, when wider), and a scale grid's planar codes and scales
+/// (`grid_vectors`) as OCP MX defines them or the F32 reference does, NaN
+/// where it is NaN.
 #[test]
 fn every_gguf_source_imports_as_the_reference_dequantizes() {
-    use seismic::{GgufScales, GridScale};
+    use seismic::GgufScales;
     for (source, operands) in conversions() {
         let width = source.logical_group().unwrap().max(128);
         let encoding = |scales| {
@@ -109,13 +118,15 @@ fn every_gguf_source_imports_as_the_reference_dequantizes() {
                 .find(|encoding| seismic::Element::gguf_source(*encoding, scales, width) == Some(source))
         };
         let scales = GgufScales::ALL.into_iter().filter(|scales| encoding(*scales).is_some()).collect::<Vec<_>>();
-        let (bytes, reference) = match scales[..] {
-            [GgufScales::Own] => reference_vectors(encoding(GgufScales::Own).unwrap()),
-            [GgufScales::Grid(GridScale::E8m0)] => e8m0_grid_vectors(),
-            [GgufScales::Grid(GridScale::F32)] => f32_grid_vectors(),
+        let (bytes, shape, reference) = match scales[..] {
+            [GgufScales::Own] => {
+                let (bytes, reference) = reference_vectors(encoding(GgufScales::Own).unwrap());
+                let shape = [reference.len() as u64 / width, width];
+                (bytes, shape, reference)
+            }
+            [GgufScales::Grid(grid)] => grid_vectors(grid),
             _ => panic!("{} is no one encoding's source", source.name()),
         };
-        let shape = [reference.len() as u64 / width, width];
         let bits = |value: f32| if value.is_nan() { f32::NAN.to_bits() } else { value.to_bits() };
         for layout in seismic::Layout::ALL {
             let element = source.converted(layout, operands).unwrap();
@@ -505,6 +516,56 @@ fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
     }
 }
 
+/// A planar source's streamed conversion (`routed_round`, its window holding
+/// the codes and the scales of their tiles) at GLM-5.3-Flash's real expert
+/// extents, up/gate and down, equals the registry's host conversion byte for
+/// byte: the planar windows' tile grids at a width of many windows, which the
+/// small shapes of the every-format test do not reach.
+fn planar_streamed_conversion_matches_the_host_at_real_extents(device: &seismic::Device) {
+    let resident = device.backend().resident_layout();
+    for (source_element, operands) in conversions().into_iter().filter(|(element, _)| element.is_planar()) {
+        let destination = source_element.converted(resident, operands).unwrap();
+        if has_records(destination) {
+            continue;
+        }
+        for shape in [[1, 16, 256], [1, 16, 6144], [1, 48, 6144], [2, 2048, 6144], [2, 6144, 2048]] {
+            let bytes = source_bytes(source_element.canonical_byte_len(&shape).unwrap(), shape[1] as u32);
+            let source = seismic::Tensor::from_host(device, source_element, &shape, &bytes).unwrap();
+            let label = format!("{} -> {} over {shape:?}", source_element.name(), destination.name());
+            let actual = streamed_conversion(device, &source, destination, &shape);
+            let expected = destination.repack_host(source_element, &shape, &bytes).unwrap();
+            assert!(
+                actual == expected,
+                "{label}: streamed: {} of {} bytes differ, the first at {:?}",
+                actual.iter().zip(&expected).filter(|(a, b)| a != b).count(),
+                expected.len(),
+                actual.iter().zip(&expected).position(|(a, b)| a != b)
+            );
+        }
+    }
+}
+
+#[test]
+fn cuda_planar_streamed_conversion_matches_the_host_at_real_extents() {
+    if let Some(device) = device(seismic::BackendName::Cuda) {
+        planar_streamed_conversion_matches_the_host_at_real_extents(&device);
+    }
+}
+
+#[test]
+fn metal_planar_streamed_conversion_matches_the_host_at_real_extents() {
+    if let Some(device) = device(seismic::BackendName::Metal) {
+        planar_streamed_conversion_matches_the_host_at_real_extents(&device);
+    }
+}
+
+#[test]
+fn vulkan_planar_streamed_conversion_matches_the_host_at_real_extents() {
+    if let Some(device) = device(seismic::BackendName::Vulkan) {
+        planar_streamed_conversion_matches_the_host_at_real_extents(&device);
+    }
+}
+
 fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
     let device = device.clone();
     let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
@@ -614,7 +675,7 @@ fn streamed_conversion(
     let mut slots = zeros(destination, shape);
     let mut down_slots = zeros(bf16, &down);
     let list = magnitude_kernels::list_extent(1);
-    routed_round::native_for_device_with(
+    let native = routed_round::native_for_device_with(
         device,
         routed_round::Elements {
             SG: source.element(),
@@ -626,7 +687,8 @@ fn streamed_conversion(
         },
         &seismic::NativeSpecialization::new(),
     )
-    .unwrap()
+    .unwrap();
+    native
     .call_answered(routed_round::Args {
         step: &step,
         scratch: &mut shared(&table.extents(), &scratch),

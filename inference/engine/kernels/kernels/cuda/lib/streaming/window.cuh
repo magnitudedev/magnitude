@@ -75,8 +75,27 @@ __host__ __device__ constexpr u32 load_unit(u32 packet) {
 template <class B> struct Window {
     typedef repack::Shape<B> S;
     static constexpr u32 ROWS = S::TILE_ROWS;
-    static constexpr u32 PACKET = B::source_packet_size();
-    static_assert(STREAMING_WINDOW_FITS(ROWS, PACKET, SEISMIC_CONST_WINDOW_BYTES), "a window holds a packet of each row");
+    // A planar source's window holds its packets' codes (`B::code_bytes()`),
+    // and beside them, after them in the block's window, the scales of its
+    // tile (`SCALES` of them: a row's own where a tile is a row, else the
+    // tile's, `Placed`): the bytes of the scales' area (`SCALE_AT` on) come
+    // off what the codes have.
+    static constexpr u32 PACKET = B::planar() ? B::code_bytes() : B::source_packet_size();
+    static constexpr u32 MOST_UNRESERVED = SEISMIC_CONST_WINDOW_BYTES / (ROWS * PACKET);
+    static constexpr u32 SCALE_ROWS = !B::planar() ? 0u : B::grid_tile_rows() == 1u ? ROWS : 1u;
+    // A row of the window's packets lies in at most this many scales' tiles
+    // along it (the window's first packet need not be a tile's first).
+    static constexpr u32 TILE_COLUMNS = B::planar() ? B::grid_tile_columns() : 1u;
+    static constexpr u32 SCALES_PER_ROW =
+        !B::planar() ? 0u : (MOST_UNRESERVED * B::group() + TILE_COLUMNS - 1u) / TILE_COLUMNS + 1u;
+    static constexpr u32 SCALES = SCALE_ROWS * SCALES_PER_ROW;
+    static constexpr u32 SCALE_PITCH = SCALES_PER_ROW * B::scale_bytes();
+    static constexpr u32 SCALE_AREA = (SCALE_ROWS * SCALE_PITCH + 15u) / 16u * 16u;
+    static constexpr u32 CODES_BYTES = SEISMIC_CONST_WINDOW_BYTES - SCALE_AREA;
+    static constexpr u32 SCALE_AT = CODES_BYTES;
+    // Each thread's share of the window's scales, in registers (`HeldScales`).
+    static constexpr u32 SCALE_ITERS = (SCALES + SEISMIC_CONST_WINDOW_THREADS - 1u) / SEISMIC_CONST_WINDOW_THREADS;
+    static_assert(STREAMING_WINDOW_FITS(ROWS, PACKET, CODES_BYTES), "a window holds a packet of each row");
     static constexpr u32 NARROW = load_unit(PACKET);
 
     u32 row_packets, source_packets, tiles_x, packets, windows, pitch, unit;
@@ -88,7 +107,7 @@ template <class B> struct Window {
         row_packets = streaming_window_row_packets((u64)tiles_x * S::TILE_COLUMNS, B::group());
         source_packets = (u32)((B::k(seismic_words_value) + B::group() - 1) / B::group());
         const u64 row = (u64)source_packets * PACKET, stride = B::source_stride_1(seismic_words_value) * PACKET;
-        const u32 window = SEISMIC_CONST_WINDOW_BYTES;
+        const u32 window = CODES_BYTES;
         whole = streaming_window_whole(ROWS, (u32)stride, window);
         packets = streaming_window_packets(ROWS, row_packets, PACKET, (u32)stride, window);
         pitch = streaming_window_pitch(ROWS, PACKET, packets, (u32)stride, window);
@@ -98,6 +117,14 @@ template <class B> struct Window {
         const bool wide = whole ? (stride == row ? n * row % 16 == 0 : stride % 16 == 0 && row % 16 == 0)
                                 : stride % 16 == 0 && row % 16 == 0 && pitch == packets * PACKET;
         unit = aligned && wide ? 16u : NARROW;
+        if constexpr (B::planar()) {
+            // A planar record is its codes and its grid, whose bytes need not
+            // fill 16-byte units: records lie only as aligned as their size
+            // lets them, and a load unit wider than that faults.
+            const u32 kept = load_unit((u32)((B::source_matrix_bytes(seismic_words_value) |
+                                              B::out_matrix_bytes(seismic_words_value)) % 16));
+            unit = kept < unit ? kept : unit;
+        }
     }
 };
 
@@ -108,12 +135,25 @@ template <class B> struct Copy {
     const u8 *copy;
     u64 first;
     u32 pitch;
+    // A planar source's scales in the window (`Window::SCALE_AT`), from the
+    // scale of its first packet `first_scale`.
+    const u8 *scales;
+    u64 first_scale;
 
+    // The packet's codes where the source is planar.
     __device__ __forceinline__ const u8 *packet(const seismic_words_t &, u64, u64 n, u64 packet) const {
         return copy + (n % Window<B>::ROWS) * pitch + (packet - first) * Window<B>::PACKET;
     }
     __device__ __forceinline__ u64 row_bytes(const seismic_words_t &) const {
         return pitch;
+    }
+    // The scale of the tile holding packet `packet` of row `n`.
+    __device__ __forceinline__ const u8 *scale(const seismic_words_t &, u64, u64 n, u64 packet) const {
+        return scales + (B::grid_tile_rows() == 1u ? (n % Window<B>::ROWS) * Window<B>::SCALE_PITCH : 0u) +
+               (packet * B::group() / B::grid_tile_columns() - first_scale) * B::scale_bytes();
+    }
+    __device__ __forceinline__ u64 scale_row_bytes(const seismic_words_t &) const {
+        return B::grid_tile_rows() == 1u ? Window<B>::SCALE_PITCH : 0u;
     }
 };
 
@@ -244,6 +284,12 @@ template <class B> struct Placed {
     const u8 *from;
     u64 span_stride;
     u8 *out;
+    // A planar source's scales the window's packets lie in: `scale_spans`
+    // rows of `scale_count` scales from `scale_from`, `scale_stride` apart,
+    // the first of tile column `scale0`.
+    const u8 *scale_from = nullptr;
+    u64 scale_stride = 0, scale0 = 0;
+    u32 scale_spans = 0, scale_count = 0;
 
     __device__ __forceinline__ Placed(const Window<B> &window, const u8 *source, u8 *destination,
                                       const seismic_words_t &seismic_words_value, u64 record, u64 slot, u64 item) {
@@ -266,6 +312,16 @@ template <class B> struct Placed {
                (row0 * B::source_stride_1(seismic_words_value) + packet0 * B::source_stride_2(seismic_words_value)) *
                    W::PACKET;
         out = destination + slot * B::out_matrix_bytes(seismic_words_value);
+        if constexpr (B::planar()) {
+            const u8 *matrix = source + record * B::source_matrix_bytes(seismic_words_value);
+            const u64 columns = repack::planar::grid_columns<B>(seismic_words_value);
+            scale0 = (u64)packet0 * B::group() / B::grid_tile_columns();
+            scale_count = stored > 0 ? (u32)(((u64)(packet0 + stored - 1) * B::group() / B::grid_tile_columns()) - scale0 + 1) : 0u;
+            scale_spans = B::grid_tile_rows() == 1u ? rows : (rows > 0 ? 1u : 0u);
+            scale_stride = columns * B::scale_bytes();
+            scale_from = matrix + repack::planar::codes_bytes<B>(seismic_words_value) +
+                         ((row0 / B::grid_tile_rows()) * columns + scale0) * B::scale_bytes();
+        }
     }
 };
 
@@ -303,7 +359,7 @@ __device__ __forceinline__ void convert_tiles(const Window<B> &window, const Pla
     constexpr u32 TILES = S::WARP_TILES, LANES = 32u / TILES;
     const u32 warp = threadIdx.x / 32, share = threadIdx.x % 32 / LANES, lane = threadIdx.x % LANES;
     const u32 warps = blockDim.x / 32 < Sh::STAGES ? blockDim.x / 32 : Sh::STAGES;
-    const Copy<B> copy{shared.window, placed.packet0, window.pitch};
+    const Copy<B> copy{shared.window, placed.packet0, window.pitch, shared.window + Window<B>::SCALE_AT, placed.scale0};
     // A window's tiles are whole groups (`Placed`): rounds of a warp's tiles
     // at once, each round's at its first's unit.
     const u32 rounds = (placed.tiles + TILES * S::UNITS - 1) / (TILES * S::UNITS) * S::UNITS;
@@ -486,6 +542,65 @@ struct Held {
         case 4: store_as<4>(span, pitch, window); break;
         case 2: store_as<2>(span, pitch, window); break;
         default: store_as<1>(span, pitch, window); break;
+        }
+    }
+};
+
+// A window's scales as the block loads them (`Placed`'s): `total` scales of
+// `bytes` bytes, `count` to a row, rows `stride` apart from `from`, into the
+// block's window `pitch` bytes apart from byte `to`. `total` is 0 for a
+// source with none.
+struct ScaleSpan {
+    const u8 *from;
+    u64 stride;
+    u32 total, count, bytes, to, pitch;
+};
+
+template <class B> __device__ __forceinline__ ScaleSpan scale_span_of(const Placed<B> &placed) {
+    if constexpr (B::planar())
+        return ScaleSpan{placed.scale_from,  placed.scale_stride, placed.scale_spans * placed.scale_count,
+                         placed.scale_count, B::scale_bytes(),     Window<B>::SCALE_AT,
+                         Window<B>::SCALE_PITCH};
+    else
+        return ScaleSpan{nullptr, 0, 0, 1, 0, 0, 0};
+}
+
+// The registers a thread of a binding's window needs for its scales: none of
+// a dense binding's, which has no window.
+template <class B> __host__ __device__ constexpr u32 scale_iters() {
+    if constexpr (B::dense())
+        return 0u;
+    else
+        return Window<B>::SCALE_ITERS;
+}
+
+// A thread's scales of a window held in registers beside its `Held` bytes,
+// in flight with them: scale `at` of the window is the block's `at %
+// WINDOW_THREADS`th thread's, `ITERS` of each thread's (the most any
+// binding's window has). A scale is one byte (UE8M0) or four (F32), the
+// grids registered.
+template <u32 ITERS> struct HeldScales {
+    u32 value[ITERS > 0u ? ITERS : 1u];
+
+    __device__ __forceinline__ void load(const ScaleSpan &span) {
+#pragma unroll
+        for (u32 it = 0; it < ITERS; ++it) {
+            const u32 at = threadIdx.x + it * SEISMIC_CONST_WINDOW_THREADS;
+            if (at < span.total) {
+                const u8 *from = span.from + (u64)(at / span.count) * span.stride + (u64)(at % span.count) * span.bytes;
+                value[it] = span.bytes == 4u ? __ldcs(reinterpret_cast<const u32 *>(from)) : u32(__ldcs(from));
+            }
+        }
+    }
+    __device__ __forceinline__ void store(const ScaleSpan &span, u8 *window) const {
+#pragma unroll
+        for (u32 it = 0; it < ITERS; ++it) {
+            const u32 at = threadIdx.x + it * SEISMIC_CONST_WINDOW_THREADS;
+            if (at < span.total) {
+                u8 *to = window + span.to + (at / span.count) * span.pitch + (at % span.count) * span.bytes;
+                if (span.bytes == 4u) *reinterpret_cast<u32 *>(to) = value[it];
+                else *to = u8(value[it]);
+            }
         }
     }
 };

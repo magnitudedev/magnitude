@@ -43,6 +43,18 @@ pub(crate) fn canonical(
             packet.packet_size,
             packet.packet_alignment,
         ),
+        // A source under a companion grid is stored planar, each matrix's
+        // codes and then its grid: a unit of its own, `concrete_storage_units`.
+        RepresentationKind::External(packet) if packet.planes.is_some() => {
+            let (units, width) = seismic_ir::storage::concrete_storage_units(representation, extents)
+                .ok_or_else(|| unaddressable(info.name, extents))?;
+            let (strides, matrices) = row_major(&units).ok_or_else(|| unaddressable(info.name, extents))?;
+            Ok(Layout {
+                strides,
+                byte_len: matrices.checked_mul(width).ok_or_else(|| unaddressable(info.name, extents))?,
+                alignment: u64::from(packet.packet_alignment),
+            })
+        }
         RepresentationKind::External(packet) => packet_layout(
             info.name,
             extents,
@@ -285,6 +297,21 @@ fn leading_slice(
     let (group, width) = match &info.kind {
         RepresentationKind::Dense(dtype) => (1, u64::from(dtype.bytes())),
         RepresentationKind::Packed(packet) => (packet.group, u64::from(packet.packet_size)),
+        // A source under a companion grid slices by matrices
+        // (`concrete_storage_units`).
+        RepresentationKind::External(packet) if packet.planes.is_some() => {
+            // Its rows share their matrix's grid: only whole matrices slice.
+            if extents.len() < 3 {
+                return Err(TensorError::UnalignedRowSlice {
+                    representation: info.name,
+                    start,
+                    end,
+                });
+            }
+            let (_, width) = seismic_ir::storage::concrete_storage_units(representation, extents)
+                .ok_or_else(|| TensorError::Execution(unaddressable(info.name, extents)))?;
+            (packet.logical_group, width)
+        }
         RepresentationKind::External(packet) => {
             (packet.logical_group, u64::from(packet.packet_size))
         }
@@ -431,6 +458,23 @@ mod tests {
         assert_eq!(&sparse[4..8], &[0xff; 4]);
         assert_eq!(&sparse[12..16], &[0xff; 4]);
         assert_eq!(&sparse[16..20], &3_u32.to_ne_bytes());
+    }
+
+    /// A planar source's rows share their matrix's grid, so a view of it
+    /// selects whole matrices only: a leading slice of one matrix's rows is
+    /// refused, one over the matrix axis offsets by whole matrices.
+    #[test]
+    fn a_planar_source_slices_by_matrices_only() {
+        let source = registry::representation("gguf_f8_e4m3_e8m0_32x32").unwrap();
+        let matrix = canonical(source, &[64, 128]).unwrap();
+        let stack = canonical(source, &[3, 64, 128]).unwrap();
+        assert_eq!(stack.byte_len, 3 * matrix.byte_len);
+        let slice = leading_slice(source, &[3, 64, 128], &stack.strides, 1, 3).unwrap();
+        assert_eq!((slice.relative_offset, slice.extents), (matrix.byte_len, vec![2, 64, 128]));
+        assert!(matches!(
+            leading_slice(source, &[64, 128], &matrix.strides, 16, 32).err(),
+            Some(TensorError::UnalignedRowSlice { start: 16, end: 32, .. })
+        ));
     }
 
     #[test]

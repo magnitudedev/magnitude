@@ -1920,13 +1920,17 @@ mod tests {
         words: &WordTable,
     ) {
         let layout = conversion.source_layout;
-        let packets = 64;
+        // 64 packets, a row each, in the source's planes; each packet's
+        // bytes gathered where the source lays them.
+        let extents = [64, u64::from(layout.logical_group)];
+        let matrices = layout.matrices(&extents).unwrap();
         let mut source = registry::pseudo_random_bytes(
             conversion.id.position() as u64,
-            (packets * layout.packet_size) as usize,
+            matrices.tensor_bytes() as usize,
         );
-        conversion.admit_source(&mut source);
-        let forms = crate::interp::packet_forms(conversion, &source);
+        conversion.admit_source(&extents, &mut source);
+        let forms = crate::interp::packet_forms(conversion, &extents, &source);
+        let source = matrices.packets(&source);
         let packet = conversion.destination_layout.packet();
         let place = |plane: usize, bit: u32| match conversion.destination_layout {
             ConversionLayout::Packet(packet) => Some(packet.planes[plane].offset * 8 + bit),

@@ -22,14 +22,15 @@
 // so the result is fully defined.
 //
 // `REPACK_TILE(NAME, C, S, D)` defines `NAME_tile_columns()`, a tile's
-// columns, and `NAME_place(packet, row, column0)` for conversion `C` from
-// source element `S` into tensor `D`'s rows16 rows: one row's tile of
+// columns, and `NAME_place(packet, scale, row, column0)` for conversion `C`
+// from source element `S` into tensor `D`'s rows16 rows: one row's tile of
 // columns from `column0`, `packet` the address of the source
-// packet holding that column, `row` the address of the stored row; and
-// `NAME_place_shared(packet, row, column0)`, the same placement from the
-// packet at byte offset `packet` of the group memory (a copy of the source,
-// the packet at a multiple of its alignment: the conversion's `_SHARED`
-// code). Placing reads no other invocation's words, so any invocations may
+// packet holding that column (a planar source's, of its codes, and `scale`
+// the address of the scale its tile holds; unread by any other), `row` the
+// address of the stored row; and `NAME_place_shared(packet, scale, row,
+// column0)`, the same placement from the packet at byte offset `packet` of
+// the group memory (a copy of the source, the packet at a multiple of its
+// alignment: the conversion's `_SHARED` code). Placing reads no other invocation's words, so any invocations may
 // place any rows' tiles. The includer checks that `S` is external and `D`
 // rows16 with no padding groups (`SEISMIC_ELEMENT_<U>_GROUP_MULTIPLE` 1):
 // every stored tile holds source packets.
@@ -40,6 +41,56 @@
 // preprocessor `#if` (glslang's divides by no unsigned one), is the Vulkan
 // prefix's (`native::abi`), which states the conversion's `TILE_ROWS` once.
 #define REPACK_TILE_ROWS uint(REPACK_TILE_ROWS_INT)
+
+// A planar source's geometry, written once: every reader of one (the
+// resident import's repack_weight.comp, the streaming windows) lays a
+// matrix's bytes by it. A matrix of `[N, K]` is its codes plane (`N` rows of
+// the source's packets per row, `ceil(K / group)`, each `packet - scale`
+// code bytes) then its grid of scales (`ceil(N / tile rows)` rows of
+// `ceil(K / tile columns)`), as the file stores them
+// (`ExternalPacketLayout::packet_pieces`, `matrix_bytes`).
+//
+// `REPACK_PLANAR_SOURCE(PFX, S, N, K)` defines, for source element prefix `S`
+// and the matrix extents `N`, `K`, the functions `PFX_row_packets()`,
+// `PFX_grid_columns()`, `PFX_code_bytes()` (a packet's), `PFX_codes_bytes()`
+// (the plane's), `PFX_matrix_bytes()`, and, from a matrix's first byte,
+// `PFX_code_at(row, packet)` and `PFX_scale_at(row, packet)`. A source of no
+// grid has no tile (read as 1x1) and is not asked.
+#define REPACK_PLANAR_SOURCE(PFX, S, N, K) \
+    uint64_t PFX##_row_packets() { \
+        return (uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul) / uint64_t(S##_LOGICAL_GROUP); \
+    } \
+    uint64_t PFX##_grid_columns() { \
+        const uint64_t columns = max(uint64_t(S##_GRID_TILE_COLUMNS), 1ul); \
+        return (uint64_t(K) + columns - 1ul) / columns; \
+    } \
+    uint64_t PFX##_code_bytes() { \
+        return uint64_t(S##_PACKET_SIZE) - uint64_t(S##_GRID_SCALE_BYTES); \
+    } \
+    uint64_t PFX##_codes_bytes() { \
+        return uint64_t(N) * PFX##_row_packets() * PFX##_code_bytes(); \
+    } \
+    uint64_t PFX##_matrix_bytes() { \
+        const uint64_t rows = max(uint64_t(S##_GRID_TILE_ROWS), 1ul); \
+        return PFX##_codes_bytes() + (uint64_t(N) + rows - 1ul) / rows * PFX##_grid_columns() \
+            * uint64_t(S##_GRID_SCALE_BYTES); \
+    } \
+    uint64_t PFX##_code_at(uint64_t row, uint64_t packet) { \
+        return (row * PFX##_row_packets() + packet) * PFX##_code_bytes(); \
+    } \
+    uint64_t PFX##_scale_at(uint64_t row, uint64_t packet) { \
+        const uint64_t rows = max(uint64_t(S##_GRID_TILE_ROWS), 1ul), columns = max(uint64_t(S##_GRID_TILE_COLUMNS), 1ul); \
+        return PFX##_codes_bytes() \
+            + ((row / rows) * PFX##_grid_columns() + packet * uint64_t(S##_LOGICAL_GROUP) / columns) \
+            * uint64_t(S##_GRID_SCALE_BYTES); \
+    }
+
+// What a conversion reads its source by: a planar source (`S_GRID_PLANAR`)
+// its packet's codes and its tile's scale, any other its packet.
+#define REPACK_PLANAR_1(planar, plain) planar
+#define REPACK_PLANAR_0(planar, plain) plain
+#define REPACK_PLANAR_(flag) REPACK_PLANAR_##flag
+#define REPACK_PLANAR(flag) REPACK_PLANAR_(flag)
 
 // `count` bytes at `place`, zero.
 void repack_zero_bytes(uint64_t place, uint64_t count) {
@@ -102,24 +153,26 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
                 D##_ROW_SUPERS_TAIL); \
         } \
     } \
-    void NAME##_place(uint64_t packet, uint64_t row, uint column0) { \
+    void NAME##_place(uint64_t packet, uint64_t scale, uint64_t row, uint column0) { \
         const uint within = column0 % uint(S##_LOGICAL_GROUP); \
         uint words[C##_WORDS]; \
-        C##_UNIT(packet, within / NAME##_tile_columns(), words); \
+        REPACK_PLANAR(S##_GRID_PLANAR)(C##_UNIT(packet, scale, within / NAME##_tile_columns(), words), \
+            C##_UNIT(packet, within / NAME##_tile_columns(), words)); \
         NAME##_place_unit(row, column0, words); \
         if (within == 0u) { \
-            C##_FIXED(packet, words); \
+            REPACK_PLANAR(S##_GRID_PLANAR)(C##_FIXED(packet, scale, words), C##_FIXED(packet, words)); \
             NAME##_place_fixed(row, column0, words); \
         } \
         NAME##_place_tails(row, column0); \
     } \
-    void NAME##_place_shared(uint packet, uint64_t row, uint column0) { \
+    void NAME##_place_shared(uint packet, uint scale, uint64_t row, uint column0) { \
         const uint within = column0 % uint(S##_LOGICAL_GROUP); \
         uint words[C##_WORDS]; \
-        C##_UNIT_SHARED(packet, within / NAME##_tile_columns(), words); \
+        REPACK_PLANAR(S##_GRID_PLANAR)(C##_UNIT_SHARED(packet, scale, within / NAME##_tile_columns(), words), \
+            C##_UNIT_SHARED(packet, within / NAME##_tile_columns(), words)); \
         NAME##_place_unit(row, column0, words); \
         if (within == 0u) { \
-            C##_FIXED_SHARED(packet, words); \
+            REPACK_PLANAR(S##_GRID_PLANAR)(C##_FIXED_SHARED(packet, scale, words), C##_FIXED_SHARED(packet, words)); \
             NAME##_place_fixed(row, column0, words); \
         } \
         NAME##_place_tails(row, column0); \

@@ -44,7 +44,7 @@ pub struct ImportWorkspaceLease {
 /// ([`crate::programs::native_import::fill_staged_source`]) before binding
 /// it as a kernel source.
 pub(crate) unsafe fn import_upload(weight: &WeightPlan, device: &Device) -> Result<Tensor, AllocationError> {
-    unsafe { Tensor::uninitialized(device, weight.upload, &[source_count(weight)?]) }
+    unsafe { Tensor::uninitialized(device, weight.upload, &source_extents(weight)?) }
         .map_err(AllocationError::Tensor)
 }
 
@@ -58,6 +58,16 @@ pub(crate) fn filled_import(weight: &WeightPlan, stored: &Stored, device: &Devic
     crate::programs::native_import::fill_staged_source(stored, weight, &mut upload)
         .map_err(|error| error.to_string())?;
     Ok(upload)
+}
+
+/// The extents of `weight`'s source and of its upload: its packets in one
+/// run, or, a source under a companion grid whose planes are a matrix's,
+/// its logical shape.
+pub(crate) fn source_extents(weight: &WeightPlan) -> Result<Vec<u64>, AllocationError> {
+    if weight.source.is_planar() {
+        return Ok(weight.shape.clone());
+    }
+    source_count(weight).map(|count| vec![count])
 }
 
 /// The elements of `weight`'s source (and of its upload).
@@ -499,14 +509,13 @@ impl ResourceAllocator {
         if !execution.weights().any(|planned| planned == weight) {
             return Err(invalid("weight is absent from the execution plan"));
         }
-        let count = crate::planning::elements(&weight.shape)
-            .ok_or_else(|| invalid("weight element count overflows"))?;
+        let extents = source_extents(weight).map_err(|error| invalid(&error.to_string()))?;
         // SAFETY: the importer fills it before binding it
         // (`NativeImportProgram::enqueue`, `submit`).
         let upload = unsafe { import_upload(weight, device) }?;
         if !upload.belongs_to(device)
             || upload.element() != weight.upload
-            || upload.extents() != [count]
+            || upload.extents() != extents
             || upload.byte_len() != weight.source_bytes
             || upload.storage_bytes() != weight.source_bytes
         {

@@ -28,9 +28,16 @@ namespace streaming {
 // holds `packets` packets of each of the tile's 16 rows, the rows' shares
 // `pitch` bytes apart, within the module's WINDOW_BYTES
 // (`SEISMIC_CONST_WINDOW_BYTES`, the includer's threadgroup memory); `whole`
-// where the window is the whole tile, copied as one span. A row's packets are
-// its stored columns' (`repack::tiles_x`): a window past the source row's
-// packets copies none and places zero tiles.
+// where the window is the whole tile, copied as one span.
+// A planar source (`B::planar()`: a record is each matrix's codes plane, then
+// its grid of scales) is windowed over its packets' codes alone
+// (`packet_bytes`), and beside them, after them in the threadgroup memory,
+// holds the scales of the tiles its packets lie in (`scale_area`: a row's own
+// where a grid tile is one row, else one row of the grid's), whose bytes come
+// off the codes' (`bytes`): the same shapes for every source, a plain
+// source's scale area empty.
+// A row's packets are its stored columns' (`repack::tiles_x`): a window past
+// the source row's packets copies none and places zero tiles.
 template <class B> struct Windows {
     uint packets;
     uint count;
@@ -40,11 +47,28 @@ template <class B> struct Windows {
     static constexpr uint rows() {
         return repack::TILE_ROWS;
     }
+    // The threadgroup memory's bytes the codes have: its scale area is the rest.
     static constexpr uint bytes() {
-        return uint(SEISMIC_CONST_WINDOW_BYTES);
+        return uint(SEISMIC_CONST_WINDOW_BYTES) - scale_area();
     }
     static constexpr uint packet_bytes() {
-        return uint(B::source_packet_size());
+        return B::planar() ? uint(B::code_bytes()) : uint(B::source_packet_size());
+    }
+    // A planar source's scales area: `scale_rows` rows of the most scales a
+    // row of a window's packets lies in (its first packet need not be a
+    // tile's first).
+    static constexpr uint scale_rows() {
+        return !B::planar() ? 0u : B::grid_tile_rows() == 1u ? repack::TILE_ROWS : 1u;
+    }
+    static constexpr uint scales_per_row() {
+        constexpr uint most = uint(SEISMIC_CONST_WINDOW_BYTES) / (repack::TILE_ROWS * packet_bytes());
+        return !B::planar() ? 0u : (most * B::group() + B::grid_tile_columns() - 1u) / B::grid_tile_columns() + 1u;
+    }
+    static constexpr uint scale_pitch() {
+        return scales_per_row() * B::grid_scale_bytes();
+    }
+    static constexpr uint scale_area() {
+        return (scale_rows() * scale_pitch() + 15u) / 16u * 16u;
     }
     // Column tiles of one packet (a tile is whole chunks of a group).
     static constexpr uint packet_tiles() {
@@ -66,25 +90,43 @@ template <class B> struct Windows {
 };
 
 // An item's window as `repack_tile` reads it (its addressing policy and
-// source): the copy, its rows' pitch and a window's packets.
+// source): the copy, its rows' pitch and a window's packets, and a planar
+// source's scales (`Windows::bytes` on) from the scale of the window's first
+// packet's tile.
 template <class B> struct Window {
     threadgroup const uchar *copy;
     uint pitch;
     uint packets;
+    threadgroup const uchar *scales;
+    ulong first_packet;
 
     // Packet `packet` of row `n` in the window's copy.
     static threadgroup const uchar *packet(Window window, constant ulong *, ulong, ulong n, ulong packet) {
         return window.copy + (n % repack::TILE_ROWS) * window.pitch +
                (packet % window.packets) * Windows<B>::packet_bytes();
     }
+    // The scale of the tile holding packet `index` of row `n` (a planar
+    // source's; any other's is its packet, unread).
+    static threadgroup const uchar *scale(Window window, constant ulong *, ulong, ulong n, ulong index) {
+        if constexpr (B::planar()) {
+            const ulong first = window.first_packet * B::group() / B::grid_tile_columns();
+            return window.scales +
+                   (B::grid_tile_rows() == 1u ? (n % repack::TILE_ROWS) * Windows<B>::scale_pitch() : 0u) +
+                   ((index >= window.first_packet ? index * B::group() / B::grid_tile_columns() - first : 0ul)) *
+                       B::grid_scale_bytes();
+        } else {
+            return Window::packet(window, nullptr, 0, n, index);
+        }
+    }
 };
 
-// Copy the `bytes` staged bytes at byte `offset` of `source` to `to`
-// (16-byte aligned) with the threadgroup's `threads` threads, in the widest
-// loads the bytes' address admits.
-inline void copy_staged(STAGED *source, ulong offset, threadgroup uchar *to, uint bytes, uint tid, uint threads) {
+// Copy the `bytes` staged bytes at byte `offset` of `source` to `to`, which
+// lies `to_offset` bytes past a 16-byte aligned address, with the
+// threadgroup's `threads` threads, in the widest loads both addresses admit.
+inline void copy_staged(STAGED *source, ulong offset, threadgroup uchar *to, uint bytes, uint tid, uint threads,
+    uint to_offset = 0) {
     STAGED *from = source + offset;
-    const ulong address = reinterpret_cast<ulong>(from);
+    const ulong address = reinterpret_cast<ulong>(from) | to_offset;
     if (address % 16 == 0) {
         for (uint i = tid; i < bytes / 16; i += threads)
             reinterpret_cast<threadgroup uint4 *>(to)[i] =
@@ -112,7 +154,8 @@ inline void copy_staged(STAGED *source, ulong offset, threadgroup uchar *to, uin
 
 // Copy `rows` rows' shares of `bytes` staged bytes, the first at byte
 // `offset` of `source` and each the next `stride` bytes on, to `to` (16-byte
-// aligned), the next `pitch` bytes on: where every share is whole 16-byte
+// aligned, as the copy's rows are placed `pitch` apart), the next `pitch`
+// bytes on: where every share is whole 16-byte
 // loads, the threadgroup's `threads` threads stride over all of them at
 // once; else row by row, in the loads each share's address admits.
 inline void copy_rows(STAGED *source, ulong offset, ulong stride, threadgroup uchar *to, uint pitch, uint rows,
@@ -126,7 +169,7 @@ inline void copy_rows(STAGED *source, ulong offset, ulong stride, threadgroup uc
         }
     } else {
         for (uint row = 0; row < rows; ++row)
-            copy_staged(source, offset + row * stride, to + row * pitch, bytes, tid, threads);
+            copy_staged(source, offset + row * stride, to + row * pitch, bytes, tid, threads, row * pitch);
     }
 }
 
@@ -242,10 +285,24 @@ inline void convert_window(STAGED *record, device uchar *out, constant ulong *se
             copy_rows(record, offset, B::source_stride_1(seismic_words) * W::packet_bytes(), window, windows.pitch,
                 rows, stored_packets * W::packet_bytes(), tid, threads);
     }
+    if constexpr (B::planar()) {
+        // The scales of the tiles the window's packets lie in, from the
+        // record's grid, which follows its codes plane.
+        if (rows != 0 && stored_packets != 0) {
+            const ulong columns = repack::planar::grid_columns<B>(seismic_words);
+            const ulong scale0 = packet0 * B::group() / B::grid_tile_columns();
+            const uint count = uint((packet0 + stored_packets - 1) * B::group() / B::grid_tile_columns() - scale0 + 1);
+            copy_rows(record,
+                repack::planar::codes_bytes<B>(seismic_words) +
+                    ((row0 / B::grid_tile_rows()) * columns + scale0) * B::grid_scale_bytes(),
+                columns * B::grid_scale_bytes(), window + W::bytes(), W::scale_pitch(),
+                B::grid_tile_rows() == 1u ? rows : 1u, count * B::grid_scale_bytes(), tid, threads);
+        }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const ulong tiles_x = repack::tiles_x<B>(seismic_words);
     const uint tiles = windows.packets * W::packet_tiles();
-    const Window<B> source{window, windows.pitch, windows.packets};
+    const Window<B> source{window, windows.pitch, windows.packets, window + W::bytes(), packet0};
     for (uint tile = 2 * simd + lane / repack::TILE_ROWS; tile < tiles; tile += 2 * simdgroups) {
         const ulong tile_x = ulong(window_index) * tiles + tile;
         if (tile_x < tiles_x)

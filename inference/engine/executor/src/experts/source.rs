@@ -156,23 +156,26 @@ impl Records {
 
 /// One range of a model file read into a record: `bytes` at `offset` of
 /// file `file` (an index of the source's files) into record `record` of
-/// `into`.
+/// `into`, `within` bytes into it (a record of planar parts, codes then
+/// grid, takes each part's read at its own).
 pub(super) struct Read {
     file: usize,
     offset: u64,
     bytes: usize,
     into: Records,
     record: u64,
+    within: u64,
 }
 
 impl Read {
     /// A read of `bytes` at `offset` of file `file` into record `record` of
-    /// `into`, which holds them: a record of `into` and no more than its
-    /// bytes, as the watcher's geometry (checked at its start) gives.
-    pub fn new(file: usize, offset: u64, bytes: u64, into: &Records, record: u64) -> Self {
+    /// `into` from `within` bytes into it, which holds them: a record of
+    /// `into` and no more than its bytes, as the watcher's geometry
+    /// (checked at its start) gives.
+    pub fn new(file: usize, offset: u64, bytes: u64, into: &Records, record: u64, within: u64) -> Self {
         assert!(
-            record < into.0.count && bytes <= into.bytes(),
-            "a read of {bytes} bytes into record {record} of {} of {} bytes",
+            record < into.0.count && within.checked_add(bytes).is_some_and(|end| end <= into.bytes()),
+            "a read of {bytes} bytes {within} into record {record} of {} of {} bytes",
             into.0.count,
             into.bytes()
         );
@@ -182,6 +185,7 @@ impl Read {
             bytes: bytes as usize,
             into: into.clone(),
             record,
+            within,
         }
     }
 
@@ -402,7 +406,7 @@ impl ExpertSource {
         for (at, read) in reads.into_iter().enumerate() {
             let (ranges, served) = &mut by_file[read.file];
             served.push((at, read.file, read.offset, read.bytes));
-            let at = read.into.offset(read.record) as usize;
+            let at = (read.into.offset(read.record) + read.within) as usize;
             ranges.push(Range { offset: read.offset, length: read.bytes, into: read.into.0, at });
         }
         let mut requests = Vec::new();
@@ -440,7 +444,7 @@ mod tests {
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
         let records = Records::new(staging.clone(), 128, 2).unwrap();
-        let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record);
+        let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record, 0);
         let demand = Want::now();
         let failed = source.request(vec![read(bytes.len() as u64 - 64, 0)], demand).unwrap();
         let landed = source.request(vec![read(1000, 0), read(40_000, 1)], demand).unwrap();
@@ -491,7 +495,7 @@ mod tests {
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         // Reversed: record 0 takes the file's second half.
         let landed = source
-            .request(vec![Read::new(0, RECORD, RECORD, &records, 0), Read::new(0, 0, RECORD, &records, 1)], Want::now())
+            .request(vec![Read::new(0, RECORD, RECORD, &records, 0, 0), Read::new(0, 0, RECORD, &records, 1, 0)], Want::now())
             .unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
@@ -530,7 +534,7 @@ mod tests {
         let bytes = (0..RECORD).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap();
-        let landed = source.request(vec![Read::new(0, 0, RECORD, &records, COUNT - 1)], Want::now()).unwrap();
+        let landed = source.request(vec![Read::new(0, 0, RECORD, &records, COUNT - 1, 0)], Want::now()).unwrap();
         assert!(matches!(landed.wait_until(Instant::now() + std::time::Duration::from_secs(30)), Some(Outcome::Read)));
         // SAFETY: the job has ended, and no device work touches the record.
         assert!(unsafe { records.record(COUNT - 1, RECORD) } == bytes);

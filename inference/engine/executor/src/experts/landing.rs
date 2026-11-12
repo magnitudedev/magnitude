@@ -319,7 +319,7 @@ impl TierTensor {
             .stored_row_bytes(k)
             .map(|row| rows.next_multiple_of(conversion.tile()) * row)
             .ok_or_else(|| format!("{form}: the target holds no such row"))?;
-        if (rows * conversion.source_row_bytes(k)) as u64 != stored || converted as u64 > records.bytes() {
+        if conversion.source_bytes(rows, k) as u64 != stored || converted as u64 > records.bytes() {
             return Err(format!("{form}: a stored record does not convert into one tier record"));
         }
         Ok(Self { records, conversion: Conversion::Rows { conversion, rows, k } })
@@ -340,11 +340,12 @@ impl TierTensor {
 pub(in crate::experts) struct LandedRecord(TierTensor);
 
 impl LandedRecord {
-    /// The pieces converting a stored record into a tier record: (stored
-    /// bytes, tier record bytes) of each, every one disjoint from the
-    /// others, together covering the record. As stored, one piece; by a
-    /// row conversion, pieces of whole stored tiles of at most
-    /// [`CONVERSION_PIECE`] source bytes.
+    /// The pieces converting a stored record into a tier record: (what of
+    /// the stored record each reads, tier record bytes), the tier bytes of
+    /// every one disjoint from the others', together covering the record.
+    /// As stored, one piece, its stored bytes; by a row conversion, pieces
+    /// of whole stored tiles of at most [`CONVERSION_PIECE`] source bytes,
+    /// each its rows of the record (`RowConversion::pieces`).
     fn pieces(&self, stored: u64) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
         match self.0.conversion {
             Conversion::Stored => {
@@ -352,7 +353,7 @@ impl LandedRecord {
                 vec![(0..bytes, 0..bytes)]
             }
             Conversion::Rows { conversion, rows, k } => {
-                let row = conversion.source_row_bytes(k) * conversion.tile();
+                let row = conversion.source_bytes(conversion.tile(), k);
                 let tiles = std::num::NonZeroUsize::new((CONVERSION_PIECE / row).max(1))
                     .expect("at least one tile a piece");
                 conversion.pieces(k, rows, tiles).expect("a tier tensor's rows convert").collect()
@@ -360,8 +361,9 @@ impl LandedRecord {
         }
     }
 
-    /// Convert piece `(from, to)` of stored record `stored` into the
-    /// record.
+    /// Convert piece `(from, to)` of stored record `stored` (the whole
+    /// record, which a row conversion's piece reads its rows `from` of)
+    /// into the tier record.
     ///
     /// # Safety
     ///
@@ -375,8 +377,8 @@ impl LandedRecord {
         let into = unsafe { std::slice::from_raw_parts_mut(records.address(0).as_ptr().add(to.start), to.len()) };
         match *conversion {
             Conversion::Stored => into.copy_from_slice(&stored[from]),
-            Conversion::Rows { conversion, k, .. } => {
-                conversion.piece(k, &stored[from], into).expect("a tier tensor's pieces convert")
+            Conversion::Rows { conversion, rows, k } => {
+                conversion.piece(k, rows, from, stored, into).expect("a tier tensor's pieces convert")
             }
         }
     }

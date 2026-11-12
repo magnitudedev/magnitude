@@ -1126,6 +1126,19 @@ pub(crate) mod internals {
                     seismic_lang::registry::representation_info(representation).name,
                 )));
             }
+            // A source under a companion grid lies in two planes per matrix
+            // (`ExternalPacketLayout::packet_pieces`); compiled storage and
+            // its packet conversion address a source as one run of packets,
+            // so only a native implementation reads one.
+            let info = seismic_lang::registry::representation_info(representation);
+            if let seismic_lang::registry::RepresentationKind::External(layout) = &info.kind {
+                if layout.planes.is_some() {
+                    return Err(PreparationError::TargetDomainUnrepresentable(format!(
+                        "source representation `{}` lies in a codes plane and a grid of scales; compiled construction addresses a source as one run of packets, so only a native implementation converts it",
+                        info.name,
+                    )));
+                }
+            }
             for axis in axes {
                 terms.push(arena.nat_cmp(CmpOp::Le, *axis, max_index));
                 terms.push(arena.side_conditions(AnyExpr::Nat(*axis)));
@@ -1221,6 +1234,53 @@ mod candidate_domain_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(unvisited.families().len(), 1);
+    }
+
+    /// A conversion from a source under a companion grid is refused before
+    /// construction, naming the source: compiled construction addresses a
+    /// source as one run of packets, which a planar source is not.
+    #[test]
+    fn a_planar_conversion_source_is_refused_by_name() {
+        use crate::realization::demand_driven_tests::{device_parts, registry};
+        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+        use seismic_lang::entry::ElementBindings;
+        use seismic_lang::registry::{self, ConversionLayout};
+
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "planar-convert.seismic".into(),
+            text: "fn convert[N, K](source: &tensor[N, K] E) -> tensor[N, K] U:\n    return repack[U = U](source)\n".into(),
+        }]))
+        .unwrap();
+        let compiler = registry();
+        let planar = registry::representation_conversions().iter().filter(|conversion| {
+            conversion.source_layout.planes.is_some()
+                && matches!(conversion.destination_layout, ConversionLayout::Packet(_))
+        });
+        let mut refused = std::collections::BTreeSet::new();
+        for conversion in planar {
+            let mut parts = device_parts();
+            parts.dtypes.representations.extend([conversion.source, conversion.destination]);
+            let target = DeviceDescription::new(parts).unwrap();
+            let bindings = ElementBindings::new()
+                .bind("E", conversion.source)
+                .bind("U", conversion.destination);
+            let entry = module
+                .entry(module.entry_named("convert").unwrap(), &bindings)
+                .unwrap();
+            let name = registry::representation_info(conversion.source).name;
+            match construct_candidate_domain(entry, &target, &compiler, &PrecisionPolicy::Exact) {
+                Err(PreparationError::TargetDomainUnrepresentable(message)) => {
+                    assert!(message.contains(&format!("`{name}`")), "{message}")
+                }
+                Err(error) => panic!("{name}: {error:?}"),
+                Ok(_) => panic!("{name}: a planar source was constructed"),
+            }
+            refused.insert(name);
+        }
+        assert_eq!(
+            refused,
+            ["gguf_f8_e4m3_e8m0_1x32", "gguf_f8_e4m3_e8m0_32x32", "gguf_f8_e4m3_f32_128x128"].into(),
+        );
     }
 
     #[test]

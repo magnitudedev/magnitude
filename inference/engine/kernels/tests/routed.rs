@@ -4688,6 +4688,20 @@ impl StreamedKind {
         })
     }
 
+    /// GLM-5.3-Flash's FP8 gate (and up, the same form) and down under a
+    /// grid of block scales, a planar source (`source`'s codes, then its
+    /// grid; the tile is its name's) resident as `resident`, at a shape of
+    /// whole tiles: gate [F 256, H 512] and down [H 512, F 256].
+    fn glm_fp8(device: &seismic::Device, source: &str, resident: &str) -> [Self; 2] {
+        let layout = resident_layout(device);
+        let (h, f) = (512, 256);
+        [[f, h], [h, f]].map(|matrix| Self {
+            source: seismic::Element::named(source).unwrap(),
+            resident: element_in(resident, layout),
+            matrix,
+        })
+    }
+
     fn shape(&self, count: u64) -> [u64; 3] {
         [count, self.matrix[0], self.matrix[1]]
     }
@@ -4715,7 +4729,7 @@ impl StreamedKind {
                 ((x >> 13) % 0x78) as u8
             })
             .collect();
-        self.resident.repack_source(self.source, raw).unwrap()
+        self.resident.repack_source(self.source, &self.shape(1), raw).unwrap()
     }
 
     /// The resident import of a stored matrix: a dense BF16 matrix's
@@ -5420,6 +5434,13 @@ impl ServedForm {
             Self { gate: Some(mxfp4([133, h])), up: mxfp4([133, h]), down: dense([h, 133]) },
             Self { gate: Some(dense([f, 139])), up: dense([f, 139]), down: mxfp4([139, f]) },
         ]
+    }
+
+    /// GLM-5.3-Flash's gated FP8 records under a block-scale grid
+    /// (`StreamedKind::glm_fp8`).
+    fn glm_fp8(device: &seismic::Device, source: &str, resident: &str) -> Self {
+        let [gate, down] = StreamedKind::glm_fp8(device, source, resident);
+        Self { gate: Some(gate), up: gate, down }
     }
 
     /// Routed tensor `tensor`'s kind (0 gate, 1 up, 2 down): an up-only
@@ -6242,7 +6263,7 @@ fn streaming_rounds_land_records_like_a_resident_import() {
     };
     let (bf16, f32) = (seismic::Element::bf16(), seismic::Element::f32());
     let [partial_gate, partial_down] = ServedForm::v41_mxfp4_partial(&device);
-    for (name, form) in [
+    let mut forms = vec![
         ("35B", ServedForm::qwen35b(&device)),
         ("V4.1 MXFP4", ServedForm::v41_mxfp4(&device)),
         ("V4.1 MXFP4 gate and up of 133 rows", partial_gate),
@@ -6251,7 +6272,19 @@ fn streaming_rounds_land_records_like_a_resident_import() {
         ("dense BF16", ServedForm::dense(false, bf16, 512, 2048)),
         ("dense F32", ServedForm::dense(false, f32, 512, 2048)),
         ("odd dense BF16", ServedForm::dense(false, bf16, 139, 133)),
-    ] {
+    ];
+    // Planar FP8 records (a source under a block-scale grid): every
+    // backend's window reads their two planes.
+    forms.extend([
+        ("GLM FP8 128x128 F32", ServedForm::glm_fp8(&device, "gguf_f8_e4m3_f32_128x128", "fp8g128")),
+        ("GLM FP8 32x32 E8M0", ServedForm::glm_fp8(&device, "gguf_f8_e4m3_e8m0_32x32", "mxfp8g32")),
+        ("GLM FP8 1x32 E8M0", ServedForm::glm_fp8(&device, "gguf_f8_e4m3_e8m0_1x32", "mxfp8g32")),
+    ]);
+    // `LANDING_FORM=<text>` lands only the forms whose name holds it (to run
+    // one form under a sanitizer).
+    let only = std::env::var("LANDING_FORM").unwrap_or_default();
+    for (name, form) in forms.into_iter().filter(|(name, _)| name.contains(&only)) {
+        eprintln!("landing form {name}");
         assert_round_lands(&device, &form, name);
     }
 }

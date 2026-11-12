@@ -5922,7 +5922,7 @@ mod tests {
                     (state >> 24) as u8
                 })
                 .collect::<Vec<_>>();
-            conversion.finite_source(&mut source);
+            conversion.finite_source(&extents, &mut source);
             let converted = crate::repack::convert(conversion, &extents, &source).unwrap();
             let reference = TensorData::encoded(conversion.destination, vec![rows, k], converted.clone())
                 .unwrap()

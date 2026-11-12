@@ -34,6 +34,29 @@ pub fn repack(
     Some(oracle::repack_bytes(conversion, shape, source))
 }
 
+/// Host reference of a registered representation conversion over a source
+/// tensor of `extents` given as its packets: `packets`, every packet of the
+/// tensor one after another (rows in turn, a row's packets in turn), each
+/// its bytes in order, wherever the source lays them (a grid's planes
+/// too). The canonical destination bytes; panics unless `packets` is every
+/// packet of the tensor. For tests (`fixtures`): a tensor's conversion
+/// equals that of its packets gathered.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn repack_packets(
+    conversion: crate::ids::RepresentationConversionId,
+    extents: &[u64],
+    packets: &[u8],
+) -> Vec<u8> {
+    let conversion = crate::registry::representation_conversion_info(conversion);
+    let matrices = conversion.source_layout.matrices(extents).expect("a source tensor's extents");
+    assert_eq!(
+        packets.len() as u64,
+        matrices.tensor_rows() * matrices.row_packets() * u64::from(conversion.source_layout.packet_size),
+        "every packet of the tensor"
+    );
+    oracle::place_forms(conversion, extents, oracle::forms_of_packets(conversion, packets))
+}
+
 use crate::entry::{AssociationOutcome, LogicalEntry, LogicalEntryView};
 use crate::failure::{SourceFailure, SourceFailureCause, SourceTermination};
 use crate::ids::NodeId;

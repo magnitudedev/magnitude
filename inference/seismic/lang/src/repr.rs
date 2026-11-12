@@ -297,18 +297,30 @@ impl PlaneEncoding {
 
     /// The bit of an entry ([`Self::entry_bits`]) whose clearing leaves any
     /// entry a finite number, in a plane of floating-point numbers: its
-    /// exponent's highest. None for a plane whose every entry is finite.
+    /// exponent's highest. None for a plane whose every entry is finite, and
+    /// for one whose only entry that is not is a NaN pattern
+    /// ([`Self::nan_pattern`]).
     pub(crate) fn finite_bit(&self) -> Option<u32> {
         match *self {
             PlaneEncoding::Dense(DType::F16 | DType::BF16) => Some(14),
             PlaneEncoding::Dense(DType::F32) => Some(30),
-            PlaneEncoding::FloatCode { format: FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 } => Some(6),
             PlaneEncoding::FloatCode { format: FloatCodeFormat::E8M0 } => Some(7),
             PlaneEncoding::Dense(_)
-            | PlaneEncoding::FloatCode { format: FloatCodeFormat::E2M1 }
+            | PlaneEncoding::FloatCode { format: FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 | FloatCodeFormat::E2M1 }
             | PlaneEncoding::Packed { .. }
             | PlaneEncoding::SignedLocal { .. }
             | PlaneEncoding::Grid(_) => None,
+        }
+    }
+
+    /// For a plane of floating-point codes whose only non-finite entry is
+    /// one NaN pattern (E4M3 and UE4M3 have no infinity: every bit but the
+    /// sign set): the mask of the pattern's bits of an entry, and the bit
+    /// whose clearing leaves a finite entry, which changes that entry alone.
+    pub(crate) fn nan_pattern(&self) -> Option<(u32, u32)> {
+        match *self {
+            PlaneEncoding::FloatCode { format: FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 } => Some((0x7f, 0)),
+            _ => None,
         }
     }
 }
