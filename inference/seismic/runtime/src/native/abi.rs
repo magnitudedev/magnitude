@@ -473,7 +473,13 @@ fn render_source_with(
         Dialect::Metal(features) => metal_header(features),
         Dialect::Cuda(features) => cuda_header(features),
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        Dialect::Vulkan(features) => vulkan::header(features),
+        Dialect::Vulkan(features) => {
+            // The conversions' tile rows as a signed literal, for the
+            // library's `#if`s (`lib/repack/repack.glsl`).
+            vulkan::header(features)
+                + vulkan::shared_views().as_str()
+                + format!("#define REPACK_TILE_ROWS_INT {}\n", conversion::TILE_ROWS).as_str()
+        }
     };
     // Whether a call that parks waits inside its kernel, spinning on its
     // awaited words, or at a submission boundary before it: the backend's
@@ -2400,7 +2406,8 @@ void probe() {
     }
 
     /// Every registered conversion's word form, as the Vulkan prefix
-    /// renders it, compiles, seals and validates.
+    /// renders it over device memory and over the group memory, compiles,
+    /// seals and validates.
     #[test]
     fn vulkan_conversion_code_compiles_for_every_conversion() {
         const ASSET: &str = "
@@ -2412,11 +2419,15 @@ void probe() {
     uint value = words[0];
     SEISMIC_CONVERSION_E_U_FIXED(packet, words);
     value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
+    SEISMIC_CONVERSION_E_U_UNIT_SHARED(gl_WorkGroupID.y * 256u, gl_WorkGroupID.z, words);
+    value |= words[0];
+    SEISMIC_CONVERSION_E_U_FIXED_SHARED(gl_WorkGroupID.y * 256u, words);
+    value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
     seismic_u32(uint64_t(gl_WorkGroupID.y) * 4ul).v = value;
 }
 ";
         for conversion in registry::representation_conversions() {
-            let mut source = vulkan::header(VULKAN_FEATURES);
+            let mut source = vulkan::header(VULKAN_FEATURES) + vulkan::shared_views().as_str();
             render_conversion(
                 &mut source,
                 "SEISMIC_CONVERSION_E_U",

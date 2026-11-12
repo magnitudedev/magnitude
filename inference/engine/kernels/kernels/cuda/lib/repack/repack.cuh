@@ -18,25 +18,29 @@
 // apart, by SEISMIC_CONVERSION_<F>_<T>_FIXED_LOAD); the rest of this header
 // places records in T's layout.
 //
-// Each warp places one row tile (`convert_tile`): 16 rows x one unit of the
-// code planes' columns (`WordSpan`, SEISMIC_CONVERSION_<F>_<T>_UNIT_COLUMNS:
-// 32, or a multiple where the code planes' words need more), a lane per row
-// (the other 16 lanes help stage and store), so the warp runs one stream of
-// record words (only their data differ). Every group is a multiple of the
-// unit's columns: a tile's words are its class's representative's, their
-// runs moved by the unit's displacements. The tile at a group's first column also
-// places the group's other record words. Stored-but-unoccupied bytes (mma16
-// padding rows and groups, plane alignment tails, packet gaps) are written
-// as zero, so the result is fully defined. A matrix spans `tiles_x` x
-// `tiles_y` tiles.
+// A tile is 16 rows x one unit of the code planes' columns (`WordSpan`,
+// SEISMIC_CONVERSION_<F>_<T>_UNIT_COLUMNS: 32, or a multiple where the code
+// planes' words need more), placed (`convert_tile`) by lanes of a warp, a
+// lane per row, so they run one stream of record words (only their data
+// differ): a whole warp (`repack_weight`: the other 16 lanes help stage and
+// store), or half a warp, its other half placing another tile at once
+// (lib/streaming/window.cuh), but where code planes are placed as mma
+// fragments, whose lanes are a whole warp's (`Shape::WARP_TILES`). Every
+// group is a multiple of the unit's columns: a tile's words are its class's
+// representative's, their runs moved by the unit's displacements. The tile
+// at a group's first column also places the group's other record words.
+// Stored-but-unoccupied bytes (mma16 padding rows and groups, plane
+// alignment tails, packet gaps) are written as zero, so the result is fully
+// defined. A matrix spans `tiles_x` x `tiles_y` tiles.
 //
-// The source is read through an addressing policy `A`: `Strided<B>` reads the
-// bound source tensor; an includer that stages the source first
-// (lib/streaming/window.cuh) addresses its copy. Either gives a tile's first
-// row's source packet and the bytes between its rows. The result is written
-// through a policy `O`: `Rows<B>` places rows in the bound destination
-// tensor; an includer that writes a row tile out whole (window.cuh's
-// `Mirror`) places them in its copy. Either gives a stored row's start.
+// The source is read through an addressing policy, an object of type `A`:
+// `Strided<B>` reads the bound source tensor; an includer that stages the
+// source first (lib/streaming/window.cuh) addresses its copy. Either gives a
+// tile's first row's source packet and the bytes between its rows. The
+// result is written through a policy `O`: `Rows<B>` places rows in the bound
+// destination tensor; an includer that writes a row tile out whole
+// (window.cuh's `Mirror`) places them in its copy. Either gives a stored
+// row's start.
 
 #include <seismic/element.cuh>
 
@@ -61,11 +65,13 @@ template <class B> struct Shape {
     static_assert(B::packet() || B::rows16() || B::mma16(), "repack writes packet, rows16 or mma16 storage");
 
     static constexpr u32 GROUP = B::group();
-    // The tile's rows and the warp's lanes, as the conversion's tile plans
-    // deal staged units to them (`SEISMIC_CONVERSION_<F>_<T>_TILE_ROWS`,
-    // `_LANES`).
+    // The tile's rows, and the lanes the conversion's tile plans deal its
+    // staged units to in turn (`SEISMIC_CONVERSION_<F>_<T>_TILE_ROWS`,
+    // `_LANES`): a lane a row. A tile's placing lanes (`convert_tile`'s
+    // LANES: those, or a whole warp) take them in turn (`Stage::past`).
     static constexpr u32 TILE_ROWS = B::tile_rows();
     static constexpr u32 LANES = B::lanes();
+    static_assert(LANES == TILE_ROWS, "a tile plan deals a unit a row in turn");
     // A tile's columns: one unit of the code planes' words, dividing every
     // group and so 256.
     static constexpr u32 TILE_COLUMNS = B::unit_columns();
@@ -106,20 +112,34 @@ template <class B> struct Shape {
     static constexpr bool FRAGMENTS = B::mma16() && !B::grids() && !B::records();
     static_assert(!FRAGMENTS || TILE_COLUMNS == 32, "fragment units of 32 columns");
 
-    // A warp's shared words: the source stage (packet: then its record
+    // A tile's shared words: the source stage (packet: then its record
     // words), then (fragments) the staged code words.
     static constexpr u32 STAGE_SHARE =
         TILE_ROWS * (B::packet() && RECORD_STRIDE > STAGE_WORDS ? RECORD_STRIDE : STAGE_WORDS);
     static constexpr u32 SHARED_WORDS = STAGE_SHARE + (FRAGMENTS ? TILE_ROWS * UNIT_WORDS : 0u);
+
+    // The most tiles a warp places at once: one a half warp (a lane a row of
+    // each), but where code planes are placed as mma fragments, whose lanes
+    // are a whole warp's (`B::fragment_row`).
+    static constexpr u32 WARP_TILES = FRAGMENTS ? 1u : 32u / TILE_ROWS;
+    static_assert(32 % TILE_ROWS == 0, "a warp's lanes are whole tiles' rows");
 };
 
-// A warp's shared words for binding `B` (`Shape::SHARED_WORDS`), or 0 when it
-// converts nothing (a dense binding).
+// The shared words of a warp placing `Shape::WARP_TILES` tiles of binding `B`
+// at once (`SHARED_WORDS` each), or 0 when it converts nothing (a dense
+// binding).
 template <class B> __host__ __device__ constexpr u32 shared_words() {
     if constexpr (B::converts())
-        return Shape<B>::SHARED_WORDS;
+        return Shape<B>::WARP_TILES * Shape<B>::SHARED_WORDS;
     else
         return 0u;
+}
+
+// The lanes of the calling thread's warp that place its tile, `LANES` of
+// them: the warp's aligned share of LANES lanes that holds the thread.
+template <u32 LANES> __device__ __forceinline__ u32 lanes_mask() {
+    static_assert(LANES > 0 && 32 % LANES == 0, "a tile's lanes are an aligned share of a warp");
+    return LANES == 32 ? 0xffffffffu : ((1u << LANES) - 1u) << (threadIdx.x % 32u / LANES * LANES);
 }
 
 // Tiles of a matrix: `repack_weight`'s launch (import.seismic). A tile past
@@ -131,16 +151,18 @@ template <class B> __device__ __forceinline__ u64 tiles_y(const seismic_words_t 
     return (B::n(seismic_words_value) + Shape<B>::TILE_ROWS - 1) / Shape<B>::TILE_ROWS;
 }
 
-// Addressing of the bound source tensor: packet `packet` of row `n` of
-// matrix `b`, and the bytes between rows.
+// Addressing of the bound source tensor at `source`: packet `packet` of row
+// `n` of matrix `b`, and the bytes between rows.
 template <class B> struct Strided {
-    __device__ static __forceinline__ const u8 *packet(const u8 *source, const seismic_words_t &seismic_words_value,
-                                                       u64 b, u64 n, u64 packet) {
+    const u8 *source;
+
+    __device__ __forceinline__ const u8 *packet(const seismic_words_t &seismic_words_value, u64 b, u64 n,
+                                                u64 packet) const {
         return source + (b * B::source_stride_0(seismic_words_value) + n * B::source_stride_1(seismic_words_value) +
                          packet * B::source_stride_2(seismic_words_value)) *
                             B::source_packet_size();
     }
-    __device__ static __forceinline__ u64 row_bytes(const seismic_words_t &seismic_words_value) {
+    __device__ __forceinline__ u64 row_bytes(const seismic_words_t &seismic_words_value) const {
         return B::source_stride_1(seismic_words_value) * B::source_packet_size();
     }
 };
@@ -155,22 +177,32 @@ template <class B> struct Rows {
     }
 };
 
-// A warp's stage of its tile's rows' source bytes, which the conversion's
-// code (SEISMIC_CONVERSION_<F>_<T>_UNIT, _FIXED) stages segment by segment of
-// its tile plan into `rows`, then reads at `row()`: rows `real` hold source
-// packets, row `r`'s at `source + r * row_bytes`.
-template <class B> struct Stage {
+// The stage of a tile's rows' source bytes, by its LANES placing lanes
+// (`mask`), which the conversion's code (SEISMIC_CONVERSION_<F>_<T>_UNIT,
+// _FIXED) stages segment by segment of its tile plan into `rows`, then reads
+// at `row()`: rows `real` hold source packets, row `r`'s at `source + r *
+// row_bytes`.
+template <class B, u32 LANES> struct Stage {
     typedef Shape<B> S;
     const u8 *source;
     u64 row_bytes;
-    u32 real, lane;
+    u32 real, lane, mask;
     u32 *rows;
+
+    // Whether staged unit `index` of a segment of `length` bytes, copied in
+    // units of `unit`, lies past the tile's: the plans deal its units to a
+    // lane a row (`Shape::LANES`), so more lanes are done with them before
+    // the plans' last indices (every argument a constant: the test folds
+    // away, and with it every unit past them).
+    __device__ static __forceinline__ bool past(u32 length, u32 unit, u32 index) {
+        return LANES * index >= S::TILE_ROWS * (length / unit);
+    }
 
     // Lane `lane`'s staged unit `index` of segment bytes [first, first +
     // length) of the tile's rows (copy units of `unit` bytes, the rows'
     // units dealt to the lanes in turn): its row and unit within the row.
     __device__ __forceinline__ void locate(u32 length, u32 unit, u32 index, u32 &r, u32 &k) const {
-        const u32 count = length / unit, at = lane + S::LANES * index;
+        const u32 count = length / unit, at = lane + LANES * index;
         r = at / count;
         k = at % count;
     }
@@ -185,6 +217,8 @@ template <class B> struct Stage {
     // between its stores: measured against A7, iq3_s 1.09x, q3_k packet
     // 1.09x its time).
     __device__ __forceinline__ u32 load(u32 first, u32 length, u32 unit, int moved, u32 index) const {
+        if (past(length, unit, index))
+            return 0u;
         u32 r, k;
         locate(length, unit, index, r, k);
         const u8 *from = source + r * row_bytes + moved + first + k * unit;
@@ -200,6 +234,8 @@ template <class B> struct Stage {
     // ... stored at staged byte `position` of its row's stage (its address
     // too formed unconditionally).
     __device__ __forceinline__ void store(u32 value, u32 length, u32 position, u32 unit, u32 index) const {
+        if (past(length, unit, index))
+            return;
         u32 r, k;
         locate(length, unit, index, r, k);
         u8 *to = reinterpret_cast<u8 *>(rows) + r * 4 * S::STAGE_WORDS + position + k * unit;
@@ -213,7 +249,7 @@ template <class B> struct Stage {
     // Row `lane`'s staged bytes, once every lane has staged its share
     // (lanes past the tile's rows read a row's, and place nothing).
     __device__ __forceinline__ const u32 *row() const {
-        __syncwarp();
+        __syncwarp(mask);
         return rows + lane % S::TILE_ROWS * S::STAGE_WORDS;
     }
 };
@@ -240,15 +276,16 @@ __device__ __forceinline__ void store(u8 *out, const u32 *words, u32 bytes, u32 
     }
 }
 
-// A warp's tile: rows row0.. of matrix b at source packet `packet`
-// (`occupied` when the tile holds source columns), unit `unit` of the
-// group, staging in `stage`. Lane l computes row l's words.
-template <class B, class A> struct Tile {
+// A tile, placed by LANES lanes (`mask`): rows row0.. of matrix b at source
+// packet `packet` (`occupied` when the tile holds source columns), unit
+// `unit` of the group, read through `source`, staging in `stage`. Lane l
+// computes row l's words.
+template <class B, class A, u32 LANES> struct Tile {
     typedef Shape<B> S;
-    const u8 *source;
+    A source;
     const seismic_words_t &seismic_words_value;
     u64 b, row0;
-    u32 packet, unit, lane;
+    u32 packet, unit, lane, mask;
     bool occupied;
     u32 *stage;
 
@@ -258,9 +295,9 @@ template <class B, class A> struct Tile {
         return occupied ? u32(min(u64(S::TILE_ROWS), n - min(row0, n))) : 0u;
     }
 
-    __device__ __forceinline__ Stage<B> staging() const {
-        return Stage<B>{A::packet(source, seismic_words_value, b, row0, packet), A::row_bytes(seismic_words_value),
-                        real(), lane, stage};
+    __device__ __forceinline__ Stage<B, LANES> staging() const {
+        return Stage<B, LANES>{source.packet(seismic_words_value, b, row0, packet), source.row_bytes(seismic_words_value),
+                               real(), lane, mask, stage};
     }
 
     // Row `lane`'s record words (zero where its row holds no source
@@ -287,8 +324,8 @@ template <class B, class A> struct Tile {
     // At a group's first tile, after its unit's (`loaded` as `fixed_load`
     // left it).
     __device__ __forceinline__ void fixed_record(u32 *loaded, u32 *words) const {
-        // The stage is the warp's: every lane is done with what it held.
-        __syncwarp();
+        // The stage is the tile's: every lane is done with what it held.
+        __syncwarp(mask);
         if constexpr (S::UNITS != 1) B::fixed_load(staging(), loaded);
         B::fixed(staging(), loaded, words);
         if (lane >= real())
@@ -312,30 +349,31 @@ __host__ __device__ constexpr u32 copy_unit(u32 alignment) { return alignment < 
 
 // Row `lane`'s words [first, first + count) and [second, second + more),
 // staged one after the other from staged word 0.
-template <class B, class A>
-__device__ __forceinline__ void stage_record(const Tile<B, A> &tile, const u32 *words, u32 first, u32 count,
+template <class B, class A, u32 LANES>
+__device__ __forceinline__ void stage_record(const Tile<B, A, LANES> &tile, const u32 *words, u32 first, u32 count,
                                              u32 second, u32 more) {
     typedef Shape<B> S;
-    __syncwarp();
+    __syncwarp(tile.mask);
     if (tile.lane < S::TILE_ROWS) {
         for (u32 word = 0; word < count; ++word) tile.stage[tile.lane * S::RECORD_STRIDE + word] = words[first + word];
         for (u32 word = 0; word < more; ++word)
             tile.stage[tile.lane * S::RECORD_STRIDE + count + word] = words[second + word];
     }
-    __syncwarp();
+    __syncwarp(tile.mask);
 }
 
 // Packet bytes [low, low + bytes), staged from record byte `slot` on, of
 // every real row into its destination packet (rows out_stride_1 packets
 // apart), coalesced, in copies of `unit` bytes (`copy_unit`); every argument
 // but `low` a constant.
-template <class B, class A>
-__device__ __forceinline__ void store_bytes(const Tile<B, A> &tile, u8 *out, u32 slot, u32 bytes, u32 unit, u32 low) {
+template <class B, class A, u32 LANES>
+__device__ __forceinline__ void store_bytes(const Tile<B, A, LANES> &tile, u8 *out, u32 slot, u32 bytes, u32 unit,
+                                            u32 low) {
     typedef Shape<B> S;
     const u32 units = bytes / unit, real = tile.real();
     const u64 row_bytes = B::out_stride_1(tile.seismic_words_value) * B::packet_size();
 #pragma unroll 4
-    for (u32 at = tile.lane; at < S::TILE_ROWS * units; at += S::LANES) {
+    for (u32 at = tile.lane; at < S::TILE_ROWS * units; at += LANES) {
         const u32 r = at / units, k = at % units;
         u8 *to = out + r * row_bytes + low + k * unit;
         const u8 *from = reinterpret_cast<const u8 *>(tile.stage + r * S::RECORD_STRIDE) + slot + k * unit;
@@ -347,20 +385,20 @@ __device__ __forceinline__ void store_bytes(const Tile<B, A> &tile, u8 *out, u32
     }
 }
 
-template <class B, class A, class O>
-__device__ __forceinline__ void packet_tile(const u8 *source, u8 *destination,
+template <class B, class A, class O, u32 LANES>
+__device__ __forceinline__ void packet_tile(const A &source, u8 *destination,
                                             const seismic_words_t &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
-                                            u32 lane, u32 *shared) {
+                                            u32 lane, u32 mask, u32 *shared) {
     typedef Shape<B> S;
     static_assert(S::CODES_END * 4 <= B::packet_size(), "the codes are whole words of a packet");
-    // `shared`: the warp's staged source bytes, then its record words.
+    // `shared`: the tile's staged source bytes, then its record words.
     const u64 row0 = u64(tile_y) * S::TILE_ROWS;
     const u32 column0 = tile_x * S::TILE_COLUMNS;
     const u64 packets = (B::k(seismic_words_value) + S::GROUP - 1) / S::GROUP;
     if (column0 >= packets * S::GROUP || row0 >= B::n(seismic_words_value)) return;
     const u32 packet = column0 / S::GROUP;
-    const Tile<B, A> tile{source, seismic_words_value, b, row0, packet, column0 % S::GROUP / S::TILE_COLUMNS, lane, true,
-                          shared};
+    const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, packet, column0 % S::GROUP / S::TILE_COLUMNS,
+                                 lane, mask, true, shared};
     u8 *out = destination_packet<B, O>(destination, seismic_words_value, b, row0, packet);
     u32 words[S::WORDS], loaded[S::FIXED_LOADS];
     tile.fixed_load(loaded);
@@ -408,10 +446,10 @@ template <class B> __device__ __forceinline__ void place_entry(u8 *entries, u32 
     *reinterpret_cast<u16 *>(entries + B::record_entry(r, e / ENTRIES, e % ENTRIES)) = u16(value);
 }
 
-template <class B, class A, class O>
-__device__ __forceinline__ void records_tile(const u8 *source, u8 *destination,
+template <class B, class A, class O, u32 LANES>
+__device__ __forceinline__ void records_tile(const A &source, u8 *destination,
                                              const seismic_words_t &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
-                                             u32 lane, u32 *shared) {
+                                             u32 lane, u32 mask, u32 *shared) {
     typedef Shape<B> S;
     constexpr u64 ENTRY_BYTES = B::records_entry_bytes();
     // The codes role is a group's entries (its units' words), then its factors.
@@ -431,8 +469,8 @@ __device__ __forceinline__ void records_tile(const u8 *source, u8 *destination,
     const u64 stored_rows = (B::n(seismic_words_value) + S::MMA_ROWS - 1) / S::MMA_ROWS * S::MMA_ROWS;
     if (column0 >= stored_columns || row0 >= stored_rows) return;
     const u64 rows = min(u64(S::TILE_ROWS), stored_rows - row0);
-    const Tile<B, A> tile{source, seismic_words_value, b, row0, column0 / S::GROUP, column0 % S::GROUP / S::TILE_COLUMNS,
-                          lane, column0 < packets * S::GROUP, shared};
+    const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
+                                 column0 % S::GROUP / S::TILE_COLUMNS, lane, mask, column0 < packets * S::GROUP, shared};
     // Row `lane`'s mma16 tile.
     u8 *mma = O::row(destination, seismic_words_value, b, row0 + lane - lane % S::MMA_ROWS);
     const u32 r = lane % S::MMA_ROWS;
@@ -460,7 +498,7 @@ __device__ __forceinline__ void records_tile(const u8 *source, u8 *destination,
         for (u64 tile_row = 0; tile_row < rows; tile_row += S::MMA_ROWS) {
             u8 *tile_bytes = O::row(destination, seismic_words_value, b, row0 + tile_row);
             for (u64 byte = row_groups * S::MMA_ROWS * B::role_bytes(Role::codes) + lane;
-                 byte < S::MMA_ROWS * B::out_row_stride_bytes(seismic_words_value); byte += S::LANES)
+                 byte < S::MMA_ROWS * B::out_row_stride_bytes(seismic_words_value); byte += LANES)
                 tile_bytes[byte] = 0;
         }
     }
@@ -484,8 +522,8 @@ __device__ __forceinline__ u8 *tile_plane_byte(u8 *destination, const seismic_wo
 // (`PackedRowLayout::code_bit`): slot `j` of a step holds the code of
 // (`B::fragment_row`, `B::fragment_column`) at bit `bits` j, stored in units
 // of `unit`.
-template <class B, class A, class O>
-__device__ __forceinline__ void place_fragments(const Tile<B, A> &tile, u8 *destination, u64 rows, u32 column0,
+template <class B, class A, class O, u32 LANES>
+__device__ __forceinline__ void place_fragments(const Tile<B, A, LANES> &tile, u8 *destination, u64 rows, u32 column0,
                                                 const u32 *staged, u32 bits, u32 at, u64 offset, u64 row_bytes,
                                                 u32 unit) {
     typedef Shape<B> S;
@@ -511,10 +549,10 @@ __device__ __forceinline__ void place_fragments(const Tile<B, A> &tile, u8 *dest
     }
 }
 
-template <class B, class A, class O>
-__device__ __forceinline__ void planes_tile(const u8 *source, u8 *destination,
+template <class B, class A, class O, u32 LANES>
+__device__ __forceinline__ void planes_tile(const A &source, u8 *destination,
                                             const seismic_words_t &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
-                                            u32 lane, u32 *shared) {
+                                            u32 lane, u32 mask, u32 *shared) {
     typedef Shape<B> S;
     static_assert(!S::FRAGMENTS || (32 % S::CODES_WORDS == 0 && (S::HIGH_WORDS == 0 || 32 % S::HIGH_WORDS == 0)),
                   "a code lies in one staged word");
@@ -531,8 +569,8 @@ __device__ __forceinline__ void planes_tile(const u8 *source, u8 *destination,
                                 : B::n(seismic_words_value);
     if (column0 >= stored_columns || row0 >= stored_rows) return;
     const u64 rows = min(u64(S::TILE_ROWS), stored_rows - row0);
-    const Tile<B, A> tile{source, seismic_words_value, b, row0, column0 / S::GROUP, column0 % S::GROUP / S::TILE_COLUMNS,
-                          lane, column0 < packets * S::GROUP, shared};
+    const Tile<B, A, LANES> tile{source, seismic_words_value, b, row0, column0 / S::GROUP,
+                                 column0 % S::GROUP / S::TILE_COLUMNS, lane, mask, column0 < packets * S::GROUP, shared};
     u8 *row = O::row(destination, seismic_words_value, b, row0 + lane);
     u32 words[S::WORDS], loaded[S::FIXED_LOADS];
     tile.fixed_load(loaded);
@@ -586,11 +624,11 @@ __device__ __forceinline__ void planes_tile(const u8 *source, u8 *destination,
         // The code roles' words of the warp's rows staged, then placed.
         if (lane < rows)
             for (u32 word = 0; word < S::UNIT_WORDS; ++word) staged[lane * S::UNIT_WORDS + word] = words[word];
-        __syncwarp();
-        place_fragments<B, A, O>(tile, destination, rows, column0, staged, S::CODES_WORDS, 0,
+        __syncwarp(mask);
+        place_fragments<B, A, O, LANES>(tile, destination, rows, column0, staged, S::CODES_WORDS, 0,
                         B::row_plane(Role::codes, seismic_words_value),
                         B::row_plane_bytes(Role::codes, seismic_words_value), B::fragment_alignment(Role::codes));
-        place_fragments<B, A, O>(tile, destination, rows, column0, staged, S::HIGH_WORDS, S::CODES_WORDS,
+        place_fragments<B, A, O, LANES>(tile, destination, rows, column0, staged, S::HIGH_WORDS, S::CODES_WORDS,
                         B::row_plane(Role::high, seismic_words_value),
                         B::row_plane_bytes(Role::high, seismic_words_value), B::fragment_alignment(Role::high));
     } else {
@@ -626,21 +664,28 @@ __device__ __forceinline__ void planes_tile(const u8 *source, u8 *destination,
 }
 
 // Place row tile (`tile_x` columns, `tile_y` rows) of matrix `b`, reading
-// the source through `A` and writing through `O`, by one warp (`lane` the
-// thread's lane), staging in the warp's `shared` (`Shape::SHARED_WORDS`
-// words). A tile outside the matrix's stored extent places nothing.
-template <class B, class A = Strided<B>, class O = Rows<B>>
-__device__ __forceinline__ void convert_tile(const u8 *source, u8 *destination,
+// the source through `source` (an `A`) and writing through `O`, by LANES
+// lanes of a warp (`lanes_mask`; `lane` the thread's among them: a whole
+// warp, or a share of it that places a tile of its own, `Shape::WARP_TILES`),
+// staging in their `shared` (`Shape::SHARED_WORDS` words). A tile outside the
+// matrix's stored extent places nothing.
+template <class B, class A = Strided<B>, class O = Rows<B>, u32 LANES = 32>
+__device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
                                              const seismic_words_t &seismic_words_value, u64 b, u32 tile_x, u32 tile_y,
                                              u32 lane, u32 *shared) {
-    static_assert(Shape<B>::TILE_ROWS % (B::packet() ? 1u : Shape<B>::MMA_ROWS) == 0,
-                  "a row tile holds whole mma16 tiles");
+    typedef Shape<B> S;
+    static_assert(S::TILE_ROWS % (B::packet() ? 1u : S::MMA_ROWS) == 0, "a row tile holds whole mma16 tiles");
+    // A lane a row computes its words, and the stage's lanes take every unit
+    // the plans deal.
+    static_assert(LANES >= S::TILE_ROWS && LANES >= S::LANES, "a tile's lanes hold its rows");
+    static_assert(32 / LANES <= S::WARP_TILES, "a warp places at most its WARP_TILES tiles at once");
+    const u32 mask = lanes_mask<LANES>();
     if constexpr (B::packet())
-        packet_tile<B, A, O>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, shared);
+        packet_tile<B, A, O, LANES>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, mask, shared);
     else if constexpr (B::records())
-        records_tile<B, A, O>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, shared);
+        records_tile<B, A, O, LANES>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, mask, shared);
     else
-        planes_tile<B, A, O>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, shared);
+        planes_tile<B, A, O, LANES>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, mask, shared);
 }
 
 } // namespace repack

@@ -221,10 +221,10 @@ native routed_move for metal from "metal/routed_move.metal":
         threadgroups (LIST_GROUPS, LIST_ROWS, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
-# Metal: a threadgroup per row tile of each listed record (one WINDOW_BYTES window
-# along a 35B row), striding over the items of longer rows, on its round's
-# grid (`routed_scratch_grids`), converting through
-# `lib/streaming/window.h`.
+# Metal: a threadgroup per row tile of each listed record (one window where
+# the tile's 16 rows fit WINDOW_BYTES, as the 35B's and V4.1's down rows
+# do), striding over the items of longer rows, on its round's grid
+# (`routed_scratch_grids`), converting through `lib/streaming/window.h`.
 native routed_convert for metal from "metal/routed_convert.metal":
     records (conveyor, destination)
     launch routed_convert:

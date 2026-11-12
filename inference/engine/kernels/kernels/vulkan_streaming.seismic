@@ -9,6 +9,12 @@
 # Group words are each call's group memory (`shared_bytes`), viewed as
 # `seismic_shared_i32`.
 
+# The byte at which a conversion workgroup's window follows its list's group
+# words (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS) bytes, 272),
+# rounded up to 16 bytes: the seismic language holds no constant
+# expressions, so `routed_convert` checks this number against its terms.
+const CONVERT_WINDOW_AT = 272
+
 # Reuse the resident router's numerical launches and the shared expert's
 # paired projection. Streaming adds selection resolution and next-layer hints.
 native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
@@ -190,17 +196,23 @@ native routed_scratch_grids for vulkan from "vulkan/routed_scratch_grids.comp":
         threads_per_threadgroup (SERIAL_THREADS, 1, 1)
 
 # Metal's launches over the Vulkan windowed conversion
-# (`vulkan/lib/streaming/window.glsl`): a workgroup of 256 invocations places
-# a window of 8 column tiles of a row tile, `repack_weight`'s placement; a
-# workgroup per CONVERT_TILE_ROWS-row tile of the round's records
-# (`routed_scratch_grids`); group words stage the list's cooperative chunk.
+# (`vulkan/lib/streaming/window.glsl`): a workgroup of 256 invocations copies
+# a window of a row tile's stored bytes into its group memory (in 16-byte
+# loads wherever the window rule aligns them), then places the window's
+# column tiles, 16 at once (an invocation a row), by `repack_weight`'s
+# placement; a workgroup per
+# CONVERT_TILE_ROWS-row tile of the round's records (`routed_scratch_grids`).
+# Group words stage the list's cooperative chunk; a packed record's window
+# follows at CONVERT_WINDOW_AT, WINDOW_BYTES: 272 + 20480 bytes in all,
+# within the Vulkan floor's 32 KiB of group memory (the spec's own floor,
+# 16 KiB, holds no window; NVIDIA's devices give 48 KiB).
 native routed_convert for vulkan from "vulkan/routed_convert.comp":
     records (conveyor, destination)
     launch routed_convert:
         threadgroups (ceil_div(N, CONVERT_TILE_ROWS), L, 1)
         grid (grid)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
+        shared_bytes (CONVERT_WINDOW_AT + packed(U) * WINDOW_BYTES)
 
 # CUDA's launch on the route's wait grid (`streaming/tier_wait.hpp`): one
 # workgroup, its first invocation reading the step's slot, its invocations

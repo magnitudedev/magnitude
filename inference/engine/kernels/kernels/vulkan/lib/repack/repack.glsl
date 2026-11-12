@@ -25,13 +25,21 @@
 // columns, and `NAME_place(packet, row, column0)` for conversion `C` from
 // source element `S` into tensor `D`'s rows16 rows: one row's tile of
 // columns from `column0`, `packet` the address of the source
-// packet holding that column, `row` the address of the stored row. The
-// includer checks that `S` is external and `D` rows16 with no padding
-// groups (`SEISMIC_ELEMENT_<U>_GROUP_MULTIPLE` 1): every stored tile holds
-// source packets.
+// packet holding that column, `row` the address of the stored row; and
+// `NAME_place_shared(packet, row, column0)`, the same placement from the
+// packet at byte offset `packet` of the group memory (a copy of the source,
+// the packet at a multiple of its alignment: the conversion's `_SHARED`
+// code). Placing reads no other invocation's words, so any invocations may
+// place any rows' tiles. The includer checks that `S` is external and `D`
+// rows16 with no padding groups (`SEISMIC_ELEMENT_<U>_GROUP_MULTIPLE` 1):
+// every stored tile holds source packets.
 #include <seismic/element.glsl>
 
-#define REPACK_TILE_ROWS 16u
+// The rows of a conversion's tile as the code computes with them: unsigned.
+// `REPACK_TILE_ROWS_INT`, the same count as a signed literal for a
+// preprocessor `#if` (glslang's divides by no unsigned one), is the Vulkan
+// prefix's (`native::abi`), which states the conversion's `TILE_ROWS` once.
+#define REPACK_TILE_ROWS uint(REPACK_TILE_ROWS_INT)
 
 // `count` bytes at `place`, zero.
 void repack_zero_bytes(uint64_t place, uint64_t count) {
@@ -67,25 +75,25 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
     uint NAME##_tile_columns() { \
         return uint(C##_UNIT_COLUMNS); \
     } \
-    void NAME##_place(uint64_t packet, uint64_t row, uint column0) { \
-        const uint group_columns = uint(S##_LOGICAL_GROUP); \
-        const uint64_t group = column0 / group_columns; \
-        const uint within = column0 % group_columns; \
+    /* The unit's code words of the tile at `column0`, stored into row `row`. */ \
+    void NAME##_place_unit(uint64_t row, uint column0, uint words[C##_WORDS]) { \
         const uint unit = column0 / NAME##_tile_columns(); \
-        uint words[C##_WORDS]; \
-        C##_UNIT(packet, within / NAME##_tile_columns(), words); \
         NAME##_store(row + D##_ROW_CODES + uint64_t(unit) * (4u * C##_CODES_UNIT_WORDS), \
             words, 0u, 4u * C##_CODES_UNIT_WORDS, C##_CODES_ALIGNMENT); \
         NAME##_store(row + D##_ROW_HIGH + uint64_t(unit) * (4u * C##_HIGH_UNIT_WORDS), \
             words, C##_CODES_UNIT_WORDS, 4u * C##_HIGH_UNIT_WORDS, C##_HIGH_ALIGNMENT); \
-        if (within == 0u) { \
-            C##_FIXED(packet, words); \
-            NAME##_store(row + D##_ROW_SCALES + group * C##_SCALES_BYTES, words, \
-                C##_SCALES_WORD, C##_SCALES_BYTES, C##_SCALES_ALIGNMENT); \
-            NAME##_store(row + D##_ROW_SUPERS + group * C##_SUPERS_BYTES, words, \
-                C##_SUPERS_WORD, C##_SUPERS_BYTES, C##_SUPERS_ALIGNMENT); \
-        } \
-        if (uint64_t(column0 + NAME##_tile_columns()) == uint64_t(D##_ROW_GROUPS) * group_columns) { \
+    } \
+    /* The fixed words of the group at `column0`, stored into row `row`. */ \
+    void NAME##_place_fixed(uint64_t row, uint column0, uint words[C##_WORDS]) { \
+        const uint64_t group = column0 / uint(S##_LOGICAL_GROUP); \
+        NAME##_store(row + D##_ROW_SCALES + group * C##_SCALES_BYTES, words, \
+            C##_SCALES_WORD, C##_SCALES_BYTES, C##_SCALES_ALIGNMENT); \
+        NAME##_store(row + D##_ROW_SUPERS + group * C##_SUPERS_BYTES, words, \
+            C##_SUPERS_WORD, C##_SUPERS_BYTES, C##_SUPERS_ALIGNMENT); \
+    } \
+    /* The row's alignment tails, zero, by its last tile. */ \
+    void NAME##_place_tails(uint64_t row, uint column0) { \
+        if (uint64_t(column0 + NAME##_tile_columns()) == uint64_t(D##_ROW_GROUPS) * uint(S##_LOGICAL_GROUP)) { \
             repack_zero_bytes(row + D##_ROW_CODES + D##_ROW_CODES_BYTES, D##_ROW_CODES_TAIL); \
             repack_zero_bytes(row + D##_ROW_HIGH + D##_ROW_HIGH_BYTES, D##_ROW_HIGH_TAIL); \
             repack_zero_bytes(row + D##_ROW_SCALES + D##_ROW_SCALES_BYTES, \
@@ -93,4 +101,26 @@ void repack_zero_bytes(uint64_t place, uint64_t count) {
             repack_zero_bytes(row + D##_ROW_SUPERS + D##_ROW_SUPERS_BYTES, \
                 D##_ROW_SUPERS_TAIL); \
         } \
+    } \
+    void NAME##_place(uint64_t packet, uint64_t row, uint column0) { \
+        const uint within = column0 % uint(S##_LOGICAL_GROUP); \
+        uint words[C##_WORDS]; \
+        C##_UNIT(packet, within / NAME##_tile_columns(), words); \
+        NAME##_place_unit(row, column0, words); \
+        if (within == 0u) { \
+            C##_FIXED(packet, words); \
+            NAME##_place_fixed(row, column0, words); \
+        } \
+        NAME##_place_tails(row, column0); \
+    } \
+    void NAME##_place_shared(uint packet, uint64_t row, uint column0) { \
+        const uint within = column0 % uint(S##_LOGICAL_GROUP); \
+        uint words[C##_WORDS]; \
+        C##_UNIT_SHARED(packet, within / NAME##_tile_columns(), words); \
+        NAME##_place_unit(row, column0, words); \
+        if (within == 0u) { \
+            C##_FIXED_SHARED(packet, words); \
+            NAME##_place_fixed(row, column0, words); \
+        } \
+        NAME##_place_tails(row, column0); \
     }

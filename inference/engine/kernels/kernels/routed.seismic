@@ -2369,10 +2369,15 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
 
 
 # The window a converting threadgroup copies staged bytes into before it
-# converts them (`lib/streaming/window.h`, the natives of `routed_convert`): its threadgroup memory, within Metal's 32 KiB
-# and CUDA's 48 KiB of static shared memory a block; no other size was
-# measured.
-const WINDOW_BYTES = 16384
+# converts them (`lib/streaming/window.h`, the natives of `routed_convert`):
+# its threadgroup memory, within Metal's 32 KiB, CUDA's 48 KiB of static
+# shared memory a block and the 32 KiB of group memory the engine requires of
+# a Vulkan device (beside a workgroup's list words). 20 KiB, the least whole KiB that holds a 16-row
+# tile of DeepSeek V4.1's MXFP4 down rows (16 x 1224 = 19584 bytes, 72
+# packets of 17 bytes a row) whole, so such a tile is one item, copied as
+# one 16-byte aligned span (a smaller window splits each row's packets
+# across two items, every other row's share off 16-byte alignment).
+const WINDOW_BYTES = 20480
 
 # The rows of a record one converting threadgroup's tile covers, which sets
 # `routed_convert`'s grid over a record of N rows, ceil_div(N,

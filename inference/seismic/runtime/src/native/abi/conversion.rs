@@ -17,7 +17,12 @@
 //! words of up to its packet alignment, each within the packet wherever a
 //! unit moves it; Metal's functions are templates over the packet's pointer,
 //! device memory or a kernel's threadgroup copy of the source, read in its
-//! own address space), or (CUDA) the kernel's stage of a warp's rows: the code
+//! own address space; Vulkan's, which GLSL cannot template over an address
+//! space, are rendered twice: `{prefix}_UNIT` and `{prefix}_FIXED` over a
+//! packet's device address, `{prefix}_UNIT_SHARED` and `{prefix}_FIXED_SHARED`
+//! over a packet's byte offset in the group memory, read through its
+//! `seismic_shared_*` views, at a multiple of the packet alignment), or
+//! (CUDA) the kernel's stage of a warp's rows: the code
 //! stages each segment of its tile plan (`TilePlans`), unit by unit, by the
 //! stage's `load(first, length, unit, moved, index)` and `store(value,
 //! length, position, unit, index)`, a batch's loads before its stores
@@ -104,17 +109,6 @@ impl Spelling {
         }
     }
 
-    /// The parameter of the source.
-    fn source_parameter(self) -> &'static str {
-        match self {
-            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Glsl => "uint64_t packet",
-            // Metal: any address space's packet (`{name}_view`).
-            Self::Msl => "P packet",
-            Self::Cuda => "const S &stage",
-        }
-    }
-
     /// A constant array of `values`, named `name`.
     fn constant_array(self, name: &str, values: &[String]) -> String {
         let values = values.join(", ");
@@ -172,11 +166,14 @@ impl Spelling {
     }
 }
 
-/// The dialects whose code reads a source packet in memory.
+/// The dialects whose code reads a source packet in memory: Vulkan's in
+/// device memory (`Glsl`) or in the group memory (`GlslShared`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PacketDialect {
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Glsl,
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    GlslShared,
     Msl,
 }
 
@@ -184,7 +181,7 @@ impl PacketDialect {
     fn spelling(self) -> Spelling {
         match self {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Glsl => Spelling::Glsl,
+            Self::Glsl | Self::GlslShared => Spelling::Glsl,
             Self::Msl => Spelling::Msl,
         }
     }
@@ -198,14 +195,37 @@ enum Source {
     Stage(TilePlans),
 }
 
-/// The rows of a CUDA kernel's tile and the lanes of its warp, whose
-/// staged units a stage deals to the lanes in turn (`{prefix}_TILE_ROWS`,
-/// `{prefix}_LANES`, the kernel's).
-const TILE_ROWS: u32 = 16;
-const LANES: u32 = 32;
+impl Source {
+    /// The parameter of the source.
+    fn parameter(&self) -> &'static str {
+        match self {
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Packet(PacketDialect::Glsl) => "uint64_t packet",
+            // A byte offset in the group memory.
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Packet(PacketDialect::GlslShared) => "uint packet",
+            // Metal: any address space's packet (`{name}_view`).
+            Self::Packet(PacketDialect::Msl) => "P packet",
+            Self::Stage(_) => "const S &stage",
+        }
+    }
+}
+
+/// The rows of a conversion's tile (Vulkan's prefix states them too, as
+/// `REPACK_TILE_ROWS_INT`), and, of a CUDA kernel, the lanes its tile plans deal the
+/// tile's staged units to in turn (`{prefix}_TILE_ROWS`, `{prefix}_LANES`):
+/// a lane a row, half a warp, so a warp may stage two tiles at once, a half
+/// each. A stage dealt to a whole warp (WARP_LANES lanes) is done with each
+/// segment's units `index` whose WARP_LANES * index lies below the
+/// segment's units; the plans order those first, so a whole warp's stage
+/// runs the batches it would were the plans dealt to it, and the kernel
+/// folds away the rest (`repack::Stage`).
+pub(super) const TILE_ROWS: u32 = 16;
+const LANES: u32 = 16;
+const WARP_LANES: u32 = 32;
 
 /// The CUDA kernel's tile plans of a conversion's word form: the source
-/// bytes a warp stages for a tile and where. A tile's words, a unit's (plan
+/// bytes a tile's lanes stage for it and where. A tile's words, a unit's (plan
 /// `c` for a unit of class `c`, its representative's block) or at a group's
 /// first tile the fixed words (the last plan, the fixed blocks), read some of
 /// its rows' source bytes: part 0, the bytes of runs that stay where the
@@ -213,7 +233,7 @@ const LANES: u32 = 32;
 /// of slot s, which a unit moves by s's byte displacement. A run's bytes are
 /// its group's members', from the lowest to the highest, so a member's
 /// staged bits lie as far from its representative's as in the packet (a
-/// unit moves each member within the bytes it spans). The warp stages
+/// unit moves each member within the bytes it spans). The lanes stage
 /// exactly those, coalesced, part by part, each maximal run of used bytes (a
 /// segment) at a position aligned to its copy unit: the widest that the
 /// source's packet alignment (at most 4, the widest unit a kernel reads a
@@ -346,22 +366,26 @@ pub(super) fn render_conversion_code(
     layout: &registry::ExternalPacketLayout,
     dialect: Dialect,
 ) {
-    let source = match dialect {
-        Dialect::Cuda(_) => Source::Stage(TilePlans::of(words, layout)),
-        Dialect::Metal(_) => Source::Packet(PacketDialect::Msl),
-        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        Dialect::Vulkan(_) => Source::Packet(PacketDialect::Glsl),
-    };
-    let spelling = match &source {
-        Source::Packet(dialect) => dialect.spelling(),
-        Source::Stage(_) => Spelling::Cuda,
-    };
-    let span = words.span();
     let name = prefix.to_ascii_lowercase();
     let (alignment, packet_size) = (layout.packet_alignment, layout.packet_size);
-    match &source {
+    // The source, after the views or readers its code reads through.
+    let source = match dialect {
+        Dialect::Cuda(_) => {
+            let plans = TilePlans::of(words, layout);
+            out.push_str(&format!(
+                "#define {prefix}_STAGE_WORDS {}\n#define {prefix}_TILE_ROWS {TILE_ROWS}\n#define {prefix}_LANES {LANES}\n",
+                plans.stage_words
+            ));
+            render_readers(out, &name);
+            Source::Stage(plans)
+        }
+        Dialect::Metal(_) => {
+            render_views(out, &name);
+            Source::Packet(PacketDialect::Msl)
+        }
+        // Device memory's views; the group memory's are the prefix's.
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        Source::Packet(PacketDialect::Glsl) => {
+        Dialect::Vulkan(_) => {
             // A read's alignment is a size's the packet alignment allows.
             for read in [1u32, 2, 4].into_iter().filter(|size| *size <= alignment) {
                 for size in [1, 2, 4].into_iter().filter(|size| *size <= read) {
@@ -371,16 +395,14 @@ pub(super) fn render_conversion_code(
                     ));
                 }
             }
+            Source::Packet(PacketDialect::Glsl)
         }
-        Source::Packet(PacketDialect::Msl) => render_views(out, &name),
-        Source::Stage(plans) => {
-            out.push_str(&format!(
-                "#define {prefix}_STAGE_WORDS {}\n#define {prefix}_TILE_ROWS {TILE_ROWS}\n#define {prefix}_LANES {LANES}\n",
-                plans.stage_words
-            ));
-            render_readers(out, &name);
-        }
-    }
+    };
+    let spelling = match &source {
+        Source::Packet(dialect) => dialect.spelling(),
+        Source::Stage(_) => Spelling::Cuda,
+    };
+    let span = words.span();
     let lookups = render_lookups(out, &name, words, spelling);
     let template = match spelling {
         Spelling::Cuda => "template <typename S> ",
@@ -389,72 +411,81 @@ pub(super) fn render_conversion_code(
         Spelling::Glsl => "",
     };
     let function = spelling.function();
-    let new = |reads| Code::new(words, &name, reads, &lookups, alignment, packet_size);
+    // `{prefix}_UNIT{suffix}` and `{prefix}_FIXED{suffix}` reading `source`.
+    let render = |out: &mut String, suffix: &str, source: &Source| {
+        let new = |reads| Code::new(words, &name, reads, &lookups, alignment, packet_size);
 
-    // The span's units, each one's class and displacements.
-    out.push_str(&format!(
-        "{template}{function}void {prefix}_UNIT({}, {} unit, {}) {{\n    switch (unit) {{\n",
-        spelling.source_parameter(),
-        spelling.word_type(),
-        spelling.words_parameter(words.words())
-    ));
-    for index in 0..span.class_count {
-        let members = words.class_units(index).collect::<Vec<_>>();
-        for (unit, _) in &members {
-            out.push_str(&format!("    case {unit}u:\n"));
-        }
-        let class = words.class(index);
-        let mut code = new(match &source {
-            Source::Packet(dialect) => Reads::Packet(*dialect),
-            Source::Stage(plans) => Reads::Stage(Plan::Unit(plans, index)),
-        });
-        code.moves = Some(Moves {
-            index,
-            class,
-            members,
-        });
-        code.block(class.representative);
-        out.push_str("    {\n");
-        for line in code.finish().1 {
-            out.push_str(&format!("        {line}\n"));
-        }
-        out.push_str("        return;\n    }\n");
-    }
-    out.push_str("    }\n}\n\n");
-
-    // The fixed blocks' words; a stage's loads of them apart (CUDA), so a
-    // kernel can issue them with its unit's.
-    let mut code = new(match &source {
-        Source::Packet(dialect) => Reads::Packet(*dialect),
-        Source::Stage(plans) => Reads::Stage(Plan::Fixed(plans)),
-    });
-    for block in span.units..words.blocks() {
-        code.block(block);
-    }
-    let (loads, lines) = code.finish();
-    let loaded = match source {
-        Source::Stage(_) => {
-            out.push_str(&format!("#define {prefix}_FIXED_LOADS {}\n", loads.len()));
-            out.push_str(&format!(
-                "{template}{function}void {prefix}_FIXED_LOAD(const S &stage, unsigned *loaded) {{\n"
-            ));
-            for line in loads {
-                out.push_str(&format!("    {line}\n"));
+        // The span's units, each one's class and displacements.
+        out.push_str(&format!(
+            "{template}{function}void {prefix}_UNIT{suffix}({}, {} unit, {}) {{\n    switch (unit) {{\n",
+            source.parameter(),
+            spelling.word_type(),
+            spelling.words_parameter(words.words())
+        ));
+        for index in 0..span.class_count {
+            let members = words.class_units(index).collect::<Vec<_>>();
+            for (unit, _) in &members {
+                out.push_str(&format!("    case {unit}u:\n"));
             }
-            out.push_str("}\n\n");
-            ", const unsigned *loaded"
+            let class = words.class(index);
+            let mut code = new(match source {
+                Source::Packet(dialect) => Reads::Packet(*dialect),
+                Source::Stage(plans) => Reads::Stage(Plan::Unit(plans, index)),
+            });
+            code.moves = Some(Moves {
+                index,
+                class,
+                members,
+            });
+            code.block(class.representative);
+            out.push_str("    {\n");
+            for line in code.finish().1 {
+                out.push_str(&format!("        {line}\n"));
+            }
+            out.push_str("        return;\n    }\n");
         }
-        Source::Packet(_) => "",
+        out.push_str("    }\n}\n\n");
+
+        // The fixed blocks' words; a stage's loads of them apart (CUDA), so a
+        // kernel can issue them with its unit's.
+        let mut code = new(match source {
+            Source::Packet(dialect) => Reads::Packet(*dialect),
+            Source::Stage(plans) => Reads::Stage(Plan::Fixed(plans)),
+        });
+        for block in span.units..words.blocks() {
+            code.block(block);
+        }
+        let (loads, lines) = code.finish();
+        let loaded = match source {
+            Source::Stage(_) => {
+                out.push_str(&format!("#define {prefix}_FIXED_LOADS {}\n", loads.len()));
+                out.push_str(&format!(
+                    "{template}{function}void {prefix}_FIXED_LOAD(const S &stage, unsigned *loaded) {{\n"
+                ));
+                for line in loads {
+                    out.push_str(&format!("    {line}\n"));
+                }
+                out.push_str("}\n\n");
+                ", const unsigned *loaded"
+            }
+            Source::Packet(_) => "",
+        };
+        out.push_str(&format!(
+            "{template}{function}void {prefix}_FIXED{suffix}({}{loaded}, {}) {{\n",
+            source.parameter(),
+            spelling.words_parameter(words.words())
+        ));
+        for line in lines {
+            out.push_str(&format!("    {line}\n"));
+        }
+        out.push_str("}\n\n");
     };
-    out.push_str(&format!(
-        "{template}{function}void {prefix}_FIXED({}{loaded}, {}) {{\n",
-        spelling.source_parameter(),
-        spelling.words_parameter(words.words())
-    ));
-    for line in lines {
-        out.push_str(&format!("    {line}\n"));
+    render(out, "", &source);
+    // Vulkan's again over the group memory (module docs).
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    if let Dialect::Vulkan(_) = dialect {
+        render(out, "_SHARED", &Source::Packet(PacketDialect::GlslShared));
     }
-    out.push_str("}\n\n");
 }
 
 /// The views a packet's code reads its words through (Metal):
@@ -830,7 +861,7 @@ impl<'a> Code<'a> {
     fn block(&mut self, block: u32) {
         match self.reads {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Reads::Packet(PacketDialect::Glsl) => self.straight_block(block),
+            Reads::Packet(PacketDialect::Glsl | PacketDialect::GlslShared) => self.straight_block(block),
             _ => self.placed_block(block),
         }
     }
@@ -874,7 +905,7 @@ impl<'a> Code<'a> {
             // in batches of STAGE_BATCH, a batch's loads, then its stores; the
             // fixed plan's loaded apart (into `loaded`, the kernel's), then
             // stored.
-            let units = plan
+            let mut units = plan
                 .segments()
                 .iter()
                 .flat_map(|&[part, first, length, position, unit]| {
@@ -889,14 +920,21 @@ impl<'a> Code<'a> {
                             format!("d{slot}b")
                         }
                     };
-                    (0..(TILE_ROWS * (length / unit)).div_ceil(LANES)).map(move |index| {
+                    let count = TILE_ROWS * (length / unit);
+                    (0..count.div_ceil(LANES)).map(move |index| {
                         (
-                            format!("{first}u, {length}u, {unit}u, {moved}, {index}u"),
-                            format!("{length}u, {position}u, {unit}u, {index}u"),
+                            WARP_LANES * index >= count,
+                            (
+                                format!("{first}u, {length}u, {unit}u, {moved}, {index}u"),
+                                format!("{length}u, {position}u, {unit}u, {index}u"),
+                            ),
                         )
                     })
                 })
                 .collect::<Vec<_>>();
+            // A whole warp's units first (`LANES`), each segment's in order.
+            units.sort_by_key(|&(past_warp, _)| past_warp);
+            let units = units.into_iter().map(|(_, unit)| unit).collect::<Vec<_>>();
             match plan {
                 Plan::Unit(..) => {
                     for (batch, units) in units.chunks(STAGE_BATCH).enumerate() {
@@ -1079,15 +1117,23 @@ impl<'a> Code<'a> {
             None => format!("source{size}_{alignment}"),
             Some(moved) => format!("moved{}_{size}_{alignment}", moved.slot),
         };
-        let declaration = match (spelling, moved) {
+        let declaration = match (self.reads, moved) {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            (Spelling::Glsl, None) => format!("{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}(packet);", name = self.name),
+            (Reads::Packet(PacketDialect::Glsl), None) => format!("{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}(packet);", name = self.name),
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            (Spelling::Glsl, Some(moved)) => format!(
+            (Reads::Packet(PacketDialect::Glsl), Some(moved)) => format!(
                 "{name}_{size}_{alignment} {view} = {name}_{size}_{alignment}(packet + uint64_t(int64_t(d{}b)));",
                 moved.slot,
                 name = self.name
             ),
+            // The view's first element: the packet's byte offset (a
+            // multiple of the alignment) in `size`-byte elements.
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            (Reads::Packet(PacketDialect::GlslShared), None) => format!("const uint {view} = packet / {size}u;"),
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            (Reads::Packet(PacketDialect::GlslShared), Some(moved)) => {
+                format!("const uint {view} = uint(int(packet) + d{}b) / {size}u;", moved.slot)
+            }
             (_, moved) => {
                 let base = moved.map_or_else(|| String::from("packet"), |moved| format!("packet + d{}b", moved.slot));
                 let word = ["uchar", "ushort", "", "uint"][size as usize - 1];
@@ -1096,9 +1142,13 @@ impl<'a> Code<'a> {
         };
         self.declare(view.clone(), declaration);
         let local = format!("{view}_{index}");
-        let load = match spelling {
+        let load = match self.reads {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Spelling::Glsl => spelling.word(&format!("{view}.v[{index}]")),
+            Reads::Packet(PacketDialect::Glsl) => spelling.word(&format!("{view}.v[{index}]")),
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Reads::Packet(PacketDialect::GlslShared) => {
+                spelling.word(&format!("seismic_shared_u{}[{view} + {index}u]", 8 * size))
+            }
             _ => spelling.word(&format!("{view}[{index}]")),
         };
         self.declare(local.clone(), format!("const uint {local} = {load};"));

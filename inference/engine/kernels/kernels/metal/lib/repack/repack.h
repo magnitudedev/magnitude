@@ -18,16 +18,20 @@
 // `repack_tile` places one row tile, 16 rows x one unit of the code planes'
 // words (`tile_columns`, SEISMIC_CONVERSION_<F>_<T>_UNIT_COLUMNS: 32, or more
 // where 32 columns are no whole words of a plane), with 32 threads, each
-// plane's share of the unit's 32-column chunks where the layout puts them. A
+// plane's share of the unit's 32-column chunks where the layout puts them:
+// a lane below 16 places its row, and the lanes above it take part only in
+// an mma16 code plane's fragment exchange (`exchange_words`). A
 // unit divides its group, so a tile covers a whole packet or part of a
 // larger one; the tile at a group's first column also places that group's
 // other record words. Stored-but-unoccupied bytes (mma16 padding rows and
 // groups, plane alignment tails, packet gaps) are written as zero, so the
 // result is fully defined. A matrix spans `tiles_x` x `tiles_y` tiles.
 //
-// The source is read through an addressing policy `A`: `Strided<B>` reads the
-// bound source tensor; an includer that stages the source first
-// (lib/streaming/window.h) addresses its copy.
+// The source is read through an addressing policy `A`, `A::packet` giving a
+// packet's address from the source handle: `Strided<B>` reads the bound
+// source tensor (the handle its pointer); an includer that stages the source
+// first (lib/streaming/window.h) addresses its copy (the handle the copy's
+// geometry).
 
 #include <seismic/element.h>
 
@@ -127,7 +131,7 @@ REPACK_INLINE void packet_tile(In source, device uchar *destination, constant ul
     if (lane >= TILE_ROWS || column0 >= packets * group || n >= B::n(seismic_words)) return;
     const uint packet = column0 / group;
     const uint within = column0 % group;
-    In in = A::packet(source, seismic_words, b, n, packet);
+    auto in = A::packet(source, seismic_words, b, n, packet);
     device uchar *out = destination_packet<B>(destination, seismic_words, b, n, packet);
     const uint unit = within / TILE_COLUMNS;
     uint words[B::words()];
@@ -296,7 +300,7 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
     // that packet.
     const ulong n = row0 + lane;
     const bool real = n < dim_n && occupied;
-    In in = A::packet(source, seismic_words, b, real ? n : 0ul, real ? group_index : 0u);
+    auto in = A::packet(source, seismic_words, b, real ? n : 0ul, real ? group_index : 0u);
 
     // Code planes: the tile's unit of each, every word computed before any
     // is stored (a store could alias the source, and the planes' words read
@@ -379,9 +383,11 @@ REPACK_INLINE void row_tile(In source, device uchar *destination, constant ulong
 }
 
 // Place row tile `tile` (columns x, rows y) of matrix `b`, reading the
-// source through `A`; `lane` is the thread's index in its 32-thread group,
-// `staged` the group's `exchange_words` exchange words. A tile outside the
-// matrix's stored extent does nothing.
+// source handle `source` through `A`; `lane` is the thread's index in its
+// 32-thread group, `staged` the group's `exchange_words` exchange words.
+// Where a tile exchanges none (`exchange_words` 1), lanes 16-31 place
+// nothing, so a caller may run another tile on them, as its lanes 0-15. A
+// tile outside the matrix's stored extent does nothing.
 template <class B, class A = Strided<B>, typename In>
 REPACK_INLINE void repack_tile(In source, device uchar *destination, constant ulong *seismic_words, ulong b,
                                uint2 tile, uint lane, threadgroup uint *staged) {

@@ -8,8 +8,11 @@
 # streaming_words.seismic); `routed_convert` takes a block per
 # CONVERT_TILE_ROWS-row tile.
 
-# The threads of a block that converts by windows (`routed_convert`): eight warps, each placing
-# tiles from its own stage (`cuda/lib/streaming/window.cuh`, `Shared`).
+# The threads of a block that converts by windows (`routed_convert`): eight
+# warps, each placing two tiles at once, a half warp each from its own stage
+# words (`cuda/lib/streaming/window.cuh`, `Shared`, which asserts that a
+# warp's stages fit CUDA's 48 KB of static shared memory beside the
+# WINDOW_BYTES window and the block's words).
 const WINDOW_THREADS = 256
 
 # A converting block's mirror of the row tile it converts, written to the

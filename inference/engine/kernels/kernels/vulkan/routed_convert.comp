@@ -8,15 +8,30 @@
 // read there. The conveyor and the destination are record ports (views of lent records, the
 // destination the scratch lender's), each record read or written at its own
 // base. Workgroups stride over the listed records' items, so a launch costs
-// what its list holds.
+// what its list holds. The group memory holds the list's words (from word
+// 0), then a packed record's window from the next 16-byte boundary.
 #include <seismic/slab.glsl>
 #include "lib/streaming/control.glsl"
 #include "lib/streaming/window.glsl"
 #include "../streaming/list.hpp"
 
+// The window follows the list's group words at the next 16-byte boundary.
+#if SEISMIC_CONST_CONVERT_WINDOW_AT != (4 * (SEISMIC_CONST_LIST_GROUP_CHUNK + \
+        SEISMIC_CONST_LIST_CHUNK * SEISMIC_CONST_LIST_ENTRY_WORDS) + 15) / 16 * 16
+#error "CONVERT_WINDOW_AT is the list's group words rounded up to 16 bytes"
+#endif
+
 #if defined(SEISMIC_ELEMENT_U_KIND_DENSE)
 STREAMING_DENSE(conveyed, SEISMIC_ELEMENT_ST, SEISMIC_ELEMENT_U, SEISMIC_CONVEYOR, SEISMIC_DESTINATION, SEISMIC_DIM_N, SEISMIC_DIM_K)
 #else
+// rows16 stores exactly the source's groups (every stored tile holds source
+// packets), and a window row holds a packet.
+#if SEISMIC_ELEMENT_U_GROUP_MULTIPLE != 1
+#error "rows16 stores no padding groups"
+#endif
+#if !STREAMING_WINDOW_FITS(REPACK_TILE_ROWS_INT, SEISMIC_ELEMENT_ST_PACKET_SIZE, SEISMIC_CONST_WINDOW_BYTES)
+#error "a window holds a source packet of each row"
+#endif
 REPACK_TILE(conveyed, SEISMIC_CONVERSION_ST_U, SEISMIC_ELEMENT_ST, SEISMIC_DESTINATION)
 STREAMING_PACKED(conveyed, SEISMIC_ELEMENT_ST, SEISMIC_CONVEYOR, SEISMIC_DESTINATION, SEISMIC_DIM_N, SEISMIC_DIM_K)
 #endif
@@ -28,6 +43,7 @@ void routed_convert() {
     const uint entries =
         streaming_step_entries(list, stride, element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), 0u, tid);
     const uint per_record = uint(conveyed_items());
+    const uint window = uint(SEISMIC_CONST_CONVERT_WINDOW_AT);
     STREAMING_LIST_ITEMS(at, entries, per_record, gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.y,
         gl_NumWorkGroups.x * gl_NumWorkGroups.y) {
         streaming_list_pair(list, stride, at, per_record, entries, 0u, tid, gl_WorkGroupSize.x);
@@ -38,6 +54,6 @@ void routed_convert() {
         // stored bytes the host read there.
         const uint64_t source = from >= 0 ? slab_region(SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR), uint64_t(from))
                                           : slab_region(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), uint64_t(-1 - from));
-        conveyed_convert(source, destination, item);
+        conveyed_convert(source, destination, item, window);
     }
 }

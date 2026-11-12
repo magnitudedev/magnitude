@@ -12,6 +12,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     // The warp's staged source bytes (then its record words, or its staged
     // code words).
     __shared__ repack::u32 shared[repack::Shape<RepackBinding>::SHARED_WORDS];
-    repack::convert_tile<RepackBinding>(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
-                                        seismic_words_value, blockIdx.z, blockIdx.x, blockIdx.y, threadIdx.x, shared);
+    repack::convert_tile<RepackBinding>(repack::Strided<RepackBinding>{SEISMIC_PTR(SEISMIC_BUFFER_SOURCE)},
+                                        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), seismic_words_value, blockIdx.z,
+                                        blockIdx.x, blockIdx.y, threadIdx.x, shared);
 }

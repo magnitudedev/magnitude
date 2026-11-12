@@ -143,8 +143,8 @@ pub(super) fn header(features: VulkanFeatures) -> String {
 }
 
 /// The argument block (buffer addresses, the scalar-result address, then
-/// the words: there is no words buffer), read-only flags, workgroup size and
-/// group-memory views of a source with `buffers` buffers.
+/// the words: there is no words buffer), read-only flags and workgroup size
+/// of a source with `buffers` buffers.
 pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> String {
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
     tail.push_str(
@@ -162,15 +162,23 @@ pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> Str
         tail.push_str(&format!("#define SEISMIC_READONLY_{index} {read_only}\n"));
     }
     tail.push_str("layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
+    tail
+}
+
+/// The group-memory views (`SHARED_VIEWS`), declared before the
+/// representations and conversions, whose code reads them (a conversion's
+/// `_SHARED` functions).
+pub(super) fn shared_views() -> String {
+    let mut views = String::new();
     for (ordinal, (name, ty, bytes)) in SHARED_VIEWS.iter().enumerate() {
         let lower = name.to_ascii_lowercase();
-        tail.push_str(&format!(
+        views.push_str(&format!(
             "layout(constant_id = {}) const uint SEISMIC_SHARED_{name} = {}u;\nshared seismic_shared_{lower}_t {{ {ty} seismic_shared_{lower}[SEISMIC_SHARED_{name}]; }};\n",
             SHARED_VIEW_CONSTANT + ordinal,
             SHARED_DEFAULT_BYTES / bytes
         ));
     }
-    tail
+    views
 }
 
 /// The group-memory region the compiler sees before specialization: the
