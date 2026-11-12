@@ -26,6 +26,8 @@ pub mod executor_costs;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod launches;
+#[cfg(feature = "machine-line")]
+pub mod line;
 pub mod miss_model;
 pub mod misses;
 #[cfg(test)]
@@ -59,12 +61,16 @@ pub use executor_costs::{
     WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
 };
 pub use launches::{Declarations, Kernel, Launches, Words};
+#[cfg(feature = "machine-line")]
+pub use line::{Line, MachineLine, MachineLineError, Operand, Peak, Rate, Stream, Sweep};
 pub use cost::{
     BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LineError, Miss, Nanoseconds, Pass,
     PassLine, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
 };
 pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
+#[cfg(feature = "machine-line")]
+pub use requests::line_outstanding;
 pub use requests::{Outstanding, PointRequest, PointRequests, SiteRequest, Waiter};
 pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
 pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};

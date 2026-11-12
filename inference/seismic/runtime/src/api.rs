@@ -847,6 +847,17 @@ pub mod device {
         pub fn properties(&self) -> &seismic_lang::device::DeviceProperties {
             &self.properties
         }
+        #[cfg(feature = "machine-line")]
+        /// Whether a Vulkan device forms the cooperative-matrix path
+        /// (`FormationTarget::matrix`: supported and chosen), which a
+        /// matrix program is empty without; `None` on every other backend.
+        pub fn forms_matrix_path(&self) -> Option<bool> {
+            match &self.kind {
+                #[cfg(not(target_os = "macos"))]
+                OpenedKind::Vulkan(opened) => Some(opened.service().formation().matrix),
+                _ => None,
+            }
+        }
         /// What this device's graphs cost its submissions so far: graphs
         /// recorded (a submission during which that count grew recorded one
         /// on the host, so its duration is not its launches' alone) and

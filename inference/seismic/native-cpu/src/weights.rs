@@ -4397,6 +4397,60 @@ impl<C: FloatCodes, K: Coefficients, const STORAGE: usize> Format for FloatRows<
     }
 }
 
+/// One quantized dot of tier `L`'s int8 forms, for the machine line's int8
+/// probe (assessment's `line_int8`), so the probe issues the instruction the
+/// forms do and the tier's dot paths have one owner: `acc` plus, per 32-bit
+/// lane, the four products of unsigned weight bytes and signed activation
+/// bytes, by `vpdpbusd` (AVX-512 VNNI's EVEX form, AVX-VNNI's VEX form on a
+/// tier without it) where the tier has VNNI, else `maddubs` pairs.
+///
+/// # Safety
+/// The caller is compiled with `L`'s features (an `#[inline(always)]` body
+/// below its tier boundary).
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "machine-line")]
+#[inline(always)]
+pub unsafe fn quantized_dot<L: Isa>(
+    acc: std::arch::x86_64::__m256i,
+    weights: std::arch::x86_64::__m256i,
+    activations: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    unsafe { packed_x86::dot::<L>(acc, weights, activations) }
+}
+
+/// The line's int8 peak on a 512-bit VNNI tier: `vpdpbusd` over whole
+/// registers, 64 products an instruction, twice the forms' 256-bit dots.
+///
+/// # Safety
+/// The caller is compiled with `L`'s features, and `L` has AVX-512 VNNI.
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "machine-line")]
+#[inline(always)]
+pub unsafe fn quantized_dot_wide<L: Isa>(
+    acc: std::arch::x86_64::__m512i,
+    weights: std::arch::x86_64::__m512i,
+    activations: std::arch::x86_64::__m512i,
+) -> std::arch::x86_64::__m512i {
+    debug_assert!(L::TIER.has("avx512vnni"));
+    unsafe { std::arch::x86_64::_mm512_dpbusd_epi32(acc, weights, activations) }
+}
+
+/// One quantized dot of the NeonDot tier's int8 forms (`sdot`), as
+/// [`quantized_dot`] is x86's.
+///
+/// # Safety
+/// The caller is compiled with the NeonDot tier's features.
+#[cfg(target_arch = "aarch64")]
+#[cfg(feature = "machine-line")]
+#[inline(always)]
+pub unsafe fn quantized_dot_neon(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    unsafe { packed_neon::sdot(acc, a, b) }
+}
+
 /// Register-resident packet decodes and dots on NEON. A packet's values are
 /// formed in two vectors in element order and never leave registers. The
 /// dots use `sdot`, which only the NeonDot tier's boundaries reach.
@@ -5051,7 +5105,7 @@ mod packed_x86 {
     /// `acc` plus, per 32-bit lane, the four products of unsigned weight
     /// bytes `weights` and signed activation bytes `activations`.
     #[inline(always)]
-    pub(super) unsafe fn dot<V: Vectors>(
+    pub(super) unsafe fn dot<V: crate::isa::Isa>(
         acc: __m256i,
         weights: __m256i,
         activations: __m256i,
@@ -5071,7 +5125,7 @@ mod packed_x86 {
     /// `activations`. AVX-512 VNNI's EVEX form on a tier with it, else
     /// AVX-VNNI's VEX form (an AVX-512 VNNI part need not have AVX-VNNI).
     #[inline(always)]
-    pub(super) unsafe fn dpbusd<V: Vectors>(acc: __m256i, weights: __m256i, activations: __m256i) -> __m256i {
+    pub(super) unsafe fn dpbusd<V: crate::isa::Isa>(acc: __m256i, weights: __m256i, activations: __m256i) -> __m256i {
         unsafe {
             if V::AVX512_VNNI {
                 _mm256_dpbusd_epi32(acc, weights, activations)

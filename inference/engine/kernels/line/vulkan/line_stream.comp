@@ -1,0 +1,28 @@
+// line_stream: a logical subgroup sums a row of C values, each lane UNROLL
+// 16-byte loads in flight at once (C is a multiple of 32 lanes x 4 values
+// x 16).
+void line_stream() {
+    const uint UNROLL = SEISMIC_TUNE_UNROLL;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * (gl_WorkGroupSize.x / 32u) + gl_LocalInvocationID.x / 32u;
+    if (row >= SEISMIC_DIM_R)
+        return;
+    const uint lane = SEISMIC_LANE;
+    seismic_uvec4 line = seismic_uvec4(SEISMIC_PTR(SEISMIC_BUFFER_INPUT) + row * SEISMIC_INPUT_STRIDE_0 * 4ul);
+    const uint vectors = uint(SEISMIC_DIM_C / 4ul);
+    float partial[UNROLL];
+    [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+        partial[k] = 0.0;
+    for (uint at = lane; at < vectors; at += 32u * UNROLL) {
+        vec4 loaded[UNROLL];
+        [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+            loaded[k] = uintBitsToFloat(line[at + 32u * k].v);
+        [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+            partial[k] += (loaded[k].x + loaded[k].y) + (loaded[k].z + loaded[k].w);
+    }
+    float total = 0.0;
+    [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+        total += partial[k];
+    total = seismic_subgroup_sum_f32(total);
+    if (lane == 0u)
+        seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_OUT))[uint(row * SEISMIC_OUT_STRIDE_0)].v = total;
+}

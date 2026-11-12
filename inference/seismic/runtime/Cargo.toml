@@ -27,6 +27,9 @@ sha2 = "=0.11.0"
 [features]
 # The offline formation coverage suite (`native::coverage`).
 coverage = ["dep:seismic-vulkan"]
+# Development-only: the machine's line probes' support (`magnitude-engine`'s
+# `machine-line` feature); never by a served engine.
+machine-line = []
 
 [dev-dependencies]
 # Fixture native sources (`seismic_lang::native_source::check_fixture`).

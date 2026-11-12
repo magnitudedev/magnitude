@@ -131,6 +131,36 @@ counting its requests as single rows' (`1 − (1 − q)^r`). The bank grows no f
 its own reads stop falling at. Nothing a load counts is stored, and nothing it counts enters
 assessment.
 
+## The machine's line
+
+Floors are judged against the hardware's own line, never a reported peak and never our kernels'
+rates: the rate device memory streams at, the arithmetic peak of each operand type the backend's
+forms multiply in (f32 multiply-adds; 16-bit matrix products into f32 on a GPU; int8 products into
+i32 where the forms use them), and an empty dependent launch, which is the costs' launch. Each rate
+is a dedicated probe kernel's, timed by the measurement job at every value of its declared UNROLL
+(loads or multiply chains a lane keeps in flight, each chain seeded apart so no compiler merges two,
+held in registers, a CPU's in its tier's widest vectors on every core, and iterated in rounds so the
+loop's own instructions are a small part of each); the figure is the fastest, and it has reached the
+line where one more step did not raise it: a larger value was timed and ran no faster, or the step
+to the largest rose less than the two timings resolve. That alone shows a plateau, not that the work
+credited was done (work a compiler drops is flat too), so a peak is timed at S, 2S and 4S
+multiply-adds a lane and is the marginal rate between S and 4S (a call's and a launch's fixed cost
+cancel), and it stands only where the 2S-to-4S increment is twice the S-to-2S increment within the
+timings' intervals; the line is the fastest UNROLL that does, and a peak none does is recorded
+unscaled with the timings, never as a line. A point of the line is sampled at least the fewest
+samples that bound its median whatever its call takes (only the job's deadline ends it sooner), so
+no point is left without an interval; a call is milliseconds at most; the stream's calls rotate
+through inputs spanning beyond the largest cache, as a streaming kernel's do. An operand the device
+lacks (a configuration its declaration refuses there, or a device property such as Vulkan's
+cooperative matrices) is recorded unobtainable. Nothing prices a figure of the line, so a point the
+job's time ends is left to the next job, as a required figure's is. No estimate reads the line, and
+nothing in loading, planning or serving does, so the runtime's standing assessment never measures
+it: it is a development measurement, taken only on request, in a job of its own that takes the
+line's requests alone (`magnitude-assess --line`, the evaluation harness), and built only with the
+`machine-line` feature, so no served engine carries its probe kernels or its code. A CPU's stream
+is its own sweeps of host memory by the CPU's pool of readers and one step more, recorded apart
+from the host memory's read line a host tier is priced by.
+
 ## Identity and caching
 
 Estimates are cached with their exact assessment under the assessment environment identity, which

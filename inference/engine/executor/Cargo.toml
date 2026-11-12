@@ -29,6 +29,11 @@ tuning-survey = []
 # over a run's recorded routing. Enabled only through `magnitude-engine`'s
 # `expert-routing` feature by `magnitude-harness`; never by a served engine.
 expert-routing = []
+# Development-only machine line (`assessment::line`): what the hardware
+# itself reaches, measured on request by a tool's measurement job. Enabled
+# only through `magnitude-engine`'s `machine-line` feature by
+# `magnitude-harness` and `magnitude-assess`; never by a served engine.
+machine-line = ["magnitude-kernels/machine-line"]
 # Test-only: the controlled execution domain (`fixtures`), its family and its
 # fake expert bank, for the tests of the owners above the domain, and the
 # expert watchers' stall (`starve`). Enabled only as a

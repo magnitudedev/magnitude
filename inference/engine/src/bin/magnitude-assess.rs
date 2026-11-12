@@ -11,8 +11,11 @@
 //! assessment result, with the model's capabilities and template
 //! fingerprint alongside. `--topology` prints the topology, its discovery
 //! diagnostics and the executor's costs (each with its samples and interval)
-//! instead; `--breakdown` prints each model's step call by call. The
-//! evaluation rig runs it per model, and for the topology.
+//! instead; `--breakdown` prints each model's step call by call. Built with
+//! the `machine-line` feature, `--line` also measures the machine's line,
+//! in a job of its own, and `--topology` prints it: a development
+//! measurement, which no served engine's job takes. The evaluation rig
+//! runs it per model, and for the topology.
 
 use magnitude_engine::{
     assessment::{
@@ -24,10 +27,12 @@ use magnitude_engine::{
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
     worker::measure::{end_measured, measure_machine, MeasureEnd, MeasureEvent, MeasureJob, MeasureRequest},
 };
+#[cfg(feature = "machine-line")]
+use magnitude_engine::worker::measure::measure_line;
 use magnitude_executor::{
     assessment::{
-        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts,
-        FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
+        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts, FormatRates,
+        HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, MemoryReserves},
 };
@@ -54,9 +59,13 @@ struct Options {
     /// The measurement job's time, its service's by default.
     time: Duration,
     /// This process is the measurement job of the process that started it
-    /// ([`bounded_job`]), of the executor that process selected: measure,
-    /// and assess nothing.
-    job: Option<ExecutorSelector>,
+    /// ([`bounded_job`]), of the executor that process selected, taking the
+    /// requests of the kind: measure, and assess nothing.
+    job: Option<(ExecutorSelector, Job)>,
+    /// Also measure the machine's line (`--line`): a development measurement
+    /// the runtime never takes, in a job of its own after the machine's.
+    #[cfg(feature = "machine-line")]
+    line: bool,
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
@@ -75,14 +84,33 @@ struct Options {
 /// its measurement does, and not again to select it.
 const JOB_ONLY: &str = "--measurement-job-only";
 
+/// As [`JOB_ONLY`], for the job of the machine's line alone ([`Job::Line`]).
+#[cfg(feature = "machine-line")]
+const LINE_JOB_ONLY: &str = "--measurement-line-job-only";
+
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
      [--storage DIR] [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
      [--method auto|plain] [--weight-cap BYTES | --device-room BYTES] [--context TOKENS] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
+/// The requests a measurement job takes.
+#[derive(Clone, Copy)]
+enum Job {
+    /// The machine's.
+    Machine,
+    /// The machine's line alone, a development measurement.
+    #[cfg(feature = "machine-line")]
+    Line,
+}
+
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// The executor a job's flag `argument` names.
+fn job_executor(argument: &str, args: &mut impl Iterator<Item = String>) -> Result<ExecutorSelector, String> {
+    value(argument, args)?.parse().map_err(|error| format!("{argument}: {error}"))
 }
 
 fn parse() -> Result<Options, String> {
@@ -96,6 +124,8 @@ fn parse() -> Result<Options, String> {
     let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
+    #[cfg(feature = "machine-line")]
+    let mut line = false;
     let mut weight_bound = None;
     let mut context = None;
     let mut job = None;
@@ -141,6 +171,8 @@ fn parse() -> Result<Options, String> {
                 }
             }
             "--topology" => topology = true,
+            #[cfg(feature = "machine-line")]
+            "--line" => line = true,
             "--weight-cap" | "--device-room" => {
                 let bytes = value(&argument, &mut args)?
                     .parse()
@@ -160,13 +192,9 @@ fn parse() -> Result<Options, String> {
                         .map_err(|error| format!("--context: {error}"))?,
                 )
             }
-            JOB_ONLY => {
-                job = Some(
-                    value(&argument, &mut args)?
-                        .parse()
-                        .map_err(|error| format!("{JOB_ONLY}: {error}"))?,
-                )
-            }
+            JOB_ONLY => job = Some((job_executor(&argument, &mut args)?, Job::Machine)),
+            #[cfg(feature = "machine-line")]
+            LINE_JOB_ONLY => job = Some((job_executor(&argument, &mut args)?, Job::Line)),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -208,6 +236,8 @@ fn parse() -> Result<Options, String> {
         time: Duration::try_from_secs_f64(seconds)
             .map_err(|error| format!("--seconds: {error}"))?,
         job,
+        #[cfg(feature = "machine-line")]
+        line,
         topology,
         weight_bound,
         context,
@@ -227,7 +257,7 @@ const JOB_KILLED_AT: u32 = 2;
 /// counts as ended this job, and one that ends two is recorded unobtainable,
 /// so a point that hangs does not hang every job. The seconds it took, and
 /// whether it ended on its own with nothing unmeasured.
-fn bounded_job(time: Duration, executor: ExecutorSelector) -> Result<(f64, bool), String> {
+fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result<(f64, bool), String> {
     let limit = time * JOB_KILLED_AT;
     eprintln!(
         "magnitude-assess: measuring this machine, {:.0} s, killed at {:.0} s",
@@ -238,7 +268,11 @@ fn bounded_job(time: Duration, executor: ExecutorSelector) -> Result<(f64, bool)
     let measured;
     let mut job = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
         .args(std::env::args_os().skip(1))
-        .arg(JOB_ONLY)
+        .arg(match scope {
+            Job::Machine => JOB_ONLY,
+            #[cfg(feature = "machine-line")]
+            Job::Line => LINE_JOB_ONLY,
+        })
         .arg(executor.to_string())
         .stdout(std::process::Stdio::null())
         .spawn()
@@ -303,11 +337,16 @@ fn run() -> Result<bool, String> {
             served.push(directory);
         }
     }
-    if let Some(executor) = options.job {
+    if let Some((executor, scope)) = options.job {
         // Measured as the job measures: what is stored is kept, and each
         // record stored now is printed.
         let started = Instant::now();
-        let MeasureEnd { failures, held } = measure_machine(
+        let measure = match scope {
+            Job::Machine => measure_machine,
+            #[cfg(feature = "machine-line")]
+            Job::Line => measure_line,
+        };
+        let MeasureEnd { failures, held } = measure(
             &MeasureRequest {
                 paths: served,
                 kernels: options.kernels.clone(),
@@ -364,7 +403,14 @@ fn run() -> Result<bool, String> {
             )
         })
         .collect::<Vec<_>>();
-    let (measure_seconds, measured) = bounded_job(options.time, executor.selector())?;
+    #[cfg_attr(not(feature = "machine-line"), allow(unused_mut))]
+    let (mut measure_seconds, mut measured) = bounded_job(options.time, executor.selector(), Job::Machine)?;
+    #[cfg(feature = "machine-line")]
+    if options.line {
+        let (seconds, line_measured) = bounded_job(options.time, executor.selector(), Job::Line)?;
+        measure_seconds += seconds;
+        measured &= line_measured;
+    }
     let measurements = structure.stored_measurements(&options.kernels, &options.storage);
 
     if options.topology {
@@ -393,17 +439,20 @@ fn run() -> Result<bool, String> {
             .collect::<Vec<_>>();
         let normalized: Value =
             serde_json::from_str(&topology.normalized()).expect("the normalized topology is JSON");
-        println!(
-            "{}",
-            json!({
-                "topology": normalized,
-                "diagnostics": diagnostics,
-                "executor": executor.selector().to_string(),
-                "executorCosts": costs,
-                "measured": measured,
-                "measureSeconds": measure_seconds,
-            })
-        );
+        #[cfg_attr(not(feature = "machine-line"), allow(unused_mut))]
+        let mut report = json!({
+            "topology": normalized,
+            "diagnostics": diagnostics,
+            "executor": executor.selector().to_string(),
+            "executorCosts": costs,
+            "measured": measured,
+            "measureSeconds": measure_seconds,
+        });
+        #[cfg(feature = "machine-line")]
+        {
+            report["machineLine"] = machine_line::stored(&topology, executor, &options.kernels);
+        }
+        println!("{report}");
         return Ok(measured);
     }
 
@@ -439,6 +488,64 @@ fn run() -> Result<bool, String> {
 
 fn cost(cost: &MeasuredCost) -> Value {
     json!({ "value": cost.value, "interval": cost.interval, "samples": cost.samples })
+}
+
+/// The machine's line as the topology report holds it, a development
+/// measurement (`--line`).
+#[cfg(feature = "machine-line")]
+mod machine_line {
+    use super::cost;
+    use magnitude_executor::assessment::{Line, MachineLine, Peak, Stream};
+    use magnitude_executor::KernelCache;
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    /// The line `kernels`' records give `executor`, or why there is none.
+    pub(super) fn stored(topology: &seismic::DeviceTopology, executor: &seismic::Executor, kernels: &Path) -> Value {
+        match MachineLine::stored(topology, executor, &KernelCache::measurement_records(kernels)) {
+            Ok(line) => report(&line),
+            Err(error) => json!({ "unavailable": error.to_string() }),
+        }
+    }
+
+    /// The machine's line: the stream's bytes a second and each operand's
+    /// operations a second (its marginal rate, where its work scales with the
+    /// steps; otherwise unscaled, with the ratio of its increments, 2 where
+    /// the work is done), each at the UNROLL it was fastest at and whether a
+    /// larger one ran no faster (its launch is the executor costs').
+    fn report(line: &MachineLine) -> Value {
+        let figure = |line: &Line, reached: bool| {
+            json!({ "perSecond": cost(&line.per_second), "unroll": line.unroll, "reached": reached })
+        };
+        json!({
+            "streamBytes": match &line.stream {
+                Stream::Kernel(rate) => figure(rate.figure(), rate.is_reached()),
+                Stream::Host(rate) => json!({
+                    "perSecond": cost(&rate.figure().per_second),
+                    "readers": rate.figure().readers,
+                    "reached": rate.is_reached(),
+                    "hostMemory": true,
+                }),
+                Stream::Defect(reason) => json!({ "defect": reason.as_str() }),
+                Stream::Unobtainable(reason) => json!({ "unobtainable": reason.as_str() }),
+            },
+            "peakOps": line.peaks.iter().map(|(operand, peak)| match peak {
+                Peak::Rate(rate) => {
+                    json!({ "operand": operand.name(), "line": figure(rate.figure(), rate.is_reached()) })
+                }
+                Peak::Unscaled { unroll, ratio, seconds } => json!({
+                    "operand": operand.name(),
+                    "unscaled": {
+                        "unroll": unroll,
+                        "incrementRatio": ratio,
+                        "secondsAtSAnd2SAnd4S": seconds.iter().map(cost).collect::<Vec<_>>(),
+                    },
+                }),
+                Peak::Defect(reason) => json!({ "operand": operand.name(), "defect": reason.as_str() }),
+                Peak::Unobtainable(reason) => json!({ "operand": operand.name(), "unobtainable": reason.as_str() }),
+            }).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// The executor's costs, each with its interval and samples, the figures

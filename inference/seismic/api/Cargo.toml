@@ -19,6 +19,9 @@ sha2 = "0.10"
 self_cell = "1"
 
 [features]
+# Development-only: the machine's line probes' support (`magnitude-engine`'s
+# `machine-line` feature); never by a served engine.
+machine-line = ["seismic-runtime/machine-line", "seismic-native-cpu/machine-line"]
 # Offline formation coverage of native implementations (`seismic::coverage`).
 coverage = ["seismic-runtime/coverage"]
 # The recorded machines (`seismic::fixtures::recorded`), for other crates' tests.

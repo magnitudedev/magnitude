@@ -25,9 +25,9 @@ use super::client::{handshake, receive, Lost};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
-use magnitude_executor::assessment::{requests, ExecutorCosts, PointRequests, StoredCosts};
+use magnitude_executor::assessment::{requests, CostWalk, ExecutorCosts, PointRequests, StoredCosts};
 use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
-use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, StoreError};
+use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, RecordStore, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -430,6 +430,9 @@ pub struct InProcessJobs {
     topology: Arc<seismic::DeviceTopology>,
     executor: seismic::Executor,
     time: JobTime,
+    /// Whether the jobs take the machine's line alone ([`Self::of_line`]).
+    #[cfg(feature = "machine-line")]
+    line: bool,
 }
 
 /// What the in-process jobs measured.
@@ -490,7 +493,32 @@ impl InProcessJobs {
             topology: catalog.topology(),
             executor: selected.info,
             time,
+            #[cfg(feature = "machine-line")]
+            line: false,
         }))
+    }
+
+    /// Jobs for the machine's line alone on `executor` of the machine
+    /// `catalog` discovered, its records in `kernels`: a development tool
+    /// that needs an executor's line (the host CPU's beside a GPU's load)
+    /// asks for it and no other figure.
+    #[cfg(feature = "machine-line")]
+    pub fn of_line(catalog: &Devices, kernels: PathBuf, storage: PathBuf, executor: seismic::Executor) -> Self {
+        let time = JobTime::default();
+        Self {
+            request: MeasureRequest {
+                paths: Vec::new(),
+                kernels,
+                storage,
+                executor: executor.selector(),
+                job: MeasureJob(0),
+                time: time.given(),
+            },
+            topology: catalog.topology(),
+            executor,
+            time,
+            line: true,
+        }
     }
 
     /// The requests a job has points of left to measure, in its order
@@ -498,6 +526,11 @@ impl InProcessJobs {
     pub fn outstanding(&self) -> Result<magnitude_executor::assessment::Outstanding, String> {
         let records = KernelCache::measurement_records(&self.request.kernels);
         let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(&self.topology, &self.executor, &records));
+        #[cfg(feature = "machine-line")]
+        if self.line {
+            use magnitude_executor::assessment::line_outstanding;
+            return Ok(line_outstanding(&self.topology, &self.executor, &records, costs));
+        }
         PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
     }
 
@@ -509,7 +542,14 @@ impl InProcessJobs {
             self.request.job = MeasureJob(self.request.job.0 + 1);
             self.request.time = self.time.given();
             let mut recorded = false;
-            let end = measure_machine(&self.request, &mut |event| recorded |= matches!(event, MeasureEvent::Recorded(..)));
+            let mut report = |event: MeasureEvent| recorded |= matches!(event, MeasureEvent::Recorded(..));
+            #[cfg(feature = "machine-line")]
+            let end = match self.line {
+                true => measure_line(&self.request, &mut report),
+                false => measure_machine(&self.request, &mut report),
+            };
+            #[cfg(not(feature = "machine-line"))]
+            let end = measure_machine(&self.request, &mut report);
             drop(end.held);
             let outstanding = self.outstanding().map_err(JobsStopped::Requests)?;
             let job = match recorded || outstanding != before {
@@ -562,6 +602,32 @@ pub fn measure_machine(
     request: &MeasureRequest,
     report: &mut dyn FnMut(MeasureEvent),
 ) -> MeasureEnd {
+    measure_job(request, report, &|topology, executor, records, costs| {
+        PointRequests::new(&request.kernels).outstanding(topology, executor, &request.storage, records, costs)
+    })
+}
+
+/// The job of [`measure_machine`] for the machine's line alone: a
+/// development measurement no served engine's job takes, which a tool that
+/// needs an executor's line asks for and no other figure.
+#[cfg(feature = "machine-line")]
+pub fn measure_line(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent)) -> MeasureEnd {
+    measure_job(request, report, &|topology, executor, records, costs| {
+        Ok(magnitude_executor::assessment::line_outstanding(topology, executor, records, costs))
+    })
+}
+
+/// The requests a job measures: those of the executor on the topology that
+/// are outstanding beside the records, given the costs' outstanding walk.
+type Requests<'a> = &'a dyn Fn(
+    &seismic::DeviceTopology,
+    &seismic::Executor,
+    &dyn RecordStore<PointKey>,
+    Option<CostWalk>,
+) -> Result<magnitude_executor::assessment::Outstanding, String>;
+
+/// A measurement job of `requests` ([`measure_machine`]).
+fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), requests: Requests<'_>) -> MeasureEnd {
     // The job's time runs from its start: discovering the machine, probing
     // and opening the executor are part of it.
     let deadlines = requests::JobDeadlines::new(std::time::Instant::now(), request.time);
@@ -609,7 +675,7 @@ pub fn measure_machine(
     let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
     let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(topology, executor, &records));
-    let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &request.storage, &records, costs);
+    let outstanding = requests(topology, executor, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,
         Err(reason) => return machine(format!("the point requests: {reason}")),
@@ -828,6 +894,8 @@ mod tests {
             topology,
             executor,
             time: JobTime { given: std::time::Duration::ZERO },
+            #[cfg(feature = "machine-line")]
+            line: false,
         }
     }
 

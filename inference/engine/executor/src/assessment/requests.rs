@@ -22,6 +22,11 @@
 //!   hold is priced from those read, so no load moves them later or
 //!   earlier; a required figure's, which nothing prices, is left
 //!   unrecorded for the next job.
+//! - **The machine's line** (`line_outstanding`, with the `machine-line`
+//!   feature): what the hardware itself reaches, which floors are judged
+//!   against, is a development measurement. Nothing in loading, planning or
+//!   serving reads it, so no standing request asks for it and no job of the
+//!   runtime measures it: a tool asks for it, in a job of its own.
 //! - **Who waits** ([`Waiter`]): a load serving with a runtime decision
 //!   pending on a request (its sites, moves, converts, tier copies and
 //!   volumes) touches it when it loads and each time it prices again, so
@@ -84,6 +89,12 @@ pub enum PointRequest {
     /// request, every fit's graphs, priced at its backend's bound
     /// (`seismic::unmeasured_graph_cost`) until it is recorded.
     GraphCost,
+    /// The machine's line (`MachineLine`): device memory's stream rate and
+    /// each operand's arithmetic peak, which floors are judged against and
+    /// nothing prices. A tool asks for it (`line_outstanding`); no standing
+    /// request does.
+    #[cfg(feature = "machine-line")]
+    Line,
     /// How the volume `file` lies on is read, for the urgent request of
     /// `records` records of `parts` where a step waits on it (`VolumeCosts`).
     Volume { file: std::path::PathBuf, urgent: Option<(Vec<u64>, u64)> },
@@ -114,6 +125,14 @@ impl PointRequest {
             }
             Self::TierCopy => matches!(TierCopyCosts::stored(topology, executor, store), Err(TierCopyError::Unrecorded { .. })),
             Self::GraphCost => matches!(GraphMemory::stored(topology, executor, store), Ok(None)),
+            #[cfg(feature = "machine-line")]
+            Self::Line => {
+                use super::line::MachineLineError::{Unrecorded, UnrecordedSweep};
+                matches!(
+                    super::line::MachineLine::stored(topology, executor, store),
+                    Err(Unrecorded { .. } | UnrecordedSweep { .. })
+                )
+            }
             Self::Site(site) => site.outstanding(topology, executor, store),
             Self::CpuSite(form) => matches!(CpuCosts::stored(topology, executor, form, store), Ok(None)),
             Self::Volume { file, urgent } => {
@@ -134,6 +153,9 @@ impl PointRequest {
             Self::CpuSite(_) => Ok(1),
             // Measured as the job's device opened: nothing to time.
             Self::GraphCost => Ok(0),
+            // Every configuration of every probe.
+            #[cfg(feature = "machine-line")]
+            Self::Line => super::line::MachineLine::points(topology, executor),
             // One probe of the volume, its own points its own.
             Self::Volume { .. } => Ok(1),
         }
@@ -154,6 +176,8 @@ impl PointRequest {
             }
             Self::TierCopy => (TierCopyCosts::measure(walks).err(), Vec::new()),
             Self::GraphCost => (GraphMemory::record(walks.device(), walks.store()).err(), Vec::new()),
+            #[cfg(feature = "machine-line")]
+            Self::Line => (super::line::MachineLine::measure(walks).err(), Vec::new()),
             Self::Site(site) => (site.measure(walks).err(), Vec::new()),
             Self::CpuSite(form) => (CpuCosts::measure(walks.device(), form, walks.store()).err(), Vec::new()),
             Self::Volume { file, urgent } => {
@@ -292,6 +316,23 @@ pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) 
         .chain(site.map(PointRequest::CpuSite))
         .chain([PointRequest::Costs(CostWalk::Whole)])
         .collect())
+}
+
+/// What a tool that needs the machine's line alone has the job measure: the
+/// line, where a point of it no record holds, and no other request (not the
+/// costs, not a load's). The job takes it as the loads' requests, with no
+/// standing one: each point an equal part of the job's time, one the time
+/// ends left unrecorded for the next job, as nothing prices the line.
+#[cfg(feature = "machine-line")]
+pub fn line_outstanding(
+    topology: &DeviceTopology,
+    executor: &Executor,
+    store: &dyn RecordStore<PointKey>,
+    costs_outstanding: Option<CostWalk>,
+) -> Outstanding {
+    let line = PointRequest::Line;
+    let loads = if line.outstanding(topology, executor, store, costs_outstanding) { vec![line] } else { Vec::new() };
+    Outstanding { standing: Vec::new(), loads }
 }
 
 /// Who waits on a stored request: a load, as of the latest time it touched
@@ -619,6 +660,61 @@ mod tests {
         assert!(second.iter().all(|(_, outcome)| matches!(outcome, Outcome::Loaded(_))), "{second:?}");
         let records = |readers| MemoryCosts::stored(topology, device.info(), readers, &store);
         assert!(records(1).is_ok() && records(2).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The machine's line runs only on request: no standing request, and no
+    /// request outstanding for a load, is the line's, and a tool that asks
+    /// for the line has the job measure it alone.
+    #[cfg(feature = "machine-line")]
+    #[test]
+    fn the_line_is_asked_for_and_never_stood() {
+        let (topology, executor, _) = host();
+        let storage = std::env::temp_dir();
+        let records = seismic::measure::HeldStore::default();
+        let costs = walk_outstanding(&topology, &executor, &records);
+        let root = std::env::temp_dir().join(format!("point-requests-scope-{}", std::process::id()));
+        let all = PointRequests::new(&root).outstanding(&topology, &executor, &storage, &records, costs).unwrap();
+        assert!(all.standing.iter().any(|request| matches!(request, PointRequest::Costs(_))));
+        let standing = standing(&topology, &executor, &storage).unwrap();
+        assert!(!standing.iter().chain(all.requests()).any(|request| *request == PointRequest::Line));
+        let line = line_outstanding(&topology, &executor, &records, costs);
+        assert_eq!(line, Outstanding { standing: Vec::new(), loads: vec![PointRequest::Line] });
+    }
+
+    /// The CPU's line is measured by the job, its probes formed and run on
+    /// the host: after one job (a line is tens of points, so several jobs
+    /// complete it; the records of a complete line are read back in
+    /// `line`'s tests) the line is whole or has only points the job's time
+    /// did not hold left, none defective or unobtainable.
+    #[cfg(feature = "machine-line")]
+    #[test]
+    fn the_job_measures_the_cpu_line() {
+        use super::super::line::{MachineLine, MachineLineError, Peak, Stream};
+        let device =
+            crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
+                .unwrap();
+        let (topology, executor) = (device.topology(), device.info());
+        let root = std::env::temp_dir().join(format!("point-requests-line-{}", std::process::id()));
+        let store = JsonFileStore::new(&root);
+        let requests = line_outstanding(topology, executor, &store, None);
+        assert!(!requests.is_empty());
+        let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+        let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(60));
+        measure(&mut measurer, &device, &store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {})
+            .unwrap();
+        match MachineLine::stored(topology, executor, &store) {
+            Ok(line) => {
+                assert!(matches!(line.stream, Stream::Host(_)), "{:?}", line.stream);
+                assert!(
+                    line.peaks.iter().all(|(_, peak)| !matches!(peak, Peak::Unobtainable(_) | Peak::Defect(_))),
+                    "{:?}",
+                    line.peaks
+                );
+            }
+            Err(MachineLineError::Unrecorded { .. } | MachineLineError::UnrecordedSweep { .. }) => {}
+            Err(error) => panic!("{error}"),
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

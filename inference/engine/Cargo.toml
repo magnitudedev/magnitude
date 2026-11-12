@@ -69,3 +69,6 @@ tuning-survey = ["magnitude-executor/tuning-survey"]
 # Development-only: the expert directory's routing replay, which
 # `magnitude-harness` prices its bars by.
 expert-routing = ["magnitude-executor/expert-routing"]
+# Development-only: the machine's line, measured on request
+# (`magnitude-assess --line`, `magnitude-harness`).
+machine-line = ["magnitude-executor/machine-line"]

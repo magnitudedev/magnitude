@@ -1,0 +1,24 @@
+// line_f32: S fused f32 multiply-adds an invocation, in UNROLL independent
+// chains seeded apart, in loop iterations of ROUNDS rounds of every chain;
+// it writes `x` back (line.seismic).
+void line_f32() {
+    const uint UNROLL = SEISMIC_TUNE_UNROLL;
+    const uint ROUNDS = 8u;
+    const uint64_t lane = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (lane >= SEISMIC_DIM_N)
+        return;
+    const float x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X))[uint(lane * SEISMIC_X_STRIDE_0)].v;
+    float chain[UNROLL];
+    [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+        chain[k] = x + float(k);
+    for (uint step = 0u; step < SEISMIC_STATIC_S / (UNROLL * ROUNDS); ++step) {
+        [[unroll]] for (uint round = 0u; round < ROUNDS; ++round)
+            [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+                chain[k] = fma(chain[k], x, x);
+    }
+    float total = 0.0;
+    [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
+        total += chain[k];
+    seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_OUT))[uint(lane * SEISMIC_OUT_STRIDE_0)].v =
+        x + (floatBitsToUint(total) == 0xFFFFFFFFu ? 1.0 : 0.0);
+}

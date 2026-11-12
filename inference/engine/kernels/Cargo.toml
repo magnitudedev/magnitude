@@ -7,6 +7,12 @@ license.workspace = true
 [dependencies]
 seismic.workspace = true
 
+[features]
+# Development-only: the machine's line probes (`line/`), which
+# `magnitude-engine`'s `machine-line` feature enables for `magnitude-harness`
+# and `magnitude-assess`; never by a served engine.
+machine-line = ["seismic/machine-line"]
+
 [build-dependencies]
 seismic-build.workspace = true
 # The GGUF formats the registry imports (`gguf_format_tests`).

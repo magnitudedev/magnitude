@@ -9,6 +9,11 @@ magnitude-ggml.workspace = true
 seismic-cpu-tiers.workspace = true
 seismic-lang.workspace = true
 
+[features]
+# Development-only: the machine's line int8 probe's dots (`magnitude-engine`'s
+# `machine-line` feature); never by a served engine.
+machine-line = []
+
 [build-dependencies]
 magnitude-ggml.workspace = true
 seismic-lang.workspace = true

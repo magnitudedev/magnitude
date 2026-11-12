@@ -1,10 +1,14 @@
-//! `machine`: the host CPU's own line, measured as a streamed `time` run
-//! loads: the int8 arithmetic rate its cores reach together (`Φ_cpu`, the
-//! machine's peak, not our kernel's), which the bar prices a CPU-computed
-//! miss by ([`crate::bar`]), or unmeasured with why; and the storage
-//! device's own lines ([`StorageMachine`]).
+//! `machine`: the host CPU's own line, which a streamed `time` run prices a
+//! CPU-computed miss by ([`crate::bar`]): its int8 peak as the measurement
+//! job stored it for the host's CPU executor (`MachineLine`, one owner), or
+//! unmeasured with why; and the storage device's own lines
+//! ([`StorageMachine`]).
 
+use magnitude_engine::worker::measure::InProcessJobs;
+use magnitude_executor::assessment::{MachineLine, MachineLineError, Operand, Peak, Rate};
+use magnitude_executor::KernelCache;
 use serde::Serialize;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
@@ -14,9 +18,9 @@ pub struct CpuMachine {
     /// The CPUs the process may run on (`available_parallelism`, which
     /// follows the affinity mask and quota).
     pub threads: usize,
-    /// int8 operations a second (a multiply and an add each), every thread
-    /// computing dot products as an int8 expert kernel does, from data in
-    /// its first-level cache.
+    /// int8 operations a second (a multiply and an add each) the CPU
+    /// executor's stored line reaches on its quantized dots, scaled with
+    /// its work.
     pub int8_ops_per_second: Result<f64, String>,
 }
 
@@ -25,93 +29,61 @@ pub struct CpuMachine {
 const SECONDS: f64 = 0.25;
 
 impl CpuMachine {
-    /// Measure the host's line.
-    pub fn measure() -> Result<Self, String> {
+    /// The host's line from the records `cache` holds of its CPU executor,
+    /// which the measurement job measures where they are missing: the job
+    /// of the executor, in this process, as any load's job is, so the
+    /// figure is never left to a manual step.
+    pub fn measured(cache: Option<&Path>, storage: &Path) -> Result<Self, String> {
         let threads = std::thread::available_parallelism().map_err(|error| error.to_string())?.get();
-        Ok(Self { threads, int8_ops_per_second: int8_kernel().map(|(ops, work)| rate(threads, ops, work)) })
+        let int8_ops_per_second = match cache {
+            Some(cache) => Self::int8(cache, storage),
+            None => Err("no kernel cache holds the CPU's line (--cache-dir)".to_owned()),
+        };
+        Ok(Self { threads, int8_ops_per_second })
     }
-}
 
-/// Run `work(iterations)` on `threads` threads at once, doubling the
-/// iterations until a run takes [`SECONDS`]: the units a second, each
-/// iteration `units` units a thread.
-fn rate(threads: usize, units: f64, work: Arc<dyn Fn(u64) -> u64 + Send + Sync>) -> f64 {
-    let mut iterations = 1u64 << 10;
-    loop {
-        let start = Arc::new(Barrier::new(threads + 1));
-        let handles = (0..threads)
-            .map(|_| {
-                let (start, work) = (start.clone(), work.clone());
-                std::thread::spawn(move || {
-                    start.wait();
-                    std::hint::black_box(work(iterations));
-                    Instant::now()
-                })
-            })
-            .collect::<Vec<_>>();
-        start.wait();
-        let begun = Instant::now();
-        let ended = handles.into_iter().map(|handle| handle.join().expect("a measuring thread")).max().expect("a thread");
-        let seconds = (ended - begun).as_secs_f64();
-        if seconds >= SECONDS {
-            return threads as f64 * iterations as f64 * units / seconds;
-        }
-        iterations *= 2;
-    }
-}
-
-/// The int8 rate's kernel and its operations an iteration: each thread's
-/// iteration multiplies `x86::VECTORS` pairs of 32 unsigned and signed bytes
-/// into eight accumulators, as a q8 dot product does, re-reading its
-/// operands each iteration.
-fn int8_kernel() -> Result<(f64, Arc<dyn Fn(u64) -> u64 + Send + Sync>), String> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return Ok(((x86::VECTORS * 32 * 2) as f64, Arc::new(|iterations| unsafe { x86::int8(iterations) })));
-        }
-        Err("the CPU has no AVX2, on which the int8 rate is measured".into())
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        Err(format!("no int8 rate kernel on {}", std::env::consts::ARCH))
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod x86 {
-    use std::arch::x86_64::*;
-
-    /// Vectors of 32 int8 lanes an iteration of the int8 kernel reads.
-    pub(super) const VECTORS: usize = 16;
-
-    /// `iterations` passes of int8 dot products over operands the compiler
-    /// cannot hoist: each pass reads them through an opaque reference.
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn int8(iterations: u64) -> u64 {
-        let weights = [[3u8; 32]; VECTORS];
-        let rows = [[5i8; 32]; VECTORS];
-        let ones = _mm256_set1_epi16(1);
-        let mut sums = [_mm256_setzero_si256(); 8];
-        for _ in 0..iterations {
-            let (weights, rows) = (std::hint::black_box(&weights), std::hint::black_box(&rows));
-            for vector in 0..VECTORS {
-                // SAFETY: each operand is 32 bytes; unaligned loads.
-                let (w, r) = unsafe {
-                    (
-                        _mm256_loadu_si256(weights[vector].as_ptr().cast()),
-                        _mm256_loadu_si256(rows[vector].as_ptr().cast()),
-                    )
-                };
-                let pairs = _mm256_maddubs_epi16(w, r);
-                sums[vector % 8] = _mm256_add_epi32(sums[vector % 8], _mm256_madd_epi16(pairs, ones));
+    fn int8(cache: &Path, storage: &Path) -> Result<f64, String> {
+        let catalog = seismic::Devices::discover(&[]).map_err(|error| error.to_string())?;
+        let topology = catalog.topology();
+        let executor = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == seismic::BackendName::Cpu)
+            .ok_or("the host has no CPU executor")?
+            .clone();
+        let records = KernelCache::measurement_records(cache);
+        let mut jobs = None;
+        let line = loop {
+            match MachineLine::stored(&topology, &executor, &records) {
+                Err(MachineLineError::Unrecorded { .. } | MachineLineError::UnrecordedSweep { .. }) => {
+                    // Each run measures something or fails with the jobs'
+                    // stall, so the loop ends.
+                    jobs
+                        .get_or_insert_with(|| {
+                            InProcessJobs::of_line(
+                                &catalog,
+                                cache.to_path_buf(),
+                                storage.to_path_buf(),
+                                executor.clone(),
+                            )
+                        })
+                        .run()
+                        .map_err(|error| format!("measuring the CPU's line: {error}"))?;
+                }
+                other => break other.map_err(|error| format!("the CPU's line: {error}"))?,
             }
+        };
+        match line.peaks.iter().find(|(operand, _)| *operand == Operand::Int8) {
+            Some((_, Peak::Rate(Rate::Reached(peak)))) => Ok(peak.per_second.value),
+            Some((_, Peak::Rate(Rate::Open(peak)))) => Err(format!(
+                "the CPU's int8 peak was not reached (at least {:.3e} operations a second)",
+                peak.per_second.value
+            )),
+            Some((_, Peak::Unscaled { .. })) => Err("the CPU's int8 work was not shown to scale".into()),
+            Some((_, Peak::Defect(reason))) => Err(format!("the CPU's int8 probe measured nothing: {reason}")),
+            Some((_, Peak::Unobtainable(reason))) => Err(format!("the CPU's int8 peak is unobtainable: {reason}")),
+            None => Err("the CPU executor has no int8 peak".into()),
         }
-        let mut total = 0u64;
-        for sum in sums {
-            total = total.wrapping_add(_mm256_extract_epi32::<0>(sum) as u64);
-        }
-        total
     }
 }
 

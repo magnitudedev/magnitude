@@ -443,6 +443,12 @@ impl Device {
     pub fn properties(&self) -> &device::DeviceProperties {
         self.inner.properties()
     }
+    #[cfg(feature = "machine-line")]
+    /// Whether a Vulkan device forms the cooperative-matrix path, which a
+    /// matrix program is empty without; `None` on every other backend.
+    pub fn forms_matrix_path(&self) -> Option<bool> {
+        self.inner.forms_matrix_path()
+    }
     /// What this device's graphs cost its submissions so far: graphs
     /// recorded (a submission during which that count grew recorded one on
     /// the host, so its duration is not its launches' alone) and replays

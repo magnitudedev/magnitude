@@ -296,7 +296,7 @@ impl FileLine {
 }
 
 /// A host-timed submission, complete when submitted.
-struct Done(f64);
+pub(super) struct Done(f64);
 
 impl Pending<String> for Done {
     fn seconds(&self) -> Result<f64, String> {
@@ -1816,9 +1816,9 @@ impl From<StoreError> for MemoryError {
 
 /// Sweeps of host memory, one a pass: `readers` threads started together,
 /// each reading its contiguous share of `words` once, then joined.
-struct Sweeps<'a> {
-    words: &'a [u64],
-    readers: usize,
+pub(super) struct Sweeps<'a> {
+    pub(super) words: &'a [u64],
+    pub(super) readers: usize,
 }
 
 impl Sweeps<'_> {
@@ -1832,7 +1832,7 @@ impl Sweeps<'_> {
     /// places every page on its one node: 29 GB/s read on a machine whose
     /// memory streams 72 to all its cores). The threads are not pinned, so
     /// a reader need not read the pages its writer wrote.
-    fn written(length: usize, readers: usize) -> Vec<u64> {
+    pub(super) fn written(length: usize, readers: usize) -> Vec<u64> {
         let mut words = vec![0u64; length];
         std::thread::scope(|scope| {
             let mut rest = words.as_mut_slice();
@@ -1911,7 +1911,7 @@ pub struct MemoryCosts {
 impl MemoryCosts {
     /// The span a sweep reads on `topology`'s host: [`CACHE_MULTIPLE`] times
     /// the largest cache that can serve host memory.
-    fn span(topology: &DeviceTopology) -> u64 {
+    pub(super) fn span(topology: &DeviceTopology) -> u64 {
         super::executor_costs::CACHE_MULTIPLE * super::executor_costs::host_cache(topology)
     }
 

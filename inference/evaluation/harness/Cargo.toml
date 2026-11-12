@@ -18,7 +18,7 @@ magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-chat = { path = "../../engine/chat" }
 # The engine's development tuning tools (pins and the survey), which only the
 # harness enables; a served engine is built without them.
-magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing"] }
+magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing", "machine-line"] }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }
 magnitude-generation = { path = "../../engine/generation" }

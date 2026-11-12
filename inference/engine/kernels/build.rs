@@ -317,8 +317,18 @@ fn main() {
     // The one source is the `kernels` directory, which the build reruns on
     // (`cargo:rerun-if-changed` of a directory watches every file under it,
     // a new one included).
-    let artifacts = seismic_build::Build::new("kernels")
-        .source("kernels")
+    let mut build = seismic_build::Build::new("kernels").source("kernels");
+    // The machine's line probes (`line/`), a development measurement
+    // (`magnitude-engine`'s `machine-line` feature, which `magnitude-harness`
+    // and `magnitude-assess` enable): built only with this crate's
+    // `machine-line` feature, so no served engine carries them. They are a
+    // source root of their own, whose per-backend assets are optional by
+    // design (a backend whose forms multiply no such operand has none), so
+    // the parity of `kernels/` below does not cover them.
+    if std::env::var_os("CARGO_FEATURE_MACHINE_LINE").is_some() {
+        build = build.source("line");
+    }
+    let artifacts = build
         .run()
         .unwrap_or_else(|error| {
             panic!("checking engine Seismic sources and generating bindings failed: {error}")
@@ -331,7 +341,13 @@ fn main() {
     let kernels = Path::new("kernels")
         .canonicalize()
         .expect("the kernels directory exists");
-    let mut violations = entry_parity(&kernels, &artifacts.natives);
+    let natives = artifacts
+        .natives
+        .iter()
+        .filter(|native| native.asset.starts_with(&kernels))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut violations = entry_parity(&kernels, &natives);
     violations.extend(tree_parity(&kernels));
     if !violations.is_empty() {
         panic!(

@@ -103,9 +103,14 @@ pub fn run(
         .expect("a fixture set is nonempty");
     let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
     let assessment = assessment(artifacts, options);
-    // The CPU's own lines, measured before the load runs anything beside
-    // them: a streamed decode's bar prices a CPU-computed miss by them.
-    let machine = crate::machine::CpuMachine::measure()?;
+    // The CPU's own lines, as the measurement job stores them (it runs here
+    // where they are missing): a streamed decode's bar prices a CPU-computed
+    // miss by them.
+    let machine = crate::machine::CpuMachine::measured(
+        options.cache_dir.as_deref(),
+        &magnitude_artifacts::model_store(&artifacts.target)
+            .map_err(|error| format!("{}: {error}", artifacts.target.display()))?,
+    )?;
     let opening = (host_seconds(), process_cpu_seconds());
     let mut engine = Engine::open(
         artifacts,

@@ -290,7 +290,7 @@ impl MeasuredCost {
 
     /// `units` over each of `timing`'s times: a rate, its interval from the
     /// times' (the slowest time bounds it below).
-    fn rate(units: f64, timing: &Timing) -> Self {
+    pub(super) fn rate(units: f64, timing: &Timing) -> Self {
         Self {
             value: units / timing.median,
             interval: timing
@@ -1128,20 +1128,44 @@ impl<E: Entry> Formation<E> {
         device: &Device,
         rows: Option<u64>,
     ) -> Result<NativeKernel<E>, ExecutorCostsError> {
-        let statics = self.statics(device.backend())?;
-        let specialization = self
-            .entry
-            .default_specialization(device, &statics)
-            .map_err(|error| failed(E::NAME)(&error))?
-            .ok_or_else(|| {
-                ExecutorCostsError(format!("`{}` admits nothing at {statics:?}", E::NAME))
-            })?;
+        let specialization = self.default(device)?;
         let specialization = match rows {
             Some(rows) => specialization.with_range(SELECTED_ROWS, rows, rows),
             None => specialization,
         };
+        self.prepare(device, &specialization)
+    }
+
+    /// Formed on `device` at its default specialization with its parameter
+    /// `name` at `value`; a configuration the device does not admit is
+    /// refused as its declaration refuses it.
+    #[cfg(feature = "machine-line")]
+    pub(super) fn form_at(
+        &self,
+        device: &Device,
+        (name, value): (&str, u64),
+    ) -> Result<NativeKernel<E>, ExecutorCostsError> {
+        self.prepare(device, &self.default(device)?.with_param(name, value))
+    }
+
+    /// Its default specialization on `device`.
+    fn default(&self, device: &Device) -> Result<NativeSpecialization, ExecutorCostsError> {
+        let statics = self.statics(device.backend())?;
         self.entry
-            .prepare(device, &specialization)
+            .default_specialization(device, &statics)
+            .map_err(|error| failed(E::NAME)(&error))?
+            .ok_or_else(|| {
+                ExecutorCostsError(format!("`{}` admits nothing at {statics:?}", E::NAME))
+            })
+    }
+
+    fn prepare(
+        &self,
+        device: &Device,
+        specialization: &NativeSpecialization,
+    ) -> Result<NativeKernel<E>, ExecutorCostsError> {
+        self.entry
+            .prepare(device, specialization)
             .map_err(|error| failed(E::NAME)(&error))
     }
 }
@@ -1870,6 +1894,9 @@ struct Measured<'a, 'd> {
     /// so the job keeps its time.
     whose: Whose,
     left: usize,
+    /// Whether the request's points are sampled to the fewest samples that
+    /// bound their medians whatever their part of the time ([`Walks::bounded`]).
+    bounded: bool,
     /// What the standing points after the next are forecast to take at
     /// least, as the walk forecast them at its latest point: a walk's point
     /// gives its own, and a standing point between the walk's parts, which
@@ -1957,12 +1984,17 @@ impl Measured<'_, '_> {
             Whose::Standing => own + (remaining - own - self.least(self.ahead.all)).max(0.) / left,
             Whose::Loads => remaining / left,
         };
-        Measure {
+        let measure = Measure {
             stop: seismic::measure::Stop::Within {
                 error_rate: crate::SEARCH_SETTINGS.error_rate,
                 seconds,
             },
             min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
+        };
+        if self.bounded {
+            measure.bounded()
+        } else {
+            measure
         }
     }
 
@@ -2136,7 +2168,7 @@ impl Times for Measured<'_, '_> {
 /// 2026-10-21), in an eighth of the time, which on a CPU, whose kernels read
 /// a gigabyte in up to 1.5 s, is most of its job. macOS reports an Apple
 /// CPU's L2, behind which its system-level cache sits.
-fn largest_cache(topology: &DeviceTopology, executor: &Executor) -> u64 {
+pub(super) fn largest_cache(topology: &DeviceTopology, executor: &Executor) -> u64 {
     cache_bound(topology.physical_device(executor.physical()))
 }
 
@@ -2162,7 +2194,7 @@ fn cache_bound(physical: Option<&seismic::PhysicalDevice>) -> u64 {
 /// its bytes span [`CACHE_MULTIPLE`] times `cache`: at least two, so no call
 /// reads the bytes the call before it read (a CPU's f32 projection, one set
 /// of 134 MB over a 128 MiB span, read 15% faster than over two).
-fn rotation_sets(cache: u64, bytes: u64) -> u64 {
+pub(super) fn rotation_sets(cache: u64, bytes: u64) -> u64 {
     (CACHE_MULTIPLE * cache).div_ceil(bytes.max(1)).max(2)
 }
 
@@ -4816,6 +4848,7 @@ impl<'a, 'd> Walks<'a, 'd> {
             visit,
             deadlines,
             whose: Whose::Standing,
+            bounded: false,
             left: 0,
             ahead: Ahead::NONE,
         };
@@ -4827,6 +4860,16 @@ impl<'a, 'd> Walks<'a, 'd> {
     pub(super) fn begin(&mut self, whose: Whose, left: usize) {
         self.measured.whose = whose;
         self.measured.left = left;
+        self.measured.bounded = false;
+    }
+
+    /// Sample the points of the request begun to the fewest samples that
+    /// bound their medians whatever their part of the time, only the job's
+    /// deadline ending one sooner ([`Measure::bounded`]): for a figure whose
+    /// interval its reading needs.
+    #[cfg(feature = "machine-line")]
+    pub(super) fn bounded(&mut self) {
+        self.measured.bounded = true;
     }
 
     /// The records the job stores into.

@@ -1,0 +1,151 @@
+# The machine's line: what the hardware itself reaches, measured once per
+# machine and build by assessment's measurement job (`assessment/line.rs`),
+# which every floor is judged against: the rate device memory streams at,
+# and the arithmetic peak of each operand type the backend's forms multiply
+# in. They measure the hardware, never our kernels: each is a dedicated
+# kernel doing only the one thing it measures, and each declares one
+# parameter, UNROLL, the independent loads or multiply chains a lane keeps
+# in flight. The job times every listed value; a probe has reached its line
+# where a larger value than its fastest was timed and ran no faster, or the
+# step to the largest rose less than the two timings resolve. A peak is also
+# timed at S, 2S and 4S multiply-adds a lane (its static S): its figure is the
+# marginal rate between S and 4S, and it stands only where the 2S-to-4S
+# increment is twice the S-to-2S one within the timings' intervals, which
+# shows the work it credits is done.
+# The peaks list one step more than the stream, whose line every measured
+# device reached within 16: 32 chains is past what a CPU's vector
+# registers hold, so the step to it shows whether fewer reached the line.
+#
+# The empty dependent launch is the third figure of the line, and has no
+# probe here: the job's launch graph already times it (dependent
+# `conditioning_overlay` calls of 64 values inside one sealed graph).
+
+# The stream: each row of C values summed. A 32-lane group (a simdgroup,
+# warp or logical subgroup) reads a row, each lane UNROLL 16-byte loads at
+# once. Its calls rotate through inputs spanning beyond the largest cache.
+fn line_stream[R, C](input: &tensor[R, C] f32, out: &mut tensor[R] f32):
+    parallel for row in 0..R:
+        out[row] = sum_any_order(f32(input[row]))
+
+native line_stream for metal from "metal/line_stream.metal":
+    params (arithmetic UNROLL in [1, 2, 4, 8, 16] default 4)
+    launch line_stream:
+        threadgroups (ceil_div(R, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_stream for cuda from "cuda/line_stream.cu":
+    params (arithmetic UNROLL in [1, 2, 4, 8, 16] default 4)
+    launch line_stream:
+        threadgroups (ceil_div(R, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_stream for vulkan from "vulkan/line_stream.comp":
+    params (arithmetic UNROLL in [1, 2, 4, 8, 16] default 4)
+    launch line_stream:
+        threadgroups (ceil_div(R, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# The CPU's stream is the host memory's line (`MemoryCosts`), one
+# measurement of that fact: no CPU implementation.
+
+# The arithmetic peaks. Each of N lanes makes S multiply-adds of its operand
+# type, in UNROLL independent chains seeded apart (each from its index, so
+# no two are alike and no compiler merges them), in loop iterations of
+# several rounds of every chain where an instruction is a single
+# multiply-add wide (so the loop's own instructions are a small part of
+# each), and writes `x` back: plus whether its chains' sum has the bits
+# 0xFFFFFFFF, which no sum of these products has, so no compiler drops the
+# chains and the result is `x` exactly. A lane is a thread of a GPU and a
+# work item of a CPU (whose chains are its tier's vector registers); a
+# matrix instruction's multiply-adds are shared by the lanes that issue it.
+# S is a multiple of every lane's multiply-adds a round at the largest
+# UNROLL; `steps` holds no values, its extent S static on every backend.
+
+# f32 multiply-adds (fused).
+fn line_f32[N, S](x: &tensor[N] f32, steps: &host tensor[0, S] i32, out: &mut tensor[N] f32):
+    parallel for lane in 0..N:
+        out[lane] = x[lane]
+
+native line_f32 for metal from "metal/line_f32.metal":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_f32:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_f32 for cuda from "cuda/line_f32.cu":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32, 64, 128] default 4)
+    launch line_f32:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_f32 for vulkan from "vulkan/line_f32.comp":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_f32:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_f32 for cpu from "cpu/line_f32.rs":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_f32:
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# 16-bit matrix multiply-adds into f32, the product the GPUs' projection
+# GEMMs and attention run: Metal's 8x8 simdgroup matrices of half, CUDA's
+# m16n8k16 bf16 MMA, Vulkan's 16x16x16 f16 cooperative matrices (timed only
+# on a device that has them: the property is the device's, which a kernel's
+# identity cannot read, so the job asks it). The CPU's forms multiply no
+# 16-bit operand.
+fn line_matrix[N, S](x: &tensor[N] f32, steps: &host tensor[0, S] i32, out: &mut tensor[N] f32):
+    parallel for lane in 0..N:
+        out[lane] = x[lane]
+
+native line_matrix for metal from "metal/line_matrix.metal":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_matrix:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_matrix for cuda from "cuda/line_matrix.cu":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_matrix:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_matrix for vulkan from "vulkan/line_matrix.comp":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_matrix:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# int8 multiply-adds into i32, the product the int8 forms run: CUDA's
+# m16n8k32 s8 MMA, the CPU tier's quantized dots (`Tier::quantized_dots`:
+# AVX-512 VNNI on whole 512-bit registers, AVX2 byte products, NEON `sdot`;
+# a tier with none is refused). Metal's int8 form and its matrix path run on
+# tensor operations, which no measured Apple GPU has: their probes are not
+# built, and the simdgroup matrix probe is refused where the device has
+# them. Vulkan's forms have no int8 product.
+fn line_int8[N, S](x: &tensor[N] f32, steps: &host tensor[0, S] i32, out: &mut tensor[N] f32):
+    parallel for lane in 0..N:
+        out[lane] = x[lane]
+
+native line_int8 for cuda from "cuda/line_int8.cu":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_int8:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native line_int8 for cpu from "cpu/line_int8.rs":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_int8:
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
