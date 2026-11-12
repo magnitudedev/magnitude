@@ -255,6 +255,26 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 
+/// A growth that makes the host tier cover every expert joins at once and
+/// starts the cover's reads, which queue behind every step's: the growth
+/// never waits on them, and the tier is covered once they end.
+#[test]
+fn a_growth_covering_the_tier_joins_at_once_and_starts_its_reads() {
+    let _alone = alone();
+    let harness = lending("cover-grown", EXPERTS, 2, 1, 3 * STAGING, DECODE, EXPERTS as u32 - 1, Placer::Tier, false);
+    let shared = harness.watcher.shared().clone();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!((0..EXPERTS).all(|expert| harness.in_tier(0, expert).is_none()), "a tier short of every expert reads none ahead of use");
+    let ahead = Ahead::queue("cover-grown-ahead");
+    shared.join(super::Join::Landed { records: vec![EXPERTS as u32], views: vec![harness.host.views(EXPERTS as u32)] });
+    shared.joins.wait_taken();
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), EXPERTS as u32, "the growth joined");
+    eventually("the covered tier never read ahead", || residency::lock(&harness.watcher.state).prefetch.outstanding());
+    assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
+    ahead.finish();
+    harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
+}
+
 /// A host tier's shrink on an idle load answers at once beside a demand
 /// landing whose step has ended: the step's wait gave up on the read
 /// queued behind others and the step ended, so the device is past the
@@ -288,27 +308,6 @@ fn a_host_shrink_on_an_idle_load_answers_beside_a_landing_its_step_passed() {
     assert_eq!(cut.slots, 1, "the deepest candidate");
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), 1);
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
-}
-
-/// A filled tier whose growth is decided fills again from that decision,
-/// through every slot that joins and the fill of each, until the growth
-/// ends: its slots joining one by one never leave it filled between them.
-/// Two layers' sixteen experts beside fifteen tier records, eight the
-/// reserve, fill seven; grown to sixteen, the tier fills every expert.
-#[test]
-fn a_filled_tier_fills_again_while_it_grows() {
-    let harness = layered("tier-grows", EXPERTS, 12, 2, 4 + 4);
-    let shared = harness.watcher.shared();
-    let tiered = || (0..2).map(|layer| (0..EXPERTS).filter(|&expert| harness.in_tier(layer, expert).is_some()).count()).sum::<usize>();
-    eventually("the tier never filled", || shared.tier_fill() == crate::TierFill::Filled && tiered() == 7);
-    shared.join(super::Join::Growing);
-    eventually("the decided growth never made the tier fill", || shared.tier_fill() == crate::TierFill::Filling);
-    shared.join(super::Join::Landed { records: vec![16], views: vec![harness.host.views(16)] });
-    eventually("the joined record was never filled", || tiered() == 2 * EXPERTS);
-    assert_eq!(shared.tier_fill(), crate::TierFill::Filling, "filled between its slots, the growth still runs");
-    shared.join(super::Join::Grown);
-    shared.wait_filled().expect("the grown tier fills");
-    assert_eq!(shared.tier_fill(), crate::TierFill::Filled);
 }
 
 /// A host tier grows by its records and the views that address them,
@@ -351,10 +350,9 @@ fn running_cut(shared: &Shared) -> Option<super::super::resize::RunningCut> {
 /// read the dropped experts as cold ones, from its conveyor, and nothing
 /// lands past the cut. Asked once a later group began, whose steps decided
 /// their hits by the map before it, it cuts nothing. Two layers of eight
-/// experts in a store of fifteen records, its bottom eight lent, the fill
-/// keeping seven in records 8 to 14, one short of every expert (a store
-/// with a record for each keeps them all, `HostRecords::takes`); the cut
-/// at 12.
+/// experts in a store of fifteen records, its bottom eight lent, decode
+/// steps' misses keeping seven in records 8 to 14, each landing into the
+/// lowest ready past the lent ones; the cut at 12.
 #[test]
 fn a_cut_beside_a_running_group_drops_all_it_has_not_decided() {
     const CUT: usize = 12;
@@ -366,10 +364,21 @@ fn a_cut_beside_a_running_group_drops_all_it_has_not_decided() {
             .flat_map(|layer| (0..EXPERTS).filter_map(move |expert| Some((layer, expert, layers[layer].0.held(expert)?))))
             .collect::<Vec<_>>()
     };
-    eventually("the fill never filled beyond the reserve", || kept().len() == 7);
+    // Layer 0's 0 and 1 and layer 1's 0 and 1 into records 8 to 11, then
+    // layer 0's 2 and layer 1's 2 into 12 and 13, then layer 0's 3 into 14.
+    let misses: [[&[usize]; 2]; 3] = [[&[0, 1], &[0, 1]], [&[2], &[2]], [&[3], &[]]];
+    for routes in misses {
+        let step = harness.step();
+        for (layer, experts) in routes.into_iter().enumerate() {
+            harness.request_at(&step, layer, experts);
+        }
+        step.complete().unwrap();
+    }
+    eventually("the misses never landed", || kept().len() == 7);
     let past = kept().into_iter().filter(|&(.., record)| record >= CUT).collect::<Vec<_>>();
-    let &(_, routed, at) = past.iter().find(|&&(layer, ..)| layer == 0).expect("the fill keeps a layer 0 expert past the cut");
-    // A step before the group, which reads the store as the fill left it.
+    assert_eq!(past.iter().map(|&(layer, expert, _)| (layer, expert)).collect::<Vec<_>>(), [(0, 2), (0, 3), (1, 2)]);
+    let &(_, routed, at) = past.iter().find(|&&(layer, ..)| layer == 0).expect("a layer 0 expert past the cut");
+    // A step before the group, which reads the store as the misses left it.
     let before = begin(&shared, &[StepRoute::Decode], false).unwrap().pop().unwrap();
     let earlier = before.sequence();
     drop(before);

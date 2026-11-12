@@ -456,11 +456,11 @@ impl ExpertBank {
 
     /// Back the host tier from the floor it opens at to the plan's host
     /// slots, its load-time size (`ExpertBankPlan::host_slots`), on the
-    /// resize thread: each host slot joins the tier, and its fill, as soon
-    /// as every record tensor backs it, so the load waits for none of it
-    /// (backing tens of gigabytes of pinned host storage before the bank
-    /// opened held a 6.89 GB load of the 3090 18-26 s, its import 25-33 s
-    /// against 5-10 s at the floor, 2026-11-01). It is the open's, no
+    /// resize thread: each host slot joins the tier as soon as every record
+    /// tensor backs it, so the load waits for none of it (backing tens of
+    /// gigabytes of pinned host storage before the bank opened held a 6.89
+    /// GB load of the 3090 18-26 s, its import 25-33 s against 5-10 s at
+    /// the floor, 2026-11-01). It is the open's, no
     /// resize: its end reports none ([`HostResize::Backing`]).
     pub(super) fn back_host(&self) -> Result<(), DomainError> {
         self.host_growth(self.plan.host_slots, CompletionWake::new(|| {}), HostResize::Backing).map(|_| ())
@@ -514,12 +514,6 @@ impl ExpertBank {
         let (decided, from) = (Instant::now(), slots.load(Ordering::Acquire));
         let plan = Arc::new(self.plan.clone());
         let (shared, slots, stop) = (self.watcher.shared().clone(), slots.clone(), Arc::new(AtomicBool::new(false)));
-        // The records the host lands into grow from this decision until the
-        // thread's last slot joined: the tier fills until then.
-        let lands = landed.is_some();
-        if lands {
-            shared.join(Join::Growing);
-        }
         let (stopping, rises) = (stop.clone(), self.rises.clone());
         let backed = {
             let (cache, counts) = (self.cache.clone(), self.counts.clone());
@@ -546,15 +540,7 @@ impl ExpertBank {
         };
         let done = thread.run(wake, move || {
             let rows = |at| groups.iter().map(|&group| records(&plan, group, at)).collect();
-            // The growth ends however its slots end, a panic among them too
-            // (re-raised to the thread's catch): no slot joins after.
-            let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                grow_by_slots(resizers, (from, to), rows, backed, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
-            }));
-            if lands {
-                shared.join(Join::Grown);
-            }
-            grown.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            grow_by_slots(resizers, (from, to), rows, backed, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
         });
         Ok(Growing { from, charged, decided, stop, done })
     }

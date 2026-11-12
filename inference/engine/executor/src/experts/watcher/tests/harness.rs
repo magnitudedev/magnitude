@@ -117,8 +117,8 @@ pub(super) struct Harness {
     /// The device's transfer queue promotions copy by.
     pub(super) copies: crate::experts::copies::Copies,
     /// The first bank record the seed list names records from
-    /// (`ExpertBankPlan::seeded_from`): past the lent ones beside a host
-    /// tier.
+    /// (`ExpertBankPlan::seeded_from`): past the lent ones, the bank's
+    /// beside a host tier, the one store's where the host places.
     seeded_from: usize,
     /// Its share of the read engine's pool, none where its test holds the
     /// pool alone ([`alone`]).
@@ -196,8 +196,7 @@ pub(super) fn harness(name: &str, stored: usize, records: u64) -> Harness {
 
 /// [`harness`] of `layers` layers, one group, `staging_records` staging
 /// records and twice as many tier records, short of every expert of its
-/// layers: a tier its misses and hints fill, which the fill leaves alone
-/// (`Prefetch::fill`; a tier of every expert fills at once).
+/// layers: a tier its misses and hints fill.
 pub(super) fn layered(
     name: &str,
     stored: usize,
@@ -597,7 +596,7 @@ pub(super) fn lending_bank(
         copies,
         seeded_from: match placer {
             Placer::Tier => bank_lent,
-            Placer::Bank => 0,
+            Placer::Bank => lent,
         },
     }
 }
@@ -670,7 +669,7 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 /// submissions are still being made on the test's thread: at most one more
 /// than the workers. Two more always leave one queued, parked, on the
 /// volume's link, however fast the volume or late a resubmission: a read
-/// the test issues behind it at a lesser priority (a hint's, a fill's) is
+/// the test issues behind it at a lesser priority (a hint's) is
 /// not taken until the test finishes the line ("Order and depth"), and one
 /// at demand, or hastened to it, waits for the reads queued as it was
 /// issued: at most the pool's workers and two pieces, never the line's
@@ -824,6 +823,18 @@ impl Harness {
             let state = residency::lock(&self.watcher.state);
             let directory = &state.core.directory;
             directory.host(0).graced() == 0 && !directory.refill_short(reserve)
+        });
+    }
+
+    /// Wait until residency has retired every step ended so far
+    /// (`Residency::retire`): each landing their requests waited for is
+    /// settled, kept, and no longer an outstanding answer, so a test that
+    /// takes residency's lock finds the tier as those steps left it.
+    pub(super) fn retired(&self) {
+        let shared = self.watcher.shared();
+        eventually("residency never retired the steps ended", || {
+            let frontier = shared.steps.frontier();
+            residency::lock(&self.watcher.state).core.retired >= frontier
         });
     }
 

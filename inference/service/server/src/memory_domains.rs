@@ -127,7 +127,7 @@ fn streaming_resize(resize: &BankResize) -> StreamingResize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_engine::census::{ExpertResidency, HostResidency, ServingCensus, TableResidency};
+    use magnitude_engine::census::{ExpertCover, ExpertResidency, HostResidency, ServingCensus, TableResidency};
 
     /// The allocation states what the engine's census says of how it serves:
     /// its prompt groups' places, and its bank's slots, stores by name, disk
@@ -154,7 +154,7 @@ mod tests {
                         bytes: 650,
                         last_resize: Some(BankResize::Grew { from: 19, by: positive(1), at_unix_ms: 11 }),
                     }),
-                    fill: magnitude_engine::census::TierFill::Filled,
+                    cover: ExpertCover { begun: 1, reading: false },
                     disk_bytes: 900,
                     tables: vec![TableResidency {
                         records: 40,

@@ -958,9 +958,9 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
 }
 
 /// A streamed fit is priced on the expert bank it was classed streamed
-/// by: Qwen3.6 35B prepared on the M4 Pro with 1 GB of room (its structure,
-/// whatever the room), then fitted with 4 GB less room than its resident
-/// plan, measured on synthetic costs and figures: streamed through the bank
+/// by: Qwen3.6 35B prepared on the M4 Pro with all its room (its structure,
+/// whatever the room, which no load's own charge can exceed), then fitted
+/// with 4 GB less room than its resident plan, measured on synthetic costs and figures: streamed through the bank
 /// the fit's settle holds (`with_held_experts`), its speed estimated on
 /// that bank.
 #[test]
@@ -974,7 +974,7 @@ fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
     };
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let room = |bytes| m4_pro_setup(host_room(allocation.capacity_bytes, bytes), ModelPolicy::default(), standard_service_limits());
-    let prepared = prepare_model_assessment(&package, &room(1_000_000_000).structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
+    let prepared = prepare_model_assessment(&package, &room(allocation.capacity_bytes - 1).structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
     let PreparedModelAssessment::Planned { .. } = &prepared else {
         panic!("Qwen3.6 35B is planned");
     };

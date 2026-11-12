@@ -96,24 +96,24 @@ enum Switch {
 struct Durations(Vec<Measured>);
 
 /// One duration of a launch: its seconds, the load's round it was measured
-/// in, and whether the expert bank's fill ran beside it
-/// (`LaunchDuration::filling`), which prices the launch only until the
-/// fill finishes.
+/// in, and whether the expert bank's cover read beside it
+/// (`LaunchDuration::covering`), which prices the launch only until the
+/// cover reads nothing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Measured {
     round: u64,
     seconds: f64,
-    filling: bool,
+    covering: bool,
 }
 
 impl Durations {
-    fn record(&mut self, round: u64, seconds: f64, filling: bool) {
+    fn record(&mut self, round: u64, seconds: f64, covering: bool) {
         self.0
             .retain(|measured| round.saturating_sub(measured.round) < STALE_ROUNDS);
         if self.0.len() == COST_SAMPLES {
             self.0.remove(0);
         }
-        self.0.push(Measured { round, seconds, filling });
+        self.0.push(Measured { round, seconds, covering });
     }
 
     /// The launch's cost: the median of its durations, the lower of two.
@@ -127,15 +127,15 @@ impl Durations {
         sorted[(sorted.len() - 1) / 2]
     }
 
-    /// `(round, seconds)` durations measured with no fill beside them.
+    /// `(round, seconds)` durations measured with no cover read beside them.
     #[cfg(test)]
     fn settled(durations: &[(u64, f64)]) -> Self {
-        Self(durations.iter().map(|&(round, seconds)| Measured { round, seconds, filling: false }).collect())
+        Self(durations.iter().map(|&(round, seconds)| Measured { round, seconds, covering: false }).collect())
     }
 
-    /// Drop the durations measured beside a fill, which has finished.
+    /// Drop the durations measured beside a cover read, which has ended.
     fn settle(&mut self) {
-        self.0.retain(|measured| !measured.filling);
+        self.0.retain(|measured| !measured.covering);
     }
 
     fn measured(&self) -> bool {
@@ -287,14 +287,15 @@ pub struct LaunchCosts {
 }
 
 impl LaunchCosts {
-    fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64, filling: bool) {
-        costs.entry(size).or_default().record(round, seconds, filling);
+    fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64, covering: bool) {
+        costs.entry(size).or_default().record(round, seconds, covering);
     }
 
-    /// Drop every duration measured beside the expert bank's fill, which
-    /// has finished: what a launch missed and read then was what the fill
-    /// left, not what the bank settled to. A launch left with none is
-    /// unmeasured again, so the rounds measure it anew.
+    /// Drop every duration measured beside the expert bank's cover read,
+    /// which has ended: what a launch missed then shared the drive with the
+    /// cover and read what it had not yet landed, not what the bank settled
+    /// to. A launch left with none is unmeasured again, so the rounds
+    /// measure it anew.
     fn settle(&mut self) {
         for costs in [&mut self.draft, &mut self.verify] {
             costs.retain(|_, durations| {
@@ -312,9 +313,9 @@ impl LaunchCosts {
     /// a launch no longer taken keeps its cost relative to a plain decode
     /// rather than the seconds it took on a machine that was busier or
     /// freer, until it is measured again.
-    fn record_plain(&mut self, round: u64, seconds: f64, filling: bool) {
+    fn record_plain(&mut self, round: u64, seconds: f64, covering: bool) {
         let before = self.verify.get(&1).map(Durations::cost);
-        Self::record(&mut self.verify, round, 1, seconds, filling);
+        Self::record(&mut self.verify, round, 1, seconds, covering);
         let Some(before) = before.filter(|before| *before > 0.0) else {
             return;
         };
@@ -609,16 +610,16 @@ pub struct DraftLoad {
     /// The decode time set aside for the next plain look.
     plain_seconds: Mutex<f64>,
     /// Whether `costs` holds a duration measured beside the expert bank's
-    /// fill ([`Self::settle`]).
-    beside_fill: Mutex<bool>,
+    /// cover read ([`Self::settle`]).
+    beside_cover: Mutex<bool>,
 }
 
 impl DraftLoad {
-    /// Drop every duration measured beside the bank's fill, which a launch
-    /// measured with none beside it shows finished ([`LaunchCosts::settle`]).
+    /// Drop every duration measured beside the bank's cover read, which a
+    /// launch measured with none beside it shows ended ([`LaunchCosts::settle`]).
     fn settle(&self) {
-        let mut beside_fill = self.beside_fill.lock().expect("draft load fill");
-        if std::mem::take(&mut *beside_fill) {
+        let mut beside_cover = self.beside_cover.lock().expect("draft load cover");
+        if std::mem::take(&mut *beside_cover) {
             for costs in self.costs.lock().expect("draft load costs").values_mut() {
                 costs.settle();
             }
@@ -1176,10 +1177,10 @@ impl DraftController {
     /// its round took beyond the price of its launches; a preparing round's
     /// launch is its switch alone. A launch that recorded its graph
     /// (`duration` `None`) measured that recording, not itself: it carries
-    /// its round on and prices nothing. A launch the expert bank's fill ran
-    /// beside prices its round until a launch measured with no fill beside
-    /// it shows the fill finished: then every duration measured beside it is
-    /// dropped ([`LaunchCosts::settle`]), and the rounds measure their
+    /// its round on and prices nothing. A launch the expert bank's cover read
+    /// beside prices its round until a launch measured with no cover read
+    /// beside it shows the cover ended: then every duration measured beside
+    /// it is dropped ([`LaunchCosts::settle`]), and the rounds measure their
     /// launches anew.
     pub fn timed(
         &mut self,
@@ -1188,10 +1189,10 @@ impl DraftController {
         sequences: usize,
         rows: usize,
     ) {
-        let filling = duration.is_some_and(|duration| duration.filling);
+        let covering = duration.is_some_and(|duration| duration.covering);
         match duration {
-            Some(LaunchDuration { filling: true, .. }) => {
-                *self.load.beside_fill.lock().expect("draft load fill") = true
+            Some(LaunchDuration { covering: true, .. }) => {
+                *self.load.beside_cover.lock().expect("draft load cover") = true
             }
             Some(_) => self.load.settle(),
             None => {}
@@ -1251,7 +1252,7 @@ impl DraftController {
         if launch == TimedLaunch::Draft {
             self.drafter = Some(took);
             if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, launches, size)) {
-                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0), filling);
+                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0), covering);
             }
             return;
         }
@@ -1272,7 +1273,7 @@ impl DraftController {
         {
             launches
                 .switch_mut(switch)
-                .record(round, (took + drafter_took - steady).max(0.0), filling);
+                .record(round, (took + drafter_took - steady).max(0.0), covering);
         }
         if self.preparing {
             return;
@@ -1282,11 +1283,11 @@ impl DraftController {
         };
         let seconds = (took - paid).max(0.0);
         match (size, self.choice.generated) {
-            (1, 0) => launches.record_plain(round, seconds, filling),
+            (1, 0) => launches.record_plain(round, seconds, covering),
             // A drafting round that verified nothing decoded one row behind
             // its drafter's launch, not in a decode pipeline.
             (1, _) => {}
-            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds, filling),
+            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds, covering),
         }
     }
 }

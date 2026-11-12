@@ -7,6 +7,10 @@ use super::*;
 fn a_refill_past_the_last_step_leaves_no_grace() {
     let harness = layered("refill-past", EXPERTS, 12, 3, 4 + 4);
     harness.demand_step(4);
+    // The store starts empty: the refill's one victim is the demand's
+    // landing, which residency must have retired, kept and no longer its
+    // request's answer, so its grace ends with the step it answered.
+    harness.retired();
     harness.tier_ready();
     let reserve = harness.staging_records as usize;
     let mut state = residency::lock(&harness.watcher.state);
@@ -25,18 +29,21 @@ fn a_refill_past_the_last_step_leaves_no_grace() {
     assert_eq!(state.core.directory.host(0).graced(), 0, "graced through a step the device is past");
 }
 
-/// A host tier with a record for every expert fills to every expert from
-/// the bank's open on, before any step, each record's bytes its expert's
-/// from the file: a step's route then names nothing absent, every choice
-/// the bank lacks served from the tier, and the tier keeps them all, with
-/// no reserve unmapped. No expert can then be absent: the next gap sets the
-/// layer's resolved word, its group not whole, so its tier wait and the
-/// wait's park are left out of every step.
+/// A host tier with a record for every expert keeps every expert its
+/// steps' misses land, each record's bytes its expert's from the file: once
+/// two steps have missed every expert, a step's route names nothing
+/// absent, every choice the bank lacks served from the tier, and the tier
+/// keeps them all, with no reserve unmapped. No expert can then be absent:
+/// the next gap sets the layer's resolved word, its group not whole, so its
+/// tier wait and the wait's park are left out of every step.
 #[test]
-fn a_tier_of_every_expert_fills_before_any_step() {
-    // Staging records beyond the demand reserve and a layer's hints, which
-    // a fill reads into.
-    let harness = lending("filled", EXPERTS, 2, 1, 3 * STAGING, DECODE, EXPERTS as u32, Placer::Tier, false);
+fn a_tier_of_every_expert_keeps_every_expert_its_misses_land() {
+    // No staging beyond a request's own, so the cover reads nothing and
+    // every expert lands by a miss.
+    let harness = lending("complete", EXPERTS, 2, 1, STAGING, DECODE, EXPERTS as u32, Placer::Tier, false);
+    for experts in [[0, 1, 2, 3], [4, 5, 6, 7]] {
+        harness.request(&experts).complete().unwrap();
+    }
     harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
     let step = harness.step();
     let sources = harness.route_at(&step, 0, &[1, 5, 7]);
@@ -48,6 +55,91 @@ fn a_tier_of_every_expert_fills_before_any_step() {
     assert_eq!(policy.load(constants::POLICY_WHOLE as usize), 0, "a bank of two records is not whole");
 }
 
+/// A host tier with a record for every expert is covered from the bank's
+/// open on, before any step, each record's bytes its expert's from the
+/// file: a step's route then names nothing absent, every choice the bank
+/// lacks served from the tier.
+#[test]
+fn a_tier_of_every_expert_is_covered_before_any_step() {
+    // Staging records beyond the demand reserve and a layer's hints, which
+    // the cover reads into.
+    let harness = lending("covered", EXPERTS, 2, 1, 3 * STAGING, DECODE, EXPERTS as u32, Placer::Tier, false);
+    harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
+    let step = harness.step();
+    let sources = harness.route_at(&step, 0, &[1, 5, 7]);
+    assert!(sources.iter().all(|&source| source < -1), "every choice served from the tier: {sources:?}");
+    step.complete().unwrap();
+}
+
+/// A traffic hold cancels the cover's reads no worker has taken
+/// (`Prefetch::cancel_cover`), so it waits only for the reads that run: it
+/// turns quiet while the cover's queue stands behind others, each cancelled
+/// read freeing its staging record. The cover, paused rather than ended,
+/// reads its experts again once the hold ends.
+#[test]
+fn a_traffic_hold_cancels_the_covers_queued_reads() {
+    let _alone = alone();
+    // The line stands before the bank opens, so every cover read queues
+    // behind it.
+    let ahead = Ahead::queue("cover-hold-ahead");
+    let harness = lending("cover-hold", EXPERTS, 2, 1, 3 * STAGING, DECODE, EXPERTS as u32, Placer::Tier, false);
+    let shared = harness.watcher.shared().clone();
+    let outstanding = || residency::lock(&harness.watcher.state).prefetch.outstanding();
+    eventually("the cover never read ahead", outstanding);
+    let hold = shared.hold_traffic();
+    shared.wait_traffic_quiet().unwrap();
+    assert!(!outstanding(), "every cover read queued was cancelled");
+    assert_eq!(shared.cover(), crate::ExpertCover { begun: 1, reading: true }, "the hold pauses the cover");
+    drop(hold);
+    ahead.finish();
+    harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
+    eventually("the cover never ended", || !shared.cover().reading);
+    assert_eq!(shared.cover().begun, 1, "one cover, paused and resumed");
+}
+
+/// A resize asked of residency cancels the cover's reads no worker has
+/// taken (`Prefetch::cancel_cover`) whatever it asks, not only a traffic
+/// hold: a shrink of the bank, which waits for the reads that run, is
+/// answered while the cover's queue still stands behind others, never
+/// after the queue drains. The cover, paused rather than ended, reads its
+/// experts again once the line moves.
+#[test]
+fn a_resize_ask_cancels_the_covers_queued_reads() {
+    let _alone = alone();
+    // The line stands before the bank opens, so every cover read queues
+    // behind it.
+    let ahead = Ahead::queue("cover-resize-ahead");
+    let harness = lending("cover-resize", EXPERTS, 2, 1, 3 * STAGING, DECODE, EXPERTS as u32, Placer::Tier, false);
+    let shared = harness.watcher.shared().clone();
+    let outstanding = || residency::lock(&harness.watcher.state).prefetch.outstanding();
+    eventually("the cover never read ahead", outstanding);
+    let asking = shared.clone();
+    let shrink = std::thread::spawn(move || asking.plan_shrink(1, vec![1]).map(drop));
+    eventually("the shrink waited for the cover's queued reads", || shrink.is_finished());
+    shrink.join().unwrap().expect("the shrink is planned");
+    assert!(shared.cover().reading, "the ask pauses the cover");
+    ahead.finish();
+    harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
+    eventually("the cover never ended", || !shared.cover().reading);
+    assert_eq!(shared.cover().begun, 1, "one cover, paused and resumed");
+}
+
+/// A host tier short of a record for every expert reads nothing ahead of
+/// use: there is no expert it must keep, so it fills by its misses and
+/// hints, and its records stay ready for them.
+#[test]
+fn a_tier_short_of_every_expert_reads_nothing_ahead_of_use() {
+    // Two layers' 16 experts in one group, its tier of 15 records.
+    let harness = lending("not-covered", EXPERTS, 2, 2, 3 * STAGING, DECODE, 15, Placer::Tier, false);
+    std::thread::sleep(Duration::from_millis(50));
+    let kept = (0..2).flat_map(|layer| (0..EXPERTS).map(move |expert| (layer, expert)));
+    let tiered = kept.filter(|&(layer, expert)| harness.in_tier(layer, expert).is_some()).count();
+    assert_eq!(tiered, 0, "no expert is kept before a request");
+    let resolved = |layer: usize| harness.layers[layer].5.load(constants::POLICY_RESOLVED as usize);
+    let absentable = "a tier short of every expert leaves its layers' experts absentable";
+    assert_eq!((resolved(0), resolved(1)), (0, 0), "{absentable}");
+}
+
 /// A host tier whose records keep every expert only with its lent records
 /// leaves its layer unresolved: a prompt group's claim of a lent record
 /// unmaps its expert mid-flight, so the decode step chained behind the group
@@ -56,15 +148,18 @@ fn a_tier_of_every_expert_fills_before_any_step() {
 /// the file at layer L, whose experts cannot be absent").
 #[test]
 fn a_decode_step_behind_a_prompt_group_claiming_the_lent_records_is_served() {
-    // Eight experts: six tier records beyond the conveyor's two lent ones.
+    // Eight experts: six tier records beyond the conveyor's two lent ones,
+    // which the misses land into once the six are taken.
     let harness = lending("lent-complete", EXPERTS, 2, 1, 3 * STAGING, Conveying::of(2), EXPERTS as u32 - 2, Placer::Tier, false);
+    for experts in [[0, 1, 2, 3], [4, 5, 6, 7]] {
+        harness.request(&experts).complete().unwrap();
+    }
     harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
     let shared = harness.watcher.shared();
-    eventually("the tier never filled", || shared.tier_fill() == crate::TierFill::Filled);
-    // The turn that filled it publishes the policy words next.
+    // The turn that landed the last publishes the policy words next.
     std::thread::sleep(Duration::from_millis(50));
     let lent = (0..EXPERTS).filter(|&expert| harness.in_tier(0, expert).is_some_and(|record| record < 2)).collect::<Vec<_>>();
-    assert_eq!(lent.len(), 2, "the fill kept two experts in the lent records");
+    assert_eq!(lent.len(), 2, "the misses kept two experts in the lent records");
     let steps = begin_as(&shared, &[(StepRoute::Grouped, LaunchWork::Prompt), (StepRoute::Decode, LaunchWork::Generation)], true).unwrap();
     harness.scratch(&steps[0], 0, &lent);
     eventually("the group never claimed the lent records", || lent.iter().all(|&expert| harness.in_tier(0, expert).is_none()));
@@ -72,52 +167,6 @@ fn a_decode_step_behind_a_prompt_group_claiming_the_lent_records_is_served() {
     for step in steps {
         step.complete().unwrap();
     }
-}
-
-/// A host tier smaller than every expert fills from the bank's open on by
-/// the one rule that fills a tier of every expert: its records beyond the
-/// reserve its landings keep (a record for each staging record), with the
-/// experts it lands first (none used yet: each layer's alike, by index),
-/// and no more.
-#[test]
-fn a_partial_tier_fills_its_records_beyond_the_reserve() {
-    // Two layers' 16 experts in one group, its tier of 15 records 3 beyond
-    // the reserve of 12.
-    let harness = lending("partial", EXPERTS, 2, 2, 3 * STAGING, DECODE, 15, Placer::Tier, false);
-    harness.tiering(0, &[0, 1]);
-    harness.tiering(1, &[0]);
-    std::thread::sleep(Duration::from_millis(50));
-    let kept = (0..2).flat_map(|layer| (0..EXPERTS).map(move |expert| (layer, expert)));
-    assert_eq!(kept.filter(|&(layer, expert)| harness.in_tier(layer, expert).is_some()).count(), 3, "the reserve is the landings'");
-    let resolved = |layer: usize| harness.layers[layer].5.load(constants::POLICY_RESOLVED as usize);
-    assert_eq!((resolved(0), resolved(1)), (0, 0), "a tier short of every expert leaves its layers' experts absentable");
-}
-
-/// A host tier smaller than every expert fills while its fill's reads run,
-/// queued behind others, and is filled once its records beyond the reserve
-/// each keep an expert, though it lacks the rest; a miss's landing then
-/// displaces what it keeps at the same records, and it stays filled.
-#[test]
-fn a_tier_is_filled_once_its_records_beyond_the_reserve_keep_experts() {
-    let _alone = alone();
-    let ahead = Ahead::queue("tier-fill-ahead");
-    // Two layers' sixteen experts beside fifteen tier records, eight of them
-    // the reserve.
-    let harness = layered("tier-fill", EXPERTS, 12, 2, 4 + 4);
-    let shared = harness.watcher.shared();
-    let staged = || {
-        let state = residency::lock(&harness.watcher.state);
-        state.prefetch.staging.free() < state.prefetch.staging.records()
-    };
-    eventually("the fill never read", staged);
-    assert_eq!(shared.tier_fill(), crate::TierFill::Filling, "its reads wait");
-    ahead.finish();
-    eventually("the tier never filled", || shared.tier_fill() == crate::TierFill::Filled);
-    let tiered = || (0..2).map(|layer| (0..EXPERTS).filter(|&expert| harness.in_tier(layer, expert).is_some()).count()).sum::<usize>();
-    assert_eq!(tiered(), 15 - 8, "its records beyond the reserve, not every expert");
-    harness.demand_step(7);
-    harness.tiering(1, &[7]);
-    assert_eq!(shared.tier_fill(), crate::TierFill::Filled, "a miss's landing leaves it filled");
 }
 
 /// The host keeps a reserve of ready tier records: once landings leave
@@ -146,11 +195,11 @@ fn the_tier_keeps_a_reserve_of_ready_records() {
 }
 
 /// Where the host places into the one store, every landing of an expert
-/// (a demand's, a hint's, the fill's, one revived from staging) claims it
+/// (a demand's, a hint's, one revived from staging) claims it
 /// through the store's records (`HostRecords::claim`), so no two land it
 /// at once and a demand that finds one in flight waits for it: a store
-/// short of every expert, whose reserve unmaps what the fill and the misses
-/// land while staging keeps their bytes, under a run of steps each missing
+/// short of every expert, whose reserve unmaps what the misses land while
+/// staging keeps their bytes, under a run of steps each missing
 /// experts drawn across the layer, answers every miss and fails no step.
 /// The interleavings are the threads'; the claim's rule itself is
 /// `host_records`' `a_claim_takes_a_record_only_for_a_lacked_expert`.
@@ -188,8 +237,8 @@ fn every_landing_of_an_expert_claims_it_once_in_the_one_store() {
 /// so ready at once), and its promotions find the hold in force: the
 /// request, taking the lock after them, reads holdings already published
 /// without the victims. It begins a step while it holds the
-/// lock, which ends the hold's effect: the turn's fill, after it, reads
-/// the hold as it stands, so it reads ahead and leaves the traffic not
+/// lock, which ends the hold's effect: the turn's hastening, after it,
+/// reads the hold as it stands, so it hastens and leaves the traffic not
 /// quiet, as the running step asks.
 #[test]
 fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
@@ -222,7 +271,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     };
     // The request: waiting once the refill's and the promotions' jobs have
     // run, it takes the lock as the latter gives way, reads the holdings
-    // and begins a step, before the fill.
+    // and begins a step, before the hastening.
     let request = std::cell::RefCell::new(None);
     let wait = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         assert_ne!(alone(held), *claimed.borrow(), "the refill took no victim the tier kept alone");
@@ -230,7 +279,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
         let records = harness.layers.iter().map(|layer| layer.4.clone()).collect::<Vec<_>>();
         // Its own count, not any holder's: the load's request service is
         // counted too while it looks, and a turn that gave way to it alone
-        // would run the fill before this request begins its step.
+        // would run the hastening before this request begins its step.
         let counted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waits = counted.clone();
         let thread = std::thread::spawn(move || {
@@ -261,7 +310,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     residency::Residency::turn(&state, &[&short, turn[0], turn[1], &wait, turn[2], turn[3], &after], None, None);
     let (published, found, step) = request.into_inner().expect("the request ran").join().unwrap();
     assert_eq!(published, found, "the request read holdings the refill left unpublished");
-    assert!(!quiet.get(), "the fill called the traffic quiet while a step ran");
+    assert!(!quiet.get(), "the hastening called the traffic quiet while a step ran");
     drop(grants);
     step.complete().unwrap();
 }

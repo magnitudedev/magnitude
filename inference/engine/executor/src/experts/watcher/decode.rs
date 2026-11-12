@@ -252,7 +252,7 @@ impl Look {
 /// How a request's absent expert lands: read now, the look's posted read
 /// of it, its tier record
 /// claimed as residency serves it; already landed in a tier record; or once
-/// its read ahead (a hint's or the tier's fill's, hastened to demand) has
+/// its read ahead (a hint's or the cover's, hastened to demand) has
 /// landed, or, the look having read nothing of it (no staging record free,
 /// or it was not lacked then and is now), once a staging and a tier record
 /// are (`Waiting`): a shortage of records is backpressure, never a failure,
@@ -641,8 +641,8 @@ impl Decode {
         // hastened to demand (reading), or one read once records are free.
         // The request's lead is the layers since its last read a route
         // issued was submitted: none where every miss had landed already, a
-        // read it never saw. A fill's read no route issued is a demand's to
-        // it: no prediction made it.
+        // read it never saw. A read no route issued (the cover's, or another
+        // request's) is a demand's to it: no prediction made it.
         let mut served = RequestCost { missed: absent.clone(), ..RequestCost::default() };
         let mut plans = Vec::with_capacity(absent.len());
         let mut lead: Option<u64> = None;
@@ -665,9 +665,9 @@ impl Decode {
                         core.directory.answer(layer, HostRecord(tier), point);
                         (Plan::Unread(Unread::Kept(tier)), None)
                     }
-                    // A landing of it is in flight, whoever's (a read
-                    // ahead's, another request's, the fill's): it waits for
-                    // it, hastened to demand.
+                    // A landing of it is in flight, whoever's (a hint's, the
+                    // cover's, another request's): it waits for it, hastened
+                    // to demand.
                     Located::Landing => match prefetch.hasten(staged) {
                         Some(Reading::Hint(issued)) => {
                             taken_from(issued);

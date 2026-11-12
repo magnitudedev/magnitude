@@ -2751,20 +2751,15 @@ impl<'a> Preparation<'a> {
         )?;
         let list_stage = spec.fixed(&bindings, &[], routed_list_stage::native_entry())?;
         let pass_map = spec.fixed(&bindings, &[], routed_pass_map::native_entry())?;
-        // The device's placements, only where it places.
-        let places = bank.placer == crate::planning::Placer::Tier;
-        let seed = places
-            .then(|| {
-                bank.record.try_map(|_, tensor| {
-                    let [n, k] = tensor.matrix;
-                    spec.fixed(
-                        &bindings,
-                        &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
-                        routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
-                    )
-                })
-            })
-            .transpose()?;
+        // The device's placements, a prompt group's seeds, whoever places.
+        let seed = bank.record.try_map(|_, tensor| {
+            let [n, k] = tensor.matrix;
+            spec.fixed(
+                &bindings,
+                &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
+                routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
+            )
+        })?;
         let convert = bank.record.try_map(|_, tensor| {
             let [n, k] = tensor.matrix;
             spec.fixed(
@@ -2782,16 +2777,12 @@ impl<'a> Preparation<'a> {
                 }),
             )
         })?;
-        let seed_commit = places
-            .then(|| {
-                spec.fixed(
-                    &bindings,
-                    &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
-                    routed_seed_commit::native_entry(),
-                )
-            })
-            .transpose()?;
-        let list_grid = places.then(|| spec.fixed(&bindings, &[], routed_list_grid::native_entry())).transpose()?;
+        let seed_commit = spec.fixed(
+            &bindings,
+            &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
+            routed_seed_commit::native_entry(),
+        )?;
+        let list_grid = spec.fixed(&bindings, &[], routed_list_grid::native_entry())?;
         // Each routed tensor's records, whoever places: a shrink's moves run
         // on the device in queue order.
         let moves = bank.record.try_map(|_, tensor| {
@@ -2817,22 +2808,16 @@ impl<'a> Preparation<'a> {
             Some(scratch_grids),
             Some(list_stage),
             Some(pass_map),
-        ) = (route, tier_wait, step, scratch_request, scratch_wait, scratch_grids, list_stage, pass_map)
+            Some(seed_commit),
+            Some(list_grid),
+        ) = (route, tier_wait, step, scratch_request, scratch_wait, scratch_grids, list_stage, pass_map, seed_commit, list_grid)
         else {
             return Ok(None);
         };
-        let (Some(convert), Some(moves)) = (formed(convert), formed(moves)) else {
+        let (Some(convert), Some(moves), Some(seed)) = (formed(convert), formed(moves), formed(seed)) else {
             return Ok(None);
         };
-        let placement = match (seed, seed_commit, list_grid) {
-            (Some(seed), Some(seed_commit), Some(list_grid)) => {
-                let (Some(seed), Some(seed_commit), Some(list_grid)) = (formed(seed), seed_commit, list_grid) else {
-                    return Ok(None);
-                };
-                Some(super::DevicePlacement { seed, seed_commit, list_grid })
-            }
-            _ => None,
-        };
+        let placement = super::DevicePlacement { seed, seed_commit, list_grid };
         let site = match site {
             Some(None) => return Ok(None),
             site => site.flatten(),

@@ -192,22 +192,18 @@ pub trait ElasticBank {
     /// as that holding's last: kept with the holding, which the bank owns.
     fn record_resize(&self, holding: BankHolding, resize: BankResize);
 
-    /// Wait until the store misses land into is filled
-    /// ([`TierFill::Filled`]), as its fill publishes it: the host tier
-    /// where the device places, the one store where the host does.
-    fn wait_tier_filled(&self) -> Result<(), super::DomainError>;
+    /// The cover's reads as its residency last published them
+    /// ([`super::ExpertCover`]).
+    fn cover(&self) -> super::ExpertCover;
 
-    /// How many times the bank's fill started or finished
-    /// (`Shared::fill_epoch`): odd once it finished, even while it lands
-    /// experts beside the steps, which then miss and read what the fill
-    /// leaves, not what the bank settles to.
-    fn fill_epoch(&self) -> u64;
+    /// Wait until the cover reads nothing, as its residency publishes it.
+    fn wait_covered(&self) -> Result<(), super::DomainError>;
 }
 
 /// Where a load's routed experts are now: the slots its directory serves
 /// from, between its floor and ceiling, each a record of every streamed
-/// layer; Seismic's charge of those records in each store; and what the
-/// slots it does not commit leave on disk.
+/// layer; Seismic's charge of those records in each store; whether its
+/// cover reads; and what the slots it does not commit leave on disk.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExpertResidency {
     /// `E`: the widest routed layer's experts, which `slots` reach to hold
@@ -221,9 +217,9 @@ pub struct ExpertResidency {
     /// The host tier, where the load has one (a discrete device's,
     /// `ExpertBankPlan::host`); none on unified memory.
     pub host: Option<HostResidency>,
-    /// The fill of the store misses land into: the host tier where the
-    /// device places, the one store where the host does.
-    pub fill: TierFill,
+    /// The cover's reads ([`super::ExpertCover`]), as its residency last
+    /// published them.
+    pub cover: super::ExpertCover,
     /// The experts of every layer in no slot and not in the host tier, as
     /// the model file stores them.
     pub disk_bytes: u64,
@@ -304,19 +300,6 @@ pub enum OptionalComponent {
 
 impl OptionalComponent {
     pub const ALL: [Self; 2] = [Self::Drafter, Self::Vision];
-}
-
-/// Whether the fill of the store misses land into (the host tier where
-/// the device places, the one store where the host does) has finished:
-/// the fill lands experts into every record beyond the landing reserve,
-/// from the bank's open and again after a growth. Filled once each such
-/// record keeps an expert (or the store keeps every expert) and no fill's
-/// landing is in flight; from then the store's members change only by its
-/// misses' landings displacing what it keeps, at the same records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TierFill {
-    Filling,
-    Filled,
 }
 
 /// What asking an elastic bank for a resize came to.

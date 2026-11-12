@@ -7,7 +7,7 @@
 //! places and where its routed experts are.
 
 use magnitude_executor::{MemoryChargeReconciliation, StoreAllocation};
-pub use magnitude_executor::{BankHolding, BankResize, ExpertResidency, HostResidency, TableResidency, TierFill};
+pub use magnitude_executor::{BankHolding, BankResize, ExpertCover, ExpertResidency, HostResidency, TableResidency};
 pub use magnitude_scheduler::serving::ServingCensus;
 use serde::{Deserialize, Serialize};
 

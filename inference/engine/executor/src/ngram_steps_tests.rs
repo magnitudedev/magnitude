@@ -316,7 +316,7 @@ fn banked_shared_graphs_score_as_resident(
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) = fixture_with(test, definition, streamed_experts_manifest);
     for &backend in backends.iter().filter(|&&backend| available(&catalog, backend)) {
-        scores(&catalog, &definition, &package, backend, banked, Filled::Unwaited)
+        scores(&catalog, &definition, &package, backend, banked, Start::AtOnce)
             .assert_as_resident(backend, "the banked load's logits and selection");
     }
     std::fs::remove_dir_all(&directory).ok();
@@ -325,17 +325,17 @@ fn banked_shared_graphs_score_as_resident(
 /// On a discrete CUDA device, a partial bank of the fixture of 128 experts
 /// a layer under a weight cap of half its experts, beside a host tier the
 /// cap bounds (`ExpertBankPlan::host_cap`, fewer host slots than every
-/// expert): the tier fills from the bank's open on to its planned size
+/// expert): the tier grows from the bank's open on to its planned size
 /// (`ExpertBankPlan::host_slots`) and never holds more than its cap, and
 /// the steps, every miss served from the tier or the file, score as the
 /// resident load does ([`Scores::assert_as_resident`]).
 #[test]
-fn a_capped_partial_banks_tier_fills_within_its_cap_and_serves_every_miss() {
+fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backend = seismic::BackendName::Cuda;
     // Only a CUDA device across a link has a host tier: on unified memory
-    // (GB10's) the bank is the one store, and there is no tier to fill.
+    // (GB10's) the bank is the one store, and there is no tier to grow.
     let topology = catalog.topology();
     let linked = seismic::testing::selected(&topology, backend).is_some_and(|executor| {
         matches!(crate::platform::host_tier(&topology, executor), Ok(Some(crate::planning::HostTier::Linked(_))))
@@ -344,9 +344,9 @@ fn a_capped_partial_banks_tier_fills_within_its_cap_and_serves_every_miss() {
         return;
     }
     let definition = qwen4exp_fixture_definition_of(3, 128);
-    let (directory, definition, package) = fixture_with("tier-filled", definition, streamed_experts_manifest);
-    scores(&catalog, &definition, &package, backend, Banked::Half, Filled::Waited)
-        .assert_as_resident(backend, "the filled tier's load scores as the resident one");
+    let (directory, definition, package) = fixture_with("tier-grown", definition, streamed_experts_manifest);
+    scores(&catalog, &definition, &package, backend, Banked::Half, Start::TierGrown)
+        .assert_as_resident(backend, "the grown tier's load scores as the resident one");
     std::fs::remove_dir_all(&directory).ok();
 }
 
@@ -363,19 +363,19 @@ fn misses_the_device_lands_score_as_resident() {
     let definition = qwen4exp_fixture_definition_of(4, 128);
     let (directory, definition, package) = fixture_with("device-landed", definition, streamed_experts_manifest);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        scores(&catalog, &definition, &package, backend, Banked::Half, Filled::DeviceLanded)
+        scores(&catalog, &definition, &package, backend, Banked::Half, Start::DeviceLanded)
             .assert_as_resident(backend, "the misses the device landed score as the resident load's");
     }
     std::fs::remove_dir_all(&directory).ok();
 }
 
 /// Whether [`scores`] steps a banked load at once, once its host tier has
-/// filled to its planned size within its weight cap, or with its misses
+/// grown to its planned size within its weight cap, or with its misses
 /// priced to land on the device, where the host places.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Filled {
-    Unwaited,
-    Waited,
+enum Start {
+    AtOnce,
+    TierGrown,
     DeviceLanded,
 }
 
@@ -555,7 +555,7 @@ fn scores(
     package: &Arc<Package>,
     backend: seismic::BackendName,
     banked: Banked,
-    filled: Filled,
+    start: Start,
 ) -> Scores {
     let stored = stored_experts(package, definition);
     let expansion = definition
@@ -581,9 +581,9 @@ fn scores(
             }
         }
         let site = plan.is_some_and(|plan| !plan.whole() && (0..plan.layers().len()).any(|layer| plan.sited(layer)));
-        let waited = filled == Filled::Waited && !matches!(banked, Banked::Resident);
+        let waited = start == Start::TierGrown && !matches!(banked, Banked::Resident);
         if waited {
-            // The cap bounds the tier below every expert; the tier fills
+            // The cap bounds the tier below every expert; the tier grows
             // from the bank's open on to its planned size, within that bound.
             let (cap, planned, widest) = plan
                 .and_then(|plan| plan.host_cap.map(|cap| (cap, plan.host_slots, plan.widest().get())))
@@ -596,17 +596,17 @@ fn scores(
                 let host = residency.host.unwrap_or_else(|| panic!("{backend:?}: a linked load has a host tier"));
                 assert_eq!(host.ceiling, cap, "{backend:?}: the host tier's ceiling is its cap");
                 assert!(host.slots <= cap, "{backend:?}: the host tier holds {} host slots, past its cap of {cap}", host.slots);
-                if residency.fill == crate::TierFill::Filled && host.slots == planned {
+                if host.slots == planned {
                     break;
                 }
-                assert!(std::time::Instant::now() < deadline, "{backend:?}: the host tier never filled to its planned {planned} host slots ({host:?})");
+                assert!(std::time::Instant::now() < deadline, "{backend:?}: the host tier never grew to its planned {planned} host slots ({host:?})");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         // A site serves only once its load is priced: until then every miss
         // is served on the GPU's path. A miss lands on the device once its
         // convert is priced under the host's landing.
-        let device_landed = filled == Filled::DeviceLanded && !matches!(banked, Banked::Resident);
+        let device_landed = start == Start::DeviceLanded && !matches!(banked, Banked::Resident);
         if device_landed {
             domain.slow_host_landing();
         }
@@ -639,7 +639,7 @@ fn scores(
             _ => 0,
         };
         assert_eq!(domain.resident_decodes(), resident, "{backend:?}: the decode steps the resident forms ran");
-        if filled == Filled::DeviceLanded && domain.expert_bank_plan().is_some_and(|plan| plan.placer() == crate::planning::Placer::Bank) {
+        if start == Start::DeviceLanded && domain.expert_bank_plan().is_some_and(|plan| plan.placer() == crate::planning::Placer::Bank) {
             assert!(domain.device_landed() > 0, "{backend:?}: the device landed no miss, so its path never ran");
         }
         if waited {

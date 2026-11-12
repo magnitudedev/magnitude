@@ -260,10 +260,10 @@ impl ExpertShares {
     }
 
     /// What the plan holds of each routed layer's experts at `slots` bank
-    /// slots: those, and its host tier as the plan sizes it at load and
-    /// fills before decode (every expert where the host's memory holds
-    /// them, the tier then complete; none without a tier). The holding a
-    /// plan's estimate is of; a running load's is what it holds.
+    /// slots: those, and its host tier as the plan sizes it at load and it
+    /// fills (every expert where the host's memory holds them, the tier
+    /// then complete; none without a tier). The holding a plan's estimate
+    /// is of at steady state; a running load's is what it holds.
     pub fn held(&self, slots: u64) -> HeldSlots {
         let count = |value: u64| usize::try_from(value).expect("a layer's experts fit the host");
         let host = match self.cold {

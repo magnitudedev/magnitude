@@ -486,12 +486,12 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().in_gap()
     }
 
-    fn fill_epoch(&self) -> u64 {
-        self.bank.watcher.shared().fill_epoch()
+    fn cover(&self) -> crate::ExpertCover {
+        self.bank.watcher.shared().cover()
     }
 
-    fn wait_tier_filled(&self) -> Result<(), DomainError> {
-        self.bank.watcher.shared().wait_filled().map_err(DomainError::invariant)
+    fn wait_covered(&self) -> Result<(), DomainError> {
+        self.bank.watcher.shared().wait_covered().map_err(DomainError::invariant)
     }
 
     fn residency(&self) -> Result<ExpertResidency, DomainError> {

@@ -33,7 +33,7 @@
 //! does, and records the last timed sample's groups against their bar
 //! ([`prompt_groups`]).
 
-use crate::rest::{BankRest, STEADY_ATTEMPTS, decode_context_rows, steady_window};
+use crate::rest::{BankRest, Progress, decode_context_rows, steady_window};
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Checkpoint, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
 use crate::fixture::FixtureSet;
@@ -532,7 +532,9 @@ fn prefill_cell(
     let trace = traced(engine, TraceDetail::Submissions)?;
     // The cold sample, then warm samples until `prefill_samples - 1` of them
     // ran with the bank at rest (`BankRest`): only those are the cell's
-    // prefill. The others are reported apart, with what moved.
+    // prefill. The others are reported apart, with what moved; a bank that
+    // moves between them is waited for while its moves make progress
+    // ([`Progress`]).
     let wanted = time.prefill_samples.saturating_sub(1);
     let mut samples_ms = Vec::with_capacity(time.prefill_samples);
     let mut unsteady = Vec::new();
@@ -542,21 +544,24 @@ fn prefill_cell(
     // runs only shapes the first ran.
     let mut warm_graphs = seismic::GraphReplays::default();
     let mut attempts = 0;
+    let mut progress = Progress::default();
     while samples_ms.len() < 1 + wanted {
         let cold = samples_ms.is_empty();
-        if !cold && attempts == STEADY_ATTEMPTS * wanted {
-            return Err(format!(
-                "{} of {attempts} warm prefill samples ran with the expert bank at rest, of {wanted} wanted: {}",
-                samples_ms.len() - 1,
-                Value::from(unsteady)
-            ));
-        }
-        let (graphs, before) = (engine.graph_replays(), BankRest::filled(engine)?);
+        let (graphs, before) = (engine.graph_replays(), BankRest::covered(engine)?);
         let (seconds, steps, sampled) = prefill_sample(engine, histories, &trace)?;
         if !cold {
             attempts += 1;
             if let Some(moved) = BankRest::moved(before, BankRest::of(engine)?) {
-                unsteady.push(json!({ "ms": seconds * MS, "moved": moved }));
+                let verdict = progress.note(&moved, BankRest::targets(engine)?);
+                unsteady.push(json!({ "ms": seconds * MS, "moved": moved.record() }));
+                if let Err(why) = verdict {
+                    return Err(format!(
+                        "{} of {attempts} warm prefill samples ran with the expert bank at rest, \
+                         of {wanted} wanted: {why}: {}",
+                        samples_ms.len() - 1,
+                        Value::from(unsteady)
+                    ));
+                }
                 continue;
             }
             warm_graphs = warm_graphs.plus(engine.graph_replays().since(graphs));
@@ -952,18 +957,19 @@ fn measure(
     // steps, then more until one runs at rest, then the window; an attempt
     // whose window any step the bank moved across is discarded, with what
     // moved, and the decode begins again from its histories
-    // ([`steady_window`]). So no tier fill or resize is timed as decode,
+    // ([`steady_window`]). So no resize or cover read is timed as decode,
     // every figure of the window is of one steady span, and no attempt runs
     // deeper than the load's context.
     let ((summaries, mut submissions, phases, span, cpu, threads, throttling, experts, graphs), discarded) = steady_window(
         &mut decode,
         time.warm,
         |decode| {
-            let before = BankRest::filled(decode.engine)?;
+            let before = BankRest::covered(decode.engine)?;
             run(decode.engine, decode.sequences, &trace)?;
             decode.warm_expert_steps.extend(expert_step_of(decode.engine)?);
             Ok(BankRest::moved(before, BankRest::of(decode.engine)?))
         },
+        |decode| BankRest::targets(decode.engine),
         |decode| {
             collect(&trace)?;
             let mut summaries = Vec::with_capacity(time.steps);
@@ -1016,7 +1022,7 @@ fn measure(
                 let after = BankRest::of(decode.engine)?;
                 if let Some(moves) = BankRest::moved(rest, after) {
                     expert_costs.push((decode.engine.domain.expert_costs(), after.and_then(|after| after.host_slots())));
-                    moved = Some((index, moves));
+                    moved = Some((index, moves.record()));
                     break;
                 }
                 rest = after;

@@ -392,8 +392,8 @@ impl ExpertSource {
     }
 
     /// Request `reads` of the read engine for `want`: due now for a step's
-    /// misses, at its layer's estimated start for a hint, undated for the
-    /// tier's fill. Fails only when the engine takes no request.
+    /// misses, at its layer's estimated start for a hint. Fails only when the
+    /// engine takes no request.
     pub fn request(&self, reads: Vec<Read>, want: Want) -> Result<Ticket, String> {
         assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
         // Each file's ranges, each landing in the records its read holds,
@@ -762,8 +762,9 @@ mod tests {
     ///   work (20 and 10 µs, as a pass over 40 layers and a tend may);
     /// - each job's end holding its last piece's window through 180 µs of
     ///   work on the read worker, as a decode landing's conversion does;
-    /// - another reader of the volume, a bank fill's: one expert a job at
-    ///   [`Want::undated(0.)`], 8 queued at all times.
+    /// - another reader of the volume, a covering tier's cover: one expert a
+    ///   job, in layer and expert-index order, at [`Want::undated(0.)`], 8
+    ///   queued at all times.
     #[test]
     #[ignore = "times reads into a CUDA device's reserved bank beside a served prompt's host work, on a real model file (`MAGNITUDE_ARTIFACTS`)"]
     fn a_prompts_reads_beside_a_served_prompts_host_work() {
@@ -825,18 +826,19 @@ mod tests {
             [service, residency]
         };
 
-        // A bank fill's reads, until `stop`: what it read, a second.
-        let fill = |stop: Arc<AtomicBool>| {
+        // A cover's reads, until `stop`: what it read, a second.
+        let cover = |stop: Arc<AtomicBool>| {
             let (model, reader) = (model.clone(), reader.clone());
             std::thread::spawn(move || {
                 const QUEUED: usize = 8;
                 let layout = std::alloc::Layout::from_size_align(QUEUED * model.record as usize, 4096).unwrap();
                 // SAFETY: a nonzero layout; freed below with it, every job waited on.
                 let records = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
-                let mut seed = 0x51u64;
+                let experts = model.experts;
+                let order = (0..model.layers.len()).flat_map(|layer| (0..experts).map(move |expert| (layer, expert)));
                 let (mut bytes, mut jobs) = (0usize, std::collections::VecDeque::new());
                 let began = Instant::now();
-                for slot in (0..QUEUED).cycle() {
+                for (slot, (layer, expert)) in (0..QUEUED).cycle().zip(order.cycle()) {
                     if jobs.len() == QUEUED {
                         let job: Handle = jobs.pop_front().unwrap();
                         assert!(matches!(job.wait(), Ended::Read { failed } if failed.is_empty()));
@@ -844,10 +846,8 @@ mod tests {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let layer = &model.layers[(xorshift(&mut seed) % model.layers.len() as u64) as usize];
-                    let expert = xorshift(&mut seed) % model.experts;
                     let mut at = slot * model.record as usize;
-                    let ranges = layer
+                    let ranges = model.layers[layer]
                         .iter()
                         .map(|&(offset, per)| {
                             // SAFETY: within the slot's record.
@@ -870,14 +870,20 @@ mod tests {
         };
 
         let mut seed = 0x9a0bu64;
-        let variants = [("alone", false, false, false), ("beside the watcher's threads", true, false, false), ("each end holding its window 180 us", false, true, false), ("beside a bank fill", false, false, true), ("beside all three", true, true, true)];
+        let variants = [
+            ("alone", false, false, false),
+            ("beside the watcher's threads", true, false, false),
+            ("each end holding its window 180 us", false, true, false),
+            ("beside a cover", false, false, true),
+            ("beside all three", true, true, true),
+        ];
         for round in 0..2 {
-            for &(name, watching, holding, filling) in &variants {
+            for &(name, watching, holding, covering) in &variants {
                 let layers = model.draw(&mut seed);
                 reader.evict_cached().unwrap();
                 let (events, ends, stop) = (Arc::new(super::super::events::Events::default()), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
                 let watchers = if watching { watcher(events.clone(), ends.clone(), stop.clone()).into() } else { Vec::new() };
-                let filler = filling.then(|| fill(stop.clone()));
+                let coverer = covering.then(|| cover(stop.clone()));
                 let ended = {
                     let (events, ends) = (events.clone(), ends.clone());
                     move || {
@@ -894,8 +900,8 @@ mod tests {
                 for thread in watchers {
                     thread.join().unwrap();
                 }
-                let filled = filler.map(|thread| format!(", the fill {:.2} GB/s", thread.join().unwrap() / 1e9)).unwrap_or_default();
-                eprintln!("round {round}, reads {name}: {:.2} GB/s{filled}", rate / 1e9);
+                let covered = coverer.map(|thread| format!(", the cover {:.2} GB/s", thread.join().unwrap() / 1e9));
+                eprintln!("round {round}, reads {name}: {:.2} GB/s{}", rate / 1e9, covered.unwrap_or_default());
             }
         }
     }

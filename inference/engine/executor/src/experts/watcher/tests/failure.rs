@@ -105,8 +105,9 @@ fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on
 }
 
 /// A step whose read fails converts nothing for the group's later steps:
-/// each of its experts a later step routes is that step's to convert, and
-/// one none routes is not seeded.
+/// each of its experts a later step routes is that step's to convert, or
+/// already landed in the tier by the failed step's read of it, and one none
+/// routes is not seeded.
 #[test]
 fn a_failed_steps_experts_are_the_next_routing_steps() {
     // The file holds 6 experts of each tensor: expert 7's reads fail.
@@ -116,8 +117,13 @@ fn a_failed_steps_experts_are_the_next_routing_steps() {
     harness.publish(&steps[1], 0, &[0, 1]);
     assert_eq!(harness.every_round(&steps[0], 0), Answer::Failed);
     let lists = harness.rounds(&steps[1], 0);
+    // The failed step's read of expert 1 landed in the empty tier, where the
+    // later step copies it from: it is that step's to convert only where it
+    // did not.
     let mut converted = lists.concat().into_iter().map(|(_, expert)| expert).collect::<Vec<_>>();
+    converted.extend([0, 1].into_iter().filter(|&expert: &i32| harness.in_tier(0, expert as usize).is_some()));
     converted.sort_unstable();
+    converted.dedup();
     assert_eq!(converted, [0, 1]);
     let seeds = listed(&harness.seeds[0]);
     assert_eq!(harness.seeds[0].load(constants::LIST_SEQUENCE as usize), low_word(steps[1].sequence()));
@@ -223,10 +229,6 @@ fn a_failed_hint_fails_nothing() {
     // The file holds 6 experts of each tensor: expert 7's reads lie past
     // its end.
     let harness = layered("hint-failure", 6, 12, 2, 4 + 4);
-    // The tier's fill lands its records beyond the reserve first, every
-    // layer's lowest experts, which no step below names.
-    harness.tiering(0, &[0, 1, 2, 3]);
-    harness.tiering(1, &[0, 1, 2]);
     harness.demand_step(5);
     let step = harness.step();
     harness.hint(&step, 0, &[7]);

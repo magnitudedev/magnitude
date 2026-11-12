@@ -1,9 +1,11 @@
 //! Each expert's reuse as the routes measured it: the one
 //! ranking of what the bank holds and of how much it holds. It decides every
 //! residency choice (the bank's promotions and their victims, a prompt
-//! group's seeds' and a shrink's; the host tier's evictions and the
-//! order its fill lands in; the staging record a landing takes), and its
-//! stack prices every bank size (`Stack`'s miss curve and returns).
+//! group's seeds' and a shrink's; the host tier's evictions; the staging
+//! record a landing takes), and its stack prices every bank size (`Stack`'s
+//! miss curve and returns). A tier that covers every expert keeps them all,
+//! so it reads them in the order the steps need them, by layer and index
+//! (`Directory::cover_order`), with no choice for the ranking to make.
 //!
 //! What it measures is the routes' reads ([`RoutedRead`]): each completed
 //! decode step's routing record, every layer's chosen experts wherever

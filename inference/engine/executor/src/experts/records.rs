@@ -617,24 +617,13 @@ impl BankRecords {
         &mut self,
         progress: Point,
         commit: impl Fn(usize, BankRecord) -> i32,
-        mut ending: impl FnMut(Point) -> super::directory::Ending,
+        ending: impl FnMut(Point) -> super::directory::Ending,
         steps: &super::watcher::Steps,
     ) -> Vec<(usize, Staged, bool)> {
-        use super::directory::Ending;
-        let mut endings = std::collections::HashMap::new();
-        let mut retiring = Vec::new();
-        let filling = std::mem::take(&mut self.filling);
-        for (group, record) in filling {
-            let (staged, point) = self.fill_of((group, record));
-            let ending = (point < progress).then(|| *endings.entry(point.sequence).or_insert_with(|| ending(point)));
-            match ending {
-                None | Some(Ending::Running) => self.filling.push((group, record)),
-                Some(ending) => {
-                    let committed = ending == Ending::Ended && commit(group, bank_record(record)) == super::watcher::low_word(point.sequence);
-                    retiring.push((group, record, staged, committed));
-                }
-            }
-        }
+        let mut filling = std::mem::take(&mut self.filling);
+        let retired = super::directory::Settling::new(progress, ending).retire(&mut filling, |&taken| self.fill_of(taken).1, |&(group, record)| commit(group, bank_record(record)));
+        self.filling = filling;
+        let retiring = retired.into_iter().map(|((group, record), committed)| (group, record, self.fill_of((group, record)).0, committed)).collect::<Vec<_>>();
         let mut mapped = Vec::new();
         for &(group, record, staged, committed) in &retiring {
             self.placing.remove(&staged);

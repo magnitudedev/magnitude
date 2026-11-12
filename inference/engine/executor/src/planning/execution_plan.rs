@@ -299,8 +299,10 @@ impl ExecutionPlanDraft {
     /// (`AssessmentMemoryCharge::assess_fit`, `Fit` alone interpreting
     /// placements, stores and reserves); none past its floor beside a bank
     /// of every expert, which misses nothing. The tier's
-    /// size is this load-time decision; it is filled from the bank's open
-    /// on, before decode needs it.
+    /// size is this load-time decision. A tier of every expert is read in at
+    /// load behind every step's reads (`Prefetch::cover`); a smaller one
+    /// starts empty and fills by use (file misses, the hints' reads and a
+    /// prompt's seeds land into it).
     ///
     /// `charge` is the draft's, which holds the tier at its floor, as the
     /// bank commits it at load: a size's charge is it with the tier's growth

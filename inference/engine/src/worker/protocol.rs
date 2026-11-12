@@ -339,7 +339,7 @@ mod tests {
                             bytes: 14,
                             last_resize: None,
                         }),
-                        fill: magnitude_executor::TierFill::Filled,
+                        cover: magnitude_executor::ExpertCover { begun: 1, reading: false },
                         disk_bytes: 11,
                         tables: vec![magnitude_executor::TableResidency {
                             records: 40,

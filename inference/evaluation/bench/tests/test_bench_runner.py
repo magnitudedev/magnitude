@@ -250,7 +250,8 @@ def test_the_expert_bank_is_followed_over_each_pass():
 
         bank = None if slots is None else {
             "experts": 256, "slots": slots, "floor": 26, "ceiling": 256, "stores": [], "disk_bytes": 0,
-            "host": {"slots": 1, "ceiling": 256, "bytes": 1, "fill": "Filled", "last_resize": wire(host)},
+            "cover": {"begun": 1, "reading": False},
+            "host": {"slots": 1, "ceiling": 256, "bytes": 1, "last_resize": wire(host)},
             "tables": [{"records": 3, "floor": 1, "ceiling": 4, "bytes": 3, "last_resize": wire(resize)}
                        for resize in (tables or [None])],
             "last_resize": wire(experts),

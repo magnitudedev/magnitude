@@ -113,10 +113,9 @@ pub(super) enum Ask {
     Place(PlacedWords),
 }
 
-/// A growth's change, which the watcher's directory applies at its next
-/// pass in the order posted ([`Shared::join`]): one slot, backed by every
-/// record tensor of its holding; or, of the records the host lands into,
-/// a growth begun or ended.
+/// A growth's slot, which the watcher's directory applies at its next pass
+/// in the order posted ([`Shared::join`]), backed by every record tensor of
+/// its holding.
 pub(crate) enum Join {
     /// Each group of the bank holds `records` records, beside a host tier:
     /// the directory takes the new ones, free, and promotes into them.
@@ -126,12 +125,6 @@ pub(crate) enum Join {
     /// `views` (each group's record tensors' records committed at them):
     /// the directory takes the new ones, ready.
     Landed { records: Vec<u32>, views: Vec<Vec<Records>> },
-    /// A growth of the records the host lands into begins: posted as it is
-    /// decided, before any of its slots, so the tier is filling from then
-    /// (`Directory::fill_pending`).
-    Growing,
-    /// That growth ended, after its last slot joined: no more join.
-    Grown,
 }
 
 /// The slots a running growth has joined, in order, until the watcher
@@ -562,8 +555,6 @@ impl Residency {
                     }
                     self.address_tier(views);
                 }
-                Join::Growing => self.core.directory.host_growth(true),
-                Join::Grown => self.core.directory.host_growth(false),
             }
         }
         if count > 0 {
@@ -594,6 +585,10 @@ impl Residency {
         if self.shared.life.ended().is_some() {
             return None;
         }
+        // Whatever is asked, the cover's queued reads yield: a resize waits
+        // for the reads that run, and a cut of the tier is deferred by the
+        // landings in flight, never by a queue of reads ahead of use.
+        self.prefetch.cancel_cover();
         if asked.ask.waits() {
             if self.core.directory.moving() || self.prefetch.outstanding() {
                 return Some(asked);

@@ -479,7 +479,7 @@ fn watch(
             .collect::<Result<Vec<_>, String>>()?,
     };
     // The records the host lands into: a host tier's, each group's at its
-    // floor (backed to the plan's size beside the fill), or where the host
+    // floor (backed to the plan's size beside the load), or where the host
     // places, the bank's own.
     let host = tiers
         .as_ref()

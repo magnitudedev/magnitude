@@ -309,7 +309,7 @@ impl ExpertBank {
                 })
                 .map(|(slots, ceiling, last_resize)| self.host_charged().map(|bytes| HostResidency { slots, ceiling, bytes, last_resize }))
                 .transpose()?,
-            fill: self.watcher.shared().tier_fill(),
+            cover: self.watcher.shared().cover(),
             // The tables are the served bank's (`ServedBank::residency`).
             tables: Vec::new(),
             last_resize: *self.last_resize.lock().expect("the experts' last resize"),

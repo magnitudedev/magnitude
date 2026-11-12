@@ -1244,12 +1244,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.expert_bank().map(|bank| bank.residency()).transpose()
     }
 
-    /// Wait until the expert bank's host tier is filled
-    /// (`ElasticBank::wait_tier_filled`); at once without a bank or tier.
-    pub fn wait_expert_tier_filled(&self) -> Result<(), DomainError> {
-        self.family.expert_bank().map_or(Ok(()), |bank| bank.wait_tier_filled())
-    }
-
     /// Starve the expert bank's host for `duration` from now
     /// (`ExpertBank::starve`): a test's way to end the waits of the steps
     /// it submits meanwhile before their answers.

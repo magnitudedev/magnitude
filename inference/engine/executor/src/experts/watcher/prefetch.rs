@@ -2,11 +2,12 @@
 //! reads, and reads ahead of demand, each landing into the host tier as it
 //! ends (`experts::landing`). A read ahead is one of two kinds: a hint's,
 //! the next layer's hinted expert whose file is on the path (nothing holds,
-//! keeps or lands it), or the tier's fill's, an expert the tier lacks read
-//! at the load's priority below every step's ([`Prefetch::fill`]). Only a
-//! hint is a prediction: its precision counts hints alone, and a request
-//! that finds a fill's read of its miss waits for a read no prediction
-//! made.
+//! keeps or lands it), or a covering tier's, an expert the tier lacks read
+//! at the load's priority below every step's ([`Prefetch::cover`]) where
+//! the tier has a record for every expert. Only a hint is a prediction: its
+//! precision counts hints alone, and a request that finds a cover's read of
+//! its miss waits for a read no prediction made. A tier that cannot hold
+//! every expert keeps what the steps' misses and the hints land.
 //!
 //! A read's end submits its landing to the host compute executor on the
 //! read engine's worker that ends it, once the read's end is set and its
@@ -294,10 +295,28 @@ enum Need {
     /// any of them; `device` where the device converts it.
     Due { ticket: Arc<Ticket>, read: Step, device: Option<Arc<DeviceLanding>> },
     /// Read ahead of demand, by its own ticket (cancelled once it can only
-    /// be wrong): a hint's, wanted from its layer's estimated start
-    /// (`HintPrice::want`), when the route at `hinted` hinted it, or, with
-    /// none, the tier's fill's, undated.
-    Ahead { ticket: Ticket, hinted: Option<At> },
+    /// be wrong): what it reads ahead for is `ahead`.
+    Ahead { ticket: Ticket, ahead: Ahead },
+}
+
+/// What a read ahead is for.
+#[derive(Clone, Copy)]
+enum Ahead {
+    /// A hint's, wanted from its layer's estimated start
+    /// (`HintPrice::want`): the route at this `At` hinted it.
+    Hint(At),
+    /// The covering tier's ([`Prefetch::cover`]), undated.
+    Cover,
+}
+
+impl Ahead {
+    /// How its landing takes its tier record.
+    fn taking(self) -> Taking {
+        match self {
+            Self::Hint(_) => Taking::Ahead,
+            Self::Cover => Taking::Out,
+        }
+    }
 }
 
 impl Inbound {
@@ -310,18 +329,19 @@ impl Inbound {
     }
 
     /// The step that read it: a request's, or the route's that hinted it;
-    /// none for the fill's.
+    /// none for the cover's.
     fn read(&self) -> Option<Step> {
         match &self.need {
             Need::Due { read, .. } => Some(*read),
-            Need::Ahead { hinted, .. } => hinted.map(|hinted| hinted.point.sequence),
+            Need::Ahead { ahead: Ahead::Hint(hinted), .. } => Some(hinted.point.sequence),
+            Need::Ahead { ahead: Ahead::Cover, .. } => None,
         }
     }
 }
 
 /// A landing in flight a request waits for ([`Prefetch::hasten`]): a
 /// hint's, issued by the route at its `At`, or one no route issued (the
-/// fill's, or another request's).
+/// cover's, or another request's).
 pub(super) enum Reading {
     Hint(At),
     Unpredicted,
@@ -463,8 +483,8 @@ impl Prefetch {
                 inbound.urgency.hasten();
                 return Some(Reading::Unpredicted);
             }
-            Need::Ahead { hinted: Some(hinted), .. } => Reading::Hint(*hinted),
-            Need::Ahead { hinted: None, .. } => Reading::Unpredicted,
+            Need::Ahead { ahead: Ahead::Hint(hinted), .. } => Reading::Hint(*hinted),
+            Need::Ahead { ahead: Ahead::Cover, .. } => Reading::Unpredicted,
         };
         if inbound.ended.get() == Some(false) {
             noted(-2);
@@ -494,7 +514,7 @@ impl Prefetch {
     /// costs that read.
     pub(super) fn cancel_passed(&mut self, core: &Core, steps: &super::steps::Steps, served: Option<(Step, usize)>) {
         for (&(target, _), inbound) in &mut self.inbound {
-            let Need::Ahead { ticket, hinted: Some(hinted) } = &mut inbound.need else {
+            let Need::Ahead { ticket, ahead: Ahead::Hint(hinted) } = &mut inbound.need else {
                 continue;
             };
             if inbound.urgency.is_waited() || ticket.cancelled() {
@@ -516,19 +536,35 @@ impl Prefetch {
         assert!(previous.is_none(), "expert {staged:?} lands twice at once");
     }
 
+    /// Cancel the cover's reads no step waits for and that no read engine
+    /// worker has begun: a resize or traffic hold waits only for the reads
+    /// that run, never for the cover's queue. A cancelled read ends failed,
+    /// freeing its staging record and its tier record, and the cover reads
+    /// the expert again once nothing holds.
+    pub(super) fn cancel_cover(&mut self) {
+        for inbound in self.inbound.values_mut() {
+            let Need::Ahead { ticket, ahead: Ahead::Cover } = &mut inbound.need else {
+                continue;
+            };
+            if !inbound.urgency.is_waited() && !ticket.cancelled() {
+                ticket.cancel();
+            }
+        }
+    }
+
     /// Staging and what is in flight into it, for the exchange's watchdog.
     pub(super) fn describe(&self) -> String {
-        let [mut hints, mut fills, mut due, mut running] = [0; 4];
+        let [mut hints, mut covers, mut due, mut running] = [0; 4];
         for inbound in self.inbound.values() {
             match inbound.need {
                 Need::Due { .. } => due += 1,
-                Need::Ahead { hinted: Some(_), .. } => hints += 1,
-                Need::Ahead { hinted: None, .. } => fills += 1,
+                Need::Ahead { ahead: Ahead::Hint(_), .. } => hints += 1,
+                Need::Ahead { ahead: Ahead::Cover, .. } => covers += 1,
             }
             running += usize::from(inbound.ticket().running());
         }
         format!(
-            "staging {} free of {}; inbound: hints {hints}, fills {fills}, due {due}; reads running for {running}",
+            "staging {} free of {}; inbound: hints {hints}, covers {covers}, due {due}; reads running for {running}",
             self.staging.free(),
             self.staging.records(),
         )
@@ -580,7 +616,7 @@ impl Prefetch {
     }
 
     /// A landing of `staged` from staging record `record` into tier record
-    /// `tier`, read at step `read` (none for the fill's), ended: landed or
+    /// `tier`, read at step `read` (none for the cover's), ended: landed or
     /// not.
     fn ended(&mut self, directory: &mut Directory, record: u32, staged: Staged, tier: u32, read: Option<Step>, landed: bool) {
         let (layer, expert) = staged;
@@ -746,7 +782,7 @@ impl Prefetch {
                 continue;
             }
             let want = |bytes| price.want(rank, target - issued.point.layer, bytes, now);
-            match self.read_ahead(core, shared, (target, expert), want, Some(issued), (request, demand)) {
+            match self.read_ahead(core, shared, (target, expert), want, Ahead::Hint(issued), (request, demand)) {
                 Ok(bytes) => {
                     shared.telemetry.hint(bytes);
                     noted(Fate::Read, ShortOf::Nothing);
@@ -766,70 +802,55 @@ impl Prefetch {
         shared.telemetry.hinted(sequence, target, lead, candidates);
     }
 
-    /// Fill the host tier: each expert its tier lacks that nothing carries,
-    /// in the order the tier lands them (`Directory::fill_order`: the most
-    /// reused first, a tie, never used yet, each layer's alike), is landed
-    /// into a tier record beyond the tier's reserve (`Extents::reserve`,
-    /// or every expert still lacked, where fewer: `HostRecords::claim`), so
-    /// it displaces nothing the tier keeps: read into a staging record
-    /// undated, behind every step's reads, as a hint's read lands, so a
-    /// request that waits for one hastens its read. `carried`
-    /// names the experts a prompt group's conveyor carries, which land
-    /// through it (`Scratch::carries`): no expert is read twice.
+    /// Cover the host tier: where a group's tier has a record for every
+    /// expert of its layers (`HostRecords::covers`), each expert it lacks
+    /// that nothing carries (`Directory::cover_order`) is landed into a
+    /// tier record and read into a staging record undated, behind every
+    /// step's reads, as a hint's read lands, so a request that waits for
+    /// one hastens its read. `carried` names the experts a prompt group's
+    /// conveyor carries, which land through it (`Scratch::carries`): no
+    /// expert is read twice. Where the tier cannot hold every expert there
+    /// is no choice to make ahead of use, and nothing is read: it fills by
+    /// its misses and hints.
     ///
-    /// The tier's size is the plan's, decided at load, and it fills from the
-    /// bank's open on: a tier with a record for every expert of its group is
-    /// filled to every expert, and a decode miss of it then never reads the
-    /// file; a smaller one's records beyond the reserve with the experts
-    /// most reused when they are filled, which its misses' landings then
-    /// displace by reuse as they rank. One rule fills both.
-    ///
-    /// How many it reads at once: by the read engine's law (`seismic_io`,
-    /// "Order and depth") a due read waits for at most the bytes read ahead
-    /// already in flight, however much less urgent work is queued, so the
-    /// depth of the fill's queue costs no step anything; and its reads keep
-    /// the link busy at its rate only while
-    /// its queue holds the reads that cover the latency `λ` of each next
-    /// one and the watcher's turn to submit it, which no bound below the
-    /// staging they land into guarantees. So the fill reads into every
-    /// staging record beyond the demand reserve; the
-    /// hints' records among them it shares with hints, which each pass
-    /// admits before it fills, so a hint takes each record as it frees.
-    pub(super) fn fill(&mut self, core: &mut Core, shared: &Arc<Shared>, carried: impl Fn(Staged) -> bool) {
-        let (keep, reserve) = (core.extents.demand, core.extents.reserve);
+    /// It reads into every staging record beyond the demand reserve, the
+    /// hints' among them it shares with hints, which each pass admits
+    /// before it covers, so a hint takes each record as it frees. By the
+    /// read engine's law (`seismic_io`, "Order and depth") a due read
+    /// waits for at most the bytes read ahead already in flight, however
+    /// much less urgent work is queued, so the depth of its queue costs no
+    /// step anything. It gates nothing in serving: no growth, bank move or
+    /// step waits for it, and a miss that arrives first takes its own read.
+    /// Only a measurement waits for its end ([`Self::covering`]), so no
+    /// timed span shares the drive with it.
+    pub(super) fn cover(&mut self, core: &mut Core, shared: &Arc<Shared>, carried: impl Fn(Staged) -> bool) {
+        let keep = core.extents.demand;
         let room = self.staging.free().saturating_sub(keep);
         if room == 0 {
             return;
         }
-        let order = core.directory.fill_order(reserve, room, carried);
-        for staged in order {
+        for staged in core.directory.cover_order(room, carried) {
             if self.staging.free() <= keep {
                 break;
             }
-            match self.read_ahead(core, shared, staged, |_| Want::undated(0.), None, (keep, reserve)) {
+            match self.read_ahead(core, shared, staged, |_| Want::undated(0.), Ahead::Cover, (keep, 0)) {
                 Ok(_) => {}
                 // Refused, or its group's tier holds no record for it now:
-                // the fill goes on to the next.
+                // the cover goes on to the next.
                 Err(Short::Refused | Short::Tier) => {}
                 Err(Short::Staging) => break,
             }
         }
     }
 
-    /// Whether the fill still lands the tier ([`Self::fill`]): a fill's read
-    /// or landing is in flight, a growth of the tier runs, or a tier has a
-    /// record beyond its reserve that the fill takes
-    /// (`Directory::fill_pending`). Not once the tier holds every record it
-    /// is planned to and each beyond the reserve keeps an expert, or the
-    /// tier keeps every expert: from then only misses' landings and a prompt
-    /// group's reads (`Scratch::land_conveyed`) change what the tier keeps,
-    /// displacing it at the same records.
-    pub(super) fn filling(&self, core: &Core) -> bool {
-        self.inbound.values().any(|inbound| matches!(inbound.need, Need::Ahead { hinted: None, .. })) || core.directory.fill_pending(core.extents.reserve)
+    /// Whether the cover still reads ([`Self::cover`]): a cover's read is
+    /// inbound, or a tier that covers its experts lacks one
+    /// (`Directory::cover_pending`).
+    pub(super) fn covering(&self, core: &Core) -> bool {
+        self.inbound.values().any(|inbound| matches!(inbound.need, Need::Ahead { ahead: Ahead::Cover, .. })) || core.directory.cover_pending()
     }
 
-    /// Read `staged` ahead, a hint's where `hinted` names the route that
-    /// hinted it, else the fill's: into a staging record wanted as `want`
+    /// Read `staged` ahead, `ahead` saying for what: into a staging record wanted as `want`
     /// gives for its bytes, of those free beyond `staging`, landing into a
     /// tier record of its group the tier takes for it leaving `tier` ready
     /// (`Directory::claim_landing`), tracked inbound, so a step that waits
@@ -842,15 +863,14 @@ impl Prefetch {
         shared: &Arc<Shared>,
         staged: Staged,
         want: impl FnOnce(u64) -> Want,
-        hinted: Option<At>,
+        ahead: Ahead,
         (staging, tier): (usize, usize),
     ) -> Result<u64, Short> {
         let (target, expert) = staged;
         let Some(record) = self.staging.take_beyond(staging) else {
             return Err(Short::Staging);
         };
-        let taking = if hinted.is_some() { Taking::Ahead } else { Taking::Out };
-        let Claim::Taken(grant) = core.directory.claim_landing(target, expert, tier, taking) else {
+        let Claim::Taken(grant) = core.directory.claim_landing(target, expert, tier, ahead.taking()) else {
             self.staging.release(record);
             return Err(Short::Tier);
         };
@@ -886,7 +906,7 @@ impl Prefetch {
                     }
                     end.set(false);
                 });
-                self.arrive(staged, Inbound { record, tier, need: Need::Ahead { ticket, hinted }, ended, urgency });
+                self.arrive(staged, Inbound { record, tier, need: Need::Ahead { ticket, ahead }, ended, urgency });
                 Ok(bytes)
             }
             // The engine took no request: the read stages and lands nothing and

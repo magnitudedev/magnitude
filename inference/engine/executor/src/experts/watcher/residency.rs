@@ -12,9 +12,10 @@
 //! steps' reads to the ranking (outside the lock), retires the steps the
 //! frontier passed, learns the landings that ended, keeps the tier's
 //! map and reserve, carries the promotions, clears a prompt group's
-//! conveyor once nothing of it runs, fills the tier ahead of every step,
-//! joins a growth's slots, serves a resize (a cut of the one store beside
-//! a running chain among them) and writes the policy words in a gap. Each turn of it runs on the load's events (`events`): a step's
+//! conveyor once nothing of it runs, hastens the reads ahead a prompt
+//! group's step waits for, joins a growth's slots, serves a resize (a cut
+//! of the one store beside a running chain among them) and writes the
+//! policy words in a gap. Each turn of it runs on the load's events (`events`): a step's
 //! end (the frontier), a landing's or a read's end, a copy's completion, a
 //! growth joined, a resize asked, the request service's progress. It never
 //! waits on a time, and no job it does waits for another. It holds the lock
@@ -218,12 +219,12 @@ impl Residency {
     /// and the tier map published; then a resize asked, served once the
     /// promotions and landings in flight end (until then nothing new is
     /// promoted or read ahead); else the promotions asked and carried, a
-    /// prompt group past cleared, what each layer holds published, the tier
-    /// filled ahead of the steps, the line words written where they
-    /// changed, and in a gap the policy words a run's encoding reads. A
-    /// turn that changed what a request is served by (a retirement, a
-    /// landing learned, a promotion, a group cleared, a growth joined) is
-    /// an event: the request service looks again.
+    /// prompt group past cleared, what each layer holds published, the
+    /// reads ahead a prompt group's step waits for hastened, the line words
+    /// written where they changed, and in a gap the policy words a run's
+    /// encoding reads. A turn that changed what a request is served by (a
+    /// retirement, a landing learned, a promotion, a group cleared, a growth
+    /// joined) is an event: the request service looks again.
     ///
     /// The turn takes residency's lock once no request waits for it, and
     /// between its jobs gives it to any request that came to wait since
@@ -254,7 +255,7 @@ impl Residency {
     }
 
     /// A turn's jobs, in order ([`Self::tend`]).
-    pub(super) const TURN: [Job<'static>; 5] = [&Self::learn, &Self::promote, &Self::clear, &Self::fill, &Self::publish_turn];
+    pub(super) const TURN: [Job<'static>; 5] = [&Self::learn, &Self::promote, &Self::clear, &Self::hasten, &Self::publish_turn];
 
     /// A growth's slots joined, the steps the frontier passed retired, the
     /// landings that ended learned and the tier's reserve kept, and a cut
@@ -302,15 +303,26 @@ impl Residency {
         true
     }
 
-    /// The tier filled ahead of the steps unless traffic is held; its
-    /// turning quiet is an event, which a hold waits on. Whether it is held
-    /// is read here, not carried from the promotions: a request served
-    /// between them means a step runs, which ends the hold at once.
-    fn fill(&mut self, _: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+    /// The tier's cover read (`Prefetch::cover`), and the reads ahead a
+    /// prompt group's step waits for while they land into the host tier
+    /// (`Scratch::awaited`) hastened to demand (`Prefetch::hasten`), unless
+    /// traffic is held; then whether the cover still reads published
+    /// (`Shared::publish_cover`), and its turning quiet is an event, which a
+    /// hold waits on. Whether it is held is read here, not
+    /// carried from the promotions: a request served between them means a
+    /// step runs, which ends the hold at once.
+    fn hasten(&mut self, _: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
-        if !held {
-            self.read_ahead();
+        if held {
+            self.prefetch.cancel_cover();
+        } else {
+            let scratch = &self.scratch;
+            self.prefetch.cover(&mut self.core, &self.shared, |staged| scratch.carries(staged));
+            for staged in self.scratch.awaited(&self.core) {
+                self.prefetch.hasten(staged);
+            }
         }
+        self.shared.publish_cover(self.prefetch.covering(&self.core));
         let copying = copier.is_some_and(|copier| !copier.copies.idle());
         let quiet = held && !copying && !self.prefetch.outstanding();
         if self.shared.traffic_quiet.swap(quiet, std::sync::atomic::Ordering::AcqRel) != quiet {
@@ -452,9 +464,9 @@ impl Residency {
             self.published.holdings = Some(holdings);
         }
         // The moment the records misses land into first keep every expert:
-        // from then no decode miss reads the file (`Prefetch::fill`). They
-        // are a host tier's where the device places, the bank's own (the one
-        // store) where the host does.
+        // from then no decode miss reads the file. They are a host tier's
+        // where the device places, the bank's own (the one store) where the
+        // host does.
         let complete = self.core.directory.tier_complete();
         if complete && !self.complete {
             tracing::info!(
@@ -624,30 +636,6 @@ impl Residency {
     /// step runs then asks anything (no miss, no hint).
     pub(super) fn whole(&self) -> bool {
         self.whole.iter().all(|&whole| whole)
-    }
-
-    /// Read ahead of the steps' own reads and hints: the tier's fill, every
-    /// expert the conveyor carries left to it (`Prefetch::fill`), and each
-    /// fill's read a prompt group's step waits for promoted to demand
-    /// (`Scratch::awaited`); then publish whether the fill still lands the
-    /// tier (`Prefetch::filling`).
-    pub(super) fn read_ahead(&mut self) {
-        let scratch = &self.scratch;
-        self.prefetch.fill(&mut self.core, &self.shared, |staged| scratch.carries(staged));
-        for staged in self.scratch.awaited(&self.core) {
-            self.prefetch.hasten(staged);
-        }
-        let fill = match self.prefetch.filling(&self.core) {
-            true => crate::TierFill::Filling,
-            false => crate::TierFill::Filled,
-        };
-        if self.shared.publish_fill(fill) && fill == crate::TierFill::Filled {
-            tracing::info!(
-                "{} is filled, {:.1} s after the bank opened",
-                self.store(),
-                self.opened.elapsed().as_secs_f64()
-            );
-        }
     }
 
     /// Each group's host tier records `views` address from now (a shrink's,

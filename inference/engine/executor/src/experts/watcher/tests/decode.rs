@@ -166,12 +166,11 @@ fn a_request_past_its_staging_lands_on_the_host() {
 /// it, its bytes the file's.
 #[test]
 fn a_request_reads_an_expert_its_tier_unmapped() {
-    // The tier's fill lands the lowest experts it lacks beside the requests
-    // (4, 5 and 6 once the first request's have gone): a landing before a
-    // route serves its expert from the tier, and one before the request is
-    // served keeps it, neither a miss read on demand. Its reads stand behind
-    // the line, taken only once a request hastens them, so every miss is
-    // read on demand, whatever the threads' timing.
+    // The store starts empty: each of the first two requests' experts
+    // misses and is read on demand, and expert 0, once unmapped, is read on
+    // demand again. Reads ahead stand behind the line, taken only once a
+    // request hastens them, so every miss is read on demand, whatever the
+    // threads' timing.
     let _alone = alone();
     let ahead = Ahead::queue("kept-ahead");
     // The tier's records are short of its reserve: it keeps nothing it has
@@ -302,7 +301,7 @@ fn a_parked_step_never_lands_over_a_store_record_its_route_resolved() {
 #[test]
 fn a_park_readies_the_reserve_for_the_hints_behind_it() {
     // Eight store records, all the reserve (one per staging record), for
-    // two layers' sixteen experts: nothing beyond the reserve to fill.
+    // two layers' sixteen experts.
     let harness = lending("park-readies", EXPERTS, 8, 2, 8, DECODE, 8, Placer::Bank, false);
     let map = &harness.layers[0].0;
     let (parked, behind) = (harness.step(), harness.step());

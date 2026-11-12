@@ -52,7 +52,7 @@ mod domain_tests;
 pub use family::{
     BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, HostResidency,
     NativeFamily,
-    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, TierFill, TrafficHold, Trip,
+    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, TrafficHold, Trip,
 };
 pub use reader::{DeviceReader, LoadRoom, MachineReading, StatusReading};
 pub use in_flight::{
@@ -309,8 +309,9 @@ pub struct PendingOperationOutcome {
     kind: WorkKind,
     physical_duration: Duration,
     /// Whether its duration is its launches' alone ([`LaunchEpoch`]): no
-    /// graph was recorded, nor any expert bank resize ran or fill began or
-    /// ended, within it; and whether the bank's fill ran beside it.
+    /// graph was recorded, nor any expert bank resize ran or cover read
+    /// began or ended, within it; and whether the bank's cover read beside
+    /// it.
     timed: Timed,
     image: Option<ImageRef>,
 }
@@ -320,49 +321,42 @@ pub struct PendingOperationOutcome {
 /// duration), read from the device's own count at each submission and
 /// finish, the expert bank's resizes begun (a resize holds the thread at
 /// the boundaries it runs across, and a growth's new slots or a shrink's
-/// evictions change what the launch misses), and its fill's starts and
-/// finishes (`ElasticBank::fill_epoch`). A launch is timed only where the
-/// epoch at its finish is the one at its submission, none while a resize
-/// runs: a resize changes no launch cost the draft width is chosen by.
+/// evictions change what the launch misses), and its cover's reads
+/// (`ElasticBank::cover`). A launch is timed only where the epoch at its
+/// finish is the one at its submission, none while a resize runs: a resize
+/// changes no launch cost the draft width is chosen by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LaunchEpoch {
     graphs: u64,
     resizes: u64,
     /// None without an elastic bank.
-    fills: Option<u64>,
-}
-
-impl LaunchEpoch {
-    /// Whether the bank's fill ran beside a launch timed across this epoch:
-    /// its count is even while the fill lands experts.
-    fn filling(self) -> bool {
-        self.fills.is_some_and(|fills| fills % 2 == 0)
-    }
+    cover: Option<ExpertCover>,
 }
 
 /// Whether a launch's duration was its own ([`LaunchEpoch`]), and whether
-/// the expert bank's fill ran beside it then.
+/// the expert bank's cover read beside it then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Timed {
     Untimed,
     Settled,
-    Filling,
+    Covering,
 }
 
 /// A launch's duration where it was its own ([`LaunchEpoch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaunchDuration {
     pub duration: Duration,
-    /// Whether the expert bank's fill landed experts beside the launch: it
-    /// missed and read what the fill left, not what the bank settles to, so
-    /// its duration prices the load only until the fill finishes.
-    pub filling: bool,
+    /// Whether the expert bank's cover read beside the launch: its misses
+    /// shared the drive with the cover's reads and found what the cover had
+    /// not yet landed, not what the bank settles to, so its duration prices
+    /// the load only until the cover reads nothing.
+    pub covering: bool,
 }
 
 impl LaunchDuration {
-    /// `duration`, measured with no fill beside it.
+    /// `duration`, measured with no cover read beside it.
     pub fn settled(duration: Duration) -> Self {
-        Self { duration, filling: false }
+        Self { duration, covering: false }
     }
 }
 
@@ -396,12 +390,12 @@ impl PendingOperationOutcome {
     /// What the launches took, where the duration is theirs alone
     /// ([`LaunchEpoch`]).
     pub fn launch_duration(&self) -> Option<LaunchDuration> {
-        let filling = match self.timed {
+        let covering = match self.timed {
             Timed::Untimed => return None,
             Timed::Settled => false,
-            Timed::Filling => true,
+            Timed::Covering => true,
         };
-        Some(LaunchDuration { duration: self.physical_duration, filling })
+        Some(LaunchDuration { duration: self.physical_duration, covering })
     }
 }
 
@@ -838,9 +832,71 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.family_graph_replays()
     }
 
+    /// The expert bank's cover ([`ExpertCover`]) as now, which its
+    /// residency carries too (`ExpertResidency::cover`); none without an
+    /// elastic bank.
+    fn expert_cover(&self) -> Option<ExpertCover> {
+        self.family.expert_bank().map(|bank| bank.cover())
+    }
+
+    /// Wait until the expert bank's cover reads nothing
+    /// (`ElasticBank::wait_covered`); at once without a bank.
+    pub fn wait_expert_cover(&self) -> Result<(), DomainError> {
+        self.family.expert_bank().map_or(Ok(()), |bank| bank.wait_covered())
+    }
+
     /// The expert bank's resizes so far ([`ExpertResizes`]).
     pub fn expert_resizes(&self) -> ExpertResizes {
-        ExpertResizes { begun: self.resize_held.begun, running: self.resize_held.runs() }
+        let held = &self.resize_held;
+        ExpertResizes { begun: held.begun, running: held.runs(), advances: held.advances }
+    }
+
+    /// The expert bank's targets now ([`ExpertTargets`]); none without a
+    /// bank.
+    pub fn expert_targets(&self) -> Result<Option<ExpertTargets>, DomainError> {
+        let Some(bank) = self.family.expert_bank() else {
+            return Ok(None);
+        };
+        let targets = self.derived_targets(bank)?;
+        let of = |holding: BankHolding| {
+            targets.iter().find(|target| target.holding == holding).map(|target| target.target)
+        };
+        let slots = of(BankHolding::Experts).expect("invariant violated: an expert bank without its experts' target");
+        Ok(Some(ExpertTargets { slots, host: of(BankHolding::Host) }))
+    }
+
+    /// `read` of each of `bank`'s holdings beside its derived target, at
+    /// the decode's price and the ledgers' room now
+    /// (`experts::derived::derive`): the one derivation the bank follows
+    /// (`Self::next_bank_move`) and the domain reports
+    /// ([`Self::derived_targets`]).
+    fn derive_bank<R>(
+        &self,
+        bank: &dyn ElasticBank,
+        read: impl FnOnce(&[(&crate::experts::derived::HoldingTarget<'_>, u64)]) -> R,
+    ) -> Result<R, DomainError> {
+        let holdings = bank.targets(self.decode_price()?.as_ref())?;
+        Ok(read(&crate::experts::derived::derive(self.resources.ledgers(), &holdings, self.in_process_growth())))
+    }
+
+    /// Each of `bank`'s holdings beside its derived target, as the bank
+    /// follows it ([`Self::derive_bank`]).
+    fn derived_targets(
+        &self,
+        bank: &dyn ElasticBank,
+    ) -> Result<Vec<crate::experts::derived::DerivedTarget>, DomainError> {
+        let ledgers = self.resources.ledgers();
+        self.derive_bank(bank, |derived| {
+            derived
+                .iter()
+                .map(|(target, slots)| crate::experts::derived::DerivedTarget {
+                    holding: target.holding,
+                    store: ledgers.of(target.tier).store(),
+                    held: target.at,
+                    target: *slots,
+                })
+                .collect()
+        })
     }
 
     /// The device's graph budget (`seismic::Device::graph_budget`) and what
@@ -1025,16 +1081,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         (!self.resize_held.runs()).then(|| LaunchEpoch {
             graphs: self.domain.device().graph_replays().recorded,
             resizes: self.resize_held.begun,
-            fills: self.family.expert_bank().map(|bank| bank.fill_epoch()),
+            cover: self.expert_cover(),
         })
     }
 
     /// Whether a launch submitted at `epoch` finishing now was timed alone,
-    /// and whether the bank's fill ran beside it.
+    /// and whether the bank's cover read beside it.
     fn timed(&self, epoch: Option<LaunchEpoch>) -> Timed {
         match epoch {
-            Some(epoch) if self.launch_epoch() == Some(epoch) && epoch.filling() => Timed::Filling,
-            Some(epoch) if self.launch_epoch() == Some(epoch) => Timed::Settled,
+            Some(epoch) if self.launch_epoch() == Some(epoch) => match epoch.cover {
+                Some(ExpertCover { reading: true, .. }) => Timed::Covering,
+                _ => Timed::Settled,
+            },
             _ => Timed::Untimed,
         }
     }
@@ -1048,13 +1106,56 @@ fn recording(experts: Option<&ExpertMeasures>, work: crate::operation::LaunchWor
     experts.filter(|_| work == crate::operation::LaunchWork::Generation).map(|_| crate::experts::Recording)
 }
 
-/// The expert bank's resizes: how many began so far, and whether one runs
-/// now. A reading equal across a span with none running at either end saw
-/// no resize in it.
+/// The expert bank's resizes: how many began so far, whether one runs now,
+/// and the flight boundaries that advanced a running one so far. A reading
+/// equal across a span with none running at either end saw no resize in
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertResizes {
     pub begun: u64,
     pub running: bool,
+    pub advances: u64,
+}
+
+impl ExpertResizes {
+    /// Whether one resize ran from this reading through `after` and a
+    /// flight boundary advanced it between them: none began between them
+    /// and one runs at both ends. A resize ends only by its advances, so
+    /// one advanced across a span is on its way to its end, though the
+    /// slots it changes change only as it installs or joins them.
+    pub fn advanced_to(self, after: Self) -> bool {
+        self.running && after.running && self.begun == after.begun && after.advances > self.advances
+    }
+}
+
+/// The slots the expert bank's experts and its host tier (none without
+/// one) follow now: each holding's derived target, at the decode's price
+/// and its store's room (`experts::derived::derive`). The bank resizes
+/// toward them, so a bank whose targets move may turn back on a resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertTargets {
+    pub slots: u64,
+    pub host: Option<u64>,
+}
+
+/// The expert bank's cover (a host tier with a record for every expert,
+/// read in behind every step's reads): how many times its reads began so
+/// far, counting the bank's open, and whether they run now. A reading
+/// equal across a span with none running at either end saw no cover read
+/// in it. A bank with no tier that covers its experts reads none once its
+/// first turn publishes so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExpertCover {
+    pub begun: u64,
+    pub reading: bool,
+}
+
+impl ExpertCover {
+    /// The cover after `changes` starts and ends of its reads, reading as
+    /// the bank opens.
+    pub(crate) fn after(changes: u64) -> Self {
+        Self { begun: changes / 2 + 1, reading: changes % 2 == 0 }
+    }
 }
 
 /// What reads memory for the domain: the device's stores and ledgers, its
@@ -1166,6 +1267,9 @@ struct ResizeHeld {
     last: std::collections::HashMap<BankHolding, f64>,
     /// The resizes begun.
     begun: u64,
+    /// The flight boundaries' advances of the bank while a resize ran
+    /// ([`ExpertResizes::advances`]).
+    advances: u64,
 }
 
 /// What one resize held the submitting thread, by source: the call that
@@ -1236,6 +1340,9 @@ impl ResizeHeld {
     /// boundary's work is every running one's.
     fn hold(&mut self, started: Instant, source: HeldSource) {
         let held = started.elapsed().as_secs_f64();
+        if source == HeldSource::Advance && self.runs() {
+            self.advances += 1;
+        }
         for running in self.running.iter_mut().flatten() {
             match source {
                 HeldSource::Advance => running.advances.add(held),
@@ -1434,18 +1541,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let stores = std::iter::once(device).chain((ledgers.host().store() != device.store()).then(|| ledgers.host()));
         let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
         let targets = match (traced, self.family.expert_bank()) {
-            (true, Some(bank)) => {
-                let holdings = bank.targets(self.decode_price()?.as_ref())?;
-                crate::experts::derived::derive(ledgers, &holdings, self.in_process_growth())
-                    .into_iter()
-                    .map(|(target, slots)| crate::experts::derived::DerivedTarget {
-                        holding: target.holding,
-                        store: ledgers.of(target.tier).store(),
-                        held: target.at,
-                        target: slots,
-                    })
-                    .collect()
-            }
+            (true, Some(bank)) => self.derived_targets(bank)?,
             _ => Vec::new(),
         };
         let mut unload = false;

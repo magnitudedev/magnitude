@@ -248,13 +248,12 @@ pub(super) fn qualify_bank(
         require_bytes(&fixture.scratch, &fixture.converted, entry, label)?;
     }
 
-    // Expert 0 into record 1: where the device copies into the bank, the
-    // prompt group's seed and its commit; where the host lands, its
-    // landing's bytes. Then, whoever places, a shrink's move of record 1
-    // into record 0 over bytes no entry wrote, and the host maps it, held
-    // from the step on.
-    match placement {
-        Some(crate::native::DevicePlacement { seed, seed_commit, list_grid }) => {
+    // Expert 0 into record 1: the prompt group's seed and its commit,
+    // whoever places. Then a shrink's move of record 1 into record 0 over
+    // bytes no entry wrote, and the host maps it, held from the step on.
+    {
+        let crate::native::DevicePlacement { seed, seed_commit, list_grid } = placement;
+        {
             // A list's launch grid for its one entry: one row of a copy
             // within device memory's blocks, which the host writes and the
             // kernel keeps; and the list staged beside it.
@@ -296,15 +295,6 @@ pub(super) fn qualify_bank(
                 .call(routed_seed_commit::Args { list: &seeds, step: &step, scratch: &scratch_table, commits: &mut commits })
                 .map_err(|error| qualification_dynamic(entry, label, error))?;
             require_words(&commits, &[(0, 0), (1, SEQUENCE)], entry, label)?;
-        }
-        None => {
-            let failed = |error: &dyn fmt::Display| qualification_dynamic("host placement", label, error);
-            for fixture in records.as_mut() {
-                fixture
-                    .records
-                    .write_from_host(&[&fixture.marker[..], &fixture.converted[..]].concat())
-                    .map_err(|error| failed(&error))?;
-            }
         }
     }
     // A shrink's move of record 1 into record 0, over bytes no entry wrote.
@@ -931,7 +921,7 @@ mod tests {
                 )
                 .unwrap()
             }),
-            placement: (bank.placer == crate::planning::Placer::Tier).then(|| DevicePlacement {
+            placement: DevicePlacement {
                 seed: bank.record.map(|_, tensor| {
                     routed_copy::native_for_device_with(
                         device,
@@ -950,7 +940,7 @@ mod tests {
                 .unwrap(),
                 list_grid: routed_list_grid::native_for_device(device, &specialization::<routed_list_grid::Entry>(device, &[]))
                     .unwrap(),
-            }),
+            },
             moves: BankMoves {
                 records: bank.record.map(|_, tensor| {
                     routed_move::native_for_device_with(
@@ -979,9 +969,10 @@ mod tests {
         fused_bank_qualifies(bank(true, Down::Q8));
     }
 
-    /// A bank the host places into (unified memory's one store) qualifies
-    /// with no device placement: its tier wait sources the bank record its
-    /// answer names, and the host's landing and map write place expert 0.
+    /// A bank the host places into (unified memory's one store) qualifies:
+    /// its tier wait sources the bank record its answer names, and the
+    /// prompt group's seed copy and commit place expert 0, as beside a
+    /// tier.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "the bank fixture here is Metal's")]
     fn a_host_placed_bank_qualifies() {

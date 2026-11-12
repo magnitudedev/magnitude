@@ -4,15 +4,10 @@ use super::*;
 /// lands into the tier ahead of its request: its route finds it there and
 /// requests nothing, the tier serving it; a hint of an expert the tier
 /// holds reads nothing. The step records each layer's file and tier
-/// misses. The tier's fill lands its records
-/// beyond the reserve first, every layer's lowest experts, which no step
-/// below names.
+/// misses.
 #[test]
 fn a_hinted_expert_lands_into_the_tier_ahead_of_its_request() {
     let harness = layered("hinted", EXPERTS, 12, 3, 4 + 4);
-    for (layer, experts) in [(0, &[0, 1, 2][..]), (1, &[0, 1, 2]), (2, &[0, 1])] {
-        harness.tiering(layer, experts);
-    }
     harness.demand_step(4);
     harness.tier_ready();
     let step = harness.step();
@@ -106,11 +101,6 @@ fn a_second_leads_hint_answers_the_request_two_layers_on() {
 fn a_passed_hint_reads_nothing() {
     let _alone = alone();
     let harness = layered("hint-passed", EXPERTS, 12, 2, 4 + 4);
-    // The tier's fill lands its records beyond the reserve first, every
-    // layer's lowest experts: its reads must not wait behind the reads
-    // queued ahead below, holding the staging records the hint needs.
-    harness.tiering(0, &[0, 1, 2, 3]);
-    harness.tiering(1, &[0, 1, 2]);
     harness.demand_step(4);
     harness.tier_ready();
     let ahead = Ahead::queue("hint-passed-ahead");
@@ -132,16 +122,10 @@ fn a_passed_hint_reads_nothing() {
     assert_eq!(layer.reading, 0, "no request found the passed hint reading");
 }
 
-/// Let the tier's fill land all it will, and run a step past it. The
-/// experts of layer 1 still absent from the bank and the tier, ascending.
+/// Let every read land, and run a step past it. The experts of layer 1
+/// still absent from the bank and the tier, ascending.
 fn settled(harness: &Harness) -> Vec<usize> {
-    let held = || (0..harness.layers.len()).map(|layer| (0..EXPERTS).filter(|&expert| harness.in_tier(layer, expert).is_some()).count()).sum::<usize>();
-    let mut last = usize::MAX;
-    while held() != last {
-        last = held();
-        harness.staging_free();
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    harness.staging_free();
     let step = harness.step();
     for layer in 0..harness.layers.len() {
         harness.route_at(&step, layer, &[]);
@@ -177,9 +161,6 @@ fn a_hint_withdrawn_unread_lands_nothing() {
 fn a_hint_of_a_layer_routed_without_a_request_reads_nothing() {
     let _alone = alone();
     let harness = layered("hint-routed", EXPERTS, 12, 4, 4 + 4);
-    for layer in 0..4 {
-        harness.tiering(layer, &[0, 1]);
-    }
     harness.demand_step(4);
     harness.tier_ready();
     let ahead = Ahead::queue("hint-routed-ahead");
@@ -208,9 +189,6 @@ fn a_hint_of_a_layer_routed_without_a_request_reads_nothing() {
 fn hints_are_read_in_the_rings_order() {
     let harness = layered("hint-order", EXPERTS, 12, 2, WORDS.choices as u32 + 1);
     harness.demand_step(4);
-    // The tier's fill has landed its records beyond the reserve.
-    let tiered = || (0..2).map(|layer| (0..EXPERTS).filter(|&expert| harness.in_tier(layer, expert).is_some()).count()).sum::<usize>();
-    eventually("the tier never filled its records beyond the reserve", || tiered() == WORDS.choices as usize + 1);
     harness.staging_free();
     harness.tier_ready();
     let step = harness.step();

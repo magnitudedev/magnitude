@@ -1,4 +1,4 @@
-use super::{BankGroup, BankLayers, ExpertBankPlan, HostTier, Placer, RecordForm, RecordTensor, RecordTensors, RoutedTensor};
+use super::{BankGroup, BankLayers, ExpertBankPlan, HostTier, RecordForm, RecordTensor, RecordTensors, RoutedTensor};
 use super::records::{decode_choices, record_bytes, reserved_record};
 use seismic::Element;
 
@@ -267,17 +267,14 @@ impl ExpertBankPlan {
     }
 
     /// The first record of group `group` a prompt group's seeds take, and
-    /// so the first its seed copy and commit bind: beside a host tier the
-    /// scratch lies in the lender's bottom lent records ([`Self::scratch`]),
-    /// which the group holds claimed while it seeds, so the lender's seeds
-    /// lie past them and its seed copy writes a view of its records
-    /// disjoint from the scratch it reads; every other group's, and every
-    /// group's on the one store (where nothing seeds), from its first.
+    /// so the first its seed copy and commit bind: the scratch (past the
+    /// conveyor on the one store) lies in the lender's bottom lent records
+    /// ([`Self::scratch`]), which the group holds claimed while it seeds, so
+    /// the lender's seeds lie past them and its seed copy writes a view of
+    /// its records disjoint from the scratch it reads; every other group's
+    /// from its first.
     pub fn seeded_from(&self, group: usize) -> u64 {
-        match self.placer() {
-            Placer::Tier => Some(self.scratch().lender).filter(|lender| lender.group == group).map_or(0, |lender| lender.records),
-            Placer::Bank => 0,
-        }
+        Some(self.scratch().lender).filter(|lender| lender.group == group).map_or(0, |lender| lender.records)
     }
 
     /// [`BankStructure::reserved_records`].

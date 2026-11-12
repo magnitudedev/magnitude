@@ -27,7 +27,7 @@
 mod replay;
 mod stack;
 
-use super::host_records::{Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution, Taking};
+use super::host_records::{Claim, Demand, HostRecords, InboundTable, Kept, Located, Resolution, Taking};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
 use super::reuse::{Rank, Ranking, Reuse, Unlogged};
@@ -158,6 +158,83 @@ pub enum Ending {
     Tainted,
 }
 
+/// The retirement of the seeds a pass settles, whichever store holds them
+/// ([`Directory::retire`]): each seed placed before `progress` ends with
+/// its step, read once a step (`ending`), and is committed where its step
+/// ended whole with the device's commit holding the step's low word.
+pub(super) struct Settling<E: FnMut(Point) -> Ending> {
+    progress: Point,
+    endings: HashMap<u64, Ending>,
+    ending: E,
+}
+
+impl<E: FnMut(Point) -> Ending> Settling<E> {
+    pub(super) fn new(progress: Point, ending: E) -> Self {
+        Self { progress, endings: HashMap::new(), ending }
+    }
+
+    /// Retire the seeds of `pending` that have ended, in order: those
+    /// still running stay in it; each retired with whether it committed.
+    /// `point` is a seed's placing point, `commit` the device's commit of
+    /// its record.
+    pub(super) fn retire<T>(&mut self, pending: &mut Vec<T>, point: impl Fn(&T) -> Point, commit: impl Fn(&T) -> i32) -> Vec<(T, bool)> {
+        let mut retired = Vec::new();
+        for seed in std::mem::take(pending) {
+            match self.outcome(point(&seed), || commit(&seed)) {
+                None => pending.push(seed),
+                Some(committed) => retired.push((seed, committed)),
+            }
+        }
+        retired
+    }
+
+    /// Whether the seed placed at `point` has not ended (None), else
+    /// whether it committed: `commit` is the device's commit of its record.
+    fn outcome(&mut self, point: Point, commit: impl FnOnce() -> i32) -> Option<bool> {
+        let ending = (point < self.progress).then(|| *self.endings.entry(point.sequence).or_insert_with(|| (self.ending)(point)));
+        match ending? {
+            Ending::Running => None,
+            ending => Some(ending == Ending::Ended && commit() == crate::experts::watcher::low_word(point.sequence)),
+        }
+    }
+}
+
+/// The one seed policy ([`Directory::seed`]), over either store's records:
+/// `seeds`, the routed experts `layer` lacks, each at its place in the
+/// store's taking order (`owner`: the layer of the expert a place ranks),
+/// take the store's records (`records`: those a seed may take, in taking
+/// order, least first, each at its place, `None` for a free one; at least
+/// the first as many as `seeds` of the layer's own, and as many of the rest
+/// up to `room`). A record of the layer's own replaces one of its experts;
+/// a free one or another layer's grows the layer, which it takes only
+/// while the layer holds fewer experts than its share (`room`). The most
+/// ranked seed goes against the least ranked record, while it outranks it.
+/// Each seed taken, with its record and the record's place.
+fn seeding<P: Ord + Copy, R: Ord + Copy>(
+    layer: usize,
+    mut room: usize,
+    mut seeds: Vec<P>,
+    records: Vec<(Option<P>, R)>,
+    owner: impl Fn(P) -> usize,
+) -> Vec<(P, (Option<P>, R))> {
+    seeds.sort_unstable_by(|a, b| b.cmp(a));
+    let wanted = seeds.len();
+    let mut records = records
+        .into_iter()
+        .filter(|&(held, _)| match held {
+            Some(held) if owner(held) == layer => true,
+            _ if room > 0 => {
+                room -= 1;
+                true
+            }
+            _ => false,
+        })
+        .take(wanted)
+        .collect::<Vec<_>>();
+    records.sort_unstable();
+    seeds.into_iter().zip(records).take_while(|&(seed, (held, _))| held.is_none_or(|held| held < seed)).collect()
+}
+
 /// What a placement's experts took: per expert its record; and the experts
 /// evicted from those records, (layer, expert, the step that last read
 /// it), whose map entries the host unmaps before the device copies into
@@ -219,14 +296,10 @@ pub(super) struct Directory {
     host: Vec<HostRecords>,
     /// Their read path's mirror of where every expert is.
     inbound: Arc<InboundTable>,
-    /// Whether a growth of the records the host lands into runs, from its
-    /// decision until its last slot joined ([`Self::host_growth`]): the
-    /// tier's planned records exceed those it holds and fills.
-    host_growing: bool,
     /// The running prompt group's reads the ranking has not logged yet:
     /// every expert its steps routed, each at its last step with the
     /// choices routed to it so far ([`Self::read_pending`]), which every
-    /// taking ranks beside, so the store's fill and seeds follow the
+    /// taking ranks beside, so the store's landings and seeds follow the
     /// prompt's use of each expert as its passes resolve.
     prompt_reads: HashMap<Staged, Unlogged>,
     /// Who places into the bank: where the host does (the one store), a
@@ -266,6 +339,10 @@ pub(super) struct Directory {
     /// step, none before it: what a stay in its bank lasts
     /// ([`Self::stay`]). The one count of promotions asked.
     asked: Vec<Option<Asked>>,
+    /// Where the host places (the one store), each prompt group's seed not
+    /// yet retired: its group, the host record it took, its expert and the
+    /// point of its seeding step ([`Self::seed`], [`Self::retire`]).
+    seeding: Vec<(usize, u32, Staged, Point)>,
 }
 
 /// A group's promotions asked: the step after the first was asked at, and
@@ -459,7 +536,6 @@ impl Directory {
                     .collect()
             },
             inbound,
-            host_growing: false,
             prompt_reads: HashMap::new(),
             ranking: Reuse::ranking(experts, layers, layers.iter().map(|&group| share(kept[group], layers, group)).collect()),
             wanted: vec![BTreeSet::new(); layers.len()],
@@ -469,6 +545,7 @@ impl Directory {
             reserve: vec![0; records.len()],
             copy_hits: vec![Some(0.); layers.len()],
             asked: vec![None; records.len()],
+            seeding: Vec::new(),
         }
     }
 
@@ -587,64 +664,12 @@ impl Directory {
     }
 
     /// Claim a landing of `layer`'s `expert` in its group's host tier,
-    /// leaving `keep` of the reserve's records (the reserve, which a fill
-    /// leaves) or the experts still lacked where fewer, the record taken as
-    /// `taking` says ([`HostRecords::claim`]): every landing of an expert,
-    /// whoever lands it, claims it here. Short without a tier.
+    /// leaving `keep` of the reserve's records or the experts still lacked
+    /// where fewer, the record taken as `taking` says
+    /// ([`HostRecords::claim`]): every landing of an expert, whoever lands
+    /// it, claims it here. Short without a tier.
     pub fn claim_landing(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking) -> Claim {
         self.tier(layer).claim((layer, expert), keep, taking)
-    }
-
-    /// Seed the one store with `layer`'s experts a prompt group read into
-    /// its conveyor, `read` (each expert with the step that reads it): the
-    /// most ranked first, each it lacks lands into a ready record
-    /// ([`Self::claim_landing`], leaving no reserve) in place of the least
-    /// ranked expert the layer keeps, while the seed outranks it. That
-    /// record is displaced: the reserve unmaps it before any other
-    /// ([`HostRecords::displace`]), graced through the steps that may still
-    /// resolve it, so a layer's seeds take only its own records and no
-    /// layer's share moves to another. The prompt's read lands where the
-    /// store keeps it, and neither the fill nor a decode miss reads it
-    /// again. Each seed with its landing's grant.
-    pub fn seed_store(&mut self, layer: usize, read: &[(usize, Step)]) -> Vec<(usize, Grant)> {
-        let group = self.bank.group(layer);
-        let (mut seeds, displaceable) = {
-            let reuse = self.reuse_now();
-            let rank = store_rank(&reuse, &self.prompt_reads);
-            let tier = &self.host[group];
-            let seeds = read
-                .iter()
-                .filter(|&&(expert, _)| matches!(tier.located((layer, expert)), Located::Lacked))
-                .map(|&(expert, step)| {
-                    let kept = match self.bank.held(layer, expert) {
-                        Some(_) => Kept::Banked,
-                        None => Kept::Alone,
-                    };
-                    (kept, rank((layer, expert), Some(step)), (layer, expert))
-                })
-                .collect::<Vec<_>>();
-            (seeds, tier.displaceable(layer, rank))
-        };
-        seeds.sort_unstable_by(|a, b| b.cmp(a));
-        let mut displaceable = displaceable.into_iter().peekable();
-        let mut seeded = Vec::new();
-        for place in seeds {
-            let Some(&(least, record)) = displaceable.peek().filter(|&&(least, _)| place > least) else {
-                break;
-            };
-            let (_, _, (_, expert)) = place;
-            match self.claim_landing(layer, expert, 0, Taking::Out) {
-                Claim::Taken(grant) => {
-                    displaceable.next();
-                    self.host[group].displace(record, least.2);
-                    seeded.push((expert, grant));
-                }
-                // A read posted meanwhile lands it.
-                Claim::Kept(_) | Claim::Landing => {}
-                Claim::Short => break,
-            }
-        }
-        seeded
     }
 
     /// Where `layer`'s `expert` is in its group's host tier: lacked
@@ -659,46 +684,25 @@ impl Directory {
         self.host(self.bank.group(layer)).lands((layer, expert))
     }
 
-    /// The experts the tier's fill lands next, at most `count`: of each
-    /// group's host tier that takes a record leaving `keep`
-    /// ([`HostRecords::takes`]), the experts it lacks that `skip` does not
-    /// pass over (another read carries them), in the order each tier lands
-    /// them ([`HostRecords::lacking`], by this one order) across the groups:
-    /// those each layer's ranked share holds first (`Reuse::in_top`), then
-    /// by rank, most first: reuse, then a running prompt group's use of
-    /// each expert it has routed so far ([`Self::read_pending`]), so once a
-    /// prompt's pass has resolved a layer its experts fill by that use.
-    /// Only experts nothing has read or routed tie on every key, with no
-    /// fact to order them: those go by expert, then by layer, every
-    /// layer's alike, whatever batches the fill lands in. So a tier with a
-    /// record for every expert is filled to every expert, and a smaller
-    /// one's records beyond the reserve with each layer's ranked share.
-    pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool) -> Vec<Staged> {
-        let reuse = self.reuse_now();
-        let rank = store_rank(&reuse, &self.prompt_reads);
-        let order = |rank: Rank, (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(rank), expert, layer);
-        let mut order = self
-            .host
-            .iter()
-            .filter(|tier| tier.takes(keep))
-            .flat_map(|tier| tier.lacking(rank, count, &skip, order))
-            .collect::<Vec<_>>();
-        order.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        order.into_iter().take(count).map(|(_, staged)| staged).collect()
+    /// The experts the tier's cover reads next, at most `count`: of each
+    /// group whose host tier covers its experts ([`HostRecords::covers`]),
+    /// those it lacks that `skip` does not pass over (another read carries
+    /// them), by group, layer, then expert: the order the steps need them.
+    /// None where no tier covers its experts, or where the host places.
+    pub fn cover_order(&self, count: usize, skip: impl Fn(Staged) -> bool) -> Vec<Staged> {
+        // Where the host places (the one store) its records are the bank's:
+        // the store is the bank, and nothing is read ahead of use.
+        if self.placer != crate::planning::Placer::Tier {
+            return Vec::new();
+        }
+        self.host.iter().filter(|tier| tier.covers()).flat_map(|tier| tier.lacking_unskipped(&skip)).take(count).collect()
     }
 
-    /// Whether the fill has records still to fill, beyond the `keep` ready
-    /// each tier keeps: a growth of the tier runs, whose slots join it as
-    /// they are backed, or a tier has a record ready beyond `keep` it lacks
-    /// an expert for, one the fill takes (`HostRecords::takes`).
-    pub fn fill_pending(&self, keep: usize) -> bool {
-        self.host_growing || self.host.iter().any(|tier| tier.takes(keep))
-    }
-
-    /// A growth of the records the host lands into runs from now, or ended
-    /// (`Join::Growing`, `Join::Grown`).
-    pub fn host_growth(&mut self, growing: bool) {
-        self.host_growing = growing;
+    /// Whether a group's host tier that covers its experts lacks one, which
+    /// the cover reads ([`Self::cover_order`]); never where the host
+    /// places.
+    pub fn cover_pending(&self) -> bool {
+        self.placer == crate::planning::Placer::Tier && self.host.iter().any(|tier| tier.covers() && tier.lacked() > 0)
     }
 
     /// Whether every group's host tier keeps every expert of its layers,
@@ -798,10 +802,10 @@ impl Directory {
 
     /// `layer`'s `expert` landed whole into tier record `record`, read at
     /// step `read`, and its landing mapped it ([`HostRecords::landed`]),
-    /// ranked by its reuse beside that read (none where no step read it: the
-    /// tier's fill's). A copy of an expert the bank holds (a fill beside a
-    /// bank imported whole, or a landing a promotion or seed committed
-    /// during) is banked: the tier holds alone only what the bank lacks.
+    /// ranked by its reuse beside that read (none where no step read it). A
+    /// copy of an expert the bank holds (a landing a promotion or seed
+    /// committed during) is banked: the tier holds alone only what the bank
+    /// lacks.
     pub fn landed(&mut self, layer: usize, HostRecord(record): HostRecord, expert: usize, read: Option<Step>) {
         let kept = match self.bank.held(layer, expert) {
             Some(_) => Kept::Banked,
@@ -819,10 +823,9 @@ impl Directory {
     }
 
     /// Whether any group's host tier falls short of `reserve`
-    /// ([`HostRecords::short_of`]) or owes records seeds displaced
-    /// ([`HostRecords::owed`]): whether a refill may unmap anything.
+    /// ([`HostRecords::short_of`]): whether a refill may unmap anything.
     pub fn refill_short(&self, reserve: usize) -> bool {
-        self.host.iter().any(|records| records.short_of(reserve, 0) || !records.owed().is_empty())
+        self.host.iter().any(|records| records.short_of(reserve, 0))
     }
 
     /// Each group's records its reserve of `reserve` tier records unmaps
@@ -1347,28 +1350,36 @@ impl Directory {
         self.prompt_reads.clear();
     }
 
-    /// Seed `layer` at `point` with what a prompt group routed there, beside
-    /// a host tier (where the device places): `routed`, each expert with the
-    /// step that last routed it. Each routed expert the layer lacks whose
-    /// scratch slot the group filled (`filled`), the most reused first
-    /// ([`Ranked`]: reuse beside that step), takes the least reused record
-    /// whose expert lies outside its own layer's share (`Reuse::in_top`, as
-    /// a release's) while that ranks below it (beside the later of its
-    /// ranking's last read and that step, where the group routed it), a
-    /// free record below every one. A record of the layer's own replaces
-    /// one of its experts; a free one or another layer's grows the layer,
-    /// which it takes only while the layer holds fewer experts than its
-    /// share ([`Self::shares`]). No layer's share is taken, and none grows
-    /// past it: a prompt group leaves every layer the experts the ranking
-    /// holds for it, and decode begins at each layer's share wherever the
-    /// layers fall in the pass, not with the first layers holding the
-    /// group's records. The layer's `pinned` experts (those its merge set's
-    /// pass reads in place after the seeding) are never taken. The seeds,
-    /// placed as fills its seed copy and commit commit, with their records,
-    /// and the experts evicted, (layer, expert).
-    pub fn seed(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+    /// Seed `layer` at `point` with what a prompt group routed there:
+    /// `routed`, each expert with the step that last routed it. Every
+    /// placer seeds so, by the device's seed copy out of the expert's
+    /// scratch slot, which its rounds converted into whether it was read
+    /// into a conveyor record or a slot, and by the one seed policy
+    /// ([`seeding`]): each routed expert the layer lacks whose scratch slot
+    /// the group filled (`filled`), the most ranked first (beside the step
+    /// that last routed it), takes the least ranked record its store may
+    /// give it while that ranks below it, a free record below every one; a
+    /// record of the layer's own replaces one of its experts, a free one or
+    /// another layer's grows the layer only while it holds fewer experts
+    /// than its share. No layer's share is taken, and none grows past it: a
+    /// prompt group leaves every layer the experts the ranking holds for
+    /// it, and decode begins at each layer's share wherever the layers fall
+    /// in the pass, not with the first layers holding the group's records.
+    /// The layer's `pinned` experts (those its merge set's pass reads in
+    /// place after the seeding) are never taken. Where the host places (the
+    /// one store), into its host records past those it keeps ready for its
+    /// `reserve` ([`Self::seed_store`]); else into the bank's records, by
+    /// [`Ranked`] (reuse beside the later of its ranking's last read and
+    /// the routing step), taking no record whose expert lies inside its own
+    /// layer's share (`Reuse::in_top`, as a release's), placed as fills its
+    /// seed copy and commit commit. The seeds with their records, and the
+    /// experts evicted, (layer, expert).
+    pub fn seed(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool, reserve: usize) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+        if self.placer == crate::planning::Placer::Bank {
+            return self.seed_store(point, layer, routed, pinned, filled, reserve);
+        }
         let group = self.bank.group(layer);
-        let (absent, mut records) = {
+        let taken = {
             let reuse = self.reuse_now();
             let mut reads = self.record_reads(&reuse, group);
             for &(expert, recency) in routed {
@@ -1376,39 +1387,66 @@ impl Directory {
                     reads[record] = reads[record].max(recency);
                 }
             }
-            let mut absent = routed
+            let absent = routed
                 .iter()
                 .filter(|&&(expert, _)| self.bank.held(layer, expert).is_none() && !self.bank.placing((layer, expert)) && filled(expert))
                 .map(|&(expert, recency)| self.ranked(&reuse, layer, expert, Some(recency)))
                 .collect::<Vec<_>>();
-            absent.sort_unstable_by(|a, b| b.cmp(a));
             let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
             let contents = self.bank.records(group);
             let shared = contents.iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
             let own = |record: usize| matches!(contents[record], Record::Held((owner, _)) if owner == layer);
             let kept = |record: usize| pinned.contains(&record) || shared[record];
             let read = |record: usize| reads[record];
-            // The least of the layer's own records, and of those that grow
-            // it, as many as its share has room for.
             let room = self.shares()[layer].saturating_sub(self.held_count(layer));
-            let mut records = self.least_of(&reuse, group, absent.len(), read, |record| kept(record) || !own(record));
-            records.extend(self.least_of(&reuse, group, absent.len().min(room), read, |record| kept(record) || own(record)));
-            records.sort_unstable();
-            records.truncate(absent.len());
-            (absent, records)
+            let wanted = absent.len();
+            let mut order = self.least_of(&reuse, group, wanted, read, |record| kept(record) || !own(record));
+            order.extend(self.least_of(&reuse, group, wanted.min(room), read, |record| kept(record) || own(record)));
+            order.sort_unstable();
+            seeding(layer, room, absent, order, |held| held.layer)
         };
-        // The most reused seed against the least reused record, while it
-        // outranks it.
-        let taken = absent
-            .iter()
-            .zip(&records)
-            .take_while(|(seed, (held, _))| held.is_none_or(|held| held < **seed))
-            .count();
-        records.truncate(taken);
-        let seeded = absent[..taken].iter().map(|seed| seed.expert).collect::<Vec<_>>();
+        let (seeded, records): (Vec<_>, Vec<_>) = taken.into_iter().map(|(seed, record)| (seed.expert, record)).unzip();
         let placed = self.place_into(point, layer, &seeded, records);
         let evicted = placed.evicted.iter().map(|&(layer, expert, _)| (layer, expert)).collect();
         (seeded.into_iter().zip(placed.records).collect(), evicted)
+    }
+
+    /// [`Self::seed`] where the host places, into the one store: the
+    /// store's rank (beside each seed's routing step) places seeds and
+    /// records, its taking order ([`HostRecords::seed_order`]) the records
+    /// a seed may take, which leaves every other layer its share. However
+    /// full the store, a seed that outranks a kept expert evicts it:
+    /// seeding never waits for a ready record. The ready records the host
+    /// keeps for its `reserve` are never taken. Each seed's record is the
+    /// device's seed copy's to write ([`HostRecords::seed`]) until it
+    /// retires with its step ([`Self::retire`]); its expert stays lacked
+    /// meanwhile, so no step waits on it. The seeds with their records, and
+    /// the experts evicted, (layer, expert).
+    fn seed_store(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool, reserve: usize) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
+        let group = self.bank.group(layer);
+        let taken = {
+            let reuse = self.reuse_now();
+            let rank = store_rank(&reuse, &self.prompt_reads);
+            let host = &self.host[group];
+            let absent = routed
+                .iter()
+                .filter(|&&(expert, _)| host.located((layer, expert)) == Located::Lacked && filled(expert))
+                .map(|&(expert, step)| (Kept::Alone, rank((layer, expert), Some(step)), (layer, expert)))
+                .collect::<Vec<_>>();
+            let shares = reuse.shares();
+            let room = shares[layer].saturating_sub(host.holding(layer));
+            let pinned = |(of, expert): Staged| of == layer && pinned.contains(&expert);
+            let order = host.seed_order(layer, reserve, rank, shares, pinned);
+            seeding(layer, room, absent, order, |(.., (of, _))| of)
+        };
+        let mut seeds = Vec::with_capacity(taken.len());
+        let mut evicted = Vec::new();
+        for ((.., staged), (_, record)) in taken {
+            evicted.extend(self.host[group].seed(staged, record, point.group));
+            self.seeding.push((group, record, staged, point));
+            seeds.push((staged.1, BankRecord(record)));
+        }
+        (seeds, evicted)
     }
 
     /// A prompt group in flight routes `layer`'s `expert` at step `read`,
@@ -1436,8 +1474,12 @@ impl Directory {
     pub fn retire(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending, steps: &Steps) {
         // Only the records' change and its mapping under the steps' lock;
         // what the tier and the ranking learn of it after.
-        for (group, (layer, expert), committed) in self.bank.retire_fills(progress, commit, ending, steps) {
-            if committed {
+        let retired = match self.placer {
+            crate::planning::Placer::Bank => self.retire_seeds(progress, commit, ending, steps),
+            crate::planning::Placer::Tier => self.bank.retire_fills(progress, commit, ending, steps),
+        };
+        for (group, (layer, expert), committed) in retired {
+            if committed && self.placer == crate::planning::Placer::Tier {
                 self.host[group].banked((layer, expert));
             }
             self.resettle(layer, expert);
@@ -1445,10 +1487,28 @@ impl Directory {
         self.retire_graces(progress, steps);
     }
 
+    /// [`Self::retire`]'s seeds where the host places, into the one store
+    /// ([`Self::seed_store`]): each retired from its host record
+    /// ([`HostRecords::seeded`]), ranked beside its step. Each retired,
+    /// (group, expert, whether the store keeps it).
+    fn retire_seeds(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending, steps: &Steps) -> Vec<(usize, Staged, bool)> {
+        let mut retiring = Settling::new(progress, ending).retire(&mut self.seeding, |&(.., point)| point, |&(group, record, ..)| commit(group, BankRecord(record)));
+        if !retiring.is_empty() {
+            let host = &mut self.host;
+            steps.unbegun(|at| {
+                for ((group, record, staged, point), committed) in &mut retiring {
+                    *committed = host[*group].seeded(*record, *staged, point.sequence, *committed, at);
+                }
+            });
+        }
+        retiring.into_iter().map(|((group, _, staged, _), kept)| (group, staged, kept)).collect()
+    }
+
     /// The first group a pending seed was placed in: the taints of its steps
     /// and every later one are still to be read ([`Self::retire`]).
     pub fn pending_from(&self) -> Option<Step> {
-        self.bank.pending_from()
+        let store = self.seeding.iter().map(|&(.., point)| point.group).min();
+        store.into_iter().chain(self.bank.pending_from()).min()
     }
 
     /// The device is parked at `park`, a decode request (its tier wait),
@@ -1667,11 +1727,15 @@ impl Directory {
         }
     }
 
-    /// The first record of group `group` a seed may take
-    /// ([`BankRecords::seeded_from`]): what a seed list names its records
-    /// from.
+    /// The first record of group `group` a seed may take: what a seed list
+    /// names its records from, past the lent ones (the conveyor and the
+    /// scratch, [`HostRecords::lent`]) where the host places, else
+    /// [`BankRecords::seeded_from`].
     pub fn seeded_from(&self, group: usize) -> usize {
-        self.bank.seeded_from(group)
+        match self.placer {
+            crate::planning::Placer::Bank => self.host[group].lent() as usize,
+            crate::planning::Placer::Tier => self.bank.seeded_from(group),
+        }
     }
 
     /// Whether a shrink is planned and not yet committed

@@ -43,7 +43,8 @@
 //!   map writes, the host tier, staging and landings, the conveyor, the
 //!   promotions and the policy words, behind one lock no holder waits
 //!   under. Its own thread retires, settles landings, promotes, clears a
-//!   prompt group's conveyor, fills the tier, joins growths, serves resizes
+//!   prompt group's conveyor, hastens the reads ahead a prompt group's step
+//!   waits for, joins growths, serves resizes
 //!   and writes the policy words (those a run's encoding reads in a gap,
 //!   the line words wherever they changed), on the load's events alone.
 //! - **Request service** (`requests`): the one owner of noticing the
@@ -192,11 +193,10 @@ pub(super) struct Shared {
     /// The lender's lent bank records' reservation, beside a host tier
     /// (`lent`).
     lent: lent::LentRecords,
-    /// The fill's changes as residency published them
-    /// (`Residency::read_ahead`): each start and each finish counts one, from
-    /// filling as the bank opens, so the fill has finished when the count
-    /// is odd ([`Self::fill_epoch`]).
-    fills: std::sync::atomic::AtomicU64,
+    /// The cover's changes as residency published them
+    /// (`Residency::hasten`): each start and each end of its reads counts
+    /// one, from reading as the bank opens ([`Self::cover`]).
+    covers: std::sync::atomic::AtomicU64,
     /// What a routed pass over each streamed layer's experts costs, once
     /// priced (`Self::price`): what a scratch-served group's merge sets are
     /// chosen by (`Shared::begin`).
@@ -348,56 +348,43 @@ impl Shared {
         *self.copy.lock().expect("a copy's price") = Some(costs.clone());
     }
 
-    /// The fill of the store misses land into (the host tier where the
-    /// device places, the one store where the host does) as residency last
-    /// published it: filling from the bank's open until its first turn
-    /// finds it filled (`Prefetch::filling`).
-    pub fn tier_fill(&self) -> crate::TierFill {
-        match self.fill_epoch() % 2 {
-            1 => crate::TierFill::Filled,
-            _ => crate::TierFill::Filling,
-        }
+    /// The covering tier's reads ([`crate::ExpertCover`]) as residency last
+    /// published them: reading from the bank's open until its first turn
+    /// finds none left to read (`Prefetch::covering`).
+    pub fn cover(&self) -> crate::ExpertCover {
+        crate::ExpertCover::after(self.covers.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// How many times the fill started or finished so far: odd once it
-    /// finished, even while it lands experts. Two equal readings with the
-    /// fill finished at both saw no fill between them.
-    pub fn fill_epoch(&self) -> u64 {
-        self.fills.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Publish the host tier's fill, `fill`; a change is an event, which
-    /// wakes [`Self::wait_filled`]. Whether it changed.
-    pub(super) fn publish_fill(&self, fill: crate::TierFill) -> bool {
-        let filled = u64::from(fill == crate::TierFill::Filled);
+    /// Publish whether the cover still reads, `reading`; a change is an
+    /// event, which wakes [`Self::wait_covered`].
+    pub(super) fn publish_cover(&self, reading: bool) {
+        let read = u64::from(!reading);
         let changed = self
-            .fills
-            .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |fills| {
-                (fills % 2 != filled).then_some(fills + 1)
+            .covers
+            .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |changes| {
+                (changes % 2 != read).then_some(changes + 1)
             })
             .is_ok();
         if changed {
             self.events().notify();
         }
-        changed
     }
 
-    /// Wait until the store misses land into is filled, as residency
-    /// publishes it ([`Self::tier_fill`]), woken
-    /// by each of the load's events; why serving ended, if it ends first,
-    /// or that the load stops.
-    pub fn wait_filled(&self) -> Result<(), String> {
+    /// Wait until the cover reads nothing, as residency publishes it
+    /// ([`Self::cover`]), woken by each of the load's events; why serving
+    /// ended, if it ends first, or that the load stops.
+    pub fn wait_covered(&self) -> Result<(), String> {
         let events = self.events();
         loop {
             let seen = events.seen();
-            if self.tier_fill() == crate::TierFill::Filled {
+            if !self.cover().reading {
                 return Ok(());
             }
             if let Some(reason) = self.life.ended() {
-                return Err(format!("the host tier's fill: serving ended: {reason}"));
+                return Err(format!("the host tier's cover: serving ended: {reason}"));
             }
             if self.life.stopping() {
-                return Err("the host tier's fill: the load stops".into());
+                return Err("the host tier's cover: the load stops".into());
             }
             events.wait(seen);
         }
@@ -678,7 +665,7 @@ impl Watcher {
             promoted: Default::default(),
             copy: Mutex::new(None),
             lent: lent::LentRecords::new(),
-            fills: std::sync::atomic::AtomicU64::new(0),
+            covers: Default::default(),
             passes: Mutex::new(None),
             settled: Default::default(),
         });

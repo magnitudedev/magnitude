@@ -9,7 +9,7 @@ use super::{DraftController, DraftLoad, RoundChoice, TimedLaunch};
 use magnitude_executor::{LaunchDuration, TokenId};
 use std::{sync::Arc, time::Duration};
 
-/// `duration`, measured with no fill beside it.
+/// `duration`, measured with no cover read beside it.
 fn settled(duration: Duration) -> Option<LaunchDuration> {
     Some(LaunchDuration::settled(duration))
 }
@@ -754,26 +754,30 @@ fn a_launch_that_recorded_its_graph_prices_nothing() {
     assert!(drafted(Some(Duration::from_millis(9))));
 }
 
-/// A round the expert bank's fill ran beside prices its launches until a
-/// launch with no fill beside it shows the fill finished: then they are
+/// A round the expert bank's cover read beside prices its launches until a
+/// launch with no cover read beside it shows the cover ended: then they are
 /// unmeasured again, and the rounds measure them anew. (Regression: a
-/// streamed load's first verifies, beside its bank's first fill, cost 1-2 s
-/// against 60 ms settled, and the controller drafted nothing for the rest
-/// of the answer.)
+/// streamed load's first verifies, beside the reads filling its host tier,
+/// cost 1-2 s against 60 ms settled, and the controller drafted nothing for
+/// the rest of the answer.)
 #[test]
-fn launches_measured_beside_a_fill_price_only_until_it_finishes() {
-    let filling = |milliseconds| Some(LaunchDuration { duration: Duration::from_millis(milliseconds), filling: true });
+fn launches_measured_beside_a_cover_price_only_until_it_ends() {
+    let covering =
+        |milliseconds| Some(LaunchDuration { duration: Duration::from_millis(milliseconds), covering: true });
     let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
     let generated = controller.generate(7, CONTEXT, true);
     assert!(generated > 0);
-    controller.timed(TimedLaunch::Draft, filling(40), 1, generated + 1);
+    controller.timed(TimedLaunch::Draft, covering(40), 1, generated + 1);
     controller.drafted(generated, &vec![TokenId(1); generated], None);
     let verified = controller.verify(7);
     assert!(verified > 0, "an unscored load verifies what it drafts");
-    controller.timed(TimedLaunch::Target, filling(2_000), 1, verified + 1);
+    controller.timed(TimedLaunch::Target, covering(2_000), 1, verified + 1);
     let measured = controller.measured();
-    assert!(measured.draft.contains_key(&generated) && measured.verify.contains_key(&(verified + 1)), "the fill's round prices while it runs");
-    // A plain decode with no fill beside it: the fill finished.
+    assert!(
+        measured.draft.contains_key(&generated) && measured.verify.contains_key(&(verified + 1)),
+        "the cover's round prices while it reads"
+    );
+    // A plain decode with no cover read beside it: the cover ended.
     assert_eq!(controller.generate(0, CONTEXT, true), 0);
     controller.timed(TimedLaunch::Target, settled(Duration::from_millis(60)), 1, 1);
     let measured = controller.measured();
@@ -1060,7 +1064,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
             plain_seconds: std::sync::Mutex::new(*warm.plain_seconds.lock().unwrap()),
-            beside_fill: std::sync::Mutex::new(*warm.beside_fill.lock().unwrap()),
+            beside_cover: std::sync::Mutex::new(*warm.beside_cover.lock().unwrap()),
         });
         let round = std::cell::Cell::new(0usize);
         let run = adaptive_on(&stream, SHORT, &load, class - 50, |position| {

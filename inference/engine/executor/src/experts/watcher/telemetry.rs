@@ -571,10 +571,11 @@ fn pays(precision: f64, busy: f64, latency: f64) -> bool {
 /// its busy seconds `busy` but the share of what it delivered (`spans`,
 /// each volume's) that hints read for experts no route chose, the bytes
 /// read ahead beyond `named`, those of hints a route chose. What else it
-/// read ahead is the fill's, which orders behind every hint and delays no
-/// hint's read, so no hint's price counts it. A hint a step hastened reads
-/// its last pieces due, so `named` may exceed what it read ahead: the
-/// share is then at most the volume's, never below what steps needed.
+/// read ahead is the cover's (`Prefetch::cover`), which orders behind every
+/// hint and delays no hint's read, so no hint's price counts it. A hint a
+/// step hastened reads its last pieces due, so `named` may exceed what it
+/// read ahead: the share is then at most the volume's, never below what
+/// steps needed.
 fn needed(busy: f64, spans: &[(seismic_io::Volume, seismic_io::Totals)], named: u64) -> f64 {
     let (bytes, ahead) = spans.iter().fold((0, 0), |(bytes, ahead), (_, span)| (bytes + span.bytes(), ahead + span.ahead.bytes));
     if bytes == 0 {
@@ -716,7 +717,7 @@ impl GroupFacts {
     /// compute, and the experts the next group will read from the file and
     /// pull from the host tier there. That is what the last group to end
     /// there read and pulled: a request's prompt groups have one size and
-    /// route over a bank that only grows while it is filled, so the reads of
+    /// route over a bank that only grows as its use fills it, so the reads of
     /// the group before predict a group's. Before any group has ended there,
     /// every expert the layer lacks now (a prompt's first group reads cold),
     /// those the host tier holds alone pulled where prompt groups pull, the

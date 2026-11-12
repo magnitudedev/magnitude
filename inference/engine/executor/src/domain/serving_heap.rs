@@ -63,11 +63,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The one resize toward `bank`'s derived targets
-    /// (`experts::derived::next_move`), at the decode's price now.
+    /// (`experts::derived::next_move`), at the decode's price now: the
+    /// targets the domain reports (`Self::derive_bank`).
     fn next_bank_move(&self, bank: &dyn super::ElasticBank) -> Result<Option<(BankHolding, BankMove)>, DomainError> {
-        let price = self.decode_price()?;
-        let holdings = bank.targets(price.as_ref())?;
-        Ok(crate::experts::derived::next_move(&crate::experts::derived::derive(self.resources.ledgers(), &holdings, self.in_process_growth())))
+        self.derive_bank(bank, crate::experts::derived::next_move)
     }
 
     /// The state the largest batch the load admits grows by at once: a

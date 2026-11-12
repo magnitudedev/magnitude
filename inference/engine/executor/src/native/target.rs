@@ -95,9 +95,10 @@ pub struct ExpertBankKernels {
     /// which its expert entries read.
     pub pass_map: NativeKernel<magnitude_kernels::routed_pass_map::Entry>,
     pub convert: RecordTensors<NativeKernel<magnitude_kernels::routed_convert::Entry>>,
-    /// The device's placements into the bank, where it places
-    /// (`BankBinding::placer`): none in a program whose host places.
-    pub placement: Option<DevicePlacement>,
+    /// The device's placements into the bank's records, whoever places
+    /// (`BankBinding::placer`): a prompt group's seeds, copied from its
+    /// scratch slots.
+    pub placement: DevicePlacement,
     /// A shrink's moves of the bank's kept records, which the device runs in
     /// queue order ahead of every later step, whoever places.
     pub moves: BankMoves,

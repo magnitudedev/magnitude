@@ -1333,7 +1333,7 @@ impl ExpertStep {
                 false,
             ),
             lent: super::lent::LentRecords::new(),
-            fills: std::sync::atomic::AtomicU64::new(0),
+            covers: Default::default(),
             resizing: ResizeHandoff::new(),
             traffic_held: Default::default(),
             traffic_quiet: Default::default(),

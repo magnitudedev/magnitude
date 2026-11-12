@@ -341,11 +341,10 @@ fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
         for step in steps {
             step.complete().unwrap();
         }
-        // Each read lands into the host tier too, its bytes the file's (the
-        // staging beyond it too short for any fill): no later miss reads it
-        // again. The tier's reserve of 4 counts the lent records the group
-        // holds, which it returns ready, so the 5 stay: none is unmapped
-        // for records a group only borrows.
+        // Each read lands into the host tier too, its bytes the file's: no
+        // later miss reads it again. The tier's reserve of 4 counts the lent
+        // records the group holds, which it returns ready, so the 5 stay:
+        // none is unmapped for records a group only borrows.
         for (layer, expert) in [(0, 0), (0, 1), (0, 3), (1, 3), (1, 4)] {
             eventually("a prompt's read never landed into the tier", || harness.in_tier(layer, expert).is_some());
         }
@@ -821,7 +820,10 @@ fn conveys_the_next_layer_ahead(harness: &Harness) {
 #[test]
 fn a_group_claims_its_lent_records_and_returns_them_empty() {
     let conveying = Conveying::of(4);
-    let harness = lending("lender", EXPERTS, 12, 1, STAGING, conveying, 0, Placer::Tier, false);
+    // The tier is the four lent records alone. Its reserve (a record per
+    // staging record) is two, so two landings leave it whole: a reserve of
+    // every record would unmap each landing as residency learns it.
+    let harness = lending("lender", EXPERTS, 12, 1, 2, conveying, 0, Placer::Tier, false);
     harness.request(&[0, 1]).complete().unwrap();
     // Residency maps a landing into the tier as it learns it, which may
     // follow the answer.
@@ -868,75 +870,85 @@ fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
     assert!(directory.tier_complete() && directory.group_whole(0), "the store gave up an expert");
 }
 
-/// On the one store a fill's landing is mapped past the steps already begun,
-/// so a running group's step misses an expert the store keeps by then. No
-/// tier copy binds there: an expert beyond the conveyor's free records when
-/// the rounds are fixed stays the rounds' own, read from the file, and the
-/// tier list, whose bound there admits no record, stays empty.
+/// On the one store a hint's landing is mapped past the steps already
+/// begun, so a running group's step misses an expert the store keeps by
+/// then. No tier copy binds there: an expert beyond the conveyor's free
+/// records when the rounds are fixed stays the rounds' own, read from the
+/// file, and the tier list, whose bound there admits no record, stays empty.
 #[test]
 fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
-    let _alone = alone();
-    let ahead = Ahead::queue("store-kept-ahead");
     let conveying = Conveying::of(2);
-    let harness = lending("store-kept", EXPERTS, EXPERTS as u64, 1, 2 * STAGING, conveying, EXPERTS as u32, Placer::Bank, false);
+    // Two layers, so a decode step's ring at layer 0 hints layer 1.
+    let harness = lending("store-kept", EXPERTS, 2 * EXPERTS as u64, 2, 2 * STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false);
     let step = harness.prompt_step();
-    let map = &harness.layers[0].0;
-    ahead.finish();
+    // A decode step behind the group hints layer 1's kept experts.
+    let decode = harness.step();
     let kept = [5, 6, 7];
-    eventually("the fill never landed the experts", || kept.iter().all(|&expert| map.held(expert).is_some()));
+    harness.hint(&decode, 0, &[5, 6, 7]);
+    let map = &harness.layers[1].0;
+    eventually("the hints never landed the experts", || kept.iter().all(|&expert| map.held(expert).is_some()));
     assert!(kept.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "landed past the begun step");
-    let rounds = harness.scratch(&step, 0, &kept);
+    harness.scratch(&step, 0, &[]);
+    let rounds = harness.scratch(&step, 1, &kept);
     let mut converted = rounds.concat().iter().map(|&(_, expert)| expert as usize).collect::<Vec<_>>();
     converted.sort_unstable();
     assert_eq!(converted, kept, "the rounds convert every one");
     assert_eq!(harness.from_conveyor(rounds.last().unwrap()).len(), 1, "the last, read into the conveyor once a record freed");
-    assert_eq!(listed(&harness.tiered[0]), [], "no tier copy on the one store");
+    assert_eq!(listed(&harness.tiered[1]), [], "no tier copy on the one store");
     step.complete().unwrap();
+    for layer in 0..2 {
+        harness.route_at(&decode, layer, &[]);
+    }
+    decode.complete().unwrap();
 }
 
-/// On the one store a prompt group's reads seed the store: each cold
-/// expert read into a conveyor record lands from it into a ready record, in
-/// place of the least ranked expert its own layer keeps (here one the fill
-/// landed and nothing read), mapped past the group, which still reads it
-/// from its scratch slot. The displaced records leave as the reserve
-/// refills, so the layer keeps as many experts as before, and the group
-/// counts its seeds.
+/// The one store holds only what its steps use: a load opens it empty, no
+/// record committed before a step routes an expert, and a decode step that
+/// routes nothing leaves it so.
 #[test]
-fn the_one_stores_group_reads_seed_it_in_place_of_its_least_ranked() {
-    // Two layers of one group, more experts than records: a decode step
-    // lands two of layer 0's, and the rest of each layer is cold.
-    let harness = lending("seed-store", EXPERTS, EXPERTS as u64, 2, STAGING, Conveying::of(2), TIER, Placer::Bank, false);
+fn the_one_store_opens_empty() {
+    let harness = lending("store-empty", EXPERTS, EXPERTS as u64, 2, STAGING, Conveying::of(2), TIER, Placer::Bank, false);
     let held = |layer: usize| (0..EXPERTS).filter(|&expert| harness.layers[layer].0.held(expert).is_some()).collect::<Vec<_>>();
-    let landing = harness.step();
-    harness.request_at(&landing, 0, &[0, 1]);
-    harness.request_at(&landing, 1, &[]);
-    landing.complete().unwrap();
-    eventually("the decode step's misses never landed", || [0, 1].iter().all(|expert| held(0).contains(expert)));
-    harness.tier_ready();
-    let (before, other) = (held(0), held(1));
-    assert!(!before.is_empty(), "the fill kept none of layer 0");
-    let cold = (0..EXPERTS).filter(|expert| !before.contains(expert)).take(2).collect::<Vec<_>>();
-    let step = harness.prompt_step();
-    let rounds = harness.scratch(&step, 0, &cold);
-    assert_eq!(Harness::experts(&rounds.concat()), cold.iter().map(|&expert| expert as i32).collect::<Vec<_>>());
-    let map = &harness.layers[0].0;
-    eventually("the group's reads never seeded the store", || cold.iter().any(|&expert| map.held(expert).is_some()));
-    assert!(cold.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "seeded past the running group");
-    // Each seed displaces one of its own layer's as the reserve refills:
-    // as many of layer 0's leave as seeds land, and none of layer 1's. The
-    // fill may land more meanwhile, into records past the reserve, which
-    // displaces nothing.
-    let left = |now: &[usize]| before.iter().filter(|expert| !now.contains(expert)).count();
-    eventually("the displaced records never left", || {
-        let now = held(0);
-        left(&now) == cold.iter().filter(|expert| now.contains(expert)).count()
-    });
-    assert!(other.iter().all(|expert| held(1).contains(expert)), "a seed of layer 0 displaced layer 1's");
-    let seeded = cold.iter().filter(|&&expert| map.held(expert).is_some()).count();
-    harness.scratch(&step, 1, &[]);
+    assert_eq!((held(0), held(1)), (vec![], vec![]), "the store opened holding experts");
+    let step = harness.step();
+    for layer in 0..2 {
+        harness.request_at(&step, layer, &[]);
+    }
     step.complete().unwrap();
+    harness.tier_ready();
+    assert_eq!((held(0), held(1)), (vec![], vec![]), "the store took experts no step routed");
+}
+
+/// On the one store a prompt group's last step seeds what it routed, read
+/// into a conveyor record or straight into a scratch slot alike: its seed
+/// list names every routed expert, the device's seed copy writes each from
+/// its slot past the lent records, and once the device commits them and the
+/// group ends the store keeps them, mapped past the group, which reads them
+/// from its slots. Nothing lands from the conveyor. The group counts its
+/// seeds.
+#[test]
+fn a_prompt_seeds_the_one_store_with_every_expert_it_routed() {
+    let conveying = Conveying::of(ROUND_RECORDS).lending_scratch();
+    let harness = lending("seed-store", EXPERTS, 12, 1, STAGING, conveying, TIER, Placer::Bank, false);
+    let map = &harness.layers[0].0;
+    let routed = [0, 2, 4, 6];
+    let step = harness.prompt_step();
+    harness.publish(&step, 0, &routed);
+    let rounds = harness.rounds_checked(&step, 0).concat();
+    assert_eq!(Harness::experts(&rounds), routed.map(|expert| expert as i32));
+    assert!(!Harness::from_slots(&rounds).is_empty(), "no expert was read into a slot: {rounds:?}");
+    let seeds = harness.commit_seeds(&step, 0);
+    let mut seeded = seeds.iter().map(|&(expert, _)| expert).collect::<Vec<_>>();
+    seeded.sort_unstable();
+    assert_eq!(seeded, routed.map(|expert| expert as i32), "every routed expert seeds");
+    assert!(seeds.iter().all(|&(_, record)| record as usize >= conveying.lent), "a seed took a lent record: {seeds:?}");
+    assert!(routed.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "seeded within the running group");
+    step.complete().unwrap();
+    eventually("the seeds were never mapped", || {
+        seeds.iter().all(|&(expert, record)| map.held(expert as usize) == Some(record as usize))
+    });
     let layers = harness.watcher.shared().costs().group.unwrap().layers;
-    assert_eq!(layers[0].seeded, seeded as u64);
+    assert_eq!(layers[0].seeded, routed.len() as u64);
 }
 
 /// A resident prompt group requests nothing; its passes' grouping writes

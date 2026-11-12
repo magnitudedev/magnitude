@@ -119,9 +119,9 @@ pub(crate) struct BankGraphEntries<'a, G: GraphDraft + 'a> {
     pub list_stage: G::Binding<'a, routed_list_stage::Entry>,
     pub pass_map: G::Binding<'a, routed_pass_map::Entry>,
     pub convert: RecordTensors<G::Binding<'a, routed_convert::Entry>>,
-    /// The device's seed copy, where it copies into the bank
+    /// The device's seed copy into the bank's records, whoever places
     /// (`DevicePlacement`).
-    pub seeding: Option<BankSeedingEntries<'a, G>>,
+    pub seeding: BankSeedingEntries<'a, G>,
     /// The CPU site's request and combine, where the layer has a site.
     pub site: Option<BankSiteEntries<'a, G>>,
 }
@@ -199,11 +199,11 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
             list_stage: &kernels.list_stage,
             pass_map: &kernels.pass_map,
             convert: kernels.convert.as_ref(),
-            seeding: kernels.placement.as_ref().map(|placement| BankSeedingEntries {
-                seed: placement.seed.as_ref(),
-                seed_commit: &placement.seed_commit,
-                list_grid: &placement.list_grid,
-            }),
+            seeding: BankSeedingEntries {
+                seed: kernels.placement.seed.as_ref(),
+                seed_commit: &kernels.placement.seed_commit,
+                list_grid: &kernels.placement.list_grid,
+            },
             site: kernels.site.as_ref().map(|site| BankSiteEntries {
                 request: &site.request,
                 combine: match &site.combine {
@@ -229,8 +229,8 @@ pub(crate) struct CheckedBankEntries {
     route: CheckedRoute,
     staging: [(&'static str, Element); 3],
     none: [(&'static str, Element); 0],
-    /// The seed copy's, where the device copies into the bank.
-    seed: Option<RecordTensors<[(&'static str, Element); 1]>>,
+    /// The seed copy's.
+    seed: RecordTensors<[(&'static str, Element); 1]>,
     convert: RecordTensors<[(&'static str, Element); 2]>,
     /// The CPU site's request's and combine's, where the layer has a site
     /// (`native::BankSite::served`).
@@ -309,7 +309,7 @@ impl CheckedBankEntries {
             route,
             staging,
             none: [],
-            seed: (bank.placer == crate::planning::Placer::Tier).then(|| bank.record.map(|_, tensor| [("U", tensor.resident)])),
+            seed: bank.record.map(|_, tensor| [("U", tensor.resident)]),
             convert: bank.record.map(|_, tensor| [("ST", tensor.source), ("U", tensor.resident)]),
             site,
         })
@@ -329,11 +329,11 @@ impl CheckedBankEntries {
             list_stage: &self.none,
             pass_map: &self.none,
             convert: self.convert.as_ref().map(|_, convert| &convert[..]),
-            seeding: self.seed.as_ref().map(|seed| BankSeedingEntries {
-                seed: seed.as_ref().map(|_, seed| &seed[..]),
+            seeding: BankSeedingEntries {
+                seed: self.seed.as_ref().map(|_, seed| &seed[..]),
                 seed_commit: &self.none[..],
                 list_grid: &self.none[..],
-            }),
+            },
             site: self.site.as_ref().map(|site| BankSiteEntries {
                 request: &site.request[..],
                 combine: match &site.combine {
@@ -1012,15 +1012,12 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         let entries = self.entries;
         let numbers = self.numbers;
         // The layer's group's records, its expert stacks, which the device's
-        // seed copy writes where it copies into the bank.
-        let mut records = match entries.seeding {
-            Some(_) => {
-                let (planned, scope) = (self.planned, self.scope);
-                Some(self.topology.record.try_map(|kind, _| {
-                    weight_port(graph, planned, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
-                })?)
-            }
-            None => None,
+        // seed copy writes.
+        let records = {
+            let (planned, scope) = (self.planned, self.scope);
+            self.topology.record.try_map(|kind, _| {
+                weight_port(graph, planned, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
+            })?
         };
         let experts = &numbers.experts;
         let (scratch_slots, scratch_lanes) = (&numbers.scratch_slots, &numbers.scratch_lanes);
@@ -1063,11 +1060,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 self.part(graph, BankPart::TierStaged)?,
             )),
         };
-        let mut seed_grid = entries
-            .seeding
-            .map(|_| Ok::<_, GraphError>((self.part(graph, BankPart::SeedGrid)?, self.part(graph, BankPart::SeedStaged)?)))
-            .transpose()?;
-        let mut commits = entries.seeding.map(|_| self.part(graph, BankPart::Commits)).transpose()?;
+        let (mut seed_grid, mut seed_staged) = (self.part(graph, BankPart::SeedGrid)?, self.part(graph, BankPart::SeedStaged)?);
+        let commits = self.part(graph, BankPart::Commits)?;
         // Round 0 always parks (hit against cold is final only as the request
         // is served); its park's return carries the count of records the
         // rounds convert, from which `routed_scratch_grids` writes every
@@ -1141,7 +1135,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 // from its tier record in place into its scratch slot, on
                 // the tier list's grid.
                 if let Some((records, tier_grid, staged)) = tier.as_mut() {
-                    let seeding = entries.seeding.ok_or("a host tier's bank seeds by the device")?;
+                    let seeding = entries.seeding;
                     graph.enqueue(
                         seeding.list_grid,
                         &[("L", numbers.widest.clone())],
@@ -1173,22 +1167,19 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                         )?;
                     }
                 }
-                // The seed list's grid, where the device seeds: its host
-                // lists the group's last step's seeds before acknowledging
-                // round 0, and no list of another step launches the seed
-                // copy.
-                if let (Some(seeding), Some((seed_grid, staged))) = (entries.seeding, seed_grid.as_mut()) {
-                    graph.enqueue(
-                        seeding.list_grid,
-                        &[("L", numbers.widest.clone())],
-                        routed_list_grid::WorkflowArgs {
-                            list: seeds.tensor().into(),
-                            step: step.tensor().into(),
-                            grid: seed_grid.tensor_mut().into(),
-                            staged: staged.tensor_mut().into(),
-                        },
-                    )?;
-                }
+                // The seed list's grid: its host lists the group's last
+                // step's seeds before acknowledging round 0, and no list of
+                // another step launches the seed copy.
+                graph.enqueue(
+                    entries.seeding.list_grid,
+                    &[("L", numbers.widest.clone())],
+                    routed_list_grid::WorkflowArgs {
+                        list: seeds.tensor().into(),
+                        step: step.tensor().into(),
+                        grid: seed_grid.tensor_mut().into(),
+                        staged: seed_staged.tensor_mut().into(),
+                    },
+                )?;
             }
             graph.enqueue(
                 entries.list_stage,
@@ -1222,25 +1213,20 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             }
         }
         constants.push(always);
-        // Where the device copies into the bank, a prompt group's last step
-        // seeds it from the filled tier: its listed experts copied into
+        // A prompt group's last step seeds the group's records, whoever
+        // places, from the filled scratch: its listed experts copied into
         // their records on the seed list's grid, then each record
         // committed, which the host maps once the step has completed. A list
-        // of another step, or a failed step, seeds nothing. Where the host
-        // lands, nothing seeds.
-        let (Some(seeding), Some(records), Some((seed_grid, staged)), Some(commits)) =
-            (entries.seeding, records.as_mut(), seed_grid.as_ref(), commits.as_mut())
-        else {
-            // Its last write: the scratch tier's up records, which every
-            // round converts into.
-            return Ok(scratch.up.tensor().clone());
-        };
+        // of another step, or a failed step, seeds nothing.
+        let seeding = entries.seeding;
+        let staged = &seed_staged;
         // The seeds' records from the first a seed takes
         // (`ExpertBankPlan::seeded_from`), which the seed list names them
-        // from: beside a host tier the lender's lie past the lent records
-        // the scratch fills, so the copy's destination is disjoint from its
+        // from: the lender's lie past the lent records the conveyor and the
+        // scratch fill, so the copy's destination is disjoint from its
         // source by construction. A lender with no record past them seeds
-        // nothing.
+        // nothing: its last write the scratch's up records, which every
+        // round converts into.
         let first = &numbers.seeded_from;
         let seeded = numbers.records.checked_sub(first).ok_or("a bank group's lent records exceed its records")?;
         if seeded.is_zero() {
