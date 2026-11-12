@@ -2834,29 +2834,30 @@ struct Ledger {
     /// when what they are ranked against changes ([`Ledger::rerank`]): the
     /// served choice, a leader's measurement or the settings, each the
     /// work of a conversion.
-    resolved: BTreeSet<(Total, Configuration)>,
-    nominal: BTreeSet<(Total, Configuration)>,
+    resolved: BTreeSet<(Gain, Configuration)>,
+    nominal: BTreeSet<(Gain, Configuration)>,
     /// The challengers that hold a formed kernel.
     holding: BTreeSet<Configuration>,
     /// How each challenger was formed before it was first measured.
     formations: BTreeMap<Configuration, FormationRecord>,
 }
 
-/// A cost total, ordered.
+/// What a challenger gains on the served choice over the points that tell
+/// them apart ([`Cost::gain_over`]), ordered best first.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Total(f64);
+struct Gain(f64);
 
-impl Eq for Total {}
+impl Eq for Gain {}
 
-impl PartialOrd for Total {
+impl PartialOrd for Gain {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Total {
+impl Ord for Gain {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.total_cmp(&other.0)
+        other.0.total_cmp(&self.0)
     }
 }
 
@@ -2977,7 +2978,7 @@ impl Ledger {
         let incumbent = self.incumbent();
         let contender = &self.contenders[configuration];
         let verdict = self.evidence(contender).verdict(self.settings.error_rate);
-        let total = Total(contender.cost.total());
+        let gain = Gain(contender.cost.gain_over(&incumbent.cost));
         match verdict {
             Some(Verdict::Trails) => {
                 self.contenders
@@ -2986,10 +2987,10 @@ impl Ledger {
                     .standing = ContenderStanding::Trailing;
             }
             Some(Verdict::Leads) => {
-                self.resolved.insert((total, configuration.clone()));
+                self.resolved.insert((gain, configuration.clone()));
             }
             None if contender.cost.improves_on(&incumbent.cost) => {
-                self.nominal.insert((total, configuration.clone()));
+                self.nominal.insert((gain, configuration.clone()));
             }
             None => {}
         }
@@ -3073,19 +3074,20 @@ impl Ledger {
         );
     }
 
-    /// The leader owed its conversion, if any: the cheapest measured
-    /// challenger whose lead is resolved.
+    /// The leader owed its conversion, if any: the measured challenger
+    /// whose resolved lead gains most on the served choice.
     fn leader(&self) -> Option<&Configuration> {
         self.resolved.first().map(|(_, leader)| leader)
     }
 
-    /// The cheapest measured challenger whose lead is nominal, and that
-    /// lead: its measured cost is below the served choice's, and its
-    /// rounds beside that choice have resolved nothing yet.
+    /// The measured challenger whose nominal lead gains most on the served
+    /// choice, and that gain: its measured cost is below the served
+    /// choice's, and its rounds beside that choice have resolved nothing
+    /// yet.
     fn nominal(&self) -> Option<(&Configuration, f64)> {
         self.nominal
             .first()
-            .map(|(total, leader)| (leader, self.incumbent().cost.total() - total.0))
+            .map(|(gain, leader)| (leader, gain.0))
     }
 
     /// One record per configuration reached. A measurement is recorded
@@ -4168,7 +4170,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                             .promotion_quote(searching, incumbent, leader)
                             .and(rebuilding),
                         forming: Quote::default(),
-                        opportunity: incumbent.cost.total() - leader.cost.total(),
+                        opportunity: leader.cost.gain_over(&incumbent.cost),
                         footprint: conversion,
                     });
                 }
@@ -8095,8 +8097,8 @@ mod tests {
         );
     }
 
-    /// The leader owed its conversion is the cheapest measured challenger
-    /// whose cost is below the served choice's, by however little. One
+    /// The leader owed its conversion is the measured challenger gaining
+    /// most on the served choice, by however little. One
     /// that fails its conversion gives way to the next; the defaults are
     /// the reference and are never a challenger; a challenger that costs
     /// as much as the served choice, or more, leads nothing.
@@ -8215,20 +8217,40 @@ mod tests {
         assert!(ledger.nominal().is_none());
     }
 
-    /// The rule the ledger's ranking keeps: the cheapest of the `measured`
-    /// configurations whose cost is below `incumbent`'s is the leader owed
-    /// its conversion. A leader that fails gives way to the next; one that
-    /// is promoted becomes the incumbent the rest must beat. Computed over
-    /// all of them: what the ledger's ranking is checked against.
-    fn leading<'c, 'm, C>(
+    /// The rule the ledger's ranking keeps: of the `measured` configurations,
+    /// the one gaining most on `incumbent` over the points that tell them
+    /// apart ([`Cost::gain_over`]), ties to the smaller configuration (the
+    /// ledger's set order). Computed over all of them: what the ledger's
+    /// ranking is checked against.
+    fn best_gain<'c, 'm, C: Ord>(
         incumbent: &Cost,
         measured: impl IntoIterator<Item = (&'c C, &'m Cost)>,
     ) -> Option<&'c C> {
         measured
             .into_iter()
-            .filter(|(_, cost)| cost.improves_on(incumbent))
-            .min_by(|left, right| left.1.total().total_cmp(&right.1.total()))
+            .min_by(|left, right| {
+                let gain = |cost: &Cost| cost.gain_over(incumbent);
+                gain(right.1)
+                    .total_cmp(&gain(left.1))
+                    .then_with(|| left.0.cmp(right.0))
+            })
             .map(|(configuration, _)| configuration)
+    }
+
+    /// The leader owed its conversion by that rule among the `measured`
+    /// configurations whose cost is below `incumbent`'s. A leader that fails
+    /// gives way to the next; one that is promoted becomes the incumbent the
+    /// rest must beat.
+    fn leading<'c, 'm, C: Ord>(
+        incumbent: &Cost,
+        measured: impl IntoIterator<Item = (&'c C, &'m Cost)>,
+    ) -> Option<&'c C> {
+        best_gain(
+            incumbent,
+            measured
+                .into_iter()
+                .filter(|(_, cost)| cost.improves_on(incumbent)),
+        )
     }
 
     use seismic_lang::checked::{SourceFile, SourceSet, check_source};
@@ -9384,6 +9406,38 @@ mod tests {
         }
     }
 
+    /// Challengers gain on the served choice only where they differ from it:
+    /// the heavy points they share with it read as noise. The challenger
+    /// whose shared points happened to read dearest still leads when its own
+    /// point is the fastest, and the one whose total is lowest does not.
+    #[test]
+    fn the_ledger_leads_with_the_challenger_gaining_most_where_they_differ() {
+        let mut recorded = recorded(3);
+        // Each challenger runs its own work at point 0 and the served work,
+        // keyed alike, at the other two.
+        let mut challenge = |id: usize, own: f64, shared: f64| {
+            let measured = timed(
+                3,
+                |point| if point == 0 { id as u64 } else { 0 },
+                |point| if point == 0 { own } else { shared },
+            );
+            recorded.challenge(id, measured)
+        };
+        let slower = challenge(1, 1.15, 0.8);
+        let middling = challenge(2, 0.9, 0.9);
+        let faster = challenge(3, 0.7, 1.2);
+        let ledger = &recorded.ledger;
+        let total = |configuration: &Configuration| ledger.contenders[configuration].cost.total();
+        // By total the faster challenger is the dearest of all three, and
+        // the middling one the cheapest.
+        assert!(total(&faster) > total(&slower));
+        assert!(total(&middling) < total(&slower));
+        let (nominal, gain) = ledger.nominal().expect("a challenger gains");
+        assert_eq!(nominal, &faster);
+        assert!((gain - 0.1).abs() < 1e-9, "{gain}");
+        assert_eq!(ledger.leader(), None);
+    }
+
     /// The ledger ranks a challenger when it is measured and ranks them
     /// all again only after a conversion: at every step its leaders are
     /// those ranking every measured challenger afresh names.
@@ -9412,13 +9466,16 @@ mod tests {
                     .verdict(ledger.settings.error_rate)
             };
             (
-                // Resolved by its rounds beside the served choice: the
-                // cheapest.
-                measured
-                    .iter()
-                    .filter(|(_, contender)| verdict(contender) == Some(Verdict::Leads))
-                    .min_by(|left, right| left.1.cost.total().total_cmp(&right.1.cost.total()))
-                    .map(|(configuration, _)| (*configuration).clone()),
+                // Resolved by its rounds beside the served choice: the one
+                // gaining most.
+                best_gain(
+                    &incumbent.cost,
+                    measured
+                        .iter()
+                        .filter(|(_, contender)| verdict(contender) == Some(Verdict::Leads))
+                        .map(|(configuration, contender)| (*configuration, &contender.cost)),
+                )
+                .cloned(),
                 leading(
                     &incumbent.cost,
                     measured

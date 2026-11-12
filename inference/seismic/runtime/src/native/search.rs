@@ -83,20 +83,29 @@ impl Cost {
         self.points.iter().map(|(_, cost)| cost).sum()
     }
 
-    /// Whether this cost is below `other` over the points that tell the
-    /// two apart. Points with equal keys share one measurement and cancel,
-    /// so two configurations that no point tells apart do not improve on
-    /// one another.
-    pub fn improves_on(&self, other: &Cost) -> bool {
-        let (mine, theirs) = self
-            .points
+    /// How much cheaper this cost is than `other` over the points that tell
+    /// the two apart (negative when dearer). Points with equal keys share
+    /// one measurement and cancel, so they neither vote nor add noise to the
+    /// comparison, and two configurations that no point tells apart gain
+    /// nothing on one another.
+    pub fn gain_over(&self, other: &Cost) -> f64 {
+        assert_eq!(
+            self.points.len(),
+            other.points.len(),
+            "costs compared at different points"
+        );
+        self.points
             .iter()
             .zip(&other.points)
             .filter(|((key, _), (other, _))| key != other)
-            .fold((0.0, 0.0), |(mine, theirs), ((_, cost), (_, other))| {
-                (mine + cost, theirs + other)
-            });
-        mine < theirs
+            .map(|((_, cost), (_, other))| other - cost)
+            .sum()
+    }
+
+    /// Whether this cost is below `other` over the points that tell the
+    /// two apart.
+    pub fn improves_on(&self, other: &Cost) -> bool {
+        self.gain_over(other) > 0.0
     }
 }
 
@@ -160,6 +169,31 @@ mod tests {
         assert!(!cost(2, 0.1005, 0.5).improves_on(&cost(1, 0.1, 0.9)));
         // Equal keys everywhere: nothing tells them apart, nothing improves.
         assert!(!cost(1, 0.05, 0.9).improves_on(&cost(1, 0.1, 0.9)));
+    }
+
+    #[test]
+    fn challengers_rank_by_their_gain_where_they_differ_not_by_noise_where_they_do_not() {
+        let key = |name: &str, value: u64, launch: usize| LaunchKey {
+            launches: vec![launch],
+            values: [(name.to_string(), value)].into_iter().collect(),
+        };
+        // A decode point that reads the setting, and a heavy point that does
+        // not: every configuration has the same key there, so its recorded
+        // times differ by noise alone.
+        let cost = |setting: u64, decode: f64, shared: f64| {
+            Cost::new(vec![(key("K", setting, 0), decode), (key("P", 0, 1), shared)])
+        };
+        let served = cost(4, 0.40, 0.60);
+        let faster = cost(2, 0.30, 0.75);
+        let slower = cost(8, 0.45, 0.50);
+        // The totals order the faster challenger last because its shared
+        // point read dearer; the gains where they differ do not.
+        assert!(faster.total() > served.total());
+        assert!(slower.total() < served.total());
+        assert!(faster.gain_over(&served) > 0.0);
+        assert!(slower.gain_over(&served) < 0.0);
+        assert!(faster.gain_over(&served) > slower.gain_over(&served));
+        assert!((faster.gain_over(&served) - 0.10).abs() < 1e-12);
     }
 
     #[test]
