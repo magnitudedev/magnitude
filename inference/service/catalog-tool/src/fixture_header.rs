@@ -11,7 +11,7 @@ use std::path::Path;
 
 use flate2::{Compression, GzBuilder};
 use magnitude_artifacts::gguf::{
-    Array, Element, StoredHeader, StoredType, Strings, Value, ValueType,
+    Array, Element, Elements, StoredHeader, StoredType, Strings, Value, ValueType,
 };
 
 /// The token kind of a normal token (`LLAMA_TOKEN_TYPE_NORMAL`).
@@ -30,10 +30,10 @@ pub fn trim(header: &[u8]) -> anyhow::Result<Vec<u8>> {
         .filter_map(|entry| entry.metadata.value.unsigned())
         .collect::<HashSet<_>>();
     if let Some(Value::Array(ids)) = stored.value("tokenizer.ggml.eos_token_ids") {
-        special.extend(ids.iter().filter_map(Element::unsigned));
+        special.extend(ids.elements()?.iter().filter_map(Element::unsigned));
     }
     let kinds = match stored.value("tokenizer.ggml.token_type") {
-        Some(Value::Array(kinds)) => kinds.iter().map(Element::unsigned).collect(),
+        Some(Value::Array(kinds)) => kinds.elements()?.iter().map(Element::unsigned).collect(),
         _ => Vec::new(),
     };
     let normal = |index: usize| {
@@ -43,24 +43,28 @@ pub fn trim(header: &[u8]) -> anyhow::Result<Vec<u8>> {
         let value = &mut entry.metadata.value;
         match (entry.metadata.name.as_str(), &*value) {
             ("tokenizer.ggml.merges", _) => {
-                *value = Value::Array(Array::String(Strings::default()));
+                *value = Value::Array(Array::from(Strings::default()));
                 entry.stored = StoredType::Array(ValueType::String);
             }
-            ("tokenizer.ggml.tokens", Value::Array(Array::String(tokens))) => {
-                let tokens = tokens
-                    .iter()
-                    .enumerate()
-                    .map(|(index, token)| if normal(index) { "" } else { token })
-                    .collect::<Strings>();
-                *value = Value::Array(Array::String(tokens));
+            ("tokenizer.ggml.tokens", Value::Array(tokens)) => {
+                if let Elements::String(tokens) = tokens.elements()? {
+                    let tokens = tokens
+                        .iter()
+                        .enumerate()
+                        .map(|(index, token)| if normal(index) { "" } else { token })
+                        .collect::<Strings>();
+                    *value = Value::Array(Array::from(tokens));
+                }
             }
-            ("tokenizer.ggml.scores", Value::Array(Array::Float(scores))) => {
-                let scores = scores
-                    .iter()
-                    .enumerate()
-                    .map(|(index, score)| if normal(index) { 0.0 } else { *score })
-                    .collect();
-                *value = Value::Array(Array::Float(scores));
+            ("tokenizer.ggml.scores", Value::Array(scores)) => {
+                if let Elements::Float(scores) = scores.elements()? {
+                    let scores = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(index, score)| if normal(index) { 0.0 } else { *score })
+                        .collect::<Vec<_>>();
+                    *value = Value::Array(Array::from(scores));
+                }
             }
             _ => {}
         }

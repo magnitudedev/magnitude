@@ -4,7 +4,9 @@
 //! manifest format is described in the fixtures' README.
 
 use flate2::read::GzDecoder;
-use magnitude_artifacts::gguf::{Array, Directory, Metadata, Scalar, Value, inspect_header};
+use magnitude_artifacts::gguf::{
+    inspect_header, Array, Directory, Elements, Metadata, Scalar, Value,
+};
 use magnitude_engine::{
     assessment::{
         AssessmentSetup, AssessmentStructure, DrafterVerdict, Measurements, ModelAssessment,
@@ -343,6 +345,7 @@ fn gguf_header(directory: &Directory) -> Vec<u8> {
             }
             Value::Array(values) => {
                 out.extend(9u32.to_le_bytes());
+                let values = values.elements().unwrap();
                 let element = values.iter().next().map(|value| kind(&value.to_scalar()));
                 out.extend(element.unwrap_or(8).to_le_bytes());
                 out.extend((values.len() as u64).to_le_bytes());
@@ -431,14 +434,19 @@ fn a_qwen4exp_target_with_its_prediction_block_is_assessed_with_built_in_heads()
         name: "qwen4exp.nextn_predict_layers".into(),
         value: Value::Scalar(Scalar::Unsigned(1)),
     });
-    let ratios = match combined.value("qwen4exp.attention.compress_ratios").cloned() {
-        Some(Value::Array(Array::Signed(mut ratios))) => {
+    let ratios = match combined
+        .value("qwen4exp.attention.compress_ratios")
+        .map(|value| match value {
+            Value::Array(ratios) => ratios.elements().cloned().ok(),
+            Value::Scalar(_) => None,
+        }) {
+        Some(Some(Elements::Signed(mut ratios))) => {
             ratios.push(0);
-            Array::Signed(ratios)
+            Array::from(ratios)
         }
-        Some(Value::Array(Array::Unsigned(mut ratios))) => {
+        Some(Some(Elements::Unsigned(mut ratios))) => {
             ratios.push(0);
-            Array::Unsigned(ratios)
+            Array::from(ratios)
         }
         _ => panic!("the target names its compression ratios"),
     };

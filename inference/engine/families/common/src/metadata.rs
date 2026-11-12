@@ -25,6 +25,20 @@ pub fn architecture_keys<'a>(
         .filter_map(move |entry| entry.name.strip_prefix(&prefix).map(|key| (key, entry)))
 }
 
+/// The elements of the metadata array named `key`: the one reading of an
+/// array's payload a family makes, a payload that doesn't read or decode
+/// (text that isn't UTF-8, a payload shorter than its elements) being
+/// [`HeaderError::Payload`].
+pub fn array_elements<'a>(
+    key: &str,
+    values: &'a gguf::Array,
+) -> Result<&'a gguf::Elements, HeaderError> {
+    values.elements().map_err(|error| HeaderError::Payload {
+        key: key.to_owned(),
+        detail: error.to_string(),
+    })
+}
+
 pub struct Metadata<'a> {
     directory: &'a Directory,
     prefix: String,
@@ -187,14 +201,20 @@ impl<'a> Metadata<'a> {
         length: Option<u64>,
         read: impl Fn(Element<'a>) -> Option<T>,
     ) -> Result<Option<Vec<T>>, HeaderError> {
-        self.typed(key, expected, |value| match value {
-            Value::Array(values)
+        match self.value(key) {
+            None => Ok(None),
+            Some(Value::Array(values))
                 if length.is_none_or(|length| values.len() as u64 == length) =>
             {
-                values.iter().map(read).collect()
+                array_elements(&self.key(key), values)?
+                    .iter()
+                    .map(read)
+                    .collect::<Option<Vec<T>>>()
+                    .map(Some)
+                    .ok_or_else(|| self.malformed(key, expected))
             }
-            _ => None,
-        })
+            Some(_) => Err(self.malformed(key, expected)),
+        }
     }
 
     /// An array of nonnegative integers.

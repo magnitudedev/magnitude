@@ -17,4 +17,6 @@ sha2 = "=0.11.0"
 tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
+# Equality of header values, for the tests that compare them.
+magnitude-artifacts = { path = "../artifacts", features = ["equality"] }
 flate2.workspace = true

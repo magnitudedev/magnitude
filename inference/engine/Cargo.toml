@@ -48,6 +48,8 @@ name = "media_drafting"
 harness = false
 
 [dev-dependencies]
+# Equality of header values, for the tests that compare them.
+magnitude-artifacts = { path = "artifacts", features = ["equality"] }
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
 # The controlled execution domain and its fake expert bank, to drive the
 # service owner and the worker session over (`magnitude_executor::fixtures`).

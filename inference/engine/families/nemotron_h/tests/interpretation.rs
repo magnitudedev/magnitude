@@ -471,6 +471,8 @@ fn edit_counts(directory: &mut Directory, key: &str, edit: impl FnOnce(&mut Vec<
         panic!("{name} is not an array");
     };
     let mut values = array
+        .elements()
+        .unwrap()
         .iter()
         .map(|value| value.unsigned().unwrap())
         .collect::<Vec<_>>();

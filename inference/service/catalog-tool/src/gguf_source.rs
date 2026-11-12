@@ -146,7 +146,7 @@ impl Gguf {
             }
             Location::Hub { store, snapshot } => {
                 let header = hub_header(store, snapshot, &path).await?;
-                let directory = read_header(&header)
+                let directory = read_header(header.clone())
                     .with_context(|| format!("failed to read {}", path.display()))?;
                 (header, directory)
             }

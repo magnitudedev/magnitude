@@ -90,7 +90,10 @@ pub fn projector_type<K: Copy>(
     if directory.value("general.architecture").and_then(Value::string)
         != Some(PROJECTOR_ARCHITECTURE)
         || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder") != Some(&Value::Scalar(Scalar::Bool(true)))
+        || !matches!(
+            directory.value("clip.has_vision_encoder"),
+            Some(Value::Scalar(Scalar::Bool(true)))
+        )
     {
         return Err(ProjectorIdentityError::NotProjector);
     }

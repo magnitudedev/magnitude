@@ -112,6 +112,8 @@ pub enum Error {
         expected: &'static str,
     },
     Geometry(String),
+    /// A metadata array whose payload doesn't read or decode.
+    Payload(String),
     Projector,
     MissingWeight(String),
     WeightShape {
@@ -153,6 +155,7 @@ impl Error {
             }],
             Self::Architecture(None)
             | Self::Geometry(_)
+            | Self::Payload(_)
             | Self::MissingWeight(_)
             | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
         }
@@ -186,6 +189,7 @@ impl fmt::Display for Error {
                 write!(formatter, "llama metadata {key:?} must be {expected}")
             }
             Self::Geometry(message) => write!(formatter, "llama geometry: {message}"),
+            Self::Payload(message) => formatter.write_str(message),
             Self::Projector => formatter.write_str("llama has no vision projector"),
             Self::MissingWeight(name) => write!(formatter, "missing llama weight {name:?}"),
             Self::WeightShape {
@@ -242,6 +246,7 @@ impl From<HeaderError> for Error {
             | HeaderError::CompanionScale { .. }
             | HeaderError::Rotary { .. }
             | HeaderError::Yarn) => Self::Geometry(error.to_string()),
+            error @ HeaderError::Payload { .. } => Self::Payload(error.to_string()),
         }
     }
 }

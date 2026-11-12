@@ -6,7 +6,9 @@
 
 use magnitude_artifacts::{
     ArtifactIdentity, PackageIdentity,
-    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{
+        Array, ByteOrder, Directory, Elements, Encoding, Metadata, Scalar, TensorDescriptor, Value,
+    },
 };
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
@@ -245,10 +247,15 @@ fn trained_cluster_readout_preserves_canonical_tokens_and_rejects_invalid_orderi
         .iter_mut()
         .find(|value| value.name == key("output.cluster_token_order"))
         .unwrap();
-    let Value::Array(Array::Unsigned(values)) = &mut ordering.value else {
+    let Value::Array(array) = &mut ordering.value else {
         unreachable!()
     };
+    let Ok(Elements::Unsigned(values)) = array.elements() else {
+        unreachable!()
+    };
+    let mut values = values.clone();
     values[1] = values[0];
+    *array = Array::from(values);
     assert!(
         inspect_assistant(&directory, &target)
             .unwrap_err()

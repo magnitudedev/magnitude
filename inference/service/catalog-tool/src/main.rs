@@ -270,7 +270,7 @@ async fn weight_sample(
 }
 
 /// A GGUF's metadata, long arrays as their length and first values, and its tensor directory.
-fn describe(gguf: &Gguf) -> Value {
+fn describe(gguf: &Gguf) -> anyhow::Result<Value> {
     let scalar = |scalar: Scalar| match scalar {
         Scalar::String(value) => json!(value),
         Scalar::Bool(value) => json!(value),
@@ -278,30 +278,31 @@ fn describe(gguf: &Gguf) -> Value {
         Scalar::Signed(value) => json!(value),
         Scalar::Float(value) => json!(value),
     };
-    let elements = |array: &Array, count: usize| {
-        Value::Array(
+    let elements = |array: &Array, count: usize| -> anyhow::Result<Value> {
+        Ok(Value::Array(
             array
+                .elements()?
                 .iter()
                 .take(count)
                 .map(|element| scalar(element.to_scalar()))
                 .collect(),
-        )
+        ))
     };
     let metadata = gguf
         .first()
         .metadata
         .iter()
-        .map(|entry| {
+        .map(|entry| -> anyhow::Result<(String, Value)> {
             let value = match &entry.value {
                 GgufValue::Scalar(value) => scalar(value.clone()),
                 GgufValue::Array(array) if array.len() > 64 => {
-                    json!({ "length": array.len(), "head": elements(array, 8) })
+                    json!({ "length": array.len(), "head": elements(array, 8)? })
                 }
-                GgufValue::Array(array) => elements(array, array.len()),
+                GgufValue::Array(array) => elements(array, array.len())?,
             };
-            (entry.name.clone(), value)
+            Ok((entry.name.clone(), value))
         })
-        .collect::<Map<_, _>>();
+        .collect::<anyhow::Result<Map<_, _>>>()?;
     let tensors = gguf
         .tensors()
         .map(|tensor| {
@@ -312,7 +313,7 @@ fn describe(gguf: &Gguf) -> Value {
             )
         })
         .collect::<Map<_, _>>();
-    json!({ "metadata": metadata, "tensors": tensors })
+    Ok(json!({ "metadata": metadata, "tensors": tensors }))
 }
 
 async fn update_lock(
@@ -569,7 +570,7 @@ async fn main() -> anyhow::Result<()> {
         } => weight_sample(source, name, output_dir).await,
         Command::Header { source } => {
             let gguf = Gguf::open(&source).await?;
-            println!("{}", serde_json::to_string_pretty(&describe(&gguf))?);
+            println!("{}", serde_json::to_string_pretty(&describe(&gguf)?)?);
             Ok(())
         }
         Command::Slice {

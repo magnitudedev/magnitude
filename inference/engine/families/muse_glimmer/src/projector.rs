@@ -5,7 +5,7 @@
 
 use crate::{invalid, product, Error};
 use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{architecture_keys, projector_type, rotary, Tensors};
+use magnitude_family_common::{architecture_keys, array_elements, projector_type, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -60,7 +60,7 @@ fn number(directory: &Directory, key: &str) -> Result<f64, Error> {
 
 fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     let values = match directory.value(key) {
-        Some(Value::Array(values)) if values.len() == 3 => values
+        Some(Value::Array(values)) if values.len() == 3 => array_elements(key, values)?
             .iter()
             .map(|value| match value {
                 Element::Float(value) if value.is_finite() => Some(value),

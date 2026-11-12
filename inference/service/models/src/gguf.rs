@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC: [u8; 4] = *b"GGUF";
 const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
@@ -160,11 +161,11 @@ impl GgufInspection {
     }
 }
 
-/// A header's `general.tags`.
-#[must_use]
-pub fn header_tags(directory: &Directory) -> Vec<String> {
-    match directory.value("general.tags") {
+/// A header's `general.tags`; an error when the array's payload can't be read or decoded.
+pub fn header_tags(directory: &Directory) -> Result<Vec<String>, magnitude_artifacts::Error> {
+    Ok(match directory.value("general.tags") {
         Some(Value::Array(values)) => values
+            .elements()?
             .iter()
             .filter_map(|value| match value {
                 Element::String(tag) => Some(tag.to_owned()),
@@ -172,7 +173,7 @@ pub fn header_tags(directory: &Directory) -> Vec<String> {
             })
             .collect(),
         _ => Vec::new(),
-    }
+    })
 }
 
 /// One `general.base_model.N.*` lineage entry.
@@ -234,7 +235,8 @@ impl LocalGguf {
 /// directory they hold.
 pub struct LocalGgufRead {
     pub gguf: LocalGguf,
-    pub header: Vec<u8>,
+    /// Shared with the metadata arrays of `directory`.
+    pub header: Arc<Vec<u8>>,
     pub directory: Directory,
 }
 
@@ -253,10 +255,8 @@ pub fn read_local(path: &Path) -> Result<LocalGgufRead, GgufError> {
 fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
     let length = file.file.metadata()?.len();
     let mut header = magnitude_artifacts::gguf::HeaderBytes::new();
-    let read = header
-        .read(file)
-        .map(|walked| (walked.data_offset, walked.directory()));
-    let (data_offset, parsed) = match read {
+    let read = header.read(file).map(|walked| walked.data_offset);
+    let data_offset = match read {
         Ok(read) => read,
         Err(magnitude_artifacts::Error::Truncated { .. }) => {
             return Err(GgufError::Io(io::Error::new(
@@ -289,7 +289,18 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
             )));
         }
     }
-    let (directory, unknown_types) = known_tensors_and_unknown_types(parsed)
+    // Sampled before the bytes read past the header are dropped, so no byte is read twice.
+    let content_sample = content_sample_digest(
+        &mut Prefixed {
+            prefix: header.bytes(),
+            file,
+            position: 0,
+        },
+        header_bytes,
+        length,
+    )?;
+    let header = header.into_shared(header_end).map_err(GgufError::Header)?;
+    let (directory, unknown_types) = known_tensors_and_unknown_types(header.directory())
         .and_then(|(directory, unknown)| {
             directory.require_execution_byte_order().map(|()| (directory, unknown))
         })
@@ -300,25 +311,15 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
             "GGUF file is truncated: it has {length} bytes of the {declared} its header declares"
         )
     });
-    let header_digest = format!("{:x}", Sha256::digest(&header.bytes()[..header_end]));
+    let header_digest = format!("{:x}", Sha256::digest(header.bytes().as_slice()));
     let mut inspection = interpret(&directory, &unknown_types, header_digest, header_bytes)?;
-    inspection.content_sample = Some(content_sample_digest(
-        &mut Prefixed {
-            prefix: header.bytes(),
-            file,
-            position: 0,
-        },
-        header_bytes,
-        length,
-    )?);
-    let mut bytes = header.into_bytes();
-    bytes.truncate(header_end);
+    inspection.content_sample = Some(content_sample);
     Ok(LocalGgufRead {
         gguf: LocalGguf {
             inspection,
             truncated,
         },
-        header: bytes,
+        header: Arc::clone(header.bytes()),
         directory,
     })
 }
@@ -625,10 +626,12 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
-/// The header's `general.base_model.N.*` lineage entries that name a model or a repository.
-pub(crate) fn base_models(directory: &Directory) -> Vec<GgufBaseModel> {
-    let count = u32_value(directory, "general.base_model.count").unwrap_or(0);
-    (0..count)
+/// The `general.base_model.N.*` lineage a header declares: each entry naming a model or its
+/// repository.
+#[must_use]
+pub fn base_models(directory: &Directory) -> Vec<GgufBaseModel> {
+    let base_model_count = u32_value(directory, "general.base_model.count").unwrap_or(0);
+    (0..base_model_count)
         .map(|index| {
             let field = |field: &str| {
                 string_value(directory, &format!("general.base_model.{index}.{field}"))
@@ -740,7 +743,7 @@ pub(crate) fn interpret(
         content_sample: None,
         fingerprint_material,
         tensors,
-        tags: header_tags(directory),
+        tags: header_tags(directory).map_err(GgufError::Header)?,
     })
 }
 

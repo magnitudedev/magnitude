@@ -665,7 +665,7 @@ fn a_stored_header_encodes_back_to_its_bytes() {
     );
     let header = gguf::StoredHeader::read(&mut Cursor::new(bytes.clone())).unwrap();
     let encoded = header.encode().unwrap();
-    let directory = gguf::read_header(&encoded).unwrap();
+    let directory = gguf::read_header(encoded.clone()).unwrap();
     assert_eq!(encoded, bytes[..directory.data_offset as usize]);
     assert_eq!(
         header.metadata[2].stored,

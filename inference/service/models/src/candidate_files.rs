@@ -133,8 +133,14 @@ pub enum CandidateFileRole {
 }
 
 impl CandidateFileRole {
+    /// The role of the file with this header directory and its `general.tags`
+    /// ([`crate::gguf::header_tags`]).
     #[must_use]
-    pub fn of(directory: &Directory, architectures: &RecognizedArchitectures) -> Self {
+    pub fn of(
+        directory: &Directory,
+        tags: &[String],
+        architectures: &RecognizedArchitectures,
+    ) -> Self {
         if directory.value("general.type").and_then(Value::string) == Some("imatrix") {
             return Self::Auxiliary;
         }
@@ -152,8 +158,7 @@ impl CandidateFileRole {
             .and_then(Value::string)
             .map(ToOwned::to_owned);
         let tensors = crate::gguf::GgufTensors::of(directory, architecture.as_deref());
-        let tags = crate::gguf::header_tags(directory);
-        match crate::gguf::role(architecture.as_deref(), &tags, tensors, architectures) {
+        match crate::gguf::role(architecture.as_deref(), tags, tensors, architectures) {
             crate::gguf::GgufRole::Projector => Self::Projector,
             crate::gguf::GgufRole::Drafter => match architecture {
                 Some(architecture) => Self::Drafter { architecture },
@@ -164,27 +169,22 @@ impl CandidateFileRole {
     }
 }
 
-/// Inspect one GGUF header held in memory (every byte through the aligned tensor-data offset).
-pub fn header_directory(header: &[u8]) -> Result<Directory, InventoryError> {
-    crate::gguf::known_tensors(magnitude_artifacts::gguf::read_header(header))
-        .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
-        .map_err(|error| InventoryError::Integrity(error.to_string()))
-}
-
 /// Inspect one GGUF header held in memory for both its directory and its catalog-facing metadata
-/// (the `general.file_type` quantization among them). The header is parsed once.
+/// (the `general.file_type` quantization among them). The header is parsed once, and its bytes
+/// become the directory's: its arrays' payloads are spans of them.
 pub fn header_inspection(
-    header: &[u8],
+    header: Vec<u8>,
 ) -> Result<(Directory, crate::gguf::GgufInspection), InventoryError> {
     use sha2::Digest;
+    let digest = format!("{:x}", sha2::Sha256::digest(&header));
+    let length = header.len() as u64;
     let (directory, unknown_types) =
         crate::gguf::known_tensors_and_unknown_types(magnitude_artifacts::gguf::read_header(header))
             .and_then(|(directory, unknown)| {
                 directory.require_execution_byte_order().map(|()| (directory, unknown))
             })
             .map_err(|error| InventoryError::Integrity(error.to_string()))?;
-    let digest = format!("{:x}", sha2::Sha256::digest(header));
-    let header_bytes = crate::gguf::header_extent(&directory, header.len() as u64);
+    let header_bytes = crate::gguf::header_extent(&directory, length);
     let inspection = crate::gguf::interpret(&directory, &unknown_types, digest, header_bytes)
         .map_err(|error| InventoryError::Integrity(error.to_string()))?;
     Ok((directory, inspection))
@@ -219,7 +219,7 @@ impl HeaderClassification {
 
 /// Classify one GGUF header held in memory.
 pub fn classify_header(
-    header: &[u8],
+    header: Vec<u8>,
     architectures: &RecognizedArchitectures,
 ) -> Result<HeaderClassification, InventoryError> {
     let (directory, inspection) = header_inspection(header)?;
@@ -240,7 +240,7 @@ pub(crate) fn classify(
             crate::gguf::GgufTensors::of(directory, architecture),
             crate::gguf::GgufTensors::Model { embedded_mtp: true }
         ),
-        role: CandidateFileRole::of(directory, architectures),
+        role: CandidateFileRole::of(directory, &inspection.tags, architectures),
         base_repositories: header_base_repositories(directory),
         quantization: inspection.quantization.clone(),
         declared_bytes: crate::gguf::declared_length(directory),
@@ -802,7 +802,7 @@ mod tests {
             "blk.2.nextn.enorm.weight",
         ];
         assert_eq!(
-            classify_header(&gguf_bytes(&full, &full_tensors), &architectures)
+            classify_header(gguf_bytes(&full, &full_tensors), &architectures)
                 .unwrap()
                 .role,
             CandidateFileRole::Target {
@@ -823,7 +823,7 @@ mod tests {
             "blk.2.nextn.hnorm.weight",
         ];
         assert_eq!(
-            classify_header(&gguf_bytes(&head, &head_tensors), &architectures)
+            classify_header(gguf_bytes(&head, &head_tensors), &architectures)
                 .unwrap()
                 .role,
             CandidateFileRole::Drafter {
@@ -873,7 +873,11 @@ mod tests {
         };
         let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
         assert_eq!(
-            CandidateFileRole::of(&directory(&[("general.type", "imatrix")]), &architectures),
+            CandidateFileRole::of(
+                &directory(&[("general.type", "imatrix")]),
+                &[],
+                &architectures
+            ),
             CandidateFileRole::Auxiliary
         );
         let model = crate::test_gguf::gguf_bytes(
@@ -887,7 +891,7 @@ mod tests {
             &["token_embd.weight"],
         );
         assert_eq!(
-            classify_header(&model, &architectures).unwrap().role,
+            classify_header(model, &architectures).unwrap().role,
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
             }
@@ -931,7 +935,7 @@ mod tests {
             .chain(head_block)
             .collect::<Vec<_>>();
         assert_eq!(
-            classify_header(&gguf_bytes(&metadata, &mtp), &architectures)
+            classify_header(gguf_bytes(&metadata, &mtp), &architectures)
                 .unwrap()
                 .role,
             CandidateFileRole::Drafter {
@@ -950,7 +954,7 @@ mod tests {
         .chain(head_block)
         .collect::<Vec<_>>();
         assert_eq!(
-            classify_header(&gguf_bytes(&metadata, &model), &architectures)
+            classify_header(gguf_bytes(&metadata, &model), &architectures)
                 .unwrap()
                 .role,
             CandidateFileRole::Target {
@@ -967,7 +971,7 @@ mod tests {
     fn a_file_shorter_than_its_declared_tensor_data_holds_no_weights() {
         let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
         let classification = classify_header(
-            &crate::test_gguf::fixture_header("skeleton"),
+            crate::test_gguf::fixture_header("skeleton"),
             &architectures,
         )
         .unwrap();
@@ -991,7 +995,7 @@ mod tests {
         use crate::test_gguf::{Meta, gguf_bytes};
         let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
         let classify = |metadata: &[(&str, Meta<'_>)]| {
-            classify_header(&gguf_bytes(metadata, &[]), &architectures)
+            classify_header(gguf_bytes(metadata, &[]), &architectures)
                 .unwrap()
                 .role
         };
@@ -1020,7 +1024,7 @@ mod tests {
             ["dflash", "gemma4-assistant", "qwen4exp"],
         );
         let classify = |name: &str| {
-            classify_header(&crate::test_gguf::fixture_header(name), &architectures).unwrap()
+            classify_header(crate::test_gguf::fixture_header(name), &architectures).unwrap()
         };
         assert_eq!(
             classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K").role,
@@ -1047,7 +1051,7 @@ mod tests {
             ["dflash", "gemma4-assistant", "qwen4exp"],
         );
         let classify = |name: &str| {
-            classify_header(&crate::test_gguf::fixture_header(name), &architectures).unwrap()
+            classify_header(crate::test_gguf::fixture_header(name), &architectures).unwrap()
         };
         for head in ["mtp-Qwen3.5-9B-heretic-Q8_0", "mtp-Qwen3.5-9B-heretic-BF16"] {
             assert_eq!(
@@ -1085,7 +1089,9 @@ mod tests {
         for name in ["Qwen3.5-4B-UD-Q6_K_XL", "Qwen3.5-4B-Q6_K"] {
             let header = crate::test_gguf::fixture_header(name);
             assert_eq!(
-                classify_header(&header, &architectures).unwrap().role,
+                classify_header(header.clone(), &architectures)
+                    .unwrap()
+                    .role,
                 CandidateFileRole::Target {
                     architecture: Some("qwen35".to_owned())
                 },

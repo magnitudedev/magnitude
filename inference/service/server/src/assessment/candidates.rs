@@ -12,7 +12,7 @@ use std::sync::{Arc, Weak};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use magnitude_artifacts::Error as ArtifactError;
-use magnitude_artifacts::gguf::{FileHeader, HeaderSource};
+use magnitude_artifacts::gguf::{Directory, FileHeader, HeaderSource};
 use magnitude_engine::assessment::{
     ModelPackagePaths, PreparedModelAssessment, finish_model_assessment,
     prepare_model_assessment_from,
@@ -125,7 +125,7 @@ impl HeaderSource for StoredHeaders {
     fn header(&self, path: &Path) -> Result<FileHeader, ArtifactError> {
         let size = std::fs::metadata(path)?.len();
         Ok(FileHeader {
-            directory: magnitude_artifacts::gguf::read_header(&self.bytes(path)?)?,
+            directory: magnitude_artifacts::gguf::read_header(self.bytes(path)?)?,
             size,
         })
     }
@@ -484,8 +484,8 @@ impl ManagedModelCandidates {
             Reach::Hub => self.models()
                 .hugging_face_gguf_header(repository.as_str(), commit, file, &[]).await?.bytes,
         };
-        let (_, classified) = header_inspection(&header)?;
-        let variant_of = match ModelShape::from_header_prefix(&header) {
+        let (directory, classified) = header_inspection(header)?;
+        let variant_of = match ModelShape::from_header_directory(&directory) {
             Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),
             None => None,
         };
@@ -1079,22 +1079,33 @@ impl ManagedModelCandidates {
         })
     }
 
-    /// The repositories a GGUF names as its base models, from its cached facts.
+    /// The repositories a GGUF names as its base models: from its cached header when the header
+    /// cache holds it, else from its file's cached facts.
     fn header_lineage(&self, path: &Path, known: &BTreeMap<PathBuf, String>) -> BTreeSet<String> {
-        let base_models = match known
+        let base_models = known
             .get(path)
-            .and_then(|digest| self.models().cached_header(digest))
-        {
-            Some(header) => header_inspection(&header)
-                .map(|(_, inspection)| inspection.base_models)
-                .unwrap_or_default(),
-            None => self
-                .models()
-                .local_gguf(path)
-                .map(|gguf| gguf.inspection.base_models)
-                .unwrap_or_default(),
-        };
+            .and_then(|digest| {
+                self.read_cached(digest, |directory| {
+                    Some(magnitude_service_models::gguf::base_models(directory))
+                })
+            })
+            .unwrap_or_else(|| {
+                self.models()
+                    .local_gguf(path)
+                    .map(|gguf| gguf.inspection.base_models)
+                    .unwrap_or_default()
+            });
         base_model_repositories(&base_models)
+    }
+
+    /// `read` of the directory of the GGUF header with this digest, its tensors of types the
+    /// engine doesn't know left out, when the header cache holds it.
+    fn read_cached<T>(&self, digest: &str, read: impl Fn(&Directory) -> Option<T>) -> Option<T> {
+        let header = self.models().cached_header(digest)?;
+        let directory = magnitude_service_models::gguf::known_tensors(
+            magnitude_artifacts::gguf::read_header(header),
+        );
+        read(&directory.ok()?)
     }
 
     /// A resolved bundle's target (and projector) as material, identified by its exact package.
@@ -1673,8 +1684,8 @@ impl ManagedModelCandidates {
         let variant_of = self.inspection_variant_of(&versions).await;
         let catalog = &self.catalog_facts().await.fingerprints;
         let families = versions.iter().map(|version| {
-            let shape = self.models().cached_header(&version.group.header_digest)
-                .and_then(|header| ModelShape::from_header_prefix(&header))
+            let shape = self
+                .read_cached(&version.group.header_digest, ModelShape::from_header_directory)
                 .or_else(|| version.assessment.as_ref()?.fingerprint.as_ref().map(ModelShape::of));
             let family = version.catalog_model.clone().or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
             (version.model_id.clone(), family)
@@ -1971,8 +1982,7 @@ impl ManagedModelCandidates {
             return Some(catalog_model);
         }
         let header_shape = versions.iter().find_map(|version| {
-            let bytes = self.models().cached_header(&version.group.header_digest)?;
-            ModelShape::from_header_prefix(&bytes)
+            self.read_cached(&version.group.header_digest, ModelShape::from_header_directory)
         });
         match header_shape {
             Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),

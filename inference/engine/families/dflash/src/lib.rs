@@ -187,6 +187,8 @@ pub enum Error {
     },
     /// Metadata that is well typed but outside the admitted geometry.
     Geometry(String),
+    /// A metadata array whose payload doesn't read or decode.
+    Payload(String),
     /// The draft disagrees with its target's definition.
     Target(String),
     MissingWeight(String),
@@ -218,6 +220,7 @@ impl fmt::Display for Error {
                 write!(formatter, "draft metadata {key:?} must be {expected}")
             }
             Self::Geometry(message) => write!(formatter, "draft geometry: {message}"),
+            Self::Payload(message) => formatter.write_str(message),
             Self::Target(message) => write!(formatter, "draft and target disagree: {message}"),
             Self::MissingWeight(name) => write!(formatter, "missing draft weight {name:?}"),
             Self::WeightShape {
@@ -241,7 +244,7 @@ impl Error {
     /// outside what drafting admits, does not fit the target it was bound
     /// to; one that omits a key it needs names that key (its attention
     /// causality is one a published file may predate); one missing a weight
-    /// it needs is `Unreadable`.
+    /// it needs, or whose metadata payload doesn't read, is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
@@ -272,7 +275,7 @@ impl Error {
                 key,
                 expected: PRESENT,
             } => vec![UnsupportedReason::MissingMetadata { key: key.clone() }],
-            Self::MissingWeight(_) => vec![UnsupportedReason::Unreadable],
+            Self::MissingWeight(_) | Self::Payload(_) => vec![UnsupportedReason::Unreadable],
             Self::Metadata { key, .. } => {
                 vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
             }
@@ -314,6 +317,7 @@ impl From<HeaderError> for Error {
             | HeaderError::CompanionScale { .. }
             | HeaderError::Rotary { .. }
             | HeaderError::Yarn) => Self::Geometry(error.to_string()),
+            error @ HeaderError::Payload { .. } => Self::Payload(error.to_string()),
         }
     }
 }

@@ -114,7 +114,7 @@ fn deepseek41() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
     GzDecoder::new(DEEPSEEK41_VOCABULARY)
         .read_to_end(&mut header)
         .unwrap();
-    let tokenizer_payload = TokenizerPayload::from_directory(&read_header(&header).unwrap());
+    let tokenizer_payload = TokenizerPayload::from_directory(&read_header(header).unwrap());
     let tokenizer =
         ByteBpeTokenizer::new(gguf_byte_bpe(&tokenizer_payload, "test".into()).unwrap()).unwrap();
     let templates = gguf_templates(

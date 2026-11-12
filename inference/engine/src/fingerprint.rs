@@ -6,7 +6,7 @@
 //! catalog target it derives from when no lineage metadata does.
 
 use magnitude_artifacts::{
-    gguf::{Array, Directory, Value},
+    gguf::{Directory, Kind, Value},
     PackageHeaders,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 
 /// Versions the token-table digest: a change to what it hashes changes the tag.
-const TOKENIZER_DIGEST_TAG: &[u8] = b"magnitude.tokenizer-digest.v1";
+const TOKENIZER_DIGEST_TAG: &[u8] = b"magnitude.tokenizer-digest.v2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelFingerprint {
@@ -77,6 +77,8 @@ impl ModelFingerprint {
             match directory.value(&key) {
                 None => Ok(None),
                 Some(Value::Array(values)) => values
+                    .elements()
+                    .map_err(|error| FingerprintError::Artifact(error.to_string()))?
                     .iter()
                     .map(|value| {
                         value
@@ -137,21 +139,24 @@ impl ModelFingerprint {
     }
 }
 
-/// The lowercase hex sha256 of the version tag and every entry of
-/// `tokenizer.ggml.tokens` in order, each length-prefixed (u64
-/// little-endian) so no two tables share a digest.
+/// The lowercase hex sha256 of the version tag, length-prefixed (u64
+/// little-endian), then the sha256 of `tokenizer.ggml.tokens`'s payload
+/// ([`magnitude_artifacts::gguf::Array::digest`]): every entry in order,
+/// each length-prefixed, as a little-endian GGUF stores it, so no two tables
+/// share a digest. No entry is decoded.
 fn tokenizer_digest(directory: &Directory) -> Result<String, FingerprintError> {
     let key = "tokenizer.ggml.tokens";
     let tokens = match directory.value(key) {
-        Some(Value::Array(Array::String(tokens))) => tokens,
-        Some(Value::Array(_)) => return Err(FingerprintError::Invalid(key.into())),
-        _ => return Err(FingerprintError::Missing(key.into())),
+        Some(Value::Array(tokens)) if tokens.kind() == Kind::String => tokens,
+        Some(_) => return Err(FingerprintError::Invalid(key.into())),
+        None => return Err(FingerprintError::Missing(key.into())),
     };
+    let payload = tokens
+        .digest()
+        .map_err(|error| FingerprintError::Artifact(error.to_string()))?;
     let mut digest = Sha256::new();
     length_prefixed(&mut digest, TOKENIZER_DIGEST_TAG);
-    for token in tokens.iter() {
-        length_prefixed(&mut digest, token.as_bytes());
-    }
+    digest.update(payload);
     Ok(digest
         .finalize()
         .iter()

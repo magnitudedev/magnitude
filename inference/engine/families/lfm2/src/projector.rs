@@ -6,7 +6,7 @@
 
 use crate::Error;
 use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{projector_type, Tensors};
+use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
     RowRange, VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
@@ -65,7 +65,7 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     let Some(Value::Array(values)) = directory.value(key) else {
         return Err(invalid(format!("{key} must contain three numbers")));
     };
-    let values = values
+    let values = array_elements(key, values)?
         .iter()
         .map(|value| match value {
             Element::Float(value) if value.is_finite() => Some(value),
@@ -95,7 +95,7 @@ pub fn describe_projector(
     }
     // The tower's feed-forward is SwiGLU and its pixels are resampled
     // bicubically; anything else is another projector.
-    if directory.value("clip.use_silu") != Some(&Value::Scalar(Scalar::Bool(true)))
+    if !matches!(directory.value("clip.use_silu"), Some(Value::Scalar(Scalar::Bool(true))))
         || directory
             .value("clip.vision.image_resize_algo")
             .and_then(Value::string)

@@ -8,7 +8,8 @@ use crate::{
     Error,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct TokenizerPayload {
     pub metadata: Vec<Metadata>,
 }

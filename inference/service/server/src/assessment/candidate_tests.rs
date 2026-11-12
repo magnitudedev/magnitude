@@ -3325,18 +3325,17 @@ fn search_shapes_agree_with_engine_fingerprints() {
         .read_to_end(&mut header)
         .unwrap();
         let Ok(fingerprint) = magnitude_engine::fingerprint::ModelFingerprint::from_directory(
-            &magnitude_artifacts::gguf::read_header(&header).unwrap(),
+            &magnitude_artifacts::gguf::read_header(header.clone()).unwrap(),
         ) else {
             continue;
         };
         let fingerprint = crate::assessment::assessor::model_fingerprint(&fingerprint);
-        let shape = ModelShape::from_header_prefix(&header)
+        let shape = ModelShape::from_header_prefix(&Arc::new(header.to_vec()))
             .unwrap_or_else(|| panic!("{} has a shape", fixture.name));
         assert!(shape.matches(&fingerprint), "{}: {shape:?} {fingerprint:?}", fixture.name);
         compared += 1;
-        if let Some(prefix) =
-            ModelShape::from_header_prefix(&header[..header.len().min(SHAPE_PREFIX_BYTES)])
-        {
+        let prefix = header[..header.len().min(SHAPE_PREFIX_BYTES)].to_vec();
+        if let Some(prefix) = ModelShape::from_header_prefix(&Arc::new(prefix)) {
             assert_eq!(prefix, shape, "{}", fixture.name);
             from_prefix += 1;
         }
@@ -3355,7 +3354,7 @@ fn fixture_file(header: &str, path: &str) -> StubFile {
     )
     .read_to_end(&mut bytes)
     .expect("gzipped header");
-    let directory = magnitude_artifacts::gguf::read_header(&bytes).expect("GGUF header");
+    let directory = magnitude_artifacts::gguf::read_header(bytes.clone()).expect("GGUF header");
     let size_bytes = directory.data_offset
         + directory
             .tensors
@@ -4663,7 +4662,7 @@ async fn found_qwen_with_weights(
 /// A file's leading bytes: `header`, then zeros but where it locates the tensors a weight sample
 /// reads, which hold `weights`, a real file's weight sample.
 fn with_weights(header: &[u8], weights: &str) -> Vec<u8> {
-    let directory = magnitude_artifacts::gguf::read_header(header).expect("GGUF header");
+    let directory = magnitude_artifacts::gguf::read_header(header.to_vec()).expect("GGUF header");
     let reads = WeightSample::reads(&directory);
     let mut bytes = header.to_vec();
     for (tensor, values) in weight_sample(weights).tensors() {

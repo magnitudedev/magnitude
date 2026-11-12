@@ -14,7 +14,7 @@ use magnitude_artifacts::{
     gguf::{Directory, Element, Scalar, Value},
     UnsupportedReason,
 };
-use magnitude_family_common::architecture_keys;
+use magnitude_family_common::{architecture_keys, array_elements};
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
@@ -108,7 +108,7 @@ impl<'a> Metadata<'a> {
         let Value::Array(values) = self.value(key)? else {
             return Err(self.malformed(key, "an integer array"));
         };
-        values
+        array_elements(&self.key(key), values)?
             .iter()
             .map(|value| match value {
                 Element::Unsigned(n) => Some(n),
@@ -218,7 +218,7 @@ pub fn mixer_kinds(
         return Ok(by_interval(m.integer("full_attention_interval")?));
     };
     let flags = match flags {
-        Value::Array(flags) => flags
+        Value::Array(flags) => array_elements(&m.key(FLAGS), flags)?
             .iter()
             .map(|v| match v {
                 Element::Bool(recurrent) => Some(recurrent),
@@ -304,7 +304,7 @@ impl Geometry {
                 "Qwen rotary sections must contain four integers",
             ));
         };
-        let sections = sections
+        let sections = array_elements(&m.key("rope.dimension_sections"), sections)?
             .iter()
             .map(|v| match v {
                 Element::Unsigned(n) => Some(n),

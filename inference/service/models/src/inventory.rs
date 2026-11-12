@@ -2405,16 +2405,23 @@ impl ManagedModelStore {
         let mut read = None;
         let gguf = local_gguf_cached(&self.cache, path, |local| {
             self.write_header(&local.header);
-            read = Some(local.header.clone());
+            read = Some(local.header.to_vec());
         })?;
         if let Some(header) = read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest))
         {
             return Ok((gguf, header));
         }
-        let local = gguf::read_local(path)
+        let gguf::LocalGgufRead {
+            gguf,
+            header,
+            directory,
+        } = gguf::read_local(path)
             .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
-        self.write_header(&local.header);
-        Ok((local.gguf, local.header))
+        self.write_header(&header);
+        // The directory's arrays share the header's bytes; without them the bytes are the
+        // header's alone.
+        drop(directory);
+        Ok((gguf, Arc::unwrap_or_clone(header)))
     }
 
     /// The GGUF header with this digest, when the header cache holds it.

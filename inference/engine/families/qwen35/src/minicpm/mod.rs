@@ -3,7 +3,7 @@ pub mod inputs;
 
 use crate::{Error, invalid};
 use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{Tensors, architecture_keys, projector_type};
+use magnitude_family_common::{Tensors, architecture_keys, array_elements, projector_type};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
     VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
@@ -47,7 +47,7 @@ impl Reader<'_> {
         let Some(Value::Array(values)) = self.directory.value(key) else {
             return Err(invalid(format!("{key} must contain three numbers")));
         };
-        let values = values
+        let values = array_elements(key, values)?
             .iter()
             .map(|v| match v {
                 Element::Float(x) if x.is_finite() => Some(x),
@@ -104,7 +104,10 @@ pub fn describe_projector(
             "MiniCPM-V 16x intra-tower compression is not supported by this projector",
         ));
     }
-    if directory.value("clip.use_gelu") != Some(&Value::Scalar(Scalar::Bool(true))) {
+    if !matches!(
+        directory.value("clip.use_gelu"),
+        Some(Value::Scalar(Scalar::Bool(true)))
+    ) {
         return Err(invalid("MiniCPM-V requires the published GELU tower"));
     }
     let hidden = r.count("clip.vision.embedding_length")?;

@@ -5,7 +5,7 @@
 //! the header's own metadata and tensor directory.
 
 use magnitude_artifacts::{
-    gguf::{self, Array, Directory, Scalar, Value},
+    gguf::{self, Array, Directory, Elements, Scalar, Value},
     ArtifactIdentity, PackageIdentity,
 };
 use magnitude_family_common::{architecture_keys, Metadata};
@@ -36,7 +36,7 @@ fn header(compressed: &[u8]) -> Directory {
     flate2::read::GzDecoder::new(compressed)
         .read_to_end(&mut header)
         .unwrap();
-    gguf::read_header(&header).unwrap()
+    gguf::read_header(header).unwrap()
 }
 
 fn identity() -> PackageIdentity {
@@ -72,7 +72,10 @@ fn number(directory: &Directory, key: &str) -> f64 {
 
 fn numbers(directory: &Directory, key: &str) -> Vec<f64> {
     match value(directory, key) {
-        Value::Array(Array::Float(values)) => values.clone(),
+        Value::Array(array) => match array.elements() {
+            Ok(Elements::Float(values)) => values.clone(),
+            other => panic!("{key} holds {other:?}"),
+        },
         other => panic!("{key} is {other:?}"),
     }
 }
@@ -442,7 +445,7 @@ fn a_compressed_layer_without_a_source_is_invalid() {
     set(
         &mut directory,
         &ratios,
-        Value::Array(Array::Unsigned(vec![2, 0, 0, 0])),
+        Value::Array(Array::from(vec![2_u64, 0, 0, 0])),
     );
     let error = inspect(&directory).unwrap_err();
     assert!(
@@ -454,9 +457,12 @@ fn a_compressed_layer_without_a_source_is_invalid() {
 /// `deepseek41.<key>`'s nonnegative integers, of whichever integer type the
 /// header stores them in.
 fn counts(directory: &Directory, key: &str) -> Vec<u64> {
-    match value(directory, key) {
-        Value::Array(Array::Unsigned(values)) => values.clone(),
-        Value::Array(Array::Signed(values)) => values
+    let Value::Array(array) = value(directory, key) else {
+        panic!("{key} is no integer array");
+    };
+    match array.elements() {
+        Ok(Elements::Unsigned(values)) => values.clone(),
+        Ok(Elements::Signed(values)) => values
             .iter()
             .map(|value| u64::try_from(*value).unwrap_or_else(|_| panic!("{key} holds {value}")))
             .collect(),

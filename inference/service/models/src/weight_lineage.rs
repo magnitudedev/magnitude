@@ -228,7 +228,7 @@ impl ManagedModelStore {
     /// tensor data.
     pub fn local_weight_sample(&self, path: &Path) -> Result<Option<WeightSample>, InventoryError> {
         let (_, header) = self.local_gguf_header(path)?;
-        let directory = read_header(&header)
+        let directory = read_header(header)
             .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
         WeightSample::read_file(&directory, path)
             .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))
@@ -269,7 +269,7 @@ impl ManagedModelStore {
         let header = self
             .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file, &[])
             .await?;
-        let directory = read_header(&header.bytes)
+        let directory = read_header(header.bytes)
             .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
         let token = self.hub_token();
         let mut remote = RemoteRanges::new(
@@ -310,7 +310,7 @@ impl ManagedModelStore {
             &crate::remote_header::no_sharing,
         )
         .await?;
-        let directory = read_header(&header)
+        let directory = read_header(header)
             .map_err(|error| InventoryError::Integrity(format!("{model}@{digest}: {error}")))?;
         remote_weight_sample(&mut remote, &directory).await
     }
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn a_file_is_sampled_where_its_header_locates_the_tensors() {
         let header = crate::test_gguf::fixture_header("Qwen3.6-27B-Q4_K_M");
-        let directory = read_header(&header).expect("header");
+        let directory = read_header(header.clone()).expect("header");
         let expected = sample("Qwen3.6-27B-Q4_K_M");
         let folder = tempfile::tempdir().expect("folder");
         let path = folder.path().join("model.gguf");

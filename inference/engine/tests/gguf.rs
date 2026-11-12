@@ -166,7 +166,10 @@ fn arrays_are_held_by_their_element_type() {
         32,
     ))
     .unwrap();
-    let Some(Value::Array(gguf::Array::String(strings))) = d.value("pieces") else {
+    let Some(Value::Array(pieces)) = d.value("pieces") else {
+        panic!("an array");
+    };
+    let Ok(gguf::Elements::String(strings)) = pieces.elements() else {
         panic!("a text array is held as text");
     };
     assert_eq!(strings.iter().collect::<Vec<_>>(), ["a", "", "héllo"]);
@@ -327,22 +330,23 @@ fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
             .data_offset;
         let mut bytes = read.into_bytes();
         bytes.truncate(data_offset);
+        let bytes = std::sync::Arc::new(bytes);
         let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
             panic!("{name}: a whole header");
         };
 
-        let directory = match gguf::read_header(&bytes) {
+        let directory = match gguf::read_header(std::sync::Arc::clone(&bytes)) {
             Ok(directory) => directory,
             Err(Error::UnknownTensorTypes { directory, .. }) => *directory,
             Err(error) => panic!("{name}: {error}"),
         };
         assert_eq!(directory.data_offset, header.data_offset as u64, "{name}");
         assert_eq!(directory.alignment, header.alignment, "{name}");
-        assert_eq!(
-            directory.metadata,
-            header.entries.iter().map(gguf::Entry::metadata).collect::<Vec<_>>(),
-            "{name}"
-        );
+        let (prefix, open) = gguf::read_prefix(&bytes)
+            .unwrap()
+            .expect("a whole header's entries");
+        assert_eq!(open, None, "{name}");
+        assert_eq!(directory.metadata, prefix.metadata, "{name}");
         let known = header
             .tensors
             .iter()

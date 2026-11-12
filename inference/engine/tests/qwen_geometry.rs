@@ -1,5 +1,7 @@
 use magnitude_artifacts::{
-    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{
+        Array, ByteOrder, Directory, Encoding, Metadata, Scalar, Strings, TensorDescriptor, Value,
+    },
     ArtifactIdentity, PackageIdentity,
 };
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping};
@@ -295,7 +297,7 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
         ),
         (
             "tokenizer.ggml.tokens",
-            Value::Array(Array::String(pieces.into_iter().collect())),
+            Value::Array(Array::from(pieces.into_iter().collect::<Strings>())),
         ),
         (
             "tokenizer.ggml.token_type",
@@ -308,7 +310,7 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
         ),
         (
             "tokenizer.ggml.merges",
-            Value::Array(Array::String(Default::default())),
+            Value::Array(Array::from(Strings::default())),
         ),
         (
             "tokenizer.ggml.eos_token_id",
@@ -344,6 +346,7 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
             }
             Value::Array(values) => {
                 bytes.extend_from_slice(&9u32.to_le_bytes());
+                let values = values.elements().unwrap();
                 let element = values.iter().next().map(|value| kind(&value.to_scalar()));
                 bytes.extend_from_slice(&element.unwrap_or(8).to_le_bytes());
                 bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());

@@ -39,6 +39,12 @@ pub enum HeaderError {
     /// YaRN parameters outside their admitted ranges.
     Yarn,
     Definition(DefinitionError),
+    /// A metadata array whose payload doesn't read or decode
+    /// ([`crate::array_elements`]).
+    Payload {
+        key: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for HeaderError {
@@ -82,6 +88,7 @@ impl fmt::Display for HeaderError {
             ),
             Self::Yarn => formatter.write_str("invalid YaRN scaling"),
             Self::Definition(error) => error.fmt(formatter),
+            Self::Payload { key, detail } => write!(formatter, "metadata {key}: {detail}"),
         }
     }
 }
@@ -123,7 +130,10 @@ impl HeaderError {
             Self::MissingWeight(name) if name == OUTPUT_HEAD => {
                 vec![UnsupportedReason::TiedOutputHead]
             }
-            Self::MissingWeight(_) | Self::Rotary { .. } | Self::Definition(_) => {
+            Self::MissingWeight(_)
+            | Self::Rotary { .. }
+            | Self::Definition(_)
+            | Self::Payload { .. } => {
                 vec![UnsupportedReason::Unreadable]
             }
         }

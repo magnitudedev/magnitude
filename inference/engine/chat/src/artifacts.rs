@@ -5,19 +5,33 @@ use super::{
     TemplateVariant, TokenId, TokenizerError,
 };
 use magnitude_artifacts::{
-    gguf::{Array, Element, Scalar, Value as GgufValue},
+    gguf::{Array, Element, Elements, Kind, Scalar, Strings, Value as GgufValue},
     TemplatePayload, TokenizerPayload, UnsupportedReason,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String> {
+/// The text array `key`, decoded from the container's payload.
+fn text<'a>(payload: &'a TokenizerPayload, key: &str) -> Result<&'a Strings, String> {
     match payload.value(key) {
-        Some(GgufValue::Array(Array::String(values))) => {
-            Ok(values.iter().map(str::to_owned).collect())
+        Some(GgufValue::Array(values)) => {
+            match values.elements().map_err(|error| error.to_string())? {
+                Elements::String(values) => Ok(values),
+                _ => Err(format!("{key} requires strings")),
+            }
         }
-        Some(GgufValue::Array(_)) => Err(format!("{key} requires strings")),
         _ => Err(format!("missing string array {key}")),
     }
+}
+
+/// The elements of an array, decoded from the container's payload.
+fn elements(value: &Array) -> Result<&Elements, TokenizerError> {
+    value
+        .elements()
+        .map_err(|error| TokenizerError::Invalid(error.to_string()))
+}
+
+fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String> {
+    Ok(text(payload, key)?.iter().map(str::to_owned).collect())
 }
 
 /// Adapt literal package template sources and tokenizer special-token metadata
@@ -37,10 +51,12 @@ pub fn gguf_templates(
             },
         );
     }
-    let pieces = match tokenizer.value("tokenizer.ggml.tokens") {
-        Some(GgufValue::Array(Array::String(pieces))) => pieces,
-        Some(GgufValue::Array(_)) => return Err("tokenizer.ggml.tokens requires strings".into()),
-        _ => return Err("missing string array tokenizer.ggml.tokens".into()),
+    // Only the pieces the special-token IDs name are read, each alone.
+    let key = "tokenizer.ggml.tokens";
+    let pieces = match tokenizer.value(key) {
+        Some(GgufValue::Array(pieces)) if pieces.kind() == Kind::String => pieces,
+        Some(GgufValue::Array(_)) => return Err(format!("{key} requires strings")),
+        _ => return Err(format!("missing string array {key}")),
     };
     let mut tokens = BTreeMap::new();
     for (native, name) in [
@@ -57,9 +73,13 @@ pub fn gguf_templates(
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid special-token ID")?;
-            let piece = pieces
-                .get(id)
-                .ok_or("special-token ID outside vocabulary")?;
+            let Element::String(piece) = pieces
+                .element(id)
+                .map_err(|error| error.to_string())?
+                .ok_or("special-token ID outside vocabulary")?
+            else {
+                unreachable!("a text array's elements are text")
+            };
             tokens.insert(name.into(), piece.to_owned());
         }
     }
@@ -382,7 +402,7 @@ fn additional_eos(payload: &TokenizerPayload, vocabulary: usize) -> Result<Vec<T
     let key = "tokenizer.ggml.eos_token_ids";
     match payload.value(key) {
         None => Ok(Vec::new()),
-        Some(GgufValue::Array(values)) => values.iter().map(|value| {
+        Some(GgufValue::Array(values)) => elements(values)?.iter().map(|value| {
             match value {
                 Element::Unsigned(n) => u32::try_from(n).ok(),
                 Element::Signed(n) => u32::try_from(n).ok(),
@@ -403,7 +423,7 @@ pub fn gguf_byte_bpe(
     let (profile, _) = tokenizer_header(payload)?;
     let pieces = strings(payload, "tokenizer.ggml.tokens")?;
     let kinds = match payload.value("tokenizer.ggml.token_type") {
-        Some(GgufValue::Array(values)) => values
+        Some(GgufValue::Array(values)) => elements(values)?
             .iter()
             .map(|v| {
                 let kind = match v {
@@ -472,7 +492,7 @@ pub fn gguf_byte_bpe(
     };
     let suppressed_tokens = match payload.value("tokenizer.ggml.suppress_tokens") {
         None => BTreeSet::new(),
-        Some(GgufValue::Array(values)) => values
+        Some(GgufValue::Array(values)) => elements(values)?
             .iter()
             .map(|value| {
                 match value {
@@ -523,9 +543,46 @@ mod eos_tests {
         for values in [Array::from(vec![1_u64, 3]), Array::from(vec![1_i64, 3])] {
             assert_eq!(additional_eos(&payload(GgufValue::Array(values)), 4).unwrap(), vec![TokenId(1), TokenId(3)]);
         }
-        for values in [Array::from(vec![-1_i64]), Array::from(vec![4_u64]), Array::String(["1"].into_iter().collect())] {
+        for values in [
+            Array::from(vec![-1_i64]),
+            Array::from(vec![4_u64]),
+            Array::from(["1"].into_iter().collect::<Strings>()),
+        ] {
             assert!(additional_eos(&payload(GgufValue::Array(values)), 4).is_err());
         }
+    }
+
+    #[test]
+    fn tokens_read_from_a_header_decode_from_its_span_to_the_strings_written() {
+        use magnitude_artifacts::gguf::{
+            read_header, StoredHeader, StoredMetadata, StoredType, ValueType,
+        };
+        let pieces = ["<s>", "", "héllo", " world", "\u{1F600}"];
+        let built = Array::from(pieces.into_iter().collect::<Strings>());
+        let header = StoredHeader::new(
+            3,
+            vec![StoredMetadata {
+                metadata: Metadata {
+                    name: "tokenizer.ggml.tokens".into(),
+                    value: GgufValue::Array(built.clone()),
+                },
+                stored: StoredType::Array(ValueType::String),
+            }],
+            [],
+        )
+        .unwrap();
+        let read =
+            TokenizerPayload::from_directory(&read_header(header.encode().unwrap()).unwrap());
+        let built = TokenizerPayload {
+            metadata: vec![Metadata {
+                name: "tokenizer.ggml.tokens".into(),
+                value: GgufValue::Array(built),
+            }],
+        };
+        let decoded = strings(&read, "tokenizer.ggml.tokens").unwrap();
+        assert_eq!(decoded, pieces);
+        assert_eq!(decoded, strings(&built, "tokenizer.ggml.tokens").unwrap());
+        assert_eq!(read, built);
     }
 }
 
@@ -538,7 +595,7 @@ mod normalization_tests {
     /// declaration `nfc` when it has one.
     fn payload(pre: &str, nfc: Option<bool>) -> TokenizerPayload {
         let text = |value: &str| GgufValue::Scalar(Scalar::String(value.into()));
-        let strings = |values: &[&str]| GgufValue::Array(Array::String(values.iter().copied().collect()));
+        let strings = |values: &[&str]| GgufValue::Array(Array::from(values.iter().copied().collect::<Strings>()));
         let mut metadata = vec![
             Metadata { name: "tokenizer.ggml.model".into(), value: text("gpt2") },
             Metadata { name: "tokenizer.ggml.pre".into(), value: text(pre) },

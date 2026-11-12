@@ -212,13 +212,15 @@ impl<'a> Slicer<'a> {
         let metadata = self
             .per_layer_keys
             .iter()
-            .map(|key| match self.gguf.first().value(key) {
-                Some(Value::Array(array)) => {
-                    Entry::from(array.get(layer).expect("a per-layer entry"))
+            .map(|key| -> anyhow::Result<Entry> {
+                match self.gguf.first().value(key) {
+                    Some(Value::Array(array)) => Ok(Entry::from(
+                        array.elements()?.get(layer).expect("a per-layer entry"),
+                    )),
+                    _ => unreachable!("a per-layer key names an array"),
                 }
-                _ => unreachable!("a per-layer key names an array"),
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
         Ok(Variant { tensors, metadata })
     }
 
@@ -271,6 +273,7 @@ impl<'a> Slicer<'a> {
                 let Value::Array(array) = value else {
                     unreachable!("a per-layer key names an array")
                 };
+                let array = array.elements()?;
                 *value =
                     Value::Array(Array::of(kept.iter().map(|layer| {
                         array.get(*layer).expect("a per-layer entry").to_scalar()

@@ -190,7 +190,8 @@ impl From<HeaderError> for Error {
             }
             error @ (HeaderError::MetadataType { .. }
             | HeaderError::Rotary { .. }
-            | HeaderError::Yarn) => metadata_error(error.to_string()),
+            | HeaderError::Yarn
+            | HeaderError::Payload { .. }) => metadata_error(error.to_string()),
         }
     }
 }

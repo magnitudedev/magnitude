@@ -13,6 +13,12 @@ pub enum Error {
         types: Vec<(u32, u32)>,
         directory: Box<crate::gguf::Directory>,
     },
+    /// A metadata array's payload that ends before the elements its count names.
+    ShortPayload,
+    /// A metadata array's payload that holds bytes past the elements its count names.
+    TrailingPayload,
+    /// A digest asked of a metadata array that isn't text ([`crate::gguf::Array::digest`]).
+    DigestOfNonText,
 }
 
 impl fmt::Display for Error {
@@ -21,6 +27,13 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(f, "artifact source: {error}"),
             Self::Invalid(message) => f.write_str(message),
             Self::Truncated { offset } => write!(f, "truncated GGUF header at byte {offset}"),
+            Self::ShortPayload => {
+                f.write_str("a GGUF metadata array's payload ends before its elements")
+            }
+            Self::TrailingPayload => {
+                f.write_str("a GGUF metadata array's payload holds bytes past its elements")
+            }
+            Self::DigestOfNonText => f.write_str("only a GGUF text array has a digest"),
             Self::UnknownTensorTypes { types, .. } => write!(
                 f,
                 "unknown GGUF tensor types {}",
@@ -48,10 +61,14 @@ impl Error {
     /// as opposed to a source that could not be read.
     pub fn unreadable(&self) -> bool {
         match self {
-            Self::Invalid(_) | Self::Truncated { .. } => true,
+            Self::Invalid(_)
+            | Self::Truncated { .. }
+            | Self::ShortPayload
+            | Self::TrailingPayload => true,
             Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
             Self::AmbiguousProjectors(_)
-            | Self::UnknownTensorTypes { .. } => false,
+            | Self::UnknownTensorTypes { .. }
+            | Self::DigestOfNonText => false,
         }
     }
 
@@ -80,7 +97,10 @@ impl std::error::Error for Error {
             Self::Invalid(_)
             | Self::Truncated { .. }
             | Self::AmbiguousProjectors(_)
-            | Self::UnknownTensorTypes { .. } => None,
+            | Self::UnknownTensorTypes { .. }
+            | Self::ShortPayload
+            | Self::TrailingPayload
+            | Self::DigestOfNonText => None,
         }
     }
 }

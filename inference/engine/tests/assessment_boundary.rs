@@ -518,7 +518,7 @@ fn independent_checks_report_every_reason_together() {
 #[test]
 fn a_header_refuses_what_admission_does_without_its_weight_types() {
     let directory =
-        |gguf: &Gguf| magnitude_artifacts::gguf::read_header(&gguf.bytes()).expect("header");
+        |gguf: &Gguf| magnitude_artifacts::gguf::read_header(gguf.bytes()).expect("header");
     let reasons = |gguf: &Gguf, extent| {
         header_refusal(&directory(gguf), extent).map(|refusal| refusal.reasons)
     };
@@ -648,8 +648,9 @@ fn the_fingerprint_reads_the_header_shape_and_the_token_table() {
     let with_heads = with_heads.write(&scratch.file("with-heads.gguf"));
     assert_eq!(ModelFingerprint::from_path(&with_heads).unwrap(), fingerprint);
 
-    // The digest is pinned: sha256 over the length-prefixed version tag and
-    // tokens.
+    // The digest is pinned (v2): sha256 over the length-prefixed version tag
+    // then the sha256 of the tokens as GGUF stores them, each length-prefixed
+    // (u64 little-endian).
     let mut small = llama();
     small.set(
         "tokenizer.ggml.tokens",
@@ -660,7 +661,7 @@ fn the_fingerprint_reads_the_header_shape_and_the_token_table() {
         ModelFingerprint::from_path(&small)
             .unwrap()
             .tokenizer_digest,
-        "eebfe72455238a43be77d699ab93425a2fc9ac6debeeabd32a4ac7ab96b7ceb7"
+        "072618fc0137f33ae5c873995892a5b2dbe6f44c34752b91bc8f39cf89c4e524"
     );
 
     // Absent key-value heads and key length are derived; per-layer counts

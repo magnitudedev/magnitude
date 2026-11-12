@@ -1,6 +1,6 @@
 use magnitude_artifacts::{
     catalog_headers::ComponentRole,
-    gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, Directory, Elements, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity, TokenId,
 };
 use magnitude_family_common::headers::{self, Header};
@@ -502,11 +502,14 @@ fn signed_tap_indices_bind_as_unsigned_ones_do() {
         .iter_mut()
         .find(|item| item.name == "dflash.target_layers")
         .unwrap();
-    let Value::Array(Array::Signed(values)) = &layers.value else {
+    let Value::Array(array) = &layers.value else {
+        panic!("the published target layers are an array");
+    };
+    let Ok(Elements::Signed(values)) = array.elements() else {
         panic!("the published target layers are a signed array");
     };
-    layers.value = Value::Array(Array::Unsigned(
-        values.iter().map(|&layer| layer as u64).collect(),
+    layers.value = Value::Array(Array::from(
+        values.iter().map(|&layer| layer as u64).collect::<Vec<_>>(),
     ));
     assert_eq!(inspect_qwen(&directory, &model).unwrap(), signed);
     let layers = directory

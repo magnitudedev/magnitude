@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use magnitude_artifacts::gguf::{
-    Directory, Entry, PROJECTOR_ARCHITECTURE, StoredType, Value, ValueType, Walk, read_header,
-    walk,
+    Directory, Kind, PROJECTOR_ARCHITECTURE, StoredType, Value, ValueType, Walk, read_header,
+    read_prefix, walk,
 };
 use magnitude_service_contracts::models::{ModelFingerprint, ModelId, UnsupportedReason};
 use magnitude_service_contracts::{
@@ -128,31 +128,18 @@ pub(crate) enum RepositoryModel {
 }
 
 /// The header metadata in a GGUF prefix: its complete entries, as a header of their own without
-/// tensors, and the token list's element count when the prefix reaches it.
-fn prefix_metadata(bytes: &[u8]) -> Option<(Directory, Option<u64>)> {
-    let (preamble, entries, alignment, open) = match walk(bytes).ok()? {
-        Walk::Complete(header) => (header.preamble, header.entries, header.alignment, None),
-        Walk::Incomplete(prefix) => (
-            prefix.preamble?,
-            prefix.entries,
-            prefix.alignment,
-            prefix.open,
-        ),
-    };
-    let vocab_size = entries
-        .iter()
-        .map(|entry| entry.head())
-        .chain(open)
-        .find(|head| head.key == TOKENS_KEY)
-        .filter(|head| head.stored == StoredType::Array(ValueType::String))
-        .map(|head| head.count);
-    let directory = Directory {
-        version: preamble.version,
-        byte_order: preamble.byte_order,
-        alignment,
-        data_offset: (entries.last()?.end as u64).next_multiple_of(alignment),
-        metadata: entries.iter().map(Entry::metadata).collect(),
-        tensors: Vec::new(),
+/// tensors ([`read_prefix`]), and the token list's element count when the prefix reaches it.
+fn prefix_metadata(bytes: &Arc<Vec<u8>>) -> Option<(Directory, Option<u64>)> {
+    let (directory, open) = read_prefix(bytes).ok()??;
+    let vocab_size = match directory.value(TOKENS_KEY) {
+        Some(Value::Array(tokens)) => {
+            (tokens.kind() == Kind::String).then_some(tokens.len() as u64)
+        }
+        _ => open
+            .filter(|head| {
+                head.key == TOKENS_KEY && head.stored == StoredType::Array(ValueType::String)
+            })
+            .map(|head| head.count),
     };
     Some((directory, vocab_size))
 }
@@ -163,10 +150,22 @@ impl ModelShape {
     /// read the way the engine reads its fingerprint: the decoder's block count without MTP prediction
     /// layers, a per-layer count as its largest layer's, an absent key-value head count as the
     /// head count, an absent key length as the embedding length per head, and a zero expert count
-    /// as a dense model.
-    pub fn from_header_prefix(bytes: &[u8]) -> Option<Self> {
+    /// as a dense model. A prefix whose metadata doesn't decode, like one that doesn't walk, states
+    /// no shape.
+    pub fn from_header_prefix(bytes: &Arc<Vec<u8>>) -> Option<Self> {
         let (directory, vocab_size) = prefix_metadata(bytes)?;
         Self::from_directory(&directory, vocab_size?)
+    }
+
+    /// The shape of a whole header's directory, as [`Self::from_header_prefix`] reads it, its
+    /// vocabulary the token list's element count.
+    pub fn from_header_directory(directory: &Directory) -> Option<Self> {
+        match directory.value(TOKENS_KEY) {
+            Some(Value::Array(tokens)) if tokens.kind() == Kind::String => {
+                Self::from_directory(directory, tokens.len() as u64)
+            }
+            _ => None,
+        }
     }
 
     fn from_directory(directory: &Directory, vocab_size: u64) -> Option<Self> {
@@ -178,6 +177,7 @@ impl ModelShape {
             match directory.value(&format!("{architecture}.{name}")) {
                 None => Some(None),
                 Some(Value::Array(values)) => {
+                    let values = values.elements().ok()?;
                     values.iter().try_fold(None, |largest: Option<u64>, value| {
                         Some(Some(largest.unwrap_or(0).max(value.unsigned()?)))
                     })
@@ -417,9 +417,11 @@ async fn read_repository_model(
     let mut projectors_only = true;
     for group in groups.iter().take(MAX_MODEL_FILE_READS) {
         let primary = group.primary();
-        let prefix = models
-            .read_prefix(repository, commit, &primary.path)
-            .await?;
+        let prefix = Arc::new(
+            models
+                .read_prefix(repository, commit, &primary.path)
+                .await?,
+        );
         read_any = true;
         let metadata = prefix_metadata(&prefix).map(|(directory, _)| directory);
         let architecture = metadata.as_ref().and_then(|directory| {
@@ -428,11 +430,16 @@ async fn read_repository_model(
                 .and_then(Value::string)
                 .map(ToOwned::to_owned)
         });
+        let tags = metadata
+            .as_ref()
+            .map(crate::gguf::header_tags)
+            .transpose()
+            .map_err(|error| InventoryError::Integrity(error.to_string()))?;
         let file = match (&architecture, &metadata) {
             (Some(architecture), _) if architecture == PROJECTOR_ARCHITECTURE => FileKind::Projector,
-            (Some(architecture), Some(directory))
+            (Some(architecture), Some(_))
                 if architectures
-                    .declares_drafter(architecture, &crate::gguf::header_tags(directory)) =>
+                    .declares_drafter(architecture, tags.as_deref().unwrap_or_default()) =>
             {
                 FileKind::Drafter
             }
@@ -478,7 +485,7 @@ async fn read_repository_model(
             _ => true,
         };
         let (shape, whole) = match settled {
-            true => (prefix_shape, complete.then_some(prefix.as_slice())),
+            true => (prefix_shape, complete),
             false => {
                 // The header's metadata only: the remote reader walks the tensor directory's
                 // layout but never judges its tensor types, which inspection decides. The
@@ -505,14 +512,15 @@ async fn read_repository_model(
                 let sharing = crate::remote_header::cached_sharing(&models.cache);
                 match crate::remote_header::read_header(&mut remote, &references, &sharing).await {
                     Ok(header) => {
+                        let header = Arc::new(header);
                         return Ok(RepositoryModel::Model {
                             shape: ModelShape::from_header_prefix(&header),
-                            unsupported: header_refusal(verdicts, &header, Some(&header)),
+                            unsupported: header_refusal(verdicts, &header, true),
                             architecture,
                             base_repositories,
                         });
                     }
-                    Err(InventoryError::Integrity(_)) => (prefix_shape, None),
+                    Err(InventoryError::Integrity(_)) => (prefix_shape, false),
                     Err(error) => return Err(error),
                 }
             }
@@ -539,14 +547,17 @@ async fn read_repository_model(
     }
 }
 
-/// The engine's refusal of the header search holds: the `whole` header when it was read (and parses
-/// through its tensor directory), else the leading metadata entries of `prefix`.
+/// The engine's refusal of the header search holds: the whole header when `prefix` is all of it
+/// (`whole`, and it parses through its tensor directory), else its leading metadata entries.
 fn header_refusal(
     verdicts: &dyn HeaderVerdicts,
-    prefix: &[u8],
-    whole: Option<&[u8]>,
+    prefix: &Arc<Vec<u8>>,
+    whole: bool,
 ) -> Vec<UnsupportedReason> {
-    if let Some(directory) = whole.and_then(|header| read_header(header).ok()) {
+    if let Some(directory) = whole
+        .then(|| read_header(Arc::clone(prefix)).ok())
+        .flatten()
+    {
         return verdicts.refusal(&directory, HeaderExtent::Whole);
     }
     prefix_metadata(prefix)
@@ -611,6 +622,11 @@ mod tests {
         assert_eq!(version_count([Path::new("mmproj-F16.gguf")]), None);
     }
 
+    /// The shape [`ModelShape::from_header_prefix`] reads from `bytes`.
+    fn shape_of(bytes: &[u8]) -> Option<ModelShape> {
+        ModelShape::from_header_prefix(&std::sync::Arc::new(bytes.to_vec()))
+    }
+
     #[test]
     fn a_prefix_ending_inside_the_token_list_has_the_whole_header_s_shape() {
         for name in [
@@ -619,9 +635,9 @@ mod tests {
             "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004",
         ] {
             let header = fixture_header(name);
-            let whole = ModelShape::from_header_prefix(&header).expect(name);
+            let whole = shape_of(&header).expect(name);
             assert_eq!(
-                ModelShape::from_header_prefix(&header[..SHAPE_PREFIX_BYTES]).as_ref(),
+                shape_of(&header[..SHAPE_PREFIX_BYTES]).as_ref(),
                 Some(&whole),
                 "{name}"
             );
@@ -630,9 +646,7 @@ mod tests {
 
     #[test]
     fn finetunes_share_their_base_s_shape_and_other_models_do_not() {
-        let shape = |name: &str| {
-            ModelShape::from_header_prefix(&fixture_header(name)[..SHAPE_PREFIX_BYTES]).unwrap()
-        };
+        let shape = |name: &str| shape_of(&fixture_header(name)[..SHAPE_PREFIX_BYTES]).unwrap();
         let gemma = shape("gemma-4-E2B-it-qat-UD-Q4_K_XL");
         assert_eq!(
             shape("Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P"),
@@ -648,7 +662,7 @@ mod tests {
     #[test]
     fn a_prefix_that_ends_before_the_token_count_has_no_shape() {
         let header = fixture_header("gemma-4-E2B-it-qat-UD-Q4_K_XL");
-        assert_eq!(ModelShape::from_header_prefix(&header[..512]), None);
-        assert_eq!(ModelShape::from_header_prefix(b"not a gguf"), None);
+        assert_eq!(shape_of(&header[..512]), None);
+        assert_eq!(shape_of(b"not a gguf"), None);
     }
 }

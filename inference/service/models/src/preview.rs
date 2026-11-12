@@ -1865,13 +1865,15 @@ async fn fetch_header(
 /// A complete header and whether the engine's parser accepts it, or why not.
 async fn header_verdict(header: Vec<u8>) -> Result<(Vec<u8>, Result<(), String>), InventoryError> {
     magnitude_service_utils::blocking::run(move || {
+        let header = Arc::new(header);
         let verdict = match header_prefix(&header) {
             Ok(HeaderPrefix::Complete(length)) if length >= header.len() => Ok(()),
             Ok(_) => Err("the GGUF header's layout is inconsistent".to_owned()),
             Err(InventoryError::Integrity(detail)) => Err(detail),
             Err(error) => return Err(error),
         };
-        Ok((header, verdict))
+        // The directory read for the verdict, which shared the bytes, is gone.
+        Ok((Arc::unwrap_or_clone(header), verdict))
     })
     .await
 }
@@ -1885,8 +1887,8 @@ pub(crate) enum HeaderPrefix {
 /// The aligned tensor-data offset of a GGUF prefix, `Truncated` when the prefix ends before the
 /// header does, or an integrity error when the header itself is invalid: reading further can't
 /// change that verdict.
-pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryError> {
-    let parsed = magnitude_artifacts::gguf::read_header(prefix).and_then(|directory| {
+pub(crate) fn header_prefix(prefix: &Arc<Vec<u8>>) -> Result<HeaderPrefix, InventoryError> {
+    let parsed = magnitude_artifacts::gguf::read_header(Arc::clone(prefix)).and_then(|directory| {
         directory.require_execution_byte_order()?;
         Ok(directory)
     });
@@ -1904,7 +1906,7 @@ pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryErro
 /// hold the whole header.
 #[cfg(test)]
 fn header_length(prefix: &[u8]) -> Result<usize, InventoryError> {
-    match header_prefix(prefix)? {
+    match header_prefix(&Arc::new(prefix.to_vec()))? {
         HeaderPrefix::Complete(length) => Ok(length),
         HeaderPrefix::Truncated => Err(InventoryError::Integrity(
             "the GGUF prefix ends before its header".to_owned(),
@@ -2406,7 +2408,7 @@ impl ManagedModelStore {
                     Some(header) => header,
                     None => self.local_gguf_header(path)?.1,
                 };
-                crate::candidate_files::classify_header(&header, architectures)?
+                crate::candidate_files::classify_header(header, architectures)?
             }
         };
         self.cache
@@ -2435,7 +2437,7 @@ impl ManagedModelStore {
             .await?;
         let classifier = architectures.clone();
         let classification = magnitude_service_utils::blocking::run(move || {
-            crate::candidate_files::classify_header(&header.bytes, &classifier)
+            crate::candidate_files::classify_header(header.bytes, &classifier)
         })
         .await?;
         self.cache.write_index(
@@ -2591,6 +2593,11 @@ impl ManagedModelStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape [`crate::search_shape::ModelShape::from_header_prefix`] reads from `bytes`.
+    fn shape_of(bytes: &[u8]) -> Option<crate::search_shape::ModelShape> {
+        crate::search_shape::ModelShape::from_header_prefix(&Arc::new(bytes.to_vec()))
+    }
     use std::fs;
 
     use magnitude_service_contracts::{HuggingFaceRecommendedVersion, LocalDeclaration};
@@ -3368,7 +3375,10 @@ mod tests {
                 "the file ends before its aligned data offset"
             );
             assert!(
-                matches!(header_prefix(&file), Ok(HeaderPrefix::Complete(length)) if length > file.len())
+                matches!(
+                    header_prefix(&Arc::new(file.clone())),
+                    Ok(HeaderPrefix::Complete(length)) if length > file.len()
+                )
             );
             let size = u64::try_from(file.len()).unwrap();
             let (endpoint, _, _) = serve_ranges(vec![("model-00001-of-00006.gguf", file.clone())]);
@@ -4504,7 +4514,8 @@ mod tests {
     }
 
     fn catalog_fingerprint(fixture: &str) -> ModelFingerprint {
-        crate::search_shape::ModelShape::from_header_prefix(&crate::test_gguf::fixture_header(fixture))
+        let header = Arc::new(crate::test_gguf::fixture_header(fixture));
+        crate::search_shape::ModelShape::from_header_prefix(&header)
             .unwrap()
             .fingerprint()
     }
@@ -4692,7 +4703,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_near_miss_is_read_from_the_whole_header_where_later_keys_settle_it() {
-        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::search_shape::SHAPE_PREFIX_BYTES;
         use crate::test_gguf::fixture_header;
         use magnitude_artifacts::gguf::{Walk, walk};
         let fixture = "Qwen3.5-4B-Q3_K_M";
@@ -4707,10 +4718,10 @@ mod tests {
         moved.extend_from_slice(&header[nextn.end..tokens.end]);
         moved.extend_from_slice(&header[nextn.head().start..nextn.end]);
         moved.extend_from_slice(&header[tokens.end..]);
-        let prefix_shape = ModelShape::from_header_prefix(&moved[..SHAPE_PREFIX_BYTES]).unwrap();
-        let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();
+        let prefix_shape = shape_of(&moved[..SHAPE_PREFIX_BYTES]).unwrap();
+        let catalog_shape = shape_of(&header).unwrap();
         assert_ne!(prefix_shape, catalog_shape, "the prefix counts the MTP layer as a block");
-        assert_eq!(ModelShape::from_header_prefix(&moved), Some(catalog_shape.clone()));
+        assert_eq!(shape_of(&moved), Some(catalog_shape.clone()));
         let length = moved.len() as u64;
         let (endpoint, _, sent) = serve_repositories(vec![
             StubRepository::new("someone/Qwen3.5-4B-MTP-GGUF", Some("qwen35"))
@@ -4730,11 +4741,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unknown_tensor_type_never_affects_the_shape() {
-        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::search_shape::SHAPE_PREFIX_BYTES;
         use crate::test_gguf::fixture_header;
         let fixture = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS";
         let mut header = fixture_header(fixture);
-        let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();
+        let catalog_shape = shape_of(&header).unwrap();
         // The output head's type becomes one no parser knows, as a new quantization's would be.
         let name = b"output.weight";
         let at = header
@@ -4746,8 +4757,8 @@ mod tests {
         let rank = u32::from_le_bytes(header[at..at + 4].try_into().unwrap()) as usize;
         let encoding = at + 4 + 8 * rank;
         header[encoding..encoding + 4].copy_from_slice(&200_u32.to_le_bytes());
-        assert!(magnitude_artifacts::gguf::read_header(&header).is_err());
-        assert_eq!(ModelShape::from_header_prefix(&header[..SHAPE_PREFIX_BYTES]), None);
+        assert!(magnitude_artifacts::gguf::read_header(header.clone()).is_err());
+        assert_eq!(shape_of(&header[..SHAPE_PREFIX_BYTES]), None);
         let length = header.len() as u64;
         let (endpoint, _, _) = serve_repositories(vec![
             StubRepository::new("someone/Bonsai-27B-GGUF", Some("qwen35"))
@@ -5126,13 +5137,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shape_keys_after_the_token_list_are_read_from_the_whole_header() {
-        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::search_shape::SHAPE_PREFIX_BYTES;
         use crate::test_gguf::fixture_header;
         use std::sync::atomic::Ordering;
         let fixture = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS";
         let header = fixture_header(fixture);
         assert_eq!(
-            ModelShape::from_header_prefix(&header[..SHAPE_PREFIX_BYTES]),
+            shape_of(&header[..SHAPE_PREFIX_BYTES]),
             None,
             "this writer puts the embedding length and head counts after the token list"
         );

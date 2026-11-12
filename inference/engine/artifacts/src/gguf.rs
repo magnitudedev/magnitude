@@ -5,17 +5,21 @@
 
 use crate::{ArtifactIdentity, Error, FileSource};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    fmt,
     io::{Read, Seek, SeekFrom},
+    ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 mod walk;
 
 pub use walk::{
-    Entry, EntryHead, HEADER_LIMIT, Header, HeaderBytes, Preamble, Prefix, TensorInfo, Walk, walk,
+    walk, Entry, EntryHead, Header, HeaderBytes, Preamble, Prefix, SharedHeader, TensorInfo, Walk,
+    HEADER_LIMIT,
 };
 
 /// The `general.architecture` a multimodal projector declares.
@@ -38,18 +42,57 @@ pub enum Scalar {
     Float(f64),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub enum Value {
     Scalar(Scalar),
     Array(Array),
 }
 
-/// One GGUF metadata array. A GGUF array has a single element type, so its elements are held
-/// unboxed in one buffer of that type rather than as a [`Scalar`] (and, for text, an allocation)
-/// apiece: a tokenizer's hundreds of thousands of pieces, merges, scores and kinds then take about
-/// the bytes they occupy in the file, where boxed scalars took several times that.
+/// One GGUF metadata array: how many elements it holds, what kind ([`Self::kind`]), and the
+/// elements ([`Self::elements`]).
+///
+/// An array read from a header holds its payload as the bytes it occupies there, a span of the
+/// header's bytes shared by every array read from them. It decodes and checks the payload the
+/// first time its elements are read, and its clones share that result. An array
+/// built in code, or detached from its header ([`Directory::detach`]), holds its elements alone,
+/// shared by its clones.
+#[derive(Clone)]
+pub struct Array(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    Decoded(Arc<Elements>),
+    Stored(Arc<Stored>),
+}
+
+/// An array read from a header: `count` elements stored as `stored` in `order`, its payload
+/// `bytes[range]`, shared with every other array read from them.
+struct Stored {
+    stored: ValueType,
+    order: ByteOrder,
+    count: usize,
+    bytes: Arc<Vec<u8>>,
+    range: Range<usize>,
+    decoded: OnceLock<Elements>,
+}
+
+/// What the elements of an array are, known whether or not its payload has been read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    String,
+    Bool,
+    Unsigned,
+    Signed,
+    Float,
+}
+
+/// The elements of a GGUF metadata array. A GGUF array has a single element type, so its elements
+/// are held unboxed in one buffer of that type rather than as a [`Scalar`] (and, for text, an
+/// allocation) apiece: a tokenizer's hundreds of thousands of pieces, merges, scores and kinds then
+/// take about the bytes they occupy in the file, where boxed scalars took several times that.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Array {
+pub enum Elements {
     String(Strings),
     Bool(Vec<bool>),
     Unsigned(Vec<u64>),
@@ -64,7 +107,7 @@ pub struct Strings {
     ends: Vec<u32>,
 }
 
-/// One element of an [`Array`].
+/// One element of an [`Elements`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Element<'a> {
     String(&'a str),
@@ -75,6 +118,14 @@ pub enum Element<'a> {
 }
 
 impl Strings {
+    /// Room for `count` strings of `text` bytes in all.
+    fn with_capacity(count: usize, text: usize) -> Self {
+        Self {
+            text: String::with_capacity(text),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
     fn push(&mut self, value: &str) -> Result<(), Error> {
         self.text.push_str(value);
         self.ends.push(
@@ -117,7 +168,17 @@ impl<S: AsRef<str>> FromIterator<S> for Strings {
     }
 }
 
-impl Array {
+impl Elements {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::String(_) => Kind::String,
+            Self::Bool(_) => Kind::Bool,
+            Self::Unsigned(_) => Kind::Unsigned,
+            Self::Signed(_) => Kind::Signed,
+            Self::Float(_) => Kind::Float,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::String(values) => values.len(),
@@ -145,13 +206,143 @@ impl Array {
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Element<'_>> + '_ {
         (0..self.len()).map(|index| self.get(index).expect("an index below the length"))
     }
+}
+
+impl Stored {
+    fn payload(&self) -> &[u8] {
+        &self.bytes[self.range.clone()]
+    }
+}
+
+impl Array {
+    /// The array of `count` elements stored as `stored` in `order`, whose payload is
+    /// `bytes[range]`, which the walk hopped as that many such elements.
+    fn held(
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    ) -> Self {
+        Self(Repr::Stored(Arc::new(Stored {
+            stored,
+            order,
+            count,
+            bytes,
+            range,
+            decoded: OnceLock::new(),
+        })))
+    }
+
+    /// How many elements the array holds, known whether or not its payload has been read.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Repr::Decoded(elements) => elements.len(),
+            Repr::Stored(stored) => stored.count,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What the array's elements are, known whether or not its payload has been read.
+    pub fn kind(&self) -> Kind {
+        match &self.0 {
+            Repr::Decoded(elements) => elements.kind(),
+            Repr::Stored(stored) => stored.stored.kind(),
+        }
+    }
+
+    /// The array's elements, decoded from its payload (and checked: text must be UTF-8 and
+    /// booleans 0 or 1) the first time any clone of it reads them.
+    pub fn elements(&self) -> Result<&Elements, Error> {
+        match &self.0 {
+            Repr::Decoded(elements) => Ok(elements.as_ref()),
+            Repr::Stored(stored) => {
+                if let Some(elements) = stored.decoded.get() {
+                    return Ok(elements);
+                }
+                let elements =
+                    walk::decode(stored.stored, stored.order, stored.count, stored.payload())?;
+                Ok(stored.decoded.get_or_init(|| elements))
+            }
+        }
+    }
+
+    /// The element at `index`, checked as [`Self::elements`] checks it: from the decoded elements
+    /// when they are, else decoded alone from the payload, the elements before it passed by their
+    /// lengths. `None` past the end.
+    pub fn element(&self, index: usize) -> Result<Option<Element<'_>>, Error> {
+        match &self.0 {
+            Repr::Decoded(elements) => Ok(elements.get(index)),
+            Repr::Stored(stored) => match stored.decoded.get() {
+                Some(elements) => Ok(elements.get(index)),
+                None if index < stored.count => {
+                    walk::element(stored.stored, stored.order, stored.payload(), index).map(Some)
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Makes this array hold its elements alone ([`Directory::detach`]): elements already
+    /// decoded are moved out of the payload's holder when no clone shares it, and copied only
+    /// when one does.
+    fn detach(&mut self) -> Result<(), Error> {
+        let Repr::Stored(stored) = &mut self.0 else {
+            return Ok(());
+        };
+        let elements = match Arc::get_mut(stored) {
+            Some(owned) => match owned.decoded.take() {
+                Some(elements) => elements,
+                None => walk::decode(owned.stored, owned.order, owned.count, owned.payload())?,
+            },
+            None => Self(Repr::Stored(Arc::clone(stored))).elements()?.clone(),
+        };
+        self.0 = Repr::Decoded(Arc::new(elements));
+        Ok(())
+    }
+
+    /// The sha256 of a text array's payload stored little-endian, so one list of strings has one
+    /// digest however it was read or built: a little-endian header's payload is hashed as it is,
+    /// any other is encoded first. A non-text array is [`Error::DigestOfNonText`]: its stored width
+    /// is part of its payload, so equal elements could digest differently.
+    pub fn digest(&self) -> Result<[u8; 32], Error> {
+        if self.kind() != Kind::String {
+            return Err(Error::DigestOfNonText);
+        }
+        if let Repr::Stored(stored) = &self.0 {
+            if stored.order == ByteOrder::Little {
+                return Ok(sha256(stored.payload()));
+            }
+        }
+        let mut payload = Vec::new();
+        self.encode(ValueType::String, &mut payload)?;
+        Ok(sha256(&payload))
+    }
+
+    /// The array's payload stored as `stored` (little-endian): a payload read from a header of
+    /// that type and byte order as it is, else its elements encoded.
+    fn encode(&self, stored: ValueType, out: &mut Vec<u8>) -> Result<(), Error> {
+        if let Repr::Stored(read) = &self.0 {
+            if read.stored == stored && read.order == ByteOrder::Little {
+                out.extend_from_slice(read.payload());
+                return Ok(());
+            }
+        }
+        for element in self.elements()?.iter() {
+            stored.encode(element, out)?;
+        }
+        Ok(())
+    }
 
     /// The array of `values`, which must share one element type.
     pub fn of(values: impl IntoIterator<Item = Scalar>) -> Result<Self, Error> {
         let mut values = values.into_iter().peekable();
         let mismatch = || invalid("GGUF array elements must share one type");
-        Ok(match values.peek() {
-            None | Some(Scalar::Unsigned(_)) => Self::Unsigned(
+        Ok(Self::from(match values.peek() {
+            None | Some(Scalar::Unsigned(_)) => Elements::Unsigned(
                 values
                     .map(|value| match value {
                         Scalar::Unsigned(value) => Ok(value),
@@ -159,7 +350,7 @@ impl Array {
                     })
                     .collect::<Result<_, _>>()?,
             ),
-            Some(Scalar::Signed(_)) => Self::Signed(
+            Some(Scalar::Signed(_)) => Elements::Signed(
                 values
                     .map(|value| match value {
                         Scalar::Signed(value) => Ok(value),
@@ -167,7 +358,7 @@ impl Array {
                     })
                     .collect::<Result<_, _>>()?,
             ),
-            Some(Scalar::Float(_)) => Self::Float(
+            Some(Scalar::Float(_)) => Elements::Float(
                 values
                     .map(|value| match value {
                         Scalar::Float(value) => Ok(value),
@@ -175,7 +366,7 @@ impl Array {
                     })
                     .collect::<Result<_, _>>()?,
             ),
-            Some(Scalar::Bool(_)) => Self::Bool(
+            Some(Scalar::Bool(_)) => Elements::Bool(
                 values
                     .map(|value| match value {
                         Scalar::Bool(value) => Ok(value),
@@ -191,39 +382,78 @@ impl Array {
                         _ => return Err(mismatch()),
                     }
                 }
-                Self::String(strings)
+                Elements::String(strings)
             }
-        })
+        }))
+    }
+}
+
+/// Arrays are equal when their elements are; one whose payload can't be read or decoded equals
+/// none. Comparing decodes both, so it is for tests only (feature `equality`).
+#[cfg(any(test, feature = "equality"))]
+impl PartialEq for Array {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self.elements(), other.elements()),
+            (Ok(left), Ok(right)) if left == right
+        )
+    }
+}
+
+impl fmt::Debug for Array {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Repr::Decoded(elements) => fmt::Debug::fmt(elements, f),
+            Repr::Stored(stored) => f
+                .debug_struct("Array")
+                .field("stored", &stored.stored)
+                .field("count", &stored.count)
+                .field("payload", &stored.range)
+                .finish(),
+        }
+    }
+}
+
+/// The sha256 of `bytes`.
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = [0; 32];
+    digest.copy_from_slice(&Sha256::digest(bytes));
+    digest
+}
+
+impl From<Elements> for Array {
+    fn from(elements: Elements) -> Self {
+        Self(Repr::Decoded(Arc::new(elements)))
     }
 }
 
 impl From<Vec<bool>> for Array {
     fn from(values: Vec<bool>) -> Self {
-        Self::Bool(values)
+        Self::from(Elements::Bool(values))
     }
 }
 
 impl From<Vec<u64>> for Array {
     fn from(values: Vec<u64>) -> Self {
-        Self::Unsigned(values)
+        Self::from(Elements::Unsigned(values))
     }
 }
 
 impl From<Vec<i64>> for Array {
     fn from(values: Vec<i64>) -> Self {
-        Self::Signed(values)
+        Self::from(Elements::Signed(values))
     }
 }
 
 impl From<Vec<f64>> for Array {
     fn from(values: Vec<f64>) -> Self {
-        Self::Float(values)
+        Self::from(Elements::Float(values))
     }
 }
 
 impl From<Strings> for Array {
     fn from(values: Strings) -> Self {
-        Self::String(values)
+        Self::from(Elements::String(values))
     }
 }
 
@@ -264,7 +494,8 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct Metadata {
     pub name: String,
     pub value: Value,
@@ -306,6 +537,17 @@ impl ValueType {
             12 => Self::F64,
             _ => return Err(invalid(format!("unsupported GGUF metadata type {id}"))),
         })
+    }
+
+    /// What elements of this type are.
+    fn kind(self) -> Kind {
+        match self {
+            Self::String => Kind::String,
+            Self::Bool => Kind::Bool,
+            Self::U8 | Self::U16 | Self::U32 | Self::U64 => Kind::Unsigned,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 => Kind::Signed,
+            Self::F32 | Self::F64 => Kind::Float,
+        }
     }
 
     /// The bytes one value of this type takes; for a string, the least (its length).
@@ -384,7 +626,8 @@ pub enum StoredType {
 }
 
 /// One metadata entry of a [`StoredHeader`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct StoredMetadata {
     pub metadata: Metadata,
     pub stored: StoredType,
@@ -393,7 +636,8 @@ pub struct StoredMetadata {
 /// One little-endian GGUF file's header as it is stored: its version, its metadata with each
 /// value's stored type, and its tensor directory in stored order, so it encodes back to the bytes
 /// it was read from ([`StoredHeader::encode`]) and an edited copy keeps every value's type.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct StoredHeader {
     pub version: u32,
     pub metadata: Vec<StoredMetadata>,
@@ -471,7 +715,8 @@ impl StoredHeader {
 
     /// `general.alignment`, or GGUF's default of 32.
     pub fn alignment(&self) -> Result<u64, Error> {
-        self.value("general.alignment").map_or(Ok(32), alignment)
+        self.value("general.alignment")
+            .map_or(Ok(32), |value| alignment(value.unsigned()))
     }
 
     /// Every byte of the header through its aligned tensor-data offset.
@@ -492,9 +737,7 @@ impl StoredHeader {
                     out.extend(9u32.to_le_bytes());
                     out.extend(stored.id().to_le_bytes());
                     out.extend(count(array.len()).to_le_bytes());
-                    for element in array.iter() {
-                        stored.encode(element, &mut out)?;
-                    }
+                    array.encode(stored, &mut out)?;
                 }
                 _ => {
                     return Err(invalid(format!(
@@ -528,9 +771,8 @@ impl StoredHeader {
 
 /// The tensor-data alignment a `general.alignment` value declares: a power of two, stored as an
 /// integer of any width.
-fn alignment(value: &Value) -> Result<u64, Error> {
+fn alignment(value: Option<u64>) -> Result<u64, Error> {
     value
-        .unsigned()
         .filter(|alignment| alignment.is_power_of_two())
         .ok_or_else(|| invalid("alignment must be a positive power of two"))
 }
@@ -592,7 +834,8 @@ pub struct TensorDescriptor {
 /// the shards' data sections in shard order (each starting at the next
 /// alignment boundary after the previous shard's last tensor), so
 /// `data_offset` is 0 and tensor offsets address that concatenation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct Directory {
     pub version: u32,
     pub byte_order: ByteOrder,
@@ -603,6 +846,19 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// Decodes every metadata array into one that holds its elements alone, so the directory keeps
+    /// no header bytes alive: for a directory held as long as its model is loaded, whose arrays
+    /// (a tokenizer's above all) would otherwise keep the whole header in memory beside what was
+    /// decoded from it.
+    pub fn detach(&mut self) -> Result<(), Error> {
+        for entry in &mut self.metadata {
+            if let Value::Array(array) = &mut entry.value {
+                array.detach()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn tensor(&self, name: &str) -> Option<&TensorDescriptor> {
         self.tensors.iter().find(|tensor| tensor.name == name)
     }
@@ -634,18 +890,44 @@ pub fn read_directory<R: Read + Seek>(source: &mut R) -> Result<Directory, Error
 }
 
 /// Read a GGUF header held in memory (every byte through the aligned data
-/// offset); tensor payloads need not follow it.
-pub fn read_header(bytes: &[u8]) -> Result<Directory, Error> {
-    let Walk::Complete(header) = walk(bytes)? else {
-        return Err(Error::Truncated {
-            offset: bytes.len() as u64,
-        });
-    };
-    header.directory()
+/// offset); tensor payloads need not follow it. Its metadata arrays hold their
+/// payloads as spans of `bytes`, decoded when read.
+pub fn read_header(bytes: impl Into<Arc<Vec<u8>>>) -> Result<Directory, Error> {
+    SharedHeader::walk(bytes.into())?.directory()
 }
 
-impl Header<'_> {
-    /// The directory of this header ([`read_header`]), from its walk.
+/// The metadata of a GGUF header's prefix `bytes`: its complete entries, as a header of their own
+/// without tensors (its data offset where the last of them ends, aligned), and the head of the
+/// entry the bytes end inside, if any. `None` before the preamble and one entry are in hand. Its
+/// arrays hold their payloads as spans of `bytes`, decoded when read.
+pub fn read_prefix(
+    bytes: &Arc<Vec<u8>>,
+) -> Result<Option<(Directory, Option<EntryHead<'_>>)>, Error> {
+    let (preamble, entries, alignment, open) = match walk(bytes)? {
+        Walk::Complete(header) => (header.preamble, header.entries, header.alignment, None),
+        Walk::Incomplete(prefix) => match prefix.preamble {
+            Some(preamble) => (preamble, prefix.entries, prefix.alignment, prefix.open),
+            None => return Ok(None),
+        },
+    };
+    let Some(last) = entries.last() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        Directory {
+            version: preamble.version,
+            byte_order: preamble.byte_order,
+            alignment,
+            data_offset: (last.end as u64).next_multiple_of(alignment),
+            metadata: entries.iter().map(|entry| entry.metadata(bytes)).collect(),
+            tensors: Vec::new(),
+        },
+        open,
+    )))
+}
+
+impl SharedHeader {
+    /// The directory of this header ([`read_header`]).
     pub fn directory(&self) -> Result<Directory, Error> {
         stored_directory(self, None).map(|(directory, _)| directory)
     }
@@ -883,19 +1165,22 @@ fn read_stored_directory<R: Read + Seek>(
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
     let mut bytes = HeaderBytes::new();
-    stored_directory(&bytes.read(source)?, require_payload.then_some(size))
+    bytes.read(source)?;
+    let length = bytes.bytes().len();
+    stored_directory(&bytes.into_shared(length)?, require_payload.then_some(size))
 }
 
 /// The directory of a walked GGUF header, with the stored type of each of its metadata values.
 /// With the `size` of its file, every tensor's bytes must lie within the file.
 fn stored_directory(
-    header: &Header<'_>,
+    shared: &SharedHeader,
     size: Option<u64>,
 ) -> Result<(Directory, Vec<StoredType>), Error> {
+    let header = shared.header();
     let (metadata, types) = header
         .entries
         .iter()
-        .map(|entry| (entry.metadata(), entry.head().stored))
+        .map(|entry| (entry.metadata(shared.bytes()), entry.head().stored))
         .unzip();
     let alignment = header.alignment;
     let mut tensors = Vec::new();
@@ -1012,12 +1297,14 @@ pub struct GgufArtifact {
 
 impl GgufArtifact {
     /// Open the GGUF component `path` names: the file, or every shard when
-    /// it is the first shard of a split GGUF (see [`split_paths`]).
+    /// it is the first shard of a split GGUF (see [`split_paths`]). The
+    /// artifact lives as long as its model is loaded, so its directory is
+    /// detached from the header bytes ([`Directory::detach`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let first = Arc::new(FileSource::open(path)?);
         let directory = read_file_directory(&first, true)?;
-        let (directory, shards) = match split_paths(path, &directory)? {
+        let (mut directory, shards) = match split_paths(path, &directory)? {
             None => {
                 let data_offset = directory.data_offset;
                 (
@@ -1055,6 +1342,7 @@ impl GgufArtifact {
                 (directory, shards)
             }
         };
+        directory.detach()?;
         Ok(Self {
             directory,
             shards,

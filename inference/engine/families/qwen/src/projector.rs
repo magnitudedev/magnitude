@@ -2,7 +2,7 @@
 
 use crate::{Error, product};
 use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{Tensors, projector_type};
+use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -40,7 +40,7 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     let Some(Value::Array(values)) = directory.value(key) else {
         return Err(invalid(format!("{key} must contain three numbers")));
     };
-    let values = values
+    let values = array_elements(key, values)?
         .iter()
         .map(|value| match value {
             Element::Float(value) if value.is_finite() => Some(value),
@@ -87,9 +87,17 @@ pub fn describe_projector(
             return Err(invalid("clip.use_gelu must be boolean"));
         }
     }
-    if let Some(deepstack) = directory.value("clip.vision.is_deepstack_layers") {
-        if !matches!(deepstack, Value::Array(values) if values.len() as u64 == depth && values.iter().all(|value| matches!(value, Element::Bool(false))))
-        {
+    let deepstack_key = "clip.vision.is_deepstack_layers";
+    if let Some(deepstack) = directory.value(deepstack_key) {
+        let none = match deepstack {
+            Value::Array(values) if values.len() as u64 == depth => {
+                array_elements(deepstack_key, values)?
+                    .iter()
+                    .all(|value| matches!(value, Element::Bool(false)))
+            }
+            _ => false,
+        };
+        if !none {
             return Err(invalid("deepstack projector layers are unsupported"));
         }
     }

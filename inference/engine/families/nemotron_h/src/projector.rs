@@ -18,7 +18,7 @@
 
 use crate::Error;
 use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::{Tensors, projector_type};
+use magnitude_family_common::{array_elements, projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage,
     PositionSampling, RowRange, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -82,7 +82,7 @@ impl Reader<'_> {
         let Some(Value::Array(values)) = self.directory.value(key) else {
             return Err(invalid(format!("{key} must contain three numbers")));
         };
-        values
+        array_elements(key, values)?
             .iter()
             .map(|value| match value {
                 Element::Float(value) if value.is_finite() => Some(value),

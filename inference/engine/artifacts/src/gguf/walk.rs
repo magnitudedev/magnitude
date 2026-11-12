@@ -7,14 +7,18 @@
 //! array), so a reader growing a prefix (from a file, or by range requests) asks for about as many
 //! as remain. A reader grows the prefix in a [`HeaderBytes`], whose walk continues where the walk
 //! of the shorter prefix stopped, so each byte is walked once however many reads the header takes.
-//! Values are decoded only on request ([`Entry::value`]), without checking their strings again.
-//! Whether the engine accepts the tensors themselves (their types, geometry and offsets) is
-//! decided on the complete header ([`Header::directory`]).
+//!
+//! A metadata array's payload is hopped by its length alone: a fixed-size element array by its
+//! count, a string array by its strings' length prefixes. Its elements are decoded and checked
+//! only when they are read ([`super::Array::elements`]). Whether the engine accepts the tensors
+//! themselves (their types, geometry and offsets) is decided on the complete header
+//! ([`SharedHeader::directory`]).
 
 use super::{
-    Array, ByteOrder, Error, Metadata, Scalar, StoredType, Strings, Value, ValueType, invalid,
+    invalid, Array, ByteOrder, Element, Elements, Error, Kind, Metadata, Scalar, StoredType,
+    Strings, Value, ValueType,
 };
-use std::{collections::HashSet, io::Read, ops::Range};
+use std::{collections::HashSet, io::Read, ops::Range, sync::Arc};
 
 /// The largest GGUF header, through its aligned tensor-data offset.
 pub const HEADER_LIMIT: usize = 256 * 1024 * 1024;
@@ -84,6 +88,7 @@ pub struct Prefix<'a> {
 /// A metadata entry's fixed part: its key, how its value is stored and how many values it holds
 /// (one for a scalar), which ends (`end`) after a string's length or an array's element count. Two
 /// entries holding the same kind and amount of data have this part byte for byte in common.
+/// Positions are in the whole header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryHead<'a> {
     pub key: &'a str,
@@ -98,12 +103,15 @@ pub struct EntryHead<'a> {
 pub struct Entry<'a> {
     /// Private, as is `value`: only the walk makes an entry, so its head
     /// states what its value's bytes hold, which they decode by
-    /// ([`Self::value`], reading its strings back unchecked).
+    /// ([`Self::value`], reading a scalar's text back unchecked).
     head: EntryHead<'a>,
+    /// Where the entry ends in the whole header.
     pub end: usize,
-    /// The value's bytes: everything after the value type (a scalar) or the element count (an
-    /// array).
+    /// The bytes of the entry's value: everything after the value type (a scalar) or the element
+    /// count (an array).
     value: &'a [u8],
+    /// Where `value` starts in the bytes walked.
+    at: usize,
     order: ByteOrder,
 }
 
@@ -113,46 +121,58 @@ impl<'a> Entry<'a> {
         self.head
     }
 
-    /// The entry's bytes in the header.
+    /// The entry's bytes in the whole header.
     pub fn range(&self) -> Range<usize> {
         self.head.start..self.end
     }
 
-    /// The entry's key and value, decoded.
-    pub fn metadata(&self) -> Metadata {
+    /// The entry's key and value ([`Self::value`]).
+    pub(crate) fn metadata(&self, header: &Arc<Vec<u8>>) -> Metadata {
         Metadata {
             name: self.head.key.to_owned(),
-            value: self.value(),
+            value: self.value(header),
         }
     }
 
-    /// The entry's value, decoded.
-    pub fn value(&self) -> Value {
-        let mut decoder = Decoder {
-            bytes: self.value,
-            order: self.order,
+    /// The entry's value. `header` holds the bytes this entry was walked from: an array's payload
+    /// is a span of them, decoded when its elements are read.
+    ///
+    /// # Panics
+    /// When `header` is not the bytes the entry was walked from.
+    pub(crate) fn value(&self, header: &Arc<Vec<u8>>) -> Value {
+        let StoredType::Array(stored) = self.head.stored else {
+            return Value::Scalar(self.scalar().expect("a scalar entry holds its value"));
         };
-        match self.head.stored {
-            StoredType::Scalar(kind) => Value::Scalar(decoder.scalar(kind)),
-            StoredType::Array(kind) => {
-                let count = usize::try_from(self.head.count).expect("a walked count fits usize");
-                Value::Array(match kind {
-                    ValueType::String => {
-                        Array::String((0..count).map(|_| decoder.string()).collect::<Strings>())
-                    }
-                    ValueType::Bool => Array::Bool((0..count).map(|_| decoder.bool()).collect()),
-                    ValueType::U8 | ValueType::U16 | ValueType::U32 | ValueType::U64 => {
-                        Array::Unsigned((0..count).map(|_| decoder.unsigned(kind)).collect())
-                    }
-                    ValueType::I8 | ValueType::I16 | ValueType::I32 | ValueType::I64 => {
-                        Array::Signed((0..count).map(|_| decoder.signed(kind)).collect())
-                    }
-                    ValueType::F32 | ValueType::F64 => {
-                        Array::Float((0..count).map(|_| decoder.float(kind)).collect())
-                    }
-                })
+        let count = usize::try_from(self.head.count).expect("a walked count fits usize");
+        let range = self.at..self.at + self.value.len();
+        assert!(
+            header
+                .get(range.clone())
+                .is_some_and(|held| std::ptr::eq(held, self.value)),
+            "an entry's value is read from the bytes it was walked from"
+        );
+        Value::Array(Array::held(
+            stored,
+            self.order,
+            count,
+            Arc::clone(header),
+            range,
+        ))
+    }
+
+    /// The entry's value when it is a scalar.
+    fn scalar(&self) -> Option<Scalar> {
+        let StoredType::Scalar(kind) = self.head.stored else {
+            return None;
+        };
+        Some(
+            Decoder {
+                bytes: self.value,
+                order: self.order,
             }
-        }
+            .scalar(kind)
+            .expect("the walk checked a scalar's bytes"),
+        )
     }
 }
 
@@ -184,10 +204,42 @@ pub fn walk(bytes: &[u8]) -> Result<Walk<'_>, Error> {
     Ok(walked.view(bytes))
 }
 
+/// A whole GGUF header's bytes, shared with the metadata arrays of its directory
+/// ([`Self::directory`]), and their walk.
+pub struct SharedHeader {
+    bytes: Arc<Vec<u8>>,
+    walked: Progress,
+}
+
+impl SharedHeader {
+    /// The whole header `bytes` hold.
+    pub(super) fn walk(bytes: Arc<Vec<u8>>) -> Result<Self, Error> {
+        let mut walked = Progress::default();
+        walked.advance(&bytes)?;
+        if let Stop::Incomplete { .. } = walked.stop {
+            return Err(Error::Truncated {
+                offset: bytes.len() as u64,
+            });
+        }
+        Ok(Self { bytes, walked })
+    }
+
+    pub fn bytes(&self) -> &Arc<Vec<u8>> {
+        &self.bytes
+    }
+
+    pub fn header(&self) -> Header<'_> {
+        match self.walked.view(&self.bytes) {
+            Walk::Complete(header) => header,
+            Walk::Incomplete(_) => unreachable!("a shared header is whole"),
+        }
+    }
+}
+
 /// The bytes of a GGUF header as a reader grows them, with their walk. The bytes are only ever
 /// extended, so each walk continues where the one before stopped: however many reads a header
-/// takes, each of its bytes is walked (its strings checked) once, and the reader ends with the
-/// whole header's walk in hand.
+/// takes, each of its bytes is walked once, and the reader ends with the whole header's walk in
+/// hand.
 #[derive(Default)]
 pub struct HeaderBytes {
     bytes: Vec<u8>,
@@ -243,6 +295,32 @@ impl HeaderBytes {
             Walk::Incomplete(_) => unreachable!("the reads end at a whole header"),
         }
     }
+
+    /// The first `length` bytes in hand, which hold the whole header walked (padding aside),
+    /// shared with the metadata arrays of its directory, its walk kept.
+    pub fn into_shared(mut self, length: usize) -> Result<SharedHeader, Error> {
+        if let Stop::Incomplete { .. } = self.walked.stop {
+            return Err(Error::Truncated {
+                offset: self.bytes.len() as u64,
+            });
+        }
+        if length > self.bytes.len() {
+            return Err(Error::Truncated {
+                offset: self.bytes.len() as u64,
+            });
+        }
+        if length < self.walked.offset {
+            return Err(invalid(format!(
+                "{length} bytes cut the GGUF header walked through byte {}",
+                self.walked.offset
+            )));
+        }
+        self.bytes.truncate(length);
+        Ok(SharedHeader {
+            bytes: Arc::new(self.bytes),
+            walked: self.walked,
+        })
+    }
 }
 
 fn beyond() -> Error {
@@ -256,18 +334,20 @@ fn utf8(bytes: &[u8]) -> Result<&str, Error> {
 /// Text the walk checked ([`utf8`]), read back without checking it again.
 fn checked(text: &[u8]) -> &str {
     debug_assert!(std::str::from_utf8(text).is_ok());
-    // SAFETY: only text the walk checked comes here: the ranges a `Progress` holds, read back from
-    // the bytes it walked (a `HeaderBytes` only ever extends its bytes), and the strings in the
-    // values of the entries it reports, which nothing else constructs or changes (an `Entry`'s
-    // head and value are private), so each decodes by the head the walk checked it by.
+    // SAFETY: only text the walk checked comes here: the keys and tensor names a `Progress` holds
+    // the ranges of, read back from the bytes it walked (a `HeaderBytes` only ever extends its
+    // bytes, and a `SharedHeader` never changes them), and the text of the scalar values of the
+    // entries it reports, which nothing else constructs or changes (an `Entry`'s head and value
+    // are private), so each decodes by the head the walk checked it by. Array text is checked
+    // when it is decoded ([`decode`]).
     unsafe { std::str::from_utf8_unchecked(text) }
 }
 
-fn valid_bool(byte: u8) -> Result<(), Error> {
-    if byte <= 1 {
-        Ok(())
-    } else {
-        Err(invalid("invalid GGUF boolean"))
+fn valid_bool(byte: u8) -> Result<bool, Error> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid("invalid GGUF boolean")),
     }
 }
 
@@ -292,12 +372,13 @@ fn u64_of(order: ByteOrder, bytes: [u8; 8]) -> u64 {
     }
 }
 
-/// Where a walk stopped, with everything it read before as offsets into the bytes it walked, so a
+/// Where a walk stopped, with everything it read before as positions in the bytes it walked, so a
 /// walk of those bytes extended continues from here. It moves only past what the walk read whole
 /// (an item, or the whole strings of a string array the bytes end in), so a walk that finds the
 /// bytes invalid leaves it where it was, and walking them again finds the same error.
 struct Progress {
-    /// Where the walk continues: the start of the next item, or of the next string of `array`.
+    /// Where the walk continues in the whole header: the start of the next item, or of the next
+    /// string of `array`.
     offset: usize,
     preamble: Option<Counted>,
     /// The keys of `entries`.
@@ -378,11 +459,11 @@ struct Head {
     end: usize,
 }
 
-/// An [`Entry`].
+/// An [`Entry`], its value from `value` to `end`.
 #[derive(Clone, Copy, Debug)]
 struct Walked {
     head: Head,
-    value_start: usize,
+    value: usize,
     end: usize,
 }
 
@@ -394,7 +475,7 @@ struct OpenArray {
     read: usize,
 }
 
-/// A [`TensorInfo`].
+/// A [`TensorInfo`], by where its parts lie in the bytes walked.
 struct WalkedTensor {
     name: Range<usize>,
     type_id: u32,
@@ -420,7 +501,8 @@ impl Walked {
         Entry {
             head: self.head.view(bytes),
             end: self.end,
-            value: &bytes[self.value_start..self.end],
+            value: &bytes[self.value..self.end],
+            at: self.value,
             order,
         }
     }
@@ -551,8 +633,16 @@ impl Progress {
         }
     }
 
+    /// A cursor at where the walk continues.
+    fn cursor<'a>(&self, bytes: &'a [u8], order: ByteOrder) -> Cursor<'a> {
+        Cursor {
+            bytes,
+            offset: self.offset,
+            order,
+        }
+    }
+
     fn walk(&mut self, bytes: &[u8]) -> Result<Stop, Halt> {
-        let held = bytes.len();
         let counted = match self.preamble {
             Some(counted) => counted,
             None => {
@@ -567,12 +657,8 @@ impl Progress {
         while self.entries.len() < counted.entries {
             let rest =
                 (counted.entries - self.entries.len() - 1) * ENTRY_ESTIMATE + tensors_estimate;
-            let mut cursor = Cursor {
-                bytes,
-                offset: self.offset,
-                order,
-            };
-            let (head, value_start) = match self.array {
+            let mut cursor = self.cursor(bytes, order);
+            let (head, value) = match self.array {
                 Some(array) => {
                     self.strings(&mut cursor, array, rest)?;
                     (array.head, array.head.end)
@@ -581,12 +667,18 @@ impl Progress {
             };
             let walked = Walked {
                 head,
-                value_start,
+                value,
                 end: cursor.offset,
             };
             let entry = walked.view(bytes, order);
             if entry.head.key == ALIGNMENT_KEY {
-                self.alignment = super::alignment(&entry.value())?;
+                self.alignment = super::alignment(
+                    entry
+                        .scalar()
+                        .map(Value::Scalar)
+                        .as_ref()
+                        .and_then(Value::unsigned),
+                )?;
             }
             self.keys.insert(entry.head.key.into());
             self.entries.push(walked);
@@ -597,11 +689,8 @@ impl Progress {
         let tensors_start = *self.tensors_start.get_or_insert(self.offset);
         while self.tensors.len() < counted.tensors {
             let index = self.tensors.len();
-            let mut cursor = Cursor {
-                bytes,
-                offset: self.offset,
-                order,
-            };
+            let mut cursor = self.cursor(bytes, order);
+            let held = cursor.held();
             let before = cursor.offset;
             let left = counted.tensors - index;
             let average = if index == 0 {
@@ -651,9 +740,9 @@ impl Progress {
         })
     }
 
-    /// Walks the metadata entry `cursor` is at, returning its head and where its value starts.
+    /// Walks the metadata entry `cursor` is at, returning its head and where its value lies.
     fn entry(&mut self, cursor: &mut Cursor<'_>, rest: usize) -> Result<(Head, usize), Halt> {
-        let held = cursor.bytes.len();
+        let held = cursor.held();
         let start = cursor.offset;
         let Some(key) = cursor.string()? else {
             return Err(stop(held, None, 12, ENTRY_ESTIMATE + rest));
@@ -702,12 +791,9 @@ impl Progress {
                 )?;
             } else {
                 let length = elements * element.width();
-                let Some(values) = cursor.take(length)? else {
+                if cursor.take(length)?.is_none() {
                     let missing = head.end + length - held;
                     return Err(stop(held, Some(head), missing, missing + rest));
-                };
-                if element == ValueType::Bool {
-                    values.iter().try_for_each(|byte| valid_bool(*byte))?;
                 }
             }
             return Ok((head, head.end));
@@ -753,18 +839,18 @@ impl Progress {
         Ok((head, value_start))
     }
 
-    /// Walks the strings of `array` from its `read`th, which `cursor` is at. Where the bytes end
-    /// first, the walk stops there, and continues from there.
+    /// Hops the strings of `array` from its `read`th, which `cursor` is at, by their lengths.
+    /// Where the bytes end first, the walk stops there, and continues from there.
     fn strings(
         &mut self,
         cursor: &mut Cursor<'_>,
         array: OpenArray,
         rest: usize,
     ) -> Result<(), Halt> {
-        let held = cursor.bytes.len();
+        let held = cursor.held();
         for read in array.read..array.elements {
             let before = cursor.offset;
-            if cursor.string()?.is_none() {
+            if cursor.text()?.is_none() {
                 let left = array.elements - read;
                 let average = if read < MEASURED_STRINGS {
                     STRING_ESTIMATE
@@ -799,6 +885,11 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// How far into the header the bytes in hand reach.
+    fn held(&self) -> usize {
+        self.bytes.len()
+    }
+
     fn take(&mut self, length: usize) -> Result<Option<&'a [u8]>, Error> {
         let end = self
             .offset
@@ -824,15 +915,15 @@ impl<'a> Cursor<'a> {
             .map(|bytes| u64_of(self.order, bytes.try_into().expect("eight bytes"))))
     }
 
-    /// A UTF-8 string.
-    fn string(&mut self) -> Result<Option<&'a str>, Error> {
+    /// A string's bytes, unchecked.
+    fn text(&mut self) -> Result<Option<&'a [u8]>, Error> {
         let start = self.offset;
         let Some(length) = self.u64()? else {
             return Ok(None);
         };
         let length = usize::try_from(length).map_err(|_| beyond())?;
         match self.take(length) {
-            Ok(Some(text)) => utf8(text).map(Some),
+            Ok(Some(text)) => Ok(Some(text)),
             Ok(None) => {
                 self.offset = start;
                 Ok(None)
@@ -840,69 +931,163 @@ impl<'a> Cursor<'a> {
             Err(error) => Err(error),
         }
     }
+
+    /// A UTF-8 string.
+    fn string(&mut self) -> Result<Option<&'a str>, Error> {
+        self.text()?.map(utf8).transpose()
+    }
 }
 
-/// Decodes the bytes of a value the walk checked.
+/// The elements of an array payload of `count` elements stored as `stored`, checked: text must be
+/// UTF-8, booleans 0 or 1, and the payload exactly its elements ([`Error::ShortPayload`] when it
+/// ends before them, [`Error::TrailingPayload`] when bytes follow them).
+pub(super) fn decode(
+    stored: ValueType,
+    order: ByteOrder,
+    count: usize,
+    bytes: &[u8],
+) -> Result<Elements, Error> {
+    let mut decoder = Decoder { bytes, order };
+    let elements = match stored.kind() {
+        Kind::String => {
+            let mut strings =
+                Strings::with_capacity(count, bytes.len().saturating_sub(count.saturating_mul(8)));
+            for _ in 0..count {
+                strings.push(decoder.string()?)?;
+            }
+            Elements::String(strings)
+        }
+        Kind::Bool => Elements::Bool(
+            (0..count)
+                .map(|_| decoder.bool())
+                .collect::<Result<_, _>>()?,
+        ),
+        Kind::Unsigned => Elements::Unsigned(
+            (0..count)
+                .map(|_| decoder.unsigned(stored))
+                .collect::<Result<_, _>>()?,
+        ),
+        Kind::Signed => Elements::Signed(
+            (0..count)
+                .map(|_| decoder.signed(stored))
+                .collect::<Result<_, _>>()?,
+        ),
+        Kind::Float => Elements::Float(
+            (0..count)
+                .map(|_| decoder.float(stored))
+                .collect::<Result<_, _>>()?,
+        ),
+    };
+    if !decoder.bytes.is_empty() {
+        return Err(Error::TrailingPayload);
+    }
+    Ok(elements)
+}
+
+/// The `index`th element of an array payload stored as `stored`, checked as [`decode`] checks it;
+/// the elements before it are passed by their lengths alone.
+pub(super) fn element(
+    stored: ValueType,
+    order: ByteOrder,
+    bytes: &[u8],
+    index: usize,
+) -> Result<Element<'_>, Error> {
+    let mut decoder = Decoder { bytes, order };
+    match stored.kind() {
+        Kind::String => {
+            for _ in 0..index {
+                decoder.text()?;
+            }
+        }
+        _ => {
+            decoder.bytes = index
+                .checked_mul(stored.width())
+                .and_then(|at| bytes.get(at..))
+                .ok_or(Error::ShortPayload)?;
+        }
+    }
+    Ok(match stored.kind() {
+        Kind::String => Element::String(decoder.string()?),
+        Kind::Bool => Element::Bool(decoder.bool()?),
+        Kind::Unsigned => Element::Unsigned(decoder.unsigned(stored)?),
+        Kind::Signed => Element::Signed(decoder.signed(stored)?),
+        Kind::Float => Element::Float(decoder.float(stored)?),
+    })
+}
+
+/// Decodes the bytes of a value; one that ends early is [`Error::ShortPayload`].
 struct Decoder<'a> {
     bytes: &'a [u8],
     order: ByteOrder,
 }
 
 impl<'a> Decoder<'a> {
-    fn take<const N: usize>(&mut self) -> [u8; N] {
-        let (taken, rest) = self.bytes.split_first_chunk().expect("a walked value");
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let (taken, rest) = self.bytes.split_first_chunk().ok_or(Error::ShortPayload)?;
         self.bytes = rest;
-        *taken
+        Ok(*taken)
     }
 
-    fn string(&mut self) -> &'a str {
-        let length = u64_of(self.order, self.take()) as usize;
-        let (text, rest) = self.bytes.split_at(length);
+    /// A string's bytes, unchecked.
+    fn text(&mut self) -> Result<&'a [u8], Error> {
+        let length =
+            usize::try_from(u64_of(self.order, self.take()?)).map_err(|_| Error::ShortPayload)?;
+        let (text, rest) = self
+            .bytes
+            .split_at_checked(length)
+            .ok_or(Error::ShortPayload)?;
         self.bytes = rest;
-        checked(text)
+        Ok(text)
     }
 
-    fn bool(&mut self) -> bool {
-        self.take::<1>()[0] == 1
+    /// A string, checked to be UTF-8.
+    fn string(&mut self) -> Result<&'a str, Error> {
+        utf8(self.text()?)
     }
 
-    fn unsigned(&mut self, kind: ValueType) -> u64 {
-        match kind.width() {
-            1 => u64::from(self.take::<1>()[0]),
-            2 => u64::from(u16_of(self.order, self.take())),
-            4 => u64::from(u32_of(self.order, self.take())),
-            _ => u64_of(self.order, self.take()),
-        }
+    /// A boolean, checked to be 0 or 1.
+    fn bool(&mut self) -> Result<bool, Error> {
+        valid_bool(self.take::<1>()?[0])
     }
 
-    fn signed(&mut self, kind: ValueType) -> i64 {
-        match kind.width() {
-            1 => i64::from(self.take::<1>()[0] as i8),
-            2 => i64::from(u16_of(self.order, self.take()) as i16),
-            4 => i64::from(u32_of(self.order, self.take()) as i32),
-            _ => u64_of(self.order, self.take()) as i64,
-        }
+    fn unsigned(&mut self, kind: ValueType) -> Result<u64, Error> {
+        Ok(match kind.width() {
+            1 => u64::from(self.take::<1>()?[0]),
+            2 => u64::from(u16_of(self.order, self.take()?)),
+            4 => u64::from(u32_of(self.order, self.take()?)),
+            _ => u64_of(self.order, self.take()?),
+        })
     }
 
-    fn float(&mut self, kind: ValueType) -> f64 {
-        match kind.width() {
-            4 => f64::from(f32::from_bits(u32_of(self.order, self.take()))),
-            _ => f64::from_bits(u64_of(self.order, self.take())),
-        }
+    fn signed(&mut self, kind: ValueType) -> Result<i64, Error> {
+        Ok(match kind.width() {
+            1 => i64::from(self.take::<1>()?[0] as i8),
+            2 => i64::from(u16_of(self.order, self.take()?) as i16),
+            4 => i64::from(u32_of(self.order, self.take()?) as i32),
+            _ => u64_of(self.order, self.take()?) as i64,
+        })
     }
 
-    fn scalar(&mut self, kind: ValueType) -> Scalar {
-        match kind {
-            ValueType::String => Scalar::String(self.string().to_owned()),
-            ValueType::Bool => Scalar::Bool(self.bool()),
+    fn float(&mut self, kind: ValueType) -> Result<f64, Error> {
+        Ok(match kind.width() {
+            4 => f64::from(f32::from_bits(u32_of(self.order, self.take()?))),
+            _ => f64::from_bits(u64_of(self.order, self.take()?)),
+        })
+    }
+
+    /// A scalar, its text and boolean as the walk checked them.
+    fn scalar(&mut self, kind: ValueType) -> Result<Scalar, Error> {
+        Ok(match kind {
+            ValueType::String => Scalar::String(checked(self.text()?).to_owned()),
+            ValueType::Bool => Scalar::Bool(self.take::<1>()?[0] == 1),
             ValueType::U8 | ValueType::U16 | ValueType::U32 | ValueType::U64 => {
-                Scalar::Unsigned(self.unsigned(kind))
+                Scalar::Unsigned(self.unsigned(kind)?)
             }
             ValueType::I8 | ValueType::I16 | ValueType::I32 | ValueType::I64 => {
-                Scalar::Signed(self.signed(kind))
+                Scalar::Signed(self.signed(kind)?)
             }
-            ValueType::F32 | ValueType::F64 => Scalar::Float(self.float(kind)),
-        }
+            ValueType::F32 | ValueType::F64 => Scalar::Float(self.float(kind)?),
+        })
     }
 }
 
@@ -948,7 +1133,7 @@ mod tests {
 
     #[test]
     fn a_whole_header_lists_its_entries_and_tensors_and_ends_at_its_aligned_data_offset() {
-        let bytes = header(10_000);
+        let bytes = Arc::new(header(10_000));
         let Ok(Walk::Complete(header)) = walk(&bytes) else {
             panic!("a whole header");
         };
@@ -971,12 +1156,16 @@ mod tests {
             &10_000_u64.to_le_bytes()
         );
         assert_eq!(header.entries[2].head.start, tokens.end);
-        let Value::Array(Array::String(pieces)) = tokens.value() else {
+        let Value::Array(pieces) = tokens.value(&bytes) else {
+            panic!("an array");
+        };
+        assert_eq!(pieces.len(), 10_000);
+        let Ok(Elements::String(pieces)) = pieces.elements() else {
             panic!("a text array");
         };
         assert_eq!(pieces.get(9_999), Some("token-009999"));
         assert_eq!(
-            header.entries[2].value(),
+            header.entries[2].value(&bytes),
             Value::Scalar(Scalar::Unsigned(15))
         );
         let tensor = &header.tensors[0];
@@ -1046,9 +1235,8 @@ mod tests {
         };
         let tokens = whole.entries[1];
         let broken = tokens.head.end + tokens.range().len() / 2;
-        let at = (broken..)
-            .find(|at| bytes[*at..].starts_with(b"token-"))
-            .unwrap();
+        // The first byte of the text of the key after the token list.
+        let at = whole.entries[2].head.start + 8;
         bytes[at] = 0xff;
         let mut grown = HeaderBytes::new();
         grown.extend_from_slice(&bytes[..broken]);
@@ -1057,6 +1245,29 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 matches!(grown.walk(), Err(Error::Invalid(message)) if message.contains("UTF-8"))
+            );
+        }
+    }
+
+    #[test]
+    fn array_text_is_checked_when_it_is_decoded_not_when_it_is_walked() {
+        let mut bytes = header(100);
+        let at = bytes
+            .windows(b"token-000042".len())
+            .position(|window| window == b"token-000042")
+            .unwrap();
+        bytes[at] = 0xff;
+        let bytes = Arc::new(bytes);
+        let Ok(Walk::Complete(whole)) = walk(&bytes) else {
+            panic!("a whole header");
+        };
+        let Value::Array(tokens) = whole.entries[1].value(&bytes) else {
+            panic!("an array");
+        };
+        assert_eq!(tokens.len(), 100);
+        for _ in 0..2 {
+            assert!(
+                matches!(tokens.elements(), Err(Error::Invalid(message)) if message.contains("UTF-8"))
             );
         }
     }
@@ -1074,6 +1285,164 @@ mod tests {
         );
         assert!(
             matches!(walk(b"GGML"), Err(Error::Invalid(message)) if message.contains("not a GGUF"))
+        );
+    }
+
+    /// A header holding only `pieces` as its token list, every number in `order`.
+    fn tokens_header(order: ByteOrder, pieces: &[&str]) -> Vec<u8> {
+        let u32 = |value: u32| match order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
+        };
+        let u64 = |value: u64| match order {
+            ByteOrder::Little => value.to_le_bytes(),
+            ByteOrder::Big => value.to_be_bytes(),
+        };
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&u32(3));
+        bytes.extend_from_slice(&u64(0));
+        bytes.extend_from_slice(&u64(1));
+        let key = "tokenizer.ggml.tokens";
+        bytes.extend_from_slice(&u64(key.len() as u64));
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&u32(9));
+        bytes.extend_from_slice(&u32(8));
+        bytes.extend_from_slice(&u64(pieces.len() as u64));
+        for piece in pieces {
+            bytes.extend_from_slice(&u64(piece.len() as u64));
+            bytes.extend_from_slice(piece.as_bytes());
+        }
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes
+    }
+
+    /// The token list of a directory.
+    fn tokens(directory: &crate::gguf::Directory) -> Array {
+        match directory.value("tokenizer.ggml.tokens") {
+            Some(Value::Array(tokens)) => tokens.clone(),
+            other => panic!("a token list, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_must_hold_exactly_its_elements() {
+        let order = ByteOrder::Little;
+        assert!(matches!(
+            decode(ValueType::U32, order, 3, &[0; 11]),
+            Err(Error::ShortPayload)
+        ));
+        assert!(matches!(
+            decode(ValueType::U32, order, 3, &[0; 13]),
+            Err(Error::TrailingPayload)
+        ));
+        assert!(matches!(
+            element(ValueType::U32, order, &[0; 11], 2),
+            Err(Error::ShortPayload)
+        ));
+        let mut text = 5_u64.to_le_bytes().to_vec();
+        text.extend_from_slice(b"abc");
+        assert!(matches!(
+            decode(ValueType::String, order, 1, &text),
+            Err(Error::ShortPayload)
+        ));
+        assert!(matches!(
+            element(ValueType::String, order, &text, 0),
+            Err(Error::ShortPayload)
+        ));
+        assert!(matches!(
+            element(ValueType::String, order, &text, 1),
+            Err(Error::ShortPayload)
+        ));
+        assert!(matches!(
+            decode(ValueType::String, order, 1, &[0; 7]),
+            Err(Error::ShortPayload)
+        ));
+    }
+
+    #[test]
+    fn an_array_boolean_other_than_zero_or_one_is_refused_when_read() {
+        let order = ByteOrder::Little;
+        assert!(matches!(
+            decode(ValueType::Bool, order, 2, &[1, 0]),
+            Ok(Elements::Bool(_))
+        ));
+        assert!(matches!(
+            decode(ValueType::Bool, order, 2, &[1, 2]),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            element(ValueType::Bool, order, &[1, 2], 1),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn header_bytes_share_only_the_whole_walked_header() {
+        let bytes = header(100);
+        let read = |length: usize| {
+            let mut read = HeaderBytes::new();
+            read.extend_from_slice(&bytes[..length]);
+            read.walk().unwrap();
+            read
+        };
+        assert!(matches!(
+            read(100).into_shared(100),
+            Err(Error::Truncated { .. })
+        ));
+        assert!(matches!(
+            read(bytes.len()).into_shared(bytes.len() + 1),
+            Err(Error::Truncated { .. })
+        ));
+        assert!(matches!(
+            read(bytes.len()).into_shared(10),
+            Err(Error::Invalid(message)) if message.contains("cut the GGUF header")
+        ));
+        assert!(read(bytes.len()).into_shared(bytes.len()).is_ok());
+    }
+
+    #[test]
+    fn a_text_array_has_one_digest_however_it_is_stored_and_no_other_array_has_one() {
+        let pieces = ["<s>", "", "héllo", " world"];
+        let little = crate::gguf::read_header(tokens_header(ByteOrder::Little, &pieces)).unwrap();
+        let big = crate::gguf::read_header(tokens_header(ByteOrder::Big, &pieces)).unwrap();
+        let built = Array::from(pieces.into_iter().collect::<Strings>());
+        let digest = tokens(&little).digest().unwrap();
+        assert_eq!(tokens(&big).digest().unwrap(), digest);
+        assert_eq!(built.digest().unwrap(), digest);
+        assert!(matches!(
+            Array::from(vec![1_u64]).digest(),
+            Err(Error::DigestOfNonText)
+        ));
+    }
+
+    #[test]
+    fn a_detached_directory_keeps_no_header_bytes_alive() {
+        let bytes = Arc::new(header(1_000));
+        let mut directory = crate::gguf::read_header(Arc::clone(&bytes)).unwrap();
+        let text = |directory: &crate::gguf::Directory| {
+            let list = tokens(directory);
+            let Elements::String(strings) = list.elements().unwrap() else {
+                panic!("tokens are text");
+            };
+            strings.text.as_ptr()
+        };
+        let decoded = tokens(&directory).elements().unwrap().clone();
+        let held = text(&directory);
+        assert!(
+            Arc::strong_count(&bytes) > 1,
+            "the arrays share the header's bytes"
+        );
+        directory.detach().unwrap();
+        assert_eq!(
+            Arc::strong_count(&bytes),
+            1,
+            "a detached directory holds none of them"
+        );
+        assert_eq!(tokens(&directory).elements().unwrap(), &decoded);
+        assert_eq!(
+            text(&directory),
+            held,
+            "decoded elements are moved, not copied"
         );
     }
 }
