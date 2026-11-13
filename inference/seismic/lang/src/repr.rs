@@ -2496,6 +2496,20 @@ impl Repr {
         }
     }
 
+    /// The power of two the decoding scales the values of plane `field` by:
+    /// a hierarchical representation's factors' `factor_exponent`, else none.
+    pub(crate) fn plane_exponent(&self, field: PlaneField) -> i32 {
+        match (&self.coding, field) {
+            (
+                Coding::Hierarchical {
+                    factor_exponent, ..
+                },
+                PlaneField::ScaleFactor | PlaneField::BiasFactor,
+            ) => *factor_exponent,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn storage_group(&self) -> u32 {
         match &self.coding {
             Coding::Direct {
