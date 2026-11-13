@@ -1423,20 +1423,24 @@ impl ManagedModelCandidates {
         &self,
         source: &CandidateSource,
         targets: &[&ClassifiedGroup],
-        mut assessments: Vec<Option<CachedModelAssessment>>,
+        assessments: Vec<Option<CachedModelAssessment>>,
         projector: Option<CandidateFile>,
         progress: &InspectionProgress,
-    ) -> Vec<Option<CachedModelAssessment>> {
+    ) -> Vec<ComposedVersion> {
         let recommended = recommended_version(
             targets
                 .iter()
                 .zip(&assessments)
                 .map(|(group, assessment)| (*group, assessment.as_ref())),
         );
+        let mut composed = assessments
+            .into_iter()
+            .map(|assessment| ComposedVersion { assessment, drafter: None })
+            .collect::<Vec<_>>();
         if let Some(index) = recommended {
             progress.checking_drafters(index);
-            let plain = assessments[index].take();
-            assessments[index] = self
+            let plain = composed[index].assessment.take();
+            composed[index] = self
                 .with_preselected_drafter(
                     version_candidate(source, targets[index], projector),
                     plain,
@@ -1444,7 +1448,7 @@ impl ManagedModelCandidates {
                 )
                 .await;
         }
-        assessments
+        composed
     }
 
     async fn with_preselected_drafter(
@@ -1452,17 +1456,19 @@ impl ManagedModelCandidates {
         candidate: ModelCandidate,
         plain: Option<CachedModelAssessment>,
         progress: &InspectionProgress,
-    ) -> Option<CachedModelAssessment> {
-        let plain = plain?;
+    ) -> ComposedVersion {
+        let Some(plain) = plain else {
+            return ComposedVersion { assessment: None, drafter: None };
+        };
         if matches!(plain.profile, ModelAssessment::Unsupported { .. }) {
-            return Some(plain);
+            return ComposedVersion { assessment: Some(plain), drafter: None };
         }
         match self.preselected_assessment(&candidate, progress).await {
-            Ok(Some(assessed)) => Some(assessed),
-            Ok(None) => Some(plain),
+            Ok((Some(assessed), drafter)) => ComposedVersion { assessment: Some(assessed), drafter },
+            Ok((None, drafter)) => ComposedVersion { assessment: Some(plain), drafter },
             Err(error) => {
                 tracing::warn!(%error, "the preselected drafter of a candidate version is unavailable");
-                Some(plain)
+                ComposedVersion { assessment: Some(plain), drafter: None }
             }
         }
     }
@@ -1475,23 +1481,23 @@ impl ManagedModelCandidates {
         &self,
         candidate: &ModelCandidate,
         progress: &InspectionProgress,
-    ) -> Result<Option<CachedModelAssessment>, InventoryError> {
+    ) -> Result<(Option<CachedModelAssessment>, Option<DrafterCandidate>), InventoryError> {
         let target = self.candidate_target(candidate).await?;
         let drafters = self.drafter_list(&target, None, true, progress).await?;
         let Some(chosen) = recommended(drafters.candidates) else {
-            return Ok(Some(
-                self.assess(&target.material, None, ModelMethod::Plain)
-                    .await?,
+            return Ok((
+                Some(self.assess(&target.material, None, ModelMethod::Plain).await?),
+                None,
             ));
         };
-        let Some(method) = chosen.method else {
-            return Ok(None);
+        let Some(method) = chosen.method.clone() else {
+            return Ok((None, Some(chosen)));
         };
         let engine = match &chosen.reference {
             DrafterReference::Embedded => {
-                return Ok(Some(
-                    self.assess(&target.material, None, ModelMethod::Auto)
-                        .await?,
+                return Ok((
+                    Some(self.assess(&target.material, None, ModelMethod::Auto).await?),
+                    Some(chosen),
                 ));
             }
             DrafterReference::Catalog { .. } => engine_method(&method),
@@ -1501,13 +1507,13 @@ impl ManagedModelCandidates {
         };
         let drafter = self
             .candidate_drafter_material(&CandidateDrafter {
-                reference: chosen.reference,
+                reference: chosen.reference.clone(),
                 method,
             })
             .await?;
-        Ok(Some(
-            self.assess(&target.material, drafter.as_ref(), engine)
-                .await?,
+        Ok((
+            Some(self.assess(&target.material, drafter.as_ref(), engine).await?),
+            Some(chosen),
         ))
     }
 
@@ -1630,6 +1636,7 @@ impl ManagedModelCandidates {
                     model_id: hugging_face_model_id(&snapshot.repository, &group.group)?,
                     catalog_model: None,
                     on_this_computer: None,
+                    drafter: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -1721,7 +1728,7 @@ impl ManagedModelCandidates {
             .iter()
             .copied()
             .zip(assessments)
-            .filter_map(|(group, assessment)| {
+            .filter_map(|(group, ComposedVersion { assessment, drafter })| {
                 let model_id = hugging_face_model_id(&snapshot.repository, &group.group)?;
                 // The catalog target at its commit, or its bytes at another commit of its
                 // repository, which install as that catalog model all the same.
@@ -1757,6 +1764,7 @@ impl ManagedModelCandidates {
                     model_id,
                     catalog_model,
                     on_this_computer,
+                    drafter,
                 })
             })
             .collect::<Vec<_>>();
@@ -1881,7 +1889,7 @@ impl ManagedModelCandidates {
             .iter()
             .copied()
             .zip(assessments)
-            .filter_map(|(group, assessment)| {
+            .filter_map(|(group, ComposedVersion { assessment, drafter })| {
                 // A file with an installed catalog target's bytes (a copy, or a link to one) is
                 // that catalog model, which is on this computer.
                 let catalog_model = group.local_digest.as_deref().and_then(|digest| {
@@ -1902,6 +1910,7 @@ impl ManagedModelCandidates {
                     model_id,
                     catalog_model,
                     on_this_computer,
+                    drafter,
                 })
             })
             .collect::<Vec<_>>();
@@ -4054,6 +4063,14 @@ struct AssessedVersion<'a> {
     model_id: ModelId,
     catalog_model: Option<ModelId>,
     on_this_computer: Option<ModelId>,
+    drafter: Option<DrafterCandidate>,
+}
+
+/// A version's assessment as inspection composes it: the recommended version with the drafter it
+/// is served with and that drafter, every other version plain.
+struct ComposedVersion {
+    assessment: Option<CachedModelAssessment>,
+    drafter: Option<DrafterCandidate>,
 }
 
 fn hugging_face_model_id(repository: &str, group: &GgufGroup) -> Option<ModelId> {
@@ -4280,6 +4297,7 @@ fn candidate_versions(
                 recommended: Some(index) == recommended,
                 catalog_model: version.catalog_model,
                 on_this_computer: version.on_this_computer,
+                drafter: version.drafter,
             }
         })
         .collect()

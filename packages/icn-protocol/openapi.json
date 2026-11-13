@@ -3255,6 +3255,9 @@
           },
           "onThisComputer": {
             "$ref": "#/components/schemas/ModelId"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/DrafterCandidate"
           }
         },
         "additionalProperties": false

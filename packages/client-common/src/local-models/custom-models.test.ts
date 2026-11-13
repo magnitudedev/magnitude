@@ -191,6 +191,7 @@ describe("drafter presentation", () => {
       recommended: true,
       catalogModel: Option.none(),
       onThisComputer: Option.none(),
+      drafter: Option.none(),
     } satisfies CandidateVersion
     const projector = Option.some({ path: "mmproj.gguf", sizeBytes: 670_000_000 })
     expect(candidateDownloadBytes(version, projector, Option.some(candidate({ sizeBytes: 685_000_000 })))).toEqual({
@@ -363,7 +364,7 @@ describe("repositories where nothing runs", () => {
   const assessment = (value: Record<string, unknown>) => Option.some(value as never)
   const version = (label: string, verdict: Option.Option<never>) => ({
     label, modelId: `hf:o/r/${label}.gguf`, files: [`${label}.gguf`], sizeBytes: 1, downloadBytes: 1,
-    assessment: verdict, recommended: false, onThisComputer: Option.none(),
+    assessment: verdict, recommended: false, onThisComputer: Option.none(), drafter: Option.none(),
   }) as never
   const tooLarge = assessment({ _tag: "DoesNotFit" })
   const unsupportedTensors = (count: number) => assessment({

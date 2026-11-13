@@ -108,6 +108,7 @@ export const version = (label: string, overrides: Partial<CandidateVersion> = {}
   recommended: false,
   catalogModel: Option.none(),
   onThisComputer: Option.none(),
+  drafter: Option.none(),
   ...overrides,
 })
 

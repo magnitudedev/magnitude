@@ -78,11 +78,12 @@ function NextPage({ onReach }: { onReach: () => void }) {
  * An offered model as opened: what opening it brings (a search result's every quant) is the model it shows. A
  * `prefetched` model is opened before it is shown open.
  */
-function OfferedCard({ model, expanded, prefetched, download, useOpened, ...rest }: Omit<Parameters<typeof ExpandingModel>[0], "footer"> & {
+function OfferedCard({ model, expanded, prefetched, download, drafters, useOpened, ...rest }: Omit<Parameters<typeof ExpandingModel>[0], "footer" | "drafter"> & {
   prefetched: boolean; download: (model: OfferedModel, quant: QuantView) => ReactNode; useOpened: (model: OfferedModel, open: boolean) => OfferedModel
+  drafters: ((model: OfferedModel, quant: QuantView) => ReactNode) | undefined
 }) {
   const opened = useOpened(model, expanded || prefetched)
-  return <ExpandingModel {...rest} model={opened} expanded={expanded} footer={quant => download(opened, quant)} />
+  return <ExpandingModel {...rest} model={opened} expanded={expanded} drafter={drafters && (quant => drafters(opened, quant))} footer={quant => download(opened, quant)} />
 }
 
 /** Reports whether its row is on screen, so the rows in view are checked first. */
@@ -135,9 +136,10 @@ function CheckingCard({ name, lab }: { name: string; lab: ModelLab | undefined }
 }
 
 /** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
-export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, useOpened, onSeen }: {
+export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, drafters, useOpened, onSeen }: {
   open: boolean; setOpen: (open: boolean) => void; query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
+  drafters?: (model: OfferedModel, quant: QuantView) => ReactNode
   useOpened: (model: OfferedModel, open: boolean) => OfferedModel
   onSeen: (update: (seen: ReadonlySet<string>) => ReadonlySet<string>) => void
 }) {
@@ -148,7 +150,7 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
   const expanded = chosen === undefined ? (results._tag === "Recommended" && results.measuring === null ? results.models[0]?.key ?? null : null) : chosen
   const card = (model: OfferedModel, note?: string, prefetched = false) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
     prefetched={prefetched} onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
-    onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} useOpened={useOpened} />
+    onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} drafters={drafters} useOpened={useOpened} />
   return <Dialog open={open} onOpenChange={value => { setOpen(value); if (!value) setExpanded(undefined) }}>
     <DialogContent className="flex h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
       <DialogTitle className="sr-only">Explore models</DialogTitle>

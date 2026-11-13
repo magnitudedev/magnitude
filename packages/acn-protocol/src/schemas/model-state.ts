@@ -1589,6 +1589,7 @@ export const CandidateVersionSchema = Schema.Struct({
   recommended: Schema.Boolean,
   catalogModel: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
   onThisComputer: Schema.optionalWith(ModelIdSchema, { as: "Option", exact: true }),
+  drafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
 })
 export type CandidateVersion = typeof CandidateVersionSchema.Type
 

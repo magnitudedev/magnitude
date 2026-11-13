@@ -1,4 +1,5 @@
 import type { FitPlacementPhrase } from "@magnitudedev/client-common"
+import type { DrafterTarget } from "@magnitudedev/sdk"
 import type { HardwarePhoto } from "../hardware-photos"
 
 /** Where part of a model sits while it runs: fast memory, host RAM beside a discrete GPU, or the disk it streams from. */
@@ -21,6 +22,7 @@ export interface QuantView {
   readonly sizeBytes: number
   readonly downloadBytes: number
   readonly drafterBytes: number
+  readonly drafterTarget: DrafterTarget | null
   readonly fits: boolean
   readonly measuring: boolean
   readonly speed: number | null

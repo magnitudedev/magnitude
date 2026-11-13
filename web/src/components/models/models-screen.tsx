@@ -1,5 +1,4 @@
 import { useState, type ReactNode } from "react"
-import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { CircleNotchIcon, MagnifyingGlassIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
@@ -13,6 +12,7 @@ import { fitLabel, MachineCard } from "./parts"
 import { machineView } from "./machine"
 import { ownedModel, unrunnableFile } from "./data"
 import { YourModels, type OwnedModel } from "./your-models"
+import { DrafterDialog } from "./drafter-picker"
 
 const residencyOf = (model: LocalModel) => "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
 
@@ -39,6 +39,7 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
   const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
   const mutations = useLocalModelMutations()
   const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set())
+  const [picking, setPicking] = useState<OwnedModel | null>(null)
   if (Result.isFailure(models)) return <><h1 className={pageLayout.pageTitle}>Models</h1><ErrorNotice title="Couldn’t load your models" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
   if (!Result.isSuccess(models) || !Result.isSuccess(hardware)) return <ModelsSkeleton />
   const memory = deriveHardwareRoles(hardware.value).servingMemory
@@ -95,20 +96,15 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
     mutations.unhide(model.modelId)
     setRemoved(current => new Set([...current].filter(modelId => modelId !== view.modelId)))
   }
-  const addDrafter = (view: OwnedModel) => {
-    const model = byId.get(view.modelId)
-    if (model?._tag !== "Custom") return
-    Option.match(model.recommendedDrafter, {
-      onNone: () => mutations.setDrafter(model.modelId as CustomFormModelId, { _tag: "Auto" }),
-      onSome: drafter => mutations.setDrafter(model.modelId as CustomFormModelId, { _tag: "Reference", reference: drafter.reference }),
-    })
-  }
+  const choosing = picking === null ? undefined : byId.get(picking.modelId)
   return <div>
     <div className="mb-5 flex items-end justify-between gap-4"><h1 className={pageLayout.pageTitle}>Models</h1><Button onClick={() => onExplore("")}><MagnifyingGlassIcon />Explore models</Button></div>
     <MachineCard machine={machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null)} />
     {owned.length === 0 && hidden.length === 0 && models.value.unsupported.length === 0
       ? <div className={cn("mt-8 rounded-xl border border-slate-200 bg-white px-5 py-6 text-[13px] text-slate-500 dark:border-slate-750 dark:bg-slate-850")}>No models yet. <button type="button" onClick={() => onExplore("")} className="text-blue-700 hover:underline dark:text-blue-400">Explore models</button> to download one.</div>
       : <YourModels models={owned} hidden={hidden} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
-        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onUnhide={unhide} onAddDrafter={addDrafter} />}
+        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onUnhide={unhide} onDrafter={setPicking} />}
+    {picking && choosing?._tag === "Custom" && <DrafterDialog model={choosing} bits={picking.quant.bits} onClose={() => setPicking(null)}
+      onChoose={choice => mutations.setDrafter(choosing.modelId as CustomFormModelId, choice)} />}
   </div>
 }

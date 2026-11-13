@@ -3269,6 +3269,7 @@ mod tests {
                         recommended: true,
                         catalog_model: None,
                         on_this_computer: None,
+                        drafter: None,
                     }],
                     projector: None,
                     unsupported_architecture: None,

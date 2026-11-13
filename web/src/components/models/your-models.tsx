@@ -22,6 +22,7 @@ export interface OwnedModel {
   readonly location: string | null
   readonly found: boolean
   readonly drafter: { readonly method: string; readonly sizeBytes: number | null; readonly attached: boolean } | null
+  readonly drafterChoosable: boolean
   readonly searchText: string
 }
 
@@ -103,13 +104,16 @@ function QuantLine({ model }: { model: OwnedModel }) {
 }
 
 /** What opening a model shows: how it runs here, then where it came from and what goes with it. */
-function Details({ model, onAddDrafter }: { model: OwnedModel; onAddDrafter: () => void }) {
+function Details({ model, onDrafter }: { model: OwnedModel; onDrafter: () => void }) {
   const rows: readonly (readonly [string, ReactNode])[] = [
     ["Source", model.quant.repository ? <span className="inline-flex min-w-0 items-center gap-1 text-slate-700 dark:text-slate-300"><HuggingFaceLogo className="size-3.5" /><RepositoryLink repository={model.quant.repository} /></span> : <span className="text-slate-500">Not matched to a Hugging Face repo</span>],
     ...(model.location ? [["Location", <span className="truncate font-mono text-[11px] text-slate-600 dark:text-slate-400">{model.location}</span>] as const] : []),
-    ["Drafter", model.drafter === null ? <span className="text-slate-500">None</span>
-      : model.drafter.attached ? <span className="rounded border border-slate-300 px-1.5 text-[11px] font-medium text-slate-600 dark:border-slate-600 dark:text-slate-300">{model.drafter.method}{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</span>
-      : <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onAddDrafter() }}><PlusIcon />Add {model.drafter.method} drafter{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</Button>],
+    ["Drafter", <span className="flex items-center gap-2">
+      {model.drafter === null ? <span className="text-slate-500">None</span>
+        : model.drafter.attached ? <span className="rounded border border-slate-300 px-1.5 text-[11px] font-medium text-slate-600 dark:border-slate-600 dark:text-slate-300">{model.drafter.method}{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</span>
+        : model.drafterChoosable && <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onDrafter() }}><PlusIcon />Add {model.drafter.method} drafter{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</Button>}
+      {model.drafterChoosable && (model.drafter === null || model.drafter.attached) && <Button size="xs" variant="ghost" onClick={event => { event.stopPropagation(); onDrafter() }}>{model.drafter === null ? "Choose…" : "Change…"}</Button>}
+    </span>],
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">
@@ -154,10 +158,10 @@ function Hidden({ models, onUnhide }: { models: readonly OwnedModel[]; onUnhide:
 }
 
 /** The user's models: one row each, opened in place, with search and filters for this list only. */
-export function YourModels({ models, hidden, unrunnable, action, onExploreQuants, onRemove, onUnhide, onAddDrafter }: {
+export function YourModels({ models, hidden, unrunnable, action, onExploreQuants, onRemove, onUnhide, onDrafter }: {
   models: readonly OwnedModel[]; hidden: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]
   action: (model: OwnedModel) => ReactNode; onExploreQuants: (model: OwnedModel) => void; onRemove: (model: OwnedModel) => void
-  onUnhide: (model: OwnedModel) => void; onAddDrafter: (model: OwnedModel) => void
+  onUnhide: (model: OwnedModel) => void; onDrafter: (model: OwnedModel) => void
 }) {
   const [open, setOpen] = useState<string | null>(null)
   const [find, setFind] = useState("")
@@ -185,7 +189,7 @@ export function YourModels({ models, hidden, unrunnable, action, onExploreQuants
             <span className="flex justify-end" onClick={event => event.stopPropagation()}>{action(model)}</span>
             <ModelMenu model={model} onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
           </div>
-          {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onAddDrafter={() => onAddDrafter(model)} /></div>}
+          {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onDrafter={() => onDrafter(model)} /></div>}
         </div>
       })}
     </div>}

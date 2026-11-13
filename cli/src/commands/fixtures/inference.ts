@@ -462,6 +462,7 @@ const version = (
   recommended: false,
   catalogModel: Option.none(),
   onThisComputer: Option.none(),
+  drafter: Option.none(),
   ...overrides,
 })
 

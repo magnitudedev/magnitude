@@ -20,9 +20,10 @@ export interface OfferedModel {
 }
 
 /** A model that opens in place to its quant ladder and how the chosen quant runs here. */
-export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, onQuantChoice, owned, footer }: {
+export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, onQuantChoice, owned, drafter, footer }: {
   model: OfferedModel; note?: string | undefined; expanded: boolean; onToggle: () => void
-  quantChoice: string | null; onQuantChoice: (key: string) => void; owned: ReadonlySet<string>; footer?: (quant: QuantView) => ReactNode
+  quantChoice: string | null; onQuantChoice: (key: string) => void; owned: ReadonlySet<string>
+  drafter?: ((quant: QuantView) => ReactNode) | undefined; footer?: (quant: QuantView) => ReactNode
 }) {
   const current = model.quants.find(quant => quant.key === quantChoice) ?? model.quants.find(quant => quant.key === model.recommended) ?? model.quants[0]
   if (!current) return null
@@ -41,7 +42,10 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
         : <QuantList quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} onSelect={onQuantChoice} />}
       {model.checking && <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 motion-safe:animate-spin" />Checking this repository's other quants…</p>}
       {current.fits && <div className="mt-4"><PlacementBar quant={current} /></div>}
-      {footer && <div className="mt-4 flex justify-end">{footer(current)}</div>}
+      {(drafter || footer) && <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        {drafter?.(current) ?? <span />}
+        {footer?.(current)}
+      </div>}
     </div>}
   </ModelCardShell>
 }

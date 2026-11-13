@@ -15,6 +15,7 @@ import {
   InvalidDirectoryPath,
   InvalidModelReference,
   LocalModelAssessmentSchema,
+  DrafterCandidateSchema,
   LocalModelMutationFailed,
   ModelRepositoryNotFound,
   ModelSourceUnavailable,
@@ -377,6 +378,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     reference: string,
   ) => Effect.gen(function* () {
     const snapshot = yield* assessmentsSnapshot
+    const { catalogModels } = yield* sources.state
     const source = native.source
     const versions = yield* Effect.forEach(native.versions, (version) => Effect.gen(function* () {
       const decoded = Schema.decodeUnknownOption(CustomFormModelIdSchema)(version.modelId)
@@ -397,6 +399,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         recommended: version.recommended,
         catalogModel: Option.flatMap(version.catalogModel, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
         onThisComputer: version.onThisComputer,
+        drafter: Option.flatMap(version.drafter, (drafter) => productDrafterCandidate(drafter, catalogModels)),
       }
     }))
     const named = Option.orElse(
@@ -418,11 +421,12 @@ export const CustomModelCommandsLive: Layer.Layer<
       ...presentField("license", native.license),
       ...presentField("variantOf", native.variantOf),
       ...presentField("developer", native.developer),
-      versions: versions.map(({ assessment, catalogModel, onThisComputer, ...version }) => ({
+      versions: versions.map(({ assessment, catalogModel, onThisComputer, drafter, ...version }) => ({
         ...version,
         ...presentField("assessment", Option.map(assessment, (value) => Schema.encodeSync(LocalModelAssessmentSchema)(value))),
         ...presentField("catalogModel", catalogModel),
         ...presentField("onThisComputer", onThisComputer),
+        ...presentField("drafter", Option.map(drafter, (value) => Schema.encodeSync(DrafterCandidateSchema)(value))),
       })),
       ...presentField("selectedVersion", Option.map(selected, ({ label }) => label)),
       ...presentField("projector", native.projector),

@@ -2390,6 +2390,9 @@ pub struct CandidateVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub on_this_computer: Option<ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub drafter: Option<DrafterCandidate>,
 }
 
 /// The repository step: every version with the engine's verdict, or why none can run.

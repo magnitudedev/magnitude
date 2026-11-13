@@ -313,6 +313,10 @@ export const CandidateVersion = S.Struct({
     { exact: true, as: "Option" },
   ),
   downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<DrafterCandidate, DrafterCandidateEncoded> => DrafterCandidate),
+    { exact: true, as: "Option" },
+  ),
   files: S.Array(S.suspend((): S.Schema<CandidateFile, CandidateFileEncoded> => CandidateFile)),
   label: S.String,
   modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),

@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
+import type { CustomLocalModel, DrafterTarget, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
 import { fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
@@ -8,7 +8,7 @@ import type { RunnableFamily } from "./explore-modal"
 import type { OwnedModel, UnrunnableFile } from "./your-models"
 import type { PlacementPhrase, PlacementTier, QuantView } from "./view"
 
-const methodName: Record<SpeculativeMethod["_tag"], string> = { Mtp: "MTP", DFlash: "DFlash", DFlash2: "DFlash 2", DSpark: "DSpark", LiLiCorr: "LiLiCorr" }
+export const methodName: Record<SpeculativeMethod["_tag"], string> = { Mtp: "MTP", DFlash: "DFlash", DFlash2: "DFlash 2", DSpark: "DSpark", LiLiCorr: "LiLiCorr" }
 
 const foundSourceName = { HuggingFaceCache: "HF cache", LmStudio: "LM Studio", LlamaCpp: "llama.cpp", Ollama: "Ollama", Folder: "Folder" } as const
 
@@ -49,7 +49,7 @@ const speedOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>): n
 }
 
 /** One quant as this machine would run it, from its assessment. */
-export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number; readonly drafterBytes?: number }, assessment: LocalModelAssessment | null, memory: ServingMemory, measuring = false): QuantView => {
+export const quantView = (quant: { readonly key: string; readonly name: string; readonly repository: string | null; readonly sizeBytes: number; readonly downloadBytes: number; readonly drafterBytes?: number; readonly drafterTarget?: DrafterTarget }, assessment: LocalModelAssessment | null, memory: ServingMemory, measuring = false): QuantView => {
   const fits = assessment?._tag === "Fits" ? assessment : null
   return {
     key: quant.key,
@@ -60,6 +60,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     sizeBytes: quant.sizeBytes,
     downloadBytes: quant.downloadBytes,
     drafterBytes: quant.drafterBytes ?? 0,
+    drafterTarget: quant.drafterTarget ?? null,
     fits: fits !== null,
     measuring: measuring || (fits !== null && fits.residency.performance._tag === "Pending"),
     speed: fits ? speedOf(fits) : null,
@@ -138,6 +139,7 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     location: locationOf(model),
     found: model._tag === "Custom" && model.origin._tag === "Found",
     drafter: drafterOf(model),
+    drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
   }
 }

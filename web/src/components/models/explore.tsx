@@ -1,12 +1,13 @@
 import { useContext, useEffect, useMemo, useState } from "react"
 import { Option } from "effect"
 import { Atom, RegistryContext, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
-import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon } from "@phosphor-icons/react"
-import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
-import { formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
+import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon, LightningIcon } from "@phosphor-icons/react"
+import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
+import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
-import { downloadContents, onThisComputer, quantView, transferOf } from "./data"
+import { downloadContents, methodName, onThisComputer, quantView, transferOf } from "./data"
+import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
 import { ExploreModal, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-modal"
@@ -94,12 +95,20 @@ const useRepositoryQuants = (memory: ServingMemory) => function useOpened(model:
   if (reference === null) return model
   if (!Result.isSuccess(inspected)) return { ...model, checking: !Result.isFailure(inspected) }
   const repository = model.key
+  const source = inspected.value.source
   const quants = inspected.value.versions.map(version => quantView(
-    { key: version.modelId, name: version.label, repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes },
+    { key: version.modelId, name: version.label, repository, sizeBytes: version.sizeBytes, downloadBytes: version.downloadBytes, drafterTarget: { _tag: "Candidate", source, files: version.files } },
     Option.getOrNull(version.assessment), memory)).sort((left, right) => left.sizeBytes - right.sizeBytes)
   if (quants.length === 0) return model
-  const recommended = inspected.value.versions.find(version => version.recommended)?.modelId ?? model.recommended
-  return { ...model, quants, recommended, checking: false }
+  const best = inspected.value.versions.find(version => version.recommended)
+  const drafter = Option.getOrNull(Option.flatMap(Option.fromNullable(best), version => version.drafter))
+  return {
+    ...model,
+    quants,
+    recommended: best?.modelId ?? model.recommended,
+    drafter: drafter ? { method: Option.match(drafter.method, { onNone: () => drafter.name, onSome: method => methodName[method._tag] }), sizeBytes: drafterCandidateDownloadBytes(drafter) } : null,
+    checking: false,
+  }
 }
 
 interface ExploreProps {
@@ -133,8 +142,19 @@ function DownloadButton({ size, contents, disabled, start }: { size: number; con
   </span>
 }
 
+/** A Hugging Face quant's Download: its files and projector, plus the drafter chosen for it unless that is here already. */
+function HuggingFaceDownload({ quant, repository, selection, start }: {
+  quant: QuantView; repository: HuggingFaceRepositoryId; selection: DrafterSelection; start: (drafter: DrafterChoice) => void
+}) {
+  const target = quant.drafterTarget
+  const { chosen } = useDrafters(target ?? { _tag: "Model", modelId: quant.key as CustomFormModelId }, selection)
+  const drafterBytes = target ? Option.match(chosen, { onNone: () => 0, onSome: drafterCandidateDownloadBytes }) : 0
+  return <DownloadButton key={`${repository}:${quant.key}`} size={quant.downloadBytes + drafterBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits}
+    start={() => start(target ? drafterChoice(selection, chosen) : { _tag: "Auto" })} />
+}
+
 /** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
-function useDownload() {
+function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
   const client = useAgentClient()
   const add = useAtomSet(client.Models.AddHuggingFaceModel)
   const { install } = useLocalModelMutations()
@@ -148,19 +168,33 @@ function useDownload() {
       return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
     }
     if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
-    if (!model.catalog && quant.repository === null) return null
-    const start = model.catalog
-      ? () => install(quant.key as CatalogFormModelId)
-      : () => add({
-          repository: quant.repository as HuggingFaceRepositoryId,
-          revision: Option.none(),
-          version: Option.some(quant.name),
-          drafter: { _tag: "Auto" },
-          force: false,
-        })
-    return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents(model, quant)} disabled={!quant.fits} start={start} />
+    if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits} start={() => install(quant.key as CatalogFormModelId)} />
+    if (quant.repository === null) return null
+    const repository = quant.repository as HuggingFaceRepositoryId
+    return <HuggingFaceDownload key={quant.key} quant={quant} repository={repository} selection={selections[quant.key] ?? AUTO_DRAFTER}
+      start={drafter => add({ repository, revision: Option.none(), version: Option.some(quant.name), drafter, force: false })} />
   }
 }
+
+/** A catalog model's drafter, which comes with it: named beside its download, with the bytes it adds. */
+function CatalogDrafter({ drafter }: { drafter: NonNullable<OfferedModel["drafter"]> }) {
+  return <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400" title="A drafter is a small model that guesses ahead, so this one writes several tokens per step">
+    <LightningIcon weight="fill" className="size-3.5 text-amber-500" />
+    <span>Using <span className="font-medium text-slate-800 dark:text-slate-200">{drafter.method} drafter</span></span>
+    {drafter.sizeBytes > 0 && <span className="text-slate-500">· {formatStorageSize(drafter.sizeBytes)}</span>}
+  </span>
+}
+
+/**
+ * The drafter beside an opened model's download: a Hugging Face quant's choice once its repository is inspected, a
+ * catalog quant's own drafter, or nothing for a catalog quant without one.
+ */
+const drafterFor = (selections: Readonly<Record<string, DrafterSelection>>, select: (key: string, selection: DrafterSelection) => void) =>
+  (model: OfferedModel, quant: QuantView) => model.catalog
+    ? model.drafter && quant.drafterBytes > 0 ? <CatalogDrafter drafter={model.drafter} /> : null
+    : quant.drafterTarget
+      ? <DrafterSection key={quant.key} target={quant.drafterTarget} selection={selections[quant.key] ?? AUTO_DRAFTER} onSelect={selection => select(quant.key, selection)} />
+      : <span role="status" className="flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 motion-safe:animate-spin" />Finding a drafter…</span>
 
 /** No results yet: one list, so what is derived from a search's results doesn't change before they do. */
 const NO_RESULTS: readonly HuggingFaceSearchResult[] = []
@@ -231,11 +265,13 @@ export function Explore(props: ExploreProps) {
   const visible = useMemo(() => Atom.make<ReadonlySet<string>>(new Set<string>()), [])
   const setVisible = useAtomSet(visible)
   const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.memory, visible)
-  const download = useDownload()
+  const [selections, setSelections] = useState<Readonly<Record<string, DrafterSelection>>>({})
+  const download = useDownload(selections)
+  const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))
   const results: ExploreResults = props.query.trim() === ""
     ? { _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }
     : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
     : searched
   const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
-  return <ExploreModal {...props} results={results} download={download} useOpened={useOpened} onSeen={setVisible} />
+  return <ExploreModal {...props} results={results} download={download} drafters={drafters} useOpened={useOpened} onSeen={setVisible} />
 }
