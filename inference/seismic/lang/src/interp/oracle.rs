@@ -51,11 +51,24 @@ pub(super) fn runtime_symbols(arena: &ExprArena) -> RuntimeSymbols {
 /// value enters through [`Frame::bind`], which also binds the value's
 /// `RuntimeValue` symbol, so extents and symbolic expressions of this body
 /// evaluate against exactly the values reached in it.
-#[derive(Clone)]
+///
+/// A nested region (a branch, a loop iteration) runs in a scope of the same
+/// frame ([`Frame::scoped`]): it sees every value bound before it, and what
+/// it binds is undone when it ends, so no region copies its enclosing values.
 struct Frame {
     environment: Environment,
     assignment: Assignment,
     runtime_symbols: RuntimeSymbols,
+    /// What the open scopes bound, latest last, each with what it replaced.
+    undo: Vec<Undo>,
+    /// Open scopes; bindings outside any are never undone, so not recorded.
+    scopes: usize,
+}
+
+/// One binding of a scope and what it replaced ([`Frame::scoped`]).
+enum Undo {
+    Value(SemanticValueId, Option<Value>),
+    Symbol(SymbolId, Option<(usize, SymbolValue)>),
 }
 
 impl Frame {
@@ -64,6 +77,36 @@ impl Frame {
             environment: Environment::new(),
             assignment,
             runtime_symbols,
+            undo: Vec::new(),
+            scopes: 0,
+        }
+    }
+
+    /// `body` in a scope of this frame: the frame as `body` leaves it while
+    /// it runs, and as it was before once it returns.
+    fn scoped<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
+        let mark = self.undo.len();
+        self.scopes += 1;
+        let result = body(self);
+        self.scopes -= 1;
+        for undo in self.undo.drain(mark..).rev() {
+            match undo {
+                Undo::Value(id, Some(previous)) => {
+                    self.environment.insert(id, previous);
+                }
+                Undo::Value(id, None) => {
+                    self.environment.remove(&id);
+                }
+                Undo::Symbol(symbol, previous) => self.assignment.restore(symbol, previous),
+            }
+        }
+        result
+    }
+
+    fn bind_symbol(&mut self, symbol: SymbolId, value: SymbolValue) {
+        let previous = self.assignment.replace(symbol, value);
+        if self.scopes > 0 {
+            self.undo.push(Undo::Symbol(symbol, previous));
         }
     }
 
@@ -82,9 +125,12 @@ impl Frame {
                     scalar_symbol(scalar)
                 }
             };
-            self.assignment.bind(*symbol, published);
+            self.bind_symbol(*symbol, published);
         }
-        self.environment.insert(id, value);
+        let previous = self.environment.insert(id, value);
+        if self.scopes > 0 {
+            self.undo.push(Undo::Value(id, previous));
+        }
     }
 
     fn value(&self, id: SemanticValueId) -> &Value {
@@ -529,15 +575,22 @@ impl Interpreter<'_> {
                     } => {
                         let condition = frame.value(condition).as_scalar().bits() != 0;
                         let child = if condition { then } else { otherwise };
-                        let mut child_frame = frame.clone();
-                        bind_region_parameters(function, child, captures, &mut child_frame, frame);
-                        self.execute_region(function, child, &mut child_frame)?;
                         let results = function.region(child).results();
                         if results.len() != outputs.len() {
                             unreachable!("checked if branch result arity mismatch")
                         }
-                        for (output, result) in outputs.iter().zip(results) {
-                            frame.bind(*output, child_frame.value(*result).clone());
+                        let values = frame.scoped(|frame| {
+                            bind_region_parameters(function, child, captures, frame);
+                            self.execute_region(function, child, frame)?;
+                            Ok::<_, EvalError>(
+                                results
+                                    .iter()
+                                    .map(|result| frame.value(*result).clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })?;
+                        for (output, value) in outputs.iter().zip(values) {
+                            frame.bind(*output, value);
                         }
                     }
                     SemanticNodeView::Loop {
@@ -567,16 +620,24 @@ impl Interpreter<'_> {
                         let mut coordinate = start;
                         while coordinate < end {
                             self.charge_work(1)?;
-                            let mut child = frame.clone();
-                            child.bind(parameters[0], Value::Index(coordinate.clone()));
-                            for (parameter, value) in parameters[1..].iter().zip(&current) {
-                                child.bind(*parameter, value.clone());
-                            }
-                            child
-                                .assignment
-                                .bind(*binder_symbol, SymbolValue::Nat(coordinate.clone()));
-                            self.execute_region(function, body, &mut child)?;
-                            for carry in carries {
+                            let yielded = frame.scoped(|frame| {
+                                frame.bind(parameters[0], Value::Index(coordinate.clone()));
+                                for (parameter, value) in parameters[1..].iter().zip(&current) {
+                                    frame.bind(*parameter, value.clone());
+                                }
+                                frame.bind_symbol(
+                                    *binder_symbol,
+                                    SymbolValue::Nat(coordinate.clone()),
+                                );
+                                self.execute_region(function, body, frame)?;
+                                Ok::<_, EvalError>(
+                                    carries
+                                        .iter()
+                                        .map(|carry| frame.value(carry.yielded).clone())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })?;
+                            for (carry, value) in carries.iter().zip(yielded) {
                                 let parameter = parameters[1..]
                                     .iter()
                                     .position(|parameter| *parameter == carry.parameter)
@@ -585,7 +646,7 @@ impl Interpreter<'_> {
                                             "checked carry parameter is not a loop capture"
                                         )
                                     });
-                                current[parameter] = child.value(carry.yielded).clone();
+                                current[parameter] = value;
                             }
                             coordinate += 1u8;
                         }
@@ -1441,19 +1502,24 @@ impl Interpreter<'_> {
     }
 }
 
+/// Binds `region`'s parameters in `frame`, a scope of the frame that holds
+/// `captures`, to the captured values.
 fn bind_region_parameters(
     function: &SemanticFunction,
     region: crate::ids::RegionId,
     captures: &[SemanticValueId],
-    child: &mut Frame,
-    parent: &Frame,
+    frame: &mut Frame,
 ) {
     let parameters = function.region(region).parameters();
     if parameters.len() != captures.len() {
         unreachable!("checked region capture arity mismatch")
     }
-    for (parameter, capture) in parameters.iter().zip(captures) {
-        child.bind(*parameter, parent.value(*capture).clone());
+    let values = captures
+        .iter()
+        .map(|capture| frame.value(*capture).clone())
+        .collect::<Vec<_>>();
+    for (parameter, value) in parameters.iter().zip(values) {
+        frame.bind(*parameter, value);
     }
 }
 

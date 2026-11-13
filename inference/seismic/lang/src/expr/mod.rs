@@ -1451,8 +1451,31 @@ impl PartialAssignment {
         Self::default()
     }
     pub fn bind(&mut self, symbol: SymbolId, value: SymbolValue) {
-        self.values.retain(|(s, _)| *s != symbol);
+        let _ = self.replace(symbol, value);
+    }
+    /// Binds `symbol` to `value`, returning its previous binding and that
+    /// binding's place, which [`Self::restore`] puts back.
+    pub(crate) fn replace(
+        &mut self,
+        symbol: SymbolId,
+        value: SymbolValue,
+    ) -> Option<(usize, SymbolValue)> {
+        let previous = self
+            .values
+            .iter()
+            .position(|(s, _)| *s == symbol)
+            .map(|at| (at, self.values.remove(at).1));
         self.values.push((symbol, value));
+        previous
+    }
+    /// Undoes the latest binding, [`Self::replace`] of `symbol` that returned
+    /// `previous`: the assignment as it was before it.
+    pub(crate) fn restore(&mut self, symbol: SymbolId, previous: Option<(usize, SymbolValue)>) {
+        let (latest, _) = self.values.pop().expect("a binding to undo");
+        assert_eq!(latest, symbol, "bindings are undone latest first");
+        if let Some((at, value)) = previous {
+            self.values.insert(at, (symbol, value));
+        }
     }
     pub fn get(&self, symbol: SymbolId) -> Option<SymbolValue> {
         self.values
