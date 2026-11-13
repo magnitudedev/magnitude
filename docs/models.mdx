@@ -54,3 +54,42 @@ For terminal control, see [CLI reference](/reference).
 | Output tokens | Generated tokens. |
 | Generation speed | Output tokens per second. |
 | Time to first token | Time before the response starts. Loading and prompt processing can delay it even when generation is fast. |
+
+### API-equivalent cost
+
+**API-equivalent cost** estimates what your local inference workload would have cost if run on a comparable hosted inference provider (such as Anthropic, OpenAI, Google, DeepSeek, or hosted open-weight model endpoints).
+
+#### Calculation formula
+
+Cost is calculated deterministically from standard published token rates:
+
+```
+uncached_input = total_input - cached_input
+
+api_equivalent_cost = (
+    uncached_input * input_price
+    + cached_input * cached_input_price
+    + output_tokens * output_price
+) / 1_000_000
+```
+
+All prices are denominated in currency per million tokens. Cached input tokens are strictly a subset of total input tokens and are never counted twice.
+
+#### Cached input pricing and fallback policy
+
+When a hosted provider publishes a prompt cache discount rate (such as Anthropic's prompt cache hit rate or OpenAI's cached input rate), that published cached rate is applied directly to cached input tokens.
+
+If a provider does not offer or publish prompt cache discount rates, Magnitude applies a transparent fallback policy: cached input tokens are charged at the standard input token rate. Magnitude does not invent synthetic discounts.
+
+#### Model equivalence and configuration
+
+- **Explicit Mapping**: Supported open-weight models map to their official hosted counterparts (for example, DeepSeek R1 local distillation maps to hosted DeepSeek-R1, and Llama 3.3 70B maps to hosted Llama 3.3 70B Instruct).
+- **Comparison Selection**: Users can compare their workload against any published hosted model (such as Claude 3.5 Sonnet, GPT-4o, DeepSeek-V3, or Gemini 1.5 Pro) using the model selector on the Usage dashboard.
+- **Unmapped Models**: Custom fine-tunes or community models without an exact counterpart are marked as unmapped rather than assigned an arbitrary guess. Users can select an explicit comparison model to view cost estimates.
+- **Pricing Assumptions**: Published provider rates, source references, and verification timestamps can be inspected directly in the dashboard by expanding **View pricing assumptions**.
+
+#### Limitations and difference from net savings
+
+API-equivalent cost is **not** actual expenditure or net savings.
+
+API-equivalent cost only calculates what hosted providers would have billed for the equivalent token volume at their list prices. Actual financial savings require taking into account electricity, local hardware acquisition and depreciation, subscriptions, cloud credits, maintenance, and operational overhead.

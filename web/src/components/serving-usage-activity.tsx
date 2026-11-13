@@ -3,6 +3,7 @@ import { useRef, useState, type KeyboardEvent } from "react"
 import type { ServingUsageSnapshot } from "@magnitudedev/sdk"
 import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 import { Skeleton } from "./ui/skeleton"
+import { formatCostCurrency } from "./api-equivalent-cost"
 
 type Activity = Extract<ServingUsageSnapshot, { _tag: "Available" }>["dailyActivity"]
 const colors = [
@@ -25,7 +26,15 @@ export function activityLevel(tokens: number, maximum: number): 0 | 1 | 2 | 3 | 
   return tokens === 0 ? 0 : Math.min(4, Math.max(1, Math.ceil(tokens / maximum * 4))) as 1 | 2 | 3 | 4
 }
 
-export function UsageActivity({ days }: { days: Activity | null }) {
+export function UsageActivity({
+  days,
+  costPerToken,
+  currency = "USD",
+}: {
+  days: Activity | null
+  costPerToken?: number
+  currency?: string
+}) {
   const table = useRef<HTMLTableElement>(null)
   const [focusedDate, setFocusedDate] = useState<string | null>(null)
   const summary = days ? activitySummary(days) : null
@@ -66,7 +75,8 @@ export function UsageActivity({ days }: { days: Activity | null }) {
               const cell = "block aspect-square w-full rounded-[3px]"
               if (!days) return <td key={column}><Skeleton className={cell} /></td>
               if (!day) return <td key={column}><span aria-hidden="true" className={`${cell} invisible`} /></td>
-              const label = `${day.totalTokens.toLocaleString()} tokens on ${dateLabel(day.date)}`
+              const costText = costPerToken && day.totalTokens > 0 ? ` (~${formatCostCurrency(day.totalTokens * costPerToken, currency)} API equiv.)` : ""
+              const label = `${day.totalTokens.toLocaleString()} tokens${costText} on ${dateLabel(day.date)}`
               return <td key={column}><ActionTooltip label={label} trigger={<button type="button" aria-label={label} data-day-index={column * 7 + row} data-activity-level={activityLevel(day.totalTokens, maximum)} tabIndex={day.date === focusDate ? 0 : -1}
                 onFocus={() => setFocusedDate(day.date)} onKeyDown={event => navigate(event, column * 7 + row)}
                 className={`${cell} ${colors[activityLevel(day.totalTokens, maximum)]} outline-offset-2 focus-visible:outline-2 focus-visible:outline-blue-500`} />} /></td>
