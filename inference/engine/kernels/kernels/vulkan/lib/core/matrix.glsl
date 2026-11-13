@@ -3,7 +3,7 @@
 //
 // This file is independent of any entry ABI.
 
-#if SEISMIC_HAS_MATRIX
+#if SEISMIC_HAS_MATRIX || SEISMIC_HAS_MATRIX_HARDWARE
 #define MATRIX_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define MATRIX_FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 #define MATRIX_FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>

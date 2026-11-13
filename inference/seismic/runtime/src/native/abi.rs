@@ -2324,6 +2324,7 @@ mod tests {
         subgroup_lanes: 32,
         float16: true,
         matrix: false,
+        matrix_hardware: false,
         wide_accumulators: true,
         mixed_dot: true,
         f32_atomic_add: false,
@@ -2371,6 +2372,7 @@ mod tests {
         let matrix = render(
             Dialect::Vulkan(vulkan::VulkanFeatures {
                 matrix: true,
+                matrix_hardware: true,
                 ..VULKAN_FEATURES
             }),
             "f32",

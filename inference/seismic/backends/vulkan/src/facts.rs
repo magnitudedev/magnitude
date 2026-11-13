@@ -38,6 +38,10 @@ pub struct FormationTarget {
     pub float16: bool,
     /// The cooperative-matrix path is formed (`SEISMIC_HAS_MATRIX`).
     pub matrix: bool,
+    /// The device has cooperative matrices to form, whether or not the path
+    /// is chosen (`SEISMIC_HAS_MATRIX_HARDWARE`): what the machine line's
+    /// matrix probe times, the hardware and not a performance choice.
+    pub matrix_hardware: bool,
     pub wide_accumulators: bool,
     pub mixed_dot: bool,
     pub f32_atomic_add: bool,
@@ -53,10 +57,12 @@ impl FormationTarget {
     pub fn of(properties: &Properties, matrix_path: bool) -> Self {
         let subgroup_lanes = u32::try_from(properties.subgroup_width.get()).expect("a subgroup's lanes fit u32");
         let float16 = properties.float16.holds();
+        let matrix_hardware = properties.matrix.holds() && float16 && subgroup_lanes == SUBGROUP_WIDTH;
         Self {
             subgroup_lanes,
             float16,
-            matrix: properties.matrix.holds() && float16 && subgroup_lanes == SUBGROUP_WIDTH && matrix_path,
+            matrix: matrix_hardware && matrix_path,
+            matrix_hardware,
             wide_accumulators: properties.wide_accumulators.holds(),
             mixed_dot: properties.mixed_dot.holds(),
             f32_atomic_add: properties.f32_atomic_add.holds(),
@@ -71,7 +77,8 @@ impl FormationTarget {
     /// fp16 arithmetic and 32-lane subgroups.
     pub fn consistent(&self) -> bool {
         matches!(self.subgroup_lanes, 32 | 64)
-            && (!self.matrix || (self.float16 && self.subgroup_lanes == SUBGROUP_WIDTH))
+            && (!self.matrix_hardware || (self.float16 && self.subgroup_lanes == SUBGROUP_WIDTH))
+            && (!self.matrix || self.matrix_hardware)
     }
 
     /// The target as it enters the formation identity: every field by name
@@ -82,6 +89,7 @@ impl FormationTarget {
             subgroup_lanes,
             float16,
             matrix,
+            matrix_hardware,
             wide_accumulators,
             mixed_dot,
             f32_atomic_add,
@@ -90,7 +98,7 @@ impl FormationTarget {
             denorm_preserve_32,
         } = *self;
         format!(
-            "subgroup_lanes={subgroup_lanes};float16={float16};matrix={matrix};wide_accumulators={wide_accumulators};\
+            "subgroup_lanes={subgroup_lanes};float16={float16};matrix={matrix};matrix_hardware={matrix_hardware};wide_accumulators={wide_accumulators};\
              mixed_dot={mixed_dot};f32_atomic_add={f32_atomic_add};shared_int64_atomics={shared_int64_atomics};\
              rounding_rte_32={rounding_rte_32};denorm_preserve_32={denorm_preserve_32}"
         )
@@ -112,6 +120,7 @@ impl FormationTarget {
             subgroup_lanes,
             float16,
             matrix,
+            matrix_hardware,
             wide_accumulators,
             mixed_dot,
             f32_atomic_add,
@@ -135,6 +144,10 @@ impl FormationTarget {
             },
             Self {
                 matrix: !matrix,
+                ..*self
+            },
+            Self {
+                matrix_hardware: !matrix_hardware,
                 ..*self
             },
             Self {

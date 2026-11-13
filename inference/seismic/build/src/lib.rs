@@ -748,6 +748,7 @@ mod internals {
                     "SEISMIC_SUBGROUPS",
                     "SEISMIC_HAS_FLOAT16",
                     "SEISMIC_HAS_MATRIX",
+                    "SEISMIC_HAS_MATRIX_HARDWARE",
                     "SEISMIC_HAS_WIDE_ACCUMULATORS",
                     "SEISMIC_HAS_MIXED_DOT",
                     "SEISMIC_HAS_F32_ATOMIC_ADD",

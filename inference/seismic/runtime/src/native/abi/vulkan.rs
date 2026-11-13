@@ -15,6 +15,9 @@ pub(crate) struct VulkanFeatures {
     pub(crate) float16: bool,
     /// Subgroup 16x16x16 cooperative matrix, f16->f32 and s8->s32.
     pub(crate) matrix: bool,
+    /// The device has cooperative matrices, formed or not
+    /// (`SEISMIC_HAS_MATRIX_HARDWARE`): only the machine line's probe reads it.
+    pub(crate) matrix_hardware: bool,
     /// Accumulator arrays of more than 4 matrix fragments compile correctly.
     pub(crate) wide_accumulators: bool,
     /// Mixed-signedness packed 4x8 dot product is accelerated.
@@ -30,6 +33,7 @@ impl VulkanFeatures {
             subgroup_lanes: facts.subgroup_lanes,
             float16: facts.float16,
             matrix: facts.matrix,
+            matrix_hardware: facts.matrix_hardware,
             wide_accumulators: facts.wide_accumulators,
             mixed_dot: facts.mixed_dot,
             f32_atomic_add: facts.f32_atomic_add,
@@ -115,7 +119,7 @@ pub(super) fn header(features: VulkanFeatures) -> String {
             features.float16,
             "GL_EXT_shader_subgroup_extended_types_float16",
         ),
-        (features.matrix, "GL_KHR_cooperative_matrix"),
+        (features.matrix || features.matrix_hardware, "GL_KHR_cooperative_matrix"),
         (features.f32_atomic_add, "GL_EXT_shader_atomic_float"),
     ];
     for extension in EXTENSIONS
@@ -131,6 +135,7 @@ pub(super) fn header(features: VulkanFeatures) -> String {
     for (name, on) in [
         ("FLOAT16", features.float16),
         ("MATRIX", features.matrix),
+        ("MATRIX_HARDWARE", features.matrix_hardware),
         ("WIDE_ACCUMULATORS", features.wide_accumulators),
         ("MIXED_DOT", features.mixed_dot),
         ("F32_ATOMIC_ADD", features.f32_atomic_add),
@@ -262,6 +267,7 @@ void main() {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: device.formation().float16,
             matrix: false,
+            matrix_hardware: false,
             wide_accumulators: false,
             mixed_dot: false,
             f32_atomic_add: false,
@@ -460,6 +466,7 @@ void main() {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
             matrix: false,
+            matrix_hardware: false,
             wide_accumulators: false,
             mixed_dot: false,
             f32_atomic_add: false,

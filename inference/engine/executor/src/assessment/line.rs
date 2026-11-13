@@ -249,11 +249,8 @@ impl Probe for line_matrix::Entry {
             seismic::device::DeviceProperties::Metal(properties) if properties.tensor_ops.holds() => {
                 Some("the forms run tensor operations on this device, which the probe does not time".to_owned())
             }
-            _ => (device.forms_matrix_path() == Some(false)).then(|| {
-                "the device does not form the cooperative-matrix path (unsupported, or off for its driver: \
-                 `facts::matrix_path`)"
-                    .to_owned()
-            }),
+            _ => (device.forms_matrix_path() == Some(false))
+                .then(|| "the device has no cooperative matrices to form".to_owned()),
         }
     }
 }

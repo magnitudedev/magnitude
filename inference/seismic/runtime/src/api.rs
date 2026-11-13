@@ -854,13 +854,14 @@ pub mod device {
             &self.properties
         }
         #[cfg(feature = "machine-line")]
-        /// Whether a Vulkan device forms the cooperative-matrix path
-        /// (`FormationTarget::matrix`: supported and chosen), which a
-        /// matrix program is empty without; `None` on every other backend.
+        /// Whether a Vulkan device has cooperative matrices to form
+        /// (`FormationTarget::matrix_hardware`, whether or not the
+        /// projection GEMMs choose the path), which a matrix program is
+        /// empty without; `None` on every other backend.
         pub fn forms_matrix_path(&self) -> Option<bool> {
             match &self.kind {
                 #[cfg(not(target_os = "macos"))]
-                OpenedKind::Vulkan(opened) => Some(opened.service().formation().matrix),
+                OpenedKind::Vulkan(opened) => Some(opened.service().formation().matrix_hardware),
                 _ => None,
             }
         }

@@ -7347,6 +7347,7 @@ pub fn kernel_digest(
                     subgroup_lanes: 32,
                     float16: false,
                     matrix: false,
+                    matrix_hardware: false,
                     wide_accumulators: false,
                     mixed_dot: false,
                     f32_atomic_add: false,

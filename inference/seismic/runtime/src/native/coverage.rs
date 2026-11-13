@@ -288,6 +288,7 @@ const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTa
     subgroup_lanes: seismic_vulkan::SUBGROUP_WIDTH,
     float16: true,
     matrix: false,
+    matrix_hardware: false,
     wide_accumulators: true,
     mixed_dot: true,
     f32_atomic_add: false,

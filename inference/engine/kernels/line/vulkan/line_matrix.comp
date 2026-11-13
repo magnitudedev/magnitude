@@ -1,5 +1,6 @@
 // line_matrix: 16x16x16 f16 cooperative-matrix multiply-adds into f32 (a
-// device that has them, `SEISMIC_HAS_MATRIX`), the product of the
+// device that has them, `SEISMIC_HAS_MATRIX_HARDWARE`: the hardware's, whether or
+// not the projection GEMMs choose the path), the product of the
 // projection GEMMs' fragments: S multiply-adds an invocation (a product is
 // 4096 / SEISMIC_SUBGROUP_LANES an invocation), in UNROLL independent
 // accumulators seeded apart, the operands each subgroup's first `x` in f16;
@@ -7,7 +8,7 @@
 #include "../../kernels/vulkan/lib/core/matrix.glsl"
 
 void line_matrix() {
-#if SEISMIC_HAS_MATRIX
+#if SEISMIC_HAS_MATRIX_HARDWARE
     const uint UNROLL = SEISMIC_TUNE_UNROLL;
     const uint PRODUCTS = SEISMIC_STATIC_S / (4096u / SEISMIC_SUBGROUP_LANES);
     const uint64_t lane = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
