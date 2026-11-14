@@ -228,8 +228,10 @@ pub fn fixture(control: Option<PendingControl>) -> Fixture {
     fixture_with(control, false, false)
 }
 
-/// A spare head store of 4096-wide F32 rows: 2048 rows per slab, 8192 rows,
-/// one slab backed. It grows independently of the target model.
+/// A spare head store of 4096-wide F32 rows of the head's block
+/// (`LayerRef::Head(0)`, the history a head launch appends): 2048 rows per
+/// slab, 8192 rows, one slab backed. It grows independently of the target
+/// model.
 fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
     use magnitude_state::{
         BankCapacity, CodecSpec, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan,
