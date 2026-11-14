@@ -1,7 +1,8 @@
-# verify-publish against upstream llama.cpp at the converter's pinned release (LLAMA_SOURCE, a checkout of the commit
-# pyproject.toml pins), CPU only: it reads metadata, tokenizes and renders, and runs no model.
+# Tools against upstream llama.cpp at the converter's pinned release (LLAMA_SOURCE, a checkout of the commit
+# pyproject.toml pins), CPU only (`magnitude_conversion/llama.py`): verify-publish reads metadata, tokenizes and
+# renders, and runs no model; logits runs one prompt through the model.
 cmake_minimum_required(VERSION 3.14)
-project(magnitude-verify-publish CXX C)
+project(magnitude-llama-tools CXX C)
 
 set(LLAMA_SOURCE "" CACHE PATH "llama.cpp checkout at the pinned commit")
 if (NOT EXISTS "${LLAMA_SOURCE}/CMakeLists.txt")
@@ -28,3 +29,7 @@ add_executable(verify-publish verify_publish.cpp)
 target_include_directories(verify-publish PRIVATE "${LLAMA_SOURCE}/src")
 target_link_libraries(verify-publish PRIVATE llama-common llama)
 target_compile_features(verify-publish PRIVATE cxx_std_17)
+
+add_executable(logits logits.cpp)
+target_link_libraries(logits PRIVATE llama)
+target_compile_features(logits PRIVATE cxx_std_17)

@@ -5,8 +5,8 @@ weights and the Engram tables to BF16, and the router to F32. These classes keep
 MXFP4 expert repack, DSpark and vision paths, and store what upstream widens as the checkpoint ships it:
 
 - an FP8 weight `X` is written as `X.weight` (F8_E4M3 codes) plus `X.scale` (I8 holding the checkpoint's UE8M0
-  bytes, one per block, in the checkpoint's block grid), declared by `magnitude.scale_encoding = "ue8m0"`
-  (the convention is `inference/docs/precision.md`'s "Block-scaled FP8 weights");
+  bytes, one per block, in the checkpoint's block grid; the convention is `inference/docs/precision.md`'s
+  "Block-scaled FP8 weights");
 - the Engram tables are `per_layer_token_embd.weight` (F8_E4M3) plus `per_layer_token_embd.scale` (I8, one per 32);
 - BF16 and F32 tensors keep their type, vectors and norms included (upstream's base writes those F32). The Engram
   gate stays upstream's F32 product of two BF16 tensors (exact).
@@ -17,28 +17,24 @@ config value remapped, so a slice converts like any model.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
-from conversion.base import LazyTorchTensor, ModelBase, gguf
+from conversion.base import ModelBase, gguf
 from conversion.deepseek41 import (
     DeepseekV41DSparkModel,
     DeepseekV41Model,
     DeepseekV41VisionModel,
-    _StreamedBytes,
     engram_multipliers,
     engram_primes,
 )
 
-SCALE_ENCODING = "magnitude.scale_encoding"
-UE8M0 = "ue8m0"
-MAX_UE8M0 = 246  # the largest byte whose E4M3 products are exact in F32 (`inference/docs/precision.md`)
-ALIGNMENT = 4096
+from .native import UE8M0, Fp8Grid, KeepBf16, Native, Slice, add_file_metadata, check_ue8m0, scale_name, streamed
+
 _EXPERT_SCALE = re.compile(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.scale$")
 # The checkpoint states its chat format only as Python (`encoding/encoding.py`), which no GGUF reader runs. The text
 # file carries its Jinja translation, which the engine's chat tests render equal to the encoding
@@ -46,157 +42,28 @@ _EXPERT_SCALE = re.compile(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.scale$")
 CHAT_TEMPLATE = (Path(__file__).parent / "deepseek41.jinja").read_text(encoding="utf-8")
 
 
-def scale_name(weight_name: str) -> str:
-    return weight_name.removesuffix(".weight") + ".scale"
+class _Native(Native):
+    """V4.1's FP8 weights: `X.weight` beside its UE8M0 `X.scale`. The Engram tables' scales and the MXFP4 experts'
+    are not FP8 block scales of a weight; both are written whole by their own paths."""
 
-
-def check_ue8m0(name: str, scales: np.ndarray) -> None:
-    """Raises unless every UE8M0 byte of `scales` keeps its E4M3 products exact in F32."""
-    if scales.size and (largest := int(scales.view(np.uint8).max())) > MAX_UE8M0:
-        raise ValueError(f"{name}: UE8M0 byte {largest} is above {MAX_UE8M0}, where E4M3 products leave F32's range")
-
-
-class AlignedShardsWriter(gguf.GGUFWriter):
-    """gguf-py pads every shard's data to `general.alignment` but writes the key into the first shard only, so a
-    reader of any later shard falls back to the default 32 and misplaces every tensor. Each shard carries it here.
-
-    With `shards`, only those shards (numbered from 1) are written, and the others' tensors are never read: a change
-    to one shard's metadata rewrites that shard alone. The split is planned from every tensor as before, so a written
-    shard is the one a whole conversion writes."""
-
-    shards: frozenset[int] | None
-
-    def format_shard_names(self, path: Path) -> list[Path]:
-        names = super().format_shard_names(path)
-        if self.shards is None:
-            return names
-        if not self.shards <= set(range(1, len(names) + 1)):
-            raise ValueError(f"shards {sorted(self.shards)}: the file has {len(names)}")
-        return [name if i in self.shards else Path(os.devnull) for i, name in enumerate(names, 1)]
-
-    def write_ti_data_to_file(self) -> None:
-        super().write_ti_data_to_file()
-        if self.shards is not None:
-            for i, tensors in enumerate(self.tensors, 1):
-                if i not in self.shards:
-                    tensors.clear()
-
-    def add_shard_kv_data(self) -> None:
-        super().add_shard_kv_data()
-        key = gguf.Keys.General.ALIGNMENT
-        for kv_data in self.kv_data[1:]:
-            kv_data[key] = self.kv_data[0][key]
-
-
-def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str, shards: frozenset[int] | None) -> None:
-    writer.__class__ = AlignedShardsWriter  # the writer is made by ModelBase; only its sharding differs
-    cast(AlignedShardsWriter, writer).shards = shards
-    writer.add_custom_alignment(ALIGNMENT)
-    writer.add_key_value(gguf.Keys.General.SOURCE_REPO_URL, source_repo_url, gguf.GGUFValueType.STRING)
-
-
-class _KeepBf16:
-    """Writes a BF16 tensor the base would widen as BF16: a vector or a norm (which the base casts to F32 before any
-    type choice), or a tensor the base forces to F32 or F16 (the router and the drafter's confidence projection,
-    which upstream writes F32, and the projector's patch embedding, for ggml's convolution)."""
-
-    gguf_writer: gguf.GGUFWriter
-    model_tensors: dict[str, Callable[[], torch.Tensor]]
-
-    def _bf16(self, name: str) -> bool:
-        return name in self.model_tensors and self.model_tensors[name]().dtype == torch.bfloat16
-
-    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
-        forced = super().tensor_force_quant(name, new_name, bid, n_dims)
-        # `False` (no type forced) equals F32 (0) as an integer, so membership alone would match it
-        wider = forced is not False and forced in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
-        return gguf.GGMLQuantizationType.BF16 if wider and self._bf16(name) else forced
-
-    def modify_tensors(self, data_torch, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
-        bf16 = self._bf16(name)
-        for new_name, data in super().modify_tensors(data_torch, name, bid):
-            if bf16 and (data.ndim <= 1 or new_name.endswith("_norm.weight")):
-                # the base casts sources to F32 first, which BF16 survives exactly
-                values = LazyTorchTensor.to_eager(data).float().numpy()
-                self.gguf_writer.add_tensor(new_name, gguf.quants.quantize(values, gguf.GGMLQuantizationType.BF16),
-                                            raw_dtype=gguf.GGMLQuantizationType.BF16)
-                continue
-            yield new_name, data
-
-
-class _NativeFp8(_KeepBf16):
-    """Keeps FP8 weights as F8_E4M3 codes with their block scales beside them, and stored types as they are."""
-
-    gguf_writer: gguf.GGUFWriter
-    model_tensors: dict[str, Callable[[], torch.Tensor]]
-    _fp8_block: tuple[int, int]
-    _fp8_e4m3_preserved: set[str]
     _ENGRAM_EMBED_RE: Any
+    _fp8_block: tuple[int, int]
 
-    def __init__(self, *args, source_repo_url: str, shards: frozenset[int] | None = None, **kwargs):
-        self._fp8_scales: dict[str, Callable[[], torch.Tensor]] = {}
-        self._source_repo_url = source_repo_url
-        self._shards = shards
-        super().__init__(*args, **kwargs)
-
-    def set_gguf_parameters(self):
-        super().set_gguf_parameters()
-        _add_file_metadata(self.gguf_writer, self._source_repo_url, self._shards)
-        self.gguf_writer.add_key_value(SCALE_ENCODING, UE8M0, gguf.GGUFValueType.STRING)
-
-    def dequant_model(self):
-        bo, bi = self._fp8_block
-        for name in [n for n in self.model_tensors if n.endswith(".scale") and not self._ENGRAM_EMBED_RE.match(n)]:
-            if _EXPERT_SCALE.match(name):
-                continue  # MXFP4 expert scales, consumed with their experts
-            weight_name = name.removesuffix(".scale") + ".weight"
-            weight = self.model_tensors.get(weight_name)
-            if weight is None or weight().dtype != torch.float8_e4m3fn:
-                found = "missing" if weight is None else weight().dtype
-                raise ValueError(f"{name}: its weight {weight_name} is {found}, not E4M3 FP8")
-            out_f, in_f = weight().shape
-            scale = self.model_tensors.pop(name)
-            # whole tiles only: a reader infers the tile from the two shapes, which a partial last tile makes ambiguous
-            if out_f % bo or in_f % bi or tuple(scale().shape) != (out_f // bo, in_f // bi):
-                raise ValueError(f"{weight_name} {(out_f, in_f)}: scale shape {tuple(scale().shape)} is not whole "
-                                 f"{(bo, bi)} blocks")
-            check_ue8m0(name, LazyTorchTensor.to_eager(scale()).view(torch.uint8).numpy())
-            self._fp8_scales[weight_name] = scale
-            self._fp8_e4m3_preserved.add(weight_name)
-
-    def modify_tensors(self, data_torch, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
-        scale = self._fp8_scales.get(name)
-        written = 0
-        for new_name, data in super().modify_tensors(data_torch, name, bid):
-            if scale is not None and (written or tuple(data.shape) != tuple(self.model_tensors[name]().shape)):
-                # a split or reshaped FP8 weight no longer matches the grid beside it
-                raise ValueError(f"{name}: an FP8 weight written as {new_name} {tuple(data.shape)}, not whole")
-            written += 1
-            yield new_name, data
-            # resumed after the weight is added, so its scale follows it in the file
-            if scale is not None:
-                codes = LazyTorchTensor.to_eager(scale()).view(torch.uint8).numpy().view(np.int8)
-                self.gguf_writer.add_tensor(scale_name(new_name), codes, raw_dtype=gguf.GGMLQuantizationType.I8)
+    def _format(self, module: str) -> Fp8Grid | None:
+        scale = module + ".scale"
+        if scale not in self.model_tensors or self._ENGRAM_EMBED_RE.match(scale) or _EXPERT_SCALE.match(scale):
+            return None
+        return Fp8Grid(scale, self._fp8_block, UE8M0)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
-        if name in self._fp8_e4m3_preserved:
-            return gguf.GGMLQuantizationType.F8_E4M3
         if new_name.endswith(".engram_gate.weight"):
             # upstream's F32 product of two BF16 tensors, exact only in F32: not a BF16 source to keep
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
-class Slice:
-    """Layers kept from the checkpoint's main model, in order; kept layer `keep[i]` becomes layer `i`."""
-
-    def __init__(self, keep: list[int], text_config: dict[str, Any]):
-        n = text_config["num_hidden_layers"]
-        if not keep or sorted(set(keep)) != keep or keep[-1] >= n:
-            raise ValueError(f"layers must be distinct, ascending and below {n}: {keep}")
-        self.keep = keep
-        self.new_id = {old: new for new, old in enumerate(keep)}
-        self.n_main = n
+class Deepseek41Slice(Slice):
+    """A V4.1 slice: the kept layers' compression sources, candidate source and Engram layers remapped."""
 
     def remap_config(self, tc: dict[str, Any]) -> dict[str, Any]:
         """The kept layers' config. Every kept compressed layer must keep the source layers it reads."""
@@ -228,12 +95,12 @@ class Slice:
         return [layer for layer in engram_layer_ids if layer in self.new_id]
 
 
-class DeepseekV41(_NativeFp8, DeepseekV41Model):
+class DeepseekV41(_Native, DeepseekV41Model):
     """The text model. With a `Slice`, only its layers, renumbered."""
 
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
 
-    def __init__(self, *args, slice: Slice | None = None, **kwargs):
+    def __init__(self, *args, slice: Deepseek41Slice | None = None, **kwargs):
         self._slice = slice
         self._source_name: dict[str, str] = {}
         super().__init__(*args, **kwargs)
@@ -242,17 +109,8 @@ class DeepseekV41(_NativeFp8, DeepseekV41Model):
         tensors = super().index_tensors(remote_hf_model_id)
         if self._slice is None:
             return tensors
-        kept: dict[str, Callable[[], torch.Tensor]] = {}
-        for name, gen in tensors.items():
-            parts = name.split(".", 2)
-            if parts[0] == "layers":
-                if (new := self._slice.new_id.get(int(parts[1]))) is None:
-                    continue
-                renamed = f"layers.{new}.{parts[2]}"
-                self._source_name[renamed] = name
-                name = renamed
-            kept[name] = gen
-        return kept
+        tensors, self._source_name = self._slice.tensors(tensors)
+        return tensors
 
     def _tensor_part(self, name: str) -> Path:
         return super()._tensor_part(self._source_name.get(name, name))
@@ -342,19 +200,18 @@ class DeepseekV41(_NativeFp8, DeepseekV41Model):
             return read
 
         name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
-        self.gguf_writer.add_tensor(name, cast(np.ndarray, _StreamedBytes((n_rows, dim), chunks(0))),
-                                    raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
-        self.gguf_writer.add_tensor(scale_name(name), cast(np.ndarray, _StreamedBytes((n_rows, dim // 32), chunks(1))),
-                                    raw_dtype=gguf.GGMLQuantizationType.I8)
+        T = gguf.GGMLQuantizationType
+        self.gguf_writer.add_tensor(name, streamed((n_rows, dim), T.F8_E4M3, chunks(0)), raw_dtype=T.F8_E4M3)
+        self.gguf_writer.add_tensor(scale_name(name), streamed((n_rows, dim // 32), T.I8, chunks(1)), raw_dtype=T.I8)
 
 
-class DeepseekV41DSpark(_NativeFp8, DeepseekV41DSparkModel):
+class DeepseekV41DSpark(_Native, DeepseekV41DSparkModel):
     """The DSpark drafter (`mtp.*`) as a `dflash` GGUF."""
 
     model_arch = gguf.MODEL_ARCH.DFLASH
 
 
-class DeepseekV41Vision(_KeepBf16, DeepseekV41VisionModel):
+class DeepseekV41Vision(KeepBf16, DeepseekV41VisionModel):
     """The vision tower and aligner as a projector GGUF. It has no FP8 tensors: the BF16 tensors the base would widen
     (vectors, norms, the patch embedding) and the file metadata are what differ."""
 
@@ -367,7 +224,7 @@ class DeepseekV41Vision(_KeepBf16, DeepseekV41VisionModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        _add_file_metadata(self.gguf_writer, self._source_repo_url, self._shards)
+        add_file_metadata(self.gguf_writer, self._source_repo_url, self._shards)
 
 
 PARTS = ("text", "dspark", "vision")
@@ -401,7 +258,7 @@ def build(part: str, checkpoint: Path, out: Path, *, source_repo_url: str, layer
     if part == "text":
         slice = None
         if layers is not None:
-            slice = Slice(layers, hparams["text_config"])
+            slice = Deepseek41Slice(layers, hparams["text_config"]["num_hidden_layers"])
             hparams["text_config"] = slice.remap_config(hparams["text_config"])
         return DeepseekV41(*args, slice=slice, **common)
     if layers is not None:

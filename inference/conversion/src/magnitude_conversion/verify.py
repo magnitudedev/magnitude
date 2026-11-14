@@ -17,53 +17,24 @@ tokenizer and encoding (`engine/chat/tests/real_tokenizer.rs` checks Magnitude's
 
 from __future__ import annotations
 
-import os
 import subprocess
-import tomllib
 from pathlib import Path
 
 from conversion.base import gguf
 
+from . import llama
 from .check import shard_facts
 
 _PROJECT = Path(__file__).resolve().parents[2]  # inference/conversion
 # The renders and token ids each architecture's text file must reproduce
-FIXTURES = {"deepseek41": _PROJECT.parent / "engine/chat/tests/assets/deepseek41.json"}
+FIXTURES = {
+    "deepseek41": _PROJECT.parent / "engine/chat/tests/assets/deepseek41.json",
+    "glm5-next": _PROJECT.parent / "engine/chat/tests/assets/glm53.json",
+}
 
 
 class Refused(Exception):
     """The file fails a check; the message names each refused check and what it found."""
-
-
-def _llama_cpp() -> tuple[str, str]:
-    """The llama.cpp repository and commit pyproject.toml pins the converter to: the one owner of the pin."""
-    source = tomllib.loads((_PROJECT / "pyproject.toml").read_text())["tool"]["uv"]["sources"]["llama-cpp-scripts"]
-    return source["git"], source["rev"]
-
-
-def llama_source() -> Path:
-    """A checkout of the pinned llama.cpp commit, fetched once into the user cache."""
-    url, rev = _llama_cpp()
-    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "magnitude-conversion" / f"llama.cpp-{rev}"
-    if not (root / "CMakeLists.txt").exists():
-        root.mkdir(parents=True, exist_ok=True)
-        for command in (["init", "-q"], ["fetch", "-q", "--depth", "1", url, rev], ["checkout", "-q", "FETCH_HEAD"]):
-            subprocess.run(["git", "-C", str(root), *command], check=True)
-    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True)
-    if head.stdout.strip() != rev:
-        raise RuntimeError(f"{root} is at {head.stdout.strip()}, not the pinned {rev}")
-    return root
-
-
-def verifier() -> Path:
-    """llama.cpp's side of the checks (`llama/verify_publish.cpp`), built CPU-only against the pinned source."""
-    source = llama_source()
-    build = source / "build-verify-publish"
-    subprocess.run(["cmake", "-S", str(_PROJECT / "llama"), "-B", str(build), f"-DLLAMA_SOURCE={source}",
-                    "-DCMAKE_BUILD_TYPE=Release"], check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["cmake", "--build", str(build), "--target", "verify-publish", "-j", str(os.cpu_count() or 1)],
-                   check=True, stdout=subprocess.DEVNULL)
-    return build / "verify-publish"
 
 
 # The checks llama.cpp's side reports, each on exactly one line
@@ -103,7 +74,8 @@ def verify(first_shard: Path) -> list[str]:
     if (fixture := FIXTURES.get(arch)) is None:
         refused.append(f"fixture: refused: no fixture for general.architecture {arch!r}")
     else:
-        run = subprocess.run([str(verifier()), str(first_shard), str(fixture)], capture_output=True, text=True)
+        run = subprocess.run([str(llama.tool("verify-publish")), str(first_shard), str(fixture)], capture_output=True,
+                             text=True)
         passed, llama_refused = _report(run)
         lines += passed
         refused += llama_refused

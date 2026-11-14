@@ -273,9 +273,9 @@ A GGUF stores an FP8 checkpoint's block-scaled weights as the checkpoint ships t
 c]` (with the stack's leading extent), one scale per `[r, c]` tile, the same tile for every
 matrix. A reader takes the tile as the quotient of the two shapes. That is unambiguous only for
 whole power-of-two tiles, so a file holds whole tiles only. The grid's stored type names its
-scales' encoding, so each grid is read in its own and one file can hold both. (Published
-files also carry a file-wide `magnitude.scale_encoding`, `"ue8m0"` or `"f32"`; it agrees with
-their grids' type, and no reader reads it.)
+scales' encoding, so each grid is read in its own and one file can hold both. (Files published
+before GLM-5.3-Flash also carry a file-wide `magnitude.scale_encoding`, `"ue8m0"` or `"f32"`; it
+agrees with their grids' type, no reader reads it, and the converter no longer writes it.)
 
 The importer reads a weight as the file stores it, planar: each matrix's codes, then its grid.
 Each registered grid is a source of its own, named for its scales and tile
