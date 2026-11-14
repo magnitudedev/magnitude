@@ -351,6 +351,25 @@ impl Case {
         self
     }
 
+    /// This case's WorkList bitmaps widened to `words` words a row: the
+    /// units past a row's complete ones are all read (its tail), so the
+    /// added words are all ones. One entry then serves launches over
+    /// histories of different lengths (the bitmap's width, B, is the entry's
+    /// static).
+    fn with_selection_words(&self, words: usize) -> Self {
+        assert!(words >= self.selection_words);
+        let mut case = self.clone();
+        if self.selection_words > 0 {
+            case.selection = self
+                .selection
+                .chunks(self.selection_words)
+                .flat_map(|row| row.iter().copied().chain(std::iter::repeat_n(u32::MAX, words - row.len())))
+                .collect();
+            case.selection_words = words;
+        }
+        case
+    }
+
     /// This case with an index-list source: `picks` picks a row over a
     /// plane of `rows` rows in slabs of `slab_rows`. Every seventh pick is -1
     /// (none), and the picks of a row repeat no plane row (17 is coprime to
@@ -1209,8 +1228,9 @@ fn metal_matrix_configurations(
     let g = form.g as u64;
     let (whole, split) = metal_decode_heads(form);
     let mut admitted: Vec<Vec<(&'static str, u64)>> = Vec::new();
-    // One row and four rows per threadgroup (verification rows).
-    for (tokens, heads) in [1u64, 4]
+    // Every declared row tile: one, two, four and eight rows per
+    // threadgroup.
+    for (tokens, heads) in [1u64, 2, 4, 8]
         .into_iter()
         .flat_map(|tokens| std::iter::once(whole).chain(split.clone()).map(move |heads| (tokens, heads)))
     {
@@ -1491,6 +1511,183 @@ fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&
         .collect()
 }
 
+/// The decode or prefill entry of one case under one specialization,
+/// created once for every launch that shares them.
+enum Attend {
+    Decode(seismic::NativeKernel<attention_decode::Entry>),
+    Prefill(seismic::NativeKernel<attention_prefill::Entry>),
+}
+
+impl Attend {
+    /// The entry for `case` (its key rounding and index-list source are
+    /// statics), or the preparation error.
+    fn new(device: &Device, decode: bool, specialization: &NativeSpecialization, case: &Case) -> Result<Self, String> {
+        assert!(!decode || case.selection_words == 0, "the decode entry reads no WorkList bitmap");
+        // The prefill's WorkList words (B, a static of the GPU natives; the
+        // Visible form has none).
+        let specialization = &if decode || device.backend() == BackendName::Cpu {
+            specialization.clone()
+        } else {
+            specialization.clone().with_static("B", case.selection_words as u64)
+        }
+        // The case's key rounding and index-list source.
+        .with_static("KR", u64::from(case.key_rounding.is_some()))
+        .with_static("KS", case.picks as u64);
+        macro_rules! create {
+            ($module:ident, $variant:ident) => {
+                {
+                    // The case's statics and pinned parameters, every other
+                    // parameter at its declared default.
+                    let entry = $module::native_entry_with($module::Elements { A: Element::bf16() });
+                    let specialization = declared::declared_at(device, &entry, specialization)
+                        .map_err(|error| format!("native specialization: {error}"))?;
+                    Self::$variant(entry.prepare(device, &specialization).map_err(|error| error.to_string())?)
+                }
+            };
+        }
+        Ok(if decode { create!(attention_decode, Decode) } else { create!(attention_prefill, Prefill) })
+    }
+
+    /// Runs the entry on `case`: the result and final histories.
+    fn run(&self, device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let mut bound = Bound::new(device, case);
+        let rounding = case.rounding_scalars();
+        macro_rules! call {
+            ($kernel:expr, $module:ident $(, $extra:ident: $value:expr)*) => {{
+                $kernel
+                    .call($module::Args {
+                        $($extra: $value,)*
+                        query: &bound.query,
+                        gate: &bound.gate,
+                        key: &bound.key,
+                        value: &bound.value,
+                        query_norm: &bound.query_norm,
+                        key_norm: &bound.key_norm,
+                        value_norm: &bound.value_norm,
+                        sinks: &bound.sinks,
+                        rotary_components: &bound.components,
+                        rotary_frequencies: &bound.frequencies,
+                        rotary_amplitudes: &bound.amplitudes,
+                        coordinates: &bound.coordinates,
+                        visible: &bound.visible,
+                        fresh: &bound.fresh,
+                        destinations: &bound.destinations,
+                        selected_rows: &bound.selected_rows,
+                        selected: &bound.selected,
+                        history_key: &mut bound.history_key,
+                        history_value: &mut bound.history_value,
+                        form: &bound.form,
+                        epsilon: case.epsilon,
+                        scale: case.scale,
+                        gate_function: i32::from(case.form.softplus),
+                        slab_rows: case.slab_rows as u32,
+                        selected_slab_rows: case.selected_slab_rows as u32,
+                        key_block: rounding.block,
+                        key_element: rounding.element,
+                        key_scale: rounding.scale,
+                        key_amax_floor: rounding.amax_floor,
+                    })
+                    .map_err(|error| format!("{error:?}"))?
+                    .value
+            }};
+        }
+        let result = match self {
+            Self::Decode(kernel) => call!(kernel, attention_decode),
+            Self::Prefill(kernel) => {
+                call!(kernel, attention_prefill, selection: &bound.selection, block_slots: &bound.block_slots)
+            }
+        };
+        let (key, value) = (bf16_values(&bound.history_key), bf16_values(&bound.history_value));
+        Ok((bf16_values(&result), key, value))
+    }
+
+    /// Runs the entry on `case`, or on `earlier` then `case` in one
+    /// `NativeTensorBatch` so `case` reuses `earlier`'s scratch arena at the
+    /// same `[M, H, PARTS, ...]` offsets: the result and final histories of
+    /// `case`.
+    fn run_after(
+        &self,
+        device: &Device,
+        earlier: Option<&Case>,
+        case: &Case,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let Some(earlier) = earlier else {
+            return self.run(device, case);
+        };
+        let mut earlier_bound = Bound::new(device, earlier);
+        let mut bound = Bound::new(device, case);
+        let earlier_rounding = earlier.rounding_scalars();
+        let rounding = case.rounding_scalars();
+        let shape = |c: &Case| [c.rows as u64, c.form.heads() as u64, c.form.w() as u64];
+        let mut earlier_out = Tensor::zeros(device, Element::bf16(), &shape(earlier))
+            .map_err(|error| format!("{error:?}"))?;
+        let mut result = Tensor::zeros(device, Element::bf16(), &shape(case))
+            .map_err(|error| format!("{error:?}"))?;
+        let mut batch = seismic::NativeTensorBatch::new(device);
+        macro_rules! push {
+            ($kernel:expr, $module:ident, $c:expr, $b:expr, $r:expr, $out:expr $(, $extra:ident: $value:expr)*) => {{
+                batch
+                    .push(
+                        $kernel,
+                        $module::Args {
+                            $($extra: $value,)*
+                            query: &$b.query,
+                            gate: &$b.gate,
+                            key: &$b.key,
+                            value: &$b.value,
+                            query_norm: &$b.query_norm,
+                            key_norm: &$b.key_norm,
+                            value_norm: &$b.value_norm,
+                            sinks: &$b.sinks,
+                            rotary_components: &$b.components,
+                            rotary_frequencies: &$b.frequencies,
+                            rotary_amplitudes: &$b.amplitudes,
+                            coordinates: &$b.coordinates,
+                            visible: &$b.visible,
+                            fresh: &$b.fresh,
+                            destinations: &$b.destinations,
+                            selected_rows: &$b.selected_rows,
+                            selected: &$b.selected,
+                            history_key: &mut $b.history_key,
+                            history_value: &mut $b.history_value,
+                            form: &$b.form,
+                            epsilon: $c.epsilon,
+                            scale: $c.scale,
+                            gate_function: i32::from($c.form.softplus),
+                            slab_rows: $c.slab_rows as u32,
+                            selected_slab_rows: $c.selected_slab_rows as u32,
+                            key_block: $r.block,
+                            key_element: $r.element,
+                            key_scale: $r.scale,
+                            key_amax_floor: $r.amax_floor,
+                        },
+                        $module::OutputArgs { value: $out },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+            }};
+        }
+        match self {
+            Self::Decode(kernel) => {
+                push!(kernel, attention_decode, earlier, earlier_bound, earlier_rounding, &mut earlier_out);
+                push!(kernel, attention_decode, case, bound, rounding, &mut result);
+            }
+            Self::Prefill(kernel) => {
+                push!(
+                    kernel, attention_prefill, earlier, earlier_bound, earlier_rounding, &mut earlier_out,
+                    selection: &earlier_bound.selection, block_slots: &earlier_bound.block_slots
+                );
+                push!(
+                    kernel, attention_prefill, case, bound, rounding, &mut result,
+                    selection: &bound.selection, block_slots: &bound.block_slots
+                );
+            }
+        }
+        batch.submit().map_err(|error| format!("{error:?}"))?.wait().map_err(|error| format!("{error:?}"))?;
+        let (key, value) = (bf16_values(&bound.history_key), bf16_values(&bound.history_value));
+        Ok((bf16_values(&result), key, value))
+    }
+}
+
 /// Runs the decode or prefill entry of `case` with `specialization`; the
 /// result and final histories, or the preparation error.
 fn run(
@@ -1499,74 +1696,8 @@ fn run(
     specialization: &NativeSpecialization,
     case: &Case,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
-    let mut bound = Bound::new(device, case);
-    assert!(!decode || case.selection_words == 0, "the decode entry reads no WorkList bitmap");
-    // The prefill's WorkList words (B, a static of the GPU natives; the
-    // Visible form has none).
-    let specialization = &if decode || device.backend() == BackendName::Cpu {
-        specialization.clone()
-    } else {
-        specialization.clone().with_static("B", case.selection_words as u64)
-    }
-    // The case's key rounding and index-list source.
-    .with_static("KR", u64::from(case.key_rounding.is_some()))
-    .with_static("KS", case.picks as u64);
-    let rounding = case.rounding_scalars();
-    macro_rules! call {
-        ($module:ident $(, $extra:ident: $value:expr)*) => {{
-            // The case's statics and pinned parameters, every other
-            // parameter at its declared default.
-            let entry = $module::native_entry_with($module::Elements { A: Element::bf16() });
-            let specialization = declared::declared_at(device, &entry, specialization)
-                .map_err(|error| format!("native specialization: {error}"))?;
-            let kernel = entry.prepare(device, &specialization).map_err(|error| error.to_string())?;
-            kernel
-                .call($module::Args {
-                    $($extra: $value,)*
-                    query: &bound.query,
-                    gate: &bound.gate,
-                    key: &bound.key,
-                    value: &bound.value,
-                    query_norm: &bound.query_norm,
-                    key_norm: &bound.key_norm,
-                    value_norm: &bound.value_norm,
-                    sinks: &bound.sinks,
-                    rotary_components: &bound.components,
-                    rotary_frequencies: &bound.frequencies,
-                    rotary_amplitudes: &bound.amplitudes,
-                    coordinates: &bound.coordinates,
-                    visible: &bound.visible,
-                    fresh: &bound.fresh,
-                    destinations: &bound.destinations,
-                    selected_rows: &bound.selected_rows,
-                    selected: &bound.selected,
-                    history_key: &mut bound.history_key,
-                    history_value: &mut bound.history_value,
-                    form: &bound.form,
-                    epsilon: case.epsilon,
-                    scale: case.scale,
-                    gate_function: i32::from(case.form.softplus),
-                    slab_rows: case.slab_rows as u32,
-                    selected_slab_rows: case.selected_slab_rows as u32,
-                    key_block: rounding.block,
-                    key_element: rounding.element,
-                    key_scale: rounding.scale,
-                    key_amax_floor: rounding.amax_floor,
-                })
-                .map_err(|error| format!("{error:?}"))?
-                .value
-        }};
-    }
-    let result = if decode {
-        call!(attention_decode)
-    } else {
-        call!(attention_prefill, selection: &bound.selection, block_slots: &bound.block_slots)
-    };
-    Ok((
-        bf16_values(&result),
-        bf16_values(&bound.history_key),
-        bf16_values(&bound.history_value),
-    ))
+    let attend = Attend::new(device, decode, specialization, case)?;
+    attend.run(device, case)
 }
 
 /// An attended row's bar: bf16 publication plus reduced-precision operands,
@@ -3440,17 +3571,22 @@ fn v41_compressed_natives_round_and_attend() {
 include!("attention_common/verify.rs");
 
 impl Case {
-    /// The verify block of `width` rows ending where this widest block
-    /// (`verify_rows`) ends, over `history`: each row's inputs, picks and
-    /// coordinates are the widest block's same row's, and the history holds
-    /// the rows the widest block appended (`history_key`, `history_value`).
-    fn narrowed(&self, history: i32, width: usize, history_key: &[f32], history_value: &[f32]) -> Self {
+    /// Rows `block` of this widest verify block launched alone as `rows`:
+    /// each row's inputs, picks and coordinates are the widest block's same
+    /// row's, and the history holds the rows the widest block appended
+    /// (`history_key`, `history_value`).
+    fn narrowed(
+        &self,
+        rows: Vec<Row>,
+        block: std::ops::Range<usize>,
+        history_key: &[f32],
+        history_value: &[f32],
+    ) -> Self {
         assert_eq!(self.rows, VERIFY_ROWS);
-        let first = VERIFY_ROWS - width;
         let mut case = Self::new(
             self.form,
             self.history_rows,
-            verify_rows(&[(0, history)], width),
+            rows,
             self.slab_rows,
             1.0,
             self.scale,
@@ -3458,7 +3594,7 @@ impl Case {
         );
         let rows = |values: &[f32]| {
             let per = values.len() / VERIFY_ROWS;
-            values[first * per..].to_vec()
+            values[block.start * per..block.end * per].to_vec()
         };
         case.query = rows(&self.query);
         case.gate = rows(&self.gate);
@@ -3475,48 +3611,139 @@ impl Case {
         case.history_value = history_value.to_vec();
         case.epsilon = self.epsilon;
         case.picks = self.picks;
-        case.selected_rows = self.selected_rows[first * self.picks..].to_vec();
+        case.selected_rows = self.selected_rows[block.start * self.picks..block.end * self.picks].to_vec();
         case.selected = self.selected.clone();
         case.selected_slab_rows = self.selected_slab_rows;
         case.key_rounding = self.key_rounding;
-        case.selection = self.selection[first * self.selection_words..].to_vec();
+        case.selection = self.selection[block.start * self.selection_words..block.end * self.selection_words].to_vec();
         case.selection_words = self.selection_words;
         case.block_rows = self.block_rows;
         case
     }
 }
 
-/// A decode row's result on Metal, Vulkan and the CPU is bit for bit the same at
-/// verify widths 1, 2, 4, 8 and 16 under one specialization: the same row
-/// over the same history, its earlier block rows fresh keys at the wider
-/// widths and history rows (as the widest launch appended them) at the
-/// narrower. So its reduction order is set by key positions alone, and a
-/// prepared fresh key and value equal the appended ones bit for bit (the
-/// narrower widths read as history what the wider attend fresh). Every
-/// configuration that holds one row a work item is checked: Metal's vector,
-/// matrix and shared-tile forms, Vulkan's vector form and its matrix form's
-/// one-row tiles, the CPU's; over Muse, and V4.1's compressed layer small and
-/// at its heads (picks, rounded keys, sinks, stored-key values, the output
-/// rotary). The re-appended rows equal the widest launch's. GLM's selected
-/// read (a WorkList bitmap of picked units and the tail, which the prefill
-/// entry alone reads) holds the same through Vulkan's prefill vector form,
-/// whose unselected keys are attended as none at their own positions.
-///
-/// The history is the smallest that reaches every path at every width: 70
-/// rows over 32-row slabs, so a row's 71 to 86 keys cross slab edges (32, 64)
-/// and the 32-key tile edge at 64 inside its history, and the tile from 64
-/// holds history and fresh keys in a different split at each width; its 40
-/// picks over a 96-row pick plane of 32-row slabs fill one pick tile and part
-/// of a second, some of them -1.
-#[test]
-fn decode_rows_are_the_same_at_every_verify_width() {
-    let history = 70;
-    let (slab_rows, picks, pooled) = (32, 40, 96);
-    let rows = || verify_rows(&[(0, history)], VERIFY_ROWS);
-    let store = history as usize + VERIFY_ROWS;
+/// Rows `range` of a verify block of several sequences, one after another
+/// (`sequences`: each its history spans and its number of rows): each
+/// sequence's rows as `verify_rows` has them, its fresh keys the launch's
+/// rows from its own first.
+fn verify_sequences(sequences: &[(&[(i32, i32)], usize)], range: std::ops::Range<usize>) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    for &(spans, length) in sequences {
+        let (lo, hi) = (range.start.max(offset), range.end.min(offset + length));
+        if lo < hi {
+            let first = rows.len() as i32;
+            rows.extend(verify_rows(spans, lo - offset..hi - offset).into_iter().map(|mut row| {
+                row.fresh = (row.fresh.0 + first, row.fresh.1 + first);
+                row
+            }));
+        }
+        offset += length;
+    }
+    rows
+}
+
+/// Every row of a verify block (`block_rows` gives its rows `range`), at
+/// every verify width, is bit for bit the row launched alone (plain decode)
+/// under one specialization: the same row over the same history, its earlier
+/// block rows fresh keys in the wider launches and history rows (as the
+/// widest launch appended them) in the narrower (`verify_blocks`). So its
+/// reduction order is set by its own keys' positions alone, whichever rows
+/// share its tile and whether its tile's other rows reach further (a tile
+/// row's masked tail), and a prepared fresh key and value equal the appended
+/// ones bit for bit. Every configuration the other tests sweep is checked on
+/// every backend, in the decode entry, or in the prefill entry where the
+/// decode declaration refuses the case's forms (DECODE_REFUSALS: it serves
+/// the same rows as a decode class). GLM's selected read (a WorkList bitmap
+/// of picked units and the tail, which the prefill entry alone reads) is held
+/// through Vulkan's prefill vector form alone: the prefill matrix form's key
+/// tiles start at each span's edges (history, then fresh), which move with
+/// the verify width, so its reduction order is not a row's key positions. With `earlier` (a case per entry of
+/// `cases`, over a longer history) each configuration's entry first serves
+/// that launch, so its scratch holds the longer launch's partitions: a launch
+/// reads only the partitions it wrote.
+fn check_verify_widths(
+    cases: &[(&str, bool, Case)],
+    earlier: Option<&[(&str, bool, Case)]>,
+    block_rows: &dyn Fn(std::ops::Range<usize>) -> Vec<Row>,
+) {
+    let mut failures = Vec::new();
+    for device in devices() {
+        for (index, (name, entry_decode, case)) in cases.iter().enumerate() {
+            if !entry_decode && device.backend() != BackendName::Vulkan {
+                continue;
+            }
+            // An entry's WorkList width is static: the shorter launch's
+            // bitmaps are widened to the longer's.
+            let widened = earlier.map(|earlier| case.with_selection_words(earlier[index].2.selection_words));
+            let case = widened.as_ref().unwrap_or(case);
+            let decode = *entry_decode && !(case.picks > 0 && DECODE_REFUSALS.contains(&device.backend()));
+            for config in case_configurations(&device, decode, case)
+                .into_iter()
+                .filter(|config| *entry_decode || config.contains(&("MATRIX", 0)))
+            {
+                let specialization = config
+                    .iter()
+                    .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
+                let label = format!("{name} {:?} decode {decode} {config:?}", device.backend());
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The entry is created once for the configuration.
+                    let attend = Attend::new(&device, decode, &specialization, case)
+                        .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    let widest = attend
+                        .run_after(&device, earlier.map(|earlier| &earlier[index].2), case)
+                        .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
+                    let row = case.form.heads() * case.form.w();
+                    let mut alone = vec![Vec::new(); VERIFY_ROWS];
+                    for block in verify_blocks() {
+                        let narrow = case.narrowed(block_rows(block.clone()), block.clone(), &widest.1, &widest.2);
+                        let actual = attend
+                            .run(&device, &narrow)
+                            .unwrap_or_else(|error| panic!("{label} rows {block:?}: {error}"));
+                        if block.len() == 1 {
+                            alone[block.start] = bits(&actual.0);
+                        }
+                        for (j, i) in block.clone().enumerate() {
+                            assert_eq!(
+                                bits(&actual.0[j * row..(j + 1) * row]),
+                                alone[i],
+                                "{label}: row {i} in rows {block:?} differs from row {i} alone"
+                            );
+                        }
+                        assert_eq!(bits(&actual.1), bits(&widest.1), "{label} rows {block:?}: key plane");
+                        assert_eq!(bits(&actual.2), bits(&widest.2), "{label} rows {block:?}: value plane");
+                    }
+                    for i in 0..VERIFY_ROWS {
+                        assert_eq!(
+                            bits(&widest.0[i * row..(i + 1) * row]),
+                            alone[i],
+                            "{label}: row {i} of the widest block differs from row {i} alone"
+                        );
+                    }
+                }));
+                if outcome.is_err() {
+                    failures.push(label);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// Muse, and V4.1's compressed layer small and at its heads (picks, rounded
+/// keys, sinks, stored-key values, the output rotary), over `rows`.
+fn verify_cases(store: usize, rows: &dyn Fn() -> Vec<Row>) -> [(&'static str, bool, Case); 4] {
+    verify_cases_over(store, 32, rows)
+}
+
+/// [`verify_cases`] over history slabs of `slab_rows` rows. The prefill
+/// entry holds a span table of 16 bytes a visible span in shared memory, and
+/// a row's visible spans are cut at slab edges, so a long history over small
+/// slabs asks for more shared bytes than a device has.
+fn verify_cases_over(store: usize, slab_rows: usize, rows: &dyn Fn() -> Vec<Row>) -> [(&'static str, bool, Case); 4] {
+    let (picks, pooled) = (40, 96);
     let scale = 1.0 / (512f32).sqrt();
-    // Each case with the entry that attends its decode rows.
-    let cases = [
+    [
         ("muse", true, Case::new(MUSE, store, rows(), slab_rows, 1.0, 0.125, 110)),
         (
             "small v41",
@@ -3541,65 +3768,56 @@ fn decode_rows_are_the_same_at_every_verify_width() {
             false,
             Case::new(GLM, store, rows(), slab_rows, 1.0, scale, 117).with_unit_reads(8, 118),
         ),
-    ];
-    let mut failures = Vec::new();
-    for device in devices()
-        .into_iter()
-        .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Vulkan | BackendName::Cpu))
-    {
-        for (name, decode, case) in &cases {
-            // The selected read is checked in Vulkan's prefill vector form,
-            // whose keys absorb at fixed positions. The prefill matrix form is
-            // exempt: its key tiles start at each span's edges (history, then
-            // fresh), which move with the verify width, so its reduction
-            // order is not a row's key positions alone; only the decode
-            // entry's matrix form cuts its tiles at fixed positions.
-            if !decode && device.backend() != BackendName::Vulkan {
-                continue;
-            }
-            // Row tiles of several rows (Metal's TOKENS > 1, Vulkan's matrix
-            // form where 16 * SIMDS rows hold two or more rows of G heads)
-            // share tiles across rows; Vulkan's vector form holds one row a
-            // workgroup.
-            let one_row = |config: &[(&str, u64)]| {
-                let param = |wanted: &str| config.iter().find(|(name, _)| *name == wanted).map(|(_, value)| *value);
-                param("TOKENS").is_none_or(|tokens| tokens == 1)
-                    && (device.backend() != BackendName::Vulkan
-                        || param("MATRIX") == Some(0)
-                        || param("SIMDS").is_some_and(|simds| 16 * simds / case.form.g as u64 == 1))
-            };
-            let configurations = case_configurations(&device, *decode, case).into_iter().filter(|config| {
-                one_row(config) && (*decode || config.contains(&("MATRIX", 0)))
-            });
-            for config in configurations {
-                let specialization = config
-                    .iter()
-                    .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
-                let label = format!("{name} {:?} {config:?}", device.backend());
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let widest = run(&device, *decode, &specialization, case)
-                        .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
-                    let row = case.form.heads() * case.form.w();
-                    for width in [8usize, 4, 2, 1] {
-                        let narrow = case.narrowed(history, width, &widest.1, &widest.2);
-                        let actual = run(&device, *decode, &specialization, &narrow)
-                            .unwrap_or_else(|error| panic!("{label} width {width}: {error}"));
-                        assert_eq!(
-                            bits(&actual.0),
-                            bits(&widest.0[(VERIFY_ROWS - width) * row..]),
-                            "{label}: width {width}'s rows differ from width {VERIFY_ROWS}'s"
-                        );
-                        assert_eq!(bits(&actual.1), bits(&widest.1), "{label} width {width}: key plane");
-                        assert_eq!(bits(&actual.2), bits(&widest.2), "{label} width {width}: value plane");
-                    }
-                }));
-                if outcome.is_err() {
-                    failures.push(label);
-                }
-            }
-        }
+    ]
+}
+
+/// A verify block's rows over one history are the same at every width
+/// (`check_verify_widths`), at the histories that reach every path: 28 rows,
+/// whose block rows' 29 to 36 keys straddle the 32-key tile edge, so a tile
+/// holds history and fresh keys in a different split at each width and rows
+/// on both sides of the edge; 60 and 70 rows, over 32-row slabs, whose 61
+/// to 68 and 71 to 78 keys straddle the 64-key tile edge and a slab edge;
+/// and 2100 rows, past every swept configuration's PARTS x SPAN keys (at
+/// most 2048), so each partition holds several chunks. The 40 picks over a 96-row pick plane of
+/// 32-row slabs fill one pick tile and part of a second, some of them -1.
+#[test]
+fn decode_rows_are_the_same_at_every_verify_width() {
+    for history in [28, 60, 70, 2100] {
+        let rows = || verify_rows(&[(0, history)], 0..VERIFY_ROWS);
+        let cases = verify_cases(history as usize + VERIFY_ROWS, &rows);
+        check_verify_widths(&cases, None, &|block| verify_rows(&[(0, history)], block));
     }
-    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// Verify blocks of 200 and 600 history rows — active across more than one
+/// partition on both decode (`MIN_TILES = 1`) and prefill-decode
+/// (`MIN_TILES = 16`) grids while leaving higher partitions empty — launched in
+/// one `NativeTensorBatch` right after an 8400-row block on the same entry and
+/// scratch arena equal each row launched alone: the partitions the longer
+/// launch filled and the shorter leaves empty are not read
+/// (`check_verify_widths`, `earlier`).
+#[test]
+fn a_shorter_history_does_not_read_a_longer_launchs_partitions() {
+    let longer = 8400;
+    let long_rows = || verify_rows(&[(0, longer)], 0..VERIFY_ROWS);
+    let earlier = verify_cases_over(longer as usize + VERIFY_ROWS, 1024, &long_rows);
+    for history in [200, 600] {
+        let rows = || verify_rows(&[(0, history)], 0..VERIFY_ROWS);
+        let cases = verify_cases_over(longer as usize + VERIFY_ROWS, 1024, &rows);
+        check_verify_widths(&cases, Some(&earlier), &|block| verify_rows(&[(0, history)], block));
+    }
+}
+
+/// A launch's tile holds rows of two sequences (three rows of one over 70
+/// history rows, five of another over its own 40, so the 2- and 4-row tiles
+/// each hold both) and each row is bit for bit the row launched alone.
+#[test]
+fn a_tile_of_two_sequences_keeps_each_row_as_it_is_alone() {
+    let (a, b): (&[(i32, i32)], &[(i32, i32)]) = (&[(0, 70)], &[(100, 140)]);
+    let sequences = [(a, 3), (b, VERIFY_ROWS - 3)];
+    let rows = || verify_sequences(&sequences, 0..VERIFY_ROWS);
+    let cases = verify_cases(160, &rows);
+    check_verify_widths(&cases, None, &|block| verify_sequences(&sequences, block));
 }
 
 /// The time of `attention_decode` on Metal at DeepSeek V4.1 Flash's decode

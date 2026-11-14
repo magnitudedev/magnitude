@@ -622,7 +622,7 @@ fn metal_matrix_configs(
     configs: &[(u64, u64, u64, u64)],
 ) -> Vec<Vec<(&'static str, u64)>> {
     let mut admitted: Vec<Vec<(&'static str, u64)>> = Vec::new();
-    for tokens in [1u64, 2, 4] {
+    for tokens in [1u64, 2, 4, 8] {
         let cols = metal_matrix_slices(geometry, tokens);
         for &(span, parts, simds, keys) in configs {
             let simds = simds.max(cols);
@@ -638,6 +638,25 @@ fn metal_matrix_configs(
             if metal_matrix_admits(geometry, tokens, simds, keys) && !admitted.contains(&config) {
                 admitted.push(config);
             }
+        }
+    }
+    // The head-band form: eight query heads of a two-row tile a
+    // threadgroup.
+    let w = geometry.w() as u64;
+    for &(span, parts, _, keys) in configs {
+        let config = vec![
+            ("SPAN", span),
+            ("PARTS", parts),
+            ("SIMDS", 4),
+            ("SLICES", 1),
+            ("MATRIX", 1),
+            ("KEYS", keys),
+            ("TOKENS", 2),
+            ("HEAD_BAND", 8),
+        ];
+        let fits = (2 * 8 * w * 2).max(keys * w * 4 + 2 * 4 * 8 * keys * 4) + 64 <= 32768;
+        if [64, 128, 256, 512].contains(&w) && fits && !admitted.contains(&config) {
+            admitted.push(config);
         }
     }
     admitted
@@ -2084,40 +2103,32 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     }
 }
 
-/// A decode row's result is the same at verify widths 1, 2, 4, 8 and 16
-/// under one specialization: the same row over the same affine history, its
-/// earlier block rows fresh keys at the wider widths and history rows (as the
-/// widest launch appended them) at the narrower. So a fresh key and value are
-/// read as their encoding, the one history holds, and a row's reduction order
-/// is set by key positions alone. On the CPU, on Metal and in Vulkan's vector
-/// form it is bit for bit the same; Metal's row tiles of several rows
-/// (TOKENS > 1) share tiles across rows and are not held to it.
+/// Every row of a verify block, at every verify width, is bit for bit the
+/// row launched alone (plain decode), under every configuration the other
+/// tests sweep, on every backend: the same row over the same affine
+/// history, its earlier block rows fresh keys in the wider launches and
+/// history rows (as the widest launch appended them) in the narrower
+/// (`verify_blocks`). So a fresh key and value are read as their encoding,
+/// the one history holds, and a row's reduction order is set by its own
+/// keys' positions alone, never by the rows sharing its launch or its tile
+/// or by how far its tile's other rows reach.
 ///
-/// CUDA's vector form and Vulkan's keywise form cut their key batches at slab
-/// edges and at the fresh span, and the matrix forms tile spans, so the order
-/// of a row's F32 sums moves with its fresh keys; they are held to one BF16
-/// rounding step of the row block's largest result: an F32 difference of a
-/// few units of its last place moves a BF16 result by at most one step, 2^-7
-/// of its binade. A result is a convex combination of values in [-1, 1) times
-/// a gate below 1, so that step is at most 2^-8, under 1/30 of a V4 step
-/// ((max - min) / 15 of a 32-column group, about 0.13 for these values), and
-/// about 1/250 of one at the outputs' typical magnitude (0.1). A key or value
-/// read other than as the encoding history holds moves a result by the key's
-/// weight (1/40 or more over the short histories) times up to half a V4 step,
-/// several such BF16 steps.
-///
-/// The histories: 8 rows (one key partition); 20 rows, whose block rows' 21
-/// to 36 keys cross the first 32-key partition and tile; and two spans over
-/// 64-row slabs, whose keys run across a span edge at position 70 and a slab
-/// edge at position 123 (history row 128), both inside a 4-key batch, before
-/// the block's rows, so at every width some batch straddles each.
+/// The histories: 8 rows (one key partition); 20 and 28 rows, whose block rows'
+/// 29 to 36 keys cross the first 32-key partition and tile; and two spans
+/// over 64-row slabs, whose keys run across a span edge at position 70 and a
+/// slab edge at position 123 (history row 128), both inside a 4-key batch,
+/// before the block's rows, so at every width some batch straddles each; and
+/// 2100 rows, past every swept configuration's PARTS x SPAN keys (at most
+/// 2048), so each partition holds several chunks of a row's keys.
 #[test]
 fn decode_rows_are_the_same_at_every_verify_width() {
     // (label, history spans, store rows, rows per slab)
-    let histories: [(&str, &[(i32, i32)], usize, usize); 3] = [
+    let histories: [(&str, &[(i32, i32)], usize, usize); 5] = [
         ("8 history rows", &[(0, 8)], 24, 24),
         ("20 history rows", &[(0, 20)], 36, 36),
+        ("28 history rows", &[(0, 28)], 36, 36),
         ("two spans over 64-row slabs", &[(0, 70), (75, 150)], 192, 64),
+        ("2100 history rows", &[(0, 2100)], 2112, 64),
     ];
     // Every configuration where other tests sweep them, one per form at
     // Qwen3.6 35B's geometry.
@@ -2127,6 +2138,7 @@ fn decode_rows_are_the_same_at_every_verify_width() {
         ("qwen35b", QWEN35B, 121, decode_forms),
         ("sliced", SLICED, 122, decode_configs),
     ];
+    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
     let mut failures = Vec::new();
     for device in seismic_native_tests::every_device() {
         for (name, geometry, seed, configs) in geometries {
@@ -2136,26 +2148,11 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                     geometry,
                     store,
                     spans.len(),
-                    &verify_rows(spans, VERIFY_ROWS),
+                    &verify_rows(spans, 0..VERIFY_ROWS),
                     seed,
                 ));
-                for config in configs(device.backend(), geometry)
-                    .into_iter()
-                    .filter(|config| {
-                        device.backend() != BackendName::Metal
-                            || config
-                                .iter()
-                                .all(|&(name, value)| name != "TOKENS" || value == 1)
-                    })
-                {
+                for config in configs(device.backend(), geometry) {
                     let label = format!("{name} {history} {:?} {config:?}", device.backend());
-                    let exact = match device.backend() {
-                        BackendName::Metal | BackendName::Cpu => true,
-                        BackendName::Vulkan => {
-                            param(&config, "MATRIX") == Some(0) && param(&config, "KEYWISE") == Some(0)
-                        }
-                        _ => false,
-                    };
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let kernel = decode_kernel(&device, geometry, &config);
                         let run = |encoded: &Encoded| {
@@ -2168,46 +2165,46 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                             (bf16_values(&gated), bound.planes())
                         };
                         let (wide, planes) = run(&widest);
-                        for width in [8usize, 4, 2, 1] {
-                            let first = VERIFY_ROWS - width;
+                        let mut alone = vec![Vec::new(); VERIFY_ROWS];
+                        for block in verify_blocks() {
                             let mut case = Case::new(
                                 geometry,
                                 store,
                                 spans.len(),
-                                &verify_rows(spans, width),
+                                &verify_rows(spans, block.clone()),
                                 seed,
                             );
-                            let tail = |values: &[f32]| {
-                                values[first * values.len() / VERIFY_ROWS..].to_vec()
+                            let rows = |values: &[f32]| {
+                                let per = values.len() / VERIFY_ROWS;
+                                values[block.start * per..block.end * per].to_vec()
                             };
-                            case.query_gate = tail(&widest.case.query_gate);
-                            case.key = tail(&widest.case.key);
-                            case.value = tail(&widest.case.value);
+                            case.query_gate = rows(&widest.case.query_gate);
+                            case.key = rows(&widest.case.key);
+                            case.value = rows(&widest.case.value);
                             let narrow = Encoded {
                                 case,
                                 planes: planes.clone(),
                             };
                             let (actual, narrow_planes) = run(&narrow);
-                            let wide = &wide[first * row..];
-                            assert_eq!(actual.len(), wide.len());
-                            // One BF16 step at the result's largest magnitude:
-                            // a reordered F32 sum's error scales with its
-                            // terms, not with a result near zero.
-                            let tolerance = bf16_step(wide.iter().fold(0.0f32, |m, w| m.max(w.abs())));
-                            for (index, (a, w)) in actual.iter().zip(wide).enumerate() {
-                                let agree = if exact {
-                                    a.to_bits() == w.to_bits()
-                                } else {
-                                    (a - w).abs() <= tolerance
-                                };
+                            assert_eq!(actual.len(), block.len() * row);
+                            if block.len() == 1 {
+                                alone[block.start] = bits(&actual);
+                            }
+                            for (j, i) in block.clone().enumerate() {
                                 assert!(
-                                    agree,
-                                    "{label}: width {width}'s element {index} is {a}, width 16's {w}"
+                                    bits(&actual[j * row..(j + 1) * row]) == alone[i],
+                                    "{label}: row {i} in rows {block:?} differs from row {i} alone"
                                 );
                             }
                             assert_eq!(
                                 narrow_planes, planes,
-                                "{label} width {width}: history planes"
+                                "{label} rows {block:?}: history planes"
+                            );
+                        }
+                        for i in 0..VERIFY_ROWS {
+                            assert!(
+                                bits(&wide[i * row..(i + 1) * row]) == alone[i],
+                                "{label}: row {i} of the widest block differs from row {i} alone"
                             );
                         }
                     }));
