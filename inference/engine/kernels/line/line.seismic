@@ -22,7 +22,10 @@
 
 # The stream: each row of C values summed. A 32-lane group (a simdgroup,
 # warp or logical subgroup) reads a row, each lane UNROLL 16-byte loads at
-# once. Its calls rotate through inputs spanning beyond the largest cache.
+# once, in rows of 2 KiB and of 8 KiB, each a probe of its own timed at the
+# UNROLL values its row holds whole (`ROW_VALUES`): which length streams
+# fastest is the device's. Its calls rotate through inputs spanning beyond
+# the largest cache.
 fn line_stream[R, C](input: &tensor[R, C] f32, out: &mut tensor[R] f32):
     parallel for row in 0..R:
         out[row] = sum_any_order(f32(input[row]))

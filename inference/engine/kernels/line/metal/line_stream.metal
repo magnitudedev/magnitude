@@ -1,5 +1,5 @@
 // line_stream: a simdgroup sums a row of C values, each lane UNROLL 16-byte
-// loads in flight at once (C is a multiple of 32 lanes x 4 values x 16).
+// loads in flight at once (C is a multiple of 32 lanes x 4 values x UNROLL).
 kernel void line_stream(
     device const float *input [[buffer(SEISMIC_BUFFER_INPUT)]],
     device float *out [[buffer(SEISMIC_BUFFER_OUT)]],

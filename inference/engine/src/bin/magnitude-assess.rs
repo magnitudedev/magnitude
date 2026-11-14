@@ -512,14 +512,19 @@ mod machine_line {
     /// operations a second (its marginal rate, where its work scales with the
     /// steps; otherwise unscaled, with the ratio of its increments, 2 where
     /// the work is done), each at the UNROLL it was fastest at and whether a
-    /// larger one ran no faster (its launch is the executor costs').
+    /// larger one ran no faster (its launch is the executor costs'), a
+    /// device's stream also at the row length it was fastest in.
     fn report(line: &MachineLine) -> Value {
         let figure = |line: &Line, reached: bool| {
             json!({ "perSecond": cost(&line.per_second), "unroll": line.unroll, "reached": reached })
         };
         json!({
             "streamBytes": match &line.stream {
-                Stream::Kernel(rate) => figure(rate.figure(), rate.is_reached()),
+                Stream::Kernel(rate) => {
+                    let mut stream = figure(&rate.figure().line, rate.is_reached());
+                    stream["rowBytes"] = json!(rate.figure().row_bytes);
+                    stream
+                }
                 Stream::Host(rate) => json!({
                     "perSecond": cost(&rate.figure().per_second),
                     "readers": rate.figure().readers,

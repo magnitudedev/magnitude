@@ -47,9 +47,18 @@ use std::fmt;
 /// The parameter every probe is timed at each value of.
 const UNROLL: &str = "UNROLL";
 
-/// The f32 values of one row of the stream: one 32-lane group's 16-byte
-/// loads at the largest UNROLL, so every value divides it.
-const ROW_VALUES: u64 = 32 * 4 * 16;
+/// The f32 values one 32-lane group's 16-byte loads read at UNROLL 1: a
+/// stream row's values are a multiple of them times its UNROLL.
+const GROUP_VALUES: u64 = 32 * 4;
+
+/// The f32 values of the stream's rows, each row length a probe of its own:
+/// which streams fastest is the device's. An M4 Pro streams 2 KiB rows at
+/// 267 GB/s, as its readout kernels' rows of about 2 KiB do (268), and 8 KiB
+/// rows at 263 (64 KiB at 258); an RTX 3090 streams 8 KiB rows at 878 GB/s
+/// (CUDA) and 870 (Vulkan), and 2 KiB rows at 870 and 862. A row length is
+/// timed at each UNROLL its row holds whole (UNROLL to 4 at 2 KiB, to 16 at
+/// 8 KiB).
+const ROW_VALUES: [u64; 2] = [GROUP_VALUES * 4, GROUP_VALUES * 16];
 
 /// The bytes one call of the stream reads: 0.3 ms at an RTX 3090's
 /// 0.9 TB/s, 1 ms at an M4 Pro's or a GB10's quarter of that, so a launch's
@@ -148,6 +157,14 @@ pub enum Peak {
     Unobtainable(Reason),
 }
 
+/// A device's stream as the line holds it: the fastest of its row lengths'
+/// figures ([`ROW_VALUES`]), and the bytes of the rows it was read in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rows {
+    pub line: Line,
+    pub row_bytes: u64,
+}
+
 /// The host memory's stream as the CPU line holds it: the figure at the
 /// readers of the CPU peaks' pool, or at more (every hardware thread where
 /// the pool has fewer, else twice the pool) where that is faster.
@@ -164,7 +181,7 @@ pub struct Sweep {
 /// had, which leaves the peaks standing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stream {
-    Kernel(Rate<Line>),
+    Kernel(Rate<Rows>),
     Host(Rate<Sweep>),
     /// The sweeps rose with no bytes: a defect of the probe.
     Defect(Reason),
@@ -289,11 +306,11 @@ impl Probe for line_int8::Entry {
 /// The shape of the probes on an executor.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
-    /// The stream's rows of [`ROW_VALUES`] a call ([`STREAM_CALL_BYTES`],
-    /// within the largest allocation), and the inputs its calls rotate
-    /// through: as many as span beyond the largest cache that can serve
-    /// device storage ([`rotation_sets`]), so each call reads memory.
-    rows: u64,
+    /// The bytes a stream's call reads ([`STREAM_CALL_BYTES`], within the
+    /// largest allocation), and the inputs its calls rotate through: as many
+    /// as span beyond the largest cache that can serve device storage
+    /// ([`rotation_sets`]), so each call reads memory.
+    call_bytes: u64,
     sets: u64,
     /// A peak's lanes, and the multiply-adds each makes of each operand
     /// ([`Operand`]'s order).
@@ -318,20 +335,26 @@ impl Shape {
     /// call's repetitions in a sample follow from `MIN_SAMPLE_SECONDS`, so
     /// these sizes hold for the sample time the job takes.
     fn of(topology: &DeviceTopology, executor: &Executor) -> Self {
-        let row = ROW_VALUES * 4;
-        let rows = STREAM_CALL_BYTES.min(executor.limits().max_allocation.bytes()) / row;
+        let call_bytes = STREAM_CALL_BYTES.min(executor.limits().max_allocation.bytes()) / (ROW_VALUES[1] * 4)
+            * (ROW_VALUES[1] * 4);
         let (lanes, steps) = match executor.backend() {
             BackendName::Cpu => (1 << 10, [1 << 18, 1 << 18, 1 << 18, 1 << 21]),
             BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => {
                 (1 << 20, [1 << 12, 1 << 12, 1 << 12, 1 << 14])
             }
         };
-        Self { rows, sets: rotation_sets(largest_cache(topology, executor), rows * row), lanes, steps }
+        Self { call_bytes, sets: rotation_sets(largest_cache(topology, executor), call_bytes), lanes, steps }
     }
 
-    /// What a stream's call reads, its key's point.
-    fn stream(self) -> (f64, Vec<(&'static str, u64)>) {
-        ((self.rows * ROW_VALUES * 4) as f64, vec![("rows", self.rows), ("columns", ROW_VALUES), ("sets", self.sets)])
+    /// The rows of `columns` values a stream's call reads.
+    fn rows(self, columns: u64) -> u64 {
+        self.call_bytes / (columns * 4)
+    }
+
+    /// What a stream's call of rows of `columns` values reads, its key's
+    /// point.
+    fn stream(self, columns: u64) -> (f64, Vec<(&'static str, u64)>) {
+        (self.call_bytes as f64, vec![("rows", self.rows(columns)), ("columns", columns), ("sets", self.sets)])
     }
 
     /// The multiply-adds a lane of `operand`'s peak makes.
@@ -681,8 +704,9 @@ fn reached(rates: &[(u64, MeasuredCost)]) -> Option<Rate<Line>> {
 /// The probes on an executor.
 struct Probes {
     shape: Shape,
-    /// The stream's probe, on a device with memory of its own.
-    stream: Option<Plan<line_stream::Entry>>,
+    /// The stream's probe at each row length ([`ROW_VALUES`]), on a device
+    /// with memory of its own.
+    stream: Option<[Plan<line_stream::Entry>; 2]>,
     /// The readers of the CPU's stream, its host memory's sweeps
     /// ([`host_readers`]); none on a device.
     host: Option<Result<[u64; 2], ExecutorCostsError>>,
@@ -698,7 +722,15 @@ impl Probes {
     fn of(topology: &DeviceTopology, executor: &Executor) -> Result<Self, ExecutorCostsError> {
         let backend = executor.backend();
         let shape = Shape::of(topology, executor);
-        let stream = Plan::of(backend, line_stream::native_entry(), &[], shape.stream())?;
+        let [short, long] = ROW_VALUES.map(|columns| {
+            Plan::of(backend, line_stream::native_entry(), &[], shape.stream(columns)).map(|plan| {
+                plan.map(|mut plan| {
+                    plan.unrolls.retain(|unroll| columns % (GROUP_VALUES * unroll) == 0);
+                    plan
+                })
+            })
+        });
+        let stream = short?.zip(long?).map(|(short, long)| [short, long]);
         assert_eq!(stream.is_none(), backend == BackendName::Cpu, "only the CPU's stream is the host's sweeps");
         Ok(Self {
             shape,
@@ -716,7 +748,7 @@ impl Probes {
     /// The points of every probe.
     fn points(&self) -> usize {
         let (f32, matrix, matrix_f32, int8) = &self.peaks;
-        self.stream.as_ref().map_or(0, |stream| stream.unrolls.len())
+        self.stream.as_ref().map_or(0, |plans| plans.iter().map(|plan| plan.unrolls.len()).sum())
             + self.host.as_ref().map_or(0, |readers| if readers.is_ok() { HOST_POINTS } else { 0 })
             + f32.as_ref().map_or(0, Ladder::points)
             + matrix.as_ref().map_or(0, Ladder::points)
@@ -756,10 +788,29 @@ impl MachineLine {
         }
         // The stream last; an unobtainable one leaves the peaks.
         let stream = match (stream, host) {
-            (Some(stream), _) => match stream.stored(&identity, backend, store)? {
-                Ok(rate) => Stream::Kernel(rate),
-                Err(reason) => Stream::Unobtainable(reason),
-            },
+            (Some(plans), _) => {
+                let mut fastest: Option<Rate<Rows>> = None;
+                let mut unobtainable = None;
+                for (plan, columns) in plans.iter().zip(ROW_VALUES) {
+                    match plan.stored(&identity, backend, store)? {
+                        Ok(rate) => {
+                            let rate = rate.map(|line| Rows { line, row_bytes: columns * 4 });
+                            if fastest.is_none_or(|best| {
+                                best.figure().line.per_second.value < rate.figure().line.per_second.value
+                            }) {
+                                fastest = Some(rate);
+                            }
+                        }
+                        Err(reason) => {
+                            unobtainable.get_or_insert(reason);
+                        }
+                    }
+                }
+                match fastest {
+                    Some(rate) => Stream::Kernel(rate),
+                    None => Stream::Unobtainable(unobtainable.expect("a stream has row lengths")),
+                }
+            }
             (None, Some(readers)) => host_stream(readers, topology, &identity, store)?,
             (None, None) => unreachable!("a device without a stream probe is the CPU"),
         };
@@ -779,13 +830,14 @@ impl MachineLine {
         if let Some(Ok(readers)) = host {
             measure_host(readers, walks)?;
         }
-        if let Some(stream) = stream {
-            stream.measure(walks, &OnceCell::new(), |device| {
+        for (plan, columns) in stream.iter().flatten().zip(ROW_VALUES) {
+            let rows = shape.rows(columns);
+            plan.measure(walks, &OnceCell::new(), |device| {
                 let inputs = (0..shape.sets)
-                    .map(|_| Tensor::zeros(device, Element::f32(), &[shape.rows, ROW_VALUES]))
+                    .map(|_| Tensor::zeros(device, Element::f32(), &[rows, columns]))
                     .collect::<Result<_, _>>()
                     .map_err(|error| failed("the stream's rows")(&error))?;
-                Ok(Operands { inputs, steps: None, outputs: shape.rows })
+                Ok(Operands { inputs, steps: None, outputs: rows })
             })?;
         }
         if let Some(ladder) = f32 {
