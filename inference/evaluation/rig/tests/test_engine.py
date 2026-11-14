@@ -1171,7 +1171,7 @@ def test_a_step_is_skipped_where_its_path_exists(rig):
 
 def test_headers_are_exported_once_for_each_catalog_a_host_runs(rig):
     """A run acquiring headers builds the catalog tool and exports only where the host has no
-    export of its catalog, which its lock and pinned artifacts key; one acquiring weights always
+    export of its catalog, which its models, lock and pinned artifacts key; one acquiring weights always
     builds the tool."""
     hosts, source, _ = rig
     for path in engine.CATALOG_INPUTS:
@@ -1191,8 +1191,11 @@ def test_headers_are_exported_once_for_each_catalog_a_host_runs(rig):
     assert build["unless"] == export["unless"] == exported
     (weights,) = [op for op in ops(engine.Weights("m:v")) if op["argv"][:2] == ["cargo", "build"]]
     assert "unless" not in weights
-    (source.directory / engine.CATALOG_INPUTS[0]).write_text("another catalog")
-    assert engine.catalog_key(source) != key
+    for path in engine.CATALOG_INPUTS:  # each file keys it: a model added without moving the lock exports its own headers
+        (source.directory / path).write_text("another catalog")
+        assert engine.catalog_key(source) != key
+        (source.directory / path).write_text("one catalog")
+        assert engine.catalog_key(source) == key
 
 
 def test_a_failed_build_names_its_phase_and_keeps_its_log(rig):
