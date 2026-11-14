@@ -40,6 +40,19 @@ impl BankShape {
         Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(curve).max(floor) }
     }
 
+    /// The shape of a host tier of at most `ceiling` host slots, growing by
+    /// `block_bytes`, bounded by `bound`, beside a device bank that is
+    /// `whole` ([`crate::planning::ExpertBankPlan::whole_at`]). A host tier
+    /// serves only the experts the device lacks: while the device holds
+    /// every expert it holds none, however much host RAM is free.
+    pub fn host(block_bytes: u64, ceiling: u64, bound: u64, whole: bool) -> Self {
+        let bound = match whole {
+            true => 0,
+            false => bound,
+        };
+        Self::new(block_bytes, 0, ceiling, bound)
+    }
+
     pub fn floor_slots(&self) -> u64 {
         self.floor_slots
     }

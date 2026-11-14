@@ -206,6 +206,10 @@ fn the_bank_holds_at_most_its_ceiling_or_saturation() {
     assert_eq!(BankShape::new(SLOT, 8, 226, 300).saturation_slots(), 226, "the ceiling");
     assert_eq!(BankShape::new(SLOT, 8, 226, 140).saturation_slots(), 140, "the curve");
     assert_eq!(BankShape::new(SLOT, 8, 226, 4).saturation_slots(), 8, "never below the floor");
+    // A host tier serves only what the device lacks: none beside a device
+    // bank of every expert, whatever host RAM holds.
+    assert_eq!(BankShape::host(SLOT, 256, 256, true).saturation_slots(), 0, "a whole device bank");
+    assert_eq!(BankShape::host(SLOT, 256, 256, false).saturation_slots(), 256, "a device short of experts");
 }
 
 /// Today's floor of a bank whose layers fall in `groups` record forms: each

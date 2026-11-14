@@ -393,7 +393,7 @@ impl ElasticBank for ServedBank {
                 holding: BankHolding::Host,
                 tier: self.storage(BankHolding::Host)?,
                 at: host,
-                shape: BankShape::new(block, 0, ceiling, bound),
+                shape: BankShape::host(block, ceiling, bound, plan.whole_at(self.bank.slots())),
                 charge: Box::new(move |slots| counts.host_charge(slots)),
             });
         }

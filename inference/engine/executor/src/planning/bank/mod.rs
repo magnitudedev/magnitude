@@ -853,7 +853,14 @@ impl ExpertBankPlan {
     /// Whether the plan holds every expert: such a bank is imported whole at
     /// load, each expert at its home record, as a resident load holds it.
     pub fn whole(&self) -> bool {
-        self.slots == self.widest().get()
+        self.whole_at(self.slots)
+    }
+
+    /// Whether a device bank of `slots` holds every expert of the widest
+    /// layer: the one predicate the plan's tier and the running bank's host
+    /// target both decide by.
+    pub fn whole_at(&self, slots: u64) -> bool {
+        slots >= self.widest().get()
     }
 
     /// The stored bytes of the experts neither the bank's slots nor its host
