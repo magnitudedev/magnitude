@@ -230,7 +230,10 @@ def test_a_build_keeps_the_units_its_kept_builds_reference_and_trims_the_rest(tm
                            "release/.fingerprint/foo-%s/x" % stale, f"release/build/foo-{keep}/out/x",
                            f"release/deps/foo-{keep}.d", f"release/deps/foo-{keep}.provenance.json",
                            f"release/deps/libfoo-{keep}.rlib", "release/magnitude-inference"])
-    assert built["trimmed"] == {"bytes": 30, "entries": 3}
+    removed = built["trimmed"].pop("removed")
+    assert built["trimmed"] == {"bytes": 30, "entries": 3} and len(removed) == 3
+    assert sorted(removed) == sorted(str(target.resolve() / relative) for relative in (
+        f"release/deps/libfoo-{stale}.rlib", f"release/build/foo-{stale}", f"debug/deps/libbar-{other}.rmeta"))
     assert BUILD in json.loads((checkout / agent.REFERENCES).read_text())
     end(current)
 
@@ -1298,9 +1301,9 @@ def _crate(directory: Path, version: str) -> Path:
     return directory
 
 
-def _build_plan(stage: Path, tree: str, *after: dict) -> list:
-    """Claim, install `stage`, build the crate's tests and record the build, then run them from
-    the output: a run of tree `tree`."""
+def _build_plan(stage: Path, tree: str, *after: dict, kept: tuple = ()) -> list:
+    """Claim, install `stage`, build the crate's tests and record the build, its provenance keeping
+    the executables `kept`, then run the tests from the output: a run of tree `tree`."""
     src, env = "{checkout:s}/src", {"CARGO_TARGET_DIR": "{checkout:s}/target"}
     tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json"],
                    stage, job="tests")
@@ -1309,7 +1312,7 @@ def _build_plan(stage: Path, tree: str, *after: dict) -> list:
             {"op": "phase", "phase": "build-s"},
             {"op": "run", "argv": ["cargo", "test", "--message-format=short", "--no-run", "--release", "--offline",
                                    "-p", "my-lib"], "cwd": src, "env": env},
-            *_built(stage), tests, *after]
+            *_built(stage, kept), tests, *after]
 
 
 def _claim_and_install(stage: Path, tree: str) -> list:
@@ -1322,12 +1325,12 @@ def _claim_and_install(stage: Path, tree: str) -> list:
             {"op": "release", "kind": "install"}]
 
 
-def _built(stage: Path) -> list:
-    """Side `s`'s build provenance (a record that keeps no profile executable: the crate has
-    none) and the end of its build."""
+def _built(stage: Path, kept: tuple = ()) -> list:
+    """Side `s`'s build provenance (a record that keeps the profile executables `kept`, the
+    crate has none of its own) and the end of its build."""
     proven = str(stage.parent / "provenance.json")
-    write = "import json, sys; json.dump({'kept': []}, open(sys.argv[1], 'w'))"
-    return [run_op([sys.executable, "-c", write, proven], stage),
+    write = "import json, sys; json.dump({'kept': sys.argv[2:]}, open(sys.argv[1], 'w'))"
+    return [run_op([sys.executable, "-c", write, proven, *map(str, kept)], stage),
             {"op": "built", "side": "s", "release": True, "provenance": proven}]
 
 
@@ -1377,6 +1380,25 @@ def test_a_build_runs_from_its_output_releases_its_checkout_and_trims_what_no_ke
     (tmp_path / "go").write_text("")
     assert ended(tmp_path, "second")["failed"] is None
     assert not output.exists()
+
+
+@needs_cargo
+def test_an_executable_the_build_trims_is_left_out_of_its_output(tmp_path):
+    """Provenance keeps what it verified before the build's trim, an executable no kept build
+    references left in the target among it (another build's); the trim removes it, and the output
+    holds what the trim left, never failing on what it removed (b9e76b: another build's
+    executable)."""
+    target = tmp_path / "checkouts" / "slot-0" / "target"
+    stage = _crate(tmp_path / "v1", "0.1.0")
+    start(tmp_path, "first", _build_plan(stage, "t1"))
+    assert ended(tmp_path, "first")["failed"] is None
+    stale = target / "release" / "deps" / "dropped-0123456789abcdef"
+    stale.write_text("#!/bin/sh\n")
+    stale.chmod(0o755)
+    start(tmp_path, "second", _build_plan(stage, "t1", kept=(stale,)))
+    result = ended(tmp_path, "second")
+    assert result["failed"] is None and result["codes"] == {"tests": 0}, result
+    assert not stale.exists()  # trimmed, and its output completed without it
 
 
 def test_a_run_sharing_a_checkout_neither_trims_nor_records_it_nor_makes_room(tmp_path):

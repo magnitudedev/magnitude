@@ -530,7 +530,7 @@ class Session:
         kept = _references(directory)
         before = build in kept
         peak = checkout_bytes(directory)  # outside the guard: a large target takes seconds
-        trimmed = {"bytes": 0, "entries": 0}
+        trimmed = {"bytes": 0, "entries": 0, "removed": []}
         if units is not None:
             began = time.time() - seconds
             if not os.path.exists(os.path.join(directory, REFERENCES)):  # what its builds before recorded none of
@@ -1157,9 +1157,10 @@ def present_units(target: str) -> set:
 def trim(target: str, kept: dict) -> dict:
     """Remove from `target` every hashed entry of a unit directory that no build of `kept`
     (`_references`) references, never its incremental directories (see the module
-    documentation): the bytes and the entries removed."""
+    documentation): the bytes and the entries removed, and the real paths of the entries."""
     units = {unit for build in kept.values() for unit in build["units"]}
     freed = entries = 0
+    removed = []
     for relative in _unit_directories(target):
         directory = os.path.join(target, *relative.split("/"))
         for name in os.listdir(directory):
@@ -1169,8 +1170,9 @@ def trim(target: str, kept: dict) -> dict:
                 continue
             freed += checkout_bytes(path) if os.path.isdir(path) and not os.path.islink(path) else os.lstat(path).st_size
             entries += 1
+            removed.append(os.path.join(os.path.realpath(directory), name))
             _clear(path)
-    return {"bytes": freed, "entries": entries}
+    return {"bytes": freed, "entries": entries, "removed": removed}
 
 
 def need(directory: str, checkout: str, build: str, fallback):
@@ -1545,10 +1547,12 @@ class Runner:
         _link_tree(os.path.join(checkout, "src"), staged)
         self._move_in(staged, os.path.join(output, "src"))
 
-    def materialize(self, side: str, proven: str) -> int:
+    def materialize(self, side: str, proven: str, trimmed) -> int:
         """Complete the side's output from its build, once: every executable of the target's
-        profile and example directories that its build provenance (`proven`, its record) kept,
-        and every test executable the build produced, linked at
+        profile and example directories that its build provenance (`proven`, its record) kept
+        and its trim left (`trimmed`, the paths the trim removed: an executable no kept build
+        references, another build's left in the target, which the provenance saw before the
+        trim), and every test executable the build produced, linked at
         its path under the output's `target`, and the list of the test executables with their
         packages' directories in the output's source (`TESTS`). The executables linked."""
         output, checkout = self.outputs[side], self.rig.checkout(self.checkouts[side])
@@ -1560,7 +1564,7 @@ class Runner:
         os.makedirs(staged)
         tests = [(os.path.realpath(path), manifest) for path, manifest in tests]
         with open(proven) as stream:
-            executables = set(json.load(stream)["kept"]) | {path for path, _ in tests}
+            executables = set(json.load(stream)["kept"]) - set(trimmed) | {path for path, _ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
@@ -1783,9 +1787,11 @@ class Runner:
             shared = op["side"] in self.shared
             if shared:
                 self.session.shared_built(name)
+                trimmed = ()
             else:
                 built = self.session.built(name, seconds, units)
-            linked = self.materialize(op["side"], op["provenance"])
+                trimmed = built["trimmed"]["removed"]
+            linked = self.materialize(op["side"], op["provenance"], trimmed)
             if op["release"]:
                 self.session.release("checkout:" + name)
                 self.events.note("released checkout %s: this run's later steps read its build output %s (%d executables)"
