@@ -47,6 +47,12 @@ harness = false
 name = "media_drafting"
 harness = false
 
+# Counts process-wide heap allocations across repeated assessments, so it runs
+# without the libtest harness (whose 60 s warning thread allocates beside it).
+[[test]]
+name = "assessment_memory"
+harness = false
+
 [dev-dependencies]
 # Equality of header values, for the tests that compare them.
 magnitude-artifacts = { path = "artifacts", features = ["equality"] }

@@ -498,7 +498,8 @@ impl DirectGraphBuilder {
     /// memory both take, which no allocation charges, is its census priced
     /// with every live graph's ([`crate::graph_cost::GraphPool`]), held until
     /// the graph is dropped. The driver has taken it once the graph exists,
-    /// so it is recorded to the device account, never refused.
+    /// so it is charged to the device store's own entry as taken, never
+    /// refused.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
         let census = GraphCensus::graph(self.launches).ok_or_else(|| {
             ExecutionError::SubmissionFailed("a graph's census overflows".into())
@@ -510,13 +511,16 @@ impl DirectGraphBuilder {
             crate::executor::OUT_OF_MEMORY => ExecutionError::DeviceRefused { required, reading: self.device.refusal_reading() },
             _ => submission(error),
         };
+        // The driver's instantiation and the record of what it took are one
+        // change.
+        let change = self.device.graphs().entry().change();
         let exec = self.graph.instantiate().map_err(refused)?;
         for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
             exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
         }
         exec.upload(self.device.stream()).map_err(refused)?;
         let launched = Event::new(self.device.context()).map_err(submission)?;
-        self.device.graphs().instantiated(&self.device, census)?;
+        self.device.graphs().instantiated(&change, &self.device, census)?;
         Ok(DirectGraph {
             device: self.device.clone(),
             exec,
@@ -528,6 +532,7 @@ impl DirectGraphBuilder {
             enabled: self.enabled,
             words: self.words,
             census,
+            scope: seismic_memory::entry::DropScope::default(),
         })
     }
 }
@@ -559,6 +564,9 @@ pub struct DirectGraph {
     census: GraphCensus,
     /// The device whose graph pool holds its driver memory.
     device: Device,
+    /// The change its drop runs in, which ends after every field has
+    /// dropped ([`DropScope`]): last.
+    scope: seismic_memory::entry::DropScope,
 }
 
 impl DirectGraph {
@@ -673,7 +681,8 @@ impl DirectGraph {
 
 impl Drop for DirectGraph {
     fn drop(&mut self) {
-        self.device.graphs().dropped(&self.device, self.census);
+        let change = self.scope.begin(self.device.graphs().entry());
+        self.device.graphs().dropped(change, &self.device, self.census);
     }
 }
 
@@ -734,17 +743,19 @@ unsafe extern "system" fn wake_after_write(data: *mut c_void) {
 }
 
 impl HostWord {
-    /// A word at 0.
+    /// A word at 0, its page charged to the device's host store's own
+    /// entry.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        Self::on(device.context(), &device.accounts().upload)
+        Self::on(device.context(), &device.stores().host.own())
     }
 
-    /// A word at 0 in `context`, charged to `account`.
+    /// A word at 0 in `context`, its page charged to `entry`, an entry of
+    /// host RAM.
     pub(crate) fn on(
         context: &Arc<driver::Context>,
-        account: &Arc<dyn seismic_compiler::executable::MemoryAccount>,
+        entry: &Arc<dyn seismic_memory::entry::Entry>,
     ) -> Result<Self, ExecutionError> {
-        let mapped = driver::HostMapped::new(context, account, 4)?;
+        let mapped = driver::HostMapped::new(context, entry, 4)?;
         mapped.write_at(0, &0u32.to_le_bytes());
         Ok(Self { mapped, wake: Arc::new(Wake { lock: Mutex::new(()), changed: Condvar::new() }) })
     }
@@ -926,6 +937,40 @@ impl DirectBatch {
         driver
             .check(status, "native kernel launch")
             .map_err(submission)
+    }
+
+    /// Copy `bytes` bytes of the device's memory at `source` to
+    /// `destination` in stream order (`cuMemcpyDtoDAsync`): after the
+    /// stream's preceding work, before its following work, waiting for no
+    /// host.
+    pub fn copy(&mut self, destination: u64, source: u64, bytes: u64) -> Result<(), ExecutionError> {
+        let count = usize::try_from(bytes)
+            .map_err(|_| ExecutionError::SubmissionFailed("a device copy exceeds the host's address space".into()))?;
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        // SAFETY: both ranges lie in live device allocations of this
+        // context, which the caller keeps until the batch completes.
+        let status = unsafe { context.enqueue().memcpy_device_async(destination, source, count, self.stream.raw()) };
+        context.driver.check(status, "device copy").map_err(submission)
+    }
+
+    /// Set the 8-byte-aligned word of the device's memory at `destination`
+    /// to `value` in stream order, as two `cuMemsetD32Async` of its halves
+    /// carrying the value in the call: no work of the stream runs between
+    /// them, and work of another stream that reads the word orders after
+    /// the batch, so no reader sees it half written.
+    pub fn write_u64(&mut self, destination: u64, value: u64) -> Result<(), ExecutionError> {
+        if destination % 8 != 0 {
+            return Err(ExecutionError::SubmissionFailed("a device word is not 8-byte aligned".into()));
+        }
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        for (offset, half) in [(0, value as u32), (4, (value >> 32) as u32)] {
+            // SAFETY: a word of a live device allocation of this context.
+            let status = unsafe { context.enqueue().memset_d32_async(destination + offset, half, 1, self.stream.raw()) };
+            context.driver.check(status, "device word write").map_err(submission)?;
+        }
+        Ok(())
     }
 
     /// Stamp mark `mark` of `stamps` once the stream's preceding work
@@ -1182,8 +1227,8 @@ extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* sc
                 .unwrap();
         let module =
             DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
-        let out = device.allocate_mapped(8).unwrap();
-        let scalars = device.allocate_mapped(4).unwrap();
+        let out = device.allocate_mapped(8, &crate::test_entry()).unwrap();
+        let scalars = device.allocate_mapped(4, &crate::test_entry()).unwrap();
         let host = out.host_address().unwrap().cast::<u32>();
         // SAFETY: `out` maps 8 bytes the device does not use yet.
         unsafe { host.as_ptr().write_bytes(0, 2) };

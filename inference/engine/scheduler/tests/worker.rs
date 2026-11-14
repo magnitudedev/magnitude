@@ -1,17 +1,15 @@
-use magnitude_executor::{DomainError, RequestId};
+use magnitude_executor::RequestId;
 use magnitude_generation::{OutputToken, TokenId};
 use magnitude_scheduler::{
-    owner::AdmissionError,
     protocol::{WorkerCommand, WorkerReply},
     publication::{Publication, PublicationQueue, PublicationWakeKind},
-    worker::{DispatchError, Driven, Event, Owner, Panicked, Worker, WorkerWakeHandle},
+    worker::{DispatchError, Driven, Event, Owner, Panicked, Reread, Worker, WorkerWakeHandle},
 };
 use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
-const NEVER: u64 = u64::MAX;
 
 /// Why a test owner stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,11 +39,11 @@ impl Driven for Replying {
         }
         self.events.send(event).unwrap();
     }
-    fn run(&mut self, _: u64) -> Result<u64, Stopped> {
+    fn run(&mut self, _: u64) -> Result<Reread, Stopped> {
         if self.closed {
             return Err(Stopped("closed"));
         }
-        Ok(NEVER)
+        Ok(Reread::Settled)
     }
 }
 
@@ -68,30 +66,6 @@ fn replying(
     )
     .unwrap();
     (worker, wakes.recv_timeout(TIMEOUT).unwrap(), observed)
-}
-
-#[test]
-fn blind_admission_crosses_the_worker_as_a_typed_refusal() {
-    let (mut worker, _, _events) = replying(
-        || {
-            WorkerReply::AdmissionRefused(AdmissionError::from(DomainError::Blind(
-                "host status unavailable".into(),
-            )))
-        },
-        1,
-    );
-    let reply = worker
-        .client()
-        .dispatch(WorkerCommand::Observe)
-        .unwrap()
-        .wait()
-        .unwrap();
-    assert!(matches!(
-        reply,
-        WorkerReply::AdmissionRefused(AdmissionError::MemoryObservationUnavailable(message))
-            if message == "host status unavailable"
-    ));
-    worker.close();
 }
 
 /// Completion and publication wakes are reserved: they reach the owner while

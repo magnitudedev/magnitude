@@ -46,13 +46,10 @@ impl Directory {
         (promotion.layer, promotion.expert)
     }
 
-    /// [`Self::evict`] and [`Self::commit_shrink`] between flights.
-    fn evicted(&mut self, group: usize, plan: &Shrink, last_read: impl Fn(usize, usize) -> Option<Step>) {
-        steps().unbegun(|at| self.evict(group, plan, last_read, at));
-    }
-
-    fn committed(&mut self, group: usize, plan: &Shrink) {
-        steps().unbegun(|at| self.commit_shrink(group, plan, at));
+    /// [`Self::evict`] group `group`'s `records`, each held expert
+    /// unmapped from the first step not yet begun.
+    fn evicted(&mut self, group: usize, records: &[usize], last_read: impl Fn(usize, usize) -> Option<Step>) {
+        steps().unbegun(|at| self.evict(group, records, last_read, |_| at.next()));
     }
 
     /// A claim of `layer`'s lacked `expert`: the record taken, none
@@ -85,8 +82,8 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let selection = crate::ComponentSelection { head: false, vision: false };
     let backend = seismic::BackendName::Metal;
     let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-    let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified(crate::planning::Parking::InKernels) };
+    let host = crate::planning::HostTier::Unified(crate::planning::Parking::InKernels);
+    let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
     let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, substrate).unwrap();
     let plan = load.expert_bank().unwrap();
@@ -288,38 +285,30 @@ fn a_replay_counts_each_rankings_misses() {
     assert_eq!(misses(&[vec![0, 1]], Recency::Reuse), [0, 0, 1, 1, 1]);
 }
 
-/// A shrink keeps the most recently read experts, wherever they lie:
-/// the ones above the commitment move into records below it that the
-/// least recent ones leave free, and a regrowth adds free records.
+/// A shrink keeps the most recently read experts where their bytes are,
+/// wherever they lie: it evicts the least recent ones, leaving holes, and
+/// moves nothing; a regrowth backs the holes again, free.
 #[test]
-fn a_shrink_keeps_the_most_recent_experts_below_the_commitment() {
+fn a_shrink_keeps_the_most_recent_experts_where_they_are() {
     let mut directory = directory();
     directory.place(at(1, 0), 0, &[], &[0, 1], |_| 0).unwrap();
     directory.place(at(1, 1), 1, &[], &[0, 1], |_| 0).unwrap();
     directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     // Records 0, 1 hold layer 0's experts 0, 1; records 2, 3 layer 1's.
     let reads = [[Some(5), Some(2)], [Some(7), Some(3)]];
-    let plan = directory.plan_shrink(0, 2, |layer, expert| reads[layer][expert]);
-    assert_eq!(plan.evicted, [(1, 1), (0, 1)], "the least recent two leave");
-    assert_eq!(plan.moved, [(1, 0, 2, 1)], "layer 1's expert 0 moves to the record left free");
-    assert_eq!(
-        (directory.held(1, 0), directory.records()[0]),
-        (Some(2), 4),
-        "a plan changes nothing"
-    );
-    directory.evicted(0, &plan, |layer, expert| reads[layer][expert]);
-    assert_eq!(
-        (directory.held(0, 1), directory.held(1, 0), directory.records()[0]),
-        (None, Some(2), 4),
-        "the evictions leave, the moved expert stays where its bytes are"
-    );
-    directory.committed(0, &plan);
-    assert_eq!((directory.held(0, 0), directory.held(1, 0)), (Some(0), Some(1)));
+    let mut evicted = directory.evictions(0, 2, |layer, expert| reads[layer][expert]);
+    evicted.sort_unstable();
+    assert_eq!(evicted, [1, 3], "the least recent two leave: layer 0's expert 1, layer 1's expert 1");
+    assert_eq!((directory.held(0, 1), directory.records()[0]), (Some(1), 4), "choosing changes nothing");
+    directory.evicted(0, &evicted, |layer, expert| reads[layer][expert]);
+    assert_eq!((directory.held(0, 0), directory.held(1, 0)), (Some(0), Some(2)), "the kept stay where their bytes are");
     assert_eq!((directory.held(0, 1), directory.held(1, 1)), (None, None));
     assert_eq!(directory.records()[0], 2);
-    directory.grow(0, 4);
+    assert_eq!(directory.evictions(0, 2, |layer, expert| reads[layer][expert]), Vec::<usize>::new(), "at its target it evicts nothing");
+    directory.grow(0, vec![1, 3]);
+    assert_eq!(directory.records()[0], 4);
     let placed = directory.place(at(2, 0), 0, &[0], &[4, 5], |_| 9).unwrap();
-    assert_eq!(placed.records, [BankRecord(2), BankRecord(3)], "the regrown records are free");
+    assert_eq!(placed.records, [BankRecord(1), BankRecord(3)], "the regrown records are free");
     assert!(placed.evicted.is_empty());
 }
 
@@ -396,10 +385,11 @@ fn the_directory_keeps_the_host_tier_inclusive_of_the_bank() {
     assert!(directory.in_tier(0, 3) && !directory.host(0).holds_alone((0, 3)) && alone(&directory) == 1);
     // A shrink evicts 3: its banked copy is held alone.
     let last_read = |_: usize, expert: usize| Some(expert as Step);
-    let plan = directory.plan_shrink(0, 0, last_read);
-    assert_eq!(plan.evicted, [(0, 3)]);
-    directory.evicted(0, &plan, last_read);
+    let evicted = directory.evictions(0, 0, last_read);
+    assert_eq!(evicted, [1, 0], "the free record first, then 3's");
+    directory.evicted(0, &evicted, last_read);
     assert!(directory.in_tier(0, 3) && alone(&directory) == 2);
+    assert_eq!((directory.held(0, 3), directory.records()[0]), (None, 0));
 }
 
 /// A landing into the host tier of an expert the bank already holds (here
@@ -656,8 +646,7 @@ fn victims_rank_by_reuse_with_recency_the_tie_break() {
     let measured = held(58);
     assert!(measured.half_life() > 0., "the reads measured a half-life");
     assert_eq!(evicted(held(58)), [(0, 59, 59)], "reuse");
-    let plan = measured.plan_shrink(0, 1, |_, _| Some(59));
-    assert_eq!((plan.evicted, plan.moved), (vec![(0, 59)], vec![]), "the shrink keeps the more reused");
+    assert_eq!(measured.evictions(0, 1, |_, _| Some(59)), [1], "the shrink keeps the more reused: 59's record leaves");
 }
 
 /// Where the host tier is the bank's own records (unified memory's one
@@ -685,7 +674,9 @@ fn the_one_stores_ranking_prices_its_records() {
     assert!(directory.half_life() > 0., "the reads measured a half-life at the store's records");
     let shared = |directory: &Directory| (0..128).filter(|&expert| directory.reuse_now().in_top(0, expert)).count();
     assert_eq!(shared(&directory), 2, "a share of the store's two records");
-    directory.shrink_host(0, 1);
+    let evicted = directory.host_evictions(0, 1);
+    assert_eq!(evicted, [0], "one ready record");
+    directory.evict_host(0, &evicted, |_| Step::MAX);
     assert_eq!(shared(&directory), 1, "shrunk with the store");
 }
 
@@ -723,7 +714,7 @@ fn a_grown_bank_beside_a_full_tier_leaves_the_rest_to_the_file() {
     // The device promotes 1 and 3 into the bank; 0 and 2 stay alone.
     directory.place(at(2, 0), 0, &[], &[1, 3], |_| 0).unwrap();
     directory.retired(past(2), |_, _| 2, |_| Ending::Ended);
-    directory.grow(0, 3);
+    directory.grow(0, vec![2]);
     let (experts, slots) = (4, directory.records()[0]);
     let (held, alone) = (directory.held_count(0), directory.alone(0));
     assert_eq!((slots, held, alone), (3, 2, 2));

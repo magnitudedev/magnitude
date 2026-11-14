@@ -21,7 +21,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    Holder, InFlightState, OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
+    InFlightState, OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
     OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
     TentativeAdvance,
 };
@@ -31,9 +31,8 @@ mod family;
 mod features;
 mod head;
 mod reader;
-mod holdings;
 mod serving_heap;
-pub use serving_heap::Followed;
+pub use serving_heap::{Followed, Yielded};
 mod in_flight;
 mod input;
 mod ownership;
@@ -54,13 +53,15 @@ pub use family::{
     NativeFamily,
     ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, TrafficHold, Trip,
 };
-pub use reader::{DeviceReader, LoadRoom, MachineReading, StatusReading};
+pub use reader::{DeviceReader, LoadRoom, MachineReading, PlanningRoom, StatusReading};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
 use in_flight::{PrimingFlight, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::{MemoryChargeReconciliation, MemoryMoment, SlotRelease, StateShrink, StoreAllocation};
+pub use state::{MemoryChargeReconciliation, StoreAllocation};
+#[cfg(any(test, feature = "fixtures"))]
+pub use state::{SlotRelease, StateShrink, StateYield};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
     AppendedRuns, accepted_history, cached_causal_domain, indexer_history,
@@ -81,10 +82,10 @@ pub struct PhysicalDecision {
 
 #[derive(Clone, Debug)]
 pub enum DomainError {
+    /// A store's ledger refused the claim (`memory::ledger::Short`): it
+    /// waits for a change of the process's that frees memory, or fails
+    /// where none can come.
     Capacity(crate::CapacityError),
-    /// A required device-memory observation failed. This is not a demand
-    /// deficit: reclaiming another request cannot make the reading valid.
-    Blind(String),
     Input(String),
     State(magnitude_state::Error),
     Submit(crate::SubmitError),
@@ -102,9 +103,10 @@ pub enum DomainError {
         ceiling: u64,
     },
     /// A sequence's state rows wait on preempting these sequences, admitted
-    /// after it, the latest first (`Ledger::claim`): their bytes are
-    /// reserved to it. The owner evicts them (`release_state`) and provisions
-    /// again, which completes the claim; nothing grew.
+    /// after it, the latest first, as the device's ledger names them
+    /// (`Claim::grow`): their bytes are reserved to it. The owner evicts
+    /// them (`release_state`) and provisions again, which completes the
+    /// claim; nothing grew.
     Preempt(Vec<RequestId>),
 }
 
@@ -116,22 +118,18 @@ impl DomainError {
         })
     }
 
-    /// A claim on `ledgers` refused as `short`: blind where its store's
-    /// reading failed, else a capacity deficit of that store, for the
-    /// owner's release order.
+    /// A claim on `ledgers` refused as `short`: a deficit of that store's
+    /// memory.
     pub(crate) fn short(short: crate::memory::ledger::Short, ledgers: &crate::memory::ledger::DeviceLedgers) -> Self {
-        use crate::memory::ledger::Short;
-        match short {
-            Short::Blind { store, reason } => Self::Blind(format!("the reading of {store:?} failed: {reason}")),
-            Short::Over { store, required, over } => Self::Capacity(CapacityError {
-                resource: match store == ledgers.device().store() {
-                    true => ResourceKind::DeviceMemory,
-                    false => ResourceKind::HostStaging,
-                },
-                required,
-                available: required - over,
-            }),
-        }
+        let crate::memory::ledger::Short { store, required, over } = short;
+        Self::Capacity(CapacityError {
+            resource: match store == ledgers.device().store() {
+                true => ResourceKind::DeviceMemory,
+                false => ResourceKind::HostStaging,
+            },
+            required,
+            available: required - over,
+        })
     }
 }
 
@@ -139,7 +137,6 @@ impl std::fmt::Display for DomainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Capacity(error) => error.fmt(f),
-            Self::Blind(message) => write!(f, "device memory observation unavailable: {message}"),
             Self::Input(message) => f.write_str(message),
             Self::State(error) => error.fmt(f),
             Self::Submit(error) => error.fmt(f),
@@ -154,7 +151,7 @@ impl std::fmt::Display for DomainError {
                 f,
                 "state growth of {growth} bytes beside {committed} committed exceeds the {ceiling}-byte state ceiling"
             ),
-            Self::Preempt(sequences) => write!(f, "state growth waits on preempting requests {sequences:?}"),
+            Self::Preempt(sequences) => write!(f, "a claim waits on preempting requests {sequences:?}"),
         }
     }
 }
@@ -578,6 +575,11 @@ impl ResumeState {
     pub fn position(&self) -> usize {
         self.target.position()
     }
+
+    /// The target store's checkpoint of the sequence.
+    pub fn target(&self) -> &magnitude_state::StateCheckpoint {
+        &self.target
+    }
 }
 
 /// Native executor with no erased stage or executor type parameters. The
@@ -619,6 +621,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The claims of the bound vision component's graph constants, released
     /// as it unbinds.
     vision_binding: Vec<crate::memory::ledger::Claim>,
+    /// The bound optional components held as cache while no request is
+    /// resident (`ExecutorDomain::release_yielded`), committed again as one
+    /// opens (`ExecutorDomain::activate_components`).
+    idle_components: Vec<serving_heap::IdleComponent>,
+    /// The latest reading's answer ([`MemoryProbe::answer`]): each store's
+    /// generation at it, and the response the owner owes.
+    answered: RefCell<Answered>,
     target: BTreeMap<RequestId, SequenceState>,
     /// The steps queued behind the last flight: the rest of a chain, with
     /// the chain under way, or one successor, with their drafter primings
@@ -639,10 +648,9 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// prefill chunks). Consumed by that group's provisioning and the steps
     /// queued behind it (`behind`).
     planned: Vec<Operation>,
-    /// The load's serving rates as it serves (`WorkloadMeter`), from its
-    /// priced decode's prior on ([`Self::serving_rates`]); none before the
-    /// bank is priced.
-    workload: Option<crate::workload::WorkloadMeter>,
+    /// What the load served since it opened, which its cache holdings are
+    /// valued over (`ExecutorDomain::value_cache`).
+    served: serving_heap::Served,
     /// The service's measurement job's committed claim beside the model
     /// (`ExecutorDomain::claim_measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
@@ -691,12 +699,11 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     shrink_step: bool,
     /// A cut of the expert bank begun beside a running chain, until the
     /// owner takes it ([`Self::take_running_release`]): the storage it
-    /// resizes and what the process held as it was decided.
-    running_release: Option<(crate::planning::BankTier, MemoryMoment)>,
-    /// The outcome of the newest periodic reading observed that the owner
-    /// has not taken yet ([`Self::take_published_memory`]): one observed
-    /// between a chain's submissions is the owner's reading too.
-    unseen_reading: RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
+    /// resizes.
+    running_release: Option<crate::planning::BankTier>,
+    /// The load's one in-process figure, held on the store its state lies
+    /// in for the domain's life (`memory::ledger::Ledger::in_process`).
+    _in_process: crate::memory::ledger::InProcess,
     /// The thread it is made on owns its memory for its life: an owner's
     /// change of the scope begun on another panics.
     _owner: crate::memory::ledger::Owner,
@@ -803,11 +810,6 @@ pub struct ExpertMeasures {
     /// passes its launches merge (`Stages::merge_sets`): until measured, a
     /// group merges by its reads alone.
     pub pass: crate::assessment::Priced<crate::assessment::ExpertPass>,
-    /// Each bank group's shrink move line on this executor, at its own
-    /// record form and moves (`MoveCosts`): what a bank step's exchange is
-    /// charged for its moves before a resize of the bank was timed
-    /// (`bank_heap`).
-    pub moves: crate::assessment::Priced<crate::assessment::MoveLines>,
     /// What a host tier's copy costs (`assessment::TierCopyCosts`): the
     /// blocks it takes over the link, the link's rate, and the device time
     /// it takes from work beside it; none without a host tier. Until
@@ -842,8 +844,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The expert bank's cover ([`ExpertCover`]) as now, which its
     /// residency carries too (`ExpertResidency::cover`); none without an
-    /// elastic bank.
-    fn expert_cover(&self) -> Option<ExpertCover> {
+    /// elastic bank. It moves as the bank's watcher reads, with no holding
+    /// moving: the census publishes it on its own change.
+    pub fn expert_cover(&self) -> Option<ExpertCover> {
         self.family.expert_bank().map(|bank| bank.cover())
     }
 
@@ -884,7 +887,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         read: impl FnOnce(&[(&crate::experts::derived::HoldingTarget<'_>, u64)]) -> R,
     ) -> Result<R, DomainError> {
         let holdings = bank.targets(self.decode_price()?.as_ref())?;
-        Ok(read(&crate::experts::derived::derive(self.resources.ledgers(), &holdings, self.in_process_growth())))
+        Ok(read(&crate::experts::derived::derive(self.resources.ledgers(), &holdings)))
     }
 
     /// Each of `bank`'s holdings beside its derived target, as the bank
@@ -902,6 +905,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     store: ledgers.of(target.tier).store(),
                     held: target.at,
                     target: *slots,
+                    block: target.shape.block_bytes(),
                 })
                 .collect()
         })
@@ -964,7 +968,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     read = experts.read.why().unwrap_or("measured"),
                     lines = experts.lines.why().unwrap_or("measured"),
                     pass = experts.pass.why().unwrap_or("measured"),
-                    moves = experts.moves.why().unwrap_or("measured"),
                     tier_copy = experts.tier_copy.why().unwrap_or("measured"),
                     convert = experts.convert.why().unwrap_or("measured"),
                     "the experts are priced"
@@ -1003,12 +1006,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.domain.device()
     }
 
-    /// The arena's committed claim beside its terms: the claim's bytes, the
-    /// plan's graph scratch and the target graphs' bound constants held now.
+    /// The arena's committed claim beside its terms: the claim's bytes,
+    /// what its allocations charged and the target graphs' bound constants
+    /// held now.
     #[cfg(test)]
     pub(crate) fn arena_terms(&self) -> (u64, u64, u64) {
         let constants = self.family.target_constant_bytes().expect("the target's constants fit u64");
-        (self.arena.bytes(), self.execution.resources().bytes().scratch, constants)
+        (self.arena.bytes(), self.arena.allocated(), constants)
     }
 
     /// The landings the device has converted.
@@ -1157,99 +1161,301 @@ impl ExpertCover {
     }
 }
 
-/// What reads memory for the domain: the device's stores and ledgers, its
-/// heap, and whether a bank resize runs. None of the program family's, which each reading is handed
-/// its expert bank from: a chain's encoding reads memory through it while
-/// it holds the family ([`ExecutorDomain::submit_chain`]).
+/// What reads memory for the domain: the device's reader and ledgers, and
+/// whether a bank resize runs. None of the program family's, which each
+/// reading is handed its expert bank from: a chain's encoding reads memory
+/// through it while it holds the family ([`ExecutorDomain::submit_chain`]).
 struct MemoryProbe<'d> {
-    domain: &'d ResourceDomain,
     memory: &'d RefCell<DeviceReader>,
     ledgers: &'d crate::memory::ledger::DeviceLedgers,
-    /// [`ExecutorDomain::unseen_reading`].
-    unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
+    answered: &'d RefCell<Answered>,
     resizing: bool,
+}
+
+/// The stores `ledgers` reach, each once: the device's own, and host RAM's
+/// where it is a store apart.
+fn stores(ledgers: &crate::memory::ledger::DeviceLedgers) -> impl Iterator<Item = &crate::memory::ledger::Ledger> {
+    let (device, host) = (ledgers.device(), ledgers.host());
+    std::iter::once(device).chain((host.store() != device.store()).then_some(host))
+}
+
+/// What the latest reading's answer left ([`MemoryProbe::answer`]): each
+/// store's generation at it, before its response moved the ledger (what a
+/// resize begun on it names, [`ExecutorDomain::sizing_terms`]), and the
+/// response the owner has yet to carry out, every store's merged, cache
+/// yielding already taken.
+#[derive(Default)]
+struct Answered {
+    generations: Vec<(seismic::StoreIdentity, u64)>,
+    owed: Option<MemoryResponse>,
+}
+
+/// One store's answer to its reading ([`MemoryProbe::answer`]).
+struct StoreAnswer<'d> {
+    ledger: &'d crate::memory::ledger::Ledger,
+    generation: u64,
+    shortage: Option<crate::memory::shortage::Shortage>,
+    yielded: u64,
 }
 
 impl<'d> MemoryProbe<'d> {
     /// The domain's probe, of its parts apart from the program family.
-    fn of(
-        domain: &'d ResourceDomain,
-        memory: &'d RefCell<DeviceReader>,
-        ledgers: &'d crate::memory::ledger::DeviceLedgers,
-        unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
-        held: &ResizeHeld,
-    ) -> Self {
-        Self { domain, memory, ledgers, unseen, resizing: held.runs() }
+    fn of(memory: &'d RefCell<DeviceReader>, ledgers: &'d crate::memory::ledger::DeviceLedgers, answered: &'d RefCell<Answered>, held: &ResizeHeld) -> Self {
+        Self { memory, ledgers, answered, resizing: held.runs() }
+    }
+
+    /// The one answer to a reading (design §3.3): each store's real
+    /// shortage at it judged once (`memory::ledger::Ledger::shortage`), its
+    /// first step taken at once (its cache yields in rank order,
+    /// `Ledger::yield_cache`, which each holder frees at the next boundary),
+    /// and the rest of every store's response merged into what the owner
+    /// owes, which it carries out in order at its next reading
+    /// ([`ExecutorDomain::read_memory`]). Each store's generation at the
+    /// reading is kept for the resizes begun on it. Whichever event read,
+    /// a flight boundary or a pressure event beside a running chain, this
+    /// is the one consumer of the shortage's answer.
+    fn answer(&self) -> Vec<StoreAnswer<'d>> {
+        let answers = stores(self.ledgers)
+            .map(|ledger| {
+                // The reading's generation, before its response moves the
+                // ledger: what a resize that follows its target names.
+                let generation = ledger.generation();
+                let shortage = ledger.shortage();
+                let yielded = shortage.as_ref().map_or(0, |shortage| ledger.yield_cache(shortage.response.yields));
+                StoreAnswer { ledger, generation, shortage, yielded }
+            })
+            .collect::<Vec<_>>();
+        let mut answered = self.answered.borrow_mut();
+        answered.generations = answers.iter().map(|answer| (answer.ledger.store(), answer.generation)).collect();
+        for StoreAnswer { ledger, generation, shortage, yielded } in &answers {
+            let Some(shortage) = shortage else { continue };
+            tracing::info!(
+                store = ?ledger.store(),
+                generation,
+                cause = ?shortage.cause,
+                yielded,
+                admission_waits = shortage.response.admission_waits,
+                preempt = shortage.response.preempt.len(),
+                unload = shortage.response.unload,
+                "a real memory shortage"
+            );
+            let owed = answered.owed.get_or_insert_with(MemoryResponse::default);
+            owed.admission_waits |= shortage.response.admission_waits;
+            for &sequence in &shortage.response.preempt {
+                if !owed.preempt.contains(&sequence) {
+                    owed.preempt.push(sequence);
+                }
+            }
+            owed.unload |= shortage.response.unload;
+        }
+        answers
     }
 
     /// [`ExecutorDomain::observe_memory`], beside `bank`.
-    fn observe(&self, bank: Option<&dyn ElasticBank>) -> Result<Vec<DomainReading>, DomainError> {
+    ///
+    /// # Panics
+    /// Where the device's reading fails: no decision stands without it.
+    fn observe(&self, bank: Option<&dyn ElasticBank>) -> Vec<DomainReading> {
         let _rises = bank.map(|bank| bank.hold_rises());
-        let readings = self
-            .memory
+        self.memory
             .borrow_mut()
             .refresh()
-            .map_err(|error| DomainError::Blind(error.to_string()))?;
-        Ok(readings)
+            .unwrap_or_else(|error| panic!("invariant violated: the device's memory reading failed: {error}"))
     }
 
-    /// The periodic reading published since the last
-    /// (`DeviceReader::refresh_published`), read off this thread: the reader
-    /// observes it, the device's ledgers read it
-    /// (`memory::ledger::DeviceLedgers::read`), and its outcome is held for
-    /// the owner until it takes it
-    /// ([`ExecutorDomain::take_published_memory`]). None where none was
-    /// published since.
-    fn probe_published(&self, bank: Option<&dyn ElasticBank>) -> Option<Result<(), DomainError>> {
+    /// The device's ledgers read from a sample taken now, beside `bank`
+    /// (`DeviceReader::read_at_event_after`): whether one stood, and so was read.
+    fn read(&self, bank: Option<&dyn ElasticBank>, after_idle: bool) -> bool {
         let _rises = bank.map(|bank| bank.hold_rises());
-        let (readings, sample) = self.memory.borrow_mut().refresh_published(self.ledgers.changes())?;
-        self.memory.borrow().read_ledgers(self.ledgers, &sample);
-        let observed = readings.map_err(|error| DomainError::Blind(error.to_string()));
-        let outcome = observed.as_ref().map(drop).map_err(Clone::clone);
-        *self.unseen.borrow_mut() = Some(observed);
-        Some(outcome)
+        self.memory.borrow().read_at_event_after(self.ledgers, after_idle).is_some()
     }
 
-    /// What the process holds now (`MemoryMoment`).
-    fn moment(&self) -> MemoryMoment {
-        let ledger = self.domain.device().device_ledger();
-        MemoryMoment { charged: ledger.charged, claimed: ledger.claim }
-    }
-
-    /// What the expert bank's store is short of now, read between a
-    /// chain's submissions (`ExpertBank::release_running`): the periodic
-    /// reading published since the last ([`Self::probe_published`]), taken
-    /// without waiting, and what free room in the ledger of the store the
-    /// bank's experts lie in lacks of the speed guarantee
-    /// (`memory::ledger::Snapshot::short`) of a prompt chunk of
-    /// `chunk_rows` rows ([`chunk_bytes`]), with what the process held
-    /// then. None while a bank resize runs (its advance is a boundary's,
-    /// and the bank begins no cut beside it), with no reading published
-    /// since, where the reading is blind (it holds it so, and the owner's next
-    /// reading reads again), or where nothing is short.
-    fn running_pressure(&self, bank: &dyn ElasticBank, chunk_rows: u64) -> Option<RunningPressure> {
-        if self.resizing {
+    /// What the expert bank's store yields between a chain's submissions
+    /// (`ExpertBank::release_running`): where an OS pressure event came
+    /// since the last reading (`DeviceReader::pressured`), the ledgers read
+    /// now and the reading answered ([`Self::answer`]), and the bank's
+    /// share of the cache the answer yielded. Cache of every kind yields in
+    /// rank order; only the bank's can be cut beside the chain, and only its
+    /// share is: what the shortage took of the other kinds their holders
+    /// free at the next boundary (`ExecutorDomain::release_yielded`), so
+    /// nothing is released twice, and the rest of the response is owed to
+    /// the owner's next reading. Each submission is an own change the next
+    /// boundary reads; between them only another program's pressure is
+    /// news. None while a bank resize runs (its advance is a boundary's, and
+    /// the bank begins no cut beside it), with no pressure event since,
+    /// where a change beside the sample deferred the reading (the pressure
+    /// stays owed to the next), or where the answer took none of the bank's
+    /// cache.
+    fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
+        let reader = self.memory.borrow();
+        if self.resizing || !reader.pressured() {
             return None;
         }
-        if let None | Some(Err(DomainError::Blind(_))) = self.probe_published(Some(bank)) {
+        drop(reader);
+        if !self.read(Some(bank), false) {
+            self.memory.borrow().repress();
             return None;
         }
         let tier = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
         let ledger = self.ledgers.of(tier);
-        match ledger.snapshot().short(chunk_bytes(ledger, chunk_rows)) {
+        let bank_cache = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
+        let before = bank_cache();
+        drop(self.answer());
+        match before - bank_cache() {
             0 => None,
-            bytes => Some(RunningPressure { bytes, held: self.moment() }),
+            bytes => Some(RunningPressure { bytes }),
         }
     }
 }
 
-/// The committed state a prompt chunk of `rows` rows grows by in `ledger`'s
-/// store at its most, from a history ending on a page boundary: what the
-/// ledger's speed guarantee keeps free for growth arriving within one
-/// reading (`memory::ledger::Snapshot::guarantee`). The size is the load's,
-/// whichever sequence grows.
-fn chunk_bytes(ledger: &crate::memory::ledger::Ledger, rows: u64) -> u64 {
-    ledger.bytes(&crate::memory::ledger::Need::StateRows { sequence: RequestId(0), from: 0, to: rows })
+/// A reading of memory at an owner's event ([`ExecutorDomain::read_memory`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryReading {
+    /// A change of ours off the owner's thread stood beside the sample
+    /// (`memory::ledger::Sample::try_now`): nothing was read nor answered.
+    /// Its completion wakes the owner, whose step reads then.
+    Beside,
+    Read(MemoryRead),
+}
+
+/// A reading taken and answered: what reading took, the ledgers'
+/// generation right after it (`ExecutorDomain::memory_generation`), before
+/// any response, and the response left for the owner, none where no store
+/// is short anew.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRead {
+    pub cost: Duration,
+    pub generation: u64,
+    pub response: Option<MemoryResponse>,
+}
+
+/// The reading a store's bank target is derived from
+/// ([`ExecutorDomain::sizing_terms`]): its store, its generation as its
+/// `memory read` record states it (none before the owner answered a
+/// reading of the store), its instant on the owner's clock, and its
+/// figures as the estimate stands now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SizingTerms {
+    pub store: seismic::StoreIdentity,
+    pub reading: Option<u64>,
+    pub read_at: Instant,
+    pub figures: SizingFigures,
+}
+
+/// The figures of a store's estimate its bank target is derived from
+/// (`memory::ledger::Estimate::target`):
+/// `floor + (budget − committed − other cache − guarantee) / slot`, the
+/// budget `min(grant, held + supply)` within the boundary `cap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizingFigures {
+    pub budget: u64,
+    pub supply: u64,
+    pub others: u64,
+    pub committed: u64,
+    pub other_cache: u64,
+    pub in_process: u64,
+    pub guarantee: u64,
+    pub cap: Option<u64>,
+}
+
+/// One term of [`SizingFigures`] that moved between two readings, from
+/// and to, named as the `memory read` record names its field
+/// ([`Self::field`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizingTerm {
+    Budget { from: u64, to: u64 },
+    Supply { from: u64, to: u64 },
+    Others { from: u64, to: u64 },
+    Committed { from: u64, to: u64 },
+    OtherCache { from: u64, to: u64 },
+    InProcess { from: u64, to: u64 },
+    Guarantee { from: u64, to: u64 },
+    Cap { from: Option<u64>, to: Option<u64> },
+}
+
+impl SizingTerm {
+    /// The field of the `memory read` record it is.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::Budget { .. } => "budget",
+            Self::Supply { .. } => "supply",
+            Self::Others { .. } => "others",
+            Self::Committed { .. } => "committed",
+            Self::OtherCache { .. } => "other_cache",
+            Self::InProcess { .. } => "in_process",
+            Self::Guarantee { .. } => "guarantee",
+            Self::Cap { .. } => "cap",
+        }
+    }
+}
+
+impl SizingTerms {
+    /// The term whose change since `before` set the target these give
+    /// (`floor + (budget − committed − other cache − guarantee) / slot`,
+    /// within the boundary): of the target's own terms, the one that
+    /// moved most, named by what moved it, supply or others within the
+    /// budget and the in-process figure within the guarantee; the boundary
+    /// where only it moved. None where no term moved: the target moved
+    /// with the bank's own price, not with memory.
+    pub fn term(&self, before: &Self) -> Option<&'static str> {
+        let moved = self.moved(before);
+        let has = |field: &str| moved.iter().any(|term| term.field() == field);
+        let delta = |from: u64, to: u64| from.abs_diff(to);
+        let (from, to) = (before.figures, self.figures);
+        let largest = [
+            ("budget", delta(from.budget, to.budget)),
+            ("committed", delta(from.committed, to.committed)),
+            ("other_cache", delta(from.other_cache, to.other_cache)),
+            ("guarantee", delta(from.guarantee, to.guarantee)),
+        ]
+        .into_iter()
+        .filter(|(_, by)| *by > 0)
+        .max_by_key(|(_, by)| *by)
+        .map(|(field, _)| field);
+        Some(match largest {
+            Some("budget") if has("supply") => "supply",
+            Some("budget") if has("others") => "others",
+            Some("guarantee") if has("in_process") => "in_process",
+            Some(field) => field,
+            None if has("cap") => "cap",
+            None => return None,
+        })
+    }
+
+    /// The terms that moved from `before` to these: what traces a resize
+    /// begun on these to the event that moved them.
+    pub fn moved(&self, before: &Self) -> Vec<SizingTerm> {
+        let (from, to) = (before.figures, self.figures);
+        let terms = [
+            (from.budget, to.budget, SizingTerm::Budget { from: from.budget, to: to.budget }),
+            (from.supply, to.supply, SizingTerm::Supply { from: from.supply, to: to.supply }),
+            (from.others, to.others, SizingTerm::Others { from: from.others, to: to.others }),
+            (from.committed, to.committed, SizingTerm::Committed { from: from.committed, to: to.committed }),
+            (from.other_cache, to.other_cache, SizingTerm::OtherCache { from: from.other_cache, to: to.other_cache }),
+            (from.in_process, to.in_process, SizingTerm::InProcess { from: from.in_process, to: to.in_process }),
+            (from.guarantee, to.guarantee, SizingTerm::Guarantee { from: from.guarantee, to: to.guarantee }),
+        ];
+        let mut moved = terms.into_iter().filter(|(from, to, _)| from != to).map(|(.., term)| term).collect::<Vec<_>>();
+        if from.cap != to.cap {
+            moved.push(SizingTerm::Cap { from: from.cap, to: to.cap });
+        }
+        moved
+    }
+}
+
+/// The ordered response to the real shortages of a load's stores
+/// (`memory::shortage`), with the first step, cache yielding, already
+/// taken ([`ExecutorDomain::read_memory`]): what the owner carries out of
+/// the rest, in order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryResponse {
+    /// New work waits: the bank sits at its floor.
+    pub admission_waits: bool,
+    /// The sequences to preempt, the lowest value first.
+    pub preempt: Vec<RequestId>,
+    /// The shortage is real and persists with nothing of ours pending: the
+    /// model unloads.
+    pub unload: bool,
 }
 
 /// The time expert bank resizes held the submitting thread at flight
@@ -1393,7 +1599,8 @@ impl ExecutorDomain<NativeFamily> {
 
     /// The domain over the load's native family. Its holdings of what the
     /// load allocated as it started (`recorded`, and `constants`, the
-    /// target's binding constants it binds now) are carved from that
+    /// target's binding constants it binds now, claimed as
+    /// [`crate::memory::ledger::CommittedKind::Arena`]) are carved from that
     /// record; a store short of what it commits beyond it refuses it as
     /// [`DomainError::Capacity`], a state the load matches.
     pub fn new(
@@ -1409,6 +1616,7 @@ impl ExecutorDomain<NativeFamily> {
         head_state: Option<StoreBindings>,
         mut recorded: crate::memory::ledger::Recorded,
         mut constants: crate::memory::ledger::Held,
+        in_process: crate::memory::ledger::InProcess,
     ) -> Result<(Self, StateBindings), DomainError> {
         // A model's drafter (its draft head or separate draft) is enabled
         // only when its method drafts.
@@ -1426,8 +1634,8 @@ impl ExecutorDomain<NativeFamily> {
         if head_state.is_some() != (head_loader.is_some() && keeps_history) {
             return Err(DomainError::invariant("head state arena differs from enabled head component"));
         }
-        // The family binds the target's constants: one change with their
-        // record.
+        // The family binds the target's constants, the arena's: one change
+        // with their record.
         let family = constants.allocate(|| NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded))?;
         recorded.record(constants);
         Self::with_family(
@@ -1441,6 +1649,7 @@ impl ExecutorDomain<NativeFamily> {
             vision_loader,
             family,
             recorded,
+            in_process,
         )
     }
 }
@@ -1492,96 +1701,200 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The owner's periodic observation: the newest reading published off
-    /// its thread observed (`MemoryProbe::probe_published`), and read by the
-    /// device's ledgers, where one was since, and the outcome of the newest
-    /// one observed, here or between a chain's submissions, that it has not
-    /// taken yet; none where there is none. Its error is only
-    /// [`DomainError::Blind`]. It waits for no reading.
-    pub fn take_published_memory(&mut self) -> Option<Result<Vec<DomainReading>, DomainError>> {
-        self.memory_probe().probe_published(self.family.expert_bank());
-        self.unseen_reading.get_mut().take()
-    }
-
-    /// Whether the store a capacity deficit of `resource` lies in now holds
-    /// its `required` bytes, by its ledger's last reading, as a claim of them
-    /// is judged (`memory::ledger::Ledger::covers`): when a request blocked
-    /// on that deficit retries.
-    ///
-    /// # Panics
-    /// For a resource no store's memory is: no claim refuses with it.
-    pub fn memory_covers(&self, resource: ResourceKind, required: u64) -> bool {
-        let ledgers = self.resources.ledgers();
-        let ledger = match resource {
-            ResourceKind::DeviceMemory => ledgers.device(),
-            ResourceKind::HostStaging => ledgers.host(),
-            other => panic!("invariant violated: a memory deficit of {other:?}, which no store's ledger keeps"),
-        };
-        ledger.covers(required, seismic::Reclaim::Nothing).is_ok()
-    }
-
-    /// The owner's judgment of a reading its ledgers recorded: whether the
-    /// model unloads, since a store the device reaches, as its ledger read
-    /// it, cannot keep the speed guarantee of a prompt chunk of
-    /// `chunk_rows` rows, the running prompt chunk's (0 where none runs)
-    /// (`memory::ledger::Snapshot::unload`). Each store's reading is
-    /// traced as one `memory read` event at [`MEMORY_TRACE`], of the one
-    /// snapshot the judgment reads: its budget, committed and cache bytes,
-    /// free room, others' memory, the guarantee, and each bank holding in
-    /// the store with what it holds and its derived target
+    /// A reading at an event (a flight boundary, an own change, an OS
+    /// pressure event, a reading owed): the device's ledgers read a sample
+    /// taken now, and each store's shortage judged on it
+    /// (`memory::ledger::Ledger::shortage`), once per reading: a shortage
+    /// already answered is not answered again. The first step of each
+    /// store's response is taken at once: its cache yields in rank order
+    /// (`Ledger::yield_cache`), which each holder frees at this boundary.
+    /// What is left of the response, every store's in one, is returned for
+    /// the owner to carry out in order; none where no store is short anew.
+    /// Where a change off the owner's thread stood beside the sample,
+    /// nothing is read and nothing answered ([`MemoryReading::Beside`]).
+    /// Each store's reading is traced as one `memory read` event at
+    /// [`MEMORY_TRACE`], of the one estimate the judgment reads, and each
+    /// bank holding in the store with what it holds and its derived target
     /// (`experts::derived::derive`, as the bank follows it).
-    pub fn memory_reading(&self, chunk_rows: u64) -> Result<bool, DomainError> {
-        let ledgers = self.resources.ledgers();
-        let device = ledgers.device();
-        let stores = std::iter::once(device).chain((ledgers.host().store() != device.store()).then(|| ledgers.host()));
+    pub fn read_memory(&self, after_idle: bool) -> Result<MemoryReading, DomainError> {
+        let began = Instant::now();
+        let probe = self.memory_probe();
+        if !probe.read(self.family.expert_bank(), after_idle) {
+            tracing::debug!(target: MEMORY_TRACE, "memory read deferred: a change of ours stood beside the sample");
+            return Ok(MemoryReading::Beside);
+        }
+        let cost = began.elapsed();
+        let generation = self.memory_generation();
         let traced = tracing::enabled!(target: MEMORY_TRACE, tracing::Level::DEBUG);
         let targets = match (traced, self.family.expert_bank()) {
             (true, Some(bank)) => self.derived_targets(bank)?,
             _ => Vec::new(),
         };
-        let mut unload = false;
-        for ledger in stores {
-            let snapshot = ledger.snapshot();
-            let guarantee = snapshot.guarantee(chunk_bytes(ledger, chunk_rows));
-            unload |= snapshot.unload(chunk_bytes(ledger, chunk_rows));
+        for StoreAnswer { ledger, generation, shortage, yielded } in probe.answer() {
             if !traced {
                 continue;
             }
+            let estimate = ledger.estimate();
             let held = |holding| targets.iter().find(|target| target.holding == holding && target.store == ledger.store());
             let (experts, host) = (held(BankHolding::Experts), held(BankHolding::Host));
             tracing::debug!(
                 target: MEMORY_TRACE,
                 store = ?ledger.store(),
-                blind = snapshot.others().is_none(),
-                budget = snapshot.budget(),
-                committed = snapshot.committed(),
-                cache = snapshot.cache(),
-                bank_cache = snapshot.cache_of(crate::memory::ledger::CacheKind::Bank),
-                free = snapshot.free(),
-                others = snapshot.others().unwrap_or(0),
-                os_available = snapshot.os_figures().map_or(0, |figures| figures.0),
-                os_reclaimable = snapshot.os_figures().map_or(0, |figures| figures.1),
-                allocated = snapshot.allocated(),
-                guarantee,
+                generation,
+                budget = estimate.budget(),
+                supply = estimate.supply(),
+                committed = estimate.committed(),
+                cache = estimate.cache(),
+                bank_cache = estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                other_cache = estimate.cache() - estimate.cache_of(crate::memory::ledger::CacheKind::Bank),
+                // Zero where no weight cap bounds the store.
+                cap = estimate.cap().unwrap_or(0),
+                free = estimate.free(),
+                others = estimate.others(),
+                nonresident = estimate.nonresident(),
+                unobserved_resident = estimate.unobserved_resident(),
+                unobserved_readings = estimate.unobserved_readings(),
+                accounting_violations = estimate.accounting_violations(),
+                pressure_lost = ledger.pressure_lost(),
+                unwired_shortfall = estimate.unwired_shortfall(),
+                unwired_readings = estimate.unwired_readings(),
+                // Zero where no wired ceiling bounds the store.
+                wired_limit = estimate.wired_limit().unwrap_or(0),
+                wire_count = estimate.wire_count().unwrap_or(0),
+                allocated = estimate.allocated(),
+                in_process = estimate.in_process(),
+                guarantee = estimate.guarantee(),
+                pending = estimate.pending(),
+                short = shortage.is_some(),
+                yielded,
                 bank_slots = experts.map_or(0, |target| target.held),
                 bank_target = experts.map_or(0, |target| target.target),
+                // The least the bank shrinks by; zero where no bank holds
+                // experts in the store.
+                bank_block = experts.map_or(0, |target| target.block),
                 host_slots = host.map_or(0, |target| target.held),
                 host_target = host.map_or(0, |target| target.target),
                 "memory read"
             );
         }
-        Ok(unload)
+        let response = self.answered.borrow_mut().owed.take();
+        Ok(MemoryReading::Read(MemoryRead { cost, generation, response }))
+    }
+
+    /// The load's stores, each once ([`stores`]).
+    fn stores(&self) -> impl Iterator<Item = &crate::memory::ledger::Ledger> {
+        stores(self.resources.ledgers())
+    }
+
+    /// The load's ledgers' generation: the sum of its stores'
+    /// (`memory::ledger::Ledger::generation`), which moves on every change
+    /// and reading of either and on nothing else.
+    pub fn memory_generation(&self) -> u64 {
+        self.stores().map(crate::memory::ledger::Ledger::generation).sum()
+    }
+
+    /// The generation of what the load's ledgers hold: the sum of its
+    /// stores' (`memory::ledger::Ledger::holdings_generation`), which moves
+    /// on every change of what either holds and never on a reading.
+    pub fn holdings_generation(&self) -> u64 {
+        self.stores().map(crate::memory::ledger::Ledger::holdings_generation).sum()
+    }
+
+    /// Whether anything stands that only a later reading can answer: a
+    /// store's own standing (`memory::ledger::Ledger::standing`: a real
+    /// shortage, a refused claim waiting, a growth the boundary holds
+    /// back), or the expert bank short of its saturation in any holding
+    /// (`experts::derived::BankShape::saturation_slots`), which only memory
+    /// another program frees can grow, and which the ledger, holding no
+    /// miss curve, cannot see.
+    pub fn memory_stands(&self) -> Result<bool, DomainError> {
+        if self.stores().any(|ledger| {
+            matches!(
+                ledger.standing(),
+                Some(
+                    crate::memory::ledger::Standing::Shortage(_)
+                        | crate::memory::ledger::Standing::Wait
+                        | crate::memory::ledger::Standing::Step
+                )
+            )
+        }) {
+            return Ok(true);
+        }
+        let Some(bank) = self.family.expert_bank() else {
+            return Ok(false);
+        };
+        self.derive_bank(bank, |derived| derived.iter().any(|(target, _)| target.at < target.shape.saturation_slots()))
+    }
+
+    /// The sum of readings folded into the load's stores so far: unchanged
+    /// across an idle sleep iff nothing read any of its stores while asleep.
+    pub fn readings_generation(&self) -> u64 {
+        self.stores().map(crate::memory::ledger::Ledger::readings).sum()
+    }
+
+    /// The shortest interval between two readings across which another
+    /// program's memory was seen to move, over the load's stores
+    /// (`memory::ledger::Ledger::others_interval`); none until one was.
+    pub fn others_interval(&self) -> Option<Duration> {
+        self.stores().filter_map(crate::memory::ledger::Ledger::others_interval).min()
+    }
+
+    /// Whether an OS pressure event came since this was last asked
+    /// (`DeviceReader::pressured`).
+    pub fn take_pressure(&self) -> bool {
+        self.memory.borrow().pressured()
+    }
+
+    /// The reading `tier`'s store's bank target is derived from now: the
+    /// latest reading's instant and its estimate's terms, the bank's own
+    /// cache apart from the rest.
+    pub fn sizing_terms(&self, tier: crate::planning::BankTier) -> SizingTerms {
+        let ledger = self.resources.ledgers().of(tier);
+        let estimate = ledger.estimate();
+        let bank = estimate.cache_of(crate::memory::ledger::CacheKind::Bank);
+        let store = ledger.store();
+        let reading = self.answered.borrow().generations.iter().find(|(read, _)| *read == store).map(|(_, generation)| *generation);
+        SizingTerms {
+            store,
+            reading,
+            read_at: estimate.at().at(),
+            figures: SizingFigures {
+                budget: estimate.budget(),
+                supply: estimate.supply(),
+                others: estimate.others(),
+                committed: estimate.committed(),
+                other_cache: estimate.cache() - bank,
+                in_process: estimate.in_process(),
+                guarantee: estimate.guarantee(),
+                cap: estimate.cap(),
+            },
+        }
+    }
+
+    /// What the process holds in the device's store now, by its ledger
+    /// (`Estimate::allocated`): what a release or growth is recorded
+    /// beside.
+    pub fn held_bytes(&self) -> u64 {
+        self.resources.ledgers().device().estimate().allocated()
     }
 
     /// Observe every domain the device uses from a reading taken now: the
     /// worker's report of them.
-    pub fn observe_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
+    pub fn observe_memory(&self) -> Vec<DomainReading> {
         self.memory_probe().observe(self.family.expert_bank())
     }
 
     /// What reads memory for the domain ([`MemoryProbe`]).
     fn memory_probe(&self) -> MemoryProbe<'_> {
-        MemoryProbe::of(&self.domain, &self.memory, self.resources.ledgers(), &self.unseen_reading, &self.resize_held)
+        MemoryProbe::of(&self.memory, self.resources.ledgers(), &self.answered, &self.resize_held)
+    }
+
+    /// Watch the OS's memory pressure events for the domain's life
+    /// (`DeviceReader::watch_pressure`): each wakes the owner through
+    /// `wake`, whose run reads memory, and a chain's encoding reads it
+    /// between submissions ([`MemoryProbe::running_pressure`]).
+    pub fn watch_pressure(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.memory.borrow_mut().watch_pressure(self.resources.ledgers().host(), wake);
     }
 
     /// Submit a chain of target launches and its spare output slot
@@ -1597,11 +1910,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
         // The family is lent to the chain, so the probe borrows the rest.
-        // The guarantee the probe keeps is of a chunk as large as the
-        // chain's largest launch.
-        let chunk_rows = chain.iter().map(|launch| launch.batch().actual_rows() as u64).max().expect("a chain is never empty");
-        let probe = MemoryProbe::of(&self.domain, &self.memory, self.resources.ledgers(), &self.unseen_reading, &self.resize_held);
-        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank, chunk_rows));
+        let probe = MemoryProbe::of(&self.memory, self.resources.ledgers(), &self.answered, &self.resize_held);
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
         self.note_running_cut();
         submitted
     }
@@ -1616,26 +1926,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return;
         };
-        let Some(RunningBegun { decided, held, moment }) = bank.running_begun() else {
+        let Some(RunningBegun { decided, held }) = bank.running_begun() else {
             return;
         };
         let tier = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
         self.resize_held.begin_held(tier, decided, held);
-        assert!(self.running_release.replace((tier, moment)).is_none(), "the owner takes a running cut before the next begins");
+        assert!(self.running_release.replace(tier).is_none(), "the owner takes a running cut before the next begins");
     }
 
     /// The cut of the expert bank begun beside a running chain since the
-    /// owner last asked, taken: the storage it resizes and what the process
-    /// held as it was decided. The owner holds it as a shrink it began,
-    /// which a later advance finishes
+    /// owner last asked, taken: the storage it resizes. The owner holds it
+    /// as a shrink it began, which a later advance finishes
     /// ([`Self::advance_expert_bank`]).
-    pub fn take_running_release(&mut self) -> Option<(crate::planning::BankTier, MemoryMoment)> {
+    pub fn take_running_release(&mut self) -> Option<crate::planning::BankTier> {
         self.running_release.take()
-    }
-
-    /// Bytes of the model's host-resident tables held in host RAM.
-    pub fn host_table_bytes(&self) -> u64 {
-        self.execution.load().host_table_bytes().expect("invariant violated: a loaded plan sizes its host tables")
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more
@@ -2425,15 +2729,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         vision_loader: Option<ComponentLoader<ResidentVision>>,
         family: F,
         mut recorded: crate::memory::ledger::Recorded,
+        in_process: crate::memory::ledger::InProcess,
     ) -> Result<(Self, StateBindings), DomainError> {
         let owner = resources.ledgers().changes().own();
         // The load's last allocation is behind it, and the OS has since
         // refilled the free pages its allocations took from the file cache:
         // the arena's claim, the first serving claims and the bank's first
         // target are judged by a reading taken now, not by the one the
-        // load's last claim was made on.
-        memory.read_ledgers_now(resources.ledgers());
-        let arena = state::claim_arena(&execution, &resources, &family, &mut recorded)?;
+        // load's last claim was made on. Where a change of ours off this
+        // thread stands beside it, they are judged by the last reading with
+        // every claim since counted; the owner's first step owes a reading
+        // and takes it.
+        if memory.read_at_event(resources.ledgers()).is_none() {
+            tracing::debug!(target: MEMORY_TRACE, "the domain's opening memory read deferred: a change of ours stood beside the sample");
+        }
+        // The arena: the load's graph scratch and the target graphs' bound
+        // constants (the floor's group buffers and the held pass's, among
+        // them) as their allocations charged them, with groups of one
+        // place; a group's class beyond it is claimed as the group opens
+        // (`Self::open_group`).
+        let arena = recorded.claim_arena(resources.ledgers().device());
         let id = resources.domain().clone();
         let lane_identities = ["target", "head", "vision"].map(|lane| {
             ProgramIdentity::new(format!("{id}:{lane}"))
@@ -2468,10 +2783,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
             planned: Vec::new(),
-            workload: None,
+            served: Default::default(),
             measurement_claim: None,
             group_class: None,
             idle_class: Vec::new(),
+            idle_components: Vec::new(),
+            answered: RefCell::default(),
             next_flight: 0,
             host_turn: None,
             proposed: BTreeSet::new(),
@@ -2481,7 +2798,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resize_held: ResizeHeld::default(),
             shrink_step: false,
             running_release: None,
-            unseen_reading: RefCell::new(None),
+            _in_process: in_process,
             _owner: owner,
             teardown: Default::default(),
         };

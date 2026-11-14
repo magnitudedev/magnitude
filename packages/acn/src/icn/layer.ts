@@ -163,7 +163,7 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
     new IcnLifecycleConfig({
       binary: new IcnBinaryResolutionConfig({
         source: binarySource(dataDir),
-        supportedApiVersion: 1,
+        supportedApiVersion: 2,
         expectedNativeBuild: Option.none(),
         expectedTarget: Option.none(),
         requiredCapabilities: [

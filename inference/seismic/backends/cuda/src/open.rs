@@ -1,6 +1,6 @@
 //! CUDA backend composition over one exact native context and stream.
 
-use crate::{Cuda, Device, MemoryAccounts};
+use crate::{Cuda, CudaStores, Device};
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::evaluation::AnalyticalEvaluationContext;
 
@@ -9,9 +9,10 @@ pub struct OpenedCuda {
     pub device: std::sync::Arc<seismic_native_target::DeviceDescription<Cuda>>,
 }
 
-/// Device `ordinal`, its own allocations charged to `accounts`.
-pub fn open(ordinal: u32, accounts: MemoryAccounts) -> Result<OpenedCuda, ExecutionError> {
-    let service = Device::open(ordinal, accounts)?;
+/// Device `ordinal`, what it holds that no caller names charged to its
+/// `stores`' own entries.
+pub fn open(ordinal: u32, stores: CudaStores) -> Result<OpenedCuda, ExecutionError> {
+    let service = Device::open(ordinal, stores)?;
     let device = crate::profile::device_for_opened(ordinal)
         .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
     Ok(OpenedCuda { service, device })

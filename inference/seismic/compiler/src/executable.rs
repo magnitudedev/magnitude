@@ -1555,52 +1555,6 @@ fn compile_steps<B: seismic_native_target::TargetFamily>(
     out
 }
 
-/// A lifetime-owned charge for memory a backend allocates internally.
-pub trait MemoryHold: Send + Sync {}
-impl<T: Send + Sync> MemoryHold for T {}
-
-/// The runtime's accounting boundary for native memory ownership.
-/// Backends retain the returned hold for exactly the native allocation's life.
-pub trait MemoryAccount: Send + Sync {
-    fn available(&self) -> u64;
-    fn reserve(&self, bytes: u64) -> Result<Box<dyn MemoryHold>, ExecutionError>;
-    /// Reserve what `decide` chooses within one admission: it runs inside
-    /// the account's admission decision, after every admission its stores
-    /// run first, with what the account has available, and returns the
-    /// bytes to charge (or refuses); those are charged in that same
-    /// decision. Returns the charge and its bytes.
-    fn reserve_decided(
-        &self,
-        decide: &mut dyn FnMut(u64) -> Result<u64, ExecutionError>,
-    ) -> Result<(Box<dyn MemoryHold>, u64), ExecutionError>;
-    /// Record driver-owned memory whose size is observable only after the
-    /// native operation. It consumes subsequent admission headroom.
-    fn record(&self, bytes: u64) -> Box<dyn MemoryHold>;
-}
-
-/// An account that bounds nothing and charges nothing: what a backend's own
-/// tests, and a backend's probe process, open a device with, outside any
-/// runtime's ledgers.
-pub struct Unbounded;
-
-impl MemoryAccount for Unbounded {
-    fn available(&self) -> u64 {
-        u64::MAX
-    }
-    fn reserve(&self, _bytes: u64) -> Result<Box<dyn MemoryHold>, ExecutionError> {
-        Ok(Box::new(()))
-    }
-    fn reserve_decided(
-        &self,
-        decide: &mut dyn FnMut(u64) -> Result<u64, ExecutionError>,
-    ) -> Result<(Box<dyn MemoryHold>, u64), ExecutionError> {
-        Ok((Box::new(()), decide(u64::MAX)?))
-    }
-    fn record(&self, _bytes: u64) -> Box<dyn MemoryHold> {
-        Box::new(())
-    }
-}
-
 /// Device services a backend provides to the generic runtime.
 pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
     /// Memory device work binds and the host reads.
@@ -1609,29 +1563,20 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
     /// Read-only memory a backend maps is a `Buffer` only, so it has no host
     /// write path.
     type Writable: std::borrow::Borrow<Self::Buffer> + Send + Sync + 'static;
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Writable, ExecutionError>;
-    /// Allocate where the device may add at most `room` bytes of device
-    /// memory beyond what it already holds, when given. A service that takes
-    /// device memory exactly per allocation ignores it.
-    fn allocate_within(
+    /// Allocate `bytes` at `alignment` in memory of `kind`, one of the
+    /// backend's kinds (`seismic_topology::KindReport::id`), charged exactly
+    /// to `entry`, an entry of the kind's store: the native bytes the
+    /// allocation takes (its rounding, or a block range's bytes carved from
+    /// the block) are the entry's while the returned buffer lives, and freed
+    /// from it as the buffer drops. A refusal is
+    /// [`ExecutionError::AllocationCapacity`], nothing allocated.
+    fn allocate(
         &self,
+        kind: u32,
         bytes: u64,
         alignment: u64,
-        _room: Option<u64>,
-    ) -> Result<Self::Writable, ExecutionError> {
-        self.allocate(bytes, alignment)
-    }
-    /// Device memory the service holds beyond its live allocations (free
-    /// space of blocks, driver objects); zero for a service that takes
-    /// device memory exactly per allocation.
-    fn held_beyond_allocations(&self) -> u64 {
-        0
-    }
-    /// The part of [`Self::held_beyond_allocations`] later allocations can
-    /// take without the device holding more: its blocks' free space.
-    fn unallocated(&self) -> u64 {
-        0
-    }
+        entry: &std::sync::Arc<dyn seismic_memory::entry::Entry>,
+    ) -> Result<Self::Writable, ExecutionError>;
     fn write(&self, buffer: &Self::Writable, offset: u64, bytes: &[u8])
         -> Result<(), ExecutionError>;
     fn read(
@@ -2783,7 +2728,13 @@ mod allocation_size_tests {
     impl DeviceService<FakeTarget> for NoDevice {
         type Buffer = ();
         type Writable = ();
-        fn allocate(&self, _: u64, _: u64) -> Result<(), ExecutionError> {
+        fn allocate(
+            &self,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: &Arc<dyn seismic_memory::entry::Entry>,
+        ) -> Result<(), ExecutionError> {
             unreachable!()
         }
         fn write(&self, _: &(), _: u64, _: &[u8]) -> Result<(), ExecutionError> {

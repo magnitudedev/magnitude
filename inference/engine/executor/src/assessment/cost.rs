@@ -423,7 +423,7 @@ impl HostLines {
     pub fn of_bank(plan: &ExpertBankPlan, bank: &[BankLines], byte_seconds: Option<f64>) -> Result<Arc<[Self]>, HostLinesError> {
         assert_eq!(
             byte_seconds.is_some(),
-            plan.tier_reservation().is_some(),
+            plan.tiered(),
             "a host memory line prices exactly a bank with a host tier"
         );
         let memory = plan

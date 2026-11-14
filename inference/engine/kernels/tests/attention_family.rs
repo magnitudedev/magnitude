@@ -23,7 +23,7 @@ include!("attention_common/vulkan_prefill.rs");
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill, project_rows};
 use rounding_model::Rounding;
 use seismic::{
-    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabLayout, SlabRegion, SlabTensor,
     Tensor,
 };
 
@@ -924,8 +924,16 @@ impl Bound {
         // zero rows of a value plane.
         let stored = [&case.history_key, &case.history_value];
         let stored = &stored[..if form.stored_key { 1 } else { 2 }];
-        let mut slabs =
-            SlabTensor::new(device, slab_rows, t as u64, vec![region(); stored.len()]).unwrap();
+        // The selected-row plane's slabs live beside these, in the same pool.
+        let selected_rows_total = case.selected_plane_rows() as u64;
+        let per = case.selected_slab_rows as u64;
+        let history_regions = vec![region(); stored.len()];
+        let mut layouts = vec![SlabLayout::for_regions(slab_rows, t as u64, &history_regions).unwrap()];
+        if selected_rows_total != 0 {
+            layouts.push(SlabLayout::for_regions(per, selected_rows_total, &[region()]).unwrap());
+        }
+        let pool = crate::common::slab_pool(device, &layouts);
+        let slabs = SlabTensor::in_pool(&pool, slab_rows, t as u64, &history_regions).unwrap();
         let row_bytes = kv * w * 2;
         let planes = stored.iter().map(|values| {
             values
@@ -934,7 +942,7 @@ impl Bound {
                 .collect::<Vec<_>>()
         }).collect::<Vec<_>>();
         for index in 0..(t as u64).div_ceil(slab_rows) {
-            slabs.add_slab().unwrap();
+            slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let start = index * slab_rows;
             let count = slab_rows.min(t as u64 - start);
             for (plane, bytes) in planes.iter().enumerate() {
@@ -960,15 +968,13 @@ impl Bound {
             )
         };
         // The index-list plane in slabs of its own, which its picks cross.
-        let selected_rows_total = case.selected_plane_rows() as u64;
         let (selected_slabs, selected) = if selected_rows_total == 0 {
             (None, bf16_tensor(device, &[0, kv, w], &[]))
         } else {
-            let per = case.selected_slab_rows as u64;
-            let mut slabs = SlabTensor::new(device, per, selected_rows_total, vec![region()]).unwrap();
+            let slabs = SlabTensor::in_pool(&pool, per, selected_rows_total, &[region()]).unwrap();
             let bytes = case.selected.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect::<Vec<_>>();
             for index in 0..selected_rows_total.div_ceil(per) {
-                slabs.add_slab().unwrap();
+                slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
                 let start = index * per;
                 let count = per.min(selected_rows_total - start);
                 slabs

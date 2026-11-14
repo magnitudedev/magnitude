@@ -485,16 +485,19 @@ impl Core {
         }
     }
 
-    /// Each group's tier tensors' first `records[group]` records, as views
-    /// of their own (`Records::range`): what they address once a shrink
-    /// cuts them there, holding no record past the cut.
-    pub(super) fn tier_views(&self, records: &[u32]) -> Result<Vec<Vec<Records>>, String> {
+    /// Each group's tier tensors' records with `evicted[group]` holes: what
+    /// they address once a shrink evicts those, holding no view of a record
+    /// whose storage the store releases.
+    pub(super) fn tier_views(&self, evicted: &[Vec<u32>]) -> Result<Vec<Vec<Records>>, String> {
         self.groups
             .iter()
-            .zip(records)
-            .map(|(group, &records)| {
+            .zip(evicted)
+            .map(|(group, evicted)| {
                 let tensors = group.tier.as_ref().expect("a host tier resizes only beside its tensors");
-                tensors.iter().map(|tensor| tensor.records.range(0, u64::from(records))).collect()
+                tensors
+                    .iter()
+                    .map(|tensor| evicted.iter().try_fold(tensor.records.clone(), |records, &record| records.with(u64::from(record), None)))
+                    .collect()
             })
             .collect()
     }

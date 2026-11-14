@@ -26,9 +26,12 @@
 // Templates over a repack binding `B` (`REPACK_BINDING`), so a kernel
 // converts through as many bindings as it holds, in one `Shared` of them;
 // the held window is the bindings' alike, so a block loads one binding's
-// window while it converts another's. The includer includes
-// lib/streaming/control.cuh first.
+// window while it converts another's. Every source and destination is a
+// record port, bound as its records' address table: a record is converted
+// from and into its own address, wherever it lies (`slab::region`). The
+// includer includes lib/streaming/control.cuh first.
 
+#include <seismic/slab.cuh>
 #include "../repack/repack.cuh"
 #include "../../../streaming/window.hpp"
 
@@ -234,17 +237,17 @@ __device__ __forceinline__ DenseItem dense_item_of(const seismic_words_t &seismi
     return DenseItem{item * span, min(span, elements - item * span)};
 }
 
-// Dense item `item` of the staged record at `record` into slot `slot` of
-// `destination`, by the whole block: each element decoded to F32 and rounded
-// into the destination, `import_dense`'s conversion, from the window the
-// item's bytes were stored into.
+// Dense item `item` of a staged record into record `slot` of `destination`,
+// by the whole block: each element decoded to F32 and rounded into the
+// destination, `import_dense`'s conversion, from the window the item's bytes
+// were stored into.
 template <class B>
-__device__ __forceinline__ void convert_span(const u8 *window, const element::Out<typename Dense<B>::Destination> &destination,
+__device__ __forceinline__ void convert_span(const u8 *window, const u8 *destination,
                                              const seismic_words_t &seismic_words_value, u64 slot, u32 item) {
     typedef typename Dense<B>::Source Source;
     typedef typename Dense<B>::Destination Destination;
-    const element::Out<Destination> out =
-        destination.offset(slot * (B::out_matrix_bytes(seismic_words_value) / Destination::bytes));
+    // A dense record's elements are written only through the owner's handle.
+    const element::Out<Destination> out = element::out_over_scratch<Destination>(slab::region(destination, slot));
     const DenseItem span = dense_item_of<B>(seismic_words_value, item);
     const u32 columns = u32(B::k(seismic_words_value));
     // A thread's row and column step with its element: two divides an item.
@@ -262,31 +265,19 @@ __device__ __forceinline__ void convert_span(const u8 *window, const element::Ou
     }
 }
 
-// The stored record a landing entry's `from` names: source record `from` of
-// `conveyor`, or, negative, scratch slot -1 - from of `destination`, a slot
-// no pass reads, which the host read the stored bytes into at its base
-// (`routed_round` in routed.seismic). Either is at record 0 of the base
-// returned.
-template <class B>
-__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 *destination,
-                                                   const seismic_words_t &seismic_words_value, int from) {
-    return from >= 0 ? conveyor + (u64)from * B::source_matrix_bytes(seismic_words_value)
-                     : destination + (u64)(-1 - from) * B::out_matrix_bytes(seismic_words_value);
-}
-// The same of a dense float destination, held by its owner's handle: the
-// scratch slot's stored bytes are read, never written, through it.
-template <class B, class E>
-__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const element::Out<E> &destination,
-                                                   const seismic_words_t &seismic_words_value, int from) {
-    return from >= 0 ? conveyor + (u64)from * B::source_matrix_bytes(seismic_words_value)
-                     : destination.stored((u64)(-1 - from) * (B::out_matrix_bytes(seismic_words_value) / E::bytes));
+// The base of the stored record a landing entry's `from` names: source
+// record `from` of `conveyor`, or, negative, scratch slot -1 - from of
+// `destination`, a slot no pass reads, which the host read the stored bytes
+// into at its base (`routed_round` in routed.seismic).
+__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 *destination, int from) {
+    return from >= 0 ? slab::region(conveyor, (u64)from) : slab::region(destination, (u64)(-1 - from));
 }
 
 // Where item `item` of a packed record lies (`window`'s windowing): its row
 // tile and window, the tile's rows below N, the window's first packet and
 // its column tiles, its stored bytes (`spans` spans of `span_bytes` bytes,
 // `span_stride` apart from `from`: the whole row tile's one span, or its
-// rows' shares), and the record's destination.
+// rows' shares), and where its destination record's tile goes.
 template <class B> struct Placed {
     u32 row_tile, window_index, rows, packet0, tile0, tiles, spans, span_bytes;
     const u8 *from;
@@ -299,8 +290,9 @@ template <class B> struct Placed {
     u64 scale_stride = 0, scale0 = 0;
     u32 scale_spans = 0, scale_count = 0;
 
+    // Item `item` of the record at `source` into the record at `destination`.
     __device__ __forceinline__ Placed(const Window<B> &window, const u8 *source, u8 *destination,
-                                      const seismic_words_t &seismic_words_value, u64 record, u64 slot, u64 item) {
+                                      const seismic_words_t &seismic_words_value, u64 item) {
         typedef Window<B> W;
         row_tile = (u32)(item / window.windows);
         window_index = (u32)(item % window.windows);
@@ -316,12 +308,11 @@ template <class B> struct Placed {
         spans = window.whole ? (rows > 0 ? 1u : 0u) : rows;
         span_bytes = !window.whole ? stored * W::PACKET : rows > 0 ? (rows - 1u) * window.pitch + stored * W::PACKET : 0u;
         span_stride = row_stride;
-        from = source + record * B::source_matrix_bytes(seismic_words_value) +
-               (row0 * B::source_stride_1(seismic_words_value) + packet0 * B::source_stride_2(seismic_words_value)) *
+        from = source + (row0 * B::source_stride_1(seismic_words_value) + packet0 * B::source_stride_2(seismic_words_value)) *
                    W::PACKET;
-        out = destination + slot * B::out_matrix_bytes(seismic_words_value);
+        out = destination;
         if constexpr (B::planar()) {
-            const u8 *matrix = source + record * B::source_matrix_bytes(seismic_words_value);
+            const u8 *matrix = source;
             const u64 columns = repack::planar::grid_columns<B>(seismic_words_value);
             scale0 = (u64)packet0 * B::group() / B::grid_tile_columns();
             scale_count = stored > 0 ? (u32)(((u64)(packet0 + stored - 1) * B::group() / B::grid_tile_columns()) - scale0 + 1) : 0u;
@@ -617,11 +608,11 @@ template <u32 ITERS> struct HeldScales {
 // (from, to) names lies: from stored record `from` of `source` (negative:
 // `listed_source`'s scratch slot) into record `to` of `destination`.
 template <class B>
-__device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 *source, u8 *destination,
+__device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 *source, const u8 *destination,
                                               const seismic_words_t &seismic_words_value, int from, int to,
                                               u64 row_tile, u64 window_index) {
-    return Placed<B>(window, listed_source<B>(source, destination, seismic_words_value, from), destination,
-                     seismic_words_value, 0, (u64)to, row_tile * window.windows + window_index);
+    return Placed<B>(window, listed_source(source, destination, from), slab::region(destination, (u64)to),
+                     seismic_words_value, row_tile * window.windows + window_index);
 }
 
 // Window `window_index` of row tile `row_tile` of entry (from, to), its
@@ -629,7 +620,7 @@ __device__ __forceinline__ Placed<B> place_of(const Window<B> &window, const u8 
 // block: through the mirror where the binding's row tiles fit it, written
 // whole once its last window is placed (`write_tile`), else into the record.
 template <class B, class Sh>
-__device__ __forceinline__ void convert_window(const Window<B> &window, const u8 *source, u8 *destination,
+__device__ __forceinline__ void convert_window(const Window<B> &window, const u8 *source, const u8 *destination,
                                                const seismic_words_t &seismic_words_value, int from, int to,
                                                u64 row_tile, u64 window_index, Sh &shared) {
     const Placed<B> placed =

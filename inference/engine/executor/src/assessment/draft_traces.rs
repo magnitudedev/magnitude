@@ -8,7 +8,7 @@
 //! load lays them out: the family's storage, census, binding constants and
 //! host heap, and each class's storage and host heaps.
 
-use super::catalog::{bank_reservations, served_drafted_targets, LIMITS};
+use super::catalog::{recorded_substrate, served_drafted_targets, LIMITS};
 use crate::programs::native_constants::CheckedGraphResources;
 use crate::programs::native_draft::{
     certified_draft_family, draft_graph_classes, draft_traces_recorded, DraftGeometry, DraftGraphClass,
@@ -57,21 +57,21 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
                     continue;
                 }
             };
-            let banked = bank_reservations(&definition, backend).ok().map(|substrate| {
-                load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
-                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
-                })
-            });
-            let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));
-            for (form, load) in loads {
-                let load = match load {
-                    Ok(load) => load,
-                    Err(error) => {
-                        failures.push(format!("{line} {form}: its load: {error}"));
-                        continue;
-                    }
-                };
-                for &codec in &served_codecs {
+            for &codec in &served_codecs {
+                let banked = recorded_substrate(&definition, backend).ok().map(|substrate| {
+                    load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
+                        load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
+                    })
+                });
+                let loads = std::iter::once(("resident", Ok(load.clone()))).chain(banked.map(|banked| ("banked", banked)));
+                for (form, load) in loads {
+                    let load = match load {
+                        Ok(load) => load,
+                        Err(error) => {
+                            failures.push(format!("{line} {form} {codec:?}: its load: {error}"));
+                            continue;
+                        }
+                    };
                     let line = format!("{line} {form} {codec:?}");
                     let state = ResourcePlanner::state_plan(
                         &definition,
@@ -82,6 +82,7 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
                         ResourceCapacity {
                             domain_bytes: 64 << 30,
                             tensor_operations: crate::TensorOperations::Absent,
+                            allocations: seismic::NativeAllocations::EXACT,
                         },
                     )
                     .unwrap_or_else(|error| panic!("{line}: its state plans: {error}"));

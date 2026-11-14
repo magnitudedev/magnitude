@@ -97,9 +97,6 @@ pub struct ExpertBankKernels {
     /// (`BankBinding::placer`): a prompt group's seeds, copied from its
     /// scratch slots.
     pub placement: DevicePlacement,
-    /// A shrink's moves of the bank's kept records, which the device runs in
-    /// queue order ahead of every later step, whoever places.
-    pub moves: BankMoves,
     /// Its CPU site, where the bank has a host tier the CPU reads its
     /// misses from, the backend serves the site's entries, and, once
     /// qualified, the precision system admits its arithmetic
@@ -225,13 +222,6 @@ pub struct DevicePlacement {
     pub list_grid: NativeKernel<magnitude_kernels::routed_list_grid::Entry>,
 }
 
-/// A shrink's record moves (`routed_move`).
-#[derive(Clone, Debug)]
-pub struct BankMoves {
-    /// Each routed tensor's records.
-    pub records: RecordTensors<NativeKernel<magnitude_kernels::routed_move::Entry>>,
-}
-
 impl ExpertBankKernels {
     /// Whether `backend` declares every entry a bank of `form` prepares
     /// (`Preparation::bank`, one field of this struct each).
@@ -240,7 +230,7 @@ impl ExpertBankKernels {
         form: BankRouteForm,
     ) -> Result<bool, seismic::CheckedBundleError> {
         use magnitude_kernels::{
-            routed_copy, routed_land, routed_list_grid, routed_move, routed_pass_map, routed_round, routed_route_streamed,
+            routed_copy, routed_land, routed_list_grid, routed_pass_map, routed_round, routed_route_streamed,
             routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_step,
         };
         type Declares = fn(seismic::BackendName) -> Result<bool, seismic::CheckedBundleError>;
@@ -251,7 +241,7 @@ impl ExpertBankKernels {
             BankRouteForm::Fused => declares::<routed_route_streamed::Entry>,
             BankRouteForm::General => declares::<routed_select_streamed::Entry>,
         };
-        let bank: [Declares; 11] = [
+        let bank: [Declares; 10] = [
             route,
             declares::<routed_land::Entry>,
             declares::<routed_step::Entry>,
@@ -260,7 +250,6 @@ impl ExpertBankKernels {
             declares::<routed_scratch_grids::Entry>,
             declares::<routed_copy::Entry>,
             declares::<routed_seed_commit::Entry>,
-            declares::<routed_move::Entry>,
             declares::<routed_list_grid::Entry>,
             declares::<routed_pass_map::Entry>,
         ];
@@ -737,23 +726,6 @@ pub enum ExpertKernels {
     },
 }
 
-impl ExpertKernels {
-    /// Whether `backend`'s routed launches of a resident layer (a held
-    /// layer's, or a whole bank's resident forms, which read its home
-    /// records) bind each expert stack as it lies and read expert `e` from
-    /// row `e * rows` of the binding, rather than through a record port's
-    /// table (`routed.seismic`: CUDA's and the CPU's launches list no expert
-    /// stack among their `records`; Metal's and Vulkan's list every one). A
-    /// binding is one buffer, which chunked reserved storage is not
-    /// (`seismic::Reservation::chunked`).
-    pub(crate) const fn bind_resident_stacks(backend: seismic::BackendName) -> bool {
-        match backend {
-            seismic::BackendName::Cuda | seismic::BackendName::Cpu => true,
-            seismic::BackendName::Metal | seismic::BackendName::Vulkan => false,
-        }
-    }
-}
-
 /// A dense expansion: gated (`dense_expand`) or up-only (`dense_up`).
 #[derive(Clone, Debug)]
 pub enum DenseExpansionKernel {
@@ -785,34 +757,36 @@ pub struct ShortConvKernels {
 
 #[cfg(test)]
 mod tests {
-    use super::ExpertKernels;
-    use magnitude_kernels::{routed_down, routed_gate_up, routed_output, routed_up};
+    use magnitude_kernels::{routed_down, routed_expand, routed_gate_up, routed_output, routed_up};
     use seismic::{BackendName, RecordPort};
 
-    /// Whether any launch of `E` on `backend` binds expert stack `stack`
-    /// as it lies: lists it among no record ports.
-    fn binds<E: seismic::Entry>(backend: BackendName, stack: &str) -> bool {
+    /// Whether every launch of `E` on `backend` reads expert stack `stack`
+    /// through its records' address table: lists it among its record ports.
+    fn reads_records<E: seismic::Entry>(backend: BackendName, stack: &str) -> bool {
         let native = seismic::generated::native_implementation_for_backend::<E>(backend)
             .unwrap()
             .unwrap_or_else(|| panic!("{backend:?} declares every routed launch"));
         let port = RecordPort::Parameter(stack.to_owned());
-        (0..native.launches.len()).any(|launch| !native.launch_records(launch).contains(&port))
+        (0..native.launches.len()).all(|launch| native.launch_records(launch).contains(&port))
     }
 
-    /// The stated property is what the routed launches declare, on every
-    /// backend and for every expert stack a resident layer reads.
+    /// Every backend's routed decode launches read each expert stack
+    /// through its records' address table, so one rule serves a held
+    /// layer's stacks and a whole bank's home records, slabs of a granule
+    /// pool, alike (`ExpertBankPlan::resident`).
     #[test]
-    fn resident_stack_binding_is_what_the_routed_launches_declare() {
+    fn every_routed_decode_launch_reads_expert_stacks_as_records() {
         for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu] {
             let declared = [
-                binds::<routed_gate_up::Entry>(backend, "expert_gate"),
-                binds::<routed_gate_up::Entry>(backend, "expert_up"),
-                binds::<routed_up::Entry>(backend, "expert_up"),
-                binds::<routed_down::Entry>(backend, "expert_down"),
-                binds::<routed_output::Entry>(backend, "expert_down"),
+                reads_records::<routed_expand::Entry>(backend, "expert_gate"),
+                reads_records::<routed_expand::Entry>(backend, "expert_up"),
+                reads_records::<routed_gate_up::Entry>(backend, "expert_gate"),
+                reads_records::<routed_gate_up::Entry>(backend, "expert_up"),
+                reads_records::<routed_up::Entry>(backend, "expert_up"),
+                reads_records::<routed_down::Entry>(backend, "expert_down"),
+                reads_records::<routed_output::Entry>(backend, "expert_down"),
             ];
-            let stated = ExpertKernels::bind_resident_stacks(backend);
-            assert!(declared.iter().all(|&binds| binds == stated), "{backend:?}: {declared:?}, stated {stated}");
+            assert!(declared.iter().all(|&reads| reads), "{backend:?}: {declared:?}");
         }
     }
 }

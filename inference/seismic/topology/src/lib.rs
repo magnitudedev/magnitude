@@ -22,17 +22,16 @@ mod selector;
 mod tests;
 
 pub use kind::{
-    HostReads, Kind, KindMemory, KindReport, NativeKind, Obtained, Reach, Reserving, Unreservable,
+    HostReads, Kind, KindMemory, KindReport, NativeKind, Reach,
 };
 pub use model::{
     AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, DeviceMemory, DeviceTopology,
     Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, GrantSource, Identity,
-    KindId, Limits, Packing, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported,
-    ReportedBy, Reservation,
-    ReservationCharges, ReservationChunks, ReservedRecords, Revision, Store, StoreId,
-    StoreIdentity, StoreKind, TableCharge, TransferPath, TransferPathId, VolumeId,
+    KindId, Limits, NativeAllocations, PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported,
+    ReportedBy, Revision, Store, StoreId,
+    StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
 };
-pub use placement::{place, reserving, Contract, Placing, ReservedContract, WINDOW_BYTES};
+pub use placement::{place, Contract, WINDOW_BYTES};
 pub use reports::{
     build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
     VulkanHeap, VulkanMemory, VulkanReport,

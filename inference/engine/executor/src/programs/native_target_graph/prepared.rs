@@ -31,7 +31,6 @@ use crate::{
         native_constants::{ConstantTensors, FamilyConstants, distinct_storage_bytes},
     },
     stored_table::SelectionNotice,
-    streamed_table::StreamedTable,
 };
 use magnitude_family_contracts::{
     Decoder, ExitNorm, SublayerIndex, TapPoint, WeightKind, WeightScope,
@@ -1182,7 +1181,7 @@ impl PreparedTargetGraphs {
                 // The rows a single-row step leaves unwritten in the floor's
                 // one region hold tokens' rows.
                 token_rows: TokenRows::new(weights.table.rows(), extents[0] as usize - 1),
-                table: StreamedTable::new(weights.table.clone()),
+                table: weights.table.clone(),
             }),
             _ => return Err("resident per-layer weights disagree with the prepared graphs".into()),
         };

@@ -11,7 +11,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     ExecutionPath,
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
 };
 use seismic::{BackendName, Devices};
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ fn model() -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Backend(BackendName::Cpu),
         kernel_cache: None,
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -63,10 +63,6 @@ impl Window {
         for byte in ballast.iter_mut().step_by(4096) {
             *byte = 1;
         }
-        let catalog = Devices::discover(&[]).unwrap();
-        let reserve = MemoryReserves::of_machine(None)
-            .thresholds(catalog.topology().host_ram())
-            .planning_bytes;
         let used = std::fs::read_to_string(group.join("memory.current"))
             .unwrap()
             .trim()
@@ -74,10 +70,10 @@ impl Window {
             .unwrap();
         std::fs::write(
             group.join("memory.max"),
-            (used + reserve + room).to_string(),
+            (used + room).to_string(),
         )
         .unwrap();
-        eprintln!("startup cgroup: used={used}, reserve={reserve}, added room={room}");
+        eprintln!("startup cgroup: used={used}, added room={room}");
         Self {
             group,
             parent,
@@ -103,7 +99,7 @@ fn zero_startup_headroom_is_insufficient_memory() {
     let resolved = model();
     let _window = Window::new(0);
     let error = match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
-        Ok(_) => panic!("load crossed its planning reserve"),
+        Ok(_) => panic!("a load with no room in its cgroup loaded"),
         Err(error) => error,
     };
     eprintln!("zero headroom: {error}");
@@ -172,11 +168,7 @@ fn virtual_cpu_availability_is_enforced_before_open() {
 #[ignore = "requires a real model; reports a load under the enclosing VM or cgroup"]
 fn probe_model_load() {
     let resolved = model();
-    let catalog = Devices::discover(&[]).unwrap();
-    eprintln!(
-        "before load: {:?}",
-        catalog.inventory().host_status().unwrap()
-    );
+    eprintln!("before load: {:?}", seismic::host_sample());
     match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
         Ok(_) => eprintln!("probe: model loaded and warmed up"),
         Err(error) => panic!("probe: {error}"),

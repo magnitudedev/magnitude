@@ -213,6 +213,9 @@ pub enum RefusalReading {
     /// Host memory the driver takes for itself or pins for the device,
     /// which it reports no figure of.
     Host,
+    /// Vulkan's `maxMemoryAllocationCount` reached: Seismic holds `held`
+    /// of the device's `limit` memory objects.
+    MemoryObjects { limit: u64, held: u64 },
     /// The driver's figure could not be read at the refusal.
     Unread,
 }
@@ -225,7 +228,7 @@ impl RefusalReading {
             Self::WorkingSet { recommended, allocated } => recommended.saturating_sub(allocated),
             Self::DeviceFree { free, .. } => free,
             Self::HeapBudget { budget, usage } => budget.saturating_sub(usage),
-            Self::Host | Self::Unread => 0,
+            Self::Host | Self::MemoryObjects { .. } | Self::Unread => 0,
         }
     }
 }
@@ -256,6 +259,10 @@ impl fmt::Display for RefusalReading {
             Self::DeviceFree { free, total } => write!(f, "the device has {free} of its {total} bytes free"),
             Self::HeapBudget { budget, usage } => write!(f, "its heaps use {usage} of a {budget}-byte budget"),
             Self::Host => f.write_str("the driver's host memory was exhausted"),
+            Self::MemoryObjects { limit, held } => write!(
+                f,
+                "Seismic holds {held} of the device's {limit} memory objects"
+            ),
             Self::Unread => f.write_str("its memory could not be read"),
         }
     }
@@ -440,6 +447,16 @@ impl fmt::Display for ExecutionError {
         }
     }
 }
+/// An entry's refusal of an allocation's bytes: nothing was allocated.
+impl From<seismic_memory::entry::Refused> for ExecutionError {
+    fn from(refused: seismic_memory::entry::Refused) -> Self {
+        Self::AllocationCapacity {
+            required: refused.required.into(),
+            available: refused.available,
+        }
+    }
+}
+
 impl std::error::Error for ExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

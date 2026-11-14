@@ -9,7 +9,6 @@ use crate::{
     programs::{CompletedHeadWork, CompletedVisionWork},
 };
 use crate::operators::attention::tests::selected::{self, CompressedForm};
-use magnitude_state::ShrinkPolicy;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -40,7 +39,7 @@ fn open<F: ProgramFamily>(
         .unwrap();
     assert!(
         domain
-            .open_state(bindings, request, None)
+            .open_state(bindings, request, None, 0)
             .unwrap()
             .is_empty()
     );
@@ -133,10 +132,10 @@ fn a_domain_is_made_on_a_reading_taken_after_its_loads_allocations() {
     let (domain, _bindings) = fixture(None);
     let shown = |domain: &ExecutorDomain<TestFamily>| {
         let ledgers = domain.resources.ledgers();
-        [ledgers.device().snapshot().os_figures(), ledgers.host().snapshot().os_figures()]
+        [ledgers.device().estimate().others(), ledgers.host().estimate().others()]
     };
     let made = shown(&domain);
-    domain.memory.borrow().read_ledgers_now(domain.resources.ledgers());
+    assert!(domain.memory.borrow().read_at_event(domain.resources.ledgers()).is_some(), "no change of ours stands beside the sample");
     assert_eq!(shown(&domain), made, "a reading taken after the domain was made showed its ledgers more");
 }
 
@@ -409,7 +408,7 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     assert_eq!((state.position(), state.history_ranges(token).len()), (3, 1));
     // Once the chain ends, its group's class is freed.
     assert_eq!(domain.group_places().get(), 1, "the chain's close frees its places");
-    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
+    super::fixtures::shrink_settled(&mut domain, &mut bindings);
 }
 
 /// A prompt group's places are the plan's: where the plan holds its
@@ -559,12 +558,81 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
     assert_eq!(domain.chain_holder(), None);
     assert!(domain.resume_state(request).is_err(), "the holder was evicted");
 
-    domain.open_state(&mut bindings, request, None).unwrap();
+    domain.open_state(&mut bindings, request, None, 0).unwrap();
     let mut bindings = held(&mut domain, bindings);
     domain.close(request).unwrap();
     assert_eq!(domain.chain_holder(), None);
-    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
+    super::fixtures::shrink_settled(&mut domain, &mut bindings);
     assert!(domain.queue.is_empty());
+}
+
+/// Spare state slabs owed to the ledger wait while a held chain is under way
+/// between its chunks (releasing them orphans queued steps), then release once
+/// the chain ends.
+#[test]
+fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
+    let mut definition = super::fixtures::tiny_definition();
+    definition.decoder.context_limit = 1024;
+    let (mut domain, mut bindings) = super::fixtures::fixture_of(
+        definition,
+        super::fixtures::limits(512, 3, false),
+        None,
+        false,
+        crate::platform::DeviceRequest::Automatic,
+    );
+    super::fixtures::measure_load(&mut domain, &mut bindings);
+    let (other, request) = (RequestId(80), RequestId(81));
+    open(&mut domain, &mut bindings, other);
+    for chunk in 0..2 {
+        let step = Operation::Forward {
+            request: other,
+            kind: WorkKind::Prefill,
+            tokens: vec![crate::TokenId(1); 512],
+            position: chunk * 512,
+            conditioning: None,
+            demand: crate::batching::Demand::NONE,
+            select: Vec::new(),
+            committed: 512,
+            prime: None,
+        };
+        let flight = submit_reserved_target(&mut domain, bindings, vec![step]);
+        let (pending, next) = finish_one(&mut domain, flight);
+        bindings = next;
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 512 })
+            .unwrap();
+    }
+    domain.close(other).unwrap();
+
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
+    let _taken = super::fixtures::take_all_cache(&domain);
+    assert!(domain.state_slabs.spare_owed() > 0);
+
+    assert_eq!(
+        domain
+            .release_yielded(&mut bindings, crate::CompletionWake::new(|| {}))
+            .unwrap(),
+        super::Yielded::Nothing
+    );
+    assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
+    assert!(domain.state_slabs.spare_owed() > 0);
+
+    domain.release_chain().unwrap();
+    assert_eq!(domain.chain_holder(), None);
+    assert!(matches!(
+        domain
+            .release_yielded(&mut bindings, crate::CompletionWake::new(|| {}))
+            .unwrap(),
+        super::Yielded::Released { released, .. } if released > 0
+    ));
+    assert_eq!(domain.state_slabs.spare_owed(), 0);
 }
 
 /// A rejected chain returns every launch: the domain restores the first's
@@ -658,7 +726,7 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
         .install_input(copy, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, copy, Some(&checkpoint))
+        .open_state(&mut bindings, copy, Some(&checkpoint), 0)
         .unwrap();
     assert!(!domain.target[&copy].blocked_tails().is_empty());
     let operations = [forward(copy, 1)];
@@ -696,7 +764,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
             .install_input(copy, PreparedModelInput::continuation_only())
             .unwrap();
         domain
-            .open_state(&mut bindings, copy, Some(&checkpoint))
+            .open_state(&mut bindings, copy, Some(&checkpoint), 0)
             .unwrap();
     }
     for copy in copies {
@@ -767,29 +835,32 @@ fn pending_target_state_is_classified_as_in_flight() {
     let request = RequestId(9);
     open(&mut domain, &mut bindings, request);
     let before = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(before.unattributed, 0, "{before:?}");
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let pending = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(pending.target_state.in_flight > before.target_state.in_flight);
-    assert_eq!(pending.unattributed, 0);
     control.resolve(Ok(()));
     for outcome in domain.finish_target(flight).unwrap().0 {
         domain.abort(outcome).unwrap();
     }
 }
 
-/// What Seismic charges the domain's device on every store: the load's
-/// holding, which nothing else counts.
+/// What the domain's ledgers count it allocated in every store it
+/// reaches: the process's one count of its memory.
 fn charged<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> u64 {
-    domain.domain.device().ledgers().own.iter().map(|(_, ledger)| ledger.charged).sum()
+    let ledgers = domain.resources.ledgers();
+    let device = ledgers.device().estimate().allocated();
+    match ledgers.device().store() == ledgers.host().store() {
+        true => device,
+        false => device + ledgers.host().estimate().allocated(),
+    }
 }
 
-/// Released state backing leaves the device's charge.
+/// Released state backing leaves the ledgers' count.
 #[test]
 fn fresh_memory_observation_reads_released_state_backing() {
     let (mut domain, mut bindings) = fixture(None);
     let before = charged(&domain);
-    let released = super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
+    let released = super::fixtures::shrink_settled(&mut domain, &mut bindings);
     assert!(released > 0);
     assert!(before - charged(&domain) >= released);
 }
@@ -807,7 +878,6 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
             lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
             read: crate::assessment::Priced::Pending("unmeasured".into()),
             pass: crate::assessment::Priced::Pending("unpriced".into()),
-            moves: crate::assessment::Priced::Pending("unmeasured".into()),
             tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
                 blocks,
                 whole_seconds: 0.001,
@@ -1148,28 +1218,13 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
 
 /// A shrink reaches the family's bank: each step begins at one boundary,
 /// installs at the next and is credited exactly what Seismic stopped
-/// charging once released; a step
-/// its storage refuses breaks an invariant (a shrink needs no memory), and at
-/// the floor a step begins none. A growth step backs what it claimed, the claim then returned.
+/// charging once released, and at the floor a step begins none. A growth
+/// step backs what it claimed, the claim then returned.
 #[test]
 fn an_expert_bank_shrink_credits_what_seismic_releases() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
-        // A region pinning every row refuses a shrink beneath it.
-        let tensor = domain.family.bank.as_ref().unwrap().tensor.clone();
-        let pin = tensor.region(seismic::Element::bool(), &[4, row], 0).unwrap();
-        assert_eq!(domain.shrink_expert_bank_by(&mut bindings, 1, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
-        let refused = loop {
-            match domain.advance_expert_bank(unwatched()) {
-                Ok(None) => {}
-                Ok(Some((finished, _))) => panic!("{backend:?}: a pinned shrink finished: {finished:?}"),
-                Err(error) => break error,
-            }
-        };
-        assert!(matches!(refused, DomainError::Invariant(_)), "{backend:?}: {refused}");
-        drop((pin, tensor, domain, bindings));
-        let (mut domain, mut bindings) = banked(backend, 4, 4);
         let before = charged(&domain);
         for slots in [3, 2, 1] {
             assert_eq!(domain.shrink_expert_bank_by(&mut bindings, 1, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
@@ -1561,7 +1616,7 @@ fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
         .unwrap();
     assert_eq!(domain.input[&request].images.len(), 2);
 
-    let images = encoded_images(&domain.open_state(&mut bindings, request, None).unwrap());
+    let images = encoded_images(&domain.open_state(&mut bindings, request, None, 0).unwrap());
     let [first, second] = images.as_slice() else {
         panic!("two distinct images form two encodes, not three")
     };
@@ -1598,7 +1653,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
     domain
         .install_input(first, vision_input(&[(1, "shared")], 3))
         .unwrap();
-    let [encode] = encoded_images(&domain.open_state(&mut bindings, first, None).unwrap())
+    let [encode] = encoded_images(&domain.open_state(&mut bindings, first, None, 0).unwrap())
         .try_into()
         .unwrap_or_else(|_| panic!("one image forms one encode"));
     reconcile_encode(&mut domain, first, encode);
@@ -1638,7 +1693,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
         .unwrap();
     let [encode] = encoded_images(
         &domain
-            .open_state(&mut bindings, second, Some(&resume))
+            .open_state(&mut bindings, second, Some(&resume), 0)
             .unwrap(),
     )
     .try_into()
@@ -1980,7 +2035,7 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
         .install_input(fork, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, fork, Some(&checkpoint))
+        .open_state(&mut bindings, fork, Some(&checkpoint), 0)
         .unwrap();
     domain.release_state(&[request]).unwrap();
     assert!(domain.input[&request].boundary.is_none());
@@ -2100,7 +2155,7 @@ fn token_history_follows_rollback_and_fork() {
         .install_input(copy, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, copy, Some(&checkpoint))
+        .open_state(&mut bindings, copy, Some(&checkpoint), 0)
         .unwrap();
     assert_eq!(
         token_values(domain.preceding_tokens(copy, 4, 8).unwrap()),
@@ -2145,7 +2200,7 @@ fn a_forward_replaces_the_tokens_at_and_after_its_position() {
 fn host_rows_from_the_token_history_equal_the_device_rows() {
     use magnitude_family_contracts::{NGramHash, NGramMedia};
     use magnitude_kernels::ngram_rows;
-    use seismic::{BackendName, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+    use seismic::{BackendName, Element, NativeSpecialization, SlabRegion, Tensor};
     let raw = NGramHash {
         context: 2,
         heads_per_order: 8,
@@ -2204,18 +2259,20 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
     ];
     for (device, hash) in devices.iter().flat_map(|device| [(device, &raw), (device, &mapped)]) {
         let backend = device.backend().as_str();
-        let mut slabs = SlabTensor::new(
+        let slabs = crate::experts::pooled_slabs(
             &device,
+            seismic::Contract::DeviceOnly,
             slab_banks,
             banks,
-            vec![SlabRegion {
+            &[SlabRegion {
                 element: Element::u32(),
                 row_shape: vec![context + tape, 1],
             }],
+            1,
         )
         .unwrap();
         for slab in 0..banks.div_ceil(slab_banks) {
-            assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), slab as usize);
             slabs
                 .region_rows(0, slab * slab_banks, slab_banks)
                 .unwrap()
@@ -2315,15 +2372,21 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     std::fs::write(&path, vec![0x11u8; (ROWS * ROW_BYTES) as usize]).unwrap();
     let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
         .unwrap();
+    // The host store's pool, a granule the table's one record of 64 slots.
+    let resident = seismic::Element::named("iq4g32s@rows16").unwrap();
+    let slab = seismic::SlabLayout::for_regions(64, 64, &[seismic::SlabRegion { element: resident, row_shape: vec![160] }]).unwrap();
+    let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
+    let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
+    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap();
     let table = Arc::new(
         StoredTable::new(
             &device,
             &magnitude_family_contracts::WeightDescriptor::stored("ngram", [ROWS, 160]),
             seismic::Element::named("gguf_iq4_nl").unwrap(),
-            seismic::Element::named("iq4g32s@rows16").unwrap(),
+            resident,
             ROWS,
             160,
-            crate::stored_table::StoredSlots::Whole { records: 1, record_rows: 64 },
+            crate::stored_table::StoredSlots::Whole { pool, records: 1, record_rows: 64 },
             crate::planning::DirectoryForm::Hashed,
             vec![crate::stored_table::RowRange {
                 source: seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),

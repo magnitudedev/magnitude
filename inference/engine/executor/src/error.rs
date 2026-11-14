@@ -82,19 +82,12 @@ pub enum UnstreamedExperts {
     /// forms, or the shared-route decode form a fused bank-served decode
     /// takes.
     Backend(seismic::BackendName),
-    /// The device reserves no address ranges, so a bank cannot resize.
-    Unreserved(seismic::BackendName),
-    /// The device reserves no address ranges where its backend reserves
-    /// on other devices, or discovery could not read how, for `reason`
-    /// (`seismic::Limits::reserving`: a Vulkan device with one queue in its
-    /// compute family, a granule that could not be read).
-    Unreservable { backend: seismic::BackendName, reason: String },
     /// The device holds no host tier, which every miss lands in
     /// (`platform::host_tier`), for `reason`.
     Untiered { backend: seismic::BackendName, reason: String },
-    /// The device's single allocation holds `most` slots of a record
-    /// tensor, fewer than the bank's `floor`.
-    Allocation { floor: u64, most: u64 },
+    /// The bank's largest lent allocation (`ExpertBankPlan::largest_lent`)
+    /// of `lent` bytes exceeds the device's single allocation of `most`.
+    Allocation { lent: u64, most: u64 },
     /// The model routes no experts.
     Unrouted,
     /// A routed layer whose record form (gated or up-only) or selected
@@ -120,24 +113,14 @@ impl fmt::Display for UnstreamedExperts {
             Self::Backend(backend) => {
                 write!(formatter, "{} has no expert-streaming entries", backend.as_str())
             }
-            Self::Unreserved(backend) => write!(
-                formatter,
-                "this {} device reserves no address ranges for an expert bank",
-                backend.as_str()
-            ),
-            Self::Unreservable { backend, reason } => write!(
-                formatter,
-                "this {} device reserves no address ranges for an expert bank: {reason}",
-                backend.as_str()
-            ),
             Self::Untiered { backend, reason } => write!(
                 formatter,
                 "this {} device holds no host tier for an expert bank's misses to land in: {reason}",
                 backend.as_str()
             ),
-            Self::Allocation { floor, most } => write!(
+            Self::Allocation { lent, most } => write!(
                 formatter,
-                "one allocation holds {most} slots of a record tensor, below the floor of {floor}"
+                "the expert bank's lent records take one allocation of {lent} bytes, past the device's {most}"
             ),
             Self::Unrouted => formatter.write_str("the model routes no experts"),
             Self::Shape(index) => write!(

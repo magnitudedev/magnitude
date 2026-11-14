@@ -35,22 +35,20 @@ use super::Shared;
 use super::core::Core;
 use crate::experts::directory::{MissCurve, Point};
 
-/// One routed tensor of a bank group as a promotion copies it: its host
-/// tier tensor (every record it reserves, which the copy engine reads, so
-/// no host view of it) and its bank record tensor, and where the records of
-/// each lie, whose record a promotion copies whole.
-pub(in crate::experts) struct CopyTensor {
-    pub tier: seismic::Tensor,
-    pub tier_at: seismic::RecordPlacement,
-    pub bank: seismic::Tensor,
-    pub bank_at: seismic::RecordPlacement,
-}
-
 /// What promotions copy with: the device's copy engine, and each group's
-/// routed tensors in its record's order.
+/// bank records (`BankRecordViews`), which a promotion copies its tier
+/// record into, routed tensor by routed tensor, each record whole: from the
+/// group's host tier records (`Group::tier`), which the copy engine reads.
 pub(in crate::experts) struct Copier {
     pub copies: crate::experts::copies::Copies,
-    pub groups: Vec<Vec<CopyTensor>>,
+    pub bank: std::sync::Arc<dyn BankRecordViews>,
+}
+
+/// The bank's records as a promotion's copy writes them: record `record` of
+/// group `group`'s routed tensor `tensor` (in its record's order), a view of
+/// its storage while the bank holds it.
+pub(in crate::experts) trait BankRecordViews: Send + Sync {
+    fn view(&self, group: usize, tensor: usize, record: usize) -> seismic::Tensor;
 }
 
 /// What a reserve is sized within ([`reserve`]): each layer's group and
@@ -269,19 +267,20 @@ pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier, progress:
     }
     // Every queued promotion's copy, one batch, queued only while no batch
     // runs (`Copies`).
-    let directory = &mut core.directory;
+    let (directory, groups) = (&mut core.directory, &core.groups);
     let posted = copier.copies.background(|| {
         let mut runs = Vec::new();
         let tiers = queued
             .iter()
             .map(|&(group, record, (layer, expert))| {
                 let tier = directory.hold_tier(layer, expert).expect("a queued promotion's tier record is kept");
-                runs.extend(copier.groups[group].iter().map(|tensor| crate::experts::copies::Run {
-                    source: tensor.tier.clone(),
-                    source_offset: tensor.tier_at.offset(u64::from(tier.0)),
-                    destination: tensor.bank.clone(),
-                    destination_offset: tensor.bank_at.offset(u64::from(record.0)),
-                    bytes: tensor.tier_at.record(),
+                let tensors = groups[group].tier.as_ref().expect("a promotion copies from its group's host tier");
+                runs.extend(tensors.iter().enumerate().map(|(index, tensor)| crate::experts::copies::Run {
+                    source: tensor.records.tensor(u64::from(tier.0)).clone(),
+                    source_offset: 0,
+                    destination: copier.bank.view(group, index, record.index()),
+                    destination_offset: 0,
+                    bytes: tensor.records.bytes(),
                 }));
                 tier
             })

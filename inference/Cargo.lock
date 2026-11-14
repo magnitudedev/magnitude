@@ -2774,6 +2774,7 @@ version = "0.1.0"
 dependencies = [
  "magnitude-family-contracts",
  "seismic",
+ "tracing",
 ]
 
 [[package]]
@@ -4197,7 +4198,9 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
+ "seismic-memory",
  "seismic-native-target",
+ "seismic-topology",
  "serde",
  "sha2 0.11.0",
 ]
@@ -4226,8 +4229,8 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
+ "seismic-memory",
  "seismic-native-target",
- "seismic-reservation",
  "seismic-topology",
  "sha2 0.11.0",
 ]
@@ -4240,15 +4243,14 @@ version = "0.1.0"
 name = "seismic-cuda"
 version = "0.1.0"
 dependencies = [
- "libc",
  "libloading",
  "magnitude-source-identity",
  "seismic-compiler",
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
+ "seismic-memory",
  "seismic-native-target",
- "seismic-reservation",
  "seismic-topology",
  "sha2 0.11.0",
 ]
@@ -4261,6 +4263,7 @@ dependencies = [
  "seismic-cpu",
  "seismic-cuda",
  "seismic-lang",
+ "seismic-memory",
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-native-target",
@@ -4331,6 +4334,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seismic-topology",
+]
+
+[[package]]
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
@@ -4345,8 +4356,8 @@ dependencies = [
  "seismic-estimator-metal",
  "seismic-ir",
  "seismic-lang",
+ "seismic-memory",
  "seismic-native-target",
- "seismic-reservation",
  "seismic-topology",
  "serde",
  "serde_json",
@@ -4392,13 +4403,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "seismic-reservation"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
@@ -4413,10 +4417,10 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-measure",
+ "seismic-memory",
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-native-target",
- "seismic-reservation",
  "seismic-std",
  "seismic-topology",
  "seismic-vulkan",
@@ -4452,8 +4456,8 @@ dependencies = [
  "magnitude-source-identity",
  "seismic-compiler",
  "seismic-lang",
+ "seismic-memory",
  "seismic-native-target",
- "seismic-reservation",
  "seismic-topology",
  "spirv-tools",
 ]

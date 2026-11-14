@@ -249,7 +249,7 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, required: b
     // Experts that stream on the backend are planned in its bank too, at its
     // floor: what the most constrained streamed load holds. Experts that do
     // not stream are refused with their reason.
-    let banked = match bank_reservations(&definition, backend) {
+    let banked = match recorded_substrate(&definition, backend) {
         Ok(substrate) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
             load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
         })),
@@ -300,7 +300,7 @@ fn sort(line: String, required: bool, failures: &mut Vec<String>, refused: &mut 
 /// every model alike, rather than of the model.
 pub(super) fn refused_by_the_device(reason: &UnstreamedExperts) -> bool {
     use UnstreamedExperts::*;
-    matches!(reason, Backend(_) | Unreserved(_) | Unreservable { .. } | Untiered { .. })
+    matches!(reason, Backend(_) | Untiered { .. })
 }
 
 /// The components a plain load of a target selects: neither an embedded
@@ -347,20 +347,14 @@ pub(super) fn plain_load(
     ModelLoadPlan::derive(manifest, definition, SELECTION, layout, PlannedMethod::Plain, LIMITS)
 }
 
-/// Where the experts of `definition` stream on `backend`: the device's and
-/// the host tier's reservations of the recorded machine of the backend.
-/// Experts that do not stream are refused with their reason.
-pub(super) fn bank_reservations(
+/// Where the experts of `definition` stream on `backend`: the substrate of
+/// the recorded machine of the backend. Experts that do not stream are
+/// refused with their reason.
+pub(super) fn recorded_substrate(
     definition: &magnitude_family_contracts::ModelDefinition,
     backend: BackendName,
 ) -> Result<crate::planning::BankSubstrate, PlanError> {
-    let recorded = recorded_reservation(backend).map_err(|why| why.to_string());
-    let substrate = crate::planning::bank_substrate(
-        backend,
-        recorded.as_ref().map(|recorded| recorded.map(|(reservation, _)| reservation)).map_err(String::as_str),
-        Ok(recorded.as_ref().ok().copied().flatten().and_then(|(_, host)| host)),
-        definition,
-    )?;
+    let substrate = crate::planning::bank_substrate(backend, recorded_allocations(backend), recorded_host_tier(backend), definition)?;
     crate::planning::routed_experts(definition)?;
     Ok(substrate)
 }
@@ -410,13 +404,13 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         }
         let manifest = target_manifest(&component.path, &target, identity);
         for backend in BackendName::ALL {
-            let substrate = match bank_reservations(&definition, backend) {
+            let load = plain_load(&manifest, &definition, backend)
+                .unwrap_or_else(|error| panic!("{name}: its plain load plans on {}: {error}", backend.as_str()));
+            let substrate = match recorded_substrate(&definition, backend) {
                 Ok(substrate) => substrate,
                 Err(PlanError::Unstreamed(reason)) if refused_by_the_device(&reason) => continue,
                 Err(error) => panic!("{name}: its bank's substrate on {}: {error}", backend.as_str()),
             };
-            let load = plain_load(&manifest, &definition, backend)
-                .unwrap_or_else(|error| panic!("{name}: its plain load plans on {}: {error}", backend.as_str()));
             let banked = load
                 .bank_floor(&definition, 1, LIMITS.flights(), substrate)
                 .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate))
@@ -479,23 +473,27 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
     }
 }
 
-/// The address reservation a recorded machine's executor of `backend`
-/// makes for an expert bank (`seismic::fixtures::recorded`): the first that
-/// reserves; none where none reserves, and why where one would but cannot.
-fn recorded_reservation(
-    backend: BackendName,
-) -> Result<Option<(seismic::Reservation, Option<crate::planning::HostTier>)>, seismic::Unreservable> {
+/// How a recorded machine's executor of `backend` holds an expert bank's
+/// host tier (`seismic::fixtures::recorded`, `platform::host_tier`): the
+/// first executor's; none where no recorded machine has the backend.
+/// How the recorded machine of `backend` makes its native allocations; a
+/// backend no recorded machine has rounds nothing.
+fn recorded_allocations(backend: BackendName) -> seismic::NativeAllocations {
+    use seismic::fixtures::recorded;
+    [recorded::m4_pro(), recorded::rtx3090()]
+        .iter()
+        .find_map(|topology| topology.executors().iter().find(|executor| executor.backend() == backend).map(|executor| executor.limits().allocations()))
+        .unwrap_or(seismic::NativeAllocations::EXACT)
+}
+
+fn recorded_host_tier(backend: BackendName) -> Option<crate::planning::HostTier> {
     use seismic::fixtures::recorded;
     for topology in [recorded::m4_pro(), recorded::rtx3090()] {
-        for executor in topology.executors().iter().filter(|executor| executor.backend() == backend) {
-            let contract = crate::planning::BankTier::Bank.contract(&topology, executor);
-            if let Some(reservation) = executor.reserving(contract).map_err(Clone::clone)? {
-                let host = crate::platform::host_tier(&topology, executor).expect("a recorded machine reads how it reserves host storage");
-                return Ok(Some((reservation, host)));
-            }
+        if let Some(executor) = topology.executors().iter().find(|executor| executor.backend() == backend) {
+            return crate::platform::host_tier(&topology, executor);
         }
     }
-    Ok(None)
+    None
 }
 
 /// The assessment terms `load` of `definition` derives on `backend`: its
@@ -555,6 +553,7 @@ fn derive_terms(
         ResourceCapacity {
             domain_bytes: 64 << 30,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .and_then(|state| {
@@ -850,6 +849,7 @@ fn plan_and_charge_separate_draft(
                 ResourceCapacity {
                     domain_bytes: 64 << 30,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
@@ -1179,7 +1179,7 @@ fn state_at_limits(
         method,
         KvCodec::AffineK8V4,
         LIMITS,
-        ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent },
+        ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
     )
 }
 

@@ -7,15 +7,66 @@ use magnitude_family_contracts::{
     IndexerKeys, NGramInput, Operator, Pool, PooledRows, ProjectedRows, ResidualForm,
     RowProducer, RowRounding, Selection, ShortConv, StateSpace, TokenDomain, ValueSource,
 };
-use seismic::DType;
+use seismic::{DType, Element, SlabLayout, SlabRegion, Tensor};
 
-pub const SLAB_BYTE_TARGET: u64 = 64 * 1024 * 1024;
 pub const SLAB_ROW_TILE: usize = 256;
 /// The most spans any history of a domain can present to one launch, so the
 /// largest span class a store seals is 64.
 pub const MAX_HISTORY_SPANS: usize = 63;
 
-/// How one stored history domain places rows (see [`history_geometry`]).
+/// How a stored history domain pages its rows, whatever its slabs (see
+/// [`history_pages`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryPages {
+    /// Rows of one page: the unit a history takes beyond its own tail page.
+    pub page_rows: usize,
+    /// The most spans a history of the domain presents to a launch.
+    pub span_limit: usize,
+}
+
+impl HistoryPages {
+    /// The rows a domain reserves for `rows` requested: whole pages, so every
+    /// page is complete and a history's page demand is exactly what its
+    /// claims take.
+    pub fn reserved_rows(&self, rows: usize) -> Option<usize> {
+        rows.checked_next_multiple_of(self.page_rows)
+    }
+
+    /// The bytes of one page of rows of `row_bytes`: the smallest slab the
+    /// domain's store takes. A page's rows are whole [`SLAB_ROW_TILE`]s of
+    /// whole-byte elements, so each plane of a slab of whole pages ends at
+    /// a multiple of every plane's alignment and a slab is exactly its rows'
+    /// bytes.
+    pub fn page_bytes(&self, row_bytes: u64) -> Option<u64> {
+        row_bytes.checked_mul(self.page_rows as u64)
+    }
+
+    /// The domain's slabs in a store of `granule`-byte granules, its rows
+    /// `row_bytes` each: as many whole pages as fit one granule. Refused
+    /// where a page exceeds the granule, which the store's granule rule
+    /// never gives.
+    pub fn in_granule(self, row_bytes: u64, granule: u64) -> Result<HistoryGeometry, String> {
+        if row_bytes == 0 {
+            return Err("history row must have storage".into());
+        }
+        let page_bytes = self.page_bytes(row_bytes).ok_or("history page bytes overflow")?;
+        let slab_pages = usize::try_from(granule / page_bytes)
+            .map_err(|_| "history slab row count exceeds host domain")?;
+        if slab_pages == 0 {
+            return Err(format!("a history page of {page_bytes} bytes exceeds the store's {granule}-byte granule"));
+        }
+        Ok(HistoryGeometry {
+            page_rows: self.page_rows,
+            slab_rows: slab_pages
+                .checked_mul(self.page_rows)
+                .ok_or("history slab row count exceeds host domain")?,
+            span_limit: self.span_limit,
+        })
+    }
+}
+
+/// How one stored history domain places rows in its store's granules (see
+/// [`history_geometry`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryGeometry {
     /// Rows of one page: the unit a history takes beyond its own tail page.
@@ -26,35 +77,18 @@ pub struct HistoryGeometry {
     pub span_limit: usize,
 }
 
-impl HistoryGeometry {
-    /// The rows a domain reserves for `rows` requested: whole pages, so every
-    /// page is complete and a history's page demand is exactly what its
-    /// claims take.
-    pub fn reserved_rows(&self, rows: usize) -> Option<usize> {
-        rows.checked_next_multiple_of(self.page_rows)
-    }
-}
-
-/// The placement geometry of a stored history domain whose histories hold at
-/// most `row_limit` rows. `appended_rows` is the most rows one advance
-/// appends that Shared readers of the domain see as history (0 without
-/// readers).
+/// The pages of a stored history domain whose histories hold at most
+/// `row_limit` rows. `appended_rows` is the most rows one advance appends
+/// that Shared readers of the domain see as history (0 without readers).
 ///
 /// A history takes rows only in place after its end within its last page, or
 /// as whole free pages, so every page it references is complete except its
 /// first and last. It therefore presents at most `ceil(row_limit / page) + 1`
-/// spans, plus `ceil(appended_rows / page) + 1` for rows a Shared or causal compressed target reader sees
-/// appended within an advance. Pages are the smallest multiple of
-/// [`SLAB_ROW_TILE`] keeping that at most [`MAX_HISTORY_SPANS`]; a slab holds
-/// as many whole pages as fit [`SLAB_BYTE_TARGET`], and at least one.
-pub fn history_geometry(
-    row_bytes: u64,
-    row_limit: usize,
-    appended_rows: usize,
-) -> Result<HistoryGeometry, String> {
-    if row_bytes == 0 {
-        return Err("history row must have storage".into());
-    }
+/// spans, plus `ceil(appended_rows / page) + 1` for rows a Shared or causal
+/// compressed target reader sees appended within an advance. Pages are the
+/// smallest multiple of [`SLAB_ROW_TILE`] keeping that at most
+/// [`MAX_HISTORY_SPANS`].
+pub fn history_pages(row_limit: usize, appended_rows: usize) -> HistoryPages {
     let span_limit = |page_rows: usize| {
         let appended = if appended_rows == 0 {
             0
@@ -70,22 +104,25 @@ pub fn history_geometry(
         tiles += 1;
     }
     let page_rows = tiles * SLAB_ROW_TILE;
-    let slab_pages = usize::try_from(SLAB_BYTE_TARGET / row_bytes / page_rows as u64)
-        .map_err(|_| "history slab row count exceeds host domain")?
-        .max(1);
-    Ok(HistoryGeometry {
-        page_rows,
-        slab_rows: slab_pages
-            .checked_mul(page_rows)
-            .ok_or("history slab row count exceeds host domain")?,
-        span_limit: span_limit(page_rows),
-    })
+    HistoryPages { page_rows, span_limit: span_limit(page_rows) }
+}
+
+/// The placement geometry of a stored history domain of `row_bytes` rows in
+/// a store of `granule`-byte granules: its pages ([`history_pages`]), a slab
+/// of as many whole pages as fit the granule ([`HistoryPages::in_granule`]).
+pub fn history_geometry(
+    row_bytes: u64,
+    row_limit: usize,
+    appended_rows: usize,
+    granule: u64,
+) -> Result<HistoryGeometry, String> {
+    history_pages(row_limit, appended_rows).in_granule(row_bytes, granule)
 }
 
 /// The free-page rows a history takes to append `count` rows when its last
 /// page holds `in_place` more in place: whatever the last page cannot hold,
 /// rounded up to whole pages of `page_rows`. The one rule of a history's
-/// page demand (`StateStore::page_demand`, [`crate::batch_state_bytes`]).
+/// page demand (`StateStore::page_demand`, [`crate::state_bytes`]).
 pub(crate) fn page_demand_rows(page_rows: usize, in_place: usize, count: usize) -> usize {
     count.saturating_sub(in_place).div_ceil(page_rows) * page_rows
 }
@@ -100,14 +137,71 @@ pub fn window_pages(page_rows: usize, row_limit: usize) -> usize {
     row_limit.div_ceil(page_rows) + 1
 }
 
-/// Banks in one recurrent slab. A bank larger than the byte target still
-/// occupies one slab by itself.
-pub fn banks_per_slab(bank_bytes: u64) -> Result<usize, String> {
-    if bank_bytes == 0 {
-        return Err("recurrent bank must have storage".into());
+/// The slab regions of a recurrent bank of `specs`: one per component, a
+/// bank a row of each. The layout a store's recurrent slabs take.
+pub fn bank_regions(specs: &[ComponentSpec]) -> Vec<SlabRegion> {
+    specs
+        .iter()
+        .map(|spec| SlabRegion {
+            element: Element::dense(spec.dtype),
+            row_shape: spec.shape.iter().map(|&size| size as u64).collect(),
+        })
+        .collect()
+}
+
+/// The bytes of a slab of `banks` banks of `regions` ([`bank_regions`]).
+pub fn bank_slab_bytes(regions: &[SlabRegion], banks: u64) -> Result<u64, String> {
+    SlabLayout::for_regions(banks, banks, regions)
+        .map(|layout| layout.slab_bytes)
+        .map_err(|error| format!("a recurrent slab: {error}"))
+}
+
+/// Banks of `regions` in one recurrent slab of a store of `granule`-byte
+/// granules: as many as fit one granule. Refused where one bank's slab
+/// exceeds the granule, which the store's granule rule never gives.
+pub fn banks_per_slab(regions: &[SlabRegion], granule: u64) -> Result<usize, String> {
+    let one = bank_slab_bytes(regions, 1)?;
+    if one > granule {
+        return Err(format!("a recurrent bank's {one}-byte slab exceeds the store's {granule}-byte granule"));
     }
-    usize::try_from((SLAB_BYTE_TARGET / bank_bytes).max(1))
-        .map_err(|_| "recurrent slab bank count exceeds host domain".into())
+    // A slab of `n` banks holds `n` banks' bytes and at most each plane's
+    // alignment padding, so the most that fit is at most this, and within a
+    // plane's padding of it.
+    let bank_bytes = regions.iter().try_fold(0u64, |total, region| {
+        let extents = std::iter::once(1).chain(region.row_shape.iter().copied()).collect::<Vec<_>>();
+        Tensor::canonical_layout(region.element, &extents)
+            .map_err(|error| format!("a recurrent slab: {error}"))
+            .and_then(|(bytes, _)| total.checked_add(bytes).ok_or_else(|| "recurrent bank bytes overflow".to_owned()))
+    })?;
+    let mut banks = granule / bank_bytes.max(1);
+    while banks > 1 && bank_slab_bytes(regions, banks)? > granule {
+        banks -= 1;
+    }
+    usize::try_from(banks).map_err(|_| "recurrent slab bank count exceeds host domain".into())
+}
+
+/// The smallest slab each of a store's slab stores takes, which its granule
+/// holds at least: one page of each stored history domain of `domains` at
+/// `context` and advances of at most `max_advance` rows, and one bank of
+/// `recurrent`'s components. None for a store of neither.
+pub fn smallest_slabs(
+    domains: &[HistoryDomainLayout],
+    recurrent: &[ComponentSpec],
+    context: usize,
+    max_advance: usize,
+) -> Result<Vec<SlabLayout>, crate::Error> {
+    let mut slabs = domains
+        .iter()
+        .filter(|domain| !domain.components().is_empty())
+        .map(|domain| {
+            let rows = domain.pages(domains, context, max_advance)?.page_rows as u64;
+            Ok(SlabLayout::for_regions(rows, rows, &crate::slab_regions(domain.components()))?)
+        })
+        .collect::<Result<Vec<_>, crate::Error>>()?;
+    if !recurrent.is_empty() {
+        slabs.push(SlabLayout::for_regions(1, 1, &bank_regions(recurrent))?);
+    }
+    Ok(slabs)
 }
 
 /// Device-free state allocation plan derived from the family-neutral model
@@ -770,6 +864,7 @@ fn layer(index: usize) -> Result<u32, String> {
 mod tests {
     use super::*;
     use crate::ComponentRole;
+    use crate::TEST_GRANULE;
     use magnitude_family_contracts::{
         AttentionGate, BlockElement, BlockRounding, BlockScale, EmbeddingScale, EntryForm,
         ExitForm, ExitNorm, GateFunction, GateProjection, RecurrentDecay, RecurrentGate, HeadNorm, HeadWeights, IndexerInput, IndexerQuery,
@@ -782,23 +877,27 @@ mod tests {
     fn history_geometry_is_the_smallest_page_within_the_span_limit() {
         // Qwen3.8-27B (16 K8/V4 layers x 4 heads) at 65,792 rows: the
         // incident geometry.
-        let qwen38 = history_geometry(28_672, 65_792, 0).unwrap();
+        let qwen38 = history_geometry(28_672, 65_792, 0, TEST_GRANULE).unwrap();
         assert_eq!(qwen38.page_rows, 1_280);
         assert_eq!(qwen38.span_limit, 53);
         assert_eq!(qwen38.slab_rows % qwen38.page_rows, 0);
-        assert!(qwen38.slab_rows as u64 * 28_672 <= SLAB_BYTE_TARGET);
+        assert!(qwen38.slab_rows as u64 * 28_672 <= TEST_GRANULE);
         // Qwen3.6-35B (10 layers x 2 heads).
-        let qwen36 = history_geometry(8_960, 65_792, 0).unwrap();
+        let qwen36 = history_geometry(8_960, 65_792, 0, TEST_GRANULE).unwrap();
         assert_eq!((qwen36.page_rows, qwen36.slab_rows), (1_280, 6_400));
-        // A short window keeps one-tile pages; a row above the byte target
-        // still gets a slab of one page.
-        let window = history_geometry(SLAB_BYTE_TARGET, 1_024 + 512, 0).unwrap();
+        // A slab holds as many whole pages as fit its granule: a granule of
+        // one page holds one, and a granule below a page is refused.
+        let page = history_pages(1_024 + 512, 0).page_bytes(TEST_GRANULE).unwrap();
+        let window = history_geometry(TEST_GRANULE, 1_024 + 512, 0, page).unwrap();
         assert_eq!((window.page_rows, window.slab_rows), (256, 256));
+        assert!(history_geometry(TEST_GRANULE, 1_024 + 512, 0, page - 256).is_err());
+        let larger = history_geometry(8_960, 65_792, 0, 2 * TEST_GRANULE).unwrap();
+        assert_eq!((larger.page_rows, larger.slab_rows), (1_280, 11 * 1_280));
         // Shared readers see an advance's appended rows too.
-        let shared = history_geometry(18_432, 262_144, 1_024).unwrap();
+        let shared = history_pages(262_144, 1_024);
         assert!(shared.span_limit <= MAX_HISTORY_SPANS);
         for (row_limit, appended) in [(1, 0), (65_792, 0), (262_144, 512), (1 << 20, 1_024)] {
-            let geometry = history_geometry(4_096, row_limit, appended).unwrap();
+            let geometry = history_pages(row_limit, appended);
             assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
             if geometry.page_rows > SLAB_ROW_TILE {
                 let smaller = history_geometry_span_limit(
@@ -809,7 +908,29 @@ mod tests {
                 assert!(smaller > MAX_HISTORY_SPANS, "{row_limit} {appended}");
             }
         }
-        assert_eq!(banks_per_slab(52 * 1024 * 1024).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_recurrent_slab_holds_the_most_banks_its_granule_fits() {
+        let regions = |shape: &[usize]| {
+            bank_regions(&[ComponentSpec { shape: shape.to_vec(), dtype: DType::F32 }])
+        };
+        // A 52 MiB bank: one a slab of a 64 MiB granule, refused by a
+        // smaller one.
+        let large = regions(&[13 * 1024 * 1024]);
+        assert_eq!(banks_per_slab(&large, TEST_GRANULE).unwrap(), 1);
+        assert!(banks_per_slab(&large, 52 * 1024 * 1024 - 256).is_err());
+        // Banks of planes whose rows are no multiple of the alignment: a
+        // slab of them pads each plane, and still fits its granule.
+        let padded = bank_regions(&[
+            ComponentSpec { shape: vec![3], dtype: DType::F32 },
+            ComponentSpec { shape: vec![5], dtype: DType::F32 },
+        ]);
+        for granule in [512, 4_096, 65_536] {
+            let banks = banks_per_slab(&padded, granule).unwrap() as u64;
+            assert!(bank_slab_bytes(&padded, banks).unwrap() <= granule);
+            assert!(bank_slab_bytes(&padded, banks + 1).unwrap() > granule);
+        }
     }
 
     fn history_geometry_span_limit(page_rows: usize, row_limit: usize, appended: usize) -> usize {
@@ -1573,7 +1694,7 @@ mod tests {
     /// run that stopped there would.
     #[test]
     fn a_rejected_draft_leaves_the_heads_pooled_rows_as_its_entry_rows_alone_do() {
-        use crate::{BankCapacity, HistoryDomainPlan, OwnedAdvanceResolution, OwnedStateAdvance, StateStore};
+        use crate::{BankCapacity, HistoryDomainPlan, OwnedAdvanceResolution, OwnedStateAdvance};
         let decoder = decoder(ActivationDType::BF16, vec![block(attention())]);
         let head = [block(gated_selected_attention())];
         let layout = ModelStateLayout::derive(&decoder, &head.iter().collect::<Vec<_>>(), KvCodec::AffineK8V4, 0).unwrap();
@@ -1583,10 +1704,9 @@ mod tests {
             .iter()
             .map(|layout| HistoryDomainPlan { logical_rows: layout.kind().row_limit(context, max_advance).unwrap(), layout: layout.clone() })
             .collect::<Vec<_>>();
-        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-        let device = std::rc::Rc::new(catalog.open_backend(seismic::BackendName::Cpu).expect("the CPU backend opens"));
+        let own = crate::OwnDevice::cpu();
         let banks = BankCapacity { active: 4, in_flight: 4, retained: 4 };
-        let build = || StateStore::new(device.clone(), context, max_advance, plans.clone(), vec![], banks.clone()).unwrap().1;
+        let build = || own.store(context, max_advance, plans.clone(), vec![], banks.clone()).unwrap().1;
         let store = build();
         let (pending, units) = store.produced_domains(LayerRef::HeadIndexKeys { block: 0, part: 0 }).map(|(pending, units)| (pending.unwrap(), units)).unwrap();
         let rows = |ranges: Vec<(usize, usize)>| ranges.into_iter().flat_map(|(start, count)| start..start + count).collect::<Vec<_>>();

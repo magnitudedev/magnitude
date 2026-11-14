@@ -1,15 +1,16 @@
 //! One opened Vulkan device (§8.1–§8.5): the logical device with exactly
 //! the floor's features plus the gated ones it has, one queue (compute-only
 //! when the device has such a family) and, where the family has one, a
-//! second that only zeroes reservations' chunks, a timeline semaphore that
+//! second that runs transfers and zeroes pool blocks, a timeline semaphore that
 //! numbers every submission, the block allocator, and host access to
 //! storage.
 
 use crate::facts::{self, Description, Facts, FormationTarget, Probed, Properties};
 use crate::instance::{Instance, LoaderError};
-use crate::memory::{Buffer, Memory, Pool, Range};
+use crate::memory::{Buffer, DevicePools, Memory, MemoryStores, Pool, Range};
 use ash::vk;
 use seismic_compiler::errors::ExecutionError;
+use seismic_memory::entry::{Charge, Entry};
 use seismic_native_target::GateOpening;
 use std::ffi::CStr;
 use std::fmt;
@@ -67,6 +68,17 @@ struct Staging {
     range: Range,
 }
 
+/// One step of unmapped device storage staged on the first queue
+/// (`Device::transfer`).
+enum Staged {
+    /// A copy from the staging range into the storage.
+    Upload(vk::BufferCopy),
+    /// A copy from the storage into the staging range.
+    Download(vk::BufferCopy),
+    /// Zero over the whole storage, whose bytes are whole words.
+    Zero,
+}
+
 /// Bytes of the staging range; larger transfers go in pieces.
 const STAGING_BYTES: u64 = 16 << 20;
 
@@ -87,13 +99,12 @@ pub(crate) enum RetiredCommand {
 }
 
 /// Submission-side state recorded under one lock: command buffers, query
-/// pools and argument chunks of finished submissions awaiting reuse.
+/// pools and retired submissions awaiting completion.
 pub(crate) struct Recording {
     pub(crate) pool: vk::CommandPool,
     free_commands: Vec<vk::CommandBuffer>,
     free_queries: Vec<(vk::QueryPool, u32)>,
-    free_chunks: Vec<Range>,
-    retired: Vec<Retired>,
+    retired: Vec<(Retired, Weak<Opened>)>,
 }
 
 impl Recording {
@@ -348,20 +359,13 @@ pub(crate) struct Inner {
     /// refused: a wait on one held waits on it before the driver does
     /// (`Device::ended`).
     handover: Condvar,
-    /// The family's second queue, where it has one: reservations' chunks
-    /// are zeroed on it (`Inner::zero`) beside work the first runs.
+    /// The family's second queue, where it has one: pool blocks are zeroed
+    /// on it (`Inner::zero`) beside work the first runs.
     side: Option<Mutex<Side>>,
-    /// `VK_EXT_external_memory_host`'s functions, where the device imports
-    /// host memory (`Facts::host_import_alignment`).
-    host_import: Option<ash::ext::external_memory_host::Device>,
-    /// `VK_KHR_map_memory2`'s functions, where the device maps memory at a
-    /// placed host address (`Facts::placed_map_alignment`).
-    placed_maps: Option<ash::khr::map_memory2::Device>,
     /// `VK_KHR_pipeline_executable_properties`' functions, where formed
     /// pipelines report their statistics (`Facts::pipeline_statistics`).
     pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
     recording: Mutex<Recording>,
-    staging: Mutex<Option<Staging>>,
     /// Device memory recorded graphs took (their command memory), measured
     /// while each is recorded: what each recording's own measure leaves to
     /// the others recorded beside it (`DirectGraphBuilder`). The driver's
@@ -374,12 +378,74 @@ pub(crate) struct Inner {
     destroyed: Ends,
 }
 
+/// Per-open state of a [`Device`]: its stores, pools, transfer staging,
+/// reusable argument chunks, and reconciled driver-memory charge. Dropping the
+/// last clone of an open releases its staging, argument chunks, and driver
+/// charge from its [`MemoryStores`] without disturbing other opens sharing the
+/// logical device.
+pub(crate) struct Opened {
+    inner: Arc<Inner>,
+    pub(crate) stores: MemoryStores,
+    pools: DevicePools,
+    staging: Mutex<Option<Staging>>,
+    free_chunks: Mutex<Vec<Range>>,
+    driver_charge: Mutex<Option<Charge>>,
+}
+
+impl Opened {
+    fn new(inner: Arc<Inner>, stores: MemoryStores) -> Result<Arc<Self>, OpenError> {
+        let pools = DevicePools::new(&inner.memory).map_err(OpenError::Creation)?;
+        Ok(Arc::new(Self {
+            inner,
+            stores,
+            pools,
+            staging: Mutex::new(None),
+            free_chunks: Mutex::new(Vec::new()),
+            driver_charge: Mutex::new(None),
+        }))
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.inner.retire_completed_best_effort();
+        if let Some(staging) = self
+            .staging
+            .get_mut()
+            .expect("staging lock is never poisoned")
+            .take()
+        {
+            unsafe { self.inner.device.destroy_command_pool(staging.pool, None) };
+            self.inner.memory.release(&self.inner.device, &staging.range);
+        }
+        for chunk in self
+            .free_chunks
+            .get_mut()
+            .expect("free chunks lock is never poisoned")
+            .drain(..)
+        {
+            self.inner.memory.release(&self.inner.device, &chunk);
+        }
+        if let Some(mut charge) = self
+            .driver_charge
+            .get_mut()
+            .expect("driver charge lock poisoned")
+            .take()
+        {
+            let bytes = charge.bytes();
+            if bytes > 0 {
+                let change = charge.entry().change();
+                charge.shrink(&change, bytes);
+            }
+        }
+    }
+}
+
 /// An opened Vulkan device.
 #[derive(Clone)]
 pub struct Device {
     pub(crate) inner: Arc<Inner>,
-    /// What the memory allocated through this open is charged to.
-    pub(crate) accounts: Arc<crate::memory::MemoryAccounts>,
+    opened: Arc<Opened>,
 }
 
 /// Memory-budget sample of the device-local heap (`VK_EXT_memory_budget`).
@@ -461,13 +527,13 @@ impl Inner {
     /// from (`DirectGraphBuilder`), read from `Memory`'s exact snapshot so
     /// no block in transition is ever counted as a graph's.
     pub(crate) fn unheld_mark(&self) -> (u64, u64) {
-        (self.memory.unheld().1, self.graphs.load(std::sync::atomic::Ordering::Relaxed))
+        (self.memory.unheld().1.driver, self.graphs.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// What the driver took since `mark` that no graph recorded meanwhile
     /// accounts for.
     pub(crate) fn unheld_since(&self, (unheld, graphs): (u64, u64)) -> u64 {
-        let grown = self.memory.unheld().1.saturating_sub(unheld);
+        let grown = self.memory.unheld().1.driver.saturating_sub(unheld);
         let recorded = self.graphs.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(graphs);
         grown.saturating_sub(recorded)
     }
@@ -479,30 +545,34 @@ impl Device {
     ///
     /// A physical device has one logical device at a time, created by an
     /// open when none is held and shared by every open while one is, like
-    /// CUDA's primary context. The last holder of a device (its `Device`s,
-    /// buffers, chunks and reservations) destroys it, never while any of
+    /// CUDA's primary context. The last holder of a device (its `Device`s
+    /// and buffers) destroys it, never while any of
     /// the process's devices creates pipelines ([`creating_pipelines`]), and
     /// an open meanwhile waits for that destruction to end, without the
     /// registry, before creating another.
     ///
-    /// What is allocated through the returned device (buffers, reservations
-    /// and their growth, its staging and argument chunks) is charged to
-    /// `accounts`, and the driver's memory its creation and admissions find
-    /// to their driver account: an open sharing a held logical device
-    /// charges its own to its own, and what others allocated keeps theirs.
+    /// What is allocated through the returned device lies in `stores`: each
+    /// buffer charged to the entry its allocation names, its blocks' free
+    /// space, its staging and argument chunks to their store's own entry,
+    /// and the driver's memory, as each reconciliation finds it
+    /// ([`Device::reconcile_driver_memory`]), to the own entry of the
+    /// device's store ([`MemoryStores::own`]): an open
+    /// sharing a held logical device charges its own to its own, and what
+    /// others allocated keeps theirs.
     ///
     /// The device's properties take its probes as `probed` holds them, what
     /// the measurement job stored for the device and driver version; each
     /// probe not run takes its safe value. Opening runs no probe.
-    pub fn open(uuid: [u8; 16], accounts: crate::memory::MemoryAccounts, probed: &Probed) -> Result<Self, OpenError> {
-        let accounts = Arc::new(accounts);
+    pub fn open(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
         let mut registry = loop {
             let mut registry = registry();
             let Some(index) = registry.opened.iter().position(|(opened, _, _)| *opened == uuid) else {
                 break registry;
             };
             if let Some(inner) = registry.opened[index].1.upgrade() {
-                return Ok(Self { inner, accounts });
+                drop(registry);
+                let opened = Opened::new(inner.clone(), stores)?;
+                return Ok(Self { inner, opened });
             }
             let destroyed = registry.opened[index].2.clone();
             if destroyed.ended() {
@@ -522,9 +592,11 @@ impl Device {
             .ok_or(OpenError::Missing)?;
         let properties = description.properties(probed).map_err(OpenError::Floor)?;
         let Description { handle, facts, .. } = description;
-        let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties, &*accounts.driver)?);
+        let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties)?);
         registry.opened.push((uuid, Arc::downgrade(&inner), inner.destroyed.0.clone()));
-        Ok(Self { inner, accounts })
+        drop(registry);
+        let opened = Opened::new(inner.clone(), stores)?;
+        Ok(Self { inner, opened })
     }
 
     pub fn facts(&self) -> &Facts {
@@ -542,54 +614,85 @@ impl Device {
     }
 
     /// Storage in the backend's own device placement, for what it allocates
-    /// beside the topology's. `room`, when given, bounds the device usage
-    /// the allocation may add, block slack included.
+    /// beside the topology's, charged to `entry`.
     pub fn allocate(
         &self,
         bytes: u64,
         alignment: u64,
-        room: Option<u64>,
+        entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
-        self.allocate_in(self.inner.memory.device().clone(), bytes, alignment, room)
+        self.allocate_in(self.opened.pools.device().clone(), bytes, alignment, entry)
     }
 
     /// Storage in the backend's own upload placement (record tables), which
     /// the host writes with plain memory writes that never wait for device
-    /// work; `room` as for [`Device::allocate`].
+    /// work, charged to `entry`.
     pub fn allocate_upload(
         &self,
         bytes: u64,
         alignment: u64,
-        room: Option<u64>,
+        entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
-        self.allocate_in(self.inner.memory.upload().clone(), bytes, alignment, room)
+        self.allocate_in(self.opened.pools.upload().clone(), bytes, alignment, entry)
     }
 
-    /// Storage in `kinds`, in order: an allocation lands on the first with
-    /// room. `room` as for [`Device::allocate`].
+    /// Storage in `kinds`, in order (kinds of one store): an allocation
+    /// lands on the first with room, charged to `entry`; the buffer names
+    /// the kind it landed on ([`Buffer::kind`]).
     pub fn allocate_kinds(
         &self,
         kinds: &[u32],
         bytes: u64,
         alignment: u64,
-        room: Option<u64>,
+        entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
-        self.allocate_in(self.inner.memory.pool(kinds)?, bytes, alignment, room)
+        self.allocate_in(self.opened.pools.pool(&self.inner.memory, kinds)?, bytes, alignment, entry)
     }
 
+    /// A range of `pool`, its bytes carved from its block for `entry`.
     fn allocate_in(
         &self,
         pool: Arc<Pool>,
         bytes: u64,
         alignment: u64,
-        room: Option<u64>,
+        entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
         let range = self
             .inner
             .memory
-            .allocate(&self.inner.device, &pool, bytes, alignment, room, &self.accounts)?;
-        Ok(Buffer::new(self.inner.clone(), range))
+            .allocate(&self.inner.device, &pool, bytes, alignment, &self.opened.stores)?;
+        let carved = range.carve(entry);
+        Ok(Buffer::new(self.inner.clone(), range, Some(carved)))
     }
+
+    /// A pool block (`seismic_memory::pool`): one memory object and
+    /// the buffer bound to it, of memory type `kind`, never shared, every
+    /// byte zero and backed, charged exactly to `entry` (its bytes rounded
+    /// to whole words and the driver's rounding included) and returned to
+    /// the driver when it drops. Zeroed through its mapping where its type
+    /// is mappable, else on the second queue, beside work the first runs
+    /// or holds parked; on a device without one, on the first queue behind
+    /// its submissions.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        let range = self.inner.memory.block(&self.inner.device, kind, bytes, entry)?;
+        // Freed by its drop where zeroing fails.
+        let buffer = Buffer::new(self.inner.clone(), range, None);
+        let range = buffer.range();
+        match range.mapped() {
+            // SAFETY: the block's own mapping, which nothing else reaches yet.
+            Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
+            None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
+            None => drop(self.transfer(range, |_| Staged::Zero)?),
+        }
+        Ok(buffer)
+    }
+
+    /// The own entry of the store of the device's own storage
+    /// ([`MemoryStores::own`]).
+    pub(crate) fn own(&self) -> Arc<dyn Entry> {
+        self.opened.stores.own(&self.inner.memory)
+    }
+
 
     /// Host write: through the mapping when the storage is host-visible,
     /// else through staging and a transfer on the queue, waited on. The
@@ -607,18 +710,14 @@ impl Device {
         let mut done = 0usize;
         while done < bytes.len() {
             let length = (bytes.len() - done).min(STAGING_BYTES as usize);
-            let _staging = self.transfer(
-                |staging| {
-                    staging.write_mapped(0, &bytes[done..done + length]);
-                    vk::BufferCopy {
-                        src_offset: staging.offset(),
-                        dst_offset: range.offset() + offset + done as u64,
-                        size: length as u64,
-                    }
-                },
-                range,
-                true,
-            )?;
+            let _staging = self.transfer(range, |staging| {
+                staging.write_mapped(0, &bytes[done..done + length]);
+                Staged::Upload(vk::BufferCopy {
+                    src_offset: staging.offset(),
+                    dst_offset: range.offset() + offset + done as u64,
+                    size: length as u64,
+                })
+            })?;
             done += length;
         }
         Ok(())
@@ -643,15 +742,13 @@ impl Device {
         let mut done = 0usize;
         while done < into.len() {
             let length = (into.len() - done).min(STAGING_BYTES as usize);
-            let staging = self.transfer(
-                |staging| vk::BufferCopy {
+            let staging = self.transfer(range, |staging| {
+                Staged::Download(vk::BufferCopy {
                     src_offset: range.offset() + offset + done as u64,
                     dst_offset: staging.offset(),
                     size: length as u64,
-                },
-                range,
-                false,
-            )?;
+                })
+            })?;
             staging
                 .as_ref()
                 .expect("a transfer leaves its staging in place")
@@ -662,31 +759,26 @@ impl Device {
         Ok(())
     }
 
-    /// One staged copy between `range` and the staging range, submitted and
-    /// waited on. `upload` copies staging to `range`, else `range` to
-    /// staging. Returns the staging lock so a read can copy out.
+    /// One staged step of `range`, as `step` gives it from the staging
+    /// range ([`Staged`]), submitted and waited on. Returns the staging lock
+    /// so a read can copy out.
     fn transfer(
         &self,
-        region: impl FnOnce(&Range) -> vk::BufferCopy,
         range: &Range,
-        upload: bool,
+        step: impl FnOnce(&Range) -> Staged,
     ) -> Result<MutexGuard<'_, Option<Staging>>, ExecutionError> {
         let inner = &self.inner;
         let device = &inner.device;
-        let mut guard = inner
+        let mut guard = self
+            .opened
             .staging
             .lock()
             .expect("staging lock is never poisoned");
         if guard.is_none() {
-            *guard = Some(inner.create_staging(&self.accounts)?);
+            *guard = Some(inner.create_staging(&self.opened.pools, &self.opened.stores)?);
         }
         let staging = guard.as_mut().expect("staging was created above");
-        let copy = region(&staging.range);
-        let (source, destination) = if upload {
-            (staging.range.raw(), range.raw())
-        } else {
-            (range.raw(), staging.range.raw())
-        };
+        let step = step(&staging.range);
         let command = staging.command;
         unsafe {
             call(
@@ -709,7 +801,11 @@ impl Device {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
             );
-            device.cmd_copy_buffer(command, source, destination, &[copy]);
+            match step {
+                Staged::Upload(copy) => device.cmd_copy_buffer(command, staging.range.raw(), range.raw(), &[copy]),
+                Staged::Download(copy) => device.cmd_copy_buffer(command, range.raw(), staging.range.raw(), &[copy]),
+                Staged::Zero => device.cmd_fill_buffer(command, range.raw(), range.offset(), range.bytes(), 0),
+            }
             barrier(
                 device,
                 command,
@@ -868,24 +964,7 @@ impl Device {
     pub(crate) fn recording(&self) -> Result<MutexGuard<'_, Recording>, ExecutionError> {
         let mut recording = self.locked();
         let completed = self.completed()?;
-        let mut index = 0;
-        while index < recording.retired.len() {
-            if recording.retired[index].value <= completed {
-                let retired = recording.retired.swap_remove(index);
-                match retired.command {
-                    RetiredCommand::Primary(command) => recording.free_commands.push(command),
-                    RetiredCommand::Secondary(command) => unsafe {
-                        self.inner
-                            .device
-                            .free_command_buffers(recording.pool, &[command])
-                    },
-                }
-                recording.free_queries.extend(retired.queries);
-                recording.free_chunks.extend(retired.arguments);
-            } else {
-                index += 1;
-            }
-        }
+        self.inner.retire_up_to(&mut recording, completed);
         Ok(recording)
     }
 
@@ -945,16 +1024,22 @@ impl Device {
     /// An argument chunk in upload storage.
     pub(crate) fn argument_chunk(
         &self,
-        recording: &mut Recording,
+        _recording: &mut Recording,
     ) -> Result<Range, ExecutionError> {
-        match recording.free_chunks.pop() {
+        let reused = self
+            .opened
+            .free_chunks
+            .lock()
+            .expect("free chunks lock is never poisoned")
+            .pop();
+        match reused {
             Some(chunk) => Ok(chunk),
-            None => self.inner.memory.allocate_internal(
+            None => self.inner.memory.allocate(
                 &self.inner.device,
-                self.inner.memory.upload(),
+                self.opened.pools.upload(),
                 ARGUMENT_CHUNK_BYTES,
                 256,
-                &self.accounts,
+                &self.opened.stores,
             ),
         }
     }
@@ -965,56 +1050,39 @@ impl Device {
             .lock()
             .expect("recording lock is never poisoned")
             .retired
-            .push(retired);
+            .push((retired, Arc::downgrade(&self.opened)));
     }
 
-    /// The driver memory charged, as last reconciled (I9, `Memory`).
+    /// Settle the charge of the driver's own memory for the device (the
+    /// logical device, pipelines, command, query and graph memory) to what
+    /// the driver holds now, on the own entry of the store of the device's
+    /// own storage ([`MemoryStores::own`]): grown or shrunk, never refused.
+    /// The embedder's ledger runs it before each reading of the store.
+    /// Returns what the driver grants the process of the device heaps
+    /// beyond its usage (budget less usage), read in the one
+    /// `VK_EXT_memory_budget` query the charge was settled from: the grant
+    /// and the usage the ledger counts are of one instant, so a driver that
+    /// shows a free late shows it late in both, and the freed bytes stay
+    /// counted as the driver's until it does.
+    pub fn reconcile_driver_memory(&self) -> u64 {
+        self.inner.memory.reconcile(&self.own(), &self.opened.driver_charge)
+    }
+
+    /// The driver memory charged, as last reconciled (`DriverMemory`).
     pub fn driver_charged(&self) -> u64 {
-        self.inner.memory.driver_bytes()
+        self.opened
+            .driver_charge
+            .lock()
+            .expect("driver charge lock poisoned")
+            .as_ref()
+            .map_or(0, Charge::bytes)
     }
 
     /// The driver memory held now, read exactly (no block in transition),
-    /// without charging it: what the next admission's reconciliation will
-    /// find at least.
+    /// without charging it: what the next reconciliation will find at
+    /// least.
     pub fn driver_held(&self) -> u64 {
-        self.inner.memory.unheld().1
-    }
-
-    /// What the runtime's ledger of the device's store runs under its
-    /// decision lock before each admission against the store: the driver's
-    /// memory reconciled (`Memory::reconcile_for_admission`, I9). It holds
-    /// the device weakly: the store's accounts are held by the device.
-    pub fn admission(&self) -> Arc<dyn Fn() + Send + Sync> {
-        let (device, account) = (Arc::downgrade(&self.inner), self.accounts.driver.clone());
-        Arc::new(move || {
-            if let Some(inner) = device.upgrade() {
-                inner.memory.reconcile_for_admission(&*account);
-            }
-        })
-    }
-
-    /// What the blocks of `kinds` hold beyond their ranges: held by this
-    /// process, charged to no allocation, and free for later allocations.
-    pub fn unallocated_bytes(&self, kinds: &[u32]) -> u64 {
-        let memory = &self.inner.memory;
-        memory.pooled(kinds).map_or(0, |pool| memory.free_bytes(&pool))
-    }
-
-    /// What the device holds for `kinds` beyond their allocations: their
-    /// blocks' free space and the device's own ranges in them (argument
-    /// chunks, in upload storage).
-    pub fn held_beyond_allocations(&self, kinds: &[u32]) -> u64 {
-        let memory = &self.inner.memory;
-        memory.pooled(kinds).map_or(0, |pool| memory.free_bytes(&pool) + memory.internal_bytes(&pool))
-    }
-
-    /// The driver's memory for the device and its recorded graphs,
-    /// reconciled first (`Memory::reconcile`), which the driver memory
-    /// account charges to device storage.
-    pub fn driver_bytes_reconciled(&self) -> u64 {
-        let memory = &self.inner.memory;
-        memory.reconcile(&*self.accounts.driver);
-        memory.driver_bytes()
+        self.inner.memory.unheld().1.driver
     }
 
     /// `VK_EXT_memory_budget` of the heaps device storage is allocated
@@ -1127,7 +1195,6 @@ impl Inner {
         physical: vk::PhysicalDevice,
         facts: Facts,
         properties: Properties,
-        driver_account: &dyn seismic_compiler::executable::MemoryAccount,
     ) -> Result<Self, OpenError> {
         let target = facts.formation(&properties);
         let usage_before = memory_budget(
@@ -1149,13 +1216,6 @@ impl Inner {
         }
         if properties.fma_32.holds() {
             extensions.push(facts::SHADER_FMA_EXTENSION);
-        }
-        if facts.host_import_alignment.is_some() {
-            extensions.push(ash::ext::external_memory_host::NAME);
-        }
-        if facts.placed_map_alignment.is_some() {
-            extensions.push(ash::khr::map_memory2::NAME);
-            extensions.push(ash::ext::map_memory_placed::NAME);
         }
         if facts.pipeline_statistics {
             extensions.push(ash::khr::pipeline_executable_properties::NAME);
@@ -1218,11 +1278,6 @@ impl Inner {
         if properties.fma_32.holds() {
             features = features.push_next(&mut shader_fma);
         }
-        let mut placed =
-            vk::PhysicalDeviceMapMemoryPlacedFeaturesEXT::default().memory_map_placed(true).memory_unmap_reserve(true);
-        if facts.placed_map_alignment.is_some() {
-            features = features.push_next(&mut placed);
-        }
         let mut executables =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
         if facts.pipeline_statistics {
@@ -1257,10 +1312,6 @@ impl Inner {
                 fence: vk::Fence::null(),
             })
         });
-        let host_import = facts
-            .host_import_alignment
-            .map(|_| ash::ext::external_memory_host::Device::new(raw, &device));
-        let placed_maps = facts.placed_map_alignment.map(|_| ash::khr::map_memory2::Device::new(raw, &device));
         let executables = facts
             .pipeline_statistics
             .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
@@ -1288,17 +1339,13 @@ impl Inner {
             }),
             handover: Condvar::new(),
             side,
-            host_import,
-            placed_maps,
             executables,
             recording: Mutex::new(Recording {
                 pool: vk::CommandPool::null(),
                 free_commands: Vec::new(),
                 free_queries: Vec::new(),
-                free_chunks: Vec::new(),
                 retired: Vec::new(),
             }),
-            staging: Mutex::new(None),
             graphs: std::sync::atomic::AtomicU64::new(0),
             instance,
             destroyed: Ends(Arc::default()),
@@ -1340,12 +1387,52 @@ impl Inner {
             .get_mut()
             .expect("recording lock is never poisoned")
             .pool = pool;
-        // What creating the device took of the heap.
-        inner.memory.reconcile(driver_account);
         Ok(inner)
     }
 
-    fn create_staging(&self, accounts: &crate::memory::MemoryAccounts) -> Result<Staging, ExecutionError> {
+    fn retire_up_to(&self, recording: &mut Recording, completed: u64) {
+        let mut index = 0;
+        while index < recording.retired.len() {
+            if recording.retired[index].0.value <= completed {
+                let (retired, owner) = recording.retired.swap_remove(index);
+                match retired.command {
+                    RetiredCommand::Primary(command) => recording.free_commands.push(command),
+                    RetiredCommand::Secondary(command) => unsafe {
+                        self.device
+                            .free_command_buffers(recording.pool, &[command])
+                    },
+                }
+                recording.free_queries.extend(retired.queries);
+                match owner.upgrade() {
+                    Some(opened) => opened
+                        .free_chunks
+                        .lock()
+                        .expect("free chunks lock is never poisoned")
+                        .extend(retired.arguments),
+                    None => {
+                        for chunk in retired.arguments {
+                            self.memory.release(&self.device, &chunk);
+                        }
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn retire_completed_best_effort(&self) {
+        let Ok(completed) = (unsafe { self.device.get_semaphore_counter_value(self.timeline) }) else {
+            return;
+        };
+        let mut recording = self
+            .recording
+            .lock()
+            .expect("recording lock is never poisoned");
+        self.retire_up_to(&mut recording, completed);
+    }
+
+    fn create_staging(&self, pools: &DevicePools, stores: &MemoryStores) -> Result<Staging, ExecutionError> {
         let device = &self.device;
         let pool = call(
             unsafe {
@@ -1369,7 +1456,7 @@ impl Inner {
         };
         let range = match self
             .memory
-            .allocate_internal(device, self.memory.staging(), STAGING_BYTES, 256, accounts)
+            .allocate(device, pools.staging(), STAGING_BYTES, 256, stores)
         {
             Ok(range) => range,
             Err(error) => {
@@ -1387,7 +1474,7 @@ impl Inner {
 
 impl Device {
     /// Whether the second queue is open (`Facts::side_family`): what zeroes
-    /// reservations' chunks and runs transfers beside the first's work.
+    /// pool blocks and runs transfers beside the first's work.
     pub(crate) fn has_side_queue(&self) -> bool {
         self.inner.side.is_some()
     }
@@ -1415,15 +1502,14 @@ impl Inner {
     /// (`direct::compute_barrier`) makes them visible to its work.
     ///
     /// # Panics
-    /// On a device without a second queue: only a device reserving device
-    /// storage zeroes, which it does only with one
-    /// (`Facts::reservation`).
+    /// On a device without a second queue, which zeroes on its first
+    /// (`Device::allocate_block`).
     pub(crate) fn zero(&self, regions: &[(&Range, u64, u64)]) -> Result<(), ExecutionError> {
         let device = &self.device;
         let mut side = self
             .side
             .as_ref()
-            .expect("a device reserving device storage has a second queue")
+            .expect("only a device with a second queue zeroes on it")
             .lock()
             .expect("side queue lock is never poisoned");
         // Formed whole or not at all: the pool, then its command buffer and
@@ -1483,69 +1569,6 @@ impl Inner {
         }
     }
 
-    /// The memory types the host memory at `pointer` may be imported as
-    /// (`vkGetMemoryHostPointerPropertiesEXT`).
-    ///
-    /// # Panics
-    /// On a device that imports no host memory: only a device reserving
-    /// host storage imports, which it does only where it can
-    /// (`Facts::reservation`).
-    /// Map `memory` whole at `at`, a place of a reserved host range
-    /// (`VK_EXT_map_memory_placed`), replacing what the range held there.
-    ///
-    /// # Panics
-    ///
-    /// On a device that maps no memory at a placed address: only a
-    /// reservation the device backs as placed chunks maps one
-    /// (`Facts::reservation`).
-    pub(crate) fn map_placed(&self, memory: vk::DeviceMemory, at: std::ptr::NonNull<u8>) -> Result<(), ExecutionError> {
-        let maps = self.placed_maps.as_ref().expect("a device backing placed chunks maps memory in place");
-        let mut placed = vk::MemoryMapPlacedInfoEXT::default().placed_address(at.as_ptr().cast());
-        let info = vk::MemoryMapInfoKHR::default()
-            .flags(vk::MemoryMapFlags::PLACED_EXT)
-            .memory(memory)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)
-            .push_next(&mut placed);
-        let mut mapped = std::ptr::null_mut();
-        call(
-            unsafe { (maps.fp().map_memory2_khr)(self.device.handle(), &info, &mut mapped) }.result(),
-            "vkMapMemory2KHR",
-        )?;
-        assert_eq!(mapped.cast::<u8>(), at.as_ptr(), "a placed mapping lies where it was placed");
-        Ok(())
-    }
-
-    /// Unmap `memory`, mapped in place ([`Self::map_placed`]), leaving its
-    /// host range reserved (`VK_MEMORY_UNMAP_RESERVE_BIT_EXT`), so nothing
-    /// else maps there before the range is released.
-    pub(crate) fn unmap_placed(&self, memory: vk::DeviceMemory) {
-        let maps = self.placed_maps.as_ref().expect("a placed mapping's device maps memory in place");
-        let info = vk::MemoryUnmapInfoKHR::default().flags(vk::MemoryUnmapFlagsKHR::RESERVE_EXT).memory(memory);
-        call(unsafe { (maps.fp().unmap_memory2_khr)(self.device.handle(), &info) }.result(), "vkUnmapMemory2KHR")
-            .expect("a placed mapping unmaps");
-    }
-
-    pub(crate) fn importable(&self, pointer: std::ptr::NonNull<u8>) -> Result<u32, ExecutionError> {
-        let import = self
-            .host_import
-            .as_ref()
-            .expect("a device reserving host storage imports host memory");
-        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
-        call(
-            unsafe {
-                (import.fp().get_memory_host_pointer_properties_ext)(
-                    self.device.handle(),
-                    vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
-                    pointer.as_ptr().cast(),
-                    &mut properties,
-                )
-            }
-            .result(),
-            "vkGetMemoryHostPointerPropertiesEXT",
-        )?;
-        Ok(properties.memory_type_bits)
-    }
 }
 
 fn command_pool_info<'a>(family: u32) -> vk::CommandPoolCreateInfo<'a> {
@@ -1563,21 +1586,16 @@ impl Drop for Inner {
                 .recording
                 .get_mut()
                 .expect("recording lock is never poisoned");
-            for retired in recording.retired.drain(..) {
+            for (retired, _) in recording.retired.drain(..) {
                 recording.free_queries.extend(retired.queries);
+                for chunk in retired.arguments {
+                    self.memory.release(device, &chunk);
+                }
             }
             for (pool, _) in recording.free_queries.drain(..) {
                 device.destroy_query_pool(pool, None);
             }
             device.destroy_command_pool(recording.pool, None);
-            if let Some(staging) = self
-                .staging
-                .get_mut()
-                .expect("staging lock is never poisoned")
-                .take()
-            {
-                device.destroy_command_pool(staging.pool, None);
-            }
             if let Some(side) = self.side.as_mut() {
                 let side = side.get_mut().expect("side queue lock is never poisoned");
                 device.destroy_fence(side.fence, None);
@@ -1607,42 +1625,43 @@ mod reconcile_tests {
         devices
             .into_iter()
             .filter(|description| description.floor.is_ok())
-            .map(|description| Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens"))
+            .map(|description| Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens"))
             .collect()
     }
 
     /// A reconciliation under block churn is exact both ways: pooled
-    /// blocks and chunks of 256 MiB created and freed on one thread while
-    /// another reconciles in a loop leave the charge short of no driver
-    /// memory (it covers what the driver holds once churn ends) and holding
-    /// no block (it grew by far less than one).
+    /// blocks and blocks of their own of 256 MiB created and freed on one
+    /// thread while another reconciles in a loop leave the charge at what
+    /// the driver holds once churn ends, holding no block (it moved by far
+    /// less than one).
     #[test]
     fn a_reconciliation_under_churn_is_exact() {
         for device in devices() {
             let memory = &device.inner.memory;
-            memory.reconcile(&*device.accounts.driver);
-            let before = memory.driver_bytes();
+            let driver = device.own();
+            device.reconcile_driver_memory();
+            let before = device.driver_charged();
             let stop = Arc::new(AtomicBool::new(false));
             let reconciler = {
                 let (device, stop) = (device.clone(), stop.clone());
                 std::thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        device.inner.memory.reconcile(&*device.accounts.driver);
+                        device.reconcile_driver_memory();
                     }
                 })
             };
+            let kind = device.opened.pools.device().kinds()[0];
             for _ in 0..20 {
-                drop(device.allocate(BLOCK, 256, None).expect("a pooled block allocates"));
-                let chunk = memory.chunk(&device.inner.device, memory.device(), BLOCK, crate::memory::Mapping::Pool, &device.accounts).expect("a chunk allocates");
-                memory.free(&device.inner.device, &chunk);
+                drop(device.allocate(BLOCK, 256, &driver).expect("a pooled block allocates"));
+                drop(device.allocate_block(kind, BLOCK, &driver).expect("a block of its own allocates"));
             }
             stop.store(true, Ordering::Relaxed);
             reconciler.join().unwrap();
-            memory.reconcile(&*device.accounts.driver);
-            let (_, unheld) = memory.unheld();
-            let charged = memory.driver_bytes();
-            assert!(charged >= unheld, "under-charged: {charged} charged, the driver holds {unheld}");
-            assert!(charged - before < BLOCK / 2, "a block charged as the driver's: grew {}", charged - before);
+            device.reconcile_driver_memory();
+            let unheld = memory.unheld().1.driver;
+            let charged = device.driver_charged();
+            assert_eq!(charged, unheld, "the charge is what the driver holds");
+            assert!(charged.abs_diff(before) < BLOCK / 2, "a block charged as the driver's: moved {}", charged.abs_diff(before));
         }
     }
 }

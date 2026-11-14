@@ -36,9 +36,25 @@ macro_rules! identity {
 identity!(ProgramIdentity);
 identity!(ResourceDomainId);
 
-/// Engine-wide identity of an admitted request.
+/// Engine-wide identity of an admitted request: unique in the process, and
+/// ordered as requests were admitted across every load
+/// ([`Self::admitted`]). A store's ledger, shared by every load in the
+/// process, keys each sequence's state by it, so no two loads' sequences
+/// share one and "admitted after" is one order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub u64);
+
+impl RequestId {
+    /// The identity of a request admitted now: the one way a request's
+    /// identity is made, later than every one made before it in the
+    /// process.
+    pub fn admitted() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(id != u64::MAX, "invariant violated: request identities exhausted");
+        Self(id)
+    }
+}
 
 /// A contiguous row range within an aggregate feature lease.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

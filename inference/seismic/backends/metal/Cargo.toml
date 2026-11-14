@@ -12,8 +12,8 @@ seismic-estimator.workspace = true
 seismic-lang.workspace = true
 seismic-native-target.workspace = true
 seismic-compiler.workspace = true
-# The one host reservation Metal's reserved buffers compose.
-seismic-reservation.workspace = true
+# The ledger entries allocations are charged to.
+seismic-memory.workspace = true
 sha2 = "=0.11.0"
 # Probe answers, kept in the program store.
 serde.workspace = true

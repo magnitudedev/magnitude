@@ -1,5 +1,5 @@
 use magnitude_scheduler::policy::{
-    order_victims, AvailabilityEpoch, Operation, Phase, RequestId, Scheduler, ServiceLimits, Victim,
+    AvailabilityEpoch, Operation, Phase, RequestId, Scheduler, ServiceLimits,
 };
 
 fn limits() -> ServiceLimits {
@@ -111,41 +111,6 @@ fn selection_has_no_request_count_limit() {
     assert_eq!(selection.requests().len(), candidates.len());
     assert_eq!(selection.requests().first(), Some(&RequestId(0)));
     assert_eq!(selection.requests().last(), Some(&RequestId(299)));
-}
-
-#[test]
-fn victim_order_prioritizes_blocked_output_then_actual_replay_price() {
-    let mut victims = [
-        Victim {
-            identity: RequestId(1),
-            output_blocked: false,
-            preemption_debt: 0,
-            exclusive_bytes: 100,
-            replay_tokens: 10,
-            service_ns: 0,
-        },
-        Victim {
-            identity: RequestId(2),
-            output_blocked: true,
-            preemption_debt: 0,
-            exclusive_bytes: 1,
-            replay_tokens: 100,
-            service_ns: 0,
-        },
-        Victim {
-            identity: RequestId(3),
-            output_blocked: false,
-            preemption_debt: 0,
-            exclusive_bytes: 20,
-            replay_tokens: 1,
-            service_ns: 0,
-        },
-    ];
-    order_victims(&mut victims);
-    assert_eq!(
-        victims.map(|victim| victim.identity),
-        [RequestId(2), RequestId(3), RequestId(1)]
-    );
 }
 
 #[test]

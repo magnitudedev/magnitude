@@ -15,7 +15,7 @@ use magnitude_engine::options::{
     ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
 };
 use magnitude_executor::ExecutionPath;
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::ReleaseRate;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     InstalledModelPackages as _, ModelBundleInput, ModelPackageId, ModelPackageOperand,
@@ -65,7 +65,7 @@ pub struct ResolvedConfiguration {
 pub struct ResolvedConfigurations {
     models: Arc<ManagedModelStore>,
     kernel_directory: PathBuf,
-    reserves: MemoryReserves,
+    release: ReleaseRate,
     serving: ServingDevice,
     bounds: LoadBounds,
     cache: ResolutionCache<ResolvedConfiguration>,
@@ -75,14 +75,14 @@ impl ResolvedConfigurations {
     pub fn new(
         models: Arc<ManagedModelStore>,
         kernel_directory: PathBuf,
-        reserves: MemoryReserves,
+        release: ReleaseRate,
         serving: ServingDevice,
         bounds: LoadBounds,
     ) -> Self {
         Self {
             models,
             kernel_directory,
-            reserves,
+            release,
             serving,
             bounds,
             cache: ResolutionCache::new(RETAINED_CONFIGURATIONS),
@@ -138,7 +138,7 @@ impl ResolvedConfigurations {
         let configuration = engine_configuration(
             paths,
             self.kernel_directory.clone(),
-            self.reserves,
+            self.release,
             self.serving,
             self.bounds,
             context_tokens,
@@ -162,7 +162,7 @@ impl ResolvedConfigurations {
 fn engine_configuration(
     package: ModelPackagePaths,
     kernel_directory: PathBuf,
-    reserves: MemoryReserves,
+    release: ReleaseRate,
     serving: ServingDevice,
     bounds: LoadBounds,
     served: u32,
@@ -188,7 +188,7 @@ fn engine_configuration(
         path: ExecutionPath::Native,
         device: serving.request(),
         kernel_cache: Some(kernel_directory),
-        reserves,
+        release,
     }
 }
 
@@ -387,7 +387,7 @@ mod tests {
         let resolved = engine_configuration(
             material(ModelMethod::DSpark),
             kernels.clone(),
-            MemoryReserves::of_machine(None),
+            ReleaseRate::of_machine(None),
             serving,
             LoadBounds::default(),
             0,
@@ -410,7 +410,7 @@ mod tests {
             let Err(error) = engine_configuration(
                 material(method),
                 kernels.clone(),
-                MemoryReserves::of_machine(None),
+                ReleaseRate::of_machine(None),
                 serving,
                 LoadBounds::default(),
                 0,
@@ -439,7 +439,7 @@ mod tests {
                 method: ModelMethod::Plain,
             },
             std::env::temp_dir(),
-            MemoryReserves::of_machine(None),
+            ReleaseRate::of_machine(None),
             serving,
             LoadBounds::default(),
             0,

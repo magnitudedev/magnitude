@@ -52,15 +52,23 @@ impl FileSource {
         Ok(self.file().metadata()?)
     }
 
+    /// Read `out.len()` bytes from `offset` into `out` for a caller that
+    /// waits on them: due now.
     pub fn read_into(&self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
+        self.read_into_for(offset, out, seismic_io::Want::now())
+    }
+
+    /// Read `out.len()` bytes from `offset` straight into `out` for `want`,
+    /// and wait for them: one request, which the link reads at its depth,
+    /// each piece landing in place, through no buffer of the source's own.
+    pub fn read_into_for(&self, offset: u64, out: &mut [u8], want: seismic_io::Want) -> Result<(), Error> {
         let end = offset
             .checked_add(out.len() as u64)
             .ok_or_else(|| Error::Invalid("artifact read overflows".into()))?;
         if end > self.size() {
             return Err(Error::Invalid("read outside artifact".into()));
         }
-        // A caller waits on the bytes: due now.
-        Ok(self.reader.read_at([(offset, out)], seismic_io::Want::now())?)
+        Ok(self.reader.read_at([(offset, out)], want)?)
     }
 
     pub fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {

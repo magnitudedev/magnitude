@@ -33,7 +33,6 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) coherent volatile b
 #define STREAMING_GROUP_PARAM uint streaming_group
 #define STREAMING_GROUP(index) seismic_shared_i32[streaming_group + uint(index)]
 #define STREAMING_GROUP_ADD(index, value) atomicAdd(STREAMING_GROUP(index), value)
-#define STREAMING_RECORDS_READ uint64_t
 #define STREAMING_RECORDS uint64_t
 #define u32 uint
 #define u64 uint64_t

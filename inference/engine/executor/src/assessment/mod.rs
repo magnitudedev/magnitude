@@ -79,9 +79,9 @@ pub use streaming::{
     GroupLayerTerms, GroupUnion, Notice, Stages,
 };
 pub use streaming_costs::{
-    CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, RecordLine,
+    CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, RecordLine,
     CONVERTED_RECORDS,
-    CpuCosts, GraphMemory, MoveLines, ReadLine, ReadLineError, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
+    CpuCosts, GraphMemory, ReadLine, ReadLineError, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
 };
 
 use crate::GraphError;

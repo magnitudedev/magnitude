@@ -1129,7 +1129,7 @@ mod tests {
                 reference_work_limit: 10000,
             };
             if corpus_case == ValidationCase::CORPUS[0].0 {
-                let before = device.device_ledger();
+                let before = device.allocated();
                 let mut wrong = case.clone();
                 wrong.values.bind(
                     prepared.kernel.schema().dimensions()[0].symbol,
@@ -1146,7 +1146,7 @@ mod tests {
                     Err(ObservationError::InvalidCase(_))
                 ));
                 assert_eq!(
-                    device.device_ledger(),
+                    device.allocated(),
                     before,
                     "rejected point releases admitted resources"
                 );
@@ -1161,7 +1161,7 @@ mod tests {
                     Err(ObservationError::DeadlineExpired)
                 ));
                 assert_eq!(
-                    device.device_ledger(),
+                    device.allocated(),
                     before,
                     "expired observation allocates no resources"
                 );
@@ -1176,7 +1176,7 @@ mod tests {
                     Err(ObservationError::Capacity { .. })
                 ));
                 assert_eq!(
-                    device.device_ledger(),
+                    device.allocated(),
                     before,
                     "capacity rejection retains no resources"
                 );

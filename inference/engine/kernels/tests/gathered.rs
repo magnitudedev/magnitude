@@ -332,27 +332,22 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
         );
         let extents = [records as u64, per as u64, width as u64];
         let record_bytes = resident_slots.len() / records;
-        // The slots in one allocation, and, where the device reserves, in
-        // reserved storage the host writes record by record (on Metal, chunks
-        // reached through the record table).
+        // The slots in one allocation, and in a store of one slab a record
+        // that the host writes record by record.
         let placements = devices().into_iter().flat_map(|device| {
             let whole = Tensor::from_host(&device, resident_element, &extents, &resident_slots).unwrap();
-            let reserved = match Tensor::reserved(&device, resident_element, &extents, records as u64) {
-                Ok(reserved) => Some(reserved),
-                Err(seismic::TensorError::Unreservable { .. }) => None,
-                Err(error) => panic!("{:?} reserves the slots: {error}", device.backend()),
+            let regions = [seismic::SlabRegion { element: resident_element, row_shape: vec![per as u64, width as u64] }];
+            let records_store = crate::common::slab_tensor(&device, 1, records as u64, &regions);
+            for (record, bytes) in resident_slots.chunks_exact(record_bytes).enumerate() {
+                let slab = records_store.add_slab(seismic::SlabFill::Unwritten).unwrap();
+                assert_eq!(slab, record);
+                records_store.slab_region(slab, 0).unwrap().unwrap().write_from_host(bytes).unwrap();
             }
-            .map(|(reserved, _resizer)| {
-                let placement = reserved.record_placement().unwrap();
-                for (record, bytes) in resident_slots.chunks_exact(record_bytes).enumerate() {
-                    // SAFETY: no device work uses the tensor yet.
-                    unsafe { reserved.write_shared(placement.offset(record as u64), bytes) }.unwrap();
-                }
-                reserved
-            });
-            std::iter::once((device.clone(), whole)).chain(reserved.map(|reserved| (device, reserved)))
+            let recorded = records_store.logical_region(0).unwrap();
+            // The tensor views the store's granules: the store lives beside it.
+            [(device.clone(), whole, None), (device, recorded, Some(records_store))]
         });
-        for (device, slots_tensor) in placements {
+        for (device, slots_tensor, _records_store) in placements {
             let result = stored_rows_native(&device, width as u64, resident_element)
                 .call(stored_rows::Args {
                     slots: &slots_tensor,

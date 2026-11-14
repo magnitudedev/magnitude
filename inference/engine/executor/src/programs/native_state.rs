@@ -655,18 +655,20 @@ mod tests {
             PreparedStateCopyGraphs::prepare(&device, &handles, [other, class.clone()]).unwrap();
         assert_eq!(graphs.workspace_bytes_max(), assessment.workspace);
         assert_eq!(graphs.output_bytes_max(), assessment.output);
-        let mut slabs = seismic::SlabTensor::new(
+        let slabs = crate::experts::pooled_slabs(
             &device,
+            seismic::Contract::DeviceOnly,
             2,
             4,
-            vec![seismic::SlabRegion {
+            &[seismic::SlabRegion {
                 element,
                 row_shape: vec![1, 4],
             }],
+            2,
         )
         .unwrap();
-        slabs.add_slab().unwrap();
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let source = [5.0f32, 6.0, 7.0, 8.0]
             .into_iter()
             .flat_map(f32::to_le_bytes)
@@ -697,6 +699,10 @@ mod tests {
         );
     }
 
+    /// The granule of these plans' state pool: 64 MiB, a slab of which
+    /// holds every one of their banks.
+    const BANK_GRANULE: u64 = 64 << 20;
+
     #[test]
     fn state_copy_classes_include_recurrent_banks() {
         let plan = StateStorePlan {
@@ -716,6 +722,8 @@ mod tests {
             recurrent_bank_bytes: 16,
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 48,
+            granule: BANK_GRANULE,
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
         };
         let classes = state_copy_classes(&plan, None, &[1, 2, 4, 8]).unwrap();
         assert_eq!(
@@ -754,6 +762,8 @@ mod tests {
             recurrent_bank_bytes: 16,
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 160,
+            granule: BANK_GRANULE,
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
         };
         let banks = plan.bank_capacity.storage_total().unwrap();
         let max_launch_rows = 64;

@@ -1,30 +1,18 @@
 //! The Vulkan backend's description of its devices in the topology's terms
-//! (`seismic_topology::VulkanReport`): its memory types and imported host
-//! pages, as kinds.
+//! (`seismic_topology::VulkanReport`): its memory types, as kinds.
 
 use crate::DeviceHandle;
 use seismic_lang::registry::BackendName;
 use seismic_topology::{
-    Contract, Diagnostic, DiagnosticSource, ExecutorKind, HostReads, KindMemory, KindReport, Obtained, Reach,
-    Reservation, ReservationChunks, Reserving, VulkanHeap, VulkanMemory, VulkanReport,
+    Diagnostic, DiagnosticSource, ExecutorKind, HostReads, KindMemory, KindReport, Reach, VulkanHeap,
+    VulkanMemory, VulkanReport,
 };
 
-/// The kind identifier of imported host pages; every memory type's is its
-/// index.
-pub const IMPORTED_KIND: u32 = u32::MAX;
-
-/// How `facts` reserves in `kind`.
-fn reserving(facts: &crate::Facts, kind: u32) -> Reserving {
-    facts.reservation(kind).map(|form| form.map(vulkan_reservation))
-}
-
-/// The kinds of `layout`, each reserving as `reserving` says: each memory
-/// type a kind on its heap, which the host maps where the type is mappable,
-/// through its caches where it is host-cached, and only the device reaches
-/// otherwise; and imported host pages, where a reservation can be backed in
-/// them or says why not.
-fn layout_kinds(layout: &crate::MemoryLayout, reserving: impl Fn(u32) -> Reserving) -> Vec<KindReport> {
-    let mut kinds = (0..)
+/// The kinds of `layout`: each memory type a kind on its heap, which the
+/// host maps where the type is mappable, through its caches where it is
+/// host-cached, and only the device reaches otherwise.
+fn layout_kinds(layout: &crate::MemoryLayout) -> Vec<KindReport> {
+    (0..)
         .zip(&layout.types)
         .map(|(id, memory)| {
             let heap = &layout.heaps[memory.heap as usize];
@@ -36,29 +24,15 @@ fn layout_kinds(layout: &crate::MemoryLayout, reserving: impl Fn(u32) -> Reservi
                     (true, false) => Reach::Mapped { reads: HostReads::Uncached },
                     (false, _) => Reach::Device,
                 },
-                obtained: Obtained::Allocated,
                 memory: KindMemory::Heap { index: memory.heap as usize, device_local: heap.device_local, bytes: heap.bytes },
-                reservation: reserving(id),
             }
         })
-        .collect::<Vec<_>>();
-    let imported = reserving(IMPORTED_KIND);
-    if imported != Ok(None) {
-        kinds.push(KindReport {
-            id: IMPORTED_KIND,
-            name: "imported host pages".into(),
-            reach: Reach::Mapped { reads: HostReads::Cached },
-            obtained: Obtained::ImportedHostPages,
-            memory: KindMemory::HostRam,
-            reservation: imported,
-        });
-    }
-    kinds
+        .collect()
 }
 
 /// The kinds `facts` allocates.
 pub(crate) fn kinds(facts: &crate::Facts) -> Vec<KindReport> {
-    layout_kinds(&facts.memory, |kind| reserving(facts, kind))
+    layout_kinds(&facts.memory)
 }
 
 /// `layout`'s heaps as its report states them.
@@ -110,6 +84,7 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
             device.driver_id, device.driver_version
         ),
         max_allocation: device.limits.max_allocation_bytes,
+        least_object: crate::memory::least_object(device),
         memory: VulkanMemory {
             luid: device.luid,
             heaps: heaps(&device.memory),
@@ -118,20 +93,10 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
     }
 }
 
-/// The reservation a Vulkan device's form describes: chunks of its unit,
-/// addressed through a record table in upload storage.
-fn vulkan_reservation(form: crate::ReservationForm) -> Reservation {
-    Reservation {
-        granule: form.granule,
-        host_addressed: form.host_addressed,
-        chunks: Some(ReservationChunks { unit: form.chunk_unit, table: Contract::Upload }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::layout_kinds;
-    use crate::{MemoryHeap, MemoryLayout, MemoryType, facts::chunk_backing};
+    use crate::{MemoryHeap, MemoryLayout, MemoryType};
     use seismic_topology::fixtures::{self, Layout};
     use seismic_topology::{Reports, VulkanReport};
 
@@ -160,10 +125,9 @@ mod tests {
         }
     }
 
-    /// Every recorded Vulkan device's kinds are the ones this backend
-    /// declares for its memory layout: each kind's reach, memory and
-    /// obtaining, and which kinds reserve. How one reserves is the
-    /// recording's.
+    /// Every recorded Vulkan device's memory types are the kinds this
+    /// backend declares for its memory layout: each kind's reach and
+    /// memory.
     #[test]
     fn the_recorded_vulkan_kinds_are_the_backends() {
         let only = |reports: Reports| reports.vulkan.into_iter().next().unwrap();
@@ -179,16 +143,7 @@ mod tests {
             (only(fixtures::a10_8q()), fixtures::A10_8Q_LAYOUT),
         ] {
             let layout = layout(&report, recorded);
-            let memory_is_host = report.memory_is_host.unwrap();
-            let reservation = |kind| {
-                let recorded = report.kinds.iter().find(|each| each.id == kind);
-                recorded.map_or(Ok(None), |recorded| recorded.reservation.clone())
-            };
-            // Whether a device maps at a placed address is recorded only by
-            // what reserves, so a kind may reserve under either answer.
-            let reserves = |kind| [false, true].iter().any(|&placed| chunk_backing(&layout, memory_is_host, placed, kind).is_some());
-            let declared = layout_kinds(&layout, |kind| if reserves(kind) { reservation(kind) } else { Ok(None) });
-            assert_eq!(declared, report.kinds, "{}", report.name);
+            assert_eq!(layout_kinds(&layout), report.kinds, "{}", report.name);
         }
     }
 }

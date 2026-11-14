@@ -81,7 +81,6 @@ const STREAMING_ENTRIES: &[&str] = &[
     "routed_copy",
     "routed_list_grid",
     "routed_pass_map",
-    "routed_move",
     "routed_seed_commit",
 ];
 

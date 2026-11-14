@@ -61,22 +61,20 @@ fn history_slabs(
     let slab_rows = u64::from(slab_rows);
     let row_bytes = kv * width * stored_bytes(element, &[0.0]).len();
     let mut tensors = [&case.history_key, &case.history_value].map(|values| {
-        let slabs = SlabTensor::new(
+        let slabs = crate::common::slab_tensor(
             device,
             slab_rows,
             rows as u64,
-            vec![SlabRegion {
+            &vec![SlabRegion {
                 element,
                 row_shape: vec![kv as u64, width as u64],
-            }],
-        )
-        .unwrap();
+            }]);
         let bytes = stored_bytes(element, values);
         (slabs, bytes)
     });
     for index in 0..(rows as u64).div_ceil(slab_rows) {
         for (slabs, bytes) in &mut tensors {
-            slabs.add_slab().unwrap();
+            slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let start = index * slab_rows;
             let count = slab_rows.min(rows as u64 - start);
             slabs
@@ -91,13 +89,8 @@ fn history_slabs(
     if reuse_middle {
         assert!(rows as u64 > 2 * slab_rows);
         for (slabs, bytes) in &mut tensors {
-            let old = slabs.slab(1).unwrap().observe_storage();
             slabs.free_slab(1).unwrap();
-            assert_eq!(slabs.add_slab().unwrap(), 1);
-            assert_ne!(
-                old.identity(),
-                slabs.slab(1).unwrap().observe_storage().identity()
-            );
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
             let start = slab_rows as usize;
             slabs
                 .region_rows(0, slab_rows, slab_rows)

@@ -410,7 +410,7 @@ impl Ceilings {
         plan: &magnitude_executor::ExpertBankPlan,
         cache: Option<&std::path::Path>,
     ) -> Self {
-        let link = plan.tier_reservation().map(|_| with_records(cache, |store| Self::link(device, store)));
+        let link = plan.tiered().then(|| with_records(cache, |store| Self::link(device, store)));
         Self { convert: with_records(cache, |store| Self::convert(device, plan, store)), link }
     }
 
@@ -2087,8 +2087,8 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
         ..ModelPolicy::default()
     };
     let topology = catalog.topology();
-    let reserves = magnitude_executor::platform::MemoryReserves::of_machine(Some((cache.as_path(), &topology)));
-    let structure = AssessmentStructure::discover(&catalog, options.device, Some(cache.as_path()), reserves, policy, standard_service_limits())
+    let release = magnitude_executor::platform::ReleaseRate::of_machine(Some((cache.as_path(), &topology)));
+    let structure = AssessmentStructure::discover(&catalog, options.device, Some(cache.as_path()), release, policy, standard_service_limits())
         .map_err(|error| error.to_string())?;
     let storage = magnitude_artifacts::model_store(&artifacts.target).map_err(|error| format!("{}: {error}", artifacts.target.display()))?;
     let measurements = structure.stored_measurements(cache, &storage);
@@ -2145,7 +2145,7 @@ fn estimated(
         context_limit: facts.context_limit,
         performance_depths: vec![context],
         sequences: u32::try_from(concurrency).map_err(|error| error.to_string())?,
-        reserves: structure.reserves,
+        release: structure.release,
     };
     // The window's host tier as the load held it, step by step: its misses
     // are priced where that tier served them, not where a plan's tier

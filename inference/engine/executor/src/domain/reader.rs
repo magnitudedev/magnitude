@@ -1,14 +1,17 @@
-//! The memory reading of one opened device: the machine's status, sampled
-//! now or published periodically off the owner's thread, the domains the
-//! device uses observed in it, and the device's store ledgers read from it,
-//! which alone bound Seismic's ledgers. It holds the one right to bound
-//! them while it lives.
+//! The memory reading of one opened device: the machine's status sampled
+//! at the owner's events (a flight boundary, an own change's completion, an
+//! OS pressure event, and while something stands that only a later reading
+//! answers, the worker's timed reading, `magnitude_scheduler::worker::Reread`),
+//! the domains the device uses observed in it, and the device's store
+//! ledgers read from it. The OS's pressure events
+//! ([`DeviceReader::watch_pressure`]) wake the owner where the OS gives them.
 
-use crate::memory::ledger::{Available, Blind, Changes, Sample};
-use crate::platform::{DomainReading, MemoryPolicyError, MemoryReserves};
+use crate::memory::ledger::{Changes, DeviceLedgers, DeviceReading, Sample, UnreadLedgers};
+use crate::platform::{DomainReading, MemoryPolicyError, ReleaseRate};
 use seismic::{Device, Devices};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// What the reader reads of the machine: one status sample a reading, every
@@ -27,29 +30,23 @@ pub trait StatusReading {
         Instant::now()
     }
 
-    /// Host RAM's available memory now, the ledgers' one OS input
-    /// (`memory::ledger::DeviceLedgers::read`): the live machine's reading
-    /// ([`Available::host`]); a test's, its own.
-    fn available(&self) -> Result<Available, Blind> {
-        Available::host()
+    /// Settle `device`'s driver memory and return the grant read in that
+    /// query ([`seismic::Device::reconcile_driver_memory`]).
+    fn reconcile(&self, device: &Device) -> Option<seismic::memory::Grant> {
+        device.reconcile_driver_memory()
     }
 
-    /// One sample of `device`'s status and host RAM's available memory, at
-    /// one instant taken now on the owner's thread, which never waits
-    /// ([`Sample::try_now`]): none where a change off its thread is beside
-    /// it.
+    /// Whether a scripted pressure event arrived since this was last asked.
+    fn take_pressure(&self) -> bool {
+        false
+    }
+
+    /// One sample of `device`'s status, host RAM's among it, at one
+    /// instant taken now on the owner's thread, `device`'s driver memory
+    /// settled within it, which never waits ([`Sample::try_now`]): none
+    /// where a change off its thread is beside it.
     fn sample(&self, device: &Device, changes: &Changes) -> Option<Sample> {
-        Sample::try_now(changes, || self.now(), || self.status(device), || self.available())
-    }
-
-    /// The periodic sample taken since the last one this returned, beside
-    /// `changes`, without waiting for one
-    /// ([`DeviceReader::refresh_published`]); none where none was published
-    /// since. By default it samples now: a test's readings are taken where
-    /// the test asks for them. The live machine's are sampled on a thread
-    /// of their own ([`MachineReading`]).
-    fn published(&self, device: &Device, changes: &Arc<Changes>) -> Option<Sample> {
-        self.sample(device, changes)
+        Sample::try_with(changes, || self.reconcile(device), || self.now(), || self.status(device))
     }
 }
 
@@ -59,21 +56,14 @@ impl StatusReading for Devices {
     }
 }
 
-/// The live machine's readings: a sample read where it is asked for, and
-/// the periodic ones on a thread of their own every
-/// [`crate::platform::READING_INTERVAL`], each published for
-/// the owner to take without waiting ([`StatusReading::published`]). A
-/// reading's system calls and driver queries never sit between a step and
-/// the next, however long either takes; each sample's grants and host
-/// figures are of its one instant, which the ledgers pair it at.
+/// The live machine's readings: a sample read where the owner asks for one.
 pub struct MachineReading {
     devices: Rc<Devices>,
-    reader: std::cell::OnceCell<Reader>,
 }
 
 impl MachineReading {
     pub fn new(devices: Rc<Devices>) -> Self {
-        Self { devices, reader: std::cell::OnceCell::new() }
+        Self { devices }
     }
 }
 
@@ -81,124 +71,215 @@ impl StatusReading for MachineReading {
     fn status(&self, device: &Device) -> seismic::Status {
         StatusReading::status(&*self.devices, device)
     }
-
-    /// The reader starts at the first ask, which therefore finds none yet.
-    fn published(&self, device: &Device, changes: &Arc<Changes>) -> Option<Sample> {
-        let reader = self.reader.get_or_init(|| {
-            let devices = Devices::new(self.devices.inventory().clone());
-            Reader::start(devices, device.clone(), changes.clone())
-        });
-        reader.shared.lock().latest.take()
-    }
 }
 
-/// The thread [`MachineReading`] reads on, stopped and joined as it drops.
-struct Reader {
-    shared: Arc<ReaderShared>,
-    changes: Arc<Changes>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// Whether a reader watches the OS's memory pressure events
+/// ([`DeviceReader::watch_pressure`]).
+enum Watch {
+    /// The owner has not asked.
+    Unasked,
+    /// Its host RAM store's events wake it while the watch lives.
+    Events { _watch: crate::memory::ledger::PressureWatch },
+    /// The OS gives no unprivileged events (a Linux kernel or container
+    /// without writable PSI triggers): the owner reads at its other events,
+    /// and while a shortage, a wait or a deficit stands, at its timed
+    /// readings (`magnitude_scheduler::worker::Reread`).
+    Unwatchable,
 }
 
-struct ReaderShared {
-    state: Mutex<ReaderState>,
-    stop: Condvar,
-}
-
-struct ReaderState {
-    /// The newest sample not yet taken: an older one untaken is replaced.
-    latest: Option<Sample>,
-    stopped: bool,
-}
-
-impl ReaderShared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, ReaderState> {
-        self.state.lock().expect("the machine reader's state lock is never poisoned")
-    }
-}
-
-impl Reader {
-    fn start(devices: Devices, device: Device, changes: Arc<Changes>) -> Self {
-        let shared = Arc::new(ReaderShared { state: Mutex::new(ReaderState { latest: None, stopped: false }), stop: Condvar::new() });
-        let (reading, sampled) = (shared.clone(), changes.clone());
-        let thread = std::thread::Builder::new()
-            .name("magnitude-memory".into())
-            .spawn(move || loop {
-                // Its invariant violated, no reading stands again: the
-                // process ends rather than serve blind.
-                let take = || Sample::take(&sampled, Instant::now, || devices.device_status(&device), Available::host, || reading.lock().stopped);
-                let Some(sample) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(take)).unwrap_or_else(|_| std::process::abort()) else {
-                    return;
-                };
-                let mut state = reading.lock();
-                state.latest = Some(sample);
-                let (state, _) = reading
-                    .stop
-                    .wait_timeout_while(state, crate::platform::READING_INTERVAL, |state| !state.stopped)
-                    .expect("the machine reader's state lock is never poisoned");
-                if state.stopped {
-                    return;
-                }
-            })
-            .expect("invariant violated: the memory reading thread could not start");
-        Self { shared, changes, thread: Some(thread) }
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.shared.lock().stopped = true;
-        self.shared.stop.notify_all();
-        // A sample waiting on a change learns it is stopped at once.
-        self.changes.wake();
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("the memory reading thread does not panic");
-        }
-    }
-}
-
-/// The memory reading of one opened device together with the host's
-/// threshold policy: it exists from the device's opening to the load's end,
-/// and Seismic's enforced limit is the device's store ledgers' as each
-/// reading of them leaves it ([`Self::read_ledgers`]).
+/// The memory reading of one opened device together with the machine's
+/// release rate: it exists from the device's opening to the load's end.
 pub struct DeviceReader {
     reading: Rc<dyn StatusReading>,
-    /// The reserves the reader opened with: the machine's figures.
-    reserves: MemoryReserves,
+    /// The machine's release rate the reader opened with.
+    release: ReleaseRate,
     device: Rc<Device>,
-    /// The right to bound the stores the device reaches, the reader's alone
-    /// while it lives.
-    bounds: seismic::Bounds,
+    /// An OS pressure event came since the last reading asked
+    /// ([`Self::pressured`]).
+    pressured: Arc<AtomicBool>,
+    /// Whether the reader watches the OS's pressure events
+    /// ([`Self::watch_pressure`]).
+    watch: Watch,
 }
 
 /// The room a load's search is held to: what the device's store ledgers
-/// leave free at a reading taken for each decision
-/// ([`DeviceReader::read_ledgers_now`]), less the speed guarantee's rise
-/// of others' memory (`memory::ledger::Snapshot::guarantee`; a search
-/// grows no sequence's state). The one authority on room the load's
-/// allocations read too. A reading that fails reads no room: missing
-/// observations never authorize allocation.
+/// let a load's claims take at the reading the load holds
+/// ([`DeviceReader::settled_read`]), its in-process figure in its guarantee
+/// and every holding since counted
+/// (`memory::ledger::DeviceReading::room_after`, `Estimate::room`): the one
+/// authority on room the load's claims read too, and the room its plan
+/// priced.
 pub struct LoadRoom<'a> {
-    pub reader: &'a DeviceReader,
-    pub ledgers: &'a crate::memory::ledger::DeviceLedgers,
+    pub reading: &'a DeviceReading,
+    pub ledgers: &'a DeviceLedgers,
+    /// The load's in-process figure (design §3.2), not yet held in its
+    /// store.
+    pub in_process: u64,
+    /// The machine's release rate (`platform::ReleaseRate::of_machine`).
+    pub release: crate::platform::ReleaseRate,
 }
 
 impl crate::TuningRoom for LoadRoom<'_> {
+    /// The room at the load's reading with every holding since counted:
+    /// reads no OS figure, so a search's decisions share the load's one
+    /// reading.
     fn now(&self, device: &Device) -> crate::RoomNow {
-        assert_eq!(device.info().selector(), self.reader.device.info().selector(), "a search reads the room of its load's device");
-        self.reader.read_ledgers_now(self.ledgers);
-        let room = |ledger: &crate::memory::ledger::Ledger| {
-            let snapshot = ledger.snapshot();
-            snapshot.free().saturating_sub(snapshot.guarantee(0))
-        };
+        let at = self.reading.room_after(self.ledgers, self.in_process);
         crate::RoomNow {
-            device_bytes: room(self.ledgers.device()),
-            host_bytes: room(self.ledgers.host()),
+            device_bytes: at.device.room(),
+            host_bytes: at.host.as_ref().unwrap_or(&at.device).room(),
             host_shared: crate::memory::ledger::shares_host(device),
         }
     }
 
     fn release(&self) -> crate::platform::ReleaseRate {
-        self.reader.reserves.release_rate()
+        self.release
+    }
+}
+
+/// The room a load's plan settles into: the reading the load holds
+/// ([`DeviceReader::settled_read`]) priced as its claims read it
+/// (`DeviceReading::room_after`, [`LoadRoom`]), the in-process figure of the
+/// pass each candidate plan holds in its guarantee. A plan that fits it is
+/// granted by the ledger at that reading: the plan and the claims read one
+/// room. The assessment's stable fit sizes no load ([`crate::StableRoom`] is
+/// the assessment's own).
+pub struct PlanningRoom<'a> {
+    reading: &'a DeviceReading,
+    ledgers: &'a DeviceLedgers,
+    definition: &'a magnitude_family_contracts::ModelDefinition,
+    codec: magnitude_state::KvCodec,
+    tensor_operations: crate::TensorOperations,
+    /// How the device makes its native allocations (`seismic::Limits::allocations`).
+    allocations: seismic::NativeAllocations,
+    /// Device bytes the load already holds that the charges it prices
+    /// count too ([`Self::holding`]).
+    held: u64,
+    /// The state the load's page rule shapes, which no candidate's bank
+    /// changes (its state pools at its own granule), planned once.
+    shape: std::cell::OnceCell<crate::memory::ledger::LoadShape>,
+}
+
+impl<'a> PlanningRoom<'a> {
+    pub fn new(
+        reading: &'a DeviceReading,
+        ledgers: &'a DeviceLedgers,
+        definition: &'a magnitude_family_contracts::ModelDefinition,
+        codec: magnitude_state::KvCodec,
+        tensor_operations: crate::TensorOperations,
+        allocations: seismic::NativeAllocations,
+    ) -> Self {
+        Self { reading, ledgers, definition, codec, tensor_operations, allocations, held: 0, shape: Default::default() }
+    }
+
+    /// This room once the load holds `bytes` of device storage that its
+    /// charges count (the programs' claim, which a plan's charge holds and
+    /// the ledgers show held): the room before it, so a charge is never
+    /// priced against its own claim.
+    pub fn holding(self, bytes: u64) -> Self {
+        Self { held: bytes, ..self }
+    }
+
+    /// The room before any pass is priced into it: the domain bytes the
+    /// load's state is bounded by before its in-process figure is known
+    /// ([`Self::net`] is the room its claims read).
+    pub fn gross(&self) -> u64 {
+        self.reading.room_after(self.ledgers, 0).device.room()
+    }
+
+    /// The room the load's claims read once its in-process figure is
+    /// `in_process`.
+    pub fn net(&self, in_process: u64) -> u64 {
+        self.reading.room_after(self.ledgers, in_process).device.room()
+    }
+
+    /// The load's in-process figure (design §3.2) at the pass `charge`
+    /// holds of `draft`: the state its largest launch grows by
+    /// ([`crate::in_process_bytes`]), by `draft`'s own page rule.
+    pub fn in_process(&self, draft: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge) -> Result<u64, crate::PlanError> {
+        let shape = match self.shape.get() {
+            Some(shape) => shape,
+            None => {
+                let policy = draft.policy();
+                let state = crate::ResourcePlanner::state_plan(
+                    self.definition,
+                    draft.load(),
+                    policy.method(),
+                    self.codec,
+                    policy.limits(),
+                    crate::ResourceCapacity { domain_bytes: self.gross(), tensor_operations: self.tensor_operations, allocations: self.allocations },
+                )
+                .map_err(crate::PlanError::ResourcePlanning)?;
+                self.shape.get_or_init(|| crate::memory::ledger::LoadShape::of_states(state.target_state(), state.head_state()))
+            }
+        };
+        Ok(crate::in_process_bytes(shape, draft.policy().limits().max_launch_rows, charge.held_pass.get()))
+    }
+
+    /// What a load of `draft` holding `charge`'s pass may claim at its
+    /// reading.
+    fn at(
+        &self,
+        draft: &crate::ExecutionPlanDraft,
+        charge: &crate::AssessmentMemoryCharge,
+    ) -> Result<crate::memory::ledger::LoadEstimate, crate::PlanError> {
+        Ok(self.reading.room_after(self.ledgers, self.in_process(draft, charge)?))
+    }
+}
+
+impl crate::SettleRoom for PlanningRoom<'_> {
+    fn capacity(&self) -> Result<u64, crate::PlanError> {
+        Ok(self.gross())
+    }
+
+    fn room(
+        &self,
+        draft: &crate::ExecutionPlanDraft,
+        mandatory: &crate::AssessmentMemoryCharge,
+        bytes: u64,
+    ) -> Result<crate::PlanRoom, crate::PlanError> {
+        let left = self.at(draft, mandatory)?.device.room().saturating_add(self.held).saturating_sub(bytes);
+        Ok(crate::PlanRoom { free: left, ceiling: left })
+    }
+
+    /// `charge` against the stores' rooms: its device storage in the
+    /// device's own store; its host RAM (the tables, the staging window and
+    /// a host tier's floor) in host RAM's, where that is a store of its own,
+    /// else in the device's.
+    fn fit_whole(&self, draft: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge) -> Result<crate::WholeFit, crate::PlanError> {
+        let at = self.at(draft, charge)?;
+        let device = crate::ExecutionPlanDraft::allocated(charge)?;
+        let host = charge.host_demand().map_err(crate::PlanError::ResourcePlanning)?;
+        let device_room = at.device.room().saturating_add(self.held);
+        let (host_room, needed) = match &at.host {
+            Some(store) => (Some(store.room()), device),
+            None => (None, device.saturating_add(host)),
+        };
+        let device_short = needed.saturating_sub(device_room);
+        let host_short = host_room.map_or(0, |room| host.saturating_sub(room));
+        let limiting = if device_short >= host_short { crate::platform::DomainRole::Allocation } else { crate::platform::DomainRole::Staging };
+        let short = std::num::NonZeroU64::new(device_short.max(host_short));
+        Ok(crate::WholeFit {
+            room: crate::PlanRoom { free: device_room, ceiling: device_room },
+            needed,
+            short,
+            limiting: short.map(|_| limiting),
+        })
+    }
+
+    /// Host RAM's room the load's claims read, less `charge`'s host demand
+    /// and the tier's `growth`: the one room a host tier's floor and size
+    /// are decided in. A linked host tier is host RAM's store apart from the
+    /// device's.
+    fn host_left(&self, draft: &crate::ExecutionPlanDraft, charge: &crate::AssessmentMemoryCharge, growth: u64) -> Result<i64, crate::PlanError> {
+        let at = self.at(draft, charge)?;
+        let host = at.host.as_ref().expect("invariant violated: a linked host tier's device reads host RAM as a store of its own");
+        let demand = charge
+            .host_demand()
+            .map_err(crate::PlanError::ResourcePlanning)?
+            .checked_add(growth)
+            .ok_or(crate::PlanError::Arithmetic("a load's host charge overflows"))?;
+        i64::try_from(host.room()).and_then(|room| i64::try_from(demand).map(|demand| room - demand)).map_err(|_| crate::PlanError::Arithmetic("a host tier's room exceeds i64"))
     }
 }
 
@@ -206,12 +287,11 @@ impl DeviceReader {
     /// The reading of `device`, observed once, for a load.
     pub fn open(
         reading: Rc<dyn StatusReading>,
-        reserves: MemoryReserves,
+        release: ReleaseRate,
         device: Rc<Device>,
     ) -> Result<Self, MemoryPolicyError> {
         let status = reading.status(&device);
-        let bounds = device.bounds();
-        let reader = Self { reading, reserves, device, bounds };
+        let reader = Self { reading, release, device, pressured: Arc::new(AtomicBool::new(false)), watch: Watch::Unasked };
         reader.observe(&status)?;
         Ok(reader)
     }
@@ -220,10 +300,10 @@ impl DeviceReader {
         &self.device
     }
 
-    /// The reader's right to bound the device's ledgers.
-    #[cfg(test)]
-    pub(crate) fn bounds(&self) -> &seismic::Bounds {
-        &self.bounds
+    /// The machine's release rate, which a load's search prices giving its
+    /// inputs up by ([`LoadRoom::release`]).
+    pub fn release_rate(&self) -> crate::platform::ReleaseRate {
+        self.release
     }
 
     /// Observe every domain the device uses from a sample read now.
@@ -232,398 +312,392 @@ impl DeviceReader {
         self.observe(&status)
     }
 
-    /// [`Self::refresh`] from the periodic sample published since the last
-    /// ([`StatusReading::published`]), with the sample, which the device's
-    /// ledgers read too (`memory::ledger::DeviceLedgers::read`); none,
-    /// refreshing nothing, where none was published since.
-    pub fn refresh_published(&mut self, changes: &Arc<Changes>) -> Option<(Result<Vec<DomainReading>, MemoryPolicyError>, Sample)> {
-        let sample = self.reading.published(&self.device, changes)?;
-        Some((self.observe(sample.status()), sample))
+    /// Watch the OS's memory pressure events from now on, where it gives
+    /// any, through `host`, host RAM's ledger, whose store has the one
+    /// watch every load in the process shares, each event counted there
+    /// once (`memory::ledger::Ledger::watch_pressure`): each calls `wake`
+    /// (the owner's), and marks the reader pressured until a reading asks
+    /// ([`Self::pressured`]).
+    ///
+    /// # Panics
+    /// Where it was asked already: one owner watches once.
+    pub fn watch_pressure(&mut self, host: &crate::memory::ledger::Ledger, wake: impl Fn() + Send + Sync + 'static) {
+        assert!(matches!(self.watch, Watch::Unasked), "invariant violated: a reader watches memory pressure twice");
+        let pressured = self.pressured.clone();
+        let watched = host.watch_pressure(move || {
+            pressured.store(true, Ordering::Release);
+            wake();
+        });
+        self.watch = match watched {
+            Some(watch) => Watch::Events { _watch: watch },
+            None => Watch::Unwatchable,
+        };
     }
 
-    /// Read `ledgers` from a sample taken now on the owner's thread, which
-    /// never waits ([`StatusReading::sample`]): none standing beside a
-    /// change off its thread, they keep their last reading, still bound by
-    /// it, and the periodic reader's next sample stands
-    /// ([`Sample::take`]).
-    pub fn read_ledgers_now(&self, ledgers: &crate::memory::ledger::DeviceLedgers) {
-        match self.reading.sample(&self.device, ledgers.changes()) {
-            Some(sample) => self.read_ledgers(ledgers, &sample),
-            None => self.bind_ledgers(ledgers),
-        }
+    /// Whether an OS pressure event came since this was last asked.
+    pub fn pressured(&self) -> bool {
+        self.pressured.swap(false, Ordering::AcqRel) || self.reading.take_pressure()
     }
 
-    /// Read `ledgers` from `sample`, the device's status and host RAM's
-    /// available memory at one instant, and bound Seismic's ledger of each store they
-    /// keep to what it claims now and what the ledger lets the process
-    /// allocate beside it (`memory::ledger::Snapshot::allocatable`): the
-    /// room its claims hold for allocations not yet made and the room it
-    /// leaves free, less cache that yielded to a claim and is not freed
-    /// yet; none where the reading failed. The ledger is the one authority
-    /// on room, so Seismic refuses no allocation it admits, nor takes one it
-    /// refuses, and a claim that took cache allocates it as it is freed.
-    pub fn read_ledgers(&self, ledgers: &crate::memory::ledger::DeviceLedgers, sample: &Sample) {
-        ledgers.read(&self.device, sample);
-        self.bind_ledgers(ledgers);
+    /// The pressure event [`Self::pressured`] just took stays owed: the
+    /// reading it was taken for did not stand.
+    pub fn repress(&self) {
+        self.pressured.store(true, Ordering::Release);
     }
 
-    /// Bound Seismic's ledger of each store `ledgers` keep to what it
-    /// claims and what the ledger lets the process allocate beside it
-    /// (`memory::ledger::Snapshot::allocatable`), read from the ledger at
-    /// each admission against the store, never stored: no claim, release or
-    /// reading goes unseen by the admission that follows it.
-    fn bind_ledgers(&self, ledgers: &crate::memory::ledger::DeviceLedgers) {
-        let topology = self.device.topology();
-        for view in self.device.ledgers().stores {
-            let identity = topology.store_identity(view.store).expect("a device's store ledger is of its topology");
-            let Some(ledger) = ledgers.keeping(&identity).cloned() else {
-                continue;
-            };
-            self.bounds
-                .bound_by(view.store, move |claim| Some(claim.saturating_add(ledger.snapshot().allocatable())))
-                .expect("invariant violated: a device bounds the stores it reaches");
-        }
+    /// The reading of `ledgers` at an owner's event, from a sample taken
+    /// now on the owner's thread, which never waits
+    /// ([`StatusReading::sample`]). None stands beside a change of ours off
+    /// the owner's thread; the ledgers then keep their last reading, and the
+    /// change's completion, which wakes the owner, is the event that reads
+    /// again.
+    #[must_use = "an owner decides only on a reading that stood"]
+    pub fn read_at_event(&self, ledgers: &DeviceLedgers) -> Option<DeviceReading> {
+        self.read_at_event_after(ledgers, false)
+    }
+
+    #[must_use = "an owner decides only on a reading that stood"]
+    pub fn read_at_event_after(&self, ledgers: &DeviceLedgers, after_idle: bool) -> Option<DeviceReading> {
+        let sample = self.reading.sample(&self.device, ledgers.changes())?;
+        Some(ledgers.read_after(&self.device, &sample, after_idle))
+    }
+
+    /// The reading a load holds from its start: `ledgers` read from a
+    /// sample taken with no change of ours beside it, waiting for one under
+    /// way to end (`memory::ledger::Sample::settled`). The
+    /// load plans, searches and claims at it (design §5).
+    pub fn settled_read(&self, ledgers: &DeviceLedgers) -> DeviceReading {
+        ledgers.read(&self.device, &self.settled_sample(ledgers.changes()))
+    }
+
+    /// [`Self::settled_read`] of ledgers never read, opened with the
+    /// device: their first reading, which gives the ledgers a load claims
+    /// in ([`UnreadLedgers::read`]).
+    pub fn read_opened(&self, ledgers: UnreadLedgers) -> (DeviceLedgers, DeviceReading) {
+        let sample = self.settled_sample(ledgers.changes());
+        ledgers.read(&self.device, &sample)
+    }
+
+    /// A sample of the device's stores beside `changes`, its ledgers'
+    /// scope's, taken with none of them under way
+    /// (`memory::ledger::Sample::settled`).
+    fn settled_sample(&self, changes: &Changes) -> Sample {
+        Sample::settled(changes, &self.device, || self.reading.now(), || self.reading.status(&self.device))
     }
 
     /// The readings of every domain the device uses in the status sample
     /// `status`.
     fn observe(&self, status: &seismic::Status) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-        let readings = crate::platform::domain_readings(&self.device, status, &self.reserves);
-        // Each reading's planning line by the terms of its margin, where
-        // the memory trace is read.
-        let traced = tracing::enabled!(target: super::MEMORY_TRACE, tracing::Level::DEBUG);
-        for reading in readings.iter().flatten().filter(|_| traced) {
-            let store = self.device.topology().store(reading.domain).expect("a reading is of a store of the device's topology");
-            if !matches!(store.kind(), seismic::StoreKind::Volume(_)) {
-                let terms = self.reserves.margin_terms(store);
-                tracing::debug!(
-                    target: super::MEMORY_TRACE,
-                    store = ?reading.identity,
-                    planning = reading.thresholds.planning_bytes,
-                    fluctuation = terms.fluctuation,
-                    take = terms.take,
-                    latency = terms.latency,
-                    releasing = terms.releasing,
-                    "memory line"
-                );
-            }
-        }
-        readings
+        crate::platform::domain_readings(&self.device, status)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::ledger::{CommittedKind, DeviceLedgers, Ledgers, LoadShape, Need, StoreShape};
+    use crate::memory::ClaimDemand;
     use seismic::BackendName;
+    use std::cell::Cell;
 
-    /// Two readers of the process's one shared open of an executor bound its
-    /// ledgers from their own readings, each moving the other's room: the
-    /// second to take the right to bound them panics at the first it
-    /// takes, its path account, naming both. A test opens a device of its
-    /// own (`test_support::open`) and takes the right alone.
-    #[test]
-    #[should_panic(expected = "a path ledger is bounded by two live holders")]
-    fn a_second_reader_on_a_shared_device_panics() {
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
-        let _first = DeviceReader::open(catalog.clone(), MemoryReserves::of_machine(None), device.clone()).unwrap();
-        let _second = DeviceReader::open(catalog, MemoryReserves::of_machine(None), device);
+    const MIB: u64 = 1 << 20;
+
+    /// Host RAM as a test reads it: the machine's status as first read,
+    /// still from then on (no figure of the live machine moves a test's
+    /// reading), its supply the test's: `free` above the OS's free target
+    /// and `clean` file cache, nothing cold, nothing of the process's out
+    /// of RAM, at no pressure, every figure taken at the sample's instant
+    /// and lagging by nothing, so each change of ours before a sample shows
+    /// in it (the live machine's lag, a binding cgroup's 2 s flush, and its
+    /// first counters' instant would hide them).
+    struct Room {
+        first: seismic::Status,
+        free: Rc<Cell<u64>>,
+        clean: Rc<Cell<u64>>,
     }
 
-    /// Host RAM as a test reads it: the machine's status, its allocatable
-    /// memory `room`, which the ledger's reading of host RAM gives too.
-    struct Room {
-        catalog: Rc<Devices>,
-        room: u64,
-        /// Clean file-backed pages beyond `room`, which only a load counts.
-        reclaimable: u64,
+    impl Room {
+        fn new(catalog: &Devices, device: &Device, free: u64, clean: u64) -> Self {
+            Self { first: catalog.device_status(device), free: Rc::new(Cell::new(free)), clean: Rc::new(Cell::new(clean)) }
+        }
     }
 
     impl StatusReading for Room {
-        fn status(&self, device: &Device) -> seismic::Status {
-            let mut status = self.catalog.device_status(device);
-            let host = status.sample.host_ram.as_mut().expect("the test host reads its memory");
-            host.allocatable.value = self.room;
-            host.limits.clear();
+        fn status(&self, _: &Device) -> seismic::Status {
+            let mut status = self.first.clone();
+            let host = &mut status.sample.host;
+            let now = self.now();
+            host.at = now;
+            host.counted = seismic::Counted { at: now, lag: std::time::Duration::ZERO };
+            host.lag = crate::domain::fixtures::NO_LAG;
+            host.supply = seismic::Supply { free_above_target: self.free.get(), clean_cache: self.clean.get(), cold_reclaimable: 0 };
+            host.own_reclaimed = Some(seismic::OwnReclaimed::NONE);
+            host.pressure = Some(seismic::PressureLevel::Normal);
             status
-        }
-
-        fn available(&self) -> Result<Available, Blind> {
-            Ok(Available::new(1 << 40, self.room, None)
-                .expect("the room is within the total")
-                .with_reclaimable(self.reclaimable))
         }
     }
 
-    /// What the ledger admits, Seismic allocates: the ledger is the one
-    /// authority on room. With 64 MiB of host RAM free and a planning
-    /// reserve of 32 MiB, the ledger admits a 48 MiB allocation, and Seismic
-    /// makes it. (Seismic's bound set from the planning line, the room less
-    /// its reserve, refused it as a load's expert bank was refused after its
-    /// admission: "allocation requires 929955840 bytes; 60887171 bytes
-    /// available".)
-    #[test]
-    fn seismic_allocates_what_the_ledger_admits() {
-        const MIB: u64 = 1 << 20;
+    /// The CPU device of a catalog of the machine, as a test opens it.
+    fn cpu() -> (Rc<Devices>, Rc<Device>) {
         let catalog = Rc::new(Devices::discover(&[]).unwrap());
         let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(32 * MIB - 1, 10.0), crate::platform::ReleaseRate::new(1e9));
-        let reader = DeviceReader::open(Rc::new(Room { catalog, room: 64 * MIB, reclaimable: 0 }), reserves, device.clone()).unwrap();
-        let ledgers = crate::memory::ledger::DeviceLedgers::open_in(
-            &crate::memory::ledger::Ledgers::new(),
-            &device,
-            std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }),
-        );
-        reader.read_ledgers_now(&ledgers);
+        (catalog, device)
+    }
+
+    /// A load holding no state store.
+    fn stateless() -> std::sync::Arc<LoadShape> {
+        std::sync::Arc::new(LoadShape { stores: Vec::new() })
+    }
+
+    /// One store of 1024-wide F32 rows at a context of 1024, and its
+    /// page's rows.
+    fn paged() -> (std::sync::Arc<LoadShape>, u64) {
+        let component = magnitude_state::ComponentDescriptor::new(
+            magnitude_state::LayerRef::Target(0),
+            magnitude_state::CodecSpec::dense(seismic::DType::F32, 1024, 1024),
+            1,
+        )
+        .expect("a component");
+        let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
+        let page_rows = domains[0].pages(&domains, 1024, 16).expect("the pages").page_rows as u64;
+        (std::sync::Arc::new(LoadShape { stores: vec![StoreShape { domains, context: 1024, max_advance: 16 }] }), page_rows)
+    }
+
+    /// Two readers of the process's one open device read its store's one
+    /// ledger: neither moves the other's room apart from what the ledger
+    /// holds, and a claim made beside one reader's reading is counted once
+    /// at the other's. (Before the ledger was the one count, each reader
+    /// bound its own copy of the device's room, and the second to take the
+    /// right panicked.)
+    #[test]
+    fn a_second_reader_on_a_shared_device_reads_the_one_ledger() {
+        let (catalog, device) = cpu();
+        let reading = Rc::new(Room::new(&catalog, &device, 64 * MIB, 0));
+        let first = DeviceReader::open(reading.clone(), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let second = DeviceReader::open(reading, ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let scope = Ledgers::new();
+        let (ours, _) = first.read_opened(DeviceLedgers::open_in(&scope, &device, stateless()));
+        let _held = ours.claim(&device, CommittedKind::Load, ClaimDemand { device: 16 * MIB, ..Default::default() }).expect("the ledger admits it");
+        let (theirs, _) = second.read_opened(DeviceLedgers::open_in(&scope, &device, stateless()));
+        assert_eq!(theirs.device().estimate().room(), 48 * MIB, "the claim beside the first reader is counted once at the second's");
+        assert_eq!(ours.device().estimate().room(), theirs.device().estimate().room(), "one ledger: one room");
+    }
+
+    /// What the ledger admits, Seismic allocates, charged once to the claim
+    /// that admitted it: the ledger is the one authority on room and the
+    /// one count of the process's memory. With 64 MiB of host RAM free, the
+    /// ledger admits a 48 MiB allocation, and Seismic makes it. (Seismic's
+    /// bound set from the planning line, the room less its reserve, refused
+    /// it as a load's expert bank was refused after its admission:
+    /// "allocation requires 929955840 bytes; 60887171 bytes available".)
+    #[test]
+    fn seismic_allocates_what_the_ledger_admits() {
+        let (catalog, device) = cpu();
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, 64 * MIB, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, _) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
         let bytes = 48 * MIB;
-        let _held = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, crate::memory::ClaimDemand { device: bytes, ..Default::default() })
-            .expect("the ledger admits it");
-        seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]).expect("Seismic allocates what the ledger admitted");
+        let mut held = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: bytes, ..Default::default() }).expect("the ledger admits it");
+        let _tensor = held
+            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .expect("Seismic allocates what the ledger admitted");
+        let estimate = ledgers.device().estimate();
+        assert_eq!(estimate.committed(), bytes);
+        assert_eq!(estimate.allocated(), held.claims().iter().map(|claim| claim.allocated_bytes()).sum::<u64>(), "the allocation is charged to its claim alone");
+        assert!(estimate.allocated() >= bytes);
     }
 
     /// Room a claim holds stays Seismic's to allocate through any reading
     /// taken before the allocation is made: a load claims what it
     /// allocates after its target import before the import reads the
     /// ledgers, and the import's bank fills the rest. With 64 MiB free, a
-    /// 48 MiB claim read before it is allocated still allocates. (Bounded
-    /// to free room alone, a load's bound target graphs were refused once
-    /// the import had read: "allocation requires 684195840 bytes; 32205612
-    /// bytes available".)
+    /// 48 MiB claim read before it is allocated still allocates, and the
+    /// reading holds its room for it. (Bounded to free room alone, a load's
+    /// bound target graphs were refused once the import had read:
+    /// "allocation requires 684195840 bytes; 32205612 bytes available".)
     #[test]
     fn seismic_allocates_what_a_claim_holds_across_a_reading() {
-        const MIB: u64 = 1 << 20;
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(32 * MIB - 1, 10.0), crate::platform::ReleaseRate::new(1e9));
-        let reader = DeviceReader::open(Rc::new(Room { catalog, room: 64 * MIB, reclaimable: 0 }), reserves, device.clone()).unwrap();
-        let ledgers = crate::memory::ledger::DeviceLedgers::open_in(
-            &crate::memory::ledger::Ledgers::new(),
-            &device,
-            std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }),
-        );
-        reader.read_ledgers_now(&ledgers);
+        let (catalog, device) = cpu();
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, 64 * MIB, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, _) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
         let bytes = 48 * MIB;
-        let mut held = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, crate::memory::ClaimDemand { device: bytes, ..Default::default() })
-            .expect("the ledger admits it");
-        reader.read_ledgers_now(&ledgers);
-        let _tensor = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]).expect("Seismic allocates what the claim holds");
-        held.made();
+        let mut held = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: bytes, ..Default::default() }).expect("the ledger admits it");
+        assert!(reader.read_at_event(&ledgers).is_some());
+        assert_eq!(ledgers.device().estimate().room(), 16 * MIB, "the reading leaves the claim its room");
+        let _tensor = held
+            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .expect("Seismic allocates what the claim holds");
     }
 
-    /// A claim's room is Seismic's to allocate the moment it is charged, with
+    /// A claim's room is Seismic's to allocate the moment it is taken, with
     /// no reading between the claim and the allocation: a load's claim of
-    /// 48 MiB, 16 MiB of it free and the rest clean file cache only a load
-    /// counts, allocates at once. (A bound stored at the reading before the
-    /// claim left 16 MiB less its reserve, and refused the import: "allocation
-    /// requires 1479475200 bytes; 1365841544 bytes available", the ledger
-    /// then holding 11 GB for it.)
+    /// 48 MiB, 16 MiB of it free and the rest clean file cache, which is
+    /// supply the OS drops without writing, allocates at once. (A bound
+    /// stored at the reading before the claim left 16 MiB less its
+    /// reserve, and refused the import: "allocation requires 1479475200
+    /// bytes; 1365841544 bytes available", the ledger then holding 11 GB
+    /// for it.)
     #[test]
     fn seismic_allocates_what_a_claim_takes_with_no_reading_between() {
-        const MIB: u64 = 1 << 20;
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(8 * MIB - 1, 10.0), crate::platform::ReleaseRate::new(1e9));
-        let reader =
-            DeviceReader::open(Rc::new(Room { catalog, room: 16 * MIB, reclaimable: 48 * MIB }), reserves, device.clone()).unwrap();
-        let ledgers = crate::memory::ledger::DeviceLedgers::open_in(
-            &crate::memory::ledger::Ledgers::new(),
-            &device,
-            std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }),
-        );
-        reader.read_ledgers_now(&ledgers);
+        let (catalog, device) = cpu();
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, 16 * MIB, 48 * MIB)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, _) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
         let bytes = 48 * MIB;
-        let mut held = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, crate::memory::ClaimDemand { device: bytes, ..Default::default() })
-            .expect("a load counts the clean file cache");
-        let _tensor = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]).expect("Seismic allocates what the claim took");
-        held.made();
+        let mut held = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: bytes, ..Default::default() }).expect("the clean file cache is supply");
+        let _tensor = held
+            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .expect("Seismic allocates what the claim took");
     }
 
     /// A state growth reaches Seismic through the slab path with no reading
     /// between its reservation and its allocation: the rows a sequence
-    /// claimed and the slab's rounding past them
-    /// (`StateSlabs::reserve`, held from free room) are one allocation, whose
-    /// bytes the ledger holds and has not allocated until it exists. (Counted
-    /// allocated at its reservation, the rounding left Seismic room for the
-    /// rows alone, and the slab was refused: "allocation requires 117793984
-    /// bytes; 88004412 bytes available".)
+    /// claimed and the slab's rounding past them (`StateSlabs::reserve`,
+    /// held from free room) are one allocation of the store's pool, whose
+    /// bytes the ledger holds before it exists, and once it does the
+    /// charge equals the allocations: the rows committed, the rounding
+    /// spare cache. (Counted allocated at its reservation, the rounding
+    /// left Seismic room for the rows alone, and the slab was refused:
+    /// "allocation requires 117793984 bytes; 88004412 bytes available".)
     #[test]
     fn a_state_growth_with_rounding_is_allocated_through_the_slab_path() {
-        use crate::memory::ledger::{CommittedKind, DeviceLedgers, Ledgers, LoadShape, Need, StoreShape};
-        use crate::memory::ClaimDemand;
-
-        let component = magnitude_state::ComponentDescriptor::new(
-            magnitude_state::LayerRef::Target(0),
-            magnitude_state::CodecSpec::dense(seismic::DType::F32, 1024, 1024),
-            1,
-        )
-        .expect("a component");
-        let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
-        let shape = std::sync::Arc::new(LoadShape { stores: vec![StoreShape { domains: domains.clone(), context: 1024, max_advance: 16 }] });
-        let page_rows = domains[0].geometry(&domains, 1024, 16).expect("a geometry").page_rows as u64;
+        let (shape, page_rows) = paged();
         let page = shape.state_bytes(page_rows);
         let (weights, rounding) = (3 * page, page / 2);
-
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        // The growth view holds the weights, the rows and the rounding.
+        let (catalog, device) = cpu();
+        // The room holds the weights, the rows and the rounding.
         let room = page + weights + rounding;
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(1, 1.0), crate::platform::ReleaseRate::new(1e9));
-        let reader = DeviceReader::open(Rc::new(Room { catalog, room, reclaimable: 0 }), reserves, device.clone()).unwrap();
-        let ledgers = DeviceLedgers::open_in(&Ledgers::new(), &device, shape);
-        reader.read_ledgers_now(&ledgers);
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, room, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, _) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, shape));
 
-        let mut import = ledgers
-            .claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() })
-            .expect("the weights are admitted");
-        let _weights = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]).expect("Seismic allocates the import");
-        import.made();
+        let mut import = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() }).expect("the weights are admitted");
+        let _weights = import
+            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]))
+            .expect("Seismic allocates the import");
 
         let ledger = ledgers.device();
+        let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(page).unwrap()).blocks;
         let mut rows = ledger.claim(Need::StateRows { sequence: crate::RequestId(1), from: 0, to: 0 }).expect("an empty state claim");
         rows.grow(Need::StateRows { sequence: crate::RequestId(1), from: 0, to: page_rows }).expect("the first page fits the free room");
         let mut slabs = crate::domain::state::StateSlabs::new(0);
         let growth = page + rounding;
         slabs.reserve(ledger, growth, std::iter::once(&rows)).expect("the rounding past the rows fits the free room");
-        let _slab = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[growth]).expect("Seismic allocates the reserved slab");
-        ledger.change(|changing| slabs.settle(ledger, growth, std::iter::once(&mut rows), changing));
-        let snapshot = ledger.snapshot();
-        assert_eq!(snapshot.committed() + snapshot.cache(), snapshot.allocated(), "the charge equals the allocations once the slab exists");
+        let _slab = seismic::memory::charging(&[pool], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[growth]))
+            .expect("Seismic allocates the reserved slab");
+        ledger.change(|_| slabs.settle(ledger, growth, 0, std::iter::once(&rows)));
+        let estimate = ledger.estimate();
+        assert_eq!(estimate.committed() + estimate.cache(), estimate.allocated(), "the charge equals the allocations once the slab exists");
+        assert_eq!(estimate.cache_of(crate::memory::ledger::CacheKind::Spare), rounding, "the rounding is spare");
     }
 
-    /// A load's whole admission → import → first state claim sequence, against
-    /// a ledger at the laptop's figures: the clean file cache counts for the
-    /// load, the growth view is tight (the weights and the floor fill it), and
-    /// no reading is taken between a claim and the allocation it admits. Each
-    /// step's allocation succeeds in Seismic, and the charge equals the
-    /// allocations at the end: the state floor is held once, by the floor,
-    /// until the first request's rows are claimed from it. A group's staging
-    /// beyond the floor's is claimed as the group opens, before it is
-    /// allocated: refused while the growth view is tight, admitted and
-    /// allocated at once when room comes back.
+    /// A load's whole admission → import → first state claim sequence, at
+    /// the laptop's figures: the import past the free room takes the clean
+    /// file cache, the room is tight once the weights and the floor fill
+    /// it, and no reading is taken between a claim and the allocation it
+    /// admits. Each step's allocation succeeds in Seismic, and the charge
+    /// equals the allocations at the end: the state floor is held once, by
+    /// the floor, until the first request's rows are claimed from it. A
+    /// group's staging beyond the floor's is claimed as the group opens,
+    /// before it is allocated: refused while the room is tight, admitted
+    /// and allocated at once when room comes back.
     #[test]
     fn a_load_sequence_allocates_what_each_claim_admits_at_the_laptops_figures() {
-        use crate::memory::ledger::{CommittedKind, DeviceLedgers, Ledgers, LoadShape, Need, StoreShape};
-        use crate::memory::ClaimDemand;
-        use std::cell::Cell;
-
-        /// Host RAM as the laptop reads it: the free room moves with the test.
-        struct Moving {
-            catalog: Rc<Devices>,
-            room: Rc<Cell<u64>>,
-            reclaimable: u64,
-        }
-        impl StatusReading for Moving {
-            fn status(&self, device: &Device) -> seismic::Status {
-                let mut status = self.catalog.device_status(device);
-                let host = status.sample.host_ram.as_mut().expect("the test host reads its memory");
-                host.allocatable.value = self.room.get();
-                host.limits.clear();
-                status
-            }
-
-            fn available(&self) -> Result<Available, Blind> {
-                Ok(Available::new(1 << 40, self.room.get(), None)
-                    .expect("the room is within the total")
-                    .with_reclaimable(self.reclaimable))
-            }
-        }
-
-        let component = magnitude_state::ComponentDescriptor::new(
-            magnitude_state::LayerRef::Target(0),
-            magnitude_state::CodecSpec::dense(seismic::DType::F32, 1024, 1024),
-            1,
-        )
-        .expect("a component");
-        let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
-        let shape = std::sync::Arc::new(LoadShape { stores: vec![StoreShape { domains: domains.clone(), context: 1024, max_advance: 16 }] });
-        let page_rows = domains[0].geometry(&domains, 1024, 16).expect("a geometry").page_rows as u64;
+        let (shape, page_rows) = paged();
         let first_page = Need::StateRows { sequence: crate::RequestId(1), from: 0, to: page_rows };
         let second_page = Need::StateRows { sequence: crate::RequestId(1), from: page_rows, to: 2 * page_rows };
         let page = shape.state_bytes(page_rows);
         let (floor_bytes, weights, staging) = (page, 5 * page, page);
 
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        // The growth view holds the floor and the weights' room less one page;
-        // the file cache holds the rest.
-        let room = Rc::new(Cell::new(floor_bytes + weights - page));
-        let reading = Moving { catalog, room: room.clone(), reclaimable: 4 * weights };
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(1, 1.0), crate::platform::ReleaseRate::new(1e9));
-        let reader = DeviceReader::open(Rc::new(reading), reserves, device.clone()).unwrap();
-        let ledgers = DeviceLedgers::open_in(&Ledgers::new(), &device, shape.clone());
-        reader.read_ledgers_now(&ledgers);
+        let (catalog, device) = cpu();
+        // Free room holds the floor and the weights less one page; the
+        // clean file cache holds that page.
+        let reading = Room::new(&catalog, &device, floor_bytes + weights - page, page);
+        let (free, clean) = (reading.free.clone(), reading.clean.clone());
+        let reader = DeviceReader::open(Rc::new(reading), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, _) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, shape));
+        let ledger = ledgers.device();
+        let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(page).unwrap()).blocks;
 
-        // The load claims what it needs to serve, under its policy, and
-        // allocates each claim at once.
+        // The load claims what it needs to serve, and allocates each claim
+        // at once.
         let state_floor = ledgers
             .claim(&device, CommittedKind::StateFloor, ClaimDemand { device: floor_bytes, ..Default::default() })
             .expect("the load's minimum request state is admitted");
         let mut import = ledgers
             .claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() })
-            .expect("the weights, past the growth view, take the file cache");
-        let _weights = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]).expect("Seismic allocates the import");
-        import.made();
+            .expect("the weights, past the free room, take the clean file cache");
+        let _weights = import
+            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]))
+            .expect("Seismic allocates the import");
 
-        // The first request draws its rows from the floor: nothing more held,
-        // and the page it allocates is admitted.
-        let ledger = ledgers.device();
+        // The first request draws its rows from the floor: nothing more
+        // held, and the page it allocates in the pool is admitted.
         let mut state = ledger.claim(Need::StateRows { sequence: crate::RequestId(1), from: 0, to: 0 }).expect("an empty state claim");
         state.grow(first_page).expect("the first page draws from the floor");
-        let _page = ledger.change(|changing| {
-            let made = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[page]).expect("Seismic allocates the first page");
-            state.allocated(page, changing);
-            made
-        });
-        let snapshot = ledger.snapshot();
-        assert_eq!(snapshot.committed(), snapshot.allocated(), "the charge equals the allocations: the floor is held once");
-        assert_eq!(snapshot.committed(), weights + page);
-        assert!(state.grow(second_page).is_err(), "a page past the floor has no room in the tight growth view");
+        let _page = seismic::memory::charging(&[pool.clone()], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[page]))
+            .expect("Seismic allocates the first page");
+        let estimate = ledger.estimate();
+        assert_eq!(estimate.committed(), estimate.allocated(), "the charge equals the allocations: the floor is held once");
+        assert_eq!(estimate.committed(), weights + page);
+        assert!(state.grow(second_page).is_err(), "a page past the floor has no room");
 
-        // A group's staging beyond the floor's: refused while the view is
-        // tight, with nothing held; admitted, then allocated with no reading
-        // between, once the room is back.
+        // A group's staging beyond the floor's: refused while the room is
+        // tight, with nothing held; admitted, then allocated with no
+        // reading between, once room is back.
         let unit = std::num::NonZeroU64::new(staging).unwrap();
         let (refused, units) = ledger.claim_units(CommittedKind::GroupClass, unit, 1);
-        assert_eq!(units, 0, "the tight view holds no staging");
+        assert_eq!(units, 0, "the tight room holds no staging");
         drop(refused);
-        // The allocations took the free room and the file cache covered the
-        // rest: what is free now is what others gave back.
-        room.set(staging);
-        reader.read_ledgers_now(&ledgers);
-        let (mut group, units) = ledger.claim_units(CommittedKind::GroupClass, unit, 1);
+        // The allocations took the free room and the file cache: what is
+        // free now is what others gave back.
+        free.set(staging);
+        clean.set(0);
+        assert!(reader.read_at_event(&ledgers).is_some());
+        let (group, units) = ledger.claim_units(CommittedKind::GroupClass, unit, 1);
         assert_eq!(units, 1, "the room that came back holds the staging");
-        let _staging = ledger.change(|changing| {
-            let made = seismic::Tensor::zeros(&device, seismic::Element::bool(), &[staging]).expect("Seismic allocates the staging its claim admitted");
-            group.allocated(staging, changing);
-            made
-        });
-        let snapshot = ledger.snapshot();
-        assert_eq!(snapshot.committed(), snapshot.allocated(), "the charge equals the allocations with the group's staging");
+        let _staging = seismic::memory::charging(&[group.entry()], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[staging]))
+            .expect("Seismic allocates the staging its claim admitted");
+        let estimate = ledger.estimate();
+        assert_eq!(estimate.committed(), estimate.allocated(), "the charge equals the allocations with the group's staging");
         drop(state_floor);
     }
 
-    /// A load's search reads its room from the load's ledgers, the
-    /// authority its allocations read: with 64 MiB of host RAM free and a
-    /// 32 MiB planning reserve, the search's room is the 64 MiB, in host
-    /// RAM the device's storage shares.
+    /// A load's search reads its room from the load's ledgers at the
+    /// reading the load holds, the authority its claims read: with 64 MiB
+    /// of host RAM free and an in-process figure of 8 MiB, the search's
+    /// room is the 56 MiB, in host RAM the device's storage shares; a claim
+    /// the load makes is counted at once, with no reading taken.
     #[test]
     fn a_search_reads_the_ledgers_room() {
-        const MIB: u64 = 1 << 20;
-        let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
-        let reserves = MemoryReserves::new(crate::platform::StoreMotion::new(32 * MIB - 1, 10.0), crate::platform::ReleaseRate::new(1e9));
-        let reader = DeviceReader::open(Rc::new(Room { catalog, room: 64 * MIB, reclaimable: 0 }), reserves, device.clone()).unwrap();
-        let ledgers = crate::memory::ledger::DeviceLedgers::open_in(
-            &crate::memory::ledger::Ledgers::new(),
-            &device,
-            std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() }),
-        );
-        let room: &dyn crate::TuningRoom = &LoadRoom { reader: &reader, ledgers: &ledgers };
-        assert_eq!(room.now(&device), crate::RoomNow { device_bytes: 64 * MIB, host_bytes: 64 * MIB, host_shared: true });
+        let (catalog, device) = cpu();
+        let reader = DeviceReader::open(Rc::new(Room::new(&catalog, &device, 64 * MIB, 0)), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, reading) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
+        let load = LoadRoom { reading: &reading, ledgers: &ledgers, in_process: 8 * MIB, release: reader.release_rate() };
+        let room: &dyn crate::TuningRoom = &load;
+        assert_eq!(room.now(&device), crate::RoomNow { device_bytes: 56 * MIB, host_bytes: 56 * MIB, host_shared: true });
+        let _held = ledgers.claim_at(&reading, &device, CommittedKind::Load, ClaimDemand { device: 16 * MIB, ..Default::default() }).expect("the ledger admits it");
+        assert_eq!(room.now(&device).device_bytes, 40 * MIB, "the claim is counted at the held reading");
+    }
+
+    /// A load prices the reading it holds (the real `read_opened` path) by
+    /// the room its claims read
+    /// (`DeviceReading::room_after`): with nothing held since, the reading's
+    /// own less its in-process figure, then less exactly what the claims
+    /// took. A reading another load or event takes later moves neither, as
+    /// the load holds its own.
+    #[test]
+    fn a_loads_claims_read_the_room_of_the_reading_it_holds() {
+        let (catalog, device) = cpu();
+        let room = Room::new(&catalog, &device, 64 * MIB, 32 * MIB);
+        let free = room.free.clone();
+        let reader = DeviceReader::open(Rc::new(room), ReleaseRate::of_machine(None), device.clone()).unwrap();
+        let (ledgers, reading) = reader.read_opened(DeviceLedgers::open_in(&Ledgers::new(), &device, stateless()));
+        let in_process = 4 * MIB;
+        let plan = reading.room_after(&ledgers, in_process);
+        assert_eq!(plan.device.room(), 92 * MIB, "the supply less the in-process figure");
+        let _held = ledgers.claim_at(&reading, &device, CommittedKind::Load, ClaimDemand { device: 24 * MIB, ..Default::default() }).expect("the plan's room holds it");
+        assert_eq!(reading.room_after(&ledgers, in_process).device.room(), plan.device.room() - 24 * MIB);
+        free.set(0);
+        assert!(reader.read_at_event(&ledgers).is_some(), "a later event reads the store");
+        assert_eq!(reading.room_after(&ledgers, in_process).device.room(), plan.device.room() - 24 * MIB, "the load's reading stands");
+        assert!(ledgers.claim_at(&reading, &device, CommittedKind::Load, ClaimDemand { device: 60 * MIB, ..Default::default() }).is_ok(), "claims at the held reading");
     }
 }

@@ -12,9 +12,8 @@ mod volume;
 
 pub(crate) use policy::domain_readings;
 pub use policy::{
-    DemandFit, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, StoreMotion, HostRoom, ReleaseRate,
-    Releasable, Releasing, MemoryConstraint, MemoryPolicyError, MemoryReserves, MotionMeter, PageProbe, PlacementFit,
-    READING_INTERVAL, RECOVERY_STABLE_TIME, Recovery, StorageDemand, StoreFit, observe_domains,
+    DemandFit, DomainReading, DomainRole, Fit, FitMode, FitRefusal, MemoryConstraint, MemoryPolicyError,
+    PlacementFit, ReleaseRate, StorageDemand, StoreFit, observe_domains,
 };
 pub use volume::{VolumeReserve, VolumeReserves};
 pub use qualification::{

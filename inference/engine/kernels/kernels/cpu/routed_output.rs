@@ -111,10 +111,9 @@ fn routed_output_rows<L: Isa, E: Elements>(
         // projection.
         match record(slot) {
             Some(place) => {
-                let (down, record) = place.of(&down, &tier);
-                let first = routed::expert_row(record, h) + columns.start;
+                let down = place.of(&down, &tier);
                 let q8 = expert_q8.map(|q8| &q8[choice * expert_blocks..(choice + 1) * expert_blocks]);
-                projection::project_arithmetic(down, first, &expert[choice * f..(choice + 1) * f], q8, projected);
+                projection::project_arithmetic(&down, columns.start, &expert[choice * f..(choice + 1) * f], q8, projected);
             }
             None => projected.fill(0.0),
         }

@@ -6,7 +6,9 @@
 //! tensor, and the call driver) which the public `seismic` crate composes.
 //! Everything else is private:
 //!
-//! - `memory`: process-wide store ledgers, shared path grants and placement reservations.
+//! - [`memory`]: the embedder's ledger handles a device charges every byte it
+//!   takes to, and which store each contract and kind lies in.
+//! - [`pool`]: a device's granule pools and the slab stores over them.
 //! - `driver`: the backend-generic opened device, preparation cache, and the
 //!   narrow primitive that issues one already-admitted node.
 //! - `native`: the explicitly selected authored-native route: formation,
@@ -32,9 +34,9 @@
 pub mod api;
 pub use backends::unmeasured_graph_cost;
 /// What the process's large-page host backing came to (the host pages of
-/// reservations whose granules are whole large pages, backed in them or not),
-/// and the time its reservations' backing took by phase.
-pub use seismic_reservation::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
+/// host ranges whose granules are whole large pages, backed in them or not),
+/// and the time their backing took by phase.
+pub use seismic_memory::{large_page_backing, LargePageBacking};
 pub mod artifacts;
 pub mod devices;
 
@@ -44,8 +46,9 @@ mod driver;
 mod execution;
 pub mod formation;
 mod layout;
-mod memory;
+pub mod memory;
 pub mod native;
+pub mod pool;
 pub mod probes;
 mod resources;
 mod telemetry;

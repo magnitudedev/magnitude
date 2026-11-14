@@ -890,6 +890,28 @@ impl QueueBatch {
     }
 }
 
+/// Encode ordered moves (`super::moves`) as one queue submission of
+/// copies and word writes (`DirectBatch::transfer`), which the queue runs
+/// after every earlier submission: refused, nothing submitted, where a step
+/// is refused or the submission fails.
+pub(super) fn encode_moves(device: &seismic_vulkan::Device, steps: &[super::moves::MoveStep<'_>]) -> Result<Committed, ExecutionError> {
+    use super::moves::MoveStep;
+    use crate::backends::vulkan_transfer_end;
+    let (mut copies, mut words) = (Vec::new(), Vec::new());
+    for step in steps {
+        match *step {
+            MoveStep::Copy { source, source_offset, destination, destination_offset, bytes } => {
+                copies.push((vulkan_transfer_end(source, source_offset), vulkan_transfer_end(destination, destination_offset), bytes))
+            }
+            MoveStep::Word { destination, offset, value } => words.push((vulkan_transfer_end(destination, offset), value)),
+        }
+    }
+    let mut batch = DirectBatch::unmeasured(device)?;
+    batch.transfer(&copies, &words)?;
+    let submission = QueueSubmission::Unmeasured(batch.commit()?);
+    Ok(Committed::Vulkan(VulkanSubmission::new(vec![submission], None)))
+}
+
 impl VulkanSubmission {
     fn new(submissions: Vec<QueueSubmission>, feedback: Option<Feedback>) -> Self {
         assert!(

@@ -4,6 +4,7 @@ use crate::executor::{Device, Executor};
 use crate::workers::Workers;
 use crate::Cpu;
 use seismic_compiler::errors::TargetError;
+use seismic_memory::entry::Store;
 use std::sync::{Arc, Mutex, Weak};
 
 pub struct OpenedCpu {
@@ -19,8 +20,9 @@ static HOST: Mutex<Weak<Mutex<Workers>>> = Mutex::new(Weak::new());
 
 /// The host CPU over its pool of the `cores` performance cores the process
 /// may run on ([`Workers::host`]): the pool any open CPU device of the
-/// process holds already.
-pub fn open_host(cores: std::num::NonZeroUsize) -> Result<OpenedCpu, TargetError> {
+/// process holds already. What the device holds that no allocation names
+/// (the pool scratch its launches grow) is charged to `store`'s own entry.
+pub fn open_host(cores: std::num::NonZeroUsize, store: Arc<dyn Store>) -> Result<OpenedCpu, TargetError> {
     let workers = {
         let mut host = HOST
             .lock()
@@ -37,25 +39,28 @@ pub fn open_host(cores: std::num::NonZeroUsize) -> Result<OpenedCpu, TargetError
             }
         }
     };
-    open_workers(workers)
+    open_workers(workers, store)
 }
 
 /// The host CPU over a pool of the process's quota, for this crate's tests,
 /// which need no particular pool of it.
 #[cfg(test)]
 pub(crate) fn open_quota() -> Result<OpenedCpu, TargetError> {
-    open_host(std::thread::available_parallelism().map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?)
+    open_host(
+        std::thread::available_parallelism().map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?,
+        Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
+    )
 }
 
 /// Opens execution over the production worker pool. Profiling is acquired
 /// separately from this same executor only by an analytical evaluator.
-pub(crate) fn open_workers(workers: Arc<Mutex<Workers>>) -> Result<OpenedCpu, TargetError> {
+pub(crate) fn open_workers(workers: Arc<Mutex<Workers>>, store: Arc<dyn Store>) -> Result<OpenedCpu, TargetError> {
     let device = crate::profile::device_for_workers(
         &workers.lock().expect("CPU worker-pool lock poisoned"),
     )?;
     Ok(OpenedCpu {
         service: Device,
-        executor: Executor::from_workers(workers),
+        executor: Executor::from_workers(workers, store.own()),
         device,
     })
 }

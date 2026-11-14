@@ -411,8 +411,9 @@ pub(super) struct BlockBindings {
 pub(crate) struct BoundPerLayerEntry {
     /// The graph per row class, bound to its weights.
     pub(super) bound: BTreeMap<u64, BoundNativeGraphPlan>,
-    /// The table whose rows each step gathers, streamed.
-    pub table: StreamedTable,
+    /// The table whose rows each step gathers, streamed: the resident
+    /// target's.
+    pub table: std::rc::Rc<StreamedTable>,
     /// The per-layer rows the entry computed for single tokens, kept in the
     /// floor's rows a single-row step leaves unwritten
     /// (`GroupBuffers::per_layer_rows`).

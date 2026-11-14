@@ -1,0 +1,552 @@
+//! A reading as the ledger estimated it, and the estimate every decision reads.
+
+use std::time::Duration;
+
+use crate::memory::shortage;
+use crate::memory::supply::{Ceiling, HostGrant, Observed, Reading};
+
+use super::changes::Sampled;
+use super::state::State;
+use super::vocabulary::CacheKind;
+
+/// A reading as the ledger estimated it (§4.1-4.3): every figure of one
+/// sample's instant, the process's own as the sample shows it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Read {
+    pub(super) at: Sampled,
+    /// The store's supply, others' cold pages in it only once harm is
+    /// judged ([`Boundary::judges`]).
+    supply: u64,
+    /// What the process had allocated as the sample shows it.
+    visible: u64,
+    /// Of `visible`, the pageable bytes the OS reports holding outside RAM,
+    /// compressed or swapped ([`Reading::own_reclaimed`]): the process's
+    /// still, and in no figure of what the store uses.
+    nonresident: u64,
+    /// Of `visible` beyond `nonresident`, what the store's use does not hold
+    /// and the OS did not report: [`Estimate::unobserved_resident`].
+    unobserved: u64,
+    /// Others' memory: what the store uses beyond the supply and the
+    /// process's own bytes in it as the sample shows them.
+    others: u64,
+    /// Others' rise since the reading before.
+    rise: u64,
+    /// The wired ceiling's grant: the limit less others' wired bytes and
+    /// their rise; none where no ceiling bounds the store.
+    pub(super) grant: Option<u64>,
+    /// The system's wired ceiling and wire count at the reading, as the
+    /// sample gave them; none where no ceiling bounds the store.
+    ceiling: Option<Ceiling>,
+    /// What the process wires beyond the OS's wire count:
+    /// [`Estimate::unwired_shortfall`].
+    unwired: u64,
+    lag: seismic::Lag,
+    /// Whether the reading shows every change of the process's: others'
+    /// rise is judged only between two such readings.
+    shown: bool,
+    /// The boundary B the reading left standing (`memory::supply`).
+    cap: Option<u64>,
+    /// Growth is admissible at the reading: the store reads no paging
+    /// signals, or a baseline judges harm and no growth step's window λ_h
+    /// is open.
+    grows: bool,
+}
+
+impl Read {
+    /// What the store's use held of the process's bytes at the reading:
+    /// those the sample shows, less those out of RAM, reported or not.
+    fn in_use(&self) -> u64 {
+        self.visible - self.nonresident - self.unobserved
+    }
+}
+
+/// The ledger's estimate of its store at the latest reading's instant
+/// (§4.1-4.4): every figure one decision reads, the entries as they stand
+/// and the reading as the journal attributes it.
+#[derive(Clone, Debug)]
+pub struct Estimate {
+    pub(super) read: Read,
+    committed: u64,
+    cache: u64,
+    /// What entries' holders allocated of them, and cache still releasing.
+    allocated: u64,
+    /// What cache yielded and its holders have not freed yet.
+    releasing: u64,
+    /// Of it, what was shed to a shortage: held by no claim.
+    shed: u64,
+    cache_of: [u64; CacheKind::ALL.len()],
+    /// Of the spare cache, the records pool's free granules: the only spare
+    /// the bank's slots grow into, each pool holding its own class
+    /// (`PoolClass`).
+    bank_spare: u64,
+    in_process: u64,
+    /// A change of the process's no reading shows yet.
+    pending: bool,
+    /// The store's readings so far with some of the process's bytes
+    /// unobserved ([`Self::unobserved_resident`]).
+    unobserved_readings: u64,
+    /// The store's readings so far with bytes of the process's that its
+    /// use does not hold, where the OS counts those out of RAM exactly:
+    /// the ledger charged what the OS does not show
+    /// ([`Self::accounting_violations`]).
+    accounting_violations: u64,
+    /// The store's readings so far with a wire count short of the
+    /// process's wired bytes ([`Self::unwired_shortfall`]).
+    unwired_readings: u64,
+}
+
+impl Estimate {
+    /// This estimate as a load whose in-process figure is `in_process` will
+    /// find it once loaded and serving: its figure in the guarantee.
+    pub(super) fn at_load(mut self, in_process: u64) -> Self {
+        self.in_process = self.in_process.checked_add(in_process).expect("a store's in-process bytes fit u64");
+        self
+    }
+
+    /// The instant of the reading it estimates.
+    pub fn at(&self) -> Sampled {
+        self.read.at
+    }
+
+    /// The store's lag: the longest any change of the process's takes to
+    /// show in its live figures ([`seismic::Lag`]). A shortage persists
+    /// across readings spanning more than it (`memory::shortage`).
+    pub fn lag(&self) -> Duration {
+        let lag = self.read.lag;
+        lag.release.max(lag.growth)
+    }
+
+    /// Committed bytes held.
+    pub fn committed(&self) -> u64 {
+        self.committed
+    }
+
+    /// Cache bytes held.
+    pub fn cache(&self) -> u64 {
+        self.cache
+    }
+
+    /// Cache bytes of `kind` held.
+    pub fn cache_of(&self, kind: CacheKind) -> u64 {
+        self.cache_of[kind.index()]
+    }
+
+    /// What entries hold, committed and cache.
+    fn held(&self) -> u64 {
+        self.committed + self.cache
+    }
+
+    /// Bytes the process allocated: of what it holds, and what cache
+    /// yielded that its holders have not freed yet.
+    pub fn allocated(&self) -> u64 {
+        self.allocated
+    }
+
+    /// What cache yielded that its holders have not freed yet
+    /// ([`Cached::released`]).
+    pub fn releasing(&self) -> u64 {
+        self.releasing
+    }
+
+    /// The store's supply at the reading (§4.2): free above the OS's
+    /// target, clean cache and, once harm is judged, cold reclaimable pages.
+    pub fn supply(&self) -> u64 {
+        self.read.supply
+    }
+
+    /// Other programs' memory at the reading: what the store uses beyond
+    /// its supply and the process's own as the sample shows it. No claim or
+    /// free of the process's moves it.
+    pub fn others(&self) -> u64 {
+        self.read.others
+    }
+
+    /// The process's pageable bytes the OS reported holding outside RAM
+    /// at the reading, compressed or swapped
+    /// (`seismic::HostSample::own_reclaimed`): the process's still, held by
+    /// its entries and never others', and out of the budget, as they come
+    /// back into RAM only from the supply ([`Self::budget`]).
+    pub fn nonresident(&self) -> u64 {
+        self.read.nonresident
+    }
+
+    /// The process's bytes at the reading that neither what the store used
+    /// held nor the OS reported outside RAM: out of RAM unreported (no OS
+    /// figure, or an approximate one), or a device driver's charge counted
+    /// at its bound. Never others', and out of the budget as
+    /// [`Self::nonresident`] is; none where every byte was observed.
+    pub fn unobserved_resident(&self) -> u64 {
+        self.read.unobserved
+    }
+
+    /// The store's readings so far at which some of the process's bytes
+    /// were unobserved ([`Self::unobserved_resident`]) where the OS gives no
+    /// exact count of those out of RAM.
+    pub fn unobserved_readings(&self) -> u64 {
+        self.unobserved_readings
+    }
+
+    /// The store's readings so far at which bytes were unobserved where the
+    /// OS counts those out of RAM exactly (macOS): the ledger charged bytes
+    /// the OS does not show. An error, never a missing figure; none in a
+    /// correct run, so a run's gate fails on any.
+    pub fn accounting_violations(&self) -> u64 {
+        self.accounting_violations
+    }
+
+    /// The wired ceiling's limit at the reading, `min(iogpu.wired_limit_mb
+    /// or its default, recommendedMaxWorkingSetSize)`; none where no
+    /// ceiling bounds the store.
+    pub fn wired_limit(&self) -> Option<u64> {
+        self.read.ceiling.map(|ceiling| ceiling.limit)
+    }
+
+    /// The bytes the OS wires machine-wide at the reading, the process's
+    /// included; none where no ceiling bounds the store.
+    pub fn wire_count(&self) -> Option<u64> {
+        self.read.ceiling.map(|ceiling| ceiling.wired)
+    }
+
+    /// What the process wires beyond the OS's wire count at the reading:
+    /// a residency set the OS let lapse and has not wired again. Others'
+    /// wired bytes stand at the last count that showed them meanwhile.
+    pub fn unwired_shortfall(&self) -> u64 {
+        self.read.unwired
+    }
+
+    /// The store's readings so far whose wire count was short of the
+    /// process's wired bytes ([`Self::unwired_shortfall`]).
+    pub fn unwired_readings(&self) -> u64 {
+        self.unwired_readings
+    }
+
+    /// What the process may hold in the store: `min(grant, in_use +
+    /// supply)`, `in_use` what the store's use holds of the process's
+    /// allocated bytes as the sample shows them (those out of RAM come
+    /// back only into the supply), the grant the wired ceiling's where one
+    /// bounds the store (§4.3).
+    pub fn budget(&self) -> u64 {
+        let room = self.read.in_use().saturating_add(self.read.supply);
+        self.read.grant.map_or(room, |grant| grant.min(room))
+    }
+
+    /// Room a new holding may take: the budget less everything held and
+    /// what cache shed to a shortage still releases, allocated by no entry
+    /// that holds it. What a claim took in process is held by the claim.
+    pub fn free(&self) -> u64 {
+        self.budget().saturating_sub(self.held().saturating_add(self.shed))
+    }
+
+    /// The one bound on an allocation (Seismic's, through an entry): the
+    /// bytes the budget leaves beside what the process has allocated,
+    /// releasing bytes included. A claim that took cache in process
+    /// allocates those bytes only once their holder freed them.
+    pub fn allocatable(&self) -> u64 {
+        self.budget().saturating_sub(self.allocated)
+    }
+
+    /// The loads' in-process figures in the store (§3.2).
+    pub fn in_process(&self) -> u64 {
+        self.in_process
+    }
+
+    /// The speed guarantee: free room the bank's target leaves for growth
+    /// that arrives within one reading: `in_process` and others' rise since
+    /// the reading before.
+    pub fn guarantee(&self) -> u64 {
+        self.in_process.saturating_add(self.read.rise)
+    }
+
+    /// What the process holds past the budget less the guarantee: the
+    /// guarantee's room its holdings spend, exact where free room
+    /// ([`Self::free`]) reads none.
+    pub fn over_guarantee(&self) -> u64 {
+        self.held().saturating_add(self.shed).saturating_add(self.guarantee()).saturating_sub(self.budget())
+    }
+
+    /// What a claim may take beside what is committed and the guarantee:
+    /// free room and every cache, which yields to it.
+    pub fn room(&self) -> u64 {
+        self.budget().saturating_sub(self.committed.saturating_add(self.guarantee()))
+    }
+
+    /// The boundary B: the most the process may hold, where it stands.
+    pub fn cap(&self) -> Option<u64> {
+        self.read.cap
+    }
+
+    /// Whether a change of the process's is not yet shown by the reading.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// The bytes the bank's cache (its slots above the floor and the
+    /// pool's spare granules) may hold (§4.4): the budget less committed
+    /// memory, every other cache and the guarantee; within B where it
+    /// stands; and no more than it holds where growth is not admissible
+    /// (a step's window open, or no baseline yet to judge harm by). Steady
+    /// decode moves none of it: its state growth is held once, by the
+    /// in-process term it draws down (`State::in_process_left`), and
+    /// others' rise counts only where attributed to them. What moves it
+    /// within a block (others' jitter) the bank keeps
+    /// (`experts::derived::held_target`).
+    /// The room the store leaves the bank and its records pool's spare
+    /// granules (`budget` less everything beside them and the guarantee,
+    /// bounded by any weight cap; the state pool's spare is beside them, as
+    /// no slot lies in its granules),
+    /// before runtime growth's harm-rate gate (`Self::target`). Load import
+    /// sizes what the store's room holds at open (`experts::derived::import_target`).
+    pub fn import_room(&self) -> u64 {
+        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let beside = self.committed.saturating_add(self.cache - bank);
+        let room = self.budget().saturating_sub(beside.saturating_add(self.guarantee()));
+        self.read.cap.map_or(room, |cap| room.min(cap.saturating_sub(beside)))
+    }
+
+    pub fn target(&self) -> u64 {
+        let bank = self.cache_of(CacheKind::Bank) + self.bank_spare;
+        let room = self.import_room();
+        match self.read.grows {
+            true => room,
+            false => room.min(bank),
+        }
+    }
+}
+
+impl State {
+    /// The estimate of the store now; none before its first reading.
+    pub(super) fn estimate(&self) -> Option<Estimate> {
+        self.read.map(|read| self.estimate_at(read))
+    }
+
+    /// The estimate of the store at `read`'s OS figures with what the
+    /// process holds now: the latest reading's ([`Self::estimate`]), or
+    /// one a load holds ([`DeviceReading::room_after`]), every holding
+    /// since counted.
+    pub(super) fn estimate_at(&self, read: Read) -> Estimate {
+        Estimate {
+            read,
+            committed: self.committed - self.floor.min(self.state_total),
+            cache: self.cache,
+            allocated: self.allocated,
+            releasing: self.releasing,
+            shed: self.releasing - self.taken,
+            cache_of: self.cache_of,
+            bank_spare: self.spare_of(super::vocabulary::PoolClass::Records),
+            in_process: self.in_process_left(),
+            pending: self.journal.pending(),
+            unobserved_readings: self.unobserved_readings,
+            accounting_violations: self.accounting_violations,
+            unwired_readings: self.unwired_readings,
+        }
+    }
+
+    /// The in-process term of the guarantee (§3.2): none with no sequence
+    /// admitted, as nothing can grow in process then (a load idle under a
+    /// squeeze refuses new work, [`Self::admit`], and never unloads for
+    /// growth that cannot come); while sequences are admitted, the loads'
+    /// figures less the state they hold beyond the state floor. Decode's
+    /// state growth is the growth the figure guarantees room for, so it is
+    /// held once: as it is claimed, page by page, the committed state rises
+    /// by what the term falls, and neither the target nor a shortage moves
+    /// until the state passes the figure.
+    fn in_process_left(&self) -> u64 {
+        match self.state_of.is_empty() {
+            true => 0,
+            false => self.in_process.saturating_sub(self.state_total.saturating_sub(self.floor)),
+        }
+    }
+
+    /// The reading a decision is judged at: `at`, a reading a load holds
+    /// ([`DeviceLedgers::claim_at`]), or else the latest. The one way a
+    /// judgment obtains its reading: what admits, covers or sizes takes a
+    /// [`Read`], so none can be made of a store with none. A claim is made
+    /// only in ledgers read before they claim ([`super::UnreadLedgers`]),
+    /// and Seismic's charge of a device's own entry in a store never read
+    /// takes no judgment (`State::entry_take`).
+    ///
+    /// # Panics
+    /// Where the store was never read: no ledger that judges exists then.
+    pub(super) fn reading(&self, store: &seismic::StoreIdentity, at: Option<Read>) -> Read {
+        at.or(self.read).unwrap_or_else(|| panic!("invariant violated: {store:?} admits before its first reading"))
+    }
+
+    /// The estimate at the latest reading ([`Self::reading`]).
+    pub(super) fn judged(&self, store: &seismic::StoreIdentity) -> Estimate {
+        self.estimate_at(self.reading(store, None))
+    }
+
+    /// Fold in `reading`, sampled at `at` (§4.1-4.3), `events`, the OS's
+    /// pressure events in the store no reading took yet, and `after_idle`,
+    /// whether the store had no readings across an unmonitored idle sleep.
+    pub(super) fn read(&mut self, at: Sampled, reading: Reading, events: u64, after_idle: bool) {
+        self.readings += 1;
+        self.waiting = false;
+        self.shed_at_reading = 0;
+        let settled = after_idle && events == 0;
+        let lag = reading.lag();
+        // The live figures show the machine at the sample's instant; the
+        // counters (cold, harm, wire count) at their own, which may be
+        // earlier (`seismic::Counted`): what they show of the process is
+        // judged there, and a change leaves the journal only once every
+        // figure shows it.
+        let counted_at = reading.paging().map_or(at.at(), |paging| paging.counted.at);
+        let own = self.own();
+        let visible = self.journal.visible(own, at, at.at(), lag);
+        let counted = self.journal.visible(own, at, counted_at, lag);
+        self.journal.settle(at, counted_at.min(at.at()), lag);
+        // Every change of the process's shows in this reading.
+        let shown = !self.journal.pending();
+        let figures = reading.supply();
+        // None of the process's pages is supply (its cold pages are left
+        // out of it below), but those the OS compressed or swapped out are
+        // in no figure of what the store uses either. The OS reports those
+        // where it can ([`Reading::own_reclaimed`]), counting anonymous
+        // memory the ledger does not hold beside the process's pageable
+        // bytes, so they are bounded by those; wired bytes are never
+        // reclaimed. What the store's use holds of the process's is the
+        // rest, which with the supply is what only others' changes move.
+        let pageable = visible.allocated.saturating_sub(visible.wired);
+        let reclaimed = reading.own_reclaimed();
+        let nonresident = reclaimed.map_or(0, |own| own.bytes.min(pageable));
+        let resident = visible.allocated - nonresident;
+        // Others' cold pages are supply by the judgment of the readings
+        // before this one: the boundary folds this reading below, with the
+        // room the process's bytes in use leave, which the supply sets.
+        let supply = figures.free_above_target + reading.clean_cache_supply() + self.cold_supply(&reading, figures);
+        // What the store uses beyond its supply is others' and the
+        // process's own bytes in RAM. What its use does not hold of
+        // `resident` is the process's bytes out of RAM that the OS did not
+        // report: where it reports none (a cgroup shared with other
+        // processes, Windows before 1809), where its count is approximate
+        // (Linux's batched swap count), or where the store is a device's,
+        // whose driver objects are charged at a bound (CUDA's module and
+        // stack charge). Never others', and no failed reading: a term of
+        // its own, its readings counted. Where the OS's count is exact
+        // (macOS) nothing is unreported: the shortfall is a ledger charge
+        // the OS does not show, an accounting error, counted apart and
+        // logged. It stays a count, never a panic: a driver's charge or a
+        // page the OS has not yet faulted in may produce it, and a budget
+        // lowered by it is the safe side.
+        let used = reading.total() - supply;
+        let unobserved = resident.saturating_sub(used);
+        if unobserved > 0 {
+            match reclaimed.is_some_and(|own| own.exact) {
+                true => {
+                    self.accounting_violations += 1;
+                    tracing::error!(
+                        target: crate::MEMORY_TRACE,
+                        unobserved,
+                        resident,
+                        used,
+                        "the ledger holds bytes in RAM that the store's use does not, where the OS reports its own pages out of RAM exactly"
+                    );
+                }
+                false => self.unobserved_readings += 1,
+            }
+        }
+        let in_use = resident - unobserved;
+        // The OS's compressed store holds the process's compressed pages in
+        // RAM, in what the store uses and in no byte of `in_use`: its
+        // figure is an estimate at the compressor's machine-wide ratio, so
+        // others' are no less than none.
+        let stored = reclaimed.map_or(0, |own| own.stored.min(nonresident));
+        let others = (used - in_use).saturating_sub(stored);
+        if settled {
+            self.boundary.settle_idle();
+        }
+        if let Some(paging) = reading.paging() {
+            let room = in_use.saturating_add(figures.total());
+            self.boundary.observe(Observed { paging, held: counted.allocated, live: visible.allocated, room, unit: self.unit(), events });
+        }
+        // Others' rise counts only where it is attributed to them, between
+        // readings that show every change of the process's: their harm, or a
+        // fall of the supply that the process's own bytes in use do not
+        // explain. A total that moves (a binding scope's) or the process's
+        // own change shown out of step raises `others` with no such fall,
+        // and raises nothing. A reading that cannot judge it, its own change
+        // not yet shown in either side, keeps the rise last judged: our own
+        // resize must not erase the rise it answered (macOS's counters, a
+        // second stale, left 285 of 1,184 readings unshown on an M4 Pro,
+        // and each one regrew a slot just shed into that rise). A reading
+        // after an idle sleep judges none: the rise is none.
+        let rise = match self.read.filter(|_| !settled) {
+            None => 0,
+            Some(before) if !(before.shown && shown) => before.rise,
+            Some(before) => {
+                let risen = others.saturating_sub(before.others);
+                match self.boundary.harmed() {
+                    Some(_) => risen,
+                    None => {
+                        let fall = i128::from(before.supply) - i128::from(supply) - (i128::from(in_use) - i128::from(before.in_use()));
+                        risen.min(u64::try_from(fall.max(0)).expect("a supply's fall fits u64"))
+                    }
+                }
+            }
+        };
+        let mut unwired = 0;
+        let grant = match reading.grant() {
+            Some(HostGrant::Wired(ceiling)) => {
+                // Others' wired bytes: what the OS wires beyond the process's
+                // own wired bytes as the counters show them. The process's
+                // pageable memory is never in the count.
+                let (wired_others, wired_rise) = match ceiling.wired.checked_sub(counted.wired) {
+                    Some(wired_others) => {
+                        let judged = !settled && self.read.is_some_and(|before| before.shown) && shown;
+                        let wired_rise = self.wired_others.filter(|_| judged).map_or(0, |before| wired_others.saturating_sub(before));
+                        self.wired_others = Some(wired_others);
+                        (wired_others, wired_rise)
+                    }
+                    // The count shows less than the process wires: a residency
+                    // set the OS let lapse, not yet wired again when the
+                    // counters were read (whether Metal's `requestResidency`
+                    // returns only once the set is wired is not measured), so
+                    // the count shows neither side whole. The shortfall is its
+                    // own term, its readings counted; others' wired bytes stand
+                    // at the last count that showed them (the whole count, the
+                    // most they can be, before one), and rise by nothing.
+                    None => {
+                        unwired = counted.wired - ceiling.wired;
+                        self.unwired_readings += 1;
+                        (self.wired_others.unwrap_or(ceiling.wired), 0)
+                    }
+                };
+                Some(ceiling.limit.saturating_sub(wired_others).saturating_sub(wired_rise))
+            }
+            Some(HostGrant::Limit(limit)) => Some(limit),
+            Some(HostGrant::Budget { capacity, left }) => Some(visible.allocated.saturating_add(left).min(capacity)),
+            None => None,
+        };
+        if let Some(before) = self.read.filter(|before| !settled && before.others != others) {
+            let interval = at.at().duration_since(before.at.at());
+            self.others_interval = Some(self.others_interval.map_or(interval, |shortest| shortest.min(interval)));
+        }
+        let paged = reading.paging().is_some();
+        let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
+        self.read = Some(Read { at, supply, visible: visible.allocated, nonresident, unobserved, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
+        let estimate = self.estimate().expect("a store just read is estimated");
+        let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());
+        self.persistence.observe(at, cause);
+    }
+
+    /// The cold pages of `reading` that are supply (§4.2): none on host RAM
+    /// until a baseline judges harm, as growth into them could not be told
+    /// from harm before; then others' alone. The process's own cold pages
+    /// are never supply: where the OS counts them they are left out, and
+    /// where it does not, no cold page is supply while the process holds
+    /// pageable memory there, which may be any of them. A device store
+    /// has none.
+    fn cold_supply(&self, reading: &Reading, figures: seismic::Supply) -> u64 {
+        let Some(paging) = reading.paging() else {
+            return figures.cold_reclaimable;
+        };
+        if !self.boundary.judges() {
+            return 0;
+        }
+        match paging.own_cold {
+            seismic::OwnCold::Bytes(_) => figures.cold_reclaimable.min(paging.cold),
+            seismic::OwnCold::Unobserved if self.allocated > self.wired => 0,
+            seismic::OwnCold::Unobserved => figures.cold_reclaimable,
+        }
+    }
+}

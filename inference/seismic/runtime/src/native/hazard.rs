@@ -29,7 +29,7 @@
 
 use super::Dispatch;
 use super::DispatchList;
-use crate::api::tensor::Records;
+use crate::api::tensor::{Records, SlabReach};
 use crate::driver::Allocation;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -133,7 +133,7 @@ pub(crate) fn relative_placement(list: &impl DispatchList, calls: Range<usize>) 
         placement.push(reaches.len() as u64);
         for reach in &reaches {
             let places = first.len() as u64;
-            let (place, origin) = *first.entry(reach.allocation.identity()).or_insert((places, reach.offset));
+            let (place, origin) = *first.entry(reach.allocation).or_insert((places, reach.offset));
             // Two's complement: a reach before the allocation's first lies
             // at a distance below it.
             placement.extend([place, reach.offset.wrapping_sub(origin), reach.bytes, reach.through as u64]);
@@ -171,38 +171,28 @@ pub(crate) enum Through {
     Slab,
 }
 
-/// What a slab view's binding reaches ([`TensorInner::slab_reach`]): its
-/// address-table entries and, by address, each backed slab region
-/// (allocation, byte offset, bytes).
-///
-/// [`TensorInner::slab_reach`]: crate::api::tensor::TensorInner::slab_reach
-pub(crate) struct SlabReach {
-    pub(crate) table_bytes: u64,
-    pub(crate) regions: Vec<(std::sync::Arc<Allocation>, u64, u64)>,
-}
-
 impl SlabReach {
     /// The reaches of buffer `buffer`, bound to this slab view's table at
     /// `offset` of `table`, into `reaches`.
-    pub(crate) fn extend<'a>(
-        &'a self,
+    pub(crate) fn extend(
+        &self,
         buffer: usize,
-        table: &'a Allocation,
+        table: &Allocation,
         offset: u64,
-        reaches: &mut Vec<Reach<'a>>,
+        reaches: &mut Vec<Reach>,
     ) {
         reaches.push(Reach {
             buffer,
-            allocation: table,
+            allocation: table.identity(),
             offset,
             bytes: self.table_bytes,
             through: Through::Table,
         });
-        reaches.extend(self.regions.iter().map(|(allocation, offset, bytes)| Reach {
+        reaches.extend(self.regions.iter().map(|&(allocation, offset, bytes)| Reach {
             buffer,
             allocation,
-            offset: *offset,
-            bytes: *bytes,
+            offset,
+            bytes,
             through: Through::Slab,
         }));
     }
@@ -210,31 +200,38 @@ impl SlabReach {
 
 impl Records {
     /// The reach of buffer `buffer`, bound to the table entries of records
-    /// `[first, first + count)` of this view: the bytes the records span,
-    /// reached by their addresses. The entries themselves order nothing:
-    /// device work only reads a record table (the host writes it).
-    pub(crate) fn extend<'a>(
-        &'a self,
+    /// `[first, first + count)` of this view, which lie in storage of their
+    /// own (a slab view's lie wherever its slabs do: its [`SlabReach`]): the
+    /// bytes the records span, reached by their addresses. The entries
+    /// themselves order nothing: device work only reads a record table (the
+    /// host writes it).
+    pub(crate) fn extend(
+        &self,
         buffer: usize,
         first: u64,
         count: u64,
-        reaches: &mut Vec<Reach<'a>>,
+        reaches: &mut Vec<Reach>,
     ) {
-        let (offset, bytes) = self.span(first, count);
+        let (storage, start) = self
+            .storage
+            .as_ref()
+            .expect("a slab view's records are reached through its slab reach");
         reaches.push(Reach {
             buffer,
-            allocation: &self.storage,
-            offset,
-            bytes,
+            allocation: storage.identity(),
+            offset: start + first * self.record,
+            bytes: count * self.record,
             through: Through::Slab,
         });
     }
 }
 
 /// Bytes one launch reaches through its buffer `buffer` (ABI order).
-pub(crate) struct Reach<'a> {
+#[derive(Clone, Copy)]
+pub(crate) struct Reach {
     pub(crate) buffer: usize,
-    pub(crate) allocation: &'a Allocation,
+    /// [`Allocation::identity`].
+    pub(crate) allocation: u64,
     pub(crate) offset: u64,
     pub(crate) bytes: u64,
     pub(crate) through: Through,
@@ -250,18 +247,12 @@ pub(crate) struct Access {
 }
 
 impl Access {
-    fn of(allocation: &Allocation, offset: u64, bytes: u64, write: bool) -> Self {
+    fn of(allocation: u64, offset: u64, bytes: u64, write: bool) -> Self {
         Self {
-            allocation: allocation.identity(),
+            allocation,
             bytes: offset..offset.checked_add(bytes).expect("a reached range's end fits u64"),
             write,
         }
-    }
-
-    /// Whether it writes any of `bytes` of the allocation `allocation`
-    /// ([`Allocation::identity`]).
-    pub(crate) fn writes(&self, allocation: u64, bytes: &Range<u64>) -> bool {
-        self.write && self.allocation == allocation && self.bytes.start < bytes.end && bytes.start < self.bytes.end
     }
 }
 
@@ -270,7 +261,7 @@ impl Access {
 /// them, and its scalar-result slots when the kernel publishes scalars.
 pub(crate) fn dispatch_accesses(
     dispatch: &Dispatch<'_>,
-    reaches: &[Reach<'_>],
+    reaches: &[Reach],
     accesses: &mut Vec<Access>,
 ) {
     let kernel = dispatch.kernel;
@@ -280,7 +271,7 @@ pub(crate) fn dispatch_accesses(
         Access::of(reach.allocation, reach.offset, reach.bytes, write)
     }));
     if let Some(scalars) = &kernel.scalars {
-        accesses.push(Access::of(&scalars.slots, 0, scalars.bytes(), true));
+        accesses.push(Access::of(scalars.slots.identity(), 0, scalars.bytes(), true));
     }
 }
 
@@ -683,11 +674,11 @@ mod tests {
                 representations: &[],
             }
         }
-        fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<Reach<'s>>) {
+        fn reaches(&self, index: usize, reaches: &mut Vec<Reach>) {
             for (buffer, (allocation, range)) in self.calls[index].iter().flatten().enumerate() {
                 reaches.push(Reach {
                     buffer,
-                    allocation,
+                    allocation: allocation.identity(),
                     offset: range.start,
                     bytes: range.end - range.start,
                     through: Through::Binding,

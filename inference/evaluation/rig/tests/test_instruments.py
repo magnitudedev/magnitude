@@ -228,27 +228,6 @@ def test_ab_counts_a_change_only_beyond_both_sides_noise(tmp_path):
     assert answer.ok
 
 
-def test_step_reports_a_memory_admission_refusal_with_its_reading(tmp_path):
-    record = {"moment": "admission refused", "store": "host RAM", "constraint": "host RAM",
-              "headroom_bytes": 24_000_000_000, "planning_bytes": 5_153_960_755,
-              "distress": "the system is swapping", "wired_bytes": 26_600_000_000,
-              "compressed_bytes": 212_000_000,
-              "windows": [{"ms": 1000, "compressed_pages": 0, "decompressed_pages": 3, "swapped_out_pages": 120,
-                           "swapped_in_pages": 0},
-                          {"ms": 1001, "compressed_pages": 0, "decompressed_pages": 0, "swapped_out_pages": 0,
-                           "swapped_in_pages": 0}]}
-    log = tmp_path / "log"
-    log.write_text("[stderr] magnitude-harness: prefill context=65536 concurrency=1\n"
-                   f"[stderr] magnitude-harness: memory {json.dumps(record)}\n"
-                   "[stderr] magnitude-harness: the system is swapping (...)\n")
-    arguments = argparse.Namespace(context=65536, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
-    answer = REGISTRY["step"].answer(arguments, {"step": JobResult(tmp_path, log, 1)})
-    assert not answer.ok
-    assert answer.lines[0] == "refused by memory admission (host RAM): the system is swapping"
-    assert answer.lines[1].startswith("  headroom 24.00 GB · planning reserve 5.15 GB · wired 26.60 GB")
-    assert answer.lines[2].startswith("  2 displacement windows over 2.0 s · swapped out 120 pages in 1 of them")
-
-
 def _step_record(directory: Path, decode_detail: dict, decode_extra: dict | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "result.json").write_text(json.dumps({"measurements": {"speed": [
@@ -278,6 +257,28 @@ def test_step_answers_a_record_whose_harness_lacks_optional_sections(tmp_path):
     assert streamed.endswith("tokens not recorded") and "0.938× resident" in streamed
     assert any(line.startswith("  model not recorded by this build's harness (no miss_shares.reading") for line in answer.lines)
     assert "streamed-7 mean_step_ms" in answer.measures and "entry e" not in answer.measures
+
+
+def test_a_step_cell_whose_bank_resized_in_steady_decode_fails(tmp_path):
+    """The harness discards a decode window only once its warm-up ran at rest: every resize begun
+    across one was begun in steady decode, which makes none, so the cell fails. A window discarded
+    for a cover read alone resized nothing."""
+    steps = [{"interval_ms": 15.0} for _ in range(8)]
+    _step_record(tmp_path / "step", {"steps": steps, "window": {"wall_ms_per_step": 15.0}, "selected_sha256": "a"})
+    moved = lambda resizes: {"resizes_begun": resizes, "resizing": [False, False], "resize_advances": 0,
+                             "slots": [48, 48 - resizes], "host_slots": [None, None], "cover_begun": 1 - resizes,
+                             "covering": [False, False]}
+    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
+    log = tmp_path / "log"
+    for unsteady, ok in (([{"step": 3, "moved": moved(0)}], True),
+                         ([{"step": 3, "moved": moved(1)}, {"warm": moved(1)}], False)):
+        _step_record(tmp_path / "streamed-7", {"steps": steps, "window": {"wall_ms_per_step": 16.0, "unsteady": unsteady}})
+        results = {name: JobResult(tmp_path / name, log, 0) for name in ("step", "streamed-7")}
+        results["measure"] = JobResult(tmp_path, log, 0)
+        answer = REGISTRY["step"].answer(arguments, results)
+        assert answer.ok == ok
+        assert f"  discarded, the bank not at rest: {len(unsteady)} decode windows, 0 warm prefill samples" in answer.lines
+        assert ("  2 resizes begun in steady decode, which makes none · FAILED" in answer.lines) != ok
 
 
 def test_a_step_cell_whose_tuning_stopped_at_its_budget_is_void(tmp_path):
@@ -1200,9 +1201,7 @@ def test_memory_follows_the_devices_memory_as_its_hosts_recorded_topology_states
         plan("bare", "cuda")
     # The host's own judge of its options refuses what it would refuse run alone.
     with pytest.raises(SystemExit, match="it takes --residency"):
-        plan("gb10", "cuda", "--weight-cap", "7", "--pressure", "5", "--pressure-store", "host")
-    with pytest.raises(SystemExit, match="loads nothing"):
-        plan("mac", "metal", "--weight-cap", "7", "--recommit", "1")
+        plan("gb10", "cuda", "--weight-cap", "7", "--pressure-store", "host")
     # A good run whose topology log holds no topology document refuses; it never escapes.
     record_topology(tmp_path, "20261030T000000Z-device-000006", "mac", "metal", "Host")
     (tmp_path / "20261030T000000Z-device-000006" / "logs" / "job-topology.log").write_text("rig: $ assess\n")

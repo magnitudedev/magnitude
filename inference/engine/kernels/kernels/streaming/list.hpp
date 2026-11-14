@@ -2,8 +2,7 @@
 // count words, then each entry's from and to words, LIST_* in
 // streaming_words.seismic), over the backend's shim (streaming/contract.hpp):
 // their count, their entries' items and the grid a copy of them launches on,
-// shared by `routed_copy`, `routed_move` (streaming/list_copy.hpp) and
-// `routed_list_grid`.
+// shared by `routed_copy` (streaming/list_copy.hpp) and `routed_list_grid`.
 //
 // A list lies in host-shared memory, where each read is a round trip over
 // the link and small reads hardly overlap, so a group reads a list in as few
@@ -40,21 +39,10 @@ STREAMING_FN void streaming_list_unstaged(STREAMING_GROUP_PARAM, u32 tid) {
     }
 }
 
-// The count of `list`'s entries (word stride `stride`), returned to every
-// thread. Every thread calls it.
-STREAMING_FN u32 streaming_list_entries(STREAMING_SYSTEM_READ list, u64 stride, STREAMING_GROUP_PARAM, u32 tid) {
-    // The pair's words hold the count until the first pair.
-    if (tid == 0u)
-        STREAMING_LIST_TO = streaming_load(STREAMING_AT(list, SEISMIC_CONST_LIST_COUNT * stride));
-    streaming_barrier();
-    const int entries = STREAMING_LIST_TO;
-    streaming_list_unstaged(streaming_group, tid);
-    return u32(entries);
-}
-
-// `streaming_list_entries` of a list written for step `step`, its sequence
-// and count read by two threads at once; none for a list written for
-// another step.
+// The count of the entries of `list` (word stride `stride`) written for
+// step `step`, returned to every thread, its sequence and count read by two
+// threads at once; none for a list written for another step. Every thread
+// calls it.
 STREAMING_FN u32 streaming_step_entries(STREAMING_SYSTEM_READ list, u64 stride, int step, STREAMING_GROUP_PARAM,
     u32 tid) {
     // The pair's words hold the sequence and the count until the first pair.

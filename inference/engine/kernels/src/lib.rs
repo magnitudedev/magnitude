@@ -9,7 +9,7 @@
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
 /// Words of an expert-streaming list of `entries` entries (`routed_copy`,
-/// `routed_move`, `routed_seed_commit`): the sequence and count,
+/// `routed_seed_commit`): the sequence and count,
 /// then each entry's from and to words. Entry `entries` begins there.
 pub fn list_extent(entries: u64) -> u64 {
     constants::LIST_ENTRIES + constants::LIST_ENTRY_WORDS * entries

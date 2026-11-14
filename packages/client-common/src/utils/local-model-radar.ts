@@ -45,14 +45,12 @@ type ModelAssessment = AssessedModel["assessment"]
 const memoryUseRatio = (assessment: ModelAssessment): number => {
   if (assessment._tag !== "Fits") return 1
   return assessment.memory.domains.reduce((highestUse, domain) => {
-    const usableCapacityBytes =
-      domain.capacityBytes - domain.compatibilityReserveBytes
     const use =
-      usableCapacityBytes <= 0
+      domain.capacityBytes <= 0
         ? domain.requiredBytes > 0
           ? 1
           : 0
-        : domain.requiredBytes / usableCapacityBytes
+        : domain.requiredBytes / domain.capacityBytes
     return Math.max(highestUse, clamp01(use))
   }, 0)
 }

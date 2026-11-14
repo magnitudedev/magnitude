@@ -186,10 +186,6 @@ pub struct AllocatedResources {
     /// The places of the prompt-group class the pools hold: the floor's
     /// one, or an open group's, within the load's chain capacity.
     places: std::num::NonZeroUsize,
-    /// The launches of the pass the load holds
-    /// (`PreparedTargetGraphs::held_pass`), the places the bank's in-process
-    /// growth is sized by.
-    most_places: std::num::NonZeroUsize,
     /// The ledgers of the stores the device reaches, which the load's
     /// committed claims are taken from: the one handle the load holds.
     ledgers: crate::memory::ledger::DeviceLedgers,
@@ -326,12 +322,6 @@ impl AllocatedResources {
     /// (`ExecutorDomain::open_group`).
     pub fn group_places(&self) -> std::num::NonZeroUsize {
         self.places
-    }
-
-    /// The launches of the pass the load holds, the places the bank's
-    /// in-process growth is sized by.
-    pub fn most_places(&self) -> std::num::NonZeroUsize {
-        self.most_places
     }
 
     /// The ledgers of the stores the device reaches
@@ -640,7 +630,6 @@ impl ResourceAllocator {
             vision_graph,
             state_graph,
             places: std::num::NonZeroUsize::MIN,
-            most_places: std::num::NonZeroUsize::new(target_graphs.held_pass().get()).expect("a pass covers a launch"),
             ledgers: ledgers.clone(),
             releases: crate::Releases::start().map_err(AllocationError::Thread)?,
             releasing: None,

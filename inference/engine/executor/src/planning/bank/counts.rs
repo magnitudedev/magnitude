@@ -2,7 +2,7 @@ use super::{ExpertBankPlan, Placer, growth_target};
 
 /// What a bank's plan derives of each count it may hold, derived once
 /// ([`ExpertBankPlan::counts`]): each group's records and the record
-/// reservations' charge at every slot count up to the ceiling, the host
+/// pool granules' charge at every slot count up to the ceiling, the host
 /// tier's at every host slot count up to every expert, and the floor. The
 /// plan derives each from its whole layout (its conveyor, scratch and
 /// staging pools), so an opened bank, whose plan no longer changes, reads

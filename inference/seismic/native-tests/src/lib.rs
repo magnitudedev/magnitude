@@ -130,6 +130,16 @@ pub fn every_device() -> Vec<seismic::Device> {
     devices(&[Cpu, Metal, Cuda, Vulkan])
 }
 
+/// A DeviceOnly granule pool of `device`, of 1 MiB granules in 4 MiB
+/// blocks, charged to an unbounded entry of its store.
+pub fn pool(device: &seismic::Device) -> seismic::Pool {
+    let topology = device.topology();
+    let store = topology.first_store(device.info(), seismic::Contract::DeviceOnly).expect("the device places DeviceOnly");
+    let identity = topology.store_identity(store).expect("a placement names stores of its revision");
+    let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(seismic::memory::Tally::unbounded(identity));
+    device.pool(seismic::Contract::DeviceOnly, 1 << 20, 4 << 20, seismic::PoolEntries::one(entry)).expect("the pool opens")
+}
+
 /// Select test devices with the caller's artifact-store configuration. Each
 /// call discovers and opens fresh devices, each with its own ledgers, so a
 /// test bounds them alone beside the process's other tests; selection has
@@ -148,7 +158,7 @@ pub fn devices_with(
     let topology = discovery.topology();
     let opened = backends.iter().copied()
         .filter_map(|backend| seismic::testing::selected(&topology, backend).map(|device| (backend, device.id())))
-        .map(|(backend, id)| seismic::testing::open_own_ledgers(&discovery, id, options.clone())
+        .map(|(backend, id)| seismic::testing::open_tallied(&discovery, id, options.clone()).map(|(device, _)| device)
             .unwrap_or_else(|error| panic!("available {backend:?} test device must open: {error}")))
         .collect::<Vec<_>>();
     if let Some(backend) = selected {

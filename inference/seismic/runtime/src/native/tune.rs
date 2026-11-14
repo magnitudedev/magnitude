@@ -1357,7 +1357,7 @@ impl Forming<'_> {
         let held = |device: &DeviceInner| {
             held_bytes(
                 device,
-                device.device_ledger().charged,
+                device.allocated(),
                 0,
                 ProcessMemory::footprint_now(),
             )
@@ -3945,7 +3945,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     fn held(&self) -> u64 {
         held_bytes(
             &self.device,
-            self.device.device_ledger().charged,
+            self.device.allocated(),
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -3991,7 +3991,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let held = || {
             held_bytes(
                 device,
-                device.device_ledger().charged,
+                device.allocated(),
                 validator.retained_bytes(),
                 ProcessMemory::footprint_now(),
             )
@@ -4473,7 +4473,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                unit.device.device_ledger(),
+                (unit.device.allocated(), unit.device.high_water()),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4558,17 +4558,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // Where the device's allocations are in the footprint, what the
         // piece placed and released between those readings is footprint
         // it held: the ledgers' own high-water marks say how much.
-        let (usage, (_, retained_most)) = ledgers(self);
-        let rise = usage
-            .high_water
-            .saturating_sub(usage_began.charged)
+        let ((_, high_water), (_, retained_most)) = ledgers(self);
+        let rise = high_water
+            .saturating_sub(usage_began.0)
             .saturating_add(retained_most.saturating_sub(retained_began));
         let host = footprint_peak(&self.device, host_began, host, rise);
         let memory = PieceMemory {
             began_bytes,
             peak_bytes: held_bytes(
                 &self.device,
-                self.device.device_ledger().high_water,
+                self.device.high_water(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
@@ -4576,16 +4575,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ended_bytes: held_bytes(
                 &self.device,
-                self.device.device_ledger().charged,
+                self.device.allocated(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
                 ended,
             ),
-            ledger_peak_bytes: self
-                .device
-                .device_ledger()
-                .high_water
+            ledger_peak_bytes: self.device.high_water()
                 + self
                     .ground
                     .as_ref()
@@ -10093,7 +10089,9 @@ mod tests {
         // A store of its own: no program another test formed is kept.
         let store = Arc::new(crate::artifacts::ProgramStore::new(Arc::new(seismic_native_target::MemoryStore::default())));
         let options = crate::artifacts::DeviceOptions { artifacts: Some(store.clone()), ..Default::default() };
-        let Ok(device) = devices.open_own_ledgers(metal, options) else {
+        // A device of its own: Metal's one store, host RAM, an unbounded tally.
+        let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let Ok(device) = devices.open_own(metal, options, vec![Arc::new(tally)]) else {
             return;
         };
         let module = check_source_with(

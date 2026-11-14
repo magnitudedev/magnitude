@@ -1,7 +1,7 @@
 //! Every served target's family outline equals its load's layouts.
 
 use super::catalog::{
-    LIMITS, SELECTION, bank_reservations, bind_catalog_draft, refused_by_the_device, serves, target_manifest,
+    LIMITS, SELECTION, recorded_substrate, bind_catalog_draft, refused_by_the_device, serves, target_manifest,
 };
 use crate::{
     ComponentSelection, ExecutionPath, ModelLoadPlan, PlanError, PlannedMethod, ResourceCapacity, ResourcePlanner,
@@ -84,7 +84,7 @@ fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: Back
             };
             // Experts are banked where they stream: a model that routes
             // none, or a device that streams none, has no banked form.
-            let banked = match bank_reservations(&definition, backend) {
+            let banked = match recorded_substrate(&definition, backend) {
                 Ok(substrate) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), substrate).and_then(|floor| {
                     load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), substrate)
                 })),
@@ -115,7 +115,7 @@ fn every_served_target_outlines_its_family_as_its_load_lays_it_out(backend: Back
                     PlannedMethod::Plain,
                     KvCodec::AffineK8V4,
                     LIMITS,
-                    ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent },
+                    ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
                 )
                 .unwrap_or_else(|error| panic!("{line}: its state plans: {error}"));
                 let (differences, [outlining, laying], outlined) =

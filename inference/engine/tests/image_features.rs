@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath, FeatureReader, FeatureSpan, Outcome, RequestId, ReservedResources,
 };
 use magnitude_scheduler::ServiceLimits;
@@ -58,7 +58,7 @@ fn resolved() -> ResolvedEngineConfiguration {
             .map(|device| device.parse().unwrap())
             .unwrap_or(DeviceRequest::Automatic),
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -123,7 +123,7 @@ fn image_features_match_the_reference_encoder() {
         build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
     let request = RequestId(1);
     domain.install_input(request, input).unwrap();
-    let encodes = domain.open_state(&mut bindings, request, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, request, None, 0).unwrap();
     let [operation] = encodes.as_slice() else {
         panic!("one encode")
     };

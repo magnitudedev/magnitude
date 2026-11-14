@@ -264,7 +264,9 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
+        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let own = stores.host.own();
+        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: device.formation().float16,
@@ -350,7 +352,7 @@ void main() {
             }
         }
         let total = bytes.len() + cases.len() * 16;
-        let data = device.allocate(total as u64, 256, None).expect("allocation");
+        let data = device.allocate(total as u64, 256, &own).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
@@ -464,7 +466,9 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
+        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let own = stores.host.own();
+        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
@@ -520,7 +524,7 @@ void main() {
             bytes.extend_from_slice(&input.to_le_bytes());
         }
         let total = bytes.len() + inputs.len() * 8;
-        let data = device.allocate(total as u64, 256, None).expect("allocation");
+        let data = device.allocate(total as u64, 256, &own).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch

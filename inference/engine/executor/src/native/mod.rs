@@ -36,7 +36,7 @@ pub use readout::ProjectionKernels;
 use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, BankCombine, DenseDecodeKernels, BankMoves, BankRouteForm, BankRouteKernels, DevicePlacement,
+    AttentionHistoryKernels, AttentionKernels, BankCombine, DenseDecodeKernels, BankRouteForm, BankRouteKernels, DevicePlacement,
     BankSite, SiteAdmission, SiteForm,
     DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels, LEADS,
     GeneralRoutedKernels, NGramKernels, NGramOutputKernel, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,

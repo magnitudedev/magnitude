@@ -2,12 +2,14 @@
 //! (CUDA, Vulkan). Device memory is taken from the driver in blocks, and an
 //! allocation is a range of a block, so a model's many small tensors cost
 //! no per-allocation driver rounding. Blocks grow from 64 MiB to the cap; a
-//! request of more than half the first block gets a block of its own. A block's unallocated
-//! space is device usage no allocation charges, so a new block never exceeds
-//! the room the caller grants, and the backend reports its blocks' free
-//! space as held memory.
+//! request of more than half the first block gets a block of its own. A
+//! block is charged whole to its backend's own ledger entry
+//! ([`charge_block`]), and each range is carved from it for the entry the
+//! allocation names, so a block's free space is the backend's own bytes.
 
 use crate::errors::ExecutionError;
+use seismic_memory::entry::{Change, Charge, Entry, Wiring};
+use std::sync::Arc;
 
 pub const FIRST_BLOCK_BYTES: u64 = 64 << 20;
 pub const BLOCK_CAP_BYTES: u64 = 1 << 30;
@@ -112,8 +114,9 @@ pub fn largest_shared<B: PackedBlock>(blocks: &[B]) -> Option<u64> {
 /// A replay of the packing rule over a sequence of allocations, holding
 /// only the blocks' sizes and free ranges: the device memory a backend's
 /// blocks hold for those allocations, and what of it no allocation uses,
-/// without a device. No room is granted, so every new shared block is the
-/// doubled one: the most free space the sequence leaves.
+/// without a device. Every new shared block is the doubled one, as where
+/// the backend's own entry admits it: the most free space the sequence
+/// leaves.
 pub struct Packing {
     cap: u64,
     granularity: u64,
@@ -163,9 +166,8 @@ impl Packing {
             largest_shared(&self.blocks),
             self.cap,
             bytes,
-            None,
             self.granularity,
-        )?;
+        );
         let mut free = FreeRanges::new(size);
         free.take(bytes, alignment)
             .expect("a new block holds its first allocation");
@@ -219,36 +221,44 @@ pub fn takes_own_block(bytes: u64, cap: u64) -> bool {
 /// shared block (64 MiB first) up to `cap`, in whole `granularity` units,
 /// so many smaller allocations cost one driver allocation. An allocation
 /// that takes its own block (`takes_own_block`) gets its own size rounded up
-/// to the granularity. When `room` is given and the doubled block does not
-/// fit it, the block is the allocation's own size: a device near its limit
-/// holds no free block space it was not asked for, so its usage stays with
-/// its claims and clear of the planning reserve. An allocation that needs
-/// more than the room is a capacity shortfall.
-pub fn block_bytes(
-    largest: Option<u64>,
-    cap: u64,
-    bytes: u64,
-    room: Option<u64>,
-    granularity: u64,
-) -> Result<u64, ExecutionError> {
+/// to the granularity.
+pub fn block_bytes(largest: Option<u64>, cap: u64, bytes: u64, granularity: u64) -> u64 {
     let needed = bytes.next_multiple_of(granularity);
     let doubled = largest
         .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
         .min(cap);
-    let size = if takes_own_block(bytes, cap) || needed > doubled / 2 {
+    if takes_own_block(bytes, cap) || needed > doubled / 2 {
         needed
     } else {
         doubled
-    };
-    match room {
-        Some(room) if needed > room => Err(ExecutionError::AllocationCapacity {
-            required: needed.into(),
-            available: room,
-        }),
-        Some(room) if size > room => Ok(needed),
-        Some(_) => Ok(size),
-        None => Ok(size),
     }
+}
+
+/// The charge of a new block for an allocation of `bytes`, taken on `own`
+/// (the backend's own entry, which a block's free space is) before the
+/// driver allocates it, in the `change` its caller holds open
+/// ([`Entry::change`]) until the block is allocated and backed by the
+/// charge ([`seismic_memory::entry::Backed::allocate`]): the block [`block_bytes`] sizes where `own` admits
+/// it, else only the allocation's whole granules, which leave the block no
+/// free space; refused when `own` admits not even those. The block's size
+/// is the charge's bytes. Blocks are a discrete device's memory (CUDA's,
+/// Vulkan's), which the host OS never wires: pageable.
+pub fn charge_block(
+    change: &Change,
+    own: &Arc<dyn Entry>,
+    largest: Option<u64>,
+    cap: u64,
+    bytes: u64,
+    granularity: u64,
+) -> Result<Charge, ExecutionError> {
+    let size = block_bytes(largest, cap, bytes, granularity);
+    let needed = bytes.next_multiple_of(granularity);
+    Charge::take(change, own, size, Wiring::Pageable)
+        .or_else(|refused| match size > needed {
+            true => Charge::take(change, own, needed, Wiring::Pageable),
+            false => Err(refused),
+        })
+        .map_err(ExecutionError::from)
 }
 
 #[cfg(test)]
@@ -268,46 +278,40 @@ mod tests {
         assert_eq!(ranges.take(65, 1), None);
     }
 
-    /// A new block never grows device usage past the room granted: near the
-    /// limit it holds only its allocation (in whole granules), and an
-    /// allocation beyond the room is refused with the room as available. A
-    /// request beyond the cap takes its own size.
+    /// A new shared block doubles the largest up to the cap; a request
+    /// beyond the cap takes its own size in whole granules.
     #[test]
-    fn new_blocks_stay_within_the_granted_room() {
+    fn new_blocks_double_up_to_the_cap() {
         let cap = 1024 * MIB;
         let g = 2 * MIB;
-        assert_eq!(
-            block_bytes(None, cap, MIB, None, g).unwrap(),
-            FIRST_BLOCK_BYTES
-        );
-        assert_eq!(
-            block_bytes(Some(512 * MIB), cap, MIB, None, g).unwrap(),
-            cap
-        );
-        assert_eq!(
-            block_bytes(Some(512 * MIB), cap, MIB, Some(4096 * MIB), g).unwrap(),
-            cap
-        );
-        assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 300 * MIB, Some(401 * MIB), g).unwrap(),
-            300 * MIB
-        );
-        assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 3 * MIB, Some(401 * MIB), g).unwrap(),
-            4 * MIB
-        );
-        assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 400 * MIB, Some(400 * MIB), g).unwrap(),
-            400 * MIB
-        );
-        assert_eq!(
-            block_bytes(None, cap, 1500 * MIB + 1, None, g).unwrap(),
-            1502 * MIB
-        );
+        assert_eq!(block_bytes(None, cap, MIB, g), FIRST_BLOCK_BYTES);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, MIB, g), cap);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, 300 * MIB, g), 300 * MIB);
+        assert_eq!(block_bytes(None, cap, 1500 * MIB + 1, g), 1502 * MIB);
+    }
+
+    /// A new block never takes more than the backend's own entry admits:
+    /// near its limit the block holds only its allocation (in whole
+    /// granules), and an allocation beyond it is refused with what the
+    /// entry had, nothing charged.
+    #[test]
+    fn a_new_block_is_charged_within_what_the_entry_admits() {
+        let cap = 1024 * MIB;
+        let g = 2 * MIB;
+        let identity = seismic_topology::StoreIdentity::HostRam;
+        let tally = seismic_memory::entry::Tally::limited(identity, 401 * MIB);
+        let own: Arc<dyn Entry> = Arc::new(tally.clone());
+        let block = charge_block(&own.change(), &own, Some(512 * MIB), cap, 3 * MIB, g).unwrap();
+        assert_eq!(block.bytes(), 4 * MIB);
+        assert_eq!(tally.held(), 4 * MIB);
+        drop(block);
         assert!(matches!(
-            block_bytes(Some(512 * MIB), cap, 401 * MIB, Some(400 * MIB), g),
-            Err(ExecutionError::AllocationCapacity { available, .. }) if available == 400 * MIB
+            charge_block(&own.change(), &own, Some(512 * MIB), cap, 402 * MIB, g),
+            Err(ExecutionError::AllocationCapacity { available, .. }) if available == 401 * MIB
         ));
+        assert_eq!(tally.held(), 0);
+        tally.bound(u64::MAX);
+        assert_eq!(charge_block(&own.change(), &own, Some(512 * MIB), cap, MIB, g).unwrap().bytes(), cap);
     }
 
     /// A replay holds what the backends' blocks would: a run of expert stacks
@@ -343,18 +347,18 @@ mod tests {
         let cap = 1024 * MIB;
         let g = 2 * MIB;
         assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 756 * MIB + 1, None, g).unwrap(),
+            block_bytes(Some(512 * MIB), cap, 756 * MIB + 1, g),
             758 * MIB
         );
         assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 343 * MIB + 1, None, g).unwrap(),
+            block_bytes(Some(512 * MIB), cap, 343 * MIB + 1, g),
             344 * MIB
         );
         assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 32 * MIB, None, g).unwrap(),
+            block_bytes(Some(512 * MIB), cap, 32 * MIB, g),
             cap
         );
-        assert_eq!(block_bytes(None, cap, 40 * MIB, None, g).unwrap(), 40 * MIB);
+        assert_eq!(block_bytes(None, cap, 40 * MIB, g), 40 * MIB);
         assert!(takes_own_block(32 * MIB + 1, cap));
         assert!(!takes_own_block(32 * MIB, cap));
         assert!(takes_own_block(9 * MIB, 16 * MIB));

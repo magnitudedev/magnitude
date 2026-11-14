@@ -165,10 +165,11 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
     }
 }
 
-/// A native load's arena claim is exactly its graph scratch and its target
-/// graphs' bound constants (the floor's group buffers and the held pass's
-/// buffers among them), with no class beyond the floor's at one place: one
-/// charge of each, none missing and none counted twice.
+/// A native load's arena claim holds exactly what its graph scratch and its
+/// target graphs' bound constants (the floor's group buffers and the held
+/// pass's buffers among them) charged, with no class beyond the floor's at
+/// one place: the constants among it, and no byte held that none of them
+/// allocated.
 #[test]
 fn a_native_loads_arena_claim_is_its_scratch_and_bound_constants() {
     let _placement = crate::test_support::process_placement();
@@ -176,9 +177,10 @@ fn a_native_loads_arena_claim_is_its_scratch_and_bound_constants() {
     let (directory, definition, package) = fixture("arena-claim");
     for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu].into_iter().filter(|&backend| available(&catalog, backend)) {
         let (domain, _bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, true, 1, 0), Banked::Resident);
-        let (claim, scratch, constants) = domain.arena_terms();
+        let (claim, allocated, constants) = domain.arena_terms();
         assert!(constants > 0, "{backend:?}: the fixture binds constants");
-        assert_eq!(claim, scratch + constants, "{backend:?}: the arena claim of {scratch} scratch and {constants} constant bytes");
+        assert!(claim >= constants, "{backend:?}: the arena claim of {claim} bytes holds its {constants} constant bytes");
+        assert_eq!(claim, allocated, "{backend:?}: the arena claim is what its allocations charged");
     }
     std::fs::remove_dir_all(&directory).ok();
 }
@@ -199,7 +201,7 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         // A prompt chunk and a decode step of the host's tokens.
         let (_, returned) = run(
             &mut domain,
@@ -254,7 +256,7 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
             let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), banked);
             let request = RequestId(1);
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-            domain.open_state(&mut bindings, request, None).unwrap();
+            domain.open_state(&mut bindings, request, None, 0).unwrap();
             let (outcome, mut returned) =
                 run(&mut domain, bindings, forward(request, WorkKind::Prefill, &[5, 1], 0, true), false, backend);
             let mut tokens = vec![selected_token(&outcome, backend)];
@@ -305,7 +307,7 @@ const STREAMING_BACKENDS: [seismic::BackendName; 3] =
 /// hits.
 #[test]
 fn a_partial_banks_shared_graphs_read_each_layers_own_experts() {
-    let definition = qwen4exp_fixture_definition_of(4, 128);
+    let definition = qwen4exp_fixture_definition_of(9, 256);
     banked_shared_graphs_score_as_resident("partial-bank-shared", definition, &STREAMING_BACKENDS, Banked::Half);
 }
 
@@ -345,12 +347,12 @@ fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
     // (GB10's) the bank is the one store, and there is no tier to grow.
     let topology = catalog.topology();
     let linked = seismic::testing::selected(&topology, backend).is_some_and(|executor| {
-        matches!(crate::platform::host_tier(&topology, executor), Ok(Some(crate::planning::HostTier::Linked(_))))
+        matches!(crate::platform::host_tier(&topology, executor), Some(crate::planning::HostTier::Linked))
     });
     if !linked {
         return;
     }
-    let definition = qwen4exp_fixture_definition_of(3, 128);
+    let definition = qwen4exp_fixture_definition_of(9, 256);
     let (directory, definition, package) = fixture_with("tier-grown", definition, streamed_experts_manifest);
     scores(&catalog, &definition, &package, backend, Banked::Half, Start::TierGrown)
         .assert_as_resident(backend, "the grown tier's load scores as the resident one");
@@ -366,7 +368,7 @@ fn a_capped_partial_banks_tier_grows_within_its_cap_and_serves_every_miss() {
 fn misses_the_device_lands_score_as_resident() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let definition = qwen4exp_fixture_definition_of(4, 128);
+    let definition = qwen4exp_fixture_definition_of(9, 256);
     let (directory, definition, package) = fixture_with("device-landed", definition, streamed_experts_manifest);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         scores(&catalog, &definition, &package, backend, Banked::Half, Start::AtOnce)
@@ -616,7 +618,7 @@ fn scores(
         }
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let (outcome, mut returned) =
             run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
         // The prompt step's misses reach the site as a decode step's do.
@@ -705,7 +707,6 @@ impl Pricing {
             lines,
             read: pending(),
             pass: Priced::Measured(ExpertPass::of_bank(bank, self.costs.clone()).expect("the synthetic costs price the bank's pass")),
-            moves: pending(),
             tier_copy: pending(),
             convert,
         });
@@ -827,11 +828,11 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     let cuda = seismic::BackendName::Cuda;
     assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
     let test = "whole-bank-shrink-records";
-    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, cuda, limits(2, false, 1, 1), Banked::Whole);
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-    domain.open_state(&mut bindings, request, None).unwrap();
+    domain.open_state(&mut bindings, request, None, 0).unwrap();
     let (_, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, cuda);
     let mut position = 2;
     let mut decode = |domain: &mut ExecutorDomain, bindings: crate::StateBindings| {
@@ -843,10 +844,10 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     bindings = decode(&mut domain, bindings);
     let whole = domain.expert_bank_slots();
     let device = domain.device().clone();
-    let own = device.ledgers().own;
-    for (store, view) in &own {
-        domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
-    }
+    // The shrink takes nothing more than the bank holds: the device store's
+    // count never rises above what it is now.
+    let held = device.allocated();
+    device.restart_high_water();
     let ran = domain.resident_decodes();
     assert!(ran > 0, "the whole bank's steps before the shrink ran its resident forms");
     let floor = domain.expert_residency().unwrap().expect("a streamed load holds a bank").floor;
@@ -854,9 +855,7 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     assert!(matches!(step, crate::BankStep::Begun(_)), "a whole bank shrinks: {step:?}");
     while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
     assert!(domain.expert_bank_slots() < whole, "the bank shrank from {whole:?}");
-    for (store, view) in &own {
-        domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
-    }
+    assert!(device.high_water() <= held, "the shrink held {} bytes, more than the {held} the bank held", device.high_water());
     let before = domain.graph_replays().recorded;
     bindings = decode(&mut domain, bindings);
     assert_eq!(domain.graph_replays().recorded, before, "the shrink's step records no graph");
@@ -868,8 +867,8 @@ fn a_whole_banks_shrink_step_records_no_graph() {
 /// The live-graph owner's contract: every graph a decode step replays is
 /// kept live from the load on, whichever decode launch class the step takes
 /// (its count of requests), so on CUDA no decode step records a graph: not
-/// the first of a class, not after Reclaim's surplus rung releases a prompt
-/// group's class, and not on a bank shrink's step. Each step's recordings,
+/// the first of a class, not after a shrink of the state's surplus releases
+/// a prompt group's class, and not on a bank shrink's step. Each step's recordings,
 /// by family, are reported before the verdict.
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
@@ -885,7 +884,7 @@ fn no_decode_step_records_a_graph() {
 /// Mac: a Metal schedule holds no device memory (`GraphCost::None`), so
 /// every family's graph charge is none, and `record_decode` pins nothing
 /// there, so no decode step may record a graph either: of one request,
-/// eight and four, across Reclaim's surplus release and a bank shrink's
+/// eight and four, across a shrink of the state's surplus and a bank shrink's
 /// step. It fails once Metal charges or records graphs without the pins.
 #[cfg(target_os = "macos")]
 #[test]
@@ -924,7 +923,7 @@ impl DecodeSteps {
         let mut positions = Vec::new();
         for (index, &request) in requests.iter().enumerate() {
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-            domain.open_state(&mut bindings, request, None).unwrap();
+            domain.open_state(&mut bindings, request, None, 0).unwrap();
             let chunks = if index == 0 { chunks } else { 1 };
             domain.plan_successors((1..chunks).map(|next| prompt_chunk(request, next, chunks, Self::REQUESTS)).collect());
             for chunk in 0..chunks {
@@ -982,11 +981,12 @@ fn recorded_since(domain: &ExecutorDomain, before: Vec<(&'static str, seismic::G
 
 fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::BackendName) {
     let test = "decode-records-no-graph";
-    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     const FOUR: usize = DecodeSteps::REQUESTS / 2;
-    // Reclaim: a load whose experts are resident chains any prompt, its
+    // A shrink: a load whose experts are resident chains any prompt, its
     // group claiming a class of two places as it opens and freeing it as
-    // its chain closes, before Reclaim's surplus rung releases the slots.
+    // its chain closes, before a shrink of the state's surplus releases the
+    // slots.
     {
         let (mut domain, bindings, _, _) = load(catalog, &definition, &package, backend, DecodeSteps::limits(2), Banked::Resident);
         if backend == seismic::BackendName::Metal {
@@ -996,11 +996,11 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
         assert_eq!(domain.group_places().get(), 1, "{backend:?}: the prompt group's class is freed as its chain closes");
         bindings = steps.step(&mut domain, bindings, 1, "the first of one request", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "the first of eight", backend);
-        let released = crate::domain::fixtures::shrink_settled(&mut domain, &mut bindings, magnitude_state::ShrinkPolicy::Reclaim);
-        assert_eq!(domain.group_places().get(), 1, "{backend:?}: Reclaim holds no class");
+        let released = crate::domain::fixtures::shrink_settled(&mut domain, &mut bindings);
+        assert_eq!(domain.group_places().get(), 1, "{backend:?}: a shrink holds no class");
         bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, after the surplus release", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the surplus release", backend);
-        steps.assert_none(backend, &format!("a Reclaim release of {released} bytes"));
+        steps.assert_none(backend, &format!("a shrink of {released} bytes"));
         drop(bindings);
     }
     // A bank shrink: experts streamed through a whole bank, shrunk to its
@@ -1012,18 +1012,15 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "the first of eight", backend);
         let whole = domain.expert_bank_slots();
         let device = domain.device().clone();
-        let own = device.ledgers().own;
-        for (store, view) in &own {
-            domain.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
-        }
+        // The shrink takes nothing more than the bank holds.
+        let held = device.allocated();
+        device.restart_high_water();
         let floor = domain.expert_residency().unwrap().expect("a streamed load holds a bank").floor;
         let step = domain.shrink_expert_bank_to(&mut bindings, crate::BankHolding::Experts, floor, crate::CompletionWake::new(|| {})).unwrap();
         assert!(matches!(step, crate::BankStep::Begun(_)), "{backend:?}: a whole bank shrinks: {step:?}");
         while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
         assert!(domain.expert_bank_slots() < whole, "{backend:?}: the bank shrank from {whole:?}");
-        for (store, view) in &own {
-            domain.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
-        }
+        assert!(device.high_water() <= held, "{backend:?}: the shrink held {} bytes, more than the {held} the bank held", device.high_water());
         bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, the bank shrink's step", backend);
         bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the bank shrink", backend);
         steps.assert_none(backend, "a bank shrink");
@@ -1255,7 +1252,7 @@ impl DrafterSteps {
     fn prime(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId) -> (usize, crate::StateBindings) {
         let backend = self.backend;
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let before = domain.family_graph_replays();
         domain.plan_successors(vec![Self::primed_chunk(request, 1)]);
         for chunk in 0..2 {
@@ -1407,7 +1404,7 @@ fn shrunk_bank_scores_as_resident(
         }
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let (outcome, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
         let mut steps = vec![step_bits(&outcome)];
         let mut shrinks = 0;
@@ -1632,7 +1629,7 @@ fn chained_prompts(
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
     }
     let mut steps = Vec::new();
     let mut selected = Vec::new();
@@ -1810,7 +1807,7 @@ fn engram_requests_decode_together_as_each_alone() {
         let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits, Banked::Resident);
         for &request in &requests {
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-            domain.open_state(&mut bindings, request, None).unwrap();
+            domain.open_state(&mut bindings, request, None, 0).unwrap();
             bindings = run(&mut domain, bindings, prompt_chunk(request, 0, 1, CHUNK_ROWS), false, backend).1;
         }
         let mut logits = Vec::new();
@@ -1984,7 +1981,7 @@ fn decode_logits(
 ) -> (Vec<Vec<f32>>, crate::StateBindings) {
     let token = |position: usize| (position * 37 + 11) as u32 % 256;
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-    domain.open_state(&mut bindings, request, None).unwrap();
+    domain.open_state(&mut bindings, request, None, 0).unwrap();
     let chunked = if stepped { prompt } else { prompt / 16 * 16 };
     for start in (0..chunked).step_by(16) {
         let tokens = (start..chunked.min(start + 16)).map(token).collect::<Vec<_>>();
@@ -2202,12 +2199,12 @@ fn load_with(
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
     crate::diagnostics::install();
-    let reserves = platform::MemoryReserves::of_machine(None);
+    let release = platform::ReleaseRate::of_machine(None);
     let selected = platform::select_device(
         catalog,
         ExecutionPath::Native,
         platform::DeviceRequest::Backend(backend),
-        &reserves,
+        &release,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: an available device is selected: {error}"));
     let device = Rc::new(
@@ -2215,8 +2212,9 @@ fn load_with(
             .unwrap_or_else(|error| panic!("{backend:?}: the selected device opens: {error}")),
     );
     let capacity = ResourceCapacity {
-        domain_bytes: selected.assessment_capacity_bytes.min(1024 * 1024 * 1024),
+        domain_bytes: crate::StableRoom::of_selected(&selected).capacity().unwrap().min(1024 * 1024 * 1024),
         tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
+        allocations: seismic::NativeAllocations::EXACT,
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -2276,7 +2274,7 @@ fn load_with(
     // As a load finalizes it (`execution`): its readout, and the CPU sites
     // its qualification admitted, which its graphs encode.
     let draft = draft
-        .finalize_readout(definition, programs.readout_choices())
+        .finalize_readout(definition, programs.readout_choices(), &crate::StableRoom::of_selected(&selected))
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .unwrap();
     let target_graphs = programs
@@ -2287,6 +2285,7 @@ fn load_with(
             &state,
             draft.programs().target(),
             limits,
+            draft.load().pass(limits),
             &seismic::Workers::new(1),
         )
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
@@ -2321,16 +2320,29 @@ fn load_with(
     let identity = ResourceDomainId::new("ngram-steps").unwrap();
     let programs = Rc::new(programs);
     let ledgers = crate::domain::fixtures::fixture_ledgers(&device, &execution, &seismic::Devices::discover(&[]).unwrap());
-    let resources = ResourceAllocator::allocate(
-        &execution,
+    // As the engine's load records them: the arena it allocated, the
+    // target's weights, each charged to its claim as it was made.
+    let mut recorded = crate::memory::ledger::Recorded::default();
+    let scratch = crate::memory::ClaimDemand { device: execution.resources().bytes().scratch, ..Default::default() };
+    let resources = crate::domain::fixtures::fixture_charged(
         &device,
-        identity.clone(),
-        programs.target_graphs().unwrap(),
-        programs.target_readout_graphs().unwrap(),
-        programs.drafter_graphs(),
-        None,
-        programs.state_graphs().unwrap(),
         &ledgers,
+        &mut recorded,
+        crate::memory::ledger::CommittedKind::Arena,
+        scratch,
+        || {
+            ResourceAllocator::allocate(
+                &execution,
+                &device,
+                identity.clone(),
+                programs.target_graphs().unwrap(),
+                programs.target_readout_graphs().unwrap(),
+                programs.drafter_graphs(),
+                None,
+                programs.state_graphs().unwrap(),
+                &ledgers,
+            )
+        },
     )
     .unwrap();
     // As the engine's load claims the target import, whose claim the host
@@ -2342,19 +2354,27 @@ fn load_with(
     }
     .unwrap();
     let mut weights = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, demand).unwrap();
+    // As the engine's load claims them: its host tables' row caches.
+    let host_tables = crate::memory::ClaimDemand { host: load.host_table_bytes().unwrap(), ..Default::default() };
+    let host_tables = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables).unwrap();
+    // As the engine's load opens them: the state's pool, and the bank's
+    // records pool where it has a bank.
+    let pools = crate::LoadPools::open(&device, &ledgers, &execution).unwrap();
     let mut residency = ResidencyStore::for_target(
         device.clone(),
         programs.clone(),
         (*execution).clone(),
         identity,
-        resources.releases(),
         &ledgers,
         &mut weights,
+        pools.clone(),
     )
     .unwrap();
-    let target = residency
-        .load_target(definition, package, Box::new(|_, _| ()))
+    let target = weights
+        .allocate(|| residency.load_target(definition, package, &host_tables, Box::new(|_, _| ())))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    recorded.record(weights);
+    recorded.record(host_tables);
     // As the engine's load does: the drafter is imported from the store that
     // imported the target, when its first work binds it.
     let head_loader = match method.drafts() {
@@ -2364,18 +2384,11 @@ fn load_with(
         ),
         false => None,
     };
+    let held_pass = programs.target_graphs().unwrap().held_pass().get();
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(device.clone()).unwrap();
-    let head_state = plan.head_state().map(|state| state.allocate(device.clone()).unwrap());
-    // As the engine's load records them: the scratch and target weights it
-    // allocated, and the constants its domain binds.
-    let allocated = execution
-        .load()
-        .target_weight_demand()
-        .unwrap()
-        .checked_plus(crate::memory::ClaimDemand { device: plan.bytes().scratch, ..Default::default() })
-        .unwrap();
-    let recorded = crate::domain::fixtures::fixture_recorded(&device, resources.ledgers(), allocated);
+    let target_state = plan.allocate_target_state(device.clone(), pools.state.clone()).unwrap();
+    let head_state = plan.head_state().map(|state| state.allocate(device.clone(), pools.state.clone()).unwrap());
+    // The constants its domain binds, as the engine's load claims them.
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
         ..Default::default()
@@ -2383,10 +2396,15 @@ fn load_with(
     let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
     let reader = crate::DeviceReader::open(
         Rc::new(seismic::Devices::discover(&[]).unwrap()),
-        reserves,
+        release,
         device,
     )
     .unwrap();
+    let in_process = resources.ledgers().device().in_process(crate::experts::derived::in_process_bytes(
+        &crate::memory::ledger::LoadShape::of(&execution),
+        execution.policy().limits().max_launch_rows,
+        held_pass,
+    ));
     let (mut domain, mut bindings) = ExecutorDomain::new(
         execution,
         definition.clone(),
@@ -2400,6 +2418,7 @@ fn load_with(
         head_state,
         recorded,
         constants,
+        in_process,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     // As a load ends: priced on the costs it waited for, its memory read as
@@ -2409,7 +2428,7 @@ fn load_with(
     domain
         .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), &mut bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    domain.observe_memory().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain.observe_memory();
     (domain, bindings, pass_rows, pricing)
 }
 
@@ -2429,7 +2448,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
-        fixture_with("starved-step", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+        fixture_with("starved-step", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     let prompt = (0..CHUNK_ROWS as u32).map(|row| (row * 37 + 11) % 256).collect::<Vec<_>>();
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
@@ -2438,7 +2457,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
         let (unstarved, starved) = (RequestId(1), RequestId(2));
         for request in [unstarved, starved] {
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-            domain.open_state(&mut bindings, request, None).unwrap();
+            domain.open_state(&mut bindings, request, None, 0).unwrap();
         }
         let operation = |request| scored(forward(request, WorkKind::Prefill, &prompt, 0, true));
         let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
@@ -2511,7 +2530,7 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
     // At the kl's shape, where a banked load's prompt runs as one chain
     // (`a_banked_loads_prompt_groups_score_as_resident`).
     let (directory, definition, package) =
-        fixture_with("starved-chain", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+        fixture_with("starved-chain", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
@@ -2525,14 +2544,14 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         // The unstarved sequence: its prompt one chunk at a time, then two
         // decode steps.
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let (reference, returned) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);
         drop(returned);
         drop(domain);
 
         let (mut domain, mut bindings, _, _) = open();
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         // The chain opens with its first chunk, which launches the rest,
         // and is starved.
         domain.plan_successors((1..chunks).map(|next| prompt_chunk(request, next, chunks, rows)).collect());
@@ -2548,7 +2567,7 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         assert!(domain.resume_state(request).is_err(), "{backend:?}: the holder's state was released");
         // Re-opened, it re-prefills and decodes as the unstarved sequence.
         let mut bindings = returned;
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let (rerun, returned) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);
         assert!(rerun == reference, "{backend:?}: the re-prefilled sequence decodes as unstarved: {}", first_difference(&reference, &rerun));
         drop(returned);
@@ -2569,13 +2588,13 @@ fn a_streamed_load_dropped_with_a_running_successor_tears_down() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
-        fixture_with("queued-teardown", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+        fixture_with("queued-teardown", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         let (mut domain, mut bindings, _, _) =
             load(&catalog, &definition, &package, backend, limits(CHUNK_ROWS, true, 1, CHUNK_ROWS), Banked::Half);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         domain.plan_successors(vec![prompt_chunk(request, 1, 2, CHUNK_ROWS)]);
         let (_, returned) = run(&mut domain, bindings, prompt_chunk(request, 0, 2, CHUNK_ROWS), false, backend);
         assert_eq!(domain.queued_steps(), 1, "{backend:?}: the next chunk runs queued behind the first");
@@ -2611,7 +2630,7 @@ fn a_lone_prompt_chunk_at_a_half_bank_is_finite() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
-        fixture_with("lone-chunks", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+        fixture_with("lone-chunks", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest);
     let mut long = (*definition).clone();
     long.decoder.context_limit = SPLIT_CONTEXT;
     let definition = Rc::new(long);
@@ -2620,7 +2639,7 @@ fn a_lone_prompt_chunk_at_a_half_bank_is_finite() {
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
         let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(rows, false, chunks, rows), Banked::Half);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let (steps, _) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);
         for (index, step) in steps.iter().enumerate() {
             let finite = step.iter().all(|(features, logits, _)| features.iter().chain(logits).flatten().all(|&bits| f32::from_bits(bits).is_finite()));
@@ -3085,7 +3104,7 @@ fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
         let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), Banked::Resident);
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let mut decoded = [0.0f32; 5];
         for position in 0..prompts.chunks * CHUNK_ROWS {
             let mut decode = forward(request, WorkKind::Decode, &[token(position) as u32], position, false);
@@ -3108,5 +3127,290 @@ fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
             );
         }
     }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+
+/// On the CPU backend, without a GPU, loading both a whole expert bank
+/// (`HostTier::Unified`, multiple routed layers sharing one bank group at
+/// distinct `home` offsets, imported record-by-record and exposed through
+/// multi-slab `SlabView` sub-views) and a tier-placed expert bank
+/// (`HostTier::Linked`, exercising both an empty 0-slot host tier slice and
+/// a grown multi-slab host tier) succeeds within strict memory-ledger claims,
+/// and every layer's whole-bank home sub-view holds bit-for-bit identical
+/// weights to the unbanked CPU resident load.
+#[test]
+fn cpu_loads_whole_and_tier_placed_expert_banks() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let backend = seismic::BackendName::Cpu;
+    let (directory, definition, package) =
+        fixture_with("cpu-whole-and-tier-banks", qwen4exp_fixture_definition_of(2, 16), streamed_experts_manifest);
+
+    let limits = limits(2, false, 1, 1);
+    let release = platform::ReleaseRate::of_machine(None);
+    let selected = platform::select_device(
+        &catalog,
+        ExecutionPath::Native,
+        platform::DeviceRequest::Backend(backend),
+        &release,
+    )
+    .unwrap();
+    let device = Rc::new(
+        crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap(),
+    );
+    let capacity = ResourceCapacity {
+        domain_bytes: crate::StableRoom::of_selected(&selected)
+            .capacity()
+            .unwrap()
+            .min(1024 * 1024 * 1024),
+        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
+        allocations: seismic::NativeAllocations::EXACT,
+    };
+    let base_draft = ExecutionPlanner::prepare(
+        &selected,
+        &package.manifest(),
+        &definition,
+        ComponentSelection {
+            head: false,
+            vision: false,
+        },
+        ExecutionPath::Native,
+        PlannedMethod::Plain,
+        KvCodec::Dense,
+        limits,
+    )
+    .unwrap();
+
+    // Attest target weight-import kernels once on CPU using `base_draft`, and
+    // seal graphs once to obtain an admitted `ResourcePlan` shape.
+    let base_state = ResourcePlanner::state_plan(
+        &definition,
+        base_draft.load(),
+        base_draft.policy().method(),
+        KvCodec::Dense,
+        limits,
+        capacity,
+    )
+    .unwrap();
+    let mut programs = AttestedPrograms::prepare_draft(
+        &base_draft,
+        &device,
+        crate::TuningContext {
+            definition: &definition,
+            weights: &crate::ZeroTuningWeights,
+            observer: &crate::UnreportedTuning,
+            cache: None,
+            numerical_profile: crate::ResolvedNumericalProfile::standard(),
+            settings: crate::TuningSettings::STANDARD,
+        },
+        crate::UnpreparedUnits::ServeDefaults,
+    )
+    .unwrap();
+    let base_draft = base_draft
+        .finalize_readout(&definition, programs.readout_choices(), &crate::StableRoom::of_selected(&selected))
+        .unwrap();
+    let target_graphs = programs
+        .prepare_target_graphs(
+            &device,
+            base_draft.load(),
+            &definition.decoder,
+            &base_state,
+            base_draft.programs().target(),
+            limits,
+            base_draft.load().pass(limits),
+            &seismic::Workers::new(1),
+        )
+        .unwrap();
+    let target_readout_graphs = programs
+        .prepare_target_readout_graphs(&device, base_draft.load(), &definition.decoder, limits)
+        .unwrap();
+    programs
+        .prepare_auxiliary_graphs(
+            &device,
+            base_draft.load(),
+            &definition,
+            base_draft.programs(),
+            &base_state,
+            limits,
+            PlannedMethod::Plain,
+        )
+        .unwrap();
+    let base_resources = ResourcePlanner::plan_with_state(
+        base_state,
+        &target_graphs,
+        &target_readout_graphs,
+        programs.drafter_graphs(),
+        None,
+        programs.state_graphs().unwrap(),
+    )
+    .unwrap();
+    programs.install_target_graphs(target_graphs);
+    programs.install_target_readout_graphs(target_readout_graphs);
+    let programs = Rc::new(programs);
+
+    let load_resident_target = |draft: crate::ExecutionPlanDraft| {
+        let execution = Rc::new(draft.admit(base_resources.clone()).unwrap());
+        let identity = ResourceDomainId::new("cpu-bank-test").unwrap();
+        let ledgers = crate::domain::fixtures::fixture_ledgers(
+            &device,
+            &execution,
+            &seismic::Devices::discover(&[]).unwrap(),
+        );
+        let mut recorded = crate::memory::ledger::Recorded::default();
+        let load = execution.load();
+        let demand = match load.expert_bank() {
+            Some(bank) => load.clone().with_load_slots(bank.slots).unwrap().target_weight_demand(),
+            None => load.target_weight_demand(),
+        }
+        .unwrap();
+        let mut weights = ledgers
+            .claim(&device, crate::memory::ledger::CommittedKind::Load, demand)
+            .unwrap();
+        let host_tables = crate::memory::ClaimDemand {
+            host: load.host_table_bytes().unwrap(),
+            ..Default::default()
+        };
+        let host_tables = ledgers
+            .claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables)
+            .unwrap();
+        // On CPU both `DeviceOnly` and `Shared` lie in `HostRam` at the bank's
+        // one uniform granule, so a tier-placed CPU fixture shares that single
+        // `Records` pool across `records` and `host`.
+        let pools = match execution.load().expert_bank().filter(|bank| bank.host_granule().is_some()) {
+            Some(bank) => {
+                let state = ledgers
+                    .open_pool(
+                        &device,
+                        seismic::Contract::DeviceOnly,
+                        crate::memory::ledger::PoolClass::State,
+                        execution.resources().target_state().granule,
+                    )
+                    .unwrap();
+                let records = ledgers
+                    .open_pool(
+                        &device,
+                        seismic::Contract::DeviceOnly,
+                        crate::memory::ledger::PoolClass::Records,
+                        bank.granule(),
+                    )
+                    .unwrap();
+                crate::LoadPools {
+                    state,
+                    records: Some(records.clone()),
+                    host: Some(records),
+                }
+            }
+            None => crate::LoadPools::open(&device, &ledgers, &execution).unwrap(),
+        };
+        let mut residency = ResidencyStore::for_target(
+            device.clone(),
+            programs.clone(),
+            (*execution).clone(),
+            identity,
+            &ledgers,
+            &mut weights,
+            pools,
+        )
+        .unwrap();
+        let target = weights
+            .allocate(|| residency.load_target(&definition, &package, &host_tables, Box::new(|_, _| ())))
+            .unwrap();
+        recorded.record(weights);
+        recorded.record(host_tables);
+        (target, ledgers, recorded)
+    };
+
+    // 1. Unbanked resident CPU baseline vs whole-bank CPU load: every layer's
+    // home view is a 32-expert multi-slab `SlabView` sub-view of group 0,
+    // imported on CPU via `import_records` and carved cleanly in the ledger.
+    let (resident_target, _, _) = load_resident_target(base_draft.clone());
+
+    let unified = crate::ExecutionPlanDraft::test_bank_substrate(
+        backend,
+        crate::planning::HostTier::Unified(crate::planning::Parking::InKernels),
+    );
+    let whole_draft = base_draft
+        .with_test_bank(&definition, unified, 16, 16, 0, None)
+        .unwrap();
+    assert_eq!(whole_draft.load().expert_bank().map(|b| b.whole()), Some(true));
+    let (whole_target, whole_ledgers, mut whole_recorded) = load_resident_target(whole_draft);
+    let whole_bank = whole_target.bank.as_ref().expect("whole bank opened on CPU");
+    assert!(whole_bank.plan().layers().len() >= 2);
+    for (index, layer) in whole_bank.plan().layers().iter().enumerate() {
+        assert_eq!(whole_bank.plan().home(index), (index as u64) * layer.experts);
+        for kind in [
+            magnitude_family_contracts::WeightKind::ExpertGate,
+            magnitude_family_contracts::WeightKind::ExpertUp,
+            magnitude_family_contracts::WeightKind::ExpertDown,
+        ] {
+            let role = magnitude_family_contracts::WeightRole {
+                scope: layer.scope,
+                kind,
+            };
+            let home = whole_bank.home(role).unwrap();
+            let resident = resident_target.sublayers.get(role).unwrap();
+            assert_eq!(home.extents(), resident.tensor().extents());
+            assert_eq!(
+                home.read_to_host().unwrap(),
+                resident.tensor().read_to_host().unwrap(),
+                "CPU whole-bank home sub-view for {role:?} matches unbanked resident weights bit for bit"
+            );
+        }
+    }
+    let whole_served = crate::experts::ServedBank::new(
+        whole_bank.clone(),
+        Vec::new(),
+        &whole_ledgers,
+        &mut whole_recorded,
+    )
+    .expect("whole CPU bank carves its record holding cleanly");
+    drop(whole_served);
+    drop(whole_target);
+
+    // 2. Tier-placed (`HostTier::Linked`) bank on CPU: exercise both `host_slots = 0`
+    // (empty host tier slice) and `host_slots = 4` (grown multi-slab host tier)
+    // within strict memory-ledger claims.
+    let linked = crate::ExecutionPlanDraft::test_bank_substrate(
+        backend,
+        crate::planning::HostTier::Linked,
+    );
+    let floor = base_draft
+        .load()
+        .bank_floor(&definition, 1, limits.flights(), linked)
+        .unwrap();
+    for host_slots in [0u64, 4u64] {
+        let tier_draft = base_draft
+            .with_test_bank(&definition, linked, floor, 16, host_slots, Some(8))
+            .unwrap();
+        assert_eq!(tier_draft.load().expert_bank().map(|b| b.whole()), Some(false));
+        assert_eq!(tier_draft.load().expert_bank().map(|b| b.tiered()), Some(true));
+        let (tier_target, tier_ledgers, mut tier_recorded) = load_resident_target(tier_draft);
+        let bank = tier_target.bank.as_ref().expect("tier-placed bank opened on CPU");
+        let first_layer = &bank.plan().layers()[0];
+        let tier_up = bank
+            .part(
+                first_layer.scope,
+                crate::planning::BankPart::Tier {
+                    kind: crate::planning::RoutedTensor::Up,
+                },
+            )
+            .unwrap();
+        let empty_tier = tier_up.slice_leading(0, 0).unwrap();
+        assert_eq!(empty_tier.extents()[0], 0);
+        empty_tier.hold_record_table().unwrap();
+        let sub_tier = tier_up.slice_leading(0, 2).unwrap();
+        assert_eq!(sub_tier.extents()[0], 2);
+        sub_tier.hold_record_table().unwrap();
+        assert_eq!(bank.host_tier(), Some((bank.host_slots(), 8)));
+        let _served = crate::experts::ServedBank::new(
+            bank.clone(),
+            Vec::new(),
+            &tier_ledgers,
+            &mut tier_recorded,
+        )
+        .expect("tier-placed bank carves its Bank and Host record holdings cleanly");
+    }
+
     std::fs::remove_dir_all(&directory).ok();
 }

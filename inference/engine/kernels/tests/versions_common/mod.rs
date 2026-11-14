@@ -206,16 +206,16 @@ pub fn slab_arenas(
             element: arena.element,
             row_shape: arena.bank_shape.clone(),
         })
-        .collect();
-    let mut slabs = SlabTensor::new(device, slab_banks, banks as u64, regions).unwrap();
+        .collect::<Vec<_>>();
+    let slabs = crate::common::slab_tensor(device, slab_banks, banks as u64, &regions);
     let count = (banks as u64).div_ceil(slab_banks);
     for slab in 0..count {
-        assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+        assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), slab as usize);
     }
     if reuse {
         assert!(count >= 3);
         slabs.free_slab(1).unwrap();
-        assert_eq!(slabs.add_slab().unwrap(), 1);
+        assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
     }
     for (region, arena) in arenas.iter().enumerate() {
         let contents = bytes(arena.element, arena.values);

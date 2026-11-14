@@ -2,8 +2,11 @@
 //!
 //! The worker is an event pump: it applies every command and event to the
 //! execution owner as it arrives, lets the owner run every transition that is
-//! possible, then sleeps until the next arrival or the owner's next due time.
-//! It makes no scheduling, storage, or lifecycle decision of its own.
+//! possible, then sleeps until the next arrival. An OS memory pressure event
+//! arrives as an event like any other. The one wake no arrival brings is the
+//! owner's timed re-read of memory ([`Reread`]), whose interval is a search
+//! over the owner's own readings, never a set period. It makes no
+//! scheduling, storage, or lifecycle decision of its own.
 
 use crate::{
     protocol::{WorkerCommand, WorkerReply},
@@ -29,6 +32,11 @@ pub enum Event {
     Publication(RequestId, PublicationWake),
     /// A request whose admission reply was dropped, or whose host cancelled it.
     Cancel(RequestId),
+    /// The OS signalled memory pressure: the owner reads memory at once.
+    MemoryPressure,
+    /// The owner's timed re-read of memory is due ([`Reread`]): it reads
+    /// memory at once.
+    Reread,
     /// The worker is closing: terminate every request, let the flight finish, stop.
     Close,
 }
@@ -41,10 +49,79 @@ pub trait Driven {
     /// Executes immediately. No command is deferred or refused for "not now".
     fn command(&mut self, command: WorkerCommand, now: u64) -> Result<WorkerReply, String>;
     fn event(&mut self, event: Event, now: u64);
-    /// Run every transition that is possible now. Returns the worker-clock
-    /// time at which the owner must run again without an event (its next
-    /// memory observation), or why execution stopped.
-    fn run(&mut self, now: u64) -> Result<u64, Self::Stopped>;
+    /// Run every transition that is possible now: when the owner reads
+    /// memory again with no arrival ([`Reread`]), or why execution stopped,
+    /// where it did. Otherwise the owner runs again only at the next
+    /// arrival.
+    fn run(&mut self, now: u64) -> Result<Reread, Self::Stopped>;
+}
+
+/// What a run says of the owner's next reading of memory that no arrival
+/// brings.
+///
+/// The owner reads memory at every flight boundary, every OS pressure
+/// event and every completion of a change of its own. Nothing on any OS
+/// signals memory another program frees, so while something stands that
+/// only a later reading can answer (a real shortage, a wait for memory, a
+/// growth held back or the bank short of its saturation) and no flight is
+/// in progress to bring a boundary, the worker wakes the owner to read
+/// again ([`Event::Reread`]). The first wait is what the reading that found
+/// it standing took to read; each later reading that changes nothing
+/// doubles it, and one that changes anything sets it back to what that
+/// reading took. So freed memory is noticed within the time already
+/// waited, and idle readings cost a share of the time that halves with
+/// each. The wait never grows past the shortest interval the load's
+/// ledgers have seen between two readings across which others' memory
+/// moved (`Ledger::others_interval`): the owner never reads slower than
+/// others were seen to change. Until one is seen, the doubling's own bound
+/// is the only one. The doubling is a search over the owner's own
+/// readings and its ceiling a measurement, not a margin: no period is set.
+/// Once nothing stands, no timed reading is owed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reread {
+    /// No timed reading is owed: nothing stands, or a flight is in
+    /// progress, whose boundary reads.
+    Settled,
+    /// The run read no memory: the timed reading stands as it was.
+    Unread,
+    /// The run read memory, `cost` the reading took, and something stands
+    /// with no flight in progress; `changed` is whether the reading's
+    /// response changed anything of the owner's, and `ceiling` the shortest
+    /// interval across which others' memory was seen to move, none before
+    /// one was.
+    Stands { cost: Duration, changed: bool, ceiling: Option<Duration> },
+}
+
+/// The worker's timed reading ([`Reread`]): the interval its search stands
+/// at, and when the owner reads next, none once one fired and no reading
+/// has answered it yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rereading {
+    interval: Option<Duration>,
+    due: Option<Instant>,
+}
+
+impl Rereading {
+    /// The timed reading after a run that returned `reread`, at `now`.
+    ///
+    /// # Panics
+    /// Where a reading took no time: no clock reads one so, and a zero
+    /// interval would read without end.
+    fn after(self, reread: Reread, now: Instant) -> Self {
+        match reread {
+            Reread::Settled => Self::default(),
+            Reread::Unread => self,
+            Reread::Stands { cost, changed, ceiling } => {
+                assert!(!cost.is_zero(), "invariant violated: a reading of memory took no time");
+                let interval = match (changed, self.interval) {
+                    (false, Some(interval)) => interval.saturating_mul(2),
+                    _ => cost,
+                };
+                let interval = ceiling.map_or(interval, |ceiling| interval.min(ceiling));
+                Self { interval: Some(interval), due: now.checked_add(interval) }
+            }
+        }
+    }
 }
 
 /// The execution owner panicked: execution stopped without a cause of its own.
@@ -154,11 +231,13 @@ impl<C: Clone> Mailbox<C> {
     }
 }
 
-/// The wakes an execution owner raises: a submitted flight's completion and a
-/// request's publication activity.
+/// The wakes an execution owner raises: a submitted flight's completion, a
+/// request's publication activity, and the OS's memory pressure events.
 pub trait Wakes: Send + Sync {
     fn completion(&self) -> CompletionWake;
     fn publication(&self, request: RequestId, wake: PublicationWake);
+    /// The wake each OS memory pressure event raises, as often as it comes.
+    fn pressure(&self) -> Box<dyn Fn() + Send + Sync>;
 }
 
 impl<C: Clone + Send + 'static> Wakes for WorkerWakeHandle<C> {
@@ -167,6 +246,10 @@ impl<C: Clone + Send + 'static> Wakes for WorkerWakeHandle<C> {
     }
     fn publication(&self, request: RequestId, wake: PublicationWake) {
         WorkerWakeHandle::publication(self, request, wake)
+    }
+    fn pressure(&self) -> Box<dyn Fn() + Send + Sync> {
+        let mailbox = self.mailbox.clone();
+        Box::new(move || mailbox.push(Event::MemoryPressure))
     }
 }
 
@@ -458,7 +541,11 @@ impl<C: Clone + Send + 'static> Client<C> {
     }
 }
 
+/// Pump `mailbox` into `owner` until it stops: every arrival applied, the
+/// owner run, then a sleep until the next arrival or the owner's timed
+/// reading ([`Reread`]).
 fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C {
+    let mut rereading = Rereading::default();
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     loop {
@@ -476,21 +563,24 @@ fn run<C: Clone>(owner: &mut dyn Driven<Stopped = C>, mailbox: &Mailbox<C>) -> C
                 }
             }
         }
-        let due = match owner.run(now()) {
-            Ok(due) => due,
+        match owner.run(now()) {
+            Ok(reread) => rereading = rereading.after(reread, Instant::now()),
             Err(cause) => return cause,
-        };
+        }
         let mut state = mailbox.state.lock().unwrap();
         while state.items.is_empty() {
-            let remaining = due.saturating_sub(now());
-            if remaining == 0 {
-                break;
+            let Some(due) = rereading.due else {
+                state = mailbox.changed.wait(state).unwrap();
+                continue;
+            };
+            match due.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()) {
+                Some(left) => state = mailbox.changed.wait_timeout(state, left).unwrap().0,
+                None => {
+                    // Fired once: the reading it brings sets the next.
+                    rereading.due = None;
+                    state.items.push_back(Item::Event(Event::Reread));
+                }
             }
-            state = mailbox
-                .changed
-                .wait_timeout(state, Duration::from_nanos(remaining))
-                .unwrap()
-                .0;
         }
     }
 }
@@ -505,9 +595,9 @@ mod tests {
     };
     use std::collections::BTreeSet;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(2);
-    const NEVER: u64 = u64::MAX;
 
     impl From<Panicked> for String {
         fn from(_: Panicked) -> Self {
@@ -558,8 +648,9 @@ mod tests {
     /// Reports every call; stops once closed.
     struct Recorder {
         calls: mpsc::Sender<&'static str>,
-        due: u64,
         closed: bool,
+        /// What its runs return, in turn; settled once spent.
+        reread: VecDeque<Reread>,
     }
     impl Driven for Recorder {
         type Stopped = String;
@@ -576,6 +667,8 @@ mod tests {
                     Event::Completion => "completion",
                     Event::Publication(..) => "publication",
                     Event::Cancel(_) => "cancel",
+                    Event::MemoryPressure => "pressure",
+                    Event::Reread => "reread",
                     Event::Close => {
                         self.closed = true;
                         "close"
@@ -583,29 +676,33 @@ mod tests {
                 })
                 .unwrap();
         }
-        fn run(&mut self, now: u64) -> Result<u64, String> {
+        fn run(&mut self, _: u64) -> Result<Reread, String> {
             self.calls.send("run").unwrap();
             if self.closed {
                 return Err("closed".into());
             }
-            Ok(self.due.saturating_add(now))
+            Ok(self.reread.pop_front().unwrap_or(Reread::Settled))
         }
     }
 
-    fn recorder(due: u64) -> (Worker<String>, mpsc::Receiver<&'static str>) {
+    /// A worker over a [`Recorder`], with the wakes its owner was given.
+    fn recorder() -> (Worker<String>, mpsc::Receiver<&'static str>, WorkerWakeHandle<String>) {
+        rereading(Vec::new())
+    }
+
+    /// A worker over a [`Recorder`] whose runs return `reread` in turn.
+    fn rereading(reread: Vec<Reread>) -> (Worker<String>, mpsc::Receiver<&'static str>, WorkerWakeHandle<String>) {
         let (calls, observed) = mpsc::channel();
+        let (handle, wakes) = mpsc::channel();
         let worker = Worker::spawn(
-            move |_| {
-                Ok(Box::new(Recorder {
-                    calls,
-                    due,
-                    closed: false,
-                }) as Owner<String>)
+            move |wakes| {
+                handle.send(wakes).unwrap();
+                Ok(Box::new(Recorder { calls, closed: false, reread: reread.into() }) as Owner<String>)
             },
             4,
         )
         .unwrap();
-        (worker, observed)
+        (worker, observed, wakes.recv_timeout(TIMEOUT).unwrap())
     }
 
     #[test]
@@ -618,11 +715,7 @@ mod tests {
                 started.send(()).unwrap();
                 allow_finish.recv_timeout(TIMEOUT).map_err(|error| error.to_string())?;
                 Ok((
-                    Box::new(Recorder {
-                        calls,
-                        due: NEVER,
-                        closed: false,
-                    }) as Owner<String>,
+                    Box::new(Recorder { calls, closed: false, reread: VecDeque::new() }) as Owner<String>,
                     7,
                 ))
             },
@@ -640,19 +733,66 @@ mod tests {
 
     #[test]
     fn an_idle_owner_runs_once_and_the_worker_sleeps() {
-        let (mut worker, observed) = recorder(NEVER);
+        let (mut worker, observed, _wakes) = recorder();
         assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
         assert!(observed.recv_timeout(Duration::from_millis(200)).is_err());
         worker.close();
     }
 
+    /// A memory pressure event wakes the owner like any arrival.
     #[test]
-    fn the_owner_runs_again_when_its_observation_is_due() {
-        let (mut worker, observed) = recorder(Duration::from_millis(5).as_nanos() as u64);
-        for _ in 0..3 {
+    fn a_memory_pressure_event_runs_the_owner() {
+        let (mut worker, observed, wakes) = recorder();
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
+        (wakes.pressure())();
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "pressure");
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
+        worker.close();
+    }
+
+    /// While something stands the owner is woken to read again with no
+    /// arrival, at each reading that stands, and once nothing stands no
+    /// wake comes. The readings are scripted to take a nanosecond, so the
+    /// waits are the search's, never the test's.
+    #[test]
+    fn a_standing_reading_is_read_again_until_it_settles() {
+        let cost = Duration::from_nanos(1);
+        let (mut worker, observed, _wakes) = rereading(vec![
+            Reread::Stands { cost, changed: true, ceiling: None },
+            Reread::Stands { cost, changed: false, ceiling: None },
+            Reread::Settled,
+        ]);
+        assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
+        for _ in 0..2 {
+            assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "reread");
             assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
         }
+        assert!(observed.recv_timeout(Duration::from_millis(200)).is_err(), "nothing stands: no wake");
         worker.close();
+    }
+
+    /// The search's steps: a standing reading waits what it took; one that
+    /// changes nothing doubles the wait, never past the shortest interval
+    /// others were seen to move across; one that changes anything sets it
+    /// back to what it took; an unread run keeps it; a settled one ends it.
+    #[test]
+    fn the_rereading_interval_starts_at_the_reading_doubles_to_its_ceiling_and_resets() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let stands = |cost, changed| Reread::Stands { cost: ms(cost), changed, ceiling: None };
+        let first = Rereading::default().after(stands(3, false), now);
+        assert_eq!(first, Rereading { interval: Some(ms(3)), due: Some(now + ms(3)) });
+        let doubled = first.after(stands(5, false), now).after(stands(5, false), now);
+        assert_eq!(doubled.interval, Some(ms(12)));
+        assert_eq!(doubled.after(Reread::Unread, now + ms(1)), doubled);
+        let reset = doubled.after(stands(4, true), now);
+        assert_eq!(reset, Rereading { interval: Some(ms(4)), due: Some(now + ms(4)) });
+        assert_eq!(reset.after(Reread::Settled, now), Rereading::default());
+        // Others were seen to move across 10 ms: the doubling stops there.
+        let bounded = |interval: Rereading| interval.after(Reread::Stands { cost: ms(4), changed: false, ceiling: Some(ms(10)) }, now);
+        let capped = bounded(bounded(reset));
+        assert_eq!(capped, Rereading { interval: Some(ms(10)), due: Some(now + ms(10)) });
+        assert_eq!(bounded(capped).interval, Some(ms(10)));
     }
 
     /// The incident's worker half: commands never wait on the owner's state.
@@ -685,7 +825,7 @@ mod tests {
                     _ => {}
                 }
             }
-            fn run(&mut self, _: u64) -> Result<u64, String> {
+            fn run(&mut self, _: u64) -> Result<Reread, String> {
                 if self.closed {
                     return Err("closed".into());
                 }
@@ -693,7 +833,7 @@ mod tests {
                     self.submitted = true;
                     self.flight.send(self.wakes.completion()).unwrap();
                 }
-                Ok(NEVER)
+                Ok(Reread::Settled)
             }
         }
         let (flight, flights) = mpsc::channel();
@@ -732,7 +872,7 @@ mod tests {
                 Ok(WorkerReply::Acknowledged)
             }
             fn event(&mut self, _: Event, _: u64) {}
-            fn run(&mut self, _: u64) -> Result<u64, String> {
+            fn run(&mut self, _: u64) -> Result<Reread, String> {
                 Err("device lost".into())
             }
         }
@@ -775,11 +915,11 @@ mod tests {
                     _ => {}
                 }
             }
-            fn run(&mut self, _: u64) -> Result<u64, String> {
+            fn run(&mut self, _: u64) -> Result<Reread, String> {
                 if self.closed {
                     return Err("closed".into());
                 }
-                Ok(NEVER)
+                Ok(Reread::Settled)
             }
         }
         let (cancelled, observed) = mpsc::channel();
@@ -800,7 +940,7 @@ mod tests {
 
     #[test]
     fn events_bypass_a_saturated_control_queue() {
-        let (mut worker, observed) = recorder(NEVER);
+        let (mut worker, observed, _wakes) = recorder();
         assert_eq!(observed.recv_timeout(TIMEOUT).unwrap(), "run");
         let client = worker.client();
         let held = client.dispatch(WorkerCommand::Observe).unwrap();

@@ -1,70 +1,46 @@
-//! The bank's resizes. A shrink runs between flights: the owner asks, and
-//! residency answers once nothing moves a record (its turns wait on the
-//! load's events, never on a time), or at once for a shrink of the records
-//! the host lands into, which keeps every record in flight where it is. A
-//! bank's shrink is planned with its evictions published at once
-//! (always safe: the bank only loses experts), and answered with a plan the
-//! owner commits once its moves are queued on the device ahead of every
-//! later step, or drops. The one store is also cut beside a running chain
-//! ([`Shared::cut_running`]), moving nothing, when memory runs short while
-//! a long chain is encoded. A growth asks nothing: each of its slots joins
-//! as soon as every record tensor backs it ([`Shared::join`]), beside
-//! running steps, which reach a record only once the host maps it. Each
-//! carries the bank's slots, which the watcher's telemetry reads.
+//! The bank's resizes. A shrink evicts records, beside running steps or
+//! not, and moves nothing: the bank's records allow holes, so the experts it
+//! keeps stay where their bytes are, and those it evicts leave the map for
+//! the steps not yet begun (beside a running scratch-served chain, those
+//! its steps have yet to decide too) while the steps before still read
+//! them where they are, until the bank releases their storage behind them.
+//! Residency answers it at its next turn, waiting on no flight. A growth
+//! asks nothing: each of its slots joins as soon as every record tensor
+//! backs it ([`Shared::join`]), beside running steps, which reach a record
+//! only once the host maps it. Each carries the bank's slots, which the
+//! watcher's telemetry reads.
 
 use super::{Shared, Step};
-use super::core::{Core, PlacedWords};
+use super::core::PlacedWords;
 use super::residency::Residency;
 use super::telemetry::GroupReadWords;
-use crate::experts::directory::Shrink;
 use crate::experts::reuse::Reuse;
 use crate::experts::source::Records;
 use std::sync::{Condvar, Mutex};
 use crate::domain::Trip;
 use std::time::Instant;
 
-/// A shrink the watcher planned between flights, its evictions published
-/// ([`Shared::plan_shrink`]): what the owner commits once its moves are
-/// queued on the device ahead of every later step
-/// ([`Shared::commit_shrink`]), or drops, which leaves every kept expert
-/// where its bytes are. It holds the records it moves into or retires
-/// (`BankRecords::shrinking`) while it lives: dropped uncommitted, it
-/// returns them (`BankRecords::unshrink`), so no path leaves them held.
-#[must_use]
-pub(crate) struct ShrinkPlan {
-    slots: usize,
-    groups: Vec<Shrink>,
-    trip: Trip,
-    /// The watcher it returns its records to, until it commits.
-    holds: Option<std::sync::Arc<Shared>>,
+/// Which records a shrink evicts: the bank's, which the device places into
+/// beside a host tier, or those the host lands into (a host tier's, or the
+/// one store's where the host places).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Evicting {
+    Bank,
+    Landed,
 }
 
-impl Drop for ShrinkPlan {
-    fn drop(&mut self) {
-        if let Some(shared) = self.holds.take() {
-            shared.resizing.abandoned.store(true, std::sync::atomic::Ordering::Release);
-            shared.events().notify();
-        }
-    }
-}
-
-impl ShrinkPlan {
-    /// The slots the plan commits the bank to.
-    pub fn slots(&self) -> usize {
-        self.slots
-    }
-
-    /// The plan's trip through the watcher.
-    pub fn trip(&self) -> Trip {
-        self.trip
-    }
-
-    /// Each group's moved records, (from, to).
-    pub fn moves(&self) -> impl Iterator<Item = Vec<(usize, usize)>> + '_ {
-        self.groups
-            .iter()
-            .map(|plan| plan.moved.iter().map(|&(.., from, to)| (from, to)).collect())
-    }
+/// A shrink answered ([`Shared::shrink`]): the slots it commits the records
+/// to, each group's records it evicted (holes from now, which the owner
+/// releases the storage of behind the steps that may still read them), the
+/// highest streamed layer whose hits a running chain's steps had decided at
+/// it (none where they had decided none, or beside no chain), and its trip
+/// through the watcher. No run a chain submits after every pass of that
+/// layer resolves an evicted record.
+pub(crate) struct Evicted {
+    pub slots: usize,
+    pub records: Vec<Vec<u32>>,
+    pub decided: Option<usize>,
+    pub trip: Trip,
 }
 
 /// A shrink's candidate commitments: from `shallowest` slots down to
@@ -97,18 +73,12 @@ impl Candidates {
     }
 }
 
-/// What the owner asks of the watcher between flights to resize the bank.
+/// What the owner asks of the watcher to resize the bank.
 pub(super) enum Ask {
-    /// Plan each group's commitment at `records` (the bank at `slots`), and
-    /// evict what it evicts.
-    Shrink { slots: usize, records: Vec<usize> },
-    /// Take a planned shrink's moves, which the device carries.
-    Commit(ShrinkPlan),
-    /// Shrink each group's records the host lands into at the deepest of
-    /// `candidates` that keeps every record in flight, its kept experts
-    /// moved below the cut by `keeping`; its tier tensors then address the
-    /// records below the cut alone.
-    ShrinkHost { candidates: Candidates, keeping: Keeping },
+    /// Evict `evicting`'s records down to the deepest of `candidates` whose
+    /// records hold every one in flight, beside the running scratch-served
+    /// chain whose steps run from `first` through `last` where given.
+    Evict { evicting: Evicting, candidates: Candidates, chain: Option<(Step, Step)> },
     /// Serve the places the bank holds from now by their words.
     Place(PlacedWords),
 }
@@ -117,14 +87,15 @@ pub(super) enum Ask {
 /// in the order posted ([`Shared::join`]), backed by every record tensor of
 /// its holding.
 pub(crate) enum Join {
-    /// Each group of the bank holds `records` records, beside a host tier:
-    /// the directory takes the new ones, free, and promotes into them.
-    Bank { records: Vec<usize> },
+    /// Each group of the bank holds `records` more, beside a host tier
+    /// (holes or past every record): the directory takes them, free, and
+    /// promotes into them.
+    Bank { records: Vec<Vec<usize>> },
     /// Each group's records the host lands into (its host tier's, or the
-    /// one store's where the host places) are `records`, addressed by
-    /// `views` (each group's record tensors' records committed at them):
-    /// the directory takes the new ones, ready.
-    Landed { records: Vec<u32>, views: Vec<Vec<Records>> },
+    /// one store's where the host places) hold `records` more, addressed by
+    /// `views` (each group's record tensors' records the store holds now):
+    /// the directory takes them, ready.
+    Landed { records: Vec<Vec<u32>>, views: Vec<Vec<Records>> },
 }
 
 /// The slots a running growth has joined, in order, until the watcher
@@ -182,59 +153,21 @@ impl Joins {
 }
 
 impl Ask {
-    /// Whether it is served only once nothing moves a record: every resize
-    /// but a shrink of the records the host lands into, which keeps each
-    /// record in flight where it is (`HostRecords::shrink`), so it is served
-    /// as it is asked.
+    /// Whether it is served only between flights, once nothing moves a
+    /// record: the places' words, which every step binds. A shrink waits on
+    /// nothing: it evicts only records none moves.
     fn waits(&self) -> bool {
-        !matches!(self, Self::ShrinkHost { .. })
+        matches!(self, Self::Place(_))
     }
 }
 
 enum Answer {
-    Planned(ShrinkPlan),
     Done(Trip),
-    /// A shrink of the records the host lands into: cut, none where even
-    /// its shallowest candidate cuts below a record in flight, or refused.
-    Cut(Result<Option<Cut>, String>),
+    /// A shrink: evicted, none where even its shallowest candidate keeps
+    /// fewer records than those in flight (or beside a chain it may not
+    /// evict), or refused.
+    Evicted(Result<Option<Evicted>, String>),
 }
-
-/// Where a shrink of the records the host lands into cut them: the slots it
-/// commits them to, and its trip through the watcher.
-pub(crate) struct HostCut {
-    pub slots: usize,
-    pub trip: Trip,
-}
-
-/// A shrink of the records the host lands into, cut, by its [`Keeping`].
-enum Cut {
-    /// Its kept records' bytes copied on the host.
-    Copied(HostCut),
-    /// Each group's moves of its kept records, (from, to), for the device
-    /// to carry.
-    Kept(HostCut, KeptMoves),
-}
-
-/// Who moves the kept experts of a shrink of the records the host lands
-/// into below its cut.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Keeping {
-    /// The host copies them before it answers: a host tier, in host RAM,
-    /// which no device work reaches.
-    Host,
-    /// The device moves them, in queue order ahead of every later step,
-    /// as the answer names them: the one store, where the host places, so
-    /// the owner's thread only queues them. Every host write of a record
-    /// the moves write follows the device past them: the records then
-    /// ready are none of theirs, a record unmapped later frees only as the
-    /// device's frontier passes a step queued after them or it parks in
-    /// one, and a landing a step asks for follows the step.
-    Device,
-}
-
-/// Each group's moves of a shrink's kept records, (from, to), for the device
-/// to carry ([`Keeping::Device`]).
-pub(crate) type KeptMoves = Vec<Vec<(u32, u32)>>;
 
 enum Resize {
     None,
@@ -243,67 +176,15 @@ enum Resize {
     Answered(Answer),
 }
 
-/// A cut of the one store beside a running chain ([`Shared::cut_running`]),
-/// which the owner never waits for: asked, then taken by residency, then
-/// answered, each read by the owner as it encodes the chain or at a later
-/// boundary.
-enum Running {
-    /// None asked, or residency serving one.
-    None,
-    /// Asked at that instant beside the chain whose steps run from `first`
-    /// through `last`, at the deepest of `candidates` it may cut.
-    Asked { first: Step, last: Step, candidates: Candidates, at: Instant },
-    Answered(Result<Option<RunningCut>, String>),
-}
-
-/// A cut of the one store beside a running chain, answered
-/// ([`Shared::cut_running`]): the slots it commits the store to, the
-/// highest streamed layer whose hits the chain's steps had decided at the
-/// cut (none where they had decided none), and its trip through the
-/// watcher. No run the chain submits after every pass of that layer
-/// resolves a record at or past the cut.
-pub(crate) struct RunningCut {
-    pub slots: usize,
-    pub decided: Option<usize>,
-    pub trip: Trip,
-}
-
 /// The resize the owner and the watcher exchange.
 pub(super) struct ResizeHandoff {
     resize: Mutex<Resize>,
     resized: Condvar,
-    /// The cut beside a running chain, apart from the resizes asked
-    /// between flights, which wait on it never.
-    running: Mutex<Running>,
-    /// Whether a plan was dropped uncommitted since residency last looked
-    /// ([`ShrinkPlan`]'s drop): its records return.
-    abandoned: std::sync::atomic::AtomicBool,
 }
 
 impl ResizeHandoff {
     pub(super) fn new() -> Self {
-        Self {
-            resize: Mutex::new(Resize::None),
-            resized: Condvar::new(),
-            running: Mutex::new(Running::None),
-            abandoned: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn running(&self) -> std::sync::MutexGuard<'_, Running> {
-        self.running.lock().expect("watcher running cut")
-    }
-
-    /// The cut beside a running chain asked, taken.
-    fn running_asked(&self) -> Option<(Step, Step, Candidates, Instant)> {
-        let mut running = self.running();
-        match std::mem::replace(&mut *running, Running::None) {
-            Running::Asked { first, last, candidates, at } => Some((first, last, candidates, at)),
-            other => {
-                *running = other;
-                None
-            }
-        }
+        Self { resize: Mutex::new(Resize::None), resized: Condvar::new() }
     }
 
     /// What the owner asks of a resize, and when it asked, taken.
@@ -336,26 +217,19 @@ impl ResizeHandoff {
 }
 
 impl Shared {
-    /// Plan the bank's commitment at `slots`, each group's `records` there,
-    /// between flights: every begun step ended and the device past it. The watcher retires every fill (the conveyor returns
-    /// the lender's records), plans each shrinking group to keep its most
-    /// recently read experts below its new commitment
-    /// (`Directory::plan_shrink`), and evicts the rest: their slot map
-    /// entries and directory records are cleared now.
-    pub fn plan_shrink(&self, slots: usize, records: Vec<usize>) -> Result<ShrinkPlan, String> {
-        match self.ask(Ask::Shrink { slots, records })? {
-            Answer::Planned(plan) => Ok(plan),
-            Answer::Done(_) | Answer::Cut(_) => unreachable!("a shrink is answered with its plan"),
-        }
-    }
-
-    /// Commit `plan` once its moves are queued on the device ahead of every
-    /// later step, still between flights: each moved expert's map entry
-    /// follows it, and each group's records end at its new commitment.
-    pub fn commit_shrink(&self, plan: ShrinkPlan) -> Result<Trip, String> {
-        match self.ask(Ask::Commit(plan))? {
-            Answer::Done(trip) => Ok(trip),
-            Answer::Planned(_) | Answer::Cut(_) => unreachable!("a commit is answered done"),
+    /// Evict `evicting`'s records down to the deepest of `candidates` whose
+    /// every group keeps its records in flight, beside running steps or
+    /// not, the running scratch-served chain whose steps run from `first`
+    /// through `last` where `chain` names one: residency answers at its next
+    /// turn, waiting on no flight ([`Residency::serve_evict`]). Nothing
+    /// moves: each group keeps its most valuable experts where their bytes
+    /// are, and evicts the rest, free records first. None where even the
+    /// shallowest candidate keeps fewer records than those in flight, or
+    /// beside a chain it may not evict.
+    pub fn shrink(&self, evicting: Evicting, candidates: Candidates, chain: Option<(Step, Step)>) -> Result<Option<Evicted>, String> {
+        match self.ask(Ask::Evict { evicting, candidates, chain })? {
+            Answer::Evicted(evicted) => evicted,
+            Answer::Done(_) => unreachable!("a shrink is answered by its evictions"),
         }
     }
 
@@ -371,50 +245,6 @@ impl Shared {
         self.events().notify();
     }
 
-    /// Shrink each group's host tier, between flights, at the deepest of
-    /// `candidates` whose cut keeps every record in flight below it
-    /// ([`Self::cut_host`]), its kept records' bytes copied below the cut
-    /// before it answers. None where every candidate cuts below a record in
-    /// flight.
-    pub(in crate::experts) fn shrink_tier(&self, candidates: Candidates) -> Result<Option<HostCut>, String> {
-        match self.cut_host(candidates, Keeping::Host)? {
-            Some(Cut::Copied(cut)) => Ok(Some(cut)),
-            None => Ok(None),
-            Some(Cut::Kept(..)) => unreachable!("a host tier's shrink is copied on the host"),
-        }
-    }
-
-    /// Shrink the one store (where the host places), between flights, at
-    /// the deepest of `candidates` whose cut keeps every record in flight
-    /// below it ([`Self::cut_host`]): answered with each group's moves of
-    /// its kept records, which the device carries (`Keeping::Device`). None
-    /// where every candidate cuts below a record in flight.
-    pub(in crate::experts) fn shrink_store(&self, candidates: Candidates) -> Result<Option<(HostCut, KeptMoves)>, String> {
-        match self.cut_host(candidates, Keeping::Device)? {
-            Some(Cut::Kept(cut, moves)) => Ok(Some((cut, moves))),
-            None => Ok(None),
-            Some(Cut::Copied(_)) => unreachable!("the one store's shrink is moved on the device"),
-        }
-    }
-
-    /// Each group's records, a host tier's or the one store's, cut between
-    /// flights at the deepest of `candidates` whose cut lies at or above its
-    /// floor (`Directory::host_floor`): every step retired, it is served as
-    /// asked, with no wait for the reads, landings, copies or prompt groups
-    /// in flight, whose records the shrink keeps where they are
-    /// (`HostRecords::shrink`), each group's most valuable other records
-    /// kept below the cut. Its tier tensors then address the records below
-    /// the cut alone, and each landing in flight holds only its own record
-    /// (`TierTensor::landed`), so no view the watcher made holds a released
-    /// record once it answers. None where even the shallowest candidate
-    /// cuts below a record in flight: nothing changes.
-    fn cut_host(&self, candidates: Candidates, keeping: Keeping) -> Result<Option<Cut>, String> {
-        match self.ask(Ask::ShrinkHost { candidates, keeping })? {
-            Answer::Cut(cut) => cut,
-            Answer::Planned(_) | Answer::Done(_) => unreachable!("a shrink of the records the host lands into is answered by its cut"),
-        }
-    }
-
     /// The bank holds `words` for the places a group holds from now,
     /// between flights (`ExpertBank::hold_places`): every step retired, the
     /// watcher serves each place's scratch requests and the telemetry reads
@@ -423,43 +253,16 @@ impl Shared {
         self.ask(Ask::Place(words)).map(drop)
     }
 
-    /// Ask residency to cut the one store (where the host places) beside
-    /// the running chain whose steps run from `first` through `last`, at its
-    /// next turn, at the deepest of `candidates` whose cut keeps every
-    /// record in flight below it ([`Residency::serve_running`]); the owner
-    /// reads the answer as it comes ([`Self::running_cut`]) and never waits
-    /// for it. One at a time.
-    pub(in crate::experts) fn cut_running(&self, (first, last): (Step, Step), candidates: Candidates) {
-        let mut running = self.resizing.running();
-        assert!(matches!(*running, Running::None), "a cut beside running steps asked beside another");
-        *running = Running::Asked { first, last, candidates, at: Instant::now() };
-        drop(running);
-        self.events().notify();
-    }
-
-    /// The cut asked beside a running chain ([`Self::cut_running`]), once
-    /// residency answered it: cut, none where it cuts nothing (every
-    /// candidate below a record in flight, a whole layer, or a group begun
-    /// after the chain), or why serving ended. None while it is not
-    /// answered yet.
-    pub(in crate::experts) fn running_cut(&self) -> Option<Result<Option<RunningCut>, String>> {
-        let mut running = self.resizing.running();
-        match std::mem::replace(&mut *running, Running::None) {
-            Running::Answered(answer) => Some(answer),
-            asked => {
-                *running = asked;
-                let reason = self.life.ended()?;
-                *running = Running::None;
-                Some(Err(format!("the expert watcher stopped serving: {reason}")))
-            }
-        }
-    }
-
     fn ask(&self, ask: Ask) -> Result<Answer, String> {
         let resizing = &self.resizing;
-        self.steps.between_flights(|| {
-            *resizing.resize.lock().expect("watcher resize") = Resize::Asked(ask, Instant::now());
-        })?;
+        let post = |ask| *resizing.resize.lock().expect("watcher resize") = Resize::Asked(ask, Instant::now());
+        match ask.waits() {
+            true => self.steps.between_flights(|| post(ask))?,
+            false => {
+                post(ask);
+                self.events().notify();
+            }
+        }
         // The watcher answers, or ends serving (`Shared::end_serving`), and
         // either notifies under this lock.
         let mut resize = resizing.resize.lock().expect("watcher resize");
@@ -478,7 +281,7 @@ impl Shared {
 }
 
 /// A resize the owner asked at `at`, taken by residency at `taken`, served
-/// once nothing moves a record ([`Residency::resize`]).
+/// once nothing moves a record where it waits ([`Residency::resize`]).
 pub(super) struct Asked {
     ask: Ask,
     at: Instant,
@@ -504,7 +307,6 @@ struct Published(());
 #[derive(Default)]
 pub(super) struct Owed {
     answer: Option<(Answer, Published)>,
-    running: Option<Result<Option<RunningCut>, String>>,
     joined: usize,
 }
 
@@ -514,9 +316,6 @@ impl Owed {
         if let Some((answer, published)) = self.answer.take() {
             shared.resizing.answer(answer, published);
         }
-        if let Some(cut) = self.running.take() {
-            *shared.resizing.running() = Running::Answered(cut);
-        }
         if self.joined > 0 {
             shared.joins.applied(std::mem::take(&mut self.joined));
         }
@@ -524,16 +323,6 @@ impl Owed {
 }
 
 impl Residency {
-    /// Return the records of every plan dropped uncommitted
-    /// ([`ShrinkPlan`]'s drop), as residency's lock is taken
-    /// ([`super::residency::lock`]): no holder meets them, a resize served
-    /// or a prompt group lent its records alike.
-    pub(super) fn unshrink(&mut self) {
-        if self.shared.resizing.abandoned.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            self.core.directory.unshrink();
-        }
-    }
-
     /// Take each slot a growth joined since ([`Shared::join`]), in order:
     /// the directory takes its new records (free bank records it then
     /// promotes into, or ready landed records, which file misses and the
@@ -564,16 +353,15 @@ impl Residency {
         count > 0
     }
 
-    /// Serve `asked`: between flights every step has ended, so the frontier
-    /// is past the last flight, and its steps retire. A resize that waits
-    /// ([`Ask::waits`]) is answered only once nothing moves a record: the
+    /// Serve `asked`. One that waits ([`Ask::waits`]) is served between
+    /// flights, every step ended, so the frontier is past the last flight
+    /// and its steps retire, and only once nothing moves a record: the
     /// promotions in flight end (each copy's completion an event), then the
-    /// reads in flight land (each landing's end an event), so no copy and no
-    /// landing writes a record while a resize moves them, and a prompt
+    /// reads in flight land (each landing's end an event), and a prompt
     /// group the device is past clears, returning the records it claimed;
     /// meanwhile nothing new is promoted or read ahead (`Residency::tend`).
-    /// The ask, while it waits; none once answered, or once serving ended
-    /// (whose end wakes the owner).
+    /// A shrink waits on nothing. The ask, while it waits; none once
+    /// answered, or once serving ended (whose end wakes the owner).
     pub(super) fn resize(&mut self, asked: Asked, copier: Option<&super::promotions::Copier>) -> Option<Asked> {
         // Every slot a growth joined before the ask is the directory's.
         self.join();
@@ -595,7 +383,7 @@ impl Residency {
             }
             // A prompt group the device is past holds its records claimed
             // until its conveyor clears (its landings from the conveyor end,
-            // each an event): a resize moves no record a group still holds.
+            // each an event).
             if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core) {
                 return Some(asked);
             }
@@ -605,32 +393,25 @@ impl Residency {
             picked: taken - at,
             served: taken.elapsed(),
         };
-        let answer = self.serve_resize(ask, trip);
+        let answer = match ask {
+            Ask::Evict { evicting, candidates, chain } => Answer::Evicted(self.serve_evict(evicting, &candidates, chain, trip)),
+            Ask::Place(PlacedWords { flags, layers }) => {
+                let places = flags.len();
+                self.scratch.place(flags);
+                self.shared.telemetry.place(GroupReadWords { layers, places });
+                Answer::Done(trip())
+            }
+        };
         let published = self.publish_resized();
         assert!(self.owed.answer.replace((answer, published)).is_none(), "a resize is answered before residency is released");
         None
     }
 
-    /// Serve the cut asked beside a running chain, if one is
-    /// ([`Self::serve_running`]), answered as residency is released.
-    /// Whether one was.
-    pub(super) fn cut_running(&mut self) -> bool {
-        let Some((first, last, candidates, at)) = self.shared.resizing.running_asked() else {
-            return false;
-        };
-        let taken = Instant::now();
-        let trip = || Trip { picked: taken - at, served: taken.elapsed() };
-        let cut = self.serve_running((first, last), &candidates, trip);
-        assert!(self.owed.running.replace(cut).is_none(), "a running cut is answered before residency is released");
-        true
-    }
-
-    /// Still between flights, before the owner begins a step, publish what a
-    /// resize changed: the maps of every record it moved or released (a
-    /// shrink's moves within the host's records name new records, its drops
-    /// none), so no step resolves an expert at a record that holds another
-    /// or is released; then the policy words, the whole words learning which
-    /// groups it left whole. The one way to the proof an answer takes.
+    /// Before the owner reads its answer, publish what a resize changed: the
+    /// tier map of every record it evicted, so no step not yet begun
+    /// resolves an expert at a hole; then, where no step runs, the policy
+    /// words, the whole words learning which groups it left whole. The one
+    /// way to the proof an answer takes.
     fn publish_resized(&mut self) -> Published {
         self.refill_tier();
         let steps = self.shared.steps.clone();
@@ -639,171 +420,105 @@ impl Residency {
         Published(())
     }
 
-    /// Serve `asked`, every step retired, and the host's records' movements
-    /// drained where it waits for them ([`Ask::waits`]).
-    fn serve_resize(&mut self, asked: Ask, trip: impl Fn() -> Trip) -> Answer {
-        match asked {
-            Ask::Shrink { slots, records } => {
-                // Ranked by every step that ended before the gap it is asked
-                // in, whichever turn of this thread their ends fell in.
-                self.shared.telemetry.feed();
-                let ranking = self.core.directory.ranking();
-                let last_read = |layer, expert| Reuse::of(&ranking).last(layer, expert);
-                let groups = plan(&mut self.core, &records, last_read);
-                Answer::Planned(ShrinkPlan { slots, groups, trip: trip(), holds: Some(self.shared.clone()) })
-            }
-            Ask::Commit(mut plan) => {
-                commit(&mut self.core, &plan);
-                plan.holds = None;
-                self.shared.telemetry.resized(self.core.bank_records());
-                Answer::Done(trip())
-            }
-            Ask::ShrinkHost { candidates, keeping } => Answer::Cut(self.serve_cut(&candidates, keeping, trip)),
-            Ask::Place(PlacedWords { flags, layers }) => {
-                let places = flags.len();
-                self.scratch.place(flags);
-                self.shared.telemetry.place(GroupReadWords { layers, places });
-                Answer::Done(trip())
-            }
-        }
-    }
-}
-
-impl Residency {
-    /// Cut each group's records the host lands into at the deepest of
-    /// `candidates` whose records lie at or above its floor
-    /// (`Directory::host_floor`), so every record in flight stays where it
-    /// is; none where none does. The views of the records below the cut
-    /// are formed first, so a refusal changes nothing.
-    fn serve_cut(&mut self, candidates: &Candidates, keeping: Keeping, trip: impl Fn() -> Trip) -> Result<Option<Cut>, String> {
-        let floors = (0..self.core.groups.len()).map(|group| self.core.directory.host_floor(group)).collect::<Vec<_>>();
-        let Some((slots, records)) = deepest(candidates, &floors) else {
-            return Ok(None);
-        };
-        let views = self.core.tier_views(&records)?;
-        let moves = records
-            .iter()
-            .enumerate()
-            .map(|(group, &records)| self.core.directory.shrink_host(group, records))
-            .collect::<Vec<_>>();
-        if keeping == Keeping::Host {
-            for (group, moves) in moves.iter().enumerate() {
-                let tensors = self.core.groups[group].tier.as_ref().expect("a host tier shrinks only beside its tensors");
-                for &(from, to) in moves {
-                    for tensor in tensors.iter().map(|tensor| &tensor.records) {
-                        // SAFETY: both are committed records of the tensor
-                        // that no landing, copy or step reaches meanwhile:
-                        // neither is in flight (`HostRecords::shrink`), and
-                        // every step retired, between flights. Distinct
-                        // records never overlap.
-                        unsafe { tensor.copy_record(u64::from(to.0), tensor, u64::from(from.0), tensor.bytes()) };
-                    }
-                }
-            }
-        }
-        self.address_tier(views);
-        self.shared.telemetry.resized(self.core.bank_records());
-        let cut = HostCut { slots, trip: trip() };
-        Ok(Some(match keeping {
-            Keeping::Host => Cut::Copied(cut),
-            Keeping::Device => Cut::Kept(cut, moves.into_iter().map(|moves| moves.into_iter().map(|(from, to)| (from.0, to.0)).collect()).collect()),
-        }))
-    }
-}
-
-impl Residency {
-    /// Cut the one store's records beside the running chain whose steps run
-    /// from `first` through `last`, at the deepest of `candidates` whose
-    /// records lie at or above each group's running floor
-    /// (`Directory::running_floor`), moving nothing. Each expert kept at or
-    /// past the cut is unmapped where its entry still names that record
-    /// (`Directory::cut_running`): from the chain's first step where none
-    /// of its requests taken so far routed it at its layer, so every step of
-    /// the chain still to decide the layer's hits resolves it a miss and its
-    /// rounds read it, as any cold expert; else from the first step not yet
-    /// begun, so the chain's later passes there, which resolve it as the
-    /// pass whose hit it was, still read it, the decided layers' passes
-    /// being submitted before the cut's storage installs (`RunningCut`).
-    /// Each later chain begins after the stores and resolves none of them.
-    /// The views of the records below the cut are formed first, so a
-    /// refusal changes nothing.
+    /// Evict `evicting`'s records at the deepest of `candidates` whose every
+    /// group holds enough records no step writes or reads in place
+    /// (`Directory::evictions`, `Directory::host_evictions`), moving
+    /// nothing, beside running steps or not. Each evicted expert is unmapped
+    /// from the first step not yet begun; beside the running scratch-served
+    /// chain `chain` names, from the chain's first step where none of its
+    /// requests taken so far routed it at its layer, so every step of the
+    /// chain still to decide the layer's hits resolves it a miss and its
+    /// rounds read it, as any cold expert. The steps before still read the
+    /// rest where they are: the owner releases their storage once every
+    /// pass that may read them is submitted (`Evicted::decided`).
     ///
-    /// None where a layer is whole, whose steps read their experts at their
-    /// homes without the map (`POLICY_WHOLE`), or once a group began after
-    /// the chain, whose steps decided their hits by the map before the cut;
-    /// nor where even the shallowest candidate cuts below a record in
-    /// flight.
-    fn serve_running(&mut self, (first, last): (Step, Step), candidates: &Candidates, trip: impl Fn() -> Trip) -> Result<Option<RunningCut>, String> {
-        if self.whole.iter().any(|&whole| whole) || !self.shared.steps.latest(last) {
+    /// On every placement, beside running steps or not. While steps run, a
+    /// group with a whole layer keeps its bank records: its runs read its
+    /// experts at their homes without the map (`POLICY_WHOLE`), a word only
+    /// a gap publishes anew, so none of its homes may leave under them; every
+    /// other group, and a host tier's landed records (which no whole layer
+    /// reads), evict as between flights. None beside a chain once a group
+    /// began after it, whose steps decided their hits by the map before the
+    /// eviction; nor where even the shallowest candidate keeps more records
+    /// of some group than it may evict now.
+    fn serve_evict(&mut self, evicting: Evicting, candidates: &Candidates, chain: Option<(Step, Step)>, trip: impl Fn() -> Trip) -> Result<Option<Evicted>, String> {
+        let running = !self.shared.steps.idle();
+        let kept = (0..self.core.groups.len())
+            .map(|group| {
+                evicting == Evicting::Bank
+                    && running
+                    && self.core.layers.iter().zip(&self.whole).any(|(layer, &whole)| whole && layer.group == group)
+            })
+            .collect::<Vec<_>>();
+        if chain.is_some_and(|(_, last)| !self.shared.steps.latest(last)) {
             return Ok(None);
         }
-        let floors = (0..self.core.groups.len()).map(|group| self.core.directory.running_floor(group)).collect::<Vec<_>>();
-        let Some((slots, records)) = deepest(candidates, &floors) else {
+        // Ranked by every step that ended before it, whichever turn of this
+        // thread their ends fell in.
+        self.shared.telemetry.feed();
+        let ranking = self.core.directory.ranking();
+        let last_read = |layer: usize, expert: usize| Reuse::of(&ranking).last(layer, expert);
+        let groups = self.core.groups.len();
+        let directory = &self.core.directory;
+        let held = |group: usize| match evicting {
+            Evicting::Bank => directory.records()[group],
+            Evicting::Landed => directory.host(group).records() as usize,
+        };
+        let evictable = |group: usize, target: usize| match evicting {
+            Evicting::Bank if kept[group] => Vec::new(),
+            Evicting::Bank => directory.evictions(group, target, last_read).into_iter().map(|record| u32::try_from(record).expect("bank records fit u32")).collect::<Vec<_>>(),
+            Evicting::Landed => directory.host_evictions(group, u32::try_from(target).expect("host records fit u32")),
+        };
+        let most = (0..groups).map(|group| evictable(group, 0).len()).collect::<Vec<_>>();
+        let Some((slots, targets)) = deepest(candidates, |group, records| held(group).saturating_sub(records) <= most[group], groups) else {
             return Ok(None);
         };
-        let views = self.core.tier_views(&records)?;
-        let decided = self.scratch.decided(first);
-        let (scratch, directory) = (&self.scratch, &mut self.core.directory);
-        for (group, &records) in records.iter().enumerate() {
-            directory.cut_running(group, records, |(layer, expert)| match scratch.routed(first, layer, expert) {
-                true => Step::MAX,
-                false => first,
-            });
+        let evicted = targets.iter().enumerate().map(|(group, &target)| evictable(group, target)).collect::<Vec<_>>();
+        // An expert the chain's steps routed at its layer stays mapped for
+        // them; any other leaves from its first step.
+        let scratch = &self.scratch;
+        let routed = |(layer, expert): (usize, usize)| chain.is_none_or(|(first, _)| scratch.routed(first, layer, expert));
+        let first = chain.map_or(Step::MAX, |(first, _)| first);
+        match evicting {
+            Evicting::Bank => {
+                let (directory, steps) = (&mut self.core.directory, &self.core.steps);
+                steps.unbegun(|at| {
+                    for (group, records) in evicted.iter().enumerate() {
+                        let records = records.iter().map(|&record| record as usize).collect::<Vec<_>>();
+                        directory.evict(group, &records, last_read, |staged| match routed(staged) {
+                            true => at.next(),
+                            false => first.min(at.next()),
+                        });
+                    }
+                });
+            }
+            Evicting::Landed => {
+                // The views without the evicted records are formed first, so a
+                // refusal changes nothing.
+                let views = self.core.tier_views(&evicted)?;
+                let directory = &mut self.core.directory;
+                for (group, records) in evicted.iter().enumerate() {
+                    directory.evict_host(group, records, |staged| match routed(staged) {
+                        true => Step::MAX,
+                        false => first,
+                    });
+                }
+                self.address_tier(views);
+            }
         }
-        self.address_tier(views);
         self.shared.telemetry.resized(self.core.bank_records());
-        Ok(Some(RunningCut { slots, decided, trip: trip() }))
+        let decided = chain.and_then(|(first, _)| self.scratch.decided(first));
+        Ok(Some(Evicted { slots, records: evicted, decided, trip: trip() }))
     }
 }
 
-/// The deepest of `candidates` whose records (each group's, fitting u32)
-/// lie at or above each group's floor in `floors`: its slots and records.
-fn deepest(candidates: &Candidates, floors: &[u32]) -> Option<(usize, Vec<u32>)> {
+/// The deepest of `candidates` whose records each of the `groups` groups
+/// may evict down to (`fits(group, records)`): its slots and each group's
+/// records.
+fn deepest(candidates: &Candidates, fits: impl Fn(usize, usize) -> bool, groups: usize) -> Option<(usize, Vec<usize>)> {
     (0..candidates.count()).rev().map(|index| candidates.slots(index)).find_map(|slots| {
-        let records = (candidates.records)(slots)
-            .into_iter()
-            .map(|records| u32::try_from(records).expect("the records the host lands into fit u32"))
-            .collect::<Vec<_>>();
-        let keeps = records.iter().zip(floors).all(|(records, floor)| records >= floor);
-        keeps.then_some((slots, records))
+        let records = (candidates.records)(slots);
+        assert_eq!(records.len(), groups, "a candidate names each group's records");
+        records.iter().enumerate().all(|(group, &records)| fits(group, records)).then_some((slots, records))
     })
-}
-
-/// Each group's shrink to `records`, every placement ended, its evictions
-/// taken: the directory unmaps them from the first step not yet begun,
-/// every step before it completed, and holds every record a move writes or
-/// the shrink retires until it commits (`BankRecords::shrinking`), so
-/// nothing maps to a record a move writes. An expert's last read is the
-/// ranking's (`Reuse::last`), its one owner, which the stack has fed every
-/// ended step's reads, a whole group's decode reads too (its routing
-/// records).
-fn plan(
-    core: &mut Core,
-    records: &[usize],
-    last_read: impl Fn(usize, usize) -> Option<super::Step>,
-) -> Vec<Shrink> {
-    let (directory, steps) = (&mut core.directory, &core.steps);
-    steps.unbegun(|at| {
-        records
-            .iter()
-            .enumerate()
-            .map(|(group, &records)| {
-                let plan = directory.plan_shrink(group, records, &last_read);
-                directory.evict(group, &plan, &last_read, at);
-                plan
-            })
-            .collect()
-    })
-}
-
-/// `plan`'s moves, which the device carries ahead of every later step: the
-/// directory follows each, and each moved expert is mapped to its new
-/// record from the first step not yet begun.
-fn commit(core: &mut Core, plan: &ShrinkPlan) {
-    let (directory, steps) = (&mut core.directory, &core.steps);
-    steps.unbegun(|at| {
-        for (group, shrink) in plan.groups.iter().enumerate() {
-            directory.commit_shrink(group, shrink, at);
-        }
-    });
 }

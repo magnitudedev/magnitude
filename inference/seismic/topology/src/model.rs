@@ -8,13 +8,12 @@
 //! shape: every path is created between nodes it issued, and an executor's
 //! placements name only the access paths created for that executor.
 
-use crate::kind::{Kind, KindReport, NativeKind, Reserving, Unreservable};
-use crate::placement::{Contract, Placing, ReservedContract};
+use crate::kind::{Kind, KindReport, NativeKind};
+use crate::placement::Contract;
 use crate::selector::ExecutorSelector;
 use seismic_lang::registry::BackendName;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -309,6 +308,39 @@ pub enum Availability {
 pub struct Limits {
     /// The largest single allocation; neither capacity nor availability.
     pub max_allocation: AllocationLimit,
+    /// How it makes its native allocations: what a granule pool's blocks
+    /// are sized by (`seismic_memory::pool::block_bytes`), at load and in
+    /// the plan alike; why it cannot report them, which leaves the executor
+    /// unavailable ([`Self::allocations`]).
+    pub(crate) allocations: Result<NativeAllocations, String>,
+}
+
+impl Limits {
+    /// How it makes its native allocations.
+    ///
+    /// # Panics
+    /// Where it cannot report them: such an executor is unavailable
+    /// (`Availability::Unavailable`), so nothing plans for or opens it.
+    pub fn allocations(&self) -> NativeAllocations {
+        self.allocations.clone().unwrap_or_else(|error| panic!("invariant violated: the allocations of an unavailable executor are read: {error}"))
+    }
+}
+
+/// How an executor's API makes its native allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeAllocations {
+    /// The least bytes it makes an allocation of, where it bounds their
+    /// count (Vulkan's least memory object, which keeps the device's memory
+    /// objects under `maxMemoryAllocationCount`); 0 where it bounds none.
+    pub least: u64,
+    /// What it rounds each allocation's bytes up to, at least 1 (CUDA's
+    /// allocation granularity, `cuMemGetAllocationGranularity`).
+    pub granularity: u64,
+}
+
+impl NativeAllocations {
+    /// An API that bounds no count and rounds nothing.
+    pub const EXACT: Self = Self { least: 0, granularity: 1 };
 }
 
 /// What bounds an executor's single allocation.
@@ -356,304 +388,7 @@ impl AllocationLimit {
     }
 }
 
-/// What a reserved range's records are: each `record` bytes, and the most
-/// bytes of any one view laid whole in them beside their own records
-/// (`carries`, a packing of another form's records in them; none for a range
-/// of its records alone). On chunked storage each must lie in one chunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReservedRecords {
-    pub record: NonZeroU64,
-    pub carries: Option<NonZeroU64>,
-}
-
-impl ReservedRecords {
-    /// A range of `record`-byte records, holding nothing else.
-    pub const fn of(record: NonZeroU64) -> Self {
-        Self {
-            record,
-            carries: None,
-        }
-    }
-
-    /// The range also holding views of up to `view` bytes whole.
-    pub fn carrying(self, view: NonZeroU64) -> Self {
-        Self {
-            carries: Some(self.carries.map_or(view, |carries| carries.max(view))),
-            ..self
-        }
-    }
-}
-
-/// How a backend reserves a tensor's address range and backs its committed
-/// bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reservation {
-    /// The granule in which it backs the committed bytes, and charges them.
-    pub granule: u64,
-    /// Whether the host addresses the backed bytes in place, so a read can
-    /// land in a pinned region of them: a property of the backend's reserved
-    /// storage, which each backend declares once per kind
-    /// (host ranges for the CPU's and Metal's, CUDA's host-node memory and
-    /// registered pages, Vulkan's imported pages and placed mappings) and
-    /// its storage tests hold it to. A reserved `Shared` buffer requires it.
-    pub host_addressed: bool,
-    /// Where device work reaches the backed bytes through an address table
-    /// of chunks, each its own native allocation (Metal's and Vulkan's
-    /// buffers), rather
-    /// than at one base address: the bytes every chunk is a whole number of
-    /// (where it starts and ends; Metal's, a host page). A record must then
-    /// lie in one chunk ([`Reservation::of_records`]). Declared once by each
-    /// backend (`RESERVATION_CHUNKS`).
-    pub chunks: Option<ReservationChunks>,
-}
-
-impl Reservation {
-    /// Whether device work reaches the backed bytes through a table of
-    /// chunks ([`Self::chunks`]).
-    pub fn chunked(&self) -> bool {
-        self.chunks.is_some()
-    }
-
-    /// What backing a reserved range's leading `bytes` holds, and is
-    /// charged: the whole granules covering them; `None` past the bytes a
-    /// `u64` counts.
-    pub fn backing(&self, bytes: u64) -> Option<u64> {
-        bytes.div_ceil(self.granule).checked_mul(self.granule)
-    }
-
-    /// The reservation of a tensor of `records`. Chunked storage backs,
-    /// charges and addresses chunks of whole records and whole chunk units,
-    /// the least such chunk no smaller than the granule nor than the largest
-    /// view the records carry, so no record and no carried view crosses a
-    /// chunk and a chunk holds as little past the committed records as its
-    /// rules admit; other storage keeps its granule.
-    pub fn of_records(&self, records: ReservedRecords) -> Self {
-        let granule = match self.chunks {
-            Some(ReservationChunks { unit, .. }) => {
-                let record = records.record.get();
-                let whole = unit / gcd(unit, record) * record;
-                let least = records
-                    .carries
-                    .map_or(self.granule, |carries| self.granule.max(carries.get()));
-                least.div_ceil(whole) * whole
-            }
-            None => self.granule,
-        };
-        Self { granule, ..*self }
-    }
-
-    /// The largest single native allocation of a reserved range's `backing`
-    /// ([`Self::backing`]), which the device's single-allocation limit
-    /// bounds: a chunk of chunked storage, otherwise the whole backing.
-    pub fn largest_allocation(&self, backing: u64) -> u64 {
-        match self.chunked() {
-            true => self.granule.min(backing),
-            false => backing,
-        }
-    }
-
-    /// How views of `record`-byte records lie in a reserved range
-    /// ([`Packing`]); `None` for a record of no bytes, or on chunked storage
-    /// one larger than a chunk, which no chunk holds whole.
-    pub fn packing(&self, record: u64) -> Option<Packing> {
-        let record = NonZeroU64::new(record)?;
-        match self.chunks {
-            Some(_) if record.get() > self.granule => None,
-            Some(_) => Some(Packing {
-                record,
-                chunk: Some(self.granule),
-            }),
-            None => Some(Packing::contiguous(record)),
-        }
-    }
-
-    /// The bytes of the address table device work reaches `records` records
-    /// of a reserved range through: a record table
-    /// (`seismic_lang::registry::record_table_bytes`) on chunked storage,
-    /// none on other storage; `None` past the bytes a `u64` counts.
-    pub fn table_bytes(&self, records: u64) -> Option<u64> {
-        match self.chunked() {
-            true => seismic_lang::registry::record_table_bytes(records),
-            false => Some(0),
-        }
-    }
-
-    /// What a reserved range of `records` records of `held` is charged with
-    /// its leading `bytes` backed: their backing in its records'
-    /// reservation ([`Self::of_records`]) and its record table; `None` past
-    /// the bytes a `u64` counts.
-    pub fn charge(&self, held: ReservedRecords, records: u64, bytes: u64) -> Option<u64> {
-        let reservation = self.of_records(held);
-        reservation
-            .backing(bytes)?
-            .checked_add(reservation.table_bytes(records)?)
-    }
-
-    /// What a reservation under `contract` is charged ([`Self::charge`]),
-    /// its backing and its record table apart: a table under the backing's
-    /// own contract is charged with it, one under another on its own.
-    pub fn charges(
-        &self,
-        contract: ReservedContract,
-        held: ReservedRecords,
-        records: u64,
-        bytes: u64,
-    ) -> Option<ReservationCharges> {
-        let reservation = self.of_records(held);
-        let table = match reservation.chunks {
-            Some(chunks) => {
-                let bytes = reservation.table_bytes(records)?;
-                let placement = chunks.table;
-                Some(if placement == contract.contract() {
-                    TableCharge::WithBacking { placement, bytes }
-                } else {
-                    TableCharge::Separate { placement, bytes }
-                })
-            }
-            None => None,
-        };
-        Some(ReservationCharges {
-            contract,
-            backing: reservation.backing(bytes)?,
-            table,
-        })
-    }
-
-    /// The most bytes a reserved range backs with each of its native
-    /// allocations within `max_allocation`.
-    pub fn most_backed(&self, max_allocation: u64) -> u64 {
-        match (self.chunked(), self.granule <= max_allocation) {
-            (true, true) => u64::MAX,
-            (_, false) => 0,
-            (false, true) => max_allocation / self.granule * self.granule,
-        }
-    }
-}
-
-/// Chunk geometry and the contract of its record table: ordinary allocated
-/// storage the backend names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReservationChunks {
-    pub unit: u64,
-    pub table: Contract,
-}
-
-/// The physical holdings of a reservation under `contract`
-/// ([`Reservation::charges`]). Only backing changes on resize.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReservationCharges {
-    pub contract: ReservedContract,
-    pub backing: u64,
-    pub table: Option<TableCharge>,
-}
-
-/// A chunked reservation's record table charge, in its placement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TableCharge {
-    /// Under the backing's own contract: charged with the backing.
-    WithBacking { placement: Contract, bytes: u64 },
-    /// Under another: charged on its own.
-    Separate { placement: Contract, bytes: u64 },
-}
-
-impl TableCharge {
-    pub const fn placement(self) -> Contract {
-        match self {
-            Self::WithBacking { placement, .. } | Self::Separate { placement, .. } => placement,
-        }
-    }
-
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::WithBacking { bytes, .. } | Self::Separate { bytes, .. } => bytes,
-        }
-    }
-}
-
-impl ReservationCharges {
-    pub fn total(self) -> Option<u64> {
-        self.backing
-            .checked_add(self.table.map_or(0, TableCharge::bytes))
-    }
-}
-
-/// How views of records of one size lie in storage, the one rule for every
-/// view of a range ([`Reservation::packing`]). On chunked storage a view's
-/// first record is at the first place at or after its start where a whole
-/// record fits in one chunk, and each next record follows the last, moving
-/// to the next chunk boundary when it would cross one, so no record crosses
-/// a chunk and views of different record sizes may follow one another
-/// ([`Self::end`]); a view of records that fill chunks exactly (the range's
-/// own, [`Reservation::of_records`]) is contiguous from a record-aligned
-/// start. Other storage has no chunk to cross: its records follow one
-/// another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packing {
-    record: NonZeroU64,
-    /// The bytes of a chunk, no fewer than a record's, on chunked storage.
-    chunk: Option<u64>,
-}
-
-impl Packing {
-    /// Records of `record` bytes one after another, in storage without
-    /// chunks.
-    pub fn contiguous(record: NonZeroU64) -> Self {
-        Self {
-            record,
-            chunk: None,
-        }
-    }
-
-    /// The bytes of one record.
-    pub fn record(&self) -> u64 {
-        self.record.get()
-    }
-
-    /// Whether records are packed in chunks.
-    pub fn chunked(&self) -> bool {
-        self.chunk.is_some()
-    }
-
-    /// Where record `index` of a view from byte `start` lies, in bytes from
-    /// the storage's first.
-    pub fn at(&self, start: u64, index: u64) -> u64 {
-        let record = self.record();
-        let Some(chunk) = self.chunk else {
-            return start + index * record;
-        };
-        let first = match start % chunk + record <= chunk {
-            true => start,
-            false => start.next_multiple_of(chunk),
-        };
-        // Whole records left in the first record's chunk, then whole chunks.
-        let leading = (chunk - first % chunk) / record;
-        match index.checked_sub(leading) {
-            None => first + index * record,
-            Some(rest) => {
-                let per = chunk / record;
-                (first / chunk + 1 + rest / per) * chunk + rest % per * record
-            }
-        }
-    }
-
-    /// The byte just past the last of `records` records of a view from
-    /// `start` ([`Self::at`]), `start` for none: where the next view may
-    /// start.
-    pub fn end(&self, start: u64, records: u64) -> u64 {
-        records
-            .checked_sub(1)
-            .map_or(start, |last| self.at(start, last) + self.record())
-    }
-}
-
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
-/// The kinds a buffer of one placing is allocated from, in order,
+/// The kinds a buffer of one contract is allocated from, in order,
 /// and their access paths, each once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Placed {
@@ -673,10 +408,8 @@ pub struct Executor {
     driver: String,
     limits: Limits,
     tensor_operations: bool,
-    /// Each placing's placement, by [`Placing::index`].
-    placed: [Placed; Placing::COUNT],
-    /// How each reserved contract is reserved (`placement::reserving`).
-    reserving: [Reserving; ReservedContract::COUNT],
+    /// Each contract's placement, in [`Contract::ALL`] order.
+    placed: [Placed; Contract::COUNT],
 }
 
 impl Executor {
@@ -725,21 +458,16 @@ impl Executor {
     pub fn forms_tensor_operations(&self) -> bool {
         self.tensor_operations
     }
-    /// The kinds a buffer placed as `placing` is allocated from, in order:
-    /// an allocation lands on the first with room along its paths
+    /// The kinds a buffer of `contract` is allocated from, in order: an
+    /// allocation lands on the first with room along its paths
     /// (`placement::place`). Empty when no kind is admitted, and for an
     /// unavailable executor.
-    pub fn placement(&self, placing: Placing) -> &[KindId] {
-        &self.placed[placing.index()].kinds
+    pub fn placement(&self, contract: Contract) -> &[KindId] {
+        &self.placed[contract as usize].kinds
     }
     /// The access paths of [`Self::placement`], in order, each once.
-    pub fn paths(&self, placing: Placing) -> &[AccessPathId] {
-        &self.placed[placing.index()].paths
-    }
-    /// How a buffer of `contract` is reserved: none where no kind reserves
-    /// it, and why not where one would but cannot.
-    pub fn reserving(&self, contract: ReservedContract) -> Result<Option<Reservation>, &Unreservable> {
-        self.reserving[contract as usize].as_ref().copied()
+    pub fn paths(&self, contract: Contract) -> &[AccessPathId] {
+        &self.placed[contract as usize].paths
     }
 }
 
@@ -1028,21 +756,21 @@ impl DeviceTopology {
         (id.revision == self.revision).then(|| &self.kinds[id.index as usize])
     }
     /// The transfer path `id`; none for an identifier of another revision.
-    /// The store a buffer placed as `placing` on `executor` lands in first.
-    pub fn first_store(&self, executor: &Executor, placing: Placing) -> Option<StoreId> {
+    /// The store a buffer of `contract` on `executor` lands in first.
+    pub fn first_store(&self, executor: &Executor, contract: Contract) -> Option<StoreId> {
         executor
-            .paths(placing)
+            .paths(contract)
             .first()
             .and_then(|path| self.access_path(*path))
             .map(AccessPath::store)
     }
-    /// Whether a range the host and `executor` share lies where the device's
-    /// own ranges do: the store of reserved `Shared` is that of reserved
-    /// `DeviceOnly`, so a reserved buffer the host writes in place reads as
-    /// device memory, with no copy across a link.
+    /// Whether memory the host and `executor` share lies where the device's
+    /// own does: the store of `Shared` is that of `DeviceOnly`, so a buffer
+    /// the host writes in place reads as device memory, with no copy across
+    /// a link.
     pub fn shared_ranges_lie_in_device_memory(&self, executor: &Executor) -> bool {
-        let store = |contract| self.first_store(executor, Placing::Reserved(contract));
-        store(ReservedContract::Shared).is_some() && store(ReservedContract::Shared) == store(ReservedContract::DeviceOnly)
+        let store = |contract| self.first_store(executor, contract);
+        store(Contract::Shared).is_some() && store(Contract::Shared) == store(Contract::DeviceOnly)
     }
     pub fn transfer_path(&self, id: TransferPathId) -> Option<&TransferPath> {
         (id.revision == self.revision).then(|| &self.transfer[id.index as usize])
@@ -1197,7 +925,6 @@ impl Builder {
             limits: executor.limits,
             tensor_operations: executor.tensor_operations,
             placed: Default::default(),
-            reserving: std::array::from_fn(|_| Ok(None)),
         });
         ExecutorBuilder {
             builder: self,
@@ -1336,16 +1063,15 @@ impl ExecutorBuilder<'_> {
             native,
             name: report.name.clone(),
             reach: report.reach,
-            obtained: report.obtained,
             paths: paths.iter().map(|path| self.paths[path.0]).collect(),
         });
         self.kinds.push(id);
         OwnKind(self.kinds.len() - 1)
     }
 
-    /// A buffer placed as `placing` is allocated from `kinds`, in order, and
-    /// so along their paths, each once.
-    pub(crate) fn place(&mut self, placing: Placing, kinds: &[OwnKind]) {
+    /// A buffer of `contract` is allocated from `kinds`, in order, and so
+    /// along their paths, each once.
+    pub(crate) fn place(&mut self, contract: Contract, kinds: &[OwnKind]) {
         let topology = &mut self.builder.topology;
         let kinds = kinds
             .iter()
@@ -1359,13 +1085,7 @@ impl ExecutorBuilder<'_> {
                 }
             }
         }
-        topology.executors[self.executor.index as usize].placed[placing.index()] = Placed { kinds, paths };
-    }
-
-    /// A buffer of `contract` is reserved as `reserving` says.
-    pub(crate) fn reserves(&mut self, contract: ReservedContract, reserving: Reserving) {
-        self.builder.topology.executors[self.executor.index as usize].reserving
-            [contract as usize] = reserving;
+        topology.executors[self.executor.index as usize].placed[contract as usize] = Placed { kinds, paths };
     }
 
     pub(crate) fn id(&self) -> ExecutorId {

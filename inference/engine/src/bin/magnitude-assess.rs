@@ -34,7 +34,7 @@ use magnitude_executor::{
         decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts, FormatRates,
         HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
     },
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
 };
 use seismic::{Devices, DiagnosticSource, Element, ExecutorSelector, StoreId, StoreIdentity};
 use serde_json::{json, Value};
@@ -377,7 +377,7 @@ fn run() -> Result<bool, String> {
         &catalog,
         options.device,
         Some(options.kernels.as_path()),
-        MemoryReserves::of_machine(Some((options.kernels.as_path(), &*catalog.topology()))),
+        ReleaseRate::of_machine(Some((options.kernels.as_path(), &*catalog.topology()))),
         ModelPolicy { weight_bound: options.weight_bound, ..ModelPolicy::default() },
         standard_service_limits(),
     )
@@ -769,7 +769,6 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                     "memoryDomainId": domain_id(setup, domain.domain),
                     "capacityBytes": domain.capacity_bytes,
                     "requiredBytes": domain.required_bytes,
-                    "compatibilityReserveBytes": domain.reserve_bytes,
                     "remainingBytes": domain.remaining_bytes,
                 })
             })

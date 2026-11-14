@@ -43,7 +43,7 @@
 //!   the records stored. No load measures, and no load waits on the job.
 
 use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks, Whose, MEASUREMENT_SECONDS};
-use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
+use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
 use crate::planning::BankBinding;
@@ -72,9 +72,6 @@ pub enum PointRequest {
     /// The read line of the volume `directory` lies on (`StorageCosts`): a
     /// standing request, every streamed estimate's file reads.
     Storage { directory: std::path::PathBuf },
-    /// A bank group's shrink move line at its record form and moves
-    /// (`MoveCosts`).
-    Moves(MoveForm),
     /// A bank group's convert ceiling at its record form (`ConvertCosts`); a
     /// standing request at the reference form (`ConvertForm::reference`),
     /// every streamed estimate's landing.
@@ -114,9 +111,6 @@ impl PointRequest {
         match self {
             Self::Costs(part) => costs_outstanding.is_some_and(|first| first <= *part),
             Self::Storage { directory } => StorageCosts::outstanding(topology, executor, directory, store),
-            Self::Moves(form) => {
-                matches!(MoveCosts::stored(topology, executor, *form, store), Err(MoveError::Unrecorded { .. }))
-            }
             Self::Convert(form) => {
                 matches!(ConvertCosts::stored(topology, executor, *form, store), Err(CeilingError::Unrecorded { .. }))
             }
@@ -148,7 +142,7 @@ impl PointRequest {
             Self::Costs(part) => walk_points(topology, executor, *part),
             // Two points each: a line's ends, or a site's admission and its
             // pool's lines.
-            Self::Storage { .. } | Self::Moves(_) | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
+            Self::Storage { .. } | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
             // Its pool's lines.
             Self::CpuSite(_) => Ok(1),
             // Measured as the job's device opened: nothing to time.
@@ -168,7 +162,6 @@ impl PointRequest {
         match self {
             Self::Costs(part) => walks.walk(*part),
             Self::Storage { directory } => (StorageCosts::measure(directory, walks).err().map(|error| ExecutorCostsError(error.to_string())), Vec::new()),
-            Self::Moves(form) => (form.measure(walks).err(), Vec::new()),
             Self::Convert(form) => (form.measure(walks).err(), Vec::new()),
             Self::HostMemory { readers } => {
                 MemoryCosts::measure(*readers, walks);

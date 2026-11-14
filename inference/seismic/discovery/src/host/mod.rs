@@ -1,6 +1,6 @@
-//! The host: RAM capacity, the OS build, and host RAM status with the
-//! process limits that bound every path into host RAM. Host
-//! modules never load GPU drivers.
+//! The host: RAM capacity, the OS build, the CPU, and host RAM's sample at
+//! one instant ([`HostSample`]) within the process limits that bound every
+//! path into it. Host modules never load GPU drivers.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -16,8 +16,13 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::pressure_files;
+
 use seismic_topology::Reported;
 use std::fmt;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Host RAM capacity: RAM the OS can use.
 pub(crate) fn capacity() -> Result<Reported<u64>, String> {
@@ -82,134 +87,346 @@ pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
     platform::pin(cpus)
 }
 
-/// One host RAM status read now: what every claim of host RAM and every
-/// observation between claims reads, so a decision never stands on a
-/// reading older than itself.
-pub(crate) fn status() -> Result<HostStatus, ObservationError> {
+/// Host RAM at one instant ([`HostSample`]), read now.
+///
+/// # Panics
+/// Where a figure the sample needs cannot be read: each OS's reader names
+/// it. The figures are the OS's own counts of its memory, present on every
+/// release the engine runs on, so a missing one is the invariant's
+/// violation, never a reading to work around.
+pub fn host_sample() -> HostSample {
     platform::sample()
 }
 
-/// Host RAM this process can take now under `reclaim`: one reading's
-/// [`HostStatus::allocatable_bytes`]. What a one-off taker of host RAM that
-/// must not press the host bounds itself by ([`Reclaim::Nothing`]).
-pub fn host_room(reclaim: Reclaim) -> Result<u64, ObservationError> {
-    Ok(status()?.allocatable_bytes(reclaim))
-}
-
-/// Host RAM's one available reading: pages the OS can hand out without
-/// swapping or compressing anyone, and the total they are of. The only host
-/// memory figure the memory ledger reads.
+/// Host RAM at one instant: what the OS can give a taker without writing
+/// anyone's dirty data ([`Supply`]), the total it is of, the OS's pressure
+/// level, and the machine's counters ([`Counted`]): other programs' cold
+/// pages, the harm that shows where their working sets lie with this
+/// process's own share of it, and on macOS the wired count the GPU's
+/// ceiling reads. Every figure is the machine's, ours included: the memory
+/// ledger attributes its own changes ([`Lag`] says how late each shows in
+/// the supply, [`Counted`] what the counters show).
+///
+/// The scope is bound once per process: its total is the least of the
+/// host's RAM and each physical-memory limit on this process (a Linux
+/// cgroup's, a Windows job's), and its supply the least any of them leaves,
+/// so neither jumps between scopes from one sample to the
+/// next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostAvailable {
+pub struct HostSample {
+    /// When the reading of the live figures (`total`, `supply`,
+    /// `pressure`, `wired.limit`) began.
+    pub at: Instant,
+    /// The page size `cold`, `harm` and `wired` count in.
+    pub page_bytes: u64,
+    /// Bytes of the binding scope.
     pub total: u64,
-    pub available: u64,
-    /// Clean file-backed pages beyond `available` that the OS drops once for
-    /// a taker ([`HostStatus::reclaimable`]); `available + reclaimable ≤
-    /// total`. Zero where `available` already counts them.
-    pub reclaimable: u64,
+    pub supply: Supply,
+    /// When the counters below show the machine.
+    pub counted: Counted,
+    /// Cold anonymous bytes machine-wide, ours included, which the OS
+    /// compresses or swaps first: Linux `Inactive(anon)`; macOS its inactive
+    /// pages less every file-backed page (a lower bound: no count splits the
+    /// inactive queue); none on Windows, whose working-set manager trims
+    /// cold pages into the standby list `supply.clean_cache` counts. A
+    /// counter ([`Counted`]).
+    pub cold: u64,
+    /// This process's own share of `cold` ([`OwnCold`]), counted with it.
+    pub own_cold: OwnCold,
+    /// This process's own anonymous memory the OS holds outside RAM at the
+    /// sample, compressed or swapped ([`OwnReclaimed`]): what of the
+    /// process's allocations `total − supply` no longer shows. Read live
+    /// with `supply`, never a counter.
+    /// The OS reports it directly, where a resident figure would not
+    /// separate the process's allocations from what else is mapped into it
+    /// (a macOS task's resident size includes the Metal buffers and files
+    /// it maps; a cgroup's `memory.current` includes its page cache, which
+    /// `supply` counts).
+    /// - macOS: `task_vm_info.compressed`, the task's `internal_compressed`
+    ///   ledger: a page compressed is debited from the task's resident
+    ///   anonymous pages and credited here at a whole page, and stays here
+    ///   while its compressor segment is swapped out. Wired pages are never
+    ///   compressed.
+    /// - Linux: `/proc/self/status`'s `VmSwap`, the process's anonymous
+    ///   pages in swap, zswap's included (the mm's `MM_SWAPENTS`); none
+    ///   where the kernel reports no `VmSwap` (no `CONFIG_SWAP`, a sandbox's
+    ///   own `/proc`). It is
+    ///   the mm's counter as `/proc` reads it: per-thread caches of up to 64
+    ///   events before Linux 6.2, a per-CPU counter's approximate read
+    ///   since, so it may be off by those batches either way. A driver's
+    ///   pinned pages (CUDA's page-locked host memory) are never swapped.
+    /// - Windows: the process's private commit (`PrivateUsage`) less its
+    ///   private working set (`PrivateWorkingSetSize`): private pages
+    ///   trimmed out of the working set, an upper bound of those out of
+    ///   RAM, since a trimmed page waits on the modified list until it is
+    ///   written to the page file, and a committed page never touched
+    ///   counts too. None before Windows 10 1809, which reports no private
+    ///   working set.
+    pub own_reclaimed: Option<OwnReclaimed>,
+    /// The GPU's wired figures: on macOS only, where the GPU wires host RAM.
+    pub wired: Option<WiredFigures>,
+    /// The machine's harm and this process's share of it, counted together;
+    /// none where the OS counts no share of this process's in the machine's
+    /// unit ([`Harm`]).
+    pub harm: Option<Harm>,
+    /// The OS's pressure level; none where the OS reports none (Linux built
+    /// or booted without PSI, `psi=0`).
+    pub pressure: Option<PressureLevel>,
+    pub lag: Lag,
 }
 
-/// Host RAM's available reading now: each OS's own figure, which differ in
-/// what they include ([`HostStatus::allocatable`]): macOS
-/// `vm.page_free_count + vm.page_purgeable_count` less
-/// `vm.vm_page_free_target`, which leaves out the file cache (read beside it
-/// as `reclaimable`); Linux `MemAvailable` and Windows `ullAvailPhys`, which
-/// count the file cache the kernel reclaims first. Bounded by the cgroup or
-/// job limit the process lies in where one is set and binds harder.
-pub fn host_available() -> Result<HostAvailable, ObservationError> {
-    let capacity = capacity().map_err(ObservationError::Failed)?.value;
-    let sample = status()?;
-    let within = available_within(capacity, sample.allocatable.value, &sample.limits);
-    Ok(HostAvailable { reclaimable: sample.reclaimable.min(within.total.saturating_sub(within.available)), ..within })
-}
-
-/// What `available` bytes of `capacity` leave the process within `limits`:
-/// the binding one of the host's figure and each physical-memory limit's
-/// room (its limit less the usage it cannot reclaim), each with the total
-/// it is of.
-fn available_within(capacity: u64, available: u64, limits: &[ProcessMemoryLimit]) -> HostAvailable {
-    limits
-        .iter()
-        .filter(|limit| {
-            matches!(
-                limit.kind,
-                ProcessLimitKind::CgroupV1 { .. } | ProcessLimitKind::CgroupV2 { .. } | ProcessLimitKind::WindowsJobProcess
-            )
-        })
-        .map(|limit| HostAvailable { total: limit.limit_bytes.min(capacity), available: limit.remaining_bytes(), reclaimable: 0 })
-        .fold(HostAvailable { total: capacity, available, reclaimable: 0 }, |least, bound| {
-            if bound.available < least.available { bound } else { least }
-        })
-}
-
-/// RAM the OS holds that it cannot make available to a process, so not
-/// counted in [`HostStatus::allocatable`]; on a platform that counts it.
+/// What the OS can give a taker without writing anyone's dirty data, in
+/// bytes, in its three parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostHeld {
-    /// The size of the data the compressor stores
-    /// (`vm.compressor_bytes_used`), not the physical pages that hold it.
-    pub compressed_bytes: u64,
+pub struct Supply {
+    /// Free pages above the floor the OS keeps free by reclaiming: macOS
+    /// `vm.page_free_count + vm.page_purgeable_count` above
+    /// `vm.vm_page_free_target`; Linux `MemFree` above the zones' low
+    /// watermarks (`/proc/zoneinfo`); Windows the free and zero lists. In a
+    /// binding limit, the limit less its usage.
+    pub free_above_target: u64,
+    /// File pages no one has dirtied, which the OS drops without writing:
+    /// macOS file-backed pages (`external_page_count` of a
+    /// `host_statistics64` snapshot; macOS counts no dirty file page) above
+    /// those it keeps while it compresses others' memory, the file pages
+    /// standing where it last compressed more than was free above its
+    /// target (none before);
+    /// Linux `Active(file) + Inactive(file) −
+    /// Dirty − Writeback`, within a cgroup its `active_file + inactive_file −
+    /// file_dirty − file_writeback`; Windows the standby lists.
+    pub clean_cache: u64,
+    /// What compressing or swapping the cold anonymous pages frees, bounded
+    /// by where they can go: macOS [`HostSample::cold`] times what the
+    /// compressor saves of a page (`1 − compressor_page_count /
+    /// total_uncompressed_pages_in_compressor`, of the snapshot `cold` is
+    /// counted in, none while it stores nothing) plus free swap
+    /// (`vm.swapusage`), never more than the cold pages; Linux `Inactive(anon)` within `SwapFree`; none on Windows
+    /// ([`HostSample::cold`]) and none within a binding limit.
+    pub cold_reclaimable: u64,
 }
 
-/// What a taker of host RAM may count as room beyond the free memory above
-/// the OS's floor, stated by every caller of a reading: a growing process
-/// that must never displace another program's data takes
-/// [`Self::Nothing`]; a load, which is the user's own action, takes the
-/// clean file cache once ([`Self::CleanFileCache`]), as it did before a
-/// growth was told apart from a load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Reclaim {
-    /// Only what the OS hands out without reclaiming anything: the free
-    /// room of [`HostStatus::allocatable`].
-    Nothing,
-    /// Also the clean file-backed pages the OS drops once for a taker
-    /// ([`HostStatus::reclaimable`]).
-    CleanFileCache,
-}
-
-/// Host RAM's status in one sample.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostStatus {
-    /// RAM this process can take without the OS displacing another
-    /// program's data (compressing or swapping it): what a process that
-    /// grows and gives back while others run may take. An estimate, never
-    /// exact physical availability. The OSes differ in what that includes:
-    /// Linux reclaims file cache within its watermarks before it swaps, so
-    /// its `MemAvailable` counts reclaimable file cache; macOS reclaims by
-    /// page age across anonymous and file-backed pages alike, so only its
-    /// free and purgeable pages above the free-page target its pageout
-    /// daemon refills are taken without displacing anyone.
-    pub allocatable: Reported<u64>,
-    /// Clean file-backed pages the OS drops once for a taker but only beside
-    /// the age-ordered reclaim of other programs' data, so `allocatable`
-    /// leaves them out: macOS's file-backed pages (`external_page_count`).
-    /// Zero where `allocatable` already counts the file cache the kernel
-    /// reclaims first (Linux's `MemAvailable`, Windows's `ullAvailPhys`).
-    /// Only a load counts them ([`Reclaim::CleanFileCache`]).
-    pub reclaimable: u64,
-    /// The OS limits on this process: grants on host RAM that every path
-    /// into it shares.
-    pub limits: Vec<ProcessMemoryLimit>,
-    /// Whether every applicable limit could be observed.
-    pub limit_visibility: LimitVisibility,
-    /// What the OS holds that `allocatable` does not count ([`HostHeld`]).
-    /// `None` on a platform that counts none.
-    pub held: Option<HostHeld>,
-}
-
-impl HostStatus {
-    /// [`Self::allocatable`], and with [`Reclaim::CleanFileCache`] the
-    /// [`Self::reclaimable`] pages too, within every process limit.
-    pub fn allocatable_bytes(&self, reclaim: Reclaim) -> u64 {
-        let room = match reclaim {
-            Reclaim::Nothing => self.allocatable.value,
-            Reclaim::CleanFileCache => self.allocatable.value.saturating_add(self.reclaimable),
-        };
-        self.limits.iter().fold(room, |bytes, limit| bytes.min(limit.remaining_bytes()))
+impl Supply {
+    /// The three parts together.
+    pub fn total(&self) -> u64 {
+        self.free_above_target.saturating_add(self.clean_cache).saturating_add(self.cold_reclaimable)
     }
 }
 
-/// Why a status reading could not be taken.
+/// When a sample's counters show the machine, by the OS's mechanism that
+/// serves them: every event at least `lag` before `at` shows in them, and
+/// none after `at`. The counters are `cold`, `own_cold`, `harm` and the
+/// wired count, read together, this process's share of `harm` just after
+/// the machine's, so an event between the two is counted as its own and
+/// never as another program's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counted {
+    pub at: Instant,
+    /// - macOS: how long before `at` the snapshot `host_statistics64`
+    ///   served may have been taken. It serves an ordinary process the
+    ///   latest snapshot any ordinary process took while a window of XNU's
+    ///   `HOST_STATISTICS_TIME_WINDOW` (1 s) holds more requests than the
+    ///   window's random allowance, so a snapshot that differs from the one
+    ///   the sample before was served was taken after that sample began, and
+    ///   within the window: `lag` is the lesser of the two, and a snapshot
+    ///   served again keeps the `at` and `lag` it was first read with.
+    /// - Linux: the slower of the folds the counters pass through, the
+    ///   per-CPU counts `/proc` sums (`vm.stat_interval`, its timer rounded
+    ///   up to the next whole second by `round_jiffies_relative`) and, where
+    ///   `harm` or `own_cold` is a cgroup's, memcg's periodic statistics
+    ///   flush (`FLUSH_TIME`, 2 s, `mm/memcontrol.c`), from when the reading
+    ///   began.
+    /// - Windows: since the reading began, the counters being the kernel's
+    ///   own counts, read in the call.
+    pub lag: Duration,
+}
+
+/// This process's own anonymous bytes the OS holds outside RAM, compressed
+/// or swapped ([`HostSample::own_reclaimed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnReclaimed {
+    /// The bytes out of RAM, counted at their uncompressed size.
+    pub bytes: u64,
+    /// Of `bytes`, what the OS's compressed store (macOS's compressor,
+    /// Linux's zswap) holds of them in RAM, at its compressed size: in
+    /// what the machine uses, and in no figure of what the process holds.
+    /// None where the OS gives no figure (Linux outside a cgroup of this
+    /// process alone or without zswap, Windows): the process's compressed
+    /// pages then read as other programs' memory, by at most that store's
+    /// size.
+    /// - macOS: `bytes` at the compressor's machine-wide ratio
+    ///   (`compressor_page_count / total_uncompressed_pages_in_compressor`),
+    ///   the task's own ratio not being reported.
+    /// - Linux: the own cgroup's `memory.stat` `zswap`.
+    pub stored: u64,
+    /// Whether `bytes` is the OS's exact count (macOS's `internal_compressed`
+    /// ledger) or approximate (Linux's batched swap count, Windows's upper
+    /// bound): where it is exact, a process's bytes the machine's use does
+    /// not hold beyond it can only be an accounting error.
+    pub exact: bool,
+}
+
+impl OwnReclaimed {
+    /// None of the process's bytes out of RAM, exactly.
+    pub const NONE: Self = Self { bytes: 0, stored: 0, exact: true };
+}
+
+/// This process's own cold anonymous bytes, where the OS reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnCold {
+    /// Read from the OS: Linux's `inactive_anon` of this process's own
+    /// cgroup v2 (`memory.stat`), by [`Harm`]'s rule for when a cgroup's
+    /// counts are this process's.
+    Bytes(u64),
+    /// The OS reports no figure for this process alone: macOS and Windows
+    /// (neither splits a process's pages by age), and Linux in a cgroup
+    /// shared with other processes or under cgroup v1.
+    Unobserved,
+}
+
+/// macOS's wired figures: the system's GPU wired ceiling and what is wired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WiredFigures {
+    pub limit: WiredLimit,
+    /// Bytes wired machine-wide, ours included (`wire_count`): a counter
+    /// ([`Counted`]).
+    pub wire_count: u64,
+}
+
+/// `iogpu.wired_limit_mb`: the ceiling on host RAM the GPU may wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WiredLimit {
+    /// Zero: the OS's default, which Metal's `recommendedMaxWorkingSetSize`
+    /// reports.
+    OsDefault,
+    /// Set, in bytes.
+    Set(u64),
+}
+
+/// The machine's harm: programs bringing back what the OS reclaimed from
+/// them, cumulative and never decreasing (an OS count narrower than 64 bits
+/// is widened across its wraps), and this process's share of the same
+/// events in the same unit, so its own paging never reads as another
+/// program's. One count of each OS:
+/// - macOS: pages decompressed and swapped in, the machine's
+///   (`HOST_VM_INFO64`'s `decompressions + swapins`) and the task's
+///   (`task_vm_info`'s `decompressions` plus its `ledger_swapins` bytes in
+///   pages).
+/// - Linux: pages refaulted, the machine's (`/proc/vmstat`'s
+///   `workingset_refault_anon + workingset_refault_file`,
+///   `workingset_refault` before Linux 5.9) and those of this process's
+///   own cgroup v2 (its `memory.stat`'s same counts). No count is kept per
+///   process, so a cgroup's counts are this process's only where the
+///   cgroup has a memory controller, lists this process alone and has no
+///   descendant; in a cgroup shared with any other process, an ancestor's,
+///   or without a cgroup v2 memory controller, there is no share, and no
+///   harm.
+/// - Windows: hard faults, each resolved by one paging read: the machine's
+///   paging reads (`\Memory\Page Reads/sec`'s count) and the process's
+///   `HardFaultCount`. Windows counts no process's pages brought in
+///   (`\Memory\Pages Input/sec` has no per-process count), so the unit
+///   is a read, of at least one page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Harm {
+    pub machine: u64,
+    pub own: u64,
+}
+
+/// The OS's memory pressure level now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PressureLevel {
+    Normal,
+    /// macOS `kern.memorystatus_vm_pressure_level` warn; Linux PSI `some
+    /// avg10` above zero; Windows the low-memory resource notification.
+    Warn,
+    /// macOS critical; Linux PSI `full avg10` above zero. Windows reports
+    /// no level past low memory.
+    Critical,
+}
+
+/// How late this process's own changes to host RAM show in a sample's
+/// supply, by the OS's own mechanisms. Only the host's: a GPU allocator's
+/// release on unified memory shows by that allocator's mechanism, which its
+/// backend states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lag {
+    /// How late this process's release shows: at once everywhere (`munmap`
+    /// and `free` return the pages in the call; a cgroup's `memory.current`
+    /// and a Windows job's commit uncharge them in it).
+    pub release: Duration,
+    /// How late this process's growth shows: at once on the host and in a
+    /// Windows job (first touch, wiring and commit count in the call).
+    /// Where a Linux cgroup's supply binds ([`binding`]), its clean cache is
+    /// read from `memory.stat`, which shows the cache a growth displaced
+    /// within memcg's periodic statistics flush (`FLUSH_TIME`, 2 s,
+    /// `mm/memcontrol.c`): a growth shows whole within it.
+    pub growth: Duration,
+}
+
+/// A 32-bit cumulative OS count widened to 64 bits across its wraps: every
+/// reading of the count goes through one, so no wrap is missed while a
+/// reading is taken more often than the count can wrap (4.3 billion events).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) struct Widened(Mutex<Option<(u32, u64)>>);
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+impl Widened {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// The count `raw` reads, widened.
+    pub(crate) fn of(&self, raw: u32) -> u64 {
+        let mut last = self.0.lock().expect("a widened count's lock is never poisoned");
+        let wide = match *last {
+            None => u64::from(raw),
+            Some((before, wide)) => wide + u64::from(raw.wrapping_sub(before)),
+        };
+        *last = Some((raw, wide));
+        wide
+    }
+}
+
+/// A scope's total and supply: the host's, or a limit's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Scope {
+    pub(crate) total: u64,
+    pub(crate) supply: Supply,
+}
+
+/// The binding scope of a sample ([`binding`]), and which scope its supply
+/// is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) struct Binding {
+    pub(crate) scope: Scope,
+    /// The index in `limits` of the limit whose supply binds; none where the
+    /// host's does. How late a growth shows in the supply is that scope's,
+    /// so of scopes leaving the same supply the earliest binds, the host's
+    /// first: a growth shows in the least supply as soon as in any of
+    /// theirs.
+    pub(crate) supplier: Option<usize>,
+}
+
+/// The binding scope of `host` and each physical-memory limit of `limits`:
+/// the least total of them all and the least supply any of them leaves.
+/// Each bounds what this process may take, so both are bound by every one
+/// at once: whichever leaves the least supply, the total never moves with
+/// it, and the supply moves only as the scopes' own figures move.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn binding(host: Scope, limits: &[ProcessMemoryLimit]) -> Binding {
+    limits.iter().map(|limit| limit.scope(host.total)).enumerate().fold(
+        Binding { scope: host, supplier: None },
+        |least, (index, bound)| {
+            let (supply, supplier) = match bound.supply.total() < least.scope.supply.total() {
+                true => (bound.supply, Some(index)),
+                false => (least.scope.supply, least.supplier),
+            };
+            Binding { scope: Scope { total: least.scope.total.min(bound.total), supply }, supplier }
+        },
+    )
+}
+
+/// Why a reading of a volume or a grant could not be taken.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservationError {
     /// This platform or configuration offers no qualified facility for the
@@ -232,83 +449,62 @@ impl std::error::Error for ObservationError {}
 
 /// One applicable limit with the usage it is enforced against.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessMemoryLimit {
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) struct ProcessMemoryLimit {
     /// Which limit it is.
-    pub kind: ProcessLimitKind,
+    pub(crate) kind: ProcessLimitKind,
     /// The limit.
-    pub limit_bytes: u64,
+    pub(crate) limit_bytes: u64,
     /// The usage the limit is enforced against.
-    pub used_bytes: u64,
-    /// Clean inactive file cache the OS can reclaim within this limit. Zero
-    /// for address-space, data-segment and committed-memory limits, where
-    /// reclaiming physical pages does not release the accounted resource.
-    pub reclaimable_bytes: u64,
+    pub(crate) used_bytes: u64,
+    /// Clean file cache the OS can reclaim within this limit. Zero for a
+    /// committed-memory limit, where reclaiming physical pages does not
+    /// release the accounted resource.
+    pub(crate) reclaimable_bytes: u64,
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl ProcessMemoryLimit {
     /// What the limit has left: the limit less the usage the OS cannot
     /// reclaim within it.
-    pub fn remaining_bytes(&self) -> u64 {
-        self.limit_bytes
-            .saturating_sub(self.used_bytes.saturating_sub(self.reclaimable_bytes))
+    pub(crate) fn remaining_bytes(&self) -> u64 {
+        self.limit_bytes.saturating_sub(self.used_bytes.saturating_sub(self.reclaimable_bytes))
+    }
+
+    /// The limit as a scope of host RAM of `capacity` bytes: its free room
+    /// and the clean file cache within it, no more than it has left.
+    fn scope(&self, capacity: u64) -> Scope {
+        let free_above_target = self.limit_bytes.saturating_sub(self.used_bytes);
+        Scope {
+            total: self.limit_bytes.min(capacity),
+            supply: Supply {
+                free_above_target,
+                clean_cache: self.remaining_bytes() - free_above_target,
+                cold_reclaimable: 0,
+            },
+        }
     }
 }
 
 /// An OS limit on this process's memory.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum ProcessLimitKind {
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // each OS builds only its own kinds; a cgroup is named for Debug
+pub(crate) enum ProcessLimitKind {
     /// cgroup v1 `memory.limit_in_bytes` of this process's cgroup or a
     /// visible ancestor in the v1 memory hierarchy, enforced against that
     /// cgroup's `memory.usage_in_bytes`.
     CgroupV1 { cgroup: String },
-    /// cgroup v2 `memory.max` of this process's cgroup or a visible
+    /// cgroup v2 `memory.max` (or the lower `memory.high`, past which the
+    /// kernel reclaims and throttles) of this process's cgroup or a visible
     /// ancestor, enforced against that cgroup's `memory.current`.
     CgroupV2 { cgroup: String },
-    /// `RLIMIT_AS`, enforced against the process's virtual size.
-    AddressSpace,
-    /// `RLIMIT_DATA`, enforced against the process's data segment size.
-    DataSegment,
     /// A Windows job's per-process committed-memory limit, enforced against
     /// this process's private commit.
     WindowsJobProcess,
 }
 
-/// Whether a sample's process limits are all the limits that apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum LimitVisibility {
-    /// Every limit applicable to this process was observed.
-    Complete,
-    /// This process's cgroup namespace hides ancestors above its root.
-    /// Hidden ancestor limits cannot be presumed unlimited.
-    CgroupAncestorsHidden,
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-
-    /// macOS's allocatable memory is its free pages less read-ahead and
-    /// its purgeable pages, above the free-page target: never its
-    /// file-backed pages, which the OS reclaims only beside idle programs'
-    /// anonymous pages.
-    #[test]
-    fn macos_allocatable_is_free_and_purgeable_pages_above_the_target() {
-        let reading = macos::vm_reading().unwrap();
-        let allocatable = (reading.free + reading.purgeable).saturating_sub(reading.free_target);
-        let sample = macos::sample_of(&reading).unwrap();
-        assert_eq!(
-            sample.allocatable,
-            Reported::new(
-                allocatable * reading.page_size,
-                seismic_topology::ReportedBy::MacOsFreePages
-            )
-        );
-        assert_eq!(sample.reclaimable, reading.external * reading.page_size);
-    }
-}
-
 #[cfg(test)]
-mod available_tests {
+mod tests {
     use super::*;
 
     const GB: u64 = 1 << 30;
@@ -322,42 +518,54 @@ mod available_tests {
         }
     }
 
-    /// Item 59: a cgroup's file cache is available within it, all of it
-    /// the kernel can reclaim, not only its inactive part.
-    #[test]
-    fn a_cgroups_reclaimable_file_cache_is_available() {
-        let within = available_within(64 * GB, 40 * GB, &[cgroup(32 * GB, 30 * GB, 10 * GB)]);
-        assert_eq!(within, HostAvailable { total: 32 * GB, available: 12 * GB, reclaimable: 0 });
+    fn host(total: u64, free: u64, clean: u64, cold: u64) -> Scope {
+        Scope { total, supply: Supply { free_above_target: free, clean_cache: clean, cold_reclaimable: cold } }
     }
 
-    /// Only a load counts the clean file cache as room, and every process
-    /// limit binds both.
+    /// A cgroup's file cache is supply within it, all of it the kernel can
+    /// reclaim, not only its inactive part; it binds where its supply is
+    /// the least.
     #[test]
-    fn only_a_load_counts_the_clean_file_cache() {
-        let status = HostStatus {
-            allocatable: Reported::new(4 * GB, seismic_topology::ReportedBy::MacOsFreePages),
-            reclaimable: 6 * GB,
-            limits: Vec::new(),
-            limit_visibility: LimitVisibility::Complete,
-            held: None,
-        };
-        assert_eq!(status.allocatable_bytes(Reclaim::Nothing), 4 * GB);
-        assert_eq!(status.allocatable_bytes(Reclaim::CleanFileCache), 10 * GB);
-        let limited = HostStatus { limits: vec![cgroup(32 * GB, 30 * GB, 0)], ..status };
-        assert_eq!(limited.allocatable_bytes(Reclaim::CleanFileCache), 2 * GB);
+    fn a_cgroups_reclaimable_file_cache_is_supply() {
+        let within = binding(host(64 * GB, 40 * GB, 0, 0), &[cgroup(32 * GB, 30 * GB, 10 * GB)]);
+        assert_eq!(within, Binding { scope: host(32 * GB, 2 * GB, 10 * GB, 0), supplier: Some(0) });
     }
 
-    /// The host's own figure binds where it is lower than every limit's
-    /// room, and a virtual-memory limit never bounds physical memory.
+    /// The host's supply binds where it is less than every limit's, cold
+    /// pages included, and the total stays the least of them.
     #[test]
-    fn the_binding_bound_gives_the_reading() {
-        let address_space = ProcessMemoryLimit {
-            kind: ProcessLimitKind::AddressSpace,
-            limit_bytes: 1 * GB,
-            used_bytes: 1 * GB,
-            reclaimable_bytes: 0,
-        };
-        let within = available_within(64 * GB, 8 * GB, &[cgroup(32 * GB, 10 * GB, 0), address_space]);
-        assert_eq!(within, HostAvailable { total: 64 * GB, available: 8 * GB, reclaimable: 0 });
+    fn the_least_supply_binds_within_the_least_total() {
+        let machine = host(64 * GB, 8 * GB, 4 * GB, 6 * GB);
+        assert_eq!(
+            binding(machine, &[cgroup(32 * GB, 10 * GB, 0)]),
+            Binding { scope: host(32 * GB, 8 * GB, 4 * GB, 6 * GB), supplier: None },
+            "the host's supply binds, so a growth shows in it at once"
+        );
+    }
+
+    /// The scope never flips: as the host's supply falls past the cgroup's,
+    /// the total holds and the supply falls with the host's alone. Where the
+    /// two supplies are equal the host's binds, as it shows a growth at once
+    /// and the cgroup's only within memcg's flush.
+    #[test]
+    fn the_scope_holds_as_the_least_supply_moves() {
+        let limit = [cgroup(32 * GB, 20 * GB, 0)];
+        let readings: Vec<Binding> = [16, 13, 12, 11, 8].map(|free| binding(host(64 * GB, free * GB, 0, 0), &limit)).into();
+        assert!(readings.iter().all(|binding| binding.scope.total == 32 * GB));
+        assert_eq!(readings.iter().map(|binding| binding.scope.supply.total() / GB).collect::<Vec<_>>(), [12, 12, 12, 11, 8]);
+        assert_eq!(
+            readings.iter().map(|binding| binding.supplier).collect::<Vec<_>>(),
+            [Some(0), Some(0), None, None, None],
+            "the scope whose supply binds is named with it"
+        );
+    }
+
+    /// A 32-bit count read across its wrap keeps rising.
+    #[test]
+    fn a_widened_count_rises_across_its_wrap() {
+        let count = Widened::new();
+        assert_eq!(count.of(u32::MAX - 1), u64::from(u32::MAX - 1));
+        assert_eq!(count.of(3), u64::from(u32::MAX) + 4);
+        assert_eq!(count.of(3), u64::from(u32::MAX) + 4);
     }
 }

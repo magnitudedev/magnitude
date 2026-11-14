@@ -27,6 +27,7 @@ native routed_step for cuda from "cuda/routed_step.cu":
 # On its list's grid (`routed_list_grid`), each block copying its own
 # LIST_PART-byte parts of the listed records in turn.
 native routed_copy for cuda from "cuda/routed_copy.cu":
+    records (source, destination)
     launch routed_copy:
         threadgroups (LIST_GROUPS, LIST_ROWS, 1)
         grid (grid)
@@ -44,12 +45,6 @@ native routed_pass_map for cuda from "cuda/routed_pass_map.cu":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
-# `routed_copy`'s geometry, on every entry (a shrink lists its moves).
-native routed_move for cuda from "cuda/routed_move.cu":
-    launch routed_move:
-        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
-        threads_per_threadgroup (LIST_THREADS, 1, 1)
-
 # One block counts every choice in shared memory; a resident group's step
 # requests nothing.
 native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
@@ -63,6 +58,7 @@ native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
 # block's thread 0 storing the round's arrival, then claiming as
 # `routed_land`'s.
 native routed_round for cuda from "cuda/routed_round.cu":
+    records (conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
     scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_round:
         threadgroups (LAND_GROUPS, 1, 1)
@@ -90,6 +86,7 @@ native routed_scratch_grids for cuda from "cuda/routed_scratch_grids.cu":
 # places, one block only sources.
 native routed_land for cuda from "cuda/routed_land.cu":
     static (K)
+    records (staging_gate, staging_up, staging_down, gate, up, down)
     scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_land:
         threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
@@ -202,6 +199,7 @@ native routed_site_request for cuda from "cuda/routed_site_request.cu":
 native routed_down_project for cuda from "cuda/routed_down_project.cu":
     static (H, K, F)
     params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
+    records (expert_down, tier_down)
     where F % 64 == 0
     scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
     launch routed_down when M == 1:
@@ -230,6 +228,7 @@ native routed_down_sited for cuda from "cuda/routed_down_sited.cu":
 native routed_output_project for cuda from "cuda/routed_output_project.cu":
     static (H, K, F, S)
     params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
+    records (expert_down, tier_down)
     where F % 64 == 0 and S % 64 == 0
     scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
     scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1

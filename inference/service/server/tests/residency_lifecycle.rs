@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::ReleaseRate;
 use magnitude_service_api::{AppState, app};
 use magnitude_service_contracts::HardwareProvider;
 use magnitude_service_contracts::models::{
@@ -41,7 +41,6 @@ use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
-use magnitude_service_server::residency::supervisor::SeismicHostMemory;
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{WorkerLauncher, install_parent_watchdog};
@@ -90,7 +89,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     config.add_hugging_face_caches([PathBuf::from(flag(&arguments, "--hf-cache"))]);
     config.catalog_models = release.catalog().models.clone();
     config.architectures = magnitude_service_server::assessment::candidates::engine_architectures();
-    let reserves = MemoryReserves::of_machine(None);
+    let rate = ReleaseRate::of_machine(None);
     let ServedStore {
         store: inventory,
         devices: catalog,
@@ -98,12 +97,11 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     } = open_served_store(config).await?;
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
-    let host_memory = Arc::new(SeismicHostMemory::new(catalog.clone(), reserves));
     let serving = ServingDevice::select(&catalog)?;
     let configurations = Arc::new(ResolvedConfigurations::new(
         inventory.clone(),
         inventory.derived_cache().kernel_directory(),
-        reserves,
+        rate,
         serving,
         Default::default(),
     ));
@@ -113,8 +111,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             model_variants: resolver.clone(),
             configurations: configurations.clone(),
             catalog: catalog.clone(),
-            reserves,
-            host_memory: host_memory.clone(),
             idle_timeout,
             launcher: WorkerLauncher::current().expect("harness executable"),
             device: DeviceLock::default(),
@@ -261,7 +257,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         .expect("a resident worker answers an observation");
     let hardware = HardwareInventory::new(
         catalog.inventory().clone(),
-        reserves,
         volumes,
         serving,
         Arc::new(main.instances.clone()),

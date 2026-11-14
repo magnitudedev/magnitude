@@ -1,4 +1,5 @@
-//! GNU Linux: `/proc/meminfo`, `getrlimit` and cgroup memory limits.
+//! GNU Linux: `/proc/meminfo`, `/proc/zoneinfo`, `/proc/vmstat`, PSI and
+//! cgroup memory limits and counts.
 //!
 //! `MemTotal` is OS-usable RAM, not installed RAM; `MemAvailable` is the
 //! kernel's estimate. cgroup limits are read from this process's cgroup and
@@ -7,7 +8,8 @@
 //! unified hierarchy. Ancestors hidden by a cgroup namespace or a container's
 //! mount are reported as such, never presumed unlimited.
 
-use super::{HostStatus, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
+use super::{Counted, Harm, HostSample, Lag, ObservationError, OwnCold, OwnReclaimed, PressureLevel, ProcessLimitKind, ProcessMemoryLimit, Supply};
+use std::time::{Duration, Instant};
 use seismic_topology::{Reported, ReportedBy};
 use std::path::{Path, PathBuf};
 
@@ -184,26 +186,259 @@ fn cpu_caches(root: &Path, caches: &mut Vec<CpuCache>) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn sample() -> Result<HostStatus, ObservationError> {
-    let meminfo = read("/proc/meminfo")?;
-    let mem_available_bytes = kib_field(&meminfo, "MemAvailable:").ok_or_else(|| {
-        ObservationError::Unsupported(
-            "/proc/meminfo has no MemAvailable estimate (Linux 3.14+ required)".into(),
-        )
-    })?;
-    let mut limits = resource_limits()?;
-    let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
-    Ok(HostStatus {
-        // `MemAvailable` is what can be taken without swapping: page cache
-        // and reclaimable slab, not other programs' anonymous memory, less
-        // the kernel's own reserve (`totalreserve_pages`: each zone's high
-        // watermark and lowmem reserve), which kswapd reclaims toward.
-        allocatable: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
-        reclaimable: 0,
-        limits,
-        limit_visibility,
-        held: None,
+/// Host RAM now: `/proc/meminfo`'s free, file and anonymous counts above the
+/// zones' low watermarks (`/proc/zoneinfo`), within this process's cgroup
+/// limits ([`super::binding`]); the machine's refaults (`/proc/vmstat`) and,
+/// where this process's own cgroup holds it alone ([`Cgroups::own`]), that
+/// cgroup's (`memory.stat`); PSI (`/proc/pressure/memory`, and the limiting
+/// cgroup's `memory.pressure`), where the kernel keeps it. The cgroups are
+/// found again at every sample, so a process moved to another cgroup is
+/// read in the one it is in.
+///
+/// # Panics
+/// Where a figure cannot be read, naming it.
+pub(super) fn sample() -> HostSample {
+    let at = Instant::now();
+    let page = page_size();
+    let meminfo = read("/proc/meminfo").unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    let field = |name: &str| {
+        kib_field(&meminfo, name).unwrap_or_else(|| panic!("invariant violated: /proc/meminfo has no {name}"))
+    };
+    let cgroups = Cgroups::of_process();
+    let limits = cgroups.as_ref().map_or_else(Vec::new, |cgroups| {
+        cgroups.limits().unwrap_or_else(|error| panic!("invariant violated: this process's cgroup limits: {error}"))
+    });
+    let cold = field("Inactive(anon):");
+    let host = super::Scope {
+        total: field("MemTotal:"),
+        supply: Supply {
+            free_above_target: field("MemFree:").saturating_sub(low_watermarks(page)),
+            clean_cache: (field("Active(file):") + field("Inactive(file):"))
+                .saturating_sub(field("Dirty:") + field("Writeback:")),
+            cold_reclaimable: cold.min(field("SwapFree:")),
+        },
+    };
+    let binding = super::binding(host, &limits.iter().map(|(_, limit)| limit.clone()).collect::<Vec<_>>());
+    let pressure = psi_level(Path::new("/proc/pressure/memory")).map(|machine| {
+        let limiting = limits.iter().find(|(_, limit)| matches!(limit.kind, ProcessLimitKind::CgroupV2 { .. }));
+        // A cgroup whose PSI is off (`cgroup.pressure` 0) reports none.
+        limiting.and_then(|(directory, _)| psi_level(&directory.join("memory.pressure"))).map_or(machine, |within| machine.max(within))
+    });
+    let machine = refaults(&read("/proc/vmstat").unwrap_or_else(|error| panic!("invariant violated: {error}")));
+    let own = cgroups.as_ref().and_then(|cgroups| {
+        cgroups.own().unwrap_or_else(|error| panic!("invariant violated: this process's own cgroup: {error}"))
+    });
+    // Read after the machine's, so an event between the two counts as this
+    // process's alone: never another program's.
+    let harm = own.as_deref().map(|cgroup| Harm { machine, own: cgroup_refaults(cgroup) });
+    let own_cold = own.as_deref().map_or(OwnCold::Unobserved, own_cold);
+    let own_reclaimed = own_swapped().map(|bytes| OwnReclaimed { bytes, stored: own.as_deref().map_or(0, own_zswapped), exact: false });
+    // The counters show every event their folds had passed as the reading
+    // began.
+    let counted_at = Instant::now();
+    let counted = Counted { at: counted_at, lag: counters_lag(own.is_some()) + counted_at.duration_since(at) };
+    HostSample {
+        at,
+        page_bytes: page,
+        total: binding.scope.total,
+        supply: binding.scope.supply,
+        counted,
+        cold,
+        own_cold,
+        own_reclaimed,
+        wired: None,
+        harm,
+        pressure,
+        lag: Lag {
+            // A free returns its pages in the call, and a cgroup's
+            // `memory.current` uncharges them in it.
+            release: Duration::ZERO,
+            // The host's supply shows a growth in the call; a cgroup's
+            // clean cache, read from its `memory.stat`, within memcg's
+            // flush, and only where that cgroup's supply binds.
+            growth: match binding.supplier {
+                None => Duration::ZERO,
+                Some(_) => FLUSH_TIME,
+            },
+        },
+    }
+}
+
+/// memcg's periodic statistics flush (`FLUSH_TIME`, `mm/memcontrol.c`,
+/// Linux 5.15 on): a cgroup's `memory.stat` shows an event within it. A
+/// read may flush sooner, past a count of pending updates, never later.
+const FLUSH_TIME: Duration = Duration::from_secs(2);
+
+/// How late the counters show an event ([`Counted::lag`]): the per-CPU
+/// counts `/proc` sums fold within `vm.stat_interval`, their timer rounded
+/// up to the next whole second (`round_jiffies_relative`, `mm/vmstat.c`);
+/// a cgroup's, where the counters read one (`cgroup`), within memcg's flush.
+fn counters_lag(cgroup: bool) -> Duration {
+    let fold = stat_interval() + Duration::from_secs(1);
+    match cgroup {
+        true => fold.max(FLUSH_TIME),
+        false => fold,
+    }
+}
+
+/// The PSI files a pressure trigger watches: the machine's, and the
+/// innermost cgroup v2 limiting this process's ([`crate::pressure`]).
+pub(crate) fn pressure_files() -> Vec<PathBuf> {
+    let limiting = Cgroups::of_process().and_then(|cgroups| {
+        let limits = cgroups.limits().unwrap_or_else(|error| panic!("invariant violated: this process's cgroup limits: {error}"));
+        limits.into_iter().find(|(_, limit)| matches!(limit.kind, ProcessLimitKind::CgroupV2 { .. })).map(|(directory, _)| directory)
+    });
+    std::iter::once(PathBuf::from("/proc/pressure/memory"))
+        .chain(limiting.map(|directory| directory.join("memory.pressure")))
+        .collect()
+}
+
+fn page_size() -> u64 {
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|size| *size > 0)
+        .expect("invariant violated: sysconf(_SC_PAGESIZE) reads no page size")
+}
+
+/// The zones' low watermarks together, in bytes of `page` (`/proc/zoneinfo`):
+/// kswapd wakes to reclaim once free pages fall below them, so free pages
+/// above them are taken without anyone's reclaim.
+fn low_watermarks(page: u64) -> u64 {
+    let zoneinfo = read("/proc/zoneinfo").unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    zones_low(&zoneinfo) * page
+}
+
+fn zones_low(zoneinfo: &str) -> u64 {
+    zoneinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("low")).then(|| {
+                fields
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("invariant violated: /proc/zoneinfo reads {line:?}"))
+            })
+        })
+        .sum()
+}
+
+/// The pages refaulted machine-wide (`/proc/vmstat`): anonymous and file
+/// since Linux 5.9, the one count before.
+fn refaults(vmstat: &str) -> u64 {
+    refault_count(vmstat).unwrap_or_else(|| panic!("invariant violated: /proc/vmstat has no workingset refault counts"))
+}
+
+/// The pages refaulted in `cgroup`, as its `memory.stat` counts them.
+fn cgroup_refaults(cgroup: &Path) -> u64 {
+    let path = cgroup.join("memory.stat");
+    let stat = read(&path).unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    refault_count(&stat).unwrap_or_else(|| panic!("invariant violated: {} has no workingset refault counts", path.display()))
+}
+
+/// The refaults a `/proc/vmstat` or `memory.stat` text counts, under the
+/// same names in both: anonymous and file since Linux 5.9, the one count
+/// before; none where it counts neither.
+fn refault_count(text: &str) -> Option<u64> {
+    let count = |name: &str| {
+        text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(name)).then(|| {
+                fields
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("invariant violated: a refault count reads {line:?}"))
+            })
+        })
+    };
+    match (count("workingset_refault_anon"), count("workingset_refault_file"), count("workingset_refault")) {
+        (Some(anon), Some(file), _) => Some(anon + file),
+        (None, None, all) => all,
+        (anon, file, _) => panic!("invariant violated: refault counts read anon {anon:?} and file {file:?}"),
+    }
+}
+
+/// `vm.stat_interval`: how often the kernel folds the per-CPU counts into
+/// the machine's.
+fn stat_interval() -> Duration {
+    let path = "/proc/sys/vm/stat_interval";
+    let value = read(path).unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    Duration::from_secs(value.trim().parse().unwrap_or_else(|error| panic!("invariant violated: {path} reads {value:?}: {error}")))
+}
+
+/// The pressure level a PSI file `path` reports: critical where some task
+/// stalled with every task waiting (`full avg10`), warn where some task
+/// stalled (`some avg10`), over the last ten seconds. None where the kernel
+/// keeps no PSI (built without it, or booted `psi=0`, where the file is
+/// absent or refuses reads with `EOPNOTSUPP`).
+///
+/// # Panics
+/// Where the file cannot be read otherwise, or reads no level.
+fn psi_level(path: &Path) -> Option<PressureLevel> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+            return None;
+        }
+        Err(error) => panic!("invariant violated: {}: {error}", path.display()),
+    };
+    Some(parse_psi(&text).unwrap_or_else(|| panic!("invariant violated: {} reads {text:?}", path.display())))
+}
+
+fn parse_psi(text: &str) -> Option<PressureLevel> {
+    let avg10 = |kind: &str| -> Option<f64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(kind))?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("avg10="))?
+            .parse()
+            .ok()
+    };
+    Some(match (avg10("some ")?, avg10("full ")?) {
+        (_, full) if full > 0.0 => PressureLevel::Critical,
+        (some, _) if some > 0.0 => PressureLevel::Warn,
+        _ => PressureLevel::Normal,
     })
+}
+
+/// This process's anonymous bytes in swap, zswap's included
+/// (`/proc/self/status`'s `VmSwap`); none where the kernel reports no
+/// `VmSwap` (built without `CONFIG_SWAP`, or a sandbox's own `/proc`): the
+/// process's bytes out of RAM are then unreported, never a failed reading.
+fn own_swapped() -> Option<u64> {
+    let status = read("/proc/self/status").unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    kib_field(&status, "VmSwap:")
+}
+
+/// The RAM zswap holds of this process's own swapped pages, at their
+/// compressed size: the `zswap` of its own cgroup ([`Cgroups::own`]); none
+/// where the kernel counts no zswap (before 5.19, or built without it).
+fn own_zswapped(cgroup: &Path) -> u64 {
+    let path = cgroup.join("memory.stat");
+    let stat = read(&path).unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    stat_field(&path, &stat, "zswap").unwrap_or_else(|error| panic!("invariant violated: {error}")).unwrap_or(0)
+}
+
+/// This process's cold anonymous bytes: the `inactive_anon` of its own
+/// cgroup ([`Cgroups::own`]).
+fn own_cold(cgroup: &Path) -> OwnCold {
+    let path = cgroup.join("memory.stat");
+    let stat = read(&path).unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    OwnCold::Bytes(
+        stat_field(&path, &stat, "inactive_anon")
+            .unwrap_or_else(|error| panic!("invariant violated: {error}"))
+            .unwrap_or_else(|| panic!("invariant violated: {} has no inactive_anon", path.display())),
+    )
+}
+
+/// The value of `key` in the `memory.stat` text `stat` of `path`.
+fn stat_field(path: &Path, stat: &str, key: &str) -> Result<Option<u64>, ObservationError> {
+    stat.lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(key)).then(|| parse_bytes(path, fields.next().unwrap_or("")))
+        })
+        .transpose()
 }
 
 fn read(path: impl AsRef<Path>) -> Result<String, ObservationError> {
@@ -218,43 +453,6 @@ fn kib_field(text: &str, name: &str) -> Option<u64> {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
         .and_then(|kib| kib.checked_mul(1024))
-}
-
-fn resource_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
-    let mut limits = Vec::new();
-    let mut status = None;
-    for (resource, kind, usage) in [
-        (libc::RLIMIT_AS, ProcessLimitKind::AddressSpace, "VmSize:"),
-        (libc::RLIMIT_DATA, ProcessLimitKind::DataSegment, "VmData:"),
-    ] {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(resource, &mut limit) } != 0 {
-            return Err(ObservationError::Failed(format!(
-                "getrlimit failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if limit.rlim_cur == libc::RLIM_INFINITY {
-            continue;
-        }
-        if status.is_none() {
-            status = Some(read("/proc/self/status")?);
-        }
-        let status = status.as_deref().expect("process status was just read");
-        let used_bytes = kib_field(status, usage).ok_or_else(|| {
-            ObservationError::Failed(format!("/proc/self/status {usage} is absent"))
-        })?;
-        limits.push(ProcessMemoryLimit {
-            kind,
-            limit_bytes: limit.rlim_cur,
-            used_bytes,
-            reclaimable_bytes: 0,
-        });
-    }
-    Ok(limits)
 }
 
 /// The cgroup hierarchy this process's memory controller is bound to.
@@ -296,110 +494,156 @@ fn memory_hierarchy(membership: &str) -> MemoryHierarchy<'_> {
     unified.map_or(MemoryHierarchy::None, |path| MemoryHierarchy::V2 { path })
 }
 
-/// Appends every visible cgroup memory limit, from this process's cgroup up
-/// to the root of the mounted hierarchy. `root` is the filesystem root the
-/// proc and cgroup files are read under (`/` outside tests).
-fn cgroup_limits(
-    root: &Path,
-    limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<LimitVisibility, ObservationError> {
-    let membership = read(root.join("proc/self/cgroup"))?;
-    match memory_hierarchy(&membership) {
-        MemoryHierarchy::V1 { path } => cgroup_v1_limits(root, path, limits),
-        MemoryHierarchy::V2 { path } => cgroup_v2_limits(root, path, limits),
-        MemoryHierarchy::None => Ok(LimitVisibility::Complete),
+/// This process's cgroup and each visible ancestor, in the hierarchy its
+/// memory controller is bound to, as found at one sample: the scope that
+/// sample binds ([`super::binding`]).
+struct Cgroups {
+    hierarchy: Hierarchy,
+    /// From this process's cgroup up to the mount point: each directory and
+    /// its path relative to the mount.
+    chain: Vec<(PathBuf, String)>,
+}
+
+enum Hierarchy {
+    /// The v1 `memory` hierarchy, its "no limit" figure with it
+    /// ([`v1_unlimited_bytes`]).
+    V1 { unlimited: u64 },
+    V2,
+}
+
+impl Cgroups {
+    /// This process's now, read at each call so that a process moved to
+    /// another cgroup is read in the one it is in: none where no memory
+    /// controller is enabled.
+    ///
+    /// # Panics
+    /// Where they cannot be read.
+    fn of_process() -> Option<Self> {
+        Self::find(Path::new("/")).unwrap_or_else(|error| panic!("invariant violated: this process's cgroups: {error}"))
+    }
+
+    /// This process's cgroups under the filesystem root `root` (`/`
+    /// outside tests). Ancestors a cgroup namespace or a container's mount
+    /// hides cannot be read, and bound nothing here.
+    fn find(root: &Path) -> Result<Option<Self>, ObservationError> {
+        let membership = read(root.join("proc/self/cgroup"))?;
+        let (hierarchy, mount) = match memory_hierarchy(&membership) {
+            MemoryHierarchy::V1 { path } => {
+                let mount = cgroup_mount(root, path, |filesystem, options| {
+                    filesystem == "cgroup" && options.split(',').any(|option| option == "memory")
+                })?
+                .ok_or_else(|| ObservationError::Unsupported("this process's cgroup v1 memory hierarchy is not mounted".into()))?;
+                (Hierarchy::V1 { unlimited: v1_unlimited_bytes()? }, mount)
+            }
+            MemoryHierarchy::V2 { path } => {
+                let mount = cgroup_mount(root, path, |filesystem, _| filesystem == "cgroup2")?
+                    .ok_or_else(|| ObservationError::Unsupported("this process's cgroup2 hierarchy is not mounted".into()))?;
+                (Hierarchy::V2, mount)
+            }
+            MemoryHierarchy::None => return Ok(None),
+        };
+        let mut chain = Vec::new();
+        walk_cgroups(&mount, |directory, cgroup| {
+            chain.push((directory.to_path_buf(), cgroup));
+            Ok(())
+        })?;
+        Ok(Some(Self { hierarchy, chain }))
+    }
+
+    /// Every limit of the chain now, innermost first, each with its
+    /// directory.
+    fn limits(&self) -> Result<Vec<(PathBuf, ProcessMemoryLimit)>, ObservationError> {
+        let mut limits = Vec::new();
+        for (directory, cgroup) in &self.chain {
+            let limit = match self.hierarchy {
+                Hierarchy::V2 => v2_limit(directory)?.map(|limit_bytes| -> Result<_, ObservationError> {
+                    Ok(ProcessMemoryLimit {
+                        kind: ProcessLimitKind::CgroupV2 { cgroup: cgroup.clone() },
+                        limit_bytes,
+                        used_bytes: read_bytes(&directory.join("memory.current"))?,
+                        reclaimable_bytes: file_cache_headroom(
+                            directory,
+                            ["active_file", "inactive_file", "file_dirty", "file_writeback"],
+                        )?,
+                    })
+                }),
+                Hierarchy::V1 { unlimited } => {
+                    let limit_bytes = read_bytes(&directory.join("memory.limit_in_bytes"))?;
+                    (limit_bytes < unlimited).then(|| -> Result<_, ObservationError> {
+                        Ok(ProcessMemoryLimit {
+                            kind: ProcessLimitKind::CgroupV1 { cgroup: cgroup.clone() },
+                            limit_bytes,
+                            used_bytes: read_bytes(&directory.join("memory.usage_in_bytes"))?,
+                            reclaimable_bytes: file_cache_headroom(
+                                directory,
+                                ["total_active_file", "total_inactive_file", "total_dirty", "total_writeback"],
+                            )?,
+                        })
+                    })
+                }
+            };
+            if let Some(limit) = limit {
+                limits.push((directory.clone(), limit?));
+            }
+        }
+        Ok(limits)
+    }
+
+    /// The cgroup whose counts are this process's own, the one owner of
+    /// that rule for every count read from it (harm's refaults, the cold
+    /// pages): this process's own cgroup v2, where it has a memory
+    /// controller (its `memory.stat`), lists this process alone
+    /// (`cgroup.procs`) and has no descendant (`cgroup.stat`'s
+    /// `nr_descendants`), whose processes its hierarchical counts would
+    /// include. None otherwise: a cgroup shared with other processes (a
+    /// `session-N.scope`, `user.slice`, a container's root) counts their
+    /// events too, and an ancestor counts its other children's, so no count
+    /// of it is this process's. None under cgroup v1, whose counts this
+    /// reader does not take.
+    fn own(&self) -> Result<Option<PathBuf>, ObservationError> {
+        let Hierarchy::V2 = self.hierarchy else {
+            return Ok(None);
+        };
+        let (directory, _) = self.chain.first().expect("a cgroup chain starts at this process's cgroup");
+        if !present(&directory.join("memory.stat"))? {
+            return Ok(None);
+        }
+        let pid = std::process::id().to_string();
+        if !read(directory.join("cgroup.procs"))?.lines().eq([pid.as_str()]) {
+            return Ok(None);
+        }
+        let path = directory.join("cgroup.stat");
+        let stat = read(&path)?;
+        let descendants = stat_field(&path, &stat, "nr_descendants")?
+            .ok_or_else(|| ObservationError::Failed(format!("{} has no nr_descendants", path.display())))?;
+        Ok((descendants == 0).then(|| directory.clone()))
     }
 }
 
-fn cgroup_v2_limits(
-    root: &Path,
-    path: &str,
-    limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<LimitVisibility, ObservationError> {
-    let mount =
-        cgroup_mount(root, path, |filesystem, _| filesystem == "cgroup2")?.ok_or_else(|| {
-            ObservationError::Unsupported("this process's cgroup2 hierarchy is not mounted".into())
-        })?;
-    walk_cgroups(&mount, |directory, cgroup| {
-        let max = directory.join("memory.max");
-        if !max.exists() {
-            return Ok(());
-        }
-        let value = read(&max)?;
-        let value = value.trim();
-        if value == "max" {
-            return Ok(());
-        }
-        limits.push(ProcessMemoryLimit {
-            kind: ProcessLimitKind::CgroupV2 { cgroup },
-            limit_bytes: parse_bytes(&max, value)?,
-            used_bytes: read_bytes(&directory.join("memory.current"))?,
-            reclaimable_bytes: file_cache_headroom(
-                directory,
-                [
-                    "active_file",
-                    "inactive_file",
-                    "file_dirty",
-                    "file_writeback",
-                ],
-            )?,
-        });
-        Ok(())
-    })?;
-    // `cgroup.type` exists only on non-root cgroups: a visible top that has
-    // it is a namespace or bind-mount root with hidden ancestors.
-    let visibility = if mount.point.join("cgroup.type").exists() {
-        LimitVisibility::CgroupAncestorsHidden
-    } else {
-        LimitVisibility::Complete
-    };
-    Ok(visibility)
+/// Whether the file `path` exists: an error other than its absence is no
+/// answer to that.
+fn present(path: &Path) -> Result<bool, ObservationError> {
+    path.try_exists().map_err(|error| ObservationError::Failed(format!("{}: {error}", path.display())))
 }
 
-fn cgroup_v1_limits(
-    root: &Path,
-    path: &str,
-    limits: &mut Vec<ProcessMemoryLimit>,
-) -> Result<LimitVisibility, ObservationError> {
-    let mount = cgroup_mount(root, path, |filesystem, options| {
-        filesystem == "cgroup" && options.split(',').any(|option| option == "memory")
-    })?
-    .ok_or_else(|| {
-        ObservationError::Unsupported(
-            "this process's cgroup v1 memory hierarchy is not mounted".into(),
-        )
-    })?;
-    let unlimited = v1_unlimited_bytes()?;
-    walk_cgroups(&mount, |directory, cgroup| {
-        let limit = directory.join("memory.limit_in_bytes");
-        let limit_bytes = read_bytes(&limit)?;
-        if limit_bytes >= unlimited {
-            return Ok(());
+/// A cgroup v2's memory limit: the lower of `memory.max` and `memory.high`
+/// (past which the kernel reclaims the cgroup and throttles it), none where
+/// both are `max` or the cgroup has no memory controller.
+fn v2_limit(directory: &Path) -> Result<Option<u64>, ObservationError> {
+    let mut least = None;
+    for name in ["memory.max", "memory.high"] {
+        let file = directory.join(name);
+        if !present(&file)? {
+            continue;
         }
-        limits.push(ProcessMemoryLimit {
-            kind: ProcessLimitKind::CgroupV1 { cgroup },
-            limit_bytes,
-            used_bytes: read_bytes(&directory.join("memory.usage_in_bytes"))?,
-            reclaimable_bytes: file_cache_headroom(
-                directory,
-                [
-                    "total_active_file",
-                    "total_inactive_file",
-                    "total_dirty",
-                    "total_writeback",
-                ],
-            )?,
-        });
-        Ok(())
-    })?;
-    // A v1 mount exposes its hierarchy from the mounted root down; a root
-    // other than the hierarchy's own (a container's cgroup) hides ancestors.
-    let visibility = if mount.root == "/" {
-        LimitVisibility::Complete
-    } else {
-        LimitVisibility::CgroupAncestorsHidden
-    };
-    Ok(visibility)
+        let value = read(&file)?;
+        let value = value.trim();
+        if value != "max" {
+            let bytes = parse_bytes(&file, value)?;
+            least = Some(least.map_or(bytes, |least: u64| least.min(bytes)));
+        }
+    }
+    Ok(least)
 }
 
 /// Cgroup usage includes reclaimable page cache, unlike Linux MemAvailable.
@@ -446,8 +690,6 @@ fn v1_unlimited_bytes() -> Result<u64, ObservationError> {
 struct CgroupMount {
     /// Mount point, under the filesystem root.
     point: PathBuf,
-    /// The hierarchy path mounted at `point` (`/` for the hierarchy root).
-    root: String,
     /// This process's cgroup directory.
     cgroup: PathBuf,
 }
@@ -485,11 +727,7 @@ fn cgroup_mount(
             continue;
         };
         let cgroup = point.join(relative);
-        return Ok(Some(CgroupMount {
-            point,
-            root: mounted,
-            cgroup,
-        }));
+        return Ok(Some(CgroupMount { point, cgroup }));
     }
     match outside {
         Some(mounted) => Err(ObservationError::Unsupported(format!(
@@ -695,10 +933,15 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
 
-        fn limits(&self) -> Result<(Vec<ProcessMemoryLimit>, LimitVisibility), ObservationError> {
-            let mut limits = Vec::new();
-            let visibility = cgroup_limits(&self.0, &mut limits)?;
-            Ok((limits, visibility))
+        fn limits(&self) -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
+            Ok(match self.cgroups()? {
+                Some(cgroups) => cgroups.limits()?.into_iter().map(|(_, limit)| limit).collect(),
+                None => Vec::new(),
+            })
+        }
+
+        fn cgroups(&self) -> Result<Option<Cgroups>, ObservationError> {
+            Cgroups::find(&self.0)
         }
     }
 
@@ -733,7 +976,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "900\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.stat", "");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -744,17 +987,15 @@ mod tests {
                 400
             )]
         );
-        assert_eq!(visibility, LimitVisibility::Complete);
     }
 
     #[test]
-    fn v2_namespace_root_hides_its_ancestors() {
+    fn a_v2_namespace_root_gives_its_own_limit() {
         let fixture = Fixture::new("v2-namespace", "0::/\n", V2_HOST_MOUNT);
-        fixture.write("sys/fs/cgroup/cgroup.type", "domain\n");
         fixture.write("sys/fs/cgroup/memory.max", "2000\n");
         fixture.write("sys/fs/cgroup/memory.current", "500\n");
         fixture.write("sys/fs/cgroup/memory.stat", "");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -763,7 +1004,6 @@ mod tests {
                 500
             )]
         );
-        assert_eq!(visibility, LimitVisibility::CgroupAncestorsHidden);
     }
 
     #[test]
@@ -797,7 +1037,7 @@ mod tests {
         );
         fixture.write(&format!("{memory}/memory.limit_in_bytes"), &unlimited);
         fixture.write(&format!("{memory}/memory.usage_in_bytes"), "9000\n");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -808,7 +1048,6 @@ mod tests {
                 1000
             )]
         );
-        assert_eq!(visibility, LimitVisibility::Complete);
     }
 
     #[test]
@@ -838,7 +1077,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", &unlimited);
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "9000\n");
         fixture.write("sys/fs/cgroup/memory/memory.stat", "");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -849,35 +1088,103 @@ mod tests {
                 2000
             )]
         );
-        assert_eq!(visibility, LimitVisibility::Complete);
     }
 
     #[test]
-    fn v2_limits_come_from_max_alone() {
-        // `memory.high` is a throttling threshold, not a limit: only
-        // `memory.max` bounds this process, enforced against `memory.current`.
+    fn v2_limits_take_the_lower_of_max_and_high() {
+        // Past `memory.high` the kernel reclaims the cgroup and throttles
+        // it: the cgroup's limit is the lower of it and `memory.max`, and
+        // the innermost limited cgroup is the one whose pressure is read.
         let fixture = Fixture::new("v2-high", "0::/user.slice/app.scope\n", V2_HOST_MOUNT);
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.max", "1000\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.high", "800\n");
-        fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "810\n");
+        fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "790\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.stat", "");
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
-        fixture.write("sys/fs/cgroup/user.slice/memory.high", "700\n");
+        fixture.write("sys/fs/cgroup/user.slice/memory.high", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "750\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.stat", "");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
                 ProcessLimitKind::CgroupV2 {
                     cgroup: "/user.slice/app.scope".into()
                 },
-                1000,
-                810
+                800,
+                790
             )]
         );
-        assert_eq!(visibility, LimitVisibility::Complete);
-        assert_eq!(limits[0].remaining_bytes(), 190);
+        assert_eq!(limits[0].remaining_bytes(), 10);
+        let cgroups = fixture.cgroups().unwrap().unwrap();
+        let own = fixture.0.join("sys/fs/cgroup/user.slice/app.scope");
+        assert_eq!(cgroups.limits().unwrap()[0].0, own);
+    }
+
+    /// The machine's figures parse as the kernel writes them.
+    #[test]
+    fn proc_figures_parse() {
+        assert_eq!(zones_low("Node 0, zone   Normal\n  pages free     3\n        min      10\n        low      12\n        high     14\nNode 0, zone DMA32\n        low      5\n"), 17);
+        assert_eq!(refaults("workingset_refault_anon 3\nworkingset_refault_file 4\n"), 7);
+        assert_eq!(refaults("workingset_refault 9\n"), 9);
+        assert_eq!(refault_count("anon 900\nfile 30\n"), None);
+        let psi = |some: &str, full: &str| parse_psi(&format!("some avg10={some} avg60=0.00 avg300=0.00 total=1\nfull avg10={full} avg60=0.00 avg300=0.00 total=0\n"));
+        assert_eq!(psi("0.00", "0.00"), Some(PressureLevel::Normal));
+        assert_eq!(psi("0.12", "0.00"), Some(PressureLevel::Warn));
+        assert_eq!(psi("0.12", "0.01"), Some(PressureLevel::Critical));
+    }
+
+    /// A cgroup v2 of this process alone, with a memory controller and no
+    /// descendant, is its own: its refaults and cold pages are this
+    /// process's, in the machine's unit.
+    #[test]
+    fn a_cgroup_of_this_process_alone_counts_its_own_paging_and_cold_pages() {
+        let fixture = Fixture::new("own", "0::/app.scope\n", V2_HOST_MOUNT);
+        fixture.write("sys/fs/cgroup/app.scope/memory.stat", "inactive_anon 300\nzswap 70\nworkingset_refault_anon 5\nworkingset_refault_file 6\n");
+        fixture.write("sys/fs/cgroup/app.scope/cgroup.procs", &format!("{}\n", std::process::id()));
+        fixture.write("sys/fs/cgroup/app.scope/cgroup.stat", "nr_descendants 0\nnr_dying_descendants 0\n");
+        let own = fixture.cgroups().unwrap().unwrap().own().unwrap().expect("a cgroup of this process alone is its own");
+        assert_eq!(own, fixture.0.join("sys/fs/cgroup/app.scope"));
+        assert_eq!(cgroup_refaults(&own), 11);
+        assert_eq!(own_cold(&own), OwnCold::Bytes(300));
+        assert_eq!(own_zswapped(&own), 70);
+    }
+
+    /// A cgroup this process shares, by another member or a descendant
+    /// whose counts its own include, an ancestor holding its memory
+    /// controller, and a cgroup v1 hierarchy count no events as this
+    /// process's: harm and own cold pages are then unobserved, never
+    /// another program's read as ours.
+    #[test]
+    fn a_shared_cgroup_counts_nothing_as_this_processs() {
+        let pid = std::process::id();
+        let own = |name: &str, procs: String, descendants: u32| {
+            let fixture = Fixture::new(name, "0::/session-2.scope\n", V2_HOST_MOUNT);
+            fixture.write("sys/fs/cgroup/session-2.scope/memory.stat", "workingset_refault_anon 5\nworkingset_refault_file 6\n");
+            fixture.write("sys/fs/cgroup/session-2.scope/cgroup.procs", &procs);
+            fixture.write("sys/fs/cgroup/session-2.scope/cgroup.stat", &format!("nr_descendants {descendants}\n"));
+            fixture.cgroups().unwrap().unwrap().own().unwrap()
+        };
+        assert!(own("shared-sole", format!("{pid}\n"), 0).is_some());
+        assert_eq!(own("shared-member", format!("{pid}\n1\n"), 0), None, "another process in the cgroup");
+        assert_eq!(own("shared-descendant", format!("{pid}\n"), 1), None, "a descendant's counts in the cgroup's");
+        let ancestor = Fixture::new("shared-ancestor", "0::/user.slice/app.scope\n", V2_HOST_MOUNT);
+        ancestor.write("sys/fs/cgroup/user.slice/memory.stat", "workingset_refault_anon 5\nworkingset_refault_file 6\n");
+        ancestor.write("sys/fs/cgroup/user.slice/app.scope/cgroup.procs", &format!("{pid}\n"));
+        assert_eq!(ancestor.cgroups().unwrap().unwrap().own().unwrap(), None, "the memory controller is an ancestor's");
+        let v1 = Fixture::new("shared-v1", "4:memory:/svc\n", V1_HOST_MOUNTS);
+        v1.write("sys/fs/cgroup/memory/svc/memory.stat", "total_rss 1\n");
+        assert_eq!(v1.cgroups().unwrap().unwrap().own().unwrap(), None);
+    }
+
+    /// The level reads as the kernel writes it, and a kernel keeping no PSI
+    /// reports none.
+    #[test]
+    fn a_kernel_without_psi_reports_no_level() {
+        let fixture = Fixture::new("psi", "0::/\n", V2_HOST_MOUNT);
+        fixture.write("pressure", "some avg10=0.50 avg60=0.00 avg300=0.00 total=9\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
+        assert_eq!(psi_level(&fixture.0.join("pressure")), Some(PressureLevel::Warn));
+        assert_eq!(psi_level(&fixture.0.join("absent")), None);
     }
 
     #[test]
@@ -893,7 +1200,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", "4000\n");
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "1500\n");
         fixture.write("sys/fs/cgroup/memory/memory.stat", "");
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(
             limits,
             [limit(
@@ -902,7 +1209,6 @@ mod tests {
                 1500
             )]
         );
-        assert_eq!(visibility, LimitVisibility::CgroupAncestorsHidden);
     }
 
     #[test]
@@ -946,7 +1252,7 @@ mod tests {
             ),
         ] {
             fixture.write("sys/fs/cgroup/worker/memory.stat", stat);
-            let (limits, _) = fixture.limits().unwrap();
+            let limits = fixture.limits().unwrap();
             assert_eq!(limits[0].used_bytes, 900);
             assert_eq!(limits[0].reclaimable_bytes, reclaimable);
             assert_eq!(limits[0].remaining_bytes(), remaining);
@@ -971,7 +1277,7 @@ mod tests {
             "sys/fs/cgroup/memory/memory.limit_in_bytes",
             &v1_unlimited_bytes().unwrap().to_string(),
         );
-        let (limits, _) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert_eq!(limits[0].reclaimable_bytes, 450);
         assert_eq!(limits[0].remaining_bytes(), 550);
     }
@@ -983,9 +1289,8 @@ mod tests {
             "3:cpu,cpuacct:/\n1:name=systemd:/\n",
             V1_HOST_MOUNTS,
         );
-        let (limits, visibility) = fixture.limits().unwrap();
+        let limits = fixture.limits().unwrap();
         assert!(limits.is_empty());
-        assert_eq!(visibility, LimitVisibility::Complete);
     }
 
     #[test]

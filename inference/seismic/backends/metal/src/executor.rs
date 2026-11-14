@@ -4,7 +4,7 @@ use crate::{Metal, MetalBuffer, MetalDevice, MetalLaunchMode, Pipeline};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
 };
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -306,7 +306,7 @@ impl MetalSubmission {
         let registers = scratch_buffer(scratch.allocation(LaunchLocalKind::Register), env);
 
         let command = crate::pooled(|| {
-            let command = self.device.queue().commandBuffer().ok_or_else(|| {
+            let command = self.device.command_buffer().ok_or_else(|| {
                 ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
             })?;
             let encoder = command.computeCommandEncoder().ok_or_else(|| {
@@ -499,7 +499,7 @@ mod completion_tests {
         words: [u64; 2],
     ) {
         let words = submission.write_words(table, &words).unwrap();
-        let command = submission.device.queue().commandBuffer().unwrap();
+        let command = submission.device.command_buffer().unwrap();
         let encoder = command.computeCommandEncoder().unwrap();
         encoder.setComputePipelineState(pipeline);
         unsafe {
@@ -533,11 +533,11 @@ mod completion_tests {
     fn repeated_launches_preserve_each_word_table_version_until_its_native_read() {
         let device = metal_device();
         let pipeline = capture_pipeline(&device);
-        let output = device.allocate_bytes(64 * 8).unwrap();
+        let output = device.allocate_bytes(64 * 8, &crate::test_support::entry()).unwrap();
         device.write(&output, 0, &vec![0xff; 64 * 8]).unwrap();
         let table = RuntimeBuffer {
             tensor: None,
-            buffer: MetalBuffer::clone(&device.allocate_bytes(32).unwrap()),
+            buffer: MetalBuffer::clone(&device.allocate_bytes(32, &crate::test_support::entry()).unwrap()),
             base_offset: 8,
             accessible_bytes: 16,
         };
@@ -571,9 +571,9 @@ mod completion_tests {
     fn host_word_write_completes_overlapping_ranges_and_retains_independent_readers() {
         let device = metal_device();
         let pipeline = capture_pipeline(&device);
-        let output = device.allocate_bytes(3 * 8).unwrap();
-        let shared = device.allocate_bytes(32).unwrap();
-        let separate = device.allocate_bytes(16).unwrap();
+        let output = device.allocate_bytes(3 * 8, &crate::test_support::entry()).unwrap();
+        let shared = device.allocate_bytes(32, &crate::test_support::entry()).unwrap();
+        let separate = device.allocate_bytes(16, &crate::test_support::entry()).unwrap();
         let mut submission = MetalExecutor::new(device.clone())
             .begin_submission()
             .unwrap();

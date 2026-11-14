@@ -359,14 +359,14 @@ pub(super) fn qualify_attention(
             let mut slabs = Vec::new();
             $(
                 let mut $plane = if $rows > 0 {
-                    let mut slab = seismic::SlabTensor::new(device, 2, 2, vec![
+                    let slab = crate::experts::pooled_slabs(device, seismic::Contract::DeviceOnly, 2, 2, &[
                         seismic::SlabRegion {
                             element: $element,
                             row_shape: vec![kv_heads, $elements],
                         },
-                    ])
+                    ], 1)
                     .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                    slab.add_slab()
+                    slab.add_slab(seismic::SlabFill::Zeroed)
                         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
                     let region = slab
                         .logical_region(0)

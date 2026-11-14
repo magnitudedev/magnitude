@@ -1,126 +1,263 @@
-use super::{ExpertBank, host_views};
-use crate::planning::{BankTier, ExpertBankPlan, Placer};
-use crate::experts::watcher::Candidates;
-use crate::domain::{BankHolding, BankResized, BankStep, DomainError, MemoryMoment, ResizeTimes, RunningBegun, RunningPressure, Trip};
-use crate::CompletionWake;
-use crate::memory::ledger::{Changes, Changing};
-use std::time::{Duration, Instant};
-use crate::native::BankMoves;
-use magnitude_kernels::routed_move;
-use seismic::{NativeTensorBatch, NativeTensorBatchCompletion, PreparedRecommit, RecommitRelease, Resizer, Tensor, TensorError};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use crate::experts::watcher::Join;
-use crate::storage_thread::{Done, StorageThread};
+//! The bank's resizes over its stores' granule pools. Each store's records
+//! (the bank's own, and a linked host tier's) are one slab store per group
+//! in that store's pool, a record a slab: one granule holds an expert's
+//! record of every routed tensor. A growth claims granules (a free one in
+//! process first, else the pool grows by a block its ledger entry admits),
+//! slot by slot on the store's resize thread, each slot joining the watcher
+//! as soon as every group holds it. A shrink evicts the records the watcher
+//! chooses, beside running steps or not, and moves nothing: their slabs
+//! return to the pool once every pass that may read them is submitted, each
+//! granule free again once the last flight that read it completes; then the
+//! pool returns its empty blocks.
 
-/// What the bank commits: the slots its directory serves from, between the
-/// floor and every expert, and its record tensors' resize. A record
-/// tensor's commitment is never below its directory's records.
+use super::ExpertBank;
+use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, RunningBegun, RunningPressure, Trip};
+use crate::experts::source::Records;
+use crate::experts::watcher::{BankRecordViews, Candidates, Evicted, Evicting, Join};
+use crate::memory::ledger::Changes;
+use crate::planning::{BankTier, Placer};
+use crate::storage_thread::{Done, StorageThread};
+use crate::CompletionWake;
+use seismic::{Pool, SlabTensor, Tensor, TensorError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// One store's records: each group's slab store in the store's pool, a
+/// record a slab, its leading `lent` records over the lender's lent
+/// allocation for the load's life, each region one routed tensor's record
+/// of `record_bytes`.
+pub(super) struct Stores {
+    pool: Pool,
+    groups: Vec<Mutex<SlabTensor>>,
+    lent: Vec<u64>,
+    record_bytes: Vec<Vec<u64>>,
+}
+
+impl Stores {
+    /// `groups`, each a store with its leading `lent` records and its
+    /// regions' record bytes, in `pool`.
+    pub(super) fn new(pool: Pool, groups: Vec<(SlabTensor, u64, Vec<u64>)>) -> Self {
+        let (mut stores, mut lent, mut record_bytes) = (Vec::new(), Vec::new(), Vec::new());
+        for (store, leading, bytes) in groups {
+            stores.push(Mutex::new(store));
+            lent.push(leading);
+            record_bytes.push(bytes);
+        }
+        Self { pool, groups: stores, lent, record_bytes }
+    }
+
+    fn group(&self, group: usize) -> MutexGuard<'_, SlabTensor> {
+        self.groups[group].lock().expect("a bank group's store")
+    }
+
+    /// The records group `group` holds: its slabs, lent ones included.
+    pub(super) fn present(&self, group: usize) -> u64 {
+        self.group(group).backed().len() as u64
+    }
+
+    /// What the pool charges the records: a granule each beyond the lent
+    /// ones, which the lender's lent allocation holds.
+    pub(super) fn charged(&self) -> u64 {
+        (0..self.groups.len()).map(|group| self.present(group) - self.lent[group]).sum::<u64>() * self.pool.granule()
+    }
+
+    /// The tensor kernels bind as group `group`'s region `region`: its
+    /// store's view, its record table, which every record held now or
+    /// later is reached through.
+    pub(super) fn region(&self, group: usize, region: usize) -> Result<Tensor, TensorError> {
+        self.group(group).logical_region(region)
+    }
+
+    /// Claim records of group `group` until it holds `records`, each a
+    /// granule of the pool (`SlabTensor::add_slab`: a free one in process,
+    /// else the pool grows by a block its ledger entry admits), unwritten:
+    /// the watcher writes a record before any step reads it. The records
+    /// claimed, the lowest free first; on a refusal, none (those claimed
+    /// before it are freed, never having been read).
+    pub(super) fn claim_to(&self, group: usize, records: u64) -> Result<Vec<usize>, TensorError> {
+        let mut store = self.group(group);
+        let mut claimed = Vec::new();
+        while (store.backed().len() as u64) < records {
+            match store.add_slab(seismic::SlabFill::Unwritten) {
+                Ok(record) => claimed.push(record),
+                Err(refusal) => {
+                    Self::unclaim_in(&mut store, group, &claimed);
+                    return Err(refusal);
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
+    /// Free `claimed` of group `group`, which nothing read: a refusal
+    /// breaks the pool's invariant.
+    fn unclaim(&self, group: usize, claimed: &[usize]) {
+        Self::unclaim_in(&mut self.group(group), group, claimed);
+    }
+
+    fn unclaim_in(store: &mut SlabTensor, group: usize, claimed: &[usize]) {
+        for &record in claimed {
+            if let Err(error) = store.free_slab(record) {
+                panic!("invariant violated: the bank's pool refused to free record {record} of group {group}, claimed and never read: {error}");
+            }
+        }
+    }
+
+    /// Return `records` of group `group` to the pool: each granule free
+    /// once the last flight that read it completes. Never waits.
+    pub(super) fn free(&self, group: usize, records: &[u32]) -> Result<(), TensorError> {
+        let store = self.group(group);
+        records.iter().try_for_each(|&record| store.free_slab(record as usize).map(drop))
+    }
+
+    /// Return `freed` bytes of the pool to the OS, what a shrink freed:
+    /// every empty block, then the emptiest emptied while those fall short
+    /// (`seismic::Pool::return_freed`). The bytes returned.
+    fn return_freed(&self, freed: u64) -> Result<u64, TensorError> {
+        self.pool.return_freed(freed)
+    }
+
+    /// Record `record` of group `group`'s region `region`, while it is
+    /// held.
+    pub(super) fn view(&self, group: usize, region: usize, record: usize) -> Option<Tensor> {
+        self.group(group).slab_region(record, region).expect("a record and region lie in their group's store")
+    }
+
+    /// Each group's routed tensors' records the host addresses, as held
+    /// now, through the last held: holes where none is.
+    pub(super) fn records(&self) -> Result<Vec<Vec<Records>>, String> {
+        (0..self.groups.len())
+            .map(|group| {
+                let store = self.group(group);
+                let held = store.backed().last().map_or(0, |record| record + 1);
+                (0..store.region_count())
+                    .map(|region| {
+                        let views = (0..held)
+                            .map(|record| store.slab_region(record, region).expect("a record and region lie in their group's store"))
+                            .collect();
+                        Records::new(views, self.record_bytes[group][region])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+impl BankRecordViews for Stores {
+    fn view(&self, group: usize, tensor: usize, record: usize) -> Tensor {
+        Stores::view(self, group, tensor, record)
+            .unwrap_or_else(|| panic!("invariant violated: a promotion copies into record {record} of group {group}, which the bank holds no storage for"))
+    }
+}
+
+/// What a store commits: the slots its records serve, its growth running,
+/// a shrink's evicted records waiting for the passes that may read them,
+/// and a shrink done until an advance reports it.
 pub(super) struct Commitment {
-    /// Written by whoever holds the resizers: a shrink on the submitting
-    /// thread, a growth's slots on the resize thread as each joins.
+    /// Written by whoever resizes: a shrink on the submitting thread, a
+    /// growth's slots on the resize thread as each joins.
     pub(super) slots: Arc<AtomicU64>,
     pub(super) resize: Resize,
-    /// The last shrink's moves, submitted and not yet observed: the
-    /// flights queued behind them read what they wrote.
-    pub(super) moves: Option<NativeTensorBatchCompletion>,
-    /// A cut begun beside a running chain the domain has not yet taken
+    pub(super) releasing: Option<Releasing>,
+    pub(super) shrunk: Option<BankResized>,
+    /// A shrink begun beside a running chain the domain has not yet taken
     /// ([`ExpertBank::take_running_begun`]).
     pub(super) running: Option<RunningBegun>,
 }
 
-/// A host tier's host slots committed (`ExpertBankPlan::host_records`),
-/// written as [`Commitment::slots`] is, the most it holds (every expert,
-/// `ExpertBankPlan::host_ceiling`), and its record tensors' resize.
+impl Commitment {
+    pub(super) fn new(slots: Arc<AtomicU64>) -> Self {
+        Self { slots, resize: Resize::Idle, releasing: None, shrunk: None, running: None }
+    }
+
+    /// Whether a resize of the store runs until an advance finishes it: a
+    /// growth, a shrink's release, or a shrink not yet reported.
+    fn resizing(&self) -> bool {
+        matches!(self.resize, Resize::Growing(_)) || self.releasing.is_some() || self.shrunk.is_some()
+    }
+}
+
+/// A linked host tier: its records' stores, its host slots committed as
+/// [`Commitment`] commits the bank's, the most it holds (every expert,
+/// `ExpertBankPlan::host_ceiling`), and the thread its growth runs on: host
+/// RAM is a store of its own, so its growth never queues a resize of the
+/// device's records behind it, nor waits on one.
 pub(super) struct HostTier {
-    pub(super) slots: Arc<AtomicU64>,
+    pub(super) stores: Arc<Stores>,
+    pub(super) commitment: Commitment,
     pub(super) ceiling: u64,
-    pub(super) resize: HostResize,
-    /// The thread the tier's storage work runs on: host RAM is a store of
-    /// its own, so its backing and growth never queue a resize of the
-    /// device's records behind them, nor wait on one.
     pub(super) thread: StorageThread,
+    /// The growth running is its backing to the plan's host slots as the
+    /// bank opens ([`ExpertBank::back_host`]), which no domain resize began.
+    pub(super) backing: bool,
     /// Its host slots' last finished resize
     /// ([`crate::domain::ElasticBank::record_resize`]).
     pub(super) last_resize: Option<crate::domain::BankResize>,
 }
 
-/// The resize of a host tier's record tensors, group by group in routed
-/// tensor order.
-pub(super) enum HostResize {
-    /// No resize runs: each record tensor's resizer.
-    Idle(Vec<Resizer>),
-    /// A growth the domain began ([`ExpertBank::grow_host`]), which its
-    /// advance reports.
+/// A store's resize: none, a growth on its resize thread, or broken (a
+/// resize step panicked or broke an invariant: none runs again, and each
+/// asked fails with why).
+pub(super) enum Resize {
+    Idle,
     Growing(Growing),
-    /// The tier backed from its floor to the plan's host slots as the bank
-    /// opens ([`ExpertBank::back_host`]): its load-time size, which no
-    /// domain resize began, so its end reports none. While it runs no
-    /// resize of the tier begins, and a shrink stops it at its next slot.
-    Backing(Growing),
-    /// A resize step panicked or broke an invariant, taking the resizers
-    /// with it: no resize of the tier runs again, and each asked fails
-    /// with why.
     Broken(String),
 }
 
-/// A growth of a holding's record tensors from `from` slots (the bank's,
-/// or a host tier's host slots), the records charged `charged` before it,
-/// decided at `decided`: on the resize thread, slot by slot toward its
-/// target, each backed by every tensor, installed and joined to the watcher
-/// at once ([`grow_by_slots`]), so its first slots serve while later ones
-/// are still backed, and nothing waits for a gap between flights. `stop`
-/// ends it at its next slot.
-pub(super) struct Growing {
+/// A shrink's evicted records, each group's, whose storage returns once
+/// every pass that may read them is submitted: beside the running chain
+/// whose last step is `last`, every pass of block `after` (at once where
+/// none: its steps had decided no hit of them), and at any boundary between
+/// flights. From `from` slots to `to`, the records charged `charged` before.
+pub(super) struct Releasing {
     from: u64,
+    to: u64,
     charged: u64,
-    decided: Instant,
-    stop: Arc<AtomicBool>,
-    done: Done<Grown>,
+    evicted: Vec<Vec<u32>>,
+    last: u64,
+    after: Option<usize>,
+    begun: Begun,
 }
 
-/// How a growth ended on the resize thread: each resizer back, when its
+/// A growth of a store's records from `from` slots, the records charged
+/// `charged` before it, decided at `decided`: on the resize thread, slot by
+/// slot toward its target, each joined to the watcher at once
+/// ([`grow_by_slots`]), so its first slots serve while later ones are still
+/// claimed, and nothing waits for a gap between flights. `stop` ends it at
+/// its next slot.
+pub(super) struct Growing {
+    pub(super) from: u64,
+    pub(super) charged: u64,
+    pub(super) decided: Instant,
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) done: Done<Grown>,
+}
+
+/// How a growth ended on the resize thread: the slots reached, when its
 /// first and its last slot joined (none where none did), what cut it short
 /// of its target, if anything did, and where its time went.
 pub(super) struct Grown {
-    pub(super) resizers: Vec<Resizer>,
+    pub(super) at: u64,
     pub(super) joined: Option<(Instant, Instant)>,
     pub(super) cut: Cut,
     pub(super) spent: Spent,
 }
 
-/// A growth's time on the resize thread by phase, over the slots it
-/// prepared: every tensor's prepare (its storage backed), and of it what
-/// Seismic's backing spent by phase (`seismic::BackingTimes`, process-wide,
-/// so beside it any other backing then), every install (with the wait for
-/// the bank's charge lock), every release, and the slot's join posted.
+/// A growth's time on the resize thread by phase, over its slots: each
+/// slot's claims (a pool block's allocation among them, with the wait for
+/// the bank's charge lock) and its join posted.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Spent {
     slots: u64,
-    prepare: Duration,
-    backing: seismic::BackingTimes,
-    install: Duration,
-    release: Duration,
+    claim: Duration,
     join: Duration,
 }
 
 impl std::fmt::Display for Spent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mean = |phase: Duration| phase.as_secs_f64() * 1e3 / self.slots.max(1) as f64;
-        let backing = self.backing;
-        write!(
-            formatter,
-            "a slot's mean over {}: prepare {:.1} ms (fault {:.1}, collapse {:.1}, pin {:.1}, zero {:.1}), install {:.3} ms, release {:.3} ms, join {:.3} ms",
-            self.slots,
-            mean(self.prepare),
-            mean(backing.fault),
-            mean(backing.collapse),
-            mean(backing.pin),
-            mean(backing.zero),
-            mean(self.install),
-            mean(self.release),
-            mean(self.join),
-        )
+        write!(formatter, "a slot's mean over {}: claim {:.3} ms, join {:.3} ms", self.slots, mean(self.claim), mean(self.join))
     }
 }
 
@@ -128,132 +265,133 @@ impl std::fmt::Display for Spent {
 pub(super) enum Cut {
     /// Nothing: it reached its target, or was stopped (`Growing::stop`).
     None,
-    /// A tensor's storage refused its next slot, which joined nothing (a
-    /// tensor that installed it backs more than the directory uses, which
-    /// it never reads).
+    /// The pool refused its next slot's storage (its ledger entry admitted
+    /// no block), which joined nothing: what its groups claimed of it was
+    /// freed at once.
     Refused(TensorError),
     /// Its next slot's join could not be formed: a broken invariant.
     Unjoined(String),
 }
 
-/// What a growth's slots join as each is backed (`watcher::Join`): the
+/// What a growth's slots join as each is claimed (`watcher::Join`): the
 /// bank's records, which the device places into, or records the host lands
 /// into, addressed by their views.
 #[derive(Clone, Copy)]
-enum Joining {
+pub(super) enum Joining {
     Bank,
     Landed,
 }
 
-/// A holding's records of group `group` at `slots` slots: the bank's
-/// (`ExpertBankPlan::records_at`) or a host tier's
-/// (`ExpertBankPlan::host_records`).
-type RecordsAt = fn(&ExpertBankPlan, usize, u64) -> u64;
+/// A store's records of group `group` at `slots` slots: the bank's
+/// (`BankCounts::records_at`) or a host tier's (`BankCounts::host_records`).
+pub(super) type RecordsAt = Arc<dyn Fn(usize, u64) -> u64 + Send + Sync>;
 
-/// Grow `resizers` from `from` to `to` slots, one slot at a time unless
-/// `stop` is set: each tensor prepares the slot's `rows`, then installs
-/// them (a growth installs beside submission,
-/// `seismic::PreparedRecommit::install`), and `resident` records the
-/// slot's memory, which exists from its backing (a reservation backs a
-/// granule by touching or wiring every page): backing, installs and record
-/// are one change of `changes`' scope ([`Changes::back`]). Then each
-/// install's release returns once the device work submitted before it
-/// completed, so no work that could not reach the slot's rows (on Metal,
-/// committed before its chunks joined the queue's residency set) can be
-/// handed them; only then `join` forms the slot's join, `post` hands it to
-/// the watcher (`Shared::join`, taken at its next pass), and `slots` holds
-/// it. A refusal ends it at the slots joined before. The installs, where
-/// the tensors' charges rise, hold `rises` ([`ExpertBank::hold_rises`]).
-/// Each slot begins by `begin`, held until it is joined, none where it
-/// gives none (the load's traffic is held, `watcher::Shared::backing_slot`).
+/// Grow `stores` from `from` to `to` slots, one slot at a time unless
+/// `stop` is set: each group claims the records it lacks at the slot
+/// (`records(group, slot)`), holding `rises` while it does (the records'
+/// charge rises, [`ExpertBank::hold_rises`]), its granules one change of
+/// `changes`' scope (the pool's blocks charged to its ledger entry,
+/// [`Changes::back`]); then the slot joins the
+/// watcher (`post`), as `joining` says, and `slots` holds it. A refusal
+/// ends it at the slots joined before. Each slot begins by `begin`, held
+/// until it is joined, none where it gives none (the load's traffic is
+/// held, `watcher::Shared::backing_slot`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn grow_by_slots<S>(
-    mut resizers: Vec<Resizer>,
+    stores: &Stores,
     (from, to): (u64, u64),
-    rows: impl Fn(u64) -> Vec<u64>,
-    (changes, resident): (&Arc<Changes>, impl Fn(u64, &Changing)),
-    join: impl Fn(u64) -> Result<Join, String>,
+    records: &RecordsAt,
+    joining: Joining,
+    changes: &Arc<Changes>,
     post: impl Fn(Join),
     (slots, rises): (&AtomicU64, &Mutex<()>),
     stop: &AtomicBool,
     begin: impl Fn() -> Option<S>,
 ) -> Grown {
+    let groups = stores.groups.len();
+    let mut reached = from;
     let mut joined: Option<(Instant, Instant)> = None;
     let mut spent = Spent::default();
+    // The views of the records the host lands into, which each slot's join
+    // carries as they are then.
+    let mut views = match joining {
+        Joining::Bank => None,
+        Joining::Landed => match stores.records() {
+            Ok(views) => Some(views),
+            Err(reason) => return Grown { at: reached, joined, cut: Cut::Unjoined(reason), spent },
+        },
+    };
     for at in from + 1..=to {
-        // Each slot is backed only as the load's traffic may run
-        // (`watcher::Shared::backing_slot`), until it is joined.
         let Some(_slot) = begin().filter(|_| !stop.load(Ordering::Acquire)) else {
             break;
         };
         spent.slots += 1;
-        let mut refusal = None;
-        let installed = changes.back(|changing| {
-            let (preparing, backed) = (Instant::now(), seismic::backing_times());
-            let prepared = prepare(resizers, rows(at));
-            spent.prepare += preparing.elapsed();
-            spent.backing += seismic::backing_times().since(backed);
-            let prepared = prepared?;
-            let installing = Instant::now();
-            let installed = {
-                let _rises = rises.lock().expect("the bank's charge rises");
-                prepared
-                    .into_iter()
-                    .map(|prepared| match prepared.install() {
-                        Ok(release) => Installed::Release(release),
-                        Err(refused) => {
-                            refusal.get_or_insert(refused.error);
-                            Installed::Kept(refused.resizer)
+        let claiming = Instant::now();
+        let claimed = changes.back(|_| {
+            let _rises = rises.lock().expect("the bank's charge rises");
+            let mut claimed: Vec<Vec<usize>> = Vec::with_capacity(groups);
+            for group in 0..groups {
+                match stores.claim_to(group, records(group, at)) {
+                    Ok(records) => claimed.push(records),
+                    Err(refusal) => {
+                        // The slot joins nothing: what its groups claimed
+                        // before returns at once, never read.
+                        for (group, records) in claimed.iter().enumerate() {
+                            stores.unclaim(group, records);
                         }
-                    })
-                    .collect::<Vec<_>>()
-            };
-            spent.install += installing.elapsed();
-            // The slot's storage is resident (a reservation's granules are
-            // backed by touching or wiring every page,
-            // `seismic_reservation`): its memory exists from here, and its
-            // growth's claim says so.
-            if refusal.is_none() {
-                resident(at, changing);
+                        return Err(refusal);
+                    }
+                }
             }
-            Ok::<_, (Vec<Resizer>, TensorError)>(installed)
+            Ok(claimed)
         });
-        let installed = match installed {
-            Ok(installed) => installed,
-            Err((resizers, refusal)) => return Grown { resizers, joined, cut: Cut::Refused(refusal), spent },
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(refusal) => return Grown { at: reached, joined, cut: Cut::Refused(refusal), spent },
         };
-        // The releases wait together, beside no change.
-        let releasing = Instant::now();
-        resizers = installed.into_iter().map(Installed::release).collect();
-        spent.release += releasing.elapsed();
-        if let Some(refusal) = refusal {
-            return Grown { resizers, joined, cut: Cut::Refused(refusal), spent };
-        }
-        let joining = Instant::now();
-        match join(at) {
-            Ok(join) => post(join),
-            Err(reason) => return Grown { resizers, joined, cut: Cut::Unjoined(reason), spent },
-        }
-        spent.join += joining.elapsed();
+        let joining_at = Instant::now();
+        spent.claim += joining_at - claiming;
+        let join = match &mut views {
+            None => Join::Bank { records: claimed },
+            Some(views) => {
+                let formed = claimed.iter().enumerate().try_for_each(|(group, records)| {
+                    for &record in records {
+                        for (region, view) in views[group].iter_mut().enumerate() {
+                            *view = view.with(record as u64, stores.view(group, region, record))?;
+                        }
+                    }
+                    Ok::<_, String>(())
+                });
+                let records = claimed
+                    .iter()
+                    .map(|records| {
+                        records.iter().map(|&record| u32::try_from(record).map_err(|_| "landed records exceed u32".to_owned())).collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                match formed.and(records) {
+                    Ok(records) => Join::Landed { records, views: views.clone() },
+                    Err(reason) => return Grown { at: reached, joined, cut: Cut::Unjoined(reason), spent },
+                }
+            }
+        };
+        post(join);
+        spent.join += joining_at.elapsed();
         slots.store(at, Ordering::Release);
+        reached = at;
         let now = Instant::now();
         joined = Some((joined.map_or(now, |(first, _)| first), now));
     }
-    Grown { resizers, joined, cut: Cut::None, spent }
+    Grown { at: reached, joined, cut: Cut::None, spent }
 }
 
 impl Growing {
-    /// Its end, once the resize thread finished it: the resizers back,
-    /// what it came to for `holding` at `slots` slots now, its records
-    /// charged `charged` now, and where its time went; or why the holding is broken (its step
-    /// panicked, a slot backed could not join, or its charge is unread).
-    fn ended(
-        &self,
-        holding: BankHolding,
-        slots: u64,
-        charged: impl FnOnce() -> Result<u64, DomainError>,
-    ) -> Option<Result<(Vec<Resizer>, BankResized, Spent), String>> {
+    /// Its end, once the resize thread finished it: what it came to for
+    /// `holding`, its records' charge read by `charged` after the outcome is
+    /// acquired, and where its time went; or why the store is broken (its
+    /// step panicked, or a slot claimed could not join).
+    pub(super) fn ended(&self, holding: BankHolding, charged: impl FnOnce() -> u64) -> Option<Result<(BankResized, Spent), String>> {
         let (outcome, released) = self.done.lock().expect("bank growth outcome").take()?;
-        let Grown { resizers, joined, cut, spent } = match outcome {
+        let Grown { at, joined, cut, spent } = match outcome {
             Ok(grown) => grown,
             Err(panicked) => return Some(Err(panicked)),
         };
@@ -265,326 +403,190 @@ impl Growing {
         // No slot joined: refused at its first, or stopped before it.
         let Some((first, last)) = joined else {
             return Some(Ok(match refused {
-                Some(refusal) => (resizers, BankResized::GrowthRefused { holding, at: slots, refusal }, spent),
-                None => (resizers, BankResized::Stopped { holding, at: slots }, spent),
+                Some(refusal) => (BankResized::GrowthRefused { holding, at, refusal }, spent),
+                None => (BankResized::Stopped { holding, at }, spent),
             }));
         };
-        let grown = match charged().and_then(|after| {
-            after.checked_sub(self.charged).ok_or_else(|| DomainError::invariant("a growth lowered its records' charge"))
-        }) {
-            Ok(grown) => grown,
-            Err(error) => return Some(Err(error.to_string())),
+        let Some(grown) = charged().checked_sub(self.charged) else {
+            return Some(Err("a growth lowered its records' charge".to_owned()));
         };
         let zero = Duration::ZERO;
-        let begun = Begun { decided: self.decided, queued: zero, planned: zero, trips: Default::default(), moves: zero };
+        let begun = Begun { decided: self.decided, queued: zero, planned: zero, trip: Trip::default() };
         let times = begun.times(first, last, released);
-        Some(Ok((resizers, BankResized::Grown { holding, from: self.from, to: slots, grown, refused, times }, spent)))
+        Some(Ok((BankResized::Grown { holding, from: self.from, to: at, grown, refused, times }, spent)))
     }
-}
-
-/// The resize of every record tensor, group by group in routed tensor
-/// order, one at a time.
-pub(super) enum Resize {
-    /// No resize runs: each record tensor's resizer.
-    Idle(Vec<Resizer>),
-    /// A cut of the one store asked of the watcher beside a running chain
-    /// (`watcher::Shared::cut_running`), not yet answered.
-    Cutting(Cutting),
-    /// A shrink from `from` slots to the commitment's, its storage prepared
-    /// off the submitting thread, the records charged `charged` before it,
-    /// which installs where `install` says.
-    Preparing {
-        from: u64,
-        charged: u64,
-        begun: Begun,
-        install: Install,
-        done: Done<Result<Vec<PreparedRecommit>, (Vec<Resizer>, TensorError)>>,
-    },
-    /// A shrink installed (`refusal` where a tensor refused its install,
-    /// keeping its storage, which breaks the records once the others'
-    /// releases end), its surplus released off the submitting thread once the
-    /// device work before its install completes.
-    Releasing {
-        from: u64,
-        charged: u64,
-        refusal: Option<TensorError>,
-        begun: Begun,
-        prepared: Instant,
-        installed: Instant,
-        done: Done<Vec<Resizer>>,
-    },
-    Growing(Growing),
-    /// A resize step panicked or broke an invariant, taking the resizers
-    /// with it: no resize of the records runs again, and each asked fails
-    /// with why.
-    Broken(String),
-}
-
-/// A cut of the one store asked beside the running chain whose last step
-/// is `last` ([`ExpertBank::release_running`]): from `from` slots, the
-/// records charged `charged` then, decided at `decided` with the process
-/// holding `moment`, its asking having held the submitting thread `held`;
-/// the resizers held until it is answered.
-pub(super) struct Cutting {
-    from: u64,
-    charged: u64,
-    last: u64,
-    decided: Instant,
-    held: Duration,
-    moment: MemoryMoment,
-    resizers: Vec<Resizer>,
-}
-
-/// Where a shrink's prepared storage installs: at a boundary between
-/// flights; or, a cut beside the running chain whose last step is `last`,
-/// also at a submission boundary of that chain once every pass of block
-/// `after` is submitted (at once where none: its steps had decided no hit
-/// at the cut), and at any boundary of a later chain. Every run that may
-/// read a record past the cut is then submitted before the install, whose
-/// release waits for it (`PreparedRecommit::install`), and every run
-/// submitted after resolves only records below it.
-#[derive(Clone, Copy)]
-pub(super) enum Install {
-    Between,
-    Running { last: u64, after: Option<usize> },
 }
 
 /// How a resize began on the submitting thread (`ResizeTimes`).
 #[derive(Clone, Copy)]
-pub(super) struct Begun {
+struct Begun {
     decided: Instant,
     queued: Duration,
     planned: Duration,
-    trips: [Trip; 2],
-    moves: Duration,
+    trip: Trip,
 }
 
 impl Begun {
     fn times(self, prepared: Instant, installed: Instant, released: Instant) -> ResizeTimes {
-        let Self { decided, queued, planned, trips, moves } = self;
-        ResizeTimes { decided, queued, planned, trips, moves, prepared, installed, released, unpinned: Duration::ZERO }
+        let Self { decided, queued, planned, trip } = self;
+        ResizeTimes { decided, queued, planned, trips: [trip, Trip::default()], prepared, installed, released }
     }
-}
-
-/// A record tensor's resize, installed or refused at its install.
-enum Installed {
-    Release(RecommitRelease),
-    Kept(Resizer),
-}
-
-impl Installed {
-    /// Wait for the device work its release waits for
-    /// (`seismic::RecommitRelease::retire`).
-    fn retire(&self) {
-        if let Self::Release(release) = self {
-            release.retire();
-        }
-    }
-
-    fn release(self) -> Resizer {
-        match self {
-            Self::Release(release) => release.release(),
-            Self::Kept(resizer) => resizer,
-        }
-    }
-}
-
-/// What `records`' storage is charged in all; none where any is no longer
-/// held.
-fn charged_of(records: &[seismic::TensorStorageObserver]) -> Option<u64> {
-    records.iter().try_fold(0u64, |bytes, record| record.charged_bytes().map(|charged| bytes + charged))
-}
-
-/// Prepare each resizer's tensor at its `rows`, in order: on a refusal
-/// every prepared one is abandoned and each resizer returned, with why.
-fn prepare(resizers: Vec<Resizer>, rows: Vec<u64>) -> Result<Vec<PreparedRecommit>, (Vec<Resizer>, TensorError)> {
-    let mut prepared = Vec::with_capacity(resizers.len());
-    let mut each = resizers.into_iter().zip(rows);
-    while let Some((resizer, rows)) = each.next() {
-        match resizer.prepare(rows) {
-            Ok(next) => prepared.push(next),
-            Err(refusal) => {
-                let back = prepared
-                    .into_iter()
-                    .map(PreparedRecommit::abandon)
-                    .chain([refusal.resizer])
-                    .chain(each.map(|(resizer, _)| resizer))
-                    .collect();
-                return Err((back, refusal.error));
-            }
-        }
-    }
-    Ok(prepared)
 }
 
 impl ExpertBank {
-    /// A host tier's record tensors, group by group; none without a tier.
-    fn host_tensors(&self) -> impl Iterator<Item = (usize, &Tensor)> {
-        self.layout
-            .host
-            .iter()
-            .flatten()
-            .enumerate()
-            .flat_map(|(group, tier)| tier.iter().map(move |(_, tensor)| (group, tensor)))
+    pub(super) fn commitment(&self) -> MutexGuard<'_, Commitment> {
+        self.commitment.lock().expect("bank commitment")
     }
 
-    /// The host tier's record tensors' charge, as Seismic measures it.
-    pub(super) fn host_charged(&self) -> Result<u64, DomainError> {
-        self.host_tensors().try_fold(0u64, |bytes, (_, tensor)| {
-            tensor
-                .observe_storage()
-                .charged_bytes()
-                .map(|charged| bytes + charged)
-                .ok_or_else(|| DomainError::invariant("a held allocation is charged"))
-        })
+    fn host(&self) -> Option<MutexGuard<'_, HostTier>> {
+        self.host.as_ref().map(|host| host.lock().expect("host tier"))
     }
 
-    /// The host tier's record tensors' groups, in tensor order.
-    fn host_groups(&self) -> Vec<usize> {
-        self.host_tensors().map(|(group, _)| group).collect()
+    /// The records' charge: the pool's granules the bank's stores hold.
+    pub(super) fn charged(&self) -> u64 {
+        self.stores.charged()
     }
 
-    /// The host tier's record tensors' rows at `slots` host slots, in
-    /// tensor order.
-    fn host_rows(&self, slots: u64) -> Vec<u64> {
-        self.host_groups().into_iter().map(|group| self.counts.host_records(group, slots)).collect()
+    /// The host tier's records' charge: its pool's granules they hold.
+    pub(super) fn host_charged(&self) -> u64 {
+        self.host().map_or(0, |tier| tier.stores.charged())
     }
 
-    /// The host tier's resizers, taken while no resize of it runs (none
-    /// while one does): the one token a resize of it holds until it returns
-    /// them; why it is broken, if it is.
-    fn idle_host(tier: &mut HostTier) -> Result<Option<Vec<Resizer>>, DomainError> {
-        match std::mem::replace(&mut tier.resize, HostResize::Idle(Vec::new())) {
-            HostResize::Idle(resizers) => Ok(Some(resizers)),
-            HostResize::Broken(reason) => {
-                tier.resize = HostResize::Broken(reason.clone());
-                Err(DomainError::invariant(reason))
-            }
-            running => {
-                tier.resize = running;
-                Ok(None)
-            }
+    /// What `tier`'s records commit by slots.
+    fn tier_counts(&self, tier: BankTier) -> RecordsAt {
+        let counts = self.counts.clone();
+        match tier {
+            BankTier::Bank => Arc::new(move |group, slots| counts.records_at(group, slots)),
+            BankTier::Host => Arc::new(move |group, slots| counts.host_records(group, slots)),
         }
     }
 
-    /// Begin growing the host tier to `to` host slots on the resize thread,
-    /// each host slot joining the tier as soon as every record tensor backs
-    /// it ([`Self::growing`]); while a resize of it runs, none begins.
+    /// What `tier`'s records are charged at their slots.
+    fn tier_charge(&self, tier: BankTier) -> fn(&crate::planning::BankCounts, u64) -> u64 {
+        match tier {
+            BankTier::Bank => crate::planning::BankCounts::resident_charge,
+            BankTier::Host => crate::planning::BankCounts::host_charge,
+        }
+    }
+
+    /// What `tier`'s records are charged above their floor at `slots`: what
+    /// the bank's cache holds of them at most (`BankCache::fit`). The
+    /// bank's floor is its least slots, a host tier's none.
+    fn above_floor(&self, tier: BankTier, slots: u64) -> u64 {
+        let charge = self.tier_charge(tier);
+        charge(&self.counts, slots).saturating_sub(charge(&self.counts, self.floor(tier)))
+    }
+
+    /// The least slots `tier`'s records shrink to: the bank's floor, a host
+    /// tier's none.
+    pub(super) fn floor(&self, tier: BankTier) -> u64 {
+        match tier {
+            BankTier::Bank => self.counts.floor(),
+            BankTier::Host => 0,
+        }
+    }
+
+    /// The candidate shrinks of `tier`'s records from `shallowest` slots
+    /// down to `deepest` ([`Candidates`]): each group's records at a
+    /// candidate's slots.
+    fn candidates(&self, tier: BankTier, (shallowest, deepest): (u64, u64)) -> Result<Candidates, DomainError> {
+        assert!(deepest <= shallowest, "a shrink's deepest cut {deepest} lies below its shallowest {shallowest}");
+        let slots = |slots: u64| usize::try_from(slots).map_err(|_| DomainError::invariant("bank slots exceed the host"));
+        let (records, groups) = (self.tier_counts(tier), self.plan.groups().len());
+        Ok(Candidates {
+            shallowest: slots(shallowest)?,
+            deepest: slots(deepest)?,
+            records: Box::new(move |slots| (0..groups).map(|group| records(group, slots as u64) as usize).collect()),
+        })
+    }
+
+    /// Which records the watcher evicts of `tier`'s: the bank's where the
+    /// device places, else those the host lands into.
+    fn evicting(&self, tier: BankTier) -> Evicting {
+        match (tier, self.plan.placer()) {
+            (BankTier::Bank, Placer::Tier) => Evicting::Bank,
+            (BankTier::Bank, Placer::Bank) | (BankTier::Host, _) => Evicting::Landed,
+        }
+    }
+
+    /// Begin growing the host tier to `to` host slots on its thread, each
+    /// host slot joining the tier as soon as every group holds it; while a
+    /// resize of it runs, none begins.
     pub(super) fn grow_host(&self, to: u64, wake: CompletionWake) -> Result<BankStep, DomainError> {
-        Ok(match self.host_growth(to, wake, HostResize::Growing)? {
+        Ok(match self.host_growth(to, wake, false)? {
             true => BankStep::Begun(BankTier::Host),
             false => BankStep::Running,
         })
     }
 
     /// Back the host tier from the floor it opens at to the plan's host
-    /// slots, its load-time size (`ExpertBankPlan::host_slots`), on the
-    /// resize thread: each host slot joins the tier as soon as every record
-    /// tensor backs it, so the load waits for none of it (backing tens of
-    /// gigabytes of pinned host storage before the bank opened held a 6.89
-    /// GB load of the 3090 18-26 s, its import 25-33 s against 5-10 s at
-    /// the floor, 2026-11-01). It is the open's, no
-    /// resize: its end reports none ([`HostResize::Backing`]).
+    /// slots, its load-time size (`ExpertBankPlan::host_slots`), on its
+    /// thread: each host slot joins the tier as soon as every group holds
+    /// it, so the load waits for none of it (backing tens of gigabytes of
+    /// pinned host storage before the bank opened held a 6.89 GB load of
+    /// the 3090 18-26 s, its import 25-33 s against 5-10 s at the floor,
+    /// 2026-11-01). It is the open's, no resize: its end reports none.
     pub(super) fn back_host(&self) -> Result<(), DomainError> {
-        self.host_growth(self.plan.host_slots, CompletionWake::new(|| {}), HostResize::Backing).map(|_| ())
+        self.host_growth(self.plan.host_slots, CompletionWake::new(|| {}), true).map(|_| ())
     }
 
-    /// Begin growing the host tier to `to` host slots, as `resize` names
-    /// the growth; false while a resize of it runs, which begins none.
-    fn host_growth(&self, to: u64, wake: CompletionWake, resize: fn(Growing) -> HostResize) -> Result<bool, DomainError> {
-        let host = self.host.as_ref().ok_or_else(|| DomainError::invariant("a host tier growth without one"))?;
-        let mut tier = host.lock().expect("host tier");
-        let charged = self.host_charged()?;
-        let Some(resizers) = Self::idle_host(&mut tier)? else {
-            return Ok(false);
-        };
-        let records: RecordsAt = ExpertBankPlan::host_records;
-        let tensors = (self.host_groups(), records);
-        match self.growing(resizers, (&tier.slots, to), tensors, Joining::Landed, (charged, crate::planning::BankCounts::host_charge), &tier.thread, wake) {
-            Ok(growing) => tier.resize = resize(growing),
-            Err((resizers, error)) => {
-                tier.resize = HostResize::Idle(resizers);
-                return Err(error);
-            }
+    /// Begin growing the host tier to `to` host slots, the open's backing
+    /// where `backing`; false while a resize of it runs, which begins none.
+    fn host_growth(&self, to: u64, wake: CompletionWake, backing: bool) -> Result<bool, DomainError> {
+        let mut tier = self.host().ok_or_else(|| DomainError::invariant("a host tier growth without one"))?;
+        let tier = &mut *tier;
+        if let Resize::Broken(reason) = &tier.commitment.resize {
+            return Err(DomainError::invariant(reason.clone()));
         }
+        if tier.commitment.resizing() {
+            return Ok(false);
+        }
+        let growing = self.growing(&tier.stores, (&tier.commitment.slots, to), BankTier::Host, Joining::Landed, &tier.thread, wake);
+        tier.commitment.resize = Resize::Growing(growing);
+        tier.backing = backing;
         Ok(true)
     }
 
-    /// Begin growing a holding's record tensors (`resizers`, each of group
-    /// `groups[i]`, at `records`) from its `slots` now to `to` on its store's
-    /// resize `thread` ([`grow_by_slots`]), its records charged `charged` now, each
-    /// slot recorded allocated in the bank's cache at its `charge` as soon
-    /// as every tensor backs it (`BankCache::backed`), then joining the
-    /// watcher as `joining` says; `wake` completed once it ends. Refused,
-    /// the resizers come back.
+    /// Begin growing `stores`, `tier`'s, from their `slots` now to `to` on
+    /// the store's resize `thread` ([`grow_by_slots`]), each slot joining
+    /// the watcher as `joining` says as soon as every group holds it, its
+    /// granules held by the growth's claim (`BankCache::grow`); `wake`
+    /// completed once it ends.
     fn growing(
         &self,
-        resizers: Vec<Resizer>,
+        stores: &Arc<Stores>,
         (slots, to): (&Arc<AtomicU64>, u64),
-        (groups, records): (Vec<usize>, RecordsAt),
+        tier: BankTier,
         joining: Joining,
-        (charged, charge): (u64, fn(&crate::planning::BankCounts, u64) -> u64),
         thread: &StorageThread,
         wake: CompletionWake,
-    ) -> Result<Growing, (Vec<Resizer>, DomainError)> {
-        let landed = match (joining, &self.landed) {
-            (Joining::Bank, _) => None,
-            (Joining::Landed, Some(landed)) => Some(landed.clone()),
-            (Joining::Landed, None) => {
-                return Err((resizers, DomainError::invariant("a landed growth of a bank the host lands into none of")));
-            }
-        };
-        let (decided, from) = (Instant::now(), slots.load(Ordering::Acquire));
-        let plan = Arc::new(self.plan.clone());
+    ) -> Growing {
+        let (decided, from, charged) = (Instant::now(), slots.load(Ordering::Acquire), stores.charged());
         let (shared, slots, stop) = (self.watcher.shared().clone(), slots.clone(), Arc::new(AtomicBool::new(false)));
-        let (stopping, rises, changes) = (stop.clone(), self.rises.clone(), self.cache.changes().clone());
-        let backed = {
-            let (cache, counts) = (self.cache.clone(), self.counts.clone());
-            move |at: u64, changing: &Changing| cache.backed(charge(&counts, at), changing)
-        };
-        let join = {
-            let plan = plan.clone();
-            move |at: u64| -> Result<Join, String> {
-                let counts = (0..plan.groups().len()).map(|group| records(&plan, group, at));
-                match &landed {
-                    None => Ok(Join::Bank {
-                        records: counts
-                            .map(|count| usize::try_from(count).map_err(|_| "bank records exceed the host"))
-                            .collect::<Result<_, _>>()?,
-                    }),
-                    Some(tensors) => Ok(Join::Landed {
-                        records: counts
-                            .map(|count| u32::try_from(count).map_err(|_| "landed records exceed u32"))
-                            .collect::<Result<_, _>>()?,
-                        views: host_views(&plan, tensors, |group| records(&plan, group, at))?,
-                    }),
-                }
-            }
-        };
+        let (stopping, rises, stores, records) = (stop.clone(), self.rises.clone(), stores.clone(), self.tier_counts(tier));
+        let changes = self.cache.changes().clone();
         let done = thread.run(wake, move || {
-            let rows = |at| groups.iter().map(|&group| records(&plan, group, at)).collect();
             let slot = || shared.backing_slot(&stopping);
-            grow_by_slots(resizers, (from, to), rows, (&changes, backed), join, |join| shared.join(join), (&slots, &rises), &stopping, slot)
+            grow_by_slots(&stores, (from, to), &records, joining, &changes, |join| shared.join(join), (&slots, &rises), &stopping, slot)
         });
-        Ok(Growing { from, charged, decided, stop, done })
+        Growing { from, charged, decided, stop, done }
     }
 
     /// End a running growth of the holdings in `tier` storage at its next
     /// slot ([`Growing::stop`]): a shrink of that store waits for it no
-    /// longer than that slot's backing. The host tier's backing is its
+    /// longer than that slot's claims. The host tier's backing is its
     /// growth.
     pub(super) fn stop_growth(&self, tier: BankTier) {
-        match tier {
-            BankTier::Bank => {
-                if let Resize::Growing(growing) = &self.commitment().resize {
-                    growing.stop.store(true, Ordering::Release);
-                }
+        let stop = |resize: &Resize| {
+            if let Resize::Growing(growing) = resize {
+                growing.stop.store(true, Ordering::Release);
             }
+        };
+        match tier {
+            BankTier::Bank => stop(&self.commitment().resize),
             BankTier::Host => {
-                if let Some(host) = self.host.as_ref() {
-                    if let HostResize::Growing(growing) | HostResize::Backing(growing) = &host.lock().expect("host tier").resize {
-                        growing.stop.store(true, Ordering::Release);
-                    }
+                if let Some(tier) = self.host() {
+                    stop(&tier.commitment.resize);
                 }
             }
         }
@@ -592,628 +594,291 @@ impl ExpertBank {
         self.watcher.shared().events().notify();
     }
 
-    /// Finish a host tier's growth, or its backing at open, once its resize
-    /// thread ended it: its outcome (grown to the host slots its slots
-    /// reached, or refused before any joined), and whether a domain resize
-    /// began it (the backing's none did, so its end is reported to none).
+    /// Finish a host tier's resize: its growth once its thread ended it, or
+    /// its shrink. Its outcome, and whether a domain resize began it (the
+    /// open's backing to its planned slots did not, so its end is reported
+    /// to none).
     pub(super) fn advance_host(&self) -> Result<Option<(BankResized, bool)>, DomainError> {
-        let Some(host) = self.host.as_ref() else {
+        let Some(mut tier) = self.host() else {
             return Ok(None);
         };
-        let mut tier = host.lock().expect("host tier");
-        let (HostResize::Growing(growing) | HostResize::Backing(growing)) = &tier.resize else {
+        let tier = &mut *tier;
+        if let Some(shrunk) = tier.commitment.shrunk.take() {
+            return Ok(Some((shrunk, true)));
+        }
+        let Resize::Growing(growing) = &tier.commitment.resize else {
             return Ok(None);
         };
-        let slots = tier.slots.load(Ordering::Acquire);
-        let Some(ended) = growing.ended(BankHolding::Host, slots, || self.host_charged()) else {
+        let Some(ended) = growing.ended(BankHolding::Host, || tier.stores.charged()) else {
             return Ok(None);
         };
-        let reported = matches!(tier.resize, HostResize::Growing(_));
         match ended {
-            Ok((resizers, resized, spent)) => {
-                let kind = if reported { "growth" } else { "backing" };
+            Ok((resized, spent)) => {
+                let slots = tier.commitment.slots.load(Ordering::Acquire);
+                let kind = if tier.backing { "backing" } else { "growth" };
                 let (planned, ceiling) = (self.plan.host_slots, tier.ceiling);
                 tracing::info!("the host tier's {kind} ended at {slots} of {planned} planned host slots ({ceiling} every expert), {spent}: {resized:?}");
-                tier.resize = HostResize::Idle(resizers);
-                Ok(Some((resized, reported)))
-
+                tier.commitment.resize = Resize::Idle;
+                Ok(Some((resized, !std::mem::take(&mut tier.backing))))
             }
             Err(reason) => {
-                tier.resize = HostResize::Broken(reason.clone());
+                tier.commitment.resize = Resize::Broken(reason.clone());
                 Err(DomainError::invariant(reason))
             }
         }
     }
 
-    /// Whether a host tier's growth runs, until its advance finishes it.
+    /// Whether a host tier's growth runs, or its shrink is not yet
+    /// reported, until its advance finishes it.
     pub(super) fn host_growing(&self) -> bool {
-        self.host.as_ref().is_some_and(|host| matches!(host.lock().expect("host tier").resize, HostResize::Growing(_)))
+        self.host().is_some_and(|tier| !tier.backing && tier.commitment.resizing())
     }
 
     /// Whether the host tier's backing to its planned slots runs
     /// ([`Self::back_host`]), until its advance finishes it.
     pub(super) fn host_backing(&self) -> bool {
-        self.host.as_ref().is_some_and(|host| matches!(host.lock().expect("host tier").resize, HostResize::Backing(_)))
+        self.host().is_some_and(|tier| tier.backing && matches!(tier.commitment.resize, Resize::Growing(_)))
     }
 
-    /// The candidate cuts of a shrink of the records the host lands into,
-    /// from `shallowest` slots down to `deepest` ([`Candidates`]): each
-    /// group's records at a candidate's slots ([`landed_records`]), which fit
-    /// u32 as the shallowest's do.
-    fn landed_cuts(&self, (shallowest, deepest): (u64, u64)) -> Result<Candidates, DomainError> {
-        assert!(deepest <= shallowest, "a shrink's deepest cut {deepest} lies below its shallowest {shallowest}");
-        let slots = |slots: u64| usize::try_from(slots).map_err(|_| DomainError::invariant("bank slots exceed the host"));
-        for group in 0..self.plan.groups().len() {
-            u32::try_from(self.counts.landed_records(group, shallowest))
-                .map_err(|_| DomainError::invariant("the records the host lands into exceed u32"))?;
-        }
-        let (counts, groups) = (self.counts.clone(), self.plan.groups().len());
-        Ok(Candidates {
-            shallowest: slots(shallowest)?,
-            deepest: slots(deepest)?,
-            records: Box::new(move |slots| (0..groups).map(|group| counts.landed_records(group, slots as u64) as usize).collect()),
-        })
-    }
-
-    /// Shrink the host tier now, between flights, to the deepest of
-    /// `shallowest..=deepest` host slots that keeps every record in flight
-    /// (`Shared::shrink_tier`): the watcher keeps each group's most valuable
-    /// records below the cut (their bytes copied there), then each tensor
-    /// releases the rest. Its size before and after, and Seismic's charge of
-    /// it before and after (a tensor's storage refusing breaks it,
-    /// [`shrink_refused`]); not while a growth of it runs, nor where every
-    /// cut falls below a record in flight.
-    pub(super) fn shrink_host(&self, cuts: (u64, u64)) -> Result<Shrinking<LandedShrink>, DomainError> {
-        let host = self.host.as_ref().ok_or_else(|| DomainError::invariant("a host tier resize without one"))?;
-        let mut tier = host.lock().expect("host tier");
-        // Everything that can fail before the resizers are taken; an ask
-        // the watcher fails returns them, the storage as it was.
-        let (before, candidates) = (self.host_charged()?, self.landed_cuts(cuts)?);
-        let Some(resizers) = Self::idle_host(&mut tier)? else {
-            return Ok(Shrinking::Running);
+    /// [`ElasticBank::shrink`] of `tier`'s records now, beside running steps
+    /// or not, to the deepest of `cuts` (its shallowest and deepest slots)
+    /// whose every group holds enough records nothing writes or reads in
+    /// place, decided at `decided` and queued `queued`: the watcher evicts
+    /// them, moving nothing ([`watcher::Shared::shrink`]), and their slabs
+    /// return to the pool at once (every step begun is submitted on this
+    /// thread before the domain resizes, so the last flight that read them
+    /// is known), each granule free once that flight completes, and the
+    /// pool returns its empty blocks. What it came to, which the next
+    /// advance reports; none where the watcher evicted nothing (a whole bank
+    /// beside running steps, or every cut keeping fewer records than those
+    /// in flight), which the next boundary decides again. Not while a
+    /// resize of the store runs.
+    pub(super) fn shrink(&self, tier: BankTier, cuts: (u64, u64), decided: Instant, queued: Duration) -> Result<BankStep, DomainError> {
+        let candidates = self.candidates(tier, cuts)?;
+        let evicting = self.evicting(tier);
+        let shrink = |commitment: &mut Commitment, stores: &Stores, holding: BankHolding| -> Result<BankStep, DomainError> {
+            if let Resize::Broken(reason) = &commitment.resize {
+                return Err(DomainError::invariant(reason.clone()));
+            }
+            if commitment.resizing() {
+                return Ok(BankStep::Running);
+            }
+            let (from, charged) = (commitment.slots.load(Ordering::Acquire), stores.charged());
+            let Some(Evicted { slots, records, trip, .. }) = self.watcher.shared().shrink(evicting, candidates, None).map_err(DomainError::invariant)? else {
+                tracing::info!(?holding, from, "a shrink waits a boundary: the watcher evicts nothing now");
+                return Ok(BankStep::Deferred);
+            };
+            let to = slots as u64;
+            commitment.slots.store(to, Ordering::Release);
+            let begun = Begun { decided, queued, planned: decided.elapsed().saturating_sub(queued), trip };
+            commitment.shrunk = Some(self.release(stores, tier, (from, to), charged, &records, begun)?);
+            Ok(BankStep::Begun(tier))
         };
-        let from = tier.slots.load(Ordering::Acquire);
-        let cut = match self.watcher.shared().shrink_tier(candidates) {
-            Ok(Some(cut)) => cut,
-            Ok(None) => {
-                tier.resize = HostResize::Idle(resizers);
-                return Ok(Shrinking::Deferred);
-            }
-            Err(reason) => {
-                tier.resize = HostResize::Idle(resizers);
-                return Err(DomainError::invariant(reason));
-            }
-        };
-        let to = cut.slots as u64;
-        tier.slots.store(to, Ordering::Release);
-        let unpinning = seismic::backing_times();
-        let recommitted = recommit(resizers, self.host_rows(to));
-        let unpinned = seismic::backing_times().since(unpinning).unpin;
-        match recommitted {
-            Ok(resizers) => tier.resize = HostResize::Idle(resizers),
-            Err(refusal) => {
-                let reason = shrink_refused(refusal);
-                tier.resize = HostResize::Broken(reason.clone());
-                return Err(DomainError::invariant(reason));
-            }
-        }
-        Ok(Shrinking::Begun(LandedShrink { unpinned, from, to, before, after: self.host_charged()? }))
-    }
-
-    /// Shrink the one store (where the host places), decided at `decided`
-    /// and queued `queued` behind the flights before it: now, between
-    /// flights, the watcher cuts it at the deepest of `shallowest..=deepest`
-    /// slots that keeps every record in flight, keeps each group's most
-    /// valuable records below the cut and addresses those alone, so no step
-    /// reads the rest, and the device moves the kept records' bytes there by
-    /// `kernels` ([`Self::carry_moves`]) ahead of every later step, in queue
-    /// order, so this thread only queues them (`Shared::shrink_store`); each
-    /// record tensor's storage then releases the rest off this thread once
-    /// the device work before its install completes, the moves among it,
-    /// and a later boundary finishes the shrink ([`Self::advance`]). Not
-    /// while its records resize, nor where every cut falls below a record
-    /// in flight.
-    pub(super) fn shrink_store(&self, kernels: &[BankMoves], cuts: (u64, u64), decided: Instant, queued: Duration, wake: CompletionWake) -> Result<Shrinking<()>, DomainError> {
-        let mut commitment = self.commitment();
-        // Everything that can fail before the resizers are taken; an ask
-        // the watcher fails returns them, the storage as it was.
-        let (before, candidates) = (self.charged()?, self.landed_cuts(cuts)?);
-        let Some(resizers) = Self::idle(&mut commitment)? else {
-            return Ok(Shrinking::Running);
-        };
-        let from = commitment.slots.load(Ordering::Acquire);
-        let answered = Self::observe_moves(&mut commitment)
-            .and_then(|()| self.watcher.shared().shrink_store(candidates).map_err(DomainError::invariant));
-        let (cut, kept) = match answered {
-            Ok(Some(answered)) => answered,
-            Ok(None) => {
-                commitment.resize = Resize::Idle(resizers);
-                return Ok(Shrinking::Deferred);
-            }
-            Err(error) => {
-                commitment.resize = Resize::Idle(resizers);
-                return Err(error);
-            }
-        };
-        let to = cut.slots as u64;
-        let planned = decided.elapsed() - queued;
-        let moving = Instant::now();
-        let moves = kept.into_iter().map(|moves| moves.into_iter().map(|(from, to)| (from as usize, to as usize)).collect());
-        // The watcher has mapped the kept experts to their new records: a
-        // refused submission leaves them reading records no move wrote, a
-        // bank no step may read.
-        commitment.moves = match self.carry_moves(moves, kernels) {
-            Ok(moves) => moves,
-            Err(error) => {
-                commitment.resize = Resize::Broken(format!("a shrink's moves were refused after the watcher committed it: {error}"));
-                return Err(error);
-            }
-        };
-        let moves = moving.elapsed();
-        commitment.slots.store(to, Ordering::Release);
-        let begun = Begun { decided, queued, planned, trips: [cut.trip, Trip::default()], moves };
-        commitment.resize = self.prepare_off_thread(resizers, (from, to), before, begun, Install::Between, wake);
-        Ok(Shrinking::Begun(()))
-    }
-
-    /// Each group's records at `slots` slots.
-    fn committed_records(&self, slots: u64) -> Result<Vec<usize>, DomainError> {
-        (0..self.plan.groups().len())
-            .map(|group| {
-                usize::try_from(self.counts.records_at(group, slots))
-                    .map_err(|_| DomainError::invariant("bank records exceed the host"))
-            })
-            .collect()
-    }
-
-    /// The rows each record tensor commits at `slots` slots, in resizer
-    /// order.
-    fn rows_at(&self, slots: u64) -> Vec<u64> {
-        self.record_groups().into_iter().map(|group| self.counts.records_at(group, slots)).collect()
-    }
-
-    /// Each record tensor's group, in resizer order.
-    fn record_groups(&self) -> Vec<usize> {
-        (0..self.plan.groups().len())
-            .flat_map(|group| std::iter::repeat_n(group, self.plan.groups()[group].record.form().tensors().len()))
-            .collect()
-    }
-
-    /// Every record tensor's charge, as Seismic measures it: the one reading
-    /// a resize is credited by.
-    fn charged(&self) -> Result<u64, DomainError> {
-        charged_of(&self.record_storage()).ok_or_else(|| DomainError::invariant("a held allocation is charged"))
-    }
-
-    /// Every record tensor's storage, observed where a resize thread reads
-    /// its charge ([`charged_of`]).
-    fn record_storage(&self) -> Vec<seismic::TensorStorageObserver> {
-        self.layout.groups.iter().flat_map(|group| group.records.iter().map(|(_, tensor)| tensor.observe_storage())).collect()
-    }
-
-    /// The resizers, taken while no resize runs (none while one does); why
-    /// the records are broken, if they are.
-    fn idle(commitment: &mut Commitment) -> Result<Option<Vec<Resizer>>, DomainError> {
-        match std::mem::replace(&mut commitment.resize, Resize::Idle(Vec::new())) {
-            Resize::Idle(resizers) => Ok(Some(resizers)),
-            Resize::Broken(reason) => {
-                commitment.resize = Resize::Broken(reason.clone());
-                Err(DomainError::invariant(reason))
-            }
-            running => {
-                commitment.resize = running;
-                Ok(None)
+        match tier {
+            BankTier::Bank => shrink(&mut self.commitment(), &self.stores, BankHolding::Experts),
+            BankTier::Host => {
+                let mut host = self.host().ok_or_else(|| DomainError::invariant("a host tier shrink without one"))?;
+                let host = &mut *host;
+                shrink(&mut host.commitment, &host.stores, BankHolding::Host)
             }
         }
     }
 
-    /// Begin a shrink from `from` to `to` slots, the records charged
-    /// `charged` now: each record tensor's storage at `to` prepared off this
-    /// thread, installed where `install` says.
-    fn prepare_off_thread(&self, resizers: Vec<Resizer>, (from, to): (u64, u64), charged: u64, begun: Begun, install: Install, wake: CompletionWake) -> Resize {
-        let rows = self.rows_at(to);
-        let done = self.resize_thread.run(wake, move || prepare(resizers, rows));
-        Resize::Preparing { from, charged, begun, install, done }
-    }
-
-    /// Submit a shrink's `moves`, each group's (from, to), to the device in a
-    /// submission of their own: each group's records, by its move list. The
-    /// device runs every later flight after them, in queue order, so no wait
-    /// is needed before what they move is mapped. A submission refused
-    /// leaves a shrink the watcher has not committed uncommitted; one it has
-    /// committed, broken.
-    fn carry_moves(
-        &self,
-        moves: impl Iterator<Item = Vec<(usize, usize)>>,
-        kernels: &[BankMoves],
-    ) -> Result<Option<NativeTensorBatchCompletion>, DomainError> {
-        let failed = |error: &dyn std::fmt::Display| DomainError::invariant(format!("expert bank moves: {error}"));
-        let mut batch = None;
-        let groups = self.layout.groups.iter().zip(moves).zip(&self.move_lists).zip(kernels);
-        for (((group, moves), list), kernels) in groups {
-            if moves.is_empty() {
-                continue;
-            }
-            let pairs = moves
-                .iter()
-                .map(|&(from, to)| Ok((i32::try_from(from)?, i32::try_from(to)?)))
-                .collect::<Result<Vec<_>, std::num::TryFromIntError>>()
-                .map_err(|error| failed(&error))?;
-            // The records every one of the group's record tensors holds.
-            let records = group.records.iter().map(|(_, tensor)| tensor.extents()[0]).min().expect("a group has record tensors");
-            list.write_list(&pairs, crate::experts::ListBounds { from: records, to: records, lent: 0 });
-            let batch = batch.get_or_insert_with(|| NativeTensorBatch::new(&group.moves.device()));
-            for ((_, tensor), (_, kernel)) in group.records.iter().zip(kernels.records.iter()) {
-                let mut tensor = tensor.clone();
-                batch
-                    .push(kernel, routed_move::Args { records: &mut tensor, list: &group.moves }, routed_move::OutputArgs {})
-                    .map_err(|error| failed(&error))?;
-            }
-        }
-        batch.map(|batch| batch.submit().map_err(|error| failed(&error))).transpose()
-    }
-
-    /// [`ElasticBank::carried`].
-    pub(super) fn carried(&self) -> Result<(), DomainError> {
-        Self::observe_moves(&mut self.commitment())
-    }
-
-    /// Observe the last shrink's moves: their device failure, if they failed.
-    fn observe_moves(commitment: &mut Commitment) -> Result<(), DomainError> {
-        let failed = |error: seismic::CallError| {
-            DomainError::Device(crate::DeviceError::Execution(format!("expert bank moves: {error}")))
+    /// Return a shrink's `evicted` records of `stores` to their pool, the
+    /// records charged `charged` before it, then what they freed to the OS:
+    /// the pool's empty blocks, and where those return less, its emptiest
+    /// blocks emptied for it, their copies enqueued and never waited for
+    /// (`seismic::Pool::return_freed`), the bank's
+    /// cache of `tier`'s holding cut to what stays above its floor
+    /// ([`Self::above_floor`], `BankCache::fit`): one change. The shrink,
+    /// done.
+    fn release(&self, stores: &Stores, tier: BankTier, (from, to): (u64, u64), charged: u64, evicted: &[Vec<u32>], begun: Begun) -> Result<BankResized, DomainError> {
+        let holding = match tier {
+            BankTier::Bank => BankHolding::Experts,
+            BankTier::Host => BankHolding::Host,
         };
-        commitment.moves.take().map_or(Ok(()), |moves| moves.wait().map_err(failed))
-    }
-
-    /// [`ElasticBank::shrink`] to `deepest` slots, the settled size past
-    /// the nearest that releases storage (`ServedBank::releasing`), in one
-    /// resize, in a gap between flights, decided at
-    /// `decided`, its moves carried by `kernels`. The plan's
-    /// evictions are published first; nothing is mapped to a record a move
-    /// writes until the moves are queued ahead of every later step and the
-    /// plan is committed. A plan dropped on an error before then leaves
-    /// every kept expert where its bytes are; once queued, the moves' device
-    /// failure fails every flight after them ([`ElasticBank::carried`]), so
-    /// nothing read from a record they failed to write is taken.
-    pub(super) fn shrink(
-        &self,
-        kernels: &[BankMoves],
-        deepest: u64,
-        decided: Instant,
-        wake: CompletionWake,
-    ) -> Result<BankStep, DomainError> {
-        let mut commitment = self.commitment();
-        let charged = self.charged()?;
-        let Some(resizers) = Self::idle(&mut commitment)? else {
-            return Ok(BankStep::Running);
-        };
-        let from = commitment.slots.load(Ordering::Acquire);
-        if from <= self.counts.floor() {
-            commitment.resize = Resize::Idle(resizers);
-            return Ok(BankStep::AtLimit);
-        }
-        let shared = self.watcher.shared();
-        let planned = (|| {
-            Self::observe_moves(&mut commitment)?;
-            let queued = decided.elapsed();
-            let slots = usize::try_from(deepest).map_err(|_| DomainError::invariant("bank slots exceed the host"))?;
-            let plan = shared.plan_shrink(slots, self.committed_records(deepest)?).map_err(DomainError::invariant)?;
-            let to = plan.slots() as u64;
-            let moving = Instant::now();
-            commitment.moves = self.carry_moves(plan.moves(), kernels)?;
-            let moves = moving.elapsed();
-            let trips = [plan.trip(), shared.commit_shrink(plan).map_err(DomainError::invariant)?];
-            let planned = decided.elapsed() - queued - moves;
-            Ok((to, Begun { decided, queued, planned, trips, moves }))
-        })();
-        let (to, begun) = match planned {
-            Ok(planned) => planned,
-            Err(error) => {
-                commitment.resize = Resize::Idle(resizers);
-                return Err(error);
+        let releasing = Instant::now();
+        let released = self.cache.changes().clone().change(|_| {
+            for (group, records) in evicted.iter().enumerate() {
+                stores.free(group, records).map_err(|refusal| DomainError::invariant(format!("the expert bank's pool refused a shrink's release: {refusal}")))?;
             }
-        };
-        commitment.slots.store(to, Ordering::Release);
-        commitment.resize = self.prepare_off_thread(resizers, (from, to), charged, begun, Install::Between, wake);
-        Ok(BankStep::Begun(BankTier::Bank))
+            let released = charged.checked_sub(stores.charged()).ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+            self.cache.fit(holding, self.above_floor(tier, to));
+            let returned = stores
+                .return_freed(released)
+                .map_err(|error| DomainError::invariant(format!("the expert bank's pool could not return a shrink's blocks: {error}")))?;
+            tracing::debug!(?holding, released, returned, "a shrink's granules return to the pool, its empty blocks to the OS");
+            Ok::<_, DomainError>((released, returned))
+        })?;
+        let (released, returned) = released;
+        let times = begun.times(releasing, releasing, Instant::now());
+        Ok(BankResized::Shrunk { holding, from, to, released, returned, times })
     }
 
     /// [`ElasticBank::grow`] to `to` slots, its growth target, on the resize
-    /// thread, each slot joining the bank as soon as every record tensor
-    /// backs it ([`Self::growing`]): the device's records where it places,
-    /// the one store's landed records where the host does.
+    /// thread, each slot joining the bank as soon as every group holds it
+    /// ([`Self::growing`]): the device's records where it places, the one
+    /// store's landed records where the host does.
     pub(super) fn grow(&self, to: u64, wake: CompletionWake) -> Result<BankStep, DomainError> {
         let mut commitment = self.commitment();
-        let charged = self.charged()?;
-        let Some(resizers) = Self::idle(&mut commitment)? else {
+        if let Resize::Broken(reason) = &commitment.resize {
+            return Err(DomainError::invariant(reason.clone()));
+        }
+        if commitment.resizing() {
             return Ok(BankStep::Running);
-        };
+        }
         let joining = match self.plan.placer() {
             Placer::Tier => Joining::Bank,
             Placer::Bank => Joining::Landed,
         };
-        let records: RecordsAt = ExpertBankPlan::records_at;
-        let tensors = (self.record_groups(), records);
-        match self.growing(resizers, (&commitment.slots, to), tensors, joining, (charged, crate::planning::BankCounts::resident_charge), &self.resize_thread, wake) {
-            Ok(growing) => commitment.resize = Resize::Growing(growing),
-            Err((resizers, error)) => {
-                commitment.resize = Resize::Idle(resizers);
-                return Err(error);
-            }
-        }
+        let growing = self.growing(&self.stores, (&commitment.slots, to), BankTier::Bank, joining, &self.resize_thread, wake);
+        commitment.resize = Resize::Growing(growing);
         Ok(BankStep::Begun(BankTier::Bank))
     }
 
-    /// [`ElasticBank::advance`]: a shrink's prepared storage installs at
-    /// this boundary and its release is taken back at a later one; a growth
-    /// finishes once its resize thread ended it.
-    pub(super) fn advance(&self, wake: CompletionWake) -> Result<Option<BankResized>, DomainError> {
-        fn take<T>(done: &Done<T>) -> Option<(Result<T, String>, Instant)> {
-            done.lock().expect("bank resize outcome").take()
-        }
+    /// [`ElasticBank::advance`]: at a boundary between flights every pass
+    /// is submitted, so a shrink's evicted records return to the pool here;
+    /// a shrink done is reported, and a growth finishes once its resize
+    /// thread ended it.
+    pub(super) fn advance(&self) -> Result<Option<BankResized>, DomainError> {
         let mut commitment = self.commitment();
-        let slots = commitment.slots.load(Ordering::Acquire);
-        // A step that panicked or broke an invariant took the resizers: the
-        // records are broken, and the error says why.
-        let broken = |commitment: &mut Commitment, reason: String| {
-            commitment.resize = Resize::Broken(reason.clone());
-            Err(DomainError::invariant(reason))
-        };
-        let (resize, finished) = match std::mem::replace(&mut commitment.resize, Resize::Idle(Vec::new())) {
-            // Between flights every run of a chain a cut was asked beside is
-            // submitted: its answer is read, and its storage installs.
-            Resize::Cutting(cutting) => (self.cut_answered(cutting, &mut commitment, wake), None),
-            Resize::Preparing { from, charged, begun, install, done } => match take(&done) {
-                None => (Resize::Preparing { from, charged, begun, install, done }, None),
-                Some((Err(panicked), _)) => return broken(&mut commitment, panicked),
-                Some((Ok(Err((_, refusal))), _)) => return broken(&mut commitment, shrink_refused(refusal)),
-                Some((Ok(Ok(prepared)), at)) => (self.install(prepared, (from, charged), (begun, at), wake), None),
-            },
-            Resize::Releasing { from, charged, refusal, begun, prepared, installed, done } => match take(&done) {
-                None => {
-                    let releasing = Resize::Releasing { from, charged, refusal, begun, prepared, installed, done };
-                    (releasing, None)
+        if let Some(releasing) = commitment.releasing.take() {
+            match self.released(releasing) {
+                Ok(shrunk) => commitment.shrunk = Some(shrunk),
+                Err(error) => {
+                    commitment.resize = Resize::Broken(error.to_string());
+                    return Err(error);
                 }
-                Some((Err(panicked), _)) => return broken(&mut commitment, panicked),
-                Some((Ok(resizers), released)) => {
-                    if let Some(refusal) = refusal {
-                        return broken(&mut commitment, shrink_refused(refusal));
-                    }
-                    commitment.resize = Resize::Idle(resizers);
-                    return Ok(Some(BankResized::Shrunk {
-                        holding: BankHolding::Experts,
-                        from,
-                        to: slots,
-                        released: charged
-                            .checked_sub(self.charged()?)
-                            .ok_or_else(|| DomainError::invariant("an expert bank shrink raised its charge"))?,
-                        times: begun.times(prepared, installed, released),
-                    }));
-                }
-            },
-            Resize::Growing(growing) => match growing.ended(BankHolding::Experts, slots, || self.charged()) {
-                None => (Resize::Growing(growing), None),
-                Some(Ok((resizers, grown, _))) => (Resize::Idle(resizers), Some(grown)),
-                Some(Err(reason)) => return broken(&mut commitment, reason),
-            },
-            idle => (idle, None),
+            }
+        }
+        if let Some(shrunk) = commitment.shrunk.take() {
+            return Ok(Some(shrunk));
+        }
+        let Resize::Growing(growing) = &commitment.resize else {
+            return Ok(None);
         };
-        commitment.resize = resize;
-        Ok(finished)
+        match growing.ended(BankHolding::Experts, || self.charged()) {
+            None => Ok(None),
+            Some(Ok((grown, spent))) => {
+                let slots = commitment.slots.load(Ordering::Acquire);
+                tracing::info!("the expert bank's growth ended at {slots} slots, {spent}: {grown:?}");
+                commitment.resize = Resize::Idle;
+                Ok(Some(grown))
+            }
+            Some(Err(reason)) => {
+                commitment.resize = Resize::Broken(reason.clone());
+                Err(DomainError::invariant(reason))
+            }
+        }
     }
 
-    /// Install a shrink's `prepared` storage at a boundary its
-    /// [`Install`] allows and release its surplus off this thread, once the
-    /// device work before the install completes.
-    fn install(
-        &self,
-        recommits: Vec<PreparedRecommit>,
-        (from, charged): (u64, u64),
-        (begun, prepared): (Begun, Instant),
-        wake: CompletionWake,
-    ) -> Resize {
-        let installed = Instant::now();
-        let mut refusal = None;
-        let tensors = recommits
-            .into_iter()
-            .map(|prepared| match prepared.install() {
-                Ok(release) => Installed::Release(release),
-                Err(refused) => {
-                    refusal.get_or_insert(refused.error);
-                    Installed::Kept(refused.resizer)
-                }
-            })
-            .collect::<Vec<_>>();
-        // Once the device work before the install completes, the free and
-        // its record are one change, never recorded at the advance that
-        // reports it.
-        let (cache, records) = (self.cache.clone(), self.record_storage());
-        let done = self.release_thread.run(wake, move || {
-            tensors.iter().for_each(Installed::retire);
-            cache.changes().clone().back(|changing| {
-                let resizers = tensors.into_iter().map(Installed::release).collect();
-                let after = charged_of(&records).expect("invariant violated: a held allocation is charged");
-                cache.released(BankHolding::Experts, charged.saturating_sub(after), changing);
-                resizers
-            })
-        });
-        Resize::Releasing { from, charged, refusal, begun, prepared, installed, done }
+    /// `releasing`'s records returned to the pool: its shrink, done.
+    fn released(&self, releasing: Releasing) -> Result<BankResized, DomainError> {
+        let Releasing { from, to, charged, evicted, begun, .. } = releasing;
+        self.release(&self.stores, BankTier::Bank, (from, to), charged, &evicted, begun)
     }
 
-    /// Whether a resize runs, until its advance finishes it (broken records
-    /// run none: a resize asked of them fails with why).
+    /// Whether a resize of the bank's records runs, until its advance
+    /// finishes it (broken records run none: a resize asked of them fails
+    /// with why).
     pub(super) fn resizing(&self) -> bool {
-        !matches!(self.commitment().resize, Resize::Idle(_) | Resize::Broken(_))
+        self.commitment().resizing()
     }
 
     /// At a submission boundary of the scratch-served chain whose steps run
     /// from `first` through `last`, every pass of its blocks through
-    /// `submitted` submitted (none where no block's is), the one store's
-    /// release beside it, a step at a time:
-    /// - no resize running, where `pressure` finds the bank's storage short
-    ///   (it reads memory at most every reading interval), ask the watcher
-    ///   to cut the store beside the chain, from the nearest slots that
-    ///   release storage toward those releasing what it is short of
-    ///   (`watcher::Shared::cut_running`), the resizers held;
-    /// - that cut answered, its storage prepared off this thread
-    ///   ([`Self::cut_answered`]);
-    /// - prepared, installed once its [`Install`] allows, its surplus
-    ///   released off this thread (`Resize::Releasing`): the next advance
+    /// `submitted` submitted (none where no block's is), the bank's release
+    /// beside it, on every placement:
+    /// - no resize running, where `pressure` finds the bank's storage short,
+    ///   the watcher evicts records beside the chain, from the nearest
+    ///   slots that release storage toward those releasing what it is short
+    ///   of (`watcher::Shared::shrink`), moving nothing: those the chain's
+    ///   steps have yet to decide leave the map from its first step, the
+    ///   rest from the first step not yet begun;
+    /// - its evicted records return to the pool once every pass of the
+    ///   highest block whose hits the chain had decided is submitted (at
+    ///   once where none, or at a later chain's boundary): the next advance
     ///   reports it as any shrink.
     ///
-    /// The block whose passes' submission an install awaits, where one
-    /// does. Only where the host places (`Placer::Bank`): a host tier's
-    /// shrink copies its kept records first, and a device bank's moves
-    /// them, between flights alone.
+    /// The block whose passes' submission the release awaits, where one
+    /// does.
     pub(crate) fn release_running(&self, (first, last): (u64, u64), submitted: Option<usize>, pressure: &dyn Fn() -> Option<RunningPressure>) -> Option<usize> {
-        if self.plan.placer() != Placer::Bank {
-            return None;
-        }
         let started = Instant::now();
-        // The release reports to the advance that takes it: no wake.
-        let wake = || CompletionWake::new(|| {});
-        // Only this thread leaves the resizers idle.
+        // Memory is read outside the commitment's lock.
         let short = {
             let commitment = self.commitment();
-            matches!(commitment.resize, Resize::Idle(_)) && commitment.slots.load(Ordering::Acquire) > self.counts.floor()
+            matches!(commitment.resize, Resize::Idle) && !commitment.resizing() && commitment.slots.load(Ordering::Acquire) > self.counts.floor()
         };
         let short = short.then(pressure).flatten().filter(|pressure| pressure.bytes > 0);
         let mut commitment = self.commitment();
-        let (resize, awaits) = match std::mem::replace(&mut commitment.resize, Resize::Idle(Vec::new())) {
-            Resize::Idle(resizers) => match short {
-                Some(short) => {
-                    let from = commitment.slots.load(Ordering::Acquire);
-                    (self.cut_beside(resizers, from, (first, last), short, started), None)
-                }
-                None => (Resize::Idle(resizers), None),
-            },
-            Resize::Cutting(cutting) => (self.cut_answered(cutting, &mut commitment, wake()), None),
-            Resize::Preparing { from, charged, begun, install, done } => {
-                // A shrink decided between flights installs between flights
-                // alone, as it always has.
-                let (due, after) = match install {
-                    Install::Between => (false, None),
-                    Install::Running { last: of, after } if of == last => {
-                        match after.filter(|&block| submitted.is_none_or(|through| through < block)) {
-                            Some(block) => (false, Some(block)),
-                            None => (true, None),
-                        }
-                    }
-                    Install::Running { .. } => (true, None),
-                };
-                let prepared = match due {
-                    false => None,
-                    true => done.lock().expect("bank resize outcome").take(),
-                };
-                match prepared {
-                    None => (Resize::Preparing { from, charged, begun, install, done }, after),
-                    Some((Err(panicked), _)) => (Resize::Broken(panicked), None),
-                    Some((Ok(Err((_, refusal))), _)) => (Resize::Broken(shrink_refused(refusal)), None),
-                    Some((Ok(Ok(prepared)), at)) => (self.install(prepared, (from, charged), (begun, at), wake()), None),
-                }
+        if commitment.releasing.is_none() {
+            let short = short.filter(|_| !commitment.resizing())?;
+            if let Err(reason) = self.evict_beside(&mut commitment, (first, last), short, started) {
+                commitment.resize = Resize::Broken(reason);
+                return None;
             }
-            other => (other, None),
-        };
-        commitment.resize = resize;
-        awaits
+        }
+        let releasing = commitment.releasing.as_ref()?;
+        // Due once every pass of the decided block is submitted, or at once
+        // beside a later chain, whose steps resolve none of them.
+        let awaits = (releasing.last == last).then_some(releasing.after).flatten().filter(|&block| submitted.is_none_or(|through| through < block));
+        if awaits.is_some() {
+            return awaits;
+        }
+        let releasing = commitment.releasing.take().expect("a release is due");
+        match self.released(releasing) {
+            Ok(shrunk) => commitment.shrunk = Some(shrunk),
+            Err(error) => commitment.resize = Resize::Broken(error.to_string()),
+        }
+        None
     }
 
-    /// Ask the watcher to cut the one store beside the running chain whose
-    /// steps run from `first` through `last`, from `from` slots, its storage
-    /// `short` as read at `started`: from the nearest slots that release
-    /// storage toward those releasing what it is short of, the resizers
-    /// held until it answers. Resizers idle as they were where no slots
-    /// above the floor release storage, and broken records where the cut
-    /// cannot be formed (the charge unread, the records past u32).
-    fn cut_beside(&self, resizers: Vec<Resizer>, from: u64, (first, last): (u64, u64), short: RunningPressure, started: Instant) -> Resize {
-        let RunningPressure { bytes, held: moment } = short;
-        let floor = self.counts.floor();
+    /// Ask the watcher to evict the bank's records beside the running chain
+    /// whose steps run from `first` through `last`, its storage `short` as
+    /// read at `started`: from the nearest slots that release storage
+    /// toward those releasing what it is short of. Where it evicted, the
+    /// commitment's slots follow at once (no step from then on resolves an
+    /// evicted record), the domain is owed its beginning
+    /// ([`Self::take_running_begun`]), and the records wait for their
+    /// release; where none releases storage or the watcher evicted nothing,
+    /// nothing changes. Why the records broke, where they did.
+    fn evict_beside(&self, commitment: &mut Commitment, (first, last): (u64, u64), short: RunningPressure, started: Instant) -> Result<(), String> {
+        let RunningPressure { bytes } = short;
+        let (from, floor) = (commitment.slots.load(Ordering::Acquire), self.counts.floor());
         let decided = Instant::now();
         let charge = |at| Ok::<_, std::convert::Infallible>(self.counts.resident_charge(at));
         let releasing = |bytes| crate::planning::releasing(from, floor, bytes, charge).unwrap_or_else(|never| match never {});
         let (Some(shallowest), Some(deepest)) = (releasing(0), releasing(bytes)) else {
-            return Resize::Idle(resizers);
+            return Ok(());
         };
-        let asked = self.charged().and_then(|charged| Ok((charged, self.landed_cuts((shallowest, deepest))?)));
-        let (charged, candidates) = match asked {
-            Ok(asked) => asked,
-            Err(error) => return Resize::Broken(format!("a cut beside a running chain: {error}")),
+        let candidates = self.candidates(BankTier::Bank, (shallowest, deepest)).map_err(|error| format!("a shrink beside a running chain: {error}"))?;
+        let charged = self.charged();
+        let Some(Evicted { slots, records, decided: layer, trip }) = self.watcher.shared().shrink(self.evicting(BankTier::Bank), candidates, Some((first, last)))? else {
+            return Ok(());
         };
-        self.watcher.shared().cut_running((first, last), candidates);
-        tracing::info!(from, shallowest, deepest, short = bytes, "the expert bank is cut beside a running chain");
-        Resize::Cutting(Cutting { from, charged, last, decided, held: started.elapsed(), moment, resizers })
+        tracing::info!(from, shallowest, deepest, short = bytes, "the expert bank is shrunk beside a running chain");
+        let to = slots as u64;
+        commitment.slots.store(to, Ordering::Release);
+        assert!(commitment.running.replace(RunningBegun { decided, held: started.elapsed() }).is_none(), "a running shrink's beginning is taken before the next begins");
+        let after = layer.map(|layer| self.plan.layers()[layer].sublayer().block as usize);
+        let begun = Begun { decided, queued: Duration::ZERO, planned: trip.picked + trip.served, trip };
+        commitment.releasing = Some(Releasing { from, to, charged, evicted: records, last, after, begun });
+        Ok(())
     }
 
-    /// A cut asked beside a running chain, its answer read now: where it
-    /// cut, the commitment's slots follow at once (no step from then on
-    /// resolves a record past them), the domain is owed its beginning
-    /// ([`Self::take_running_begun`]), and each record tensor's storage at
-    /// the cut is prepared off this thread, installed where its
-    /// [`Install`] allows; where it cut nothing, the resizers idle as they
-    /// were; where serving ended, the records broken with why (the next
-    /// advance fails with it); unanswered, it waits.
-    fn cut_answered(&self, cutting: Cutting, commitment: &mut Commitment, wake: CompletionWake) -> Resize {
-        let Some(answer) = self.watcher.shared().running_cut() else {
-            return Resize::Cutting(cutting);
+    /// Return `freed` bytes of `tier`'s pool to the OS, what a shrink of a
+    /// holding in it freed (`seismic::Pool::return_freed`): the bytes
+    /// returned now.
+    pub(super) fn return_freed(&self, tier: BankTier, freed: u64) -> Result<u64, DomainError> {
+        let pool = match tier {
+            BankTier::Bank => self.stores.pool.clone(),
+            BankTier::Host => self.host().ok_or_else(|| DomainError::invariant("a host tier's pool without one"))?.stores.pool.clone(),
         };
-        let Cutting { from, charged, last, decided, held, moment, resizers } = cutting;
-        let cut = match answer {
-            Ok(Some(cut)) => cut,
-            Ok(None) => return Resize::Idle(resizers),
-            Err(reason) => return Resize::Broken(reason),
-        };
-        let to = cut.slots as u64;
-        commitment.slots.store(to, Ordering::Release);
-        assert!(commitment.running.replace(RunningBegun { decided, held, moment }).is_none(), "a running cut's beginning is taken before the next begins");
-        let after = cut.decided.map(|layer| self.plan.layers()[layer].sublayer().block as usize);
-        let zero = Duration::ZERO;
-        let begun = Begun { decided, queued: zero, planned: cut.trip.picked + cut.trip.served, trips: [cut.trip, Trip::default()], moves: zero };
-        self.prepare_off_thread(resizers, (from, to), charged, begun, Install::Running { last, after }, wake)
+        pool.return_freed(freed).map_err(|error| DomainError::invariant(format!("the {tier:?} pool could not return a shrink's blocks: {error}")))
     }
 
     /// [`ElasticBank::running_begun`](crate::domain::ElasticBank::running_begun).
     pub(super) fn take_running_begun(&self) -> Option<RunningBegun> {
         self.commitment().running.take()
     }
-}
-
-/// What a shrink of the records the host lands into came to: begun (or, of
-/// a host tier, done), with what it reports; not begun while a resize of
-/// them runs, which a later boundary finishes; or not begun where every cut
-/// falls below a record in flight, which the next boundary decides again.
-pub(super) enum Shrinking<T> {
-    Begun(T),
-    Running,
-    Deferred,
-}
-
-/// A shrink of the records the host lands into, done: the slots it took them
-/// from and to, and Seismic's charge of them before and after.
-pub(super) struct LandedShrink {
-    /// Its release's unregistration of host pages.
-    pub(super) unpinned: Duration,
-    pub(super) from: u64,
-    pub(super) to: u64,
-    pub(super) before: u64,
-    pub(super) after: u64,
-}
-
-/// Commit each of `resizers` at its `rows` now, a shrink's: every resizer
-/// back, or the first refusal of a tensor's storage ([`shrink_refused`]).
-fn recommit(resizers: Vec<Resizer>, rows: Vec<u64>) -> Result<Vec<Resizer>, TensorError> {
-    resizers
-        .into_iter()
-        .zip(rows)
-        .map(|(resizer, rows)| resizer.recommit(rows).map_err(|refused| refused.error))
-        .collect()
-}
-
-/// Why records whose storage refused a shrink are broken. A shrink needs no
-/// memory, and the views the watcher addresses records by are handed over
-/// before any shrink releases them, so nothing pins what it releases: a
-/// refusal is a broken invariant or a failed device, and the records keep
-/// storage the directory no longer uses.
-fn shrink_refused(refusal: TensorError) -> String {
-    format!("the expert bank's storage refused a shrink: {refusal}")
 }

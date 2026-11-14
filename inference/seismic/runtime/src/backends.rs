@@ -16,18 +16,17 @@ use crate::api::{
 use crate::devices::OpenError;
 use crate::driver::{self, Opened, PreparedHandle};
 use crate::formation::ProgramFormer;
-use crate::memory::DeviceLedgers;
+use crate::memory::DeviceStores;
 use seismic_compiler::errors::{ExecutionError, TargetError};
-use seismic_compiler::executable::{DeviceService, NativeExecutor};
+use seismic_compiler::executable::NativeExecutor;
 use seismic_compiler::feedback::PreparationOptions;
 use seismic_compiler::graph_cost::GraphCost;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
-use seismic_reservation as host;
 use seismic_native_target::{Programs, TargetFamily, Toolchain};
 use seismic_discovery::ObservationError;
-use seismic_topology::{Contract, DeviceTopology, Executor, ExecutorSelector, Placing};
+use seismic_topology::{Contract, DeviceTopology, Executor, ExecutorSelector};
 use std::sync::Arc;
 
 type CpuExecutor = seismic_cpu::Executor;
@@ -259,7 +258,7 @@ pub fn unmeasured_graph_cost(backend: seismic_lang::registry::BackendName) -> Gr
 pub(crate) fn open(
     info: Executor,
     topology: Arc<DeviceTopology>,
-    memory: Arc<DeviceLedgers>,
+    memory: Arc<DeviceStores>,
     options: crate::artifacts::DeviceOptions,
 ) -> Result<Arc<DeviceInner>, OpenError> {
     let selector = info.selector();
@@ -281,8 +280,11 @@ pub(crate) fn open(
                 service,
                 executor,
                 device,
-            } = seismic_cpu::open_host(host_cores().map_err(|reason| OpenError::Unavailable { selector, reason })?)
-                .map_err(OpenError::Backend)?;
+            } = seismic_cpu::open_host(
+                host_cores().map_err(|reason| OpenError::Unavailable { selector, reason })?,
+                memory.store(Contract::DeviceOnly),
+            )
+            .map_err(OpenError::Backend)?;
             let cpu = DeviceFormer::new(seismic_cpu::toolchain::CpuToolchain::new(&device), &store);
             let kind = OpenedKind::Cpu(Arc::new(Opened::new(
                 service,
@@ -301,7 +303,8 @@ pub(crate) fn open(
                 .find(|handle| handle.registry_id() == registry_id)
                 .ok_or(OpenError::IdentityChanged(selector))?;
             let service =
-                seismic_metal::MetalDevice::open(handle.clone()).map_err(OpenError::Backend)?;
+                seismic_metal::MetalDevice::open(handle.clone(), memory.store(Contract::DeviceOnly))
+                    .map_err(OpenError::Backend)?;
             let device =
                 seismic_metal::profile::open_device(&service, &*probes).map_err(OpenError::Backend)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
@@ -329,16 +332,13 @@ pub(crate) fn open(
                 }
             }
             let ordinal = ordinal.ok_or(OpenError::IdentityChanged(selector))?;
-            let account = |placement| -> Arc<dyn seismic_compiler::executable::MemoryAccount> {
-                Arc::new(crate::memory::MemoryAccount(placement))
-            };
-            let accounts = seismic_cuda::MemoryAccounts {
-                device: account(memory.device().physical()),
-                upload: account(memory.upload().physical()),
-                host: account(memory.staging.clone()),
+            // One store twice on unified memory.
+            let stores = seismic_cuda::CudaStores {
+                device: memory.store(Contract::DeviceOnly),
+                host: memory.host_store(),
             };
             let seismic_cuda::OpenedCuda { service, device } =
-                seismic_cuda::open(ordinal, accounts).map_err(open_error)?;
+                seismic_cuda::open(ordinal, stores).map_err(open_error)?;
             let capability = device.facts().compute_capability;
             let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
             let cuda = DeviceFormer::new(seismic_cuda::toolchain::CudaToolchain::new(service.clone(), architecture), &store);
@@ -680,19 +680,6 @@ impl OpenedKind {
         }
     }
 
-    /// What the backend holds for fixed buffers of `contract` beyond their
-    /// allocations.
-    pub(crate) fn backend_held(&self, kind: Contract) -> crate::devices::BackendHeld {
-        match self {
-            Self::Cpu(device) => device.backend_held(kind),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.backend_held(kind),
-            Self::Cuda(device) => device.backend_held(kind),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.backend_held(kind),
-        }
-    }
-
     pub(crate) fn identity(&self) -> seismic_compiler::prepared::DeviceIdentity {
         match self {
             Self::Cpu(device) => device.identity(),
@@ -809,14 +796,7 @@ impl OpenedKind {
         alignment: u64,
         access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        match self {
-            Self::Cpu(device) => device.allocate_storage_in(bytes, alignment, access),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_storage_in(bytes, alignment, access),
-            Self::Cuda(device) => device.allocate_storage_in(bytes, alignment, access),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_in(bytes, alignment, access),
-        }
+        self.allocate_contract(Contract::DeviceOnly, bytes, alignment, access)
     }
 
     /// Storage that reads zero, backed ([`Self::zeroed`]).
@@ -847,24 +827,70 @@ impl OpenedKind {
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.allocate_contract(contract, bytes, alignment, None)
+    }
+
+    /// A fixed buffer of `contract`, in the kinds it is allocated from now
+    /// (`crate::memory::DeviceStores::kinds`), charged to it and lying along
+    /// the path of the kind it landed in, ordered by `access`'s hazard
+    /// domain where given (a slab store's address table, its pool's).
+    pub(crate) fn allocate_contract(
+        &self,
+        contract: Contract,
+        bytes: u64,
+        alignment: u64,
+        access: Option<Arc<driver::AccessGroup>>,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         match self {
-            Self::Cpu(device) => device.allocate_visible_with(contract, bytes, alignment, |service| {
-                service.allocate(bytes, alignment)
-            }),
+            Self::Cpu(device) => device.allocate_contract(contract, bytes, alignment, access),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_visible_with(contract, bytes, alignment, |service| {
-                service.allocate(bytes, alignment)
-            }),
-            Self::Cuda(device) => {
-                let kind = device.memory().kinds(Placing::Fixed(contract))[0];
-                device.allocate_visible_with(contract, bytes, alignment, |service| {
-                    service.allocate_kind(kind, bytes, alignment, None)
-                })
-            }
+            Self::Metal(device) => device.allocate_contract(contract, bytes, alignment, access),
+            Self::Cuda(device) => device.allocate_contract(contract, bytes, alignment, access),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_mapped(contract, bytes, alignment),
+            Self::Vulkan(device) => device.allocate_contract(contract, bytes, alignment, access),
         }
     }
+
+    /// One block of the granule pool of `contract`'s store: one native
+    /// allocation of `bytes` of the first of `contract`'s kinds that admits
+    /// it, in `kinds` (those of the pool's store, in placement order),
+    /// charged exactly to `entry`, in `access`'s hazard domain, lying along
+    /// the path of the kind it landed in (`driver::Opened::allocate_block`).
+    /// A refusal by `entry` is the last kind's refusal: every kind charges
+    /// the same store.
+    pub(crate) fn allocate_block(
+        &self,
+        kinds: &[u32],
+        bytes: u64,
+        entry: &Arc<dyn crate::memory::Entry>,
+        access: Arc<driver::AccessGroup>,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        let allocate = |kind: u32| match self {
+            Self::Cpu(device) => {
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+            }
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => {
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+            }
+            Self::Cuda(device) => {
+                device.allocate_block(kind, bytes, access.clone(), |service| service.allocate_block(kind, bytes, entry))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.allocate_block(kind, bytes, entry, access.clone()),
+        };
+        // A kind short of room passes the block to the next; any other
+        // failure is the block's, and returns.
+        let (last, earlier) = kinds.split_last().expect("a pool's store has a kind its contract places in");
+        for &kind in earlier {
+            match allocate(kind) {
+                Err(ExecutionError::AllocationCapacity { .. }) => continue,
+                done => return done,
+            }
+        }
+        allocate(*last)
+    }
+
 
     /// `allocation`, fresh storage of `bytes`, reading zero. The CPU's
     /// allocations are zero-filled (`alloc_zeroed`) and Metal's are cleared
@@ -880,7 +906,7 @@ impl OpenedKind {
             Self::Cpu(_) => {}
             #[cfg(target_os = "macos")]
             Self::Metal(_) => {}
-            _ => driver::write_zeros(allocation.storage(), bytes)?,
+            _ => driver::write_zeros(allocation.storage(), 0, bytes)?,
         }
         Ok(allocation)
     }
@@ -927,19 +953,17 @@ impl OpenedKind {
         }
     }
 
-    /// Device address of byte `offset` of an allocation (of chunked
-    /// storage, a byte of a backed chunk). Only Seismic uses this to build
-    /// slab and record tables; lifetime still follows the allocation.
+    /// Device address of byte `offset` of an allocation. Only Seismic uses
+    /// this to build slab and record tables; lifetime still follows the
+    /// allocation.
     pub(crate) fn allocation_address(&self, allocation: &Arc<driver::Allocation>, offset: u64) -> u64 {
         match self {
             Self::Cpu(_) => driver::typed_buffer::<seismic_cpu::Cpu, CpuExecutor>(allocation)
                 .data_pointer() as u64 + offset,
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => match allocation.storage().as_any().downcast_ref::<MetalReserved>() {
-                Some(MetalReserved(reserved)) => reserved.gpu_address(offset),
-                None => driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
-                    .gpu_address(offset),
-            },
+            Self::Metal(_) => {
+                driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation).gpu_address(offset)
+            }
             Self::Cuda(_) => {
                 driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation).pointer() + offset
             }
@@ -1083,176 +1107,6 @@ where
         prepared,
         device: public_device.clone(),
     }))
-}
-
-impl OpenedKind {
-    /// Zero-filled storage of a reserved tensor of `reservation`'s records,
-    /// its leading `committed` rows backed and charged for what backs them,
-    /// and the resizer that resizes it in place, under a contract the device
-    /// reserves ([`seismic_topology::Executor::reserving`]).
-    pub(crate) fn allocate_reserved_tensor(
-        &self,
-        reservation: driver::ReservedRange,
-        committed: u64,
-        alignment: u64,
-    ) -> Result<driver::Resizer, crate::api::TensorError> {
-        let bytes = reservation.committed_bytes(committed)?;
-        let (reserved, granule) = (reservation.bytes, reservation.span.granule);
-        Ok(match self {
-            Self::Cpu(device) => device.allocate_reservation_with(reservation, bytes, alignment, |cpu| {
-                cpu.allocate_reserved(bytes, reserved, granule).map(|(buffer, resizer)| {
-                    let storage = driver::buffer_storage::<seismic_cpu::Cpu, CpuExecutor>(cpu, buffer);
-                    (storage, ReservedResizer::Cpu(resizer), None)
-                })
-            }),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_reservation_with(reservation, bytes, alignment, |metal| {
-                metal
-                    .allocate_reserved(bytes, reserved, granule, reservation.record.get())
-                    .map(|(buffer, resizer)| {
-                        let table = buffer.table();
-                        let storage: Box<dyn driver::Storage> = Box::new(MetalReserved(buffer));
-                        (storage, ReservedResizer::Metal(resizer), Some(table))
-                    })
-            }),
-            Self::Cuda(device) => device.allocate_reservation_with(reservation, bytes, alignment, |cuda| {
-                let (kind, memory) = (device.memory().kinds(Placing::Reserved(reservation.contract))[0], device.memory());
-                let range = seismic_cuda::RangeMemory::of(kind).expect("the rule reserves only in kinds that reserve");
-                let account: Arc<dyn seismic_compiler::executable::MemoryAccount> =
-                    Arc::new(crate::memory::MemoryAccount(memory.placement(Placing::Reserved(reservation.contract)).physical()));
-                cuda.allocate_reserved(bytes, reserved, granule, range, account)
-                    .map(|(buffer, resizer)| {
-                        let storage =
-                            driver::buffer_storage::<seismic_cuda::Cuda, CudaExecutor>(cuda, buffer);
-                        (storage, ReservedResizer::Cuda(resizer), None)
-                    })
-            }),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_reservation(reservation, bytes, alignment),
-        }?)
-    }
-}
-
-/// Metal's reserved storage: chunks the host reads and writes in place
-/// and device work reaches only through record tables. It is no
-/// `MetalBuffer`, so no binding path can bind it.
-#[cfg(target_os = "macos")]
-struct MetalReserved(seismic_metal::ReservedBuffer);
-
-#[cfg(target_os = "macos")]
-impl driver::Storage for MetalReserved {
-    fn read(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
-        self.0.read_bytes(offset, into);
-        Ok(())
-    }
-    fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
-        self.0.write_bytes(offset, bytes);
-        Ok(())
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
-        Some(self.0.host_base())
-    }
-}
-
-/// A reserving backend's resizer (`driver::Resizer`): the one reservation's
-/// over the backend's backing (the CPU backend's pages, Metal's granules,
-/// CUDA's reserved memory, Vulkan's chunks).
-pub(crate) enum ReservedResizer {
-    Cpu(host::Resizer<host::Pages>),
-    #[cfg(target_os = "macos")]
-    Metal(host::Resizer<seismic_metal::Granules>),
-    Cuda(seismic_cuda::CudaResizer),
-    #[cfg(not(target_os = "macos"))]
-    Vulkan(seismic_vulkan::VulkanResizer),
-}
-
-/// A reserving backend's prepared commitment.
-pub(crate) enum ReservedPrepared {
-    Cpu(host::Prepared<host::Pages>),
-    #[cfg(target_os = "macos")]
-    Metal(host::Prepared<seismic_metal::Granules>),
-    Cuda(host::Prepared<seismic_cuda::ReservedMemory>),
-    #[cfg(not(target_os = "macos"))]
-    Vulkan(host::Prepared<seismic_vulkan::reservation::Chunks>),
-}
-
-/// A reserving backend's installed commitment, until its release.
-pub(crate) enum ReservedPending {
-    Cpu(host::Pending<host::Pages>),
-    #[cfg(target_os = "macos")]
-    Metal(host::Pending<seismic_metal::Granules>),
-    Cuda(host::Pending<seismic_cuda::ReservedMemory>),
-    #[cfg(not(target_os = "macos"))]
-    Vulkan(host::Pending<seismic_vulkan::reservation::Chunks>),
-}
-
-impl ReservedResizer {
-    /// The backend's prepare of exactly `bytes`; a refusal returns the
-    /// resizer.
-    pub(crate) fn prepare(self, bytes: u64) -> Result<ReservedPrepared, (Self, ExecutionError)> {
-        match self {
-            Self::Cpu(resizer) => resizer.prepare(bytes).map(ReservedPrepared::Cpu).map_err(
-                |(resizer, failure)| {
-                    let error = ExecutionError::AllocationFailed(failure.to_string());
-                    (Self::Cpu(resizer), error)
-                },
-            ),
-            #[cfg(target_os = "macos")]
-            Self::Metal(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Metal)
-                .map_err(|(resizer, error)| (Self::Metal(resizer), error)),
-            Self::Cuda(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Cuda)
-                .map_err(|(resizer, error)| (Self::Cuda(resizer), error)),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Vulkan)
-                .map_err(|(resizer, error)| (Self::Vulkan(resizer), error)),
-        }
-    }
-}
-
-impl ReservedPrepared {
-    pub(crate) fn install(self) -> ReservedPending {
-        match self {
-            Self::Cpu(prepared) => ReservedPending::Cpu(prepared.install()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(prepared) => ReservedPending::Metal(prepared.install()),
-            Self::Cuda(prepared) => ReservedPending::Cuda(prepared.install()),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(prepared) => ReservedPending::Vulkan(prepared.install()),
-        }
-    }
-
-    pub(crate) fn abandon(self) -> ReservedResizer {
-        match self {
-            Self::Cpu(prepared) => ReservedResizer::Cpu(prepared.abandon()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(prepared) => ReservedResizer::Metal(prepared.abandon()),
-            Self::Cuda(prepared) => ReservedResizer::Cuda(prepared.abandon()),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(prepared) => ReservedResizer::Vulkan(prepared.abandon()),
-        }
-    }
-}
-
-impl ReservedPending {
-    pub(crate) fn release(self) -> ReservedResizer {
-        match self {
-            Self::Cpu(pending) => ReservedResizer::Cpu(pending.release()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(pending) => ReservedResizer::Metal(pending.release()),
-            Self::Cuda(pending) => ReservedResizer::Cuda(pending.release()),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(pending) => ReservedResizer::Vulkan(pending.release()),
-        }
-    }
 }
 
 #[cfg(test)]

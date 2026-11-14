@@ -1,11 +1,9 @@
 use super::{BankBinding, ExpertBankPlan, RecordTensors, RoutedTensor};
-use super::records::{record_bytes, reserved_record};
 use crate::memory::ClaimDemand;
 use crate::planning::resources::FlightDepth;
 use crate::planning::weights::representation_bytes;
-use magnitude_kernels::{constants, list_extent};
+use magnitude_kernels::constants;
 use seismic::Element;
-use std::num::NonZeroU64;
 
 /// A part of a streamed routed layer's bank its graphs bind (`BankPort`),
 /// beside its banked expert stacks.
@@ -235,22 +233,20 @@ pub enum BankAllocation {
     Protocol { element: Element, extents: Vec<u64> },
     /// The device's own, zeroed (`Tensor::zeros`): its bytes.
     Device { element: Element, extents: Vec<u64> },
-    /// `records` records of `matrix` reserved under `contract`, for the
-    /// tier `kind`, the leading `committed` backed
-    /// (`Tensor::reserved_in`); their bytes in whole granules of its
-    /// reservation.
-    Reserved {
-        kind: crate::planning::BankTier,
-        contract: seismic::ReservedContract,
-        element: Element,
-        records: u64,
-        matrix: [u64; 2],
-        committed: u64,
-        /// The largest view its records carry beside their own
-        /// (`seismic::ReservedRecords`): the conveyor's stored records, in
-        /// its lender's.
-        carries: Option<NonZeroU64>,
-    },
+    /// Group `group`'s records of routed tensor `kind` in tier `tier`: its
+    /// region of the group's slab store in the tier's granule pool
+    /// (`ExpertBankPlan::regions`), a record a granule, claimed as the
+    /// group commits it. Charged nothing here: the pool's granules are the
+    /// records' charge (`ExpertBankPlan::resident_charge`,
+    /// `ExpertBankPlan::host_charge`).
+    Records { tier: BankTier, group: usize, kind: RoutedTensor },
+    /// The lent records of group `group`'s records of routed tensor `kind`
+    /// in tier `tier` (`ExpertBankPlan::lent`, `ExpertBankPlan::host_lent`):
+    /// `extents` `[lent, m0, m1]` of `element`, one contiguous allocation
+    /// committed at load and never freed, which the conveyor and the
+    /// scratch lie in plainly and the store's first `lent` records view.
+    /// Its bytes, under the tier's contract (`HostTier::contract`).
+    Lent { tier: BankTier, group: usize, kind: RoutedTensor, element: Element, extents: Vec<u64> },
     /// A banked stack's per-expert second-level scale, imported as its
     /// resident plan holds it: its resident bytes.
     Imported(super::super::weights::WeightScalePlan),
@@ -270,7 +266,7 @@ pub enum Placer {
     Bank,
 }
 
-/// Which of a bank's reserved tiers a holding lies in.
+/// Which of a bank's tiers (each its own granule pool) a holding lies in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BankTier {
     /// The bank's own records and tables.
@@ -301,54 +297,46 @@ impl BankTier {
     /// The contract of the tier where shared ranges lie in the device's
     /// memory or not (`unified`): a bank the host writes in place is `Shared`,
     /// one across a link `DeviceOnly`; a host tier is `Shared`.
-    pub const fn contract_where(self, unified: bool) -> seismic::ReservedContract {
+    pub const fn contract_where(self, unified: bool) -> seismic::Contract {
         match (self, unified) {
-            (Self::Bank, false) => seismic::ReservedContract::DeviceOnly,
-            (Self::Bank, true) | (Self::Host, _) => seismic::ReservedContract::Shared,
+            (Self::Bank, false) => seismic::Contract::DeviceOnly,
+            (Self::Bank, true) | (Self::Host, _) => seismic::Contract::Shared,
         }
     }
 
     /// The contract of the tier on `executor`, from the rule
     /// (`DeviceTopology::shared_ranges_lie_in_device_memory`).
-    pub fn contract(self, topology: &seismic::DeviceTopology, executor: &seismic::Executor) -> seismic::ReservedContract {
+    pub fn contract(self, topology: &seismic::DeviceTopology, executor: &seismic::Executor) -> seismic::Contract {
         self.contract_where(topology.shared_ranges_lie_in_device_memory(executor))
     }
 
     /// [`Self::contract`] on `device`.
-    pub fn contract_on(self, device: &seismic::Device) -> seismic::ReservedContract {
+    pub fn contract_on(self, device: &seismic::Device) -> seismic::Contract {
         self.contract(device.topology(), device.info())
     }
 }
 
-/// What a device gives an expert bank: the backend its launches are, how its
-/// record tensors are reserved, and the host tier beside it.
+/// What a device gives an expert bank: the backend its launches are, how
+/// it makes the native allocations its records pools' blocks are
+/// (`seismic::Limits::allocations`), and the host tier beside it. Made by
+/// planning alone (`planning::bank_substrate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankSubstrate {
-    pub backend: seismic::BackendName,
-    pub reservation: seismic::Reservation,
-    pub host: HostTier,
-}
-
-impl BankSubstrate {
-    /// Whether a whole bank's resident forms can read its home records:
-    /// its backend's resident launches reach expert stacks through record
-    /// ports, or bind them to storage that is one buffer
-    /// (`native::ExpertKernels::bind_resident_stacks`).
-    pub fn reads_homes(&self) -> bool {
-        !(crate::native::ExpertKernels::bind_resident_stacks(self.backend) && self.reservation.chunked())
-    }
+    pub(in crate::planning) backend: seismic::BackendName,
+    pub(in crate::planning) allocations: seismic::NativeAllocations,
+    pub(in crate::planning) host: HostTier,
 }
 
 /// How a bank's misses are held on its device beside the bank, where its
 /// device storage and host RAM differ or are one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostTier {
-    /// Host RAM a discrete device reads over its link, a tier of its own
-    /// reserved as host storage its backend reserves: the host lands every
+    /// Host RAM a discrete device reads over its link, a tier of its own,
+    /// its records in a granule pool of host storage: the host lands every
     /// file miss into it, a step serves a miss from its records, and the
     /// host promotes the records the ranking keeps into the bank on the copy
     /// engine (`watcher::promotions`).
-    Linked(seismic::Reservation),
+    Linked,
     /// Unified memory (Metal's, an integrated CUDA device's such as
     /// GB10's): device storage is host RAM, so the bank is the one store.
     /// Every file miss lands straight into a bank record, which the device
@@ -386,65 +374,44 @@ impl HostTier {
     /// Where a file miss lands.
     pub const fn placer(self) -> Placer {
         match self {
-            Self::Linked(_) => Placer::Tier,
+            Self::Linked => Placer::Tier,
             Self::Unified(_) => Placer::Bank,
         }
     }
 
-    /// The reservation of its tier's own records: a linked tier's; unified
-    /// memory has none.
-    pub const fn tier(self) -> Option<seismic::Reservation> {
-        match self {
-            Self::Linked(reservation) => Some(reservation),
-            Self::Unified(_) => None,
-        }
-    }
-
     /// The contract of `tier`'s records.
-    pub const fn contract(self, tier: BankTier) -> seismic::ReservedContract {
+    pub const fn contract(self, tier: BankTier) -> seismic::Contract {
         tier.contract_where(matches!(self, Self::Unified(_)))
     }
 }
 
 impl BankAllocation {
-    /// `extents` reserved under `contract` on `device`, the leading
-    /// `committed` rows backed, and its resizer: the one way a bank's
-    /// reserved records, and the fills measured over them, are allocated.
-    pub fn reserve(
-        device: &seismic::Device,
-        contract: seismic::ReservedContract,
-        element: Element,
-        extents: &[u64],
-        committed: u64,
-        carries: Option<NonZeroU64>,
-    ) -> Result<(seismic::Tensor, seismic::Resizer), seismic::TensorError> {
-        seismic::Tensor::reserved_in(contract, device, element, extents, committed, carries)
-    }
-
-    /// Physical storage demanded by this allocation. Reserved backing cannot
-    /// consume free space inside ordinary allocator blocks; its record table
-    /// is an independent ordinary allocation in the declared placement.
-    pub fn storage_demand(&self, reservation: &seismic::Reservation) -> Result<ClaimDemand, String> {
+    /// Physical storage demanded by this allocation at its load beside a
+    /// host tier held as `host`: a records region's none (its pool's
+    /// granules are charged by the records committed, not by its layout).
+    pub fn storage_demand(&self, host: HostTier) -> Result<ClaimDemand, String> {
         Ok(match self {
             Self::Shared { element, extents } | Self::Words { element, extents } | Self::Protocol { element, extents } => {
                 ClaimDemand { shared: representation_bytes(*element, extents)?, ..ClaimDemand::default() }
             }
             Self::Device { element, extents } => ClaimDemand { device: representation_bytes(*element, extents)?, ..ClaimDemand::default() },
             Self::Imported(scale) => ClaimDemand { device: scale.resident_bytes, ..ClaimDemand::default() },
-            Self::Reserved { kind, contract, element, records, matrix, committed, carries } => {
-                let held = seismic::ReservedRecords { record: reserved_record(record_bytes(*element, *matrix)?)?, carries: *carries };
-                let charges = held.record.get().checked_mul(*committed)
-                    .and_then(|bytes| reservation.charges(*contract, held, *records, bytes))
-                    .ok_or_else(|| "reserved bank bytes overflow".to_owned())?;
-                ClaimDemand::reservation(*kind, charges)
+            Self::Records { .. } => ClaimDemand::default(),
+            Self::Lent { tier, element, extents, .. } => {
+                let bytes = representation_bytes(*element, extents)?;
+                match (*tier, host.contract(*tier)) {
+                    (BankTier::Host, _) => ClaimDemand { host: bytes, ..ClaimDemand::default() },
+                    (_, seismic::Contract::DeviceOnly) => ClaimDemand { device: bytes, ..ClaimDemand::default() },
+                    _ => ClaimDemand { shared: bytes, ..ClaimDemand::default() },
+                }
             }
         })
     }
 
-    /// What the allocation is charged, a reservation backed as `reservation`
-    /// backs its storage kind's (Seismic's rule).
-    pub fn charged_bytes(&self, reservation: &seismic::Reservation) -> Result<u64, String> {
-        self.storage_demand(reservation)?.checked_bytes()
+    /// What the allocation is charged at its load beside `host`
+    /// ([`Self::storage_demand`]).
+    pub fn charged_bytes(&self, host: HostTier) -> Result<u64, String> {
+        self.storage_demand(host)?.checked_bytes()
             .ok_or_else(|| "bank allocation bytes overflow".to_owned())
     }
 }
@@ -461,6 +428,10 @@ pub struct BankLayout<T> {
     /// Each group's host tier record tensors, where the bank has a tier
     /// (`ExpertBankPlan::host`).
     pub host: Option<Vec<RecordTensors<T>>>,
+    /// Each lender's lent records, a tensor of each of its routed tensors
+    /// (`BankAllocation::Lent`): the bank's lender's, then a linked host
+    /// tier's where the conveyor lies there.
+    pub lent: Vec<RecordTensors<T>>,
 }
 
 /// The load's words: whether the group being encoded is resident, the tier
@@ -523,15 +494,13 @@ impl<T> PlacedAllocations<T> {
     }
 }
 
-/// A group's record tensor of each routed tensor, its map and commits, and
-/// its move list (`routed_move`, [`ExpertBankPlan::move_records`]).
+/// A group's record tensor of each routed tensor, its map and its commits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupAllocations<T> {
     pub records: RecordTensors<T>,
     /// Every member layer's map, end to end (`BankPart::Map`).
     pub map: T,
     pub commits: T,
-    pub moves: T,
 }
 
 /// A layer's per-expert scale of each stack that has one, and its words.
@@ -608,6 +577,7 @@ impl<T> BankLayout<T> {
             layers,
             staging,
             host,
+            lent,
         } = self;
         let mut owned = vec![("load: resident words", resident)];
         owned.extend([
@@ -617,9 +587,9 @@ impl<T> BankLayout<T> {
             ("load: seed staged list", seed_staged),
             ("load: grids", grids),
         ]);
-        for GroupAllocations { records, map, commits, moves } in groups {
+        for GroupAllocations { records, map, commits } in groups {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
-            owned.extend([("group: map", map), ("group: commits", commits), ("group: moves", moves)]);
+            owned.extend([("group: map", map), ("group: commits", commits)]);
         }
         for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, rounds, tiered, seeds } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
@@ -638,6 +608,7 @@ impl<T> BankLayout<T> {
         }
         owned.extend(staging.iter().map(|pool| ("staging", pool)));
         owned.extend(host.iter().flatten().flat_map(|tier| tier.iter().map(|(_, records)| ("host tier", records))));
+        owned.extend(lent.iter().flat_map(|lent| lent.iter().map(|(_, records)| ("lent records", records))));
         owned
     }
 
@@ -667,7 +638,6 @@ impl<T> BankLayout<T> {
                 records: each(&group.records, &mut make)?,
                 map: make(&group.map)?,
                 commits: make(&group.commits)?,
-                moves: make(&group.moves)?,
             });
         }
         let mut layers = Vec::with_capacity(self.layers.len());
@@ -692,12 +662,14 @@ impl<T> BankLayout<T> {
             Some(tiers) => Some(tiers.iter().map(|tier| each(tier, &mut make)).collect::<Result<Vec<_>, E>>()?),
             None => None,
         };
+        let lent = self.lent.iter().map(|lent| each(lent, &mut make)).collect::<Result<Vec<_>, E>>()?;
         Ok(BankLayout {
             load,
             groups,
             layers,
             staging,
             host,
+            lent,
         })
     }
 }
@@ -767,7 +739,7 @@ impl ExpertBankPlan {
                 Ok(Some((Element::i32(), vec![words.flight, words.routing_words()])))
             }
             BankPart::Map => Ok(Some((Element::i32(), vec![self.group_experts(self.layers()[layer].group), constants::MAP_WORDS]))),
-            BankPart::TierMap | BankPart::Tier { .. } if self.tier_reservation().is_none() => Ok(None),
+            BankPart::TierMap | BankPart::Tier { .. } if !self.tiered() => Ok(None),
             BankPart::TierMap => words(self.layers()[layer].experts),
             BankPart::SiteTable | BankPart::SiteRows | BankPart::SiteOutput if !self.sited(layer) => Ok(None),
             BankPart::SiteTable => Ok(Some((Element::i32(), binding()?.words.site().extents().to_vec()))),
@@ -817,18 +789,19 @@ impl ExpertBankPlan {
     /// ([`Self::placed`]). Each word part the host writes or reads is host-shared (each
     /// layer's scratch table as protocol words, whose cross-queue order is
     /// the exchange's), the
-    /// device's own grids and staged lists its own; each group's record tensors are
-    /// reserved for its ceiling, its committed records backed, which a
-    /// prompt group's scratch and, on unified memory, its conveyor are views
-    /// of the lender's (no expert memory is reserved for prefill or decode
-    /// alone); each layer's per-expert scales are imported as its resident
-    /// stacks plan them; the staging pools are host-shared; a host tier's
-    /// record tensors, where its conveyor lies beside a discrete device, are
-    /// reserved in host storage for every expert of their group, their
-    /// floor committed ([`Self::host_records`] at no host slots): the tier
-    /// opens at its floor, empty, and the bank backs it to its load-time
-    /// size ([`Self::host_slots`]) beside its fill, each slot filled as it
-    /// joins (`ExpertBank::back_host`).
+    /// device's own grids and staged lists its own; each group's record
+    /// tensors are regions of its slab store in the bank's granule pool
+    /// ([`Self::regions`]), a record a granule; each layer's per-expert
+    /// scales are imported as its resident stacks plan them; the staging
+    /// pools are host-shared; a linked host tier's record tensors are
+    /// regions of each group's slab store in the tier's own pool, which
+    /// opens at its floor ([`Self::host_records`] at no host slots), empty,
+    /// and the bank grows to its load-time size ([`Self::host_slots`])
+    /// beside its fill, each slot filled as it joins
+    /// (`ExpertBank::back_host`). The lender's lent records, which a
+    /// prompt group's scratch and conveyor lie in (no expert memory is held
+    /// for prefill or decode alone), are contiguous allocations of their
+    /// own ([`BankAllocation::Lent`]).
     pub fn layout(&self) -> Result<BankLayout<BankAllocation>, String> {
         let bindings = (0..self.layers().len()).map(|layer| self.binding(layer)).collect::<Result<Vec<_>, _>>()?;
         let shape = |layer: usize, part: BankPart| self.shape_of(layer, part, || Ok(bindings[layer]));
@@ -850,23 +823,9 @@ impl ExpertBankPlan {
             .map(|(index, group)| {
                 let first = group.layers[0];
                 Ok(GroupAllocations {
-                    records: group.record.try_map(|kind, tensor| {
-                        Ok::<_, String>(BankAllocation::Reserved {
-                            kind: crate::planning::BankTier::Bank,
-                            contract: self.host().contract(crate::planning::BankTier::Bank),
-                            element: tensor.resident,
-                            records: self.records(index),
-                            matrix: tensor.matrix,
-                            committed: self.committed_records(index),
-                            carries: self.reserved_records(index, kind, tensor, crate::planning::BankTier::Bank)?.carries,
-                        })
-                    })?,
+                    records: group.record.map(|kind, _| BankAllocation::Records { tier: BankTier::Bank, group: index, kind }),
                     map: words(first, BankPart::Map)?,
                     commits: words(first, BankPart::Commits)?,
-                    moves: BankAllocation::Words {
-                        element: Element::i32(),
-                        extents: vec![list_extent(self.move_records(index))],
-                    },
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -880,7 +839,7 @@ impl ExpertBankPlan {
                         .resident
                         .as_ref()
                         .map(|_, plan| plan.scale.clone().map(BankAllocation::Imported)),
-                    tier: self.tier_reservation().map(|_| words(index, BankPart::TierMap)).transpose()?,
+                    tier: self.tiered().then(|| words(index, BankPart::TierMap)).transpose()?,
                     file: words(index, BankPart::FileTable)?,
                     scratch: {
                         let (element, extents) = shape(index, BankPart::ScratchTable)?;
@@ -928,31 +887,36 @@ impl ExpertBankPlan {
                 extents: vec![self.staging_records(), pool.matrix[0], pool.matrix[1]],
             })
             .collect();
-        let host = self.tier_reservation().map(|_| {
+        let host = self.tiered().then(|| {
             self.groups()
                 .iter()
                 .enumerate()
-                .map(|(index, group)| {
-                    group.record.try_map(|kind, tensor| {
-                        Ok::<_, String>(BankAllocation::Reserved {
-                            kind: crate::planning::BankTier::Host,
-                            contract: self.host().contract(crate::planning::BankTier::Host),
-                            element: tensor.resident,
-                            records: self.host_extent(index),
-                            matrix: tensor.matrix,
-                            committed: self.host_records(index, 0),
-                            carries: self.reserved_records(index, kind, tensor, crate::planning::BankTier::Host)?.carries,
-                        })
-                    })
+                .map(|(index, group)| group.record.map(|kind, _| BankAllocation::Records { tier: BankTier::Host, group: index, kind }))
+                .collect::<Vec<_>>()
+        });
+        // Each lender's lent records: the bank's lender's, and a linked
+        // tier's where the conveyor lies there.
+        let group = self.lender_group();
+        let lent = [(BankTier::Bank, self.lent(group)), (BankTier::Host, self.host_lent(group))]
+            .into_iter()
+            .filter(|&(_, lent)| lent > 0)
+            .map(|(tier, lent)| {
+                self.groups()[group].record.map(|kind, tensor| BankAllocation::Lent {
+                    tier,
+                    group,
+                    kind,
+                    element: tensor.resident,
+                    extents: vec![lent, tensor.matrix[0], tensor.matrix[1]],
                 })
-                .collect::<Result<Vec<_>, String>>()
-        }).transpose()?;
+            })
+            .collect::<Vec<_>>();
         Ok(BankLayout {
             load,
             groups,
             layers,
             staging,
             host,
+            lent,
         })
     }
 

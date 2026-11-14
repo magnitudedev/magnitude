@@ -17,8 +17,7 @@
 //!   configuration of the surveyed entries at the model's points, from the
 //!   model's headers alone (a catalog header export opens as the model with
 //!   zero weights) (`kernel`).
-//! - `memory`, `recommit`: one load's host memory against its charge, and
-//!   what a reserved tensor's recommit costs, loading nothing (`memory`).
+//! - `memory`: one load's host memory against its charge (`memory`).
 //!
 //! Every engine subcommand takes the development tuning tools
 //! ([`development`]): pins and the survey.
@@ -158,9 +157,9 @@ enum Command {
         /// decode resident.
         #[arg(long, value_name = "N", requires = "decode", conflicts_with = "pressure_store")]
         decode_prompt_tokens: Option<usize>,
-        /// Another process presses this physical store below the load's
-        /// planning line, past its prompt groups' surplus into its bank, over
-        /// a window of the decode; device resolves every allocation placement.
+        /// Another process takes what this physical store gives the load,
+        /// past the guarantee its ledger keeps free there, over a window of
+        /// the decode; device resolves every allocation placement.
         #[arg(long, requires = "decode")]
         pressure_store: Option<memory::PressureStore>,
         /// The pressure starts once the request is admitted, so its prompt's
@@ -181,18 +180,8 @@ enum Command {
         /// The target model file.
         target: PathBuf,
     },
-    /// What an in-place recommit of a reserved tensor (an elastic expert
-    /// bank's resize) costs at each commitment, loading nothing.
-    Recommit {
-        /// A unified-memory backend: metal or cpu.
-        #[arg(long)]
-        device: String,
-        /// Commitments, in gigabytes.
-        #[arg(long, value_delimiter = ',', required = true)]
-        gigabytes: Vec<u64>,
-    },
-    /// Another process's memory: what `memory --pressure` starts beside a
-    /// load to press it below its planning line.
+    /// Another process's memory: what `memory --pressure-store` starts
+    /// beside a load to take what its store gives past its guarantee.
     #[command(hide = true)]
     Occupy {
         #[arg(long)]
@@ -761,17 +750,6 @@ fn run(command: Command) -> Result<(), String> {
             pressure: pressure_store.map(|store| memory::Pressing { store, from_prompt: pressure_prompt }),
             hold,
         }),
-        Command::Recommit { device, gigabytes } => {
-            let commitments = gigabytes
-                .iter()
-                .map(|gigabytes| {
-                    gigabytes
-                        .checked_mul(1_000_000_000)
-                        .ok_or_else(|| format!("--gigabytes {gigabytes} overflows"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            memory::recommit(memory::backend(&device)?, &commitments)
-        }
         Command::Occupy { device, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store),
         Command::Draft {
             run,

@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 # What the machine has, as the backend crates and the OS report it: the
-# inventory of its topology, status samples, and the host's processors and
-# their pinning.
+# inventory of its topology, status samples, host RAM at one instant, the
+# OS's memory pressure events, and the host's processors and their pinning.
 [dependencies]
 seismic-topology.workspace = true
 seismic-lang.workspace = true
@@ -16,6 +16,7 @@ seismic-cuda.workspace = true
 seismic-metal.workspace = true
 # The program store Metal's capability probe answers are kept in.
 seismic-native-target.workspace = true
+seismic-memory.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
@@ -26,16 +27,25 @@ libc.workspace = true
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 seismic-vulkan.workspace = true
 
+[features]
+# Host samples recorded on real machines (`fixtures`), for other crates'
+# tests.
+fixtures = []
+
 [dev-dependencies]
 # The recorded machines the inventory's tests discover from.
 seismic-topology = { workspace = true, features = ["fixtures"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+  "Wdk_System_SystemInformation",
   "Wdk_System_SystemServices",
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
+  "Win32_Security",
   "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Performance",
   "Win32_System_ProcessStatus",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

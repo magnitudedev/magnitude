@@ -14,11 +14,11 @@
 use crate::kind::{KindMemory, KindReport};
 use crate::model::{
     AllocationLimit, Availability, Builder, DeviceAllocationBound, DeviceMemory, DeviceTopology, Diagnostic,
-    ExecutorBuilder, ExecutorKind, ExecutorReport, GrantSource, Limits, OwnKind, OwnPath,
+    ExecutorBuilder, ExecutorKind, ExecutorReport, GrantSource, Limits, NativeAllocations, OwnKind, OwnPath,
     PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision, StoreId, StoreKind,
     VolumeId,
 };
-use crate::placement::{place, reserving, Contract, Placing};
+use crate::placement::{place, Contract};
 use crate::selector::ExecutorSelector;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +30,9 @@ pub struct Reports {
     pub host: Reported<u64>,
     /// The OS build: the CPU's and Metal's driver.
     pub os_build: String,
+    /// The host's page: what the host's allocations, the CPU's and Metal's,
+    /// round each one's bytes up to.
+    pub page: u64,
     pub cpu: CpuReport,
     pub metal: Vec<MetalReport>,
     pub cuda: Vec<CudaReport>,
@@ -87,6 +90,9 @@ pub struct CudaReport {
     /// `cuDeviceTotalMem`.
     pub total: u64,
     pub max_allocation: u64,
+    /// `cuMemGetAllocationGranularity` (recommended) of its device memory:
+    /// what one allocation's size is rounded up to.
+    pub allocation_granularity: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`, which describes the device.
     pub integrated: bool,
     /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; none where it reads zero.
@@ -95,7 +101,7 @@ pub struct CudaReport {
     /// The CUDA devices whose memory it reads and writes directly
     /// (`cuDeviceCanAccessPeer`).
     pub peers: Vec<[u8; 16]>,
-    /// The kinds it allocates, each with how it reserves.
+    /// The kinds it allocates.
     pub kinds: Vec<KindReport>,
 }
 
@@ -125,9 +131,13 @@ pub struct VulkanReport {
     /// `VkDriverId` and the driver version.
     pub driver: String,
     pub max_allocation: u64,
+    /// The least bytes of each of its memory objects: its heaps over
+    /// `maxMemoryAllocationCount`; why it has none (it allows no memory
+    /// object), which leaves the device unavailable.
+    pub least_object: Result<u64, String>,
     pub memory: VulkanMemory,
     /// The kinds it allocates: its memory types, each on its heap, and
-    /// imported host pages where it imports them, each with how it reserves.
+    /// imported host pages where it imports them.
     pub kinds: Vec<KindReport>,
 }
 
@@ -299,7 +309,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             continue;
         }
         let mut heaps = Vec::new();
-        for id in place(&vulkan.kinds, false, Placing::Fixed(Contract::DeviceOnly)) {
+        for id in place(&vulkan.kinds, false, Contract::DeviceOnly) {
             if let KindMemory::Heap { index, device_local: true, bytes } = reported_kind(&vulkan.kinds, id).memory {
                 if !heaps.contains(&(index, bytes)) {
                     heaps.push((index, bytes));
@@ -353,6 +363,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             driver: reports.os_build.clone(),
             limits: Limits {
                 max_allocation: AllocationLimit::AddressSpace(reports.cpu.max_allocation),
+                allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: false,
         });
@@ -399,6 +410,8 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     bytes: metal.max_allocation,
                     by: DeviceAllocationBound::MetalMaxBufferLength,
                 },
+                // Its buffers are mappings of whole host pages.
+                allocations: Ok(NativeAllocations { least: 0, granularity: reports.page }),
             },
             tensor_operations: metal.tensor_operations,
         });
@@ -463,6 +476,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     bytes: cuda.max_allocation,
                     by: DeviceAllocationBound::CudaTotalMemory,
                 },
+                allocations: Ok(NativeAllocations { least: 0, granularity: cuda.allocation_granularity }),
             },
             tensor_operations: false,
         });
@@ -522,7 +536,8 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         };
         let own = own_memory(&builder, physical);
         let heaps = &vulkan.memory;
-        let placement = vulkan.floor.clone().and_then(|()| match memory {
+        // A device without a least memory object is unavailable for it.
+        let placement = vulkan.floor.clone().and(vulkan.least_object.clone().map(drop)).and_then(|()| match memory {
             DeviceMemory::Host => Ok(Decided::Host),
             DeviceMemory::Own => Ok(Decided::Own),
             DeviceMemory::Undecided => Err(undecided(reports, vulkan.uuid)),
@@ -539,6 +554,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     bytes: vulkan.max_allocation,
                     by: DeviceAllocationBound::VulkanMaxAllocation,
                 },
+                allocations: vulkan.least_object.clone().map(|least| NativeAllocations { least, granularity: 1 }),
             },
             tensor_operations: false,
         });
@@ -693,7 +709,7 @@ fn reported_kind(kinds: &[KindReport], id: u32) -> &KindReport {
         .expect("the rule places only kinds a backend reports")
 }
 
-/// Apply the placement rule to a backend's `kinds`: every contract and shape
+/// Apply the placement rule to a backend's `kinds`: every contract
 /// is placed, and every kind placed anywhere joins the executor by `add`, in
 /// the order the placements name them, which is the order their paths are
 /// made in.
@@ -704,9 +720,9 @@ fn place_kinds(
     mut add: impl FnMut(&mut ExecutorBuilder<'_>, &KindReport) -> OwnKind,
 ) {
     let mut added: Vec<(u32, OwnKind)> = Vec::new();
-    for placing in Placing::ALL {
+    for contract in Contract::ALL {
         let mut placed = Vec::new();
-        for id in place(kinds, memory_is_host, placing) {
+        for id in place(kinds, memory_is_host, contract) {
             let own = match added.iter().find(|(kind, _)| *kind == id) {
                 Some((_, own)) => *own,
                 None => {
@@ -717,10 +733,7 @@ fn place_kinds(
             };
             placed.push(own);
         }
-        executor.place(placing, &placed);
-        if let Placing::Reserved(contract) = placing {
-            executor.reserves(contract, reserving(kinds, memory_is_host, contract));
-        }
+        executor.place(contract, &placed);
     }
 }
 

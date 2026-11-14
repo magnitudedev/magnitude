@@ -1,7 +1,7 @@
 //! Revision-independent material for hardware fingerprints. Stable native
 //! selectors and store identities replace every revision-local identifier.
 
-use crate::{AccessPath, DeviceTopology, ExecutorId, Placing, StoreId};
+use crate::{AccessPath, Contract, DeviceTopology, ExecutorId, StoreId};
 use serde_json::{json, Value};
 
 impl DeviceTopology {
@@ -57,11 +57,11 @@ impl DeviceTopology {
                 let physical = self
                     .physical_device(executor.physical())
                     .expect("an executor's device is of its revision");
-                let placements = Placing::ALL
+                let placements = Contract::ALL
                     .into_iter()
-                    .map(|placing| {
+                    .map(|contract| {
                         executor
-                            .placement(placing)
+                            .placement(contract)
                             .iter()
                             .map(|&id| {
                                 let kind = self
@@ -81,7 +81,6 @@ impl DeviceTopology {
                                     "native": kind.native(),
                                     "name": kind.name(),
                                     "reach": kind.reach(),
-                                    "obtained": kind.obtained(),
                                     "paths": paths,
                                 })
                             })

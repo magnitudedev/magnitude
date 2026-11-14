@@ -1,6 +1,7 @@
 // Read directory-selected slots, rows16 rows of the table's resident
 // representation, through the row decoder, and round once to the activation
-// element.
+// element. Slot s is row s % P of record s / P, read where its storage holds
+// the record (`records (slots)`).
 
 use lib::core::{activation, gathered};
 
@@ -13,7 +14,10 @@ fn stored_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     let values = seismic::cpu::tensor::floats(shared, cx.dim_w() as usize);
     // A row without a slot reads zeros.
     match slot {
-        Some(slot) => cx.arg_slots().decode_row(slot, values),
+        Some(slot) => {
+            let per = cx.dim_p() as usize;
+            cx.arg_slots().record(slot / per).decode_row(slot % per, values)
+        }
         None => values.fill(0.0),
     }
     for value in values.iter_mut() {

@@ -2,14 +2,14 @@
 //! so that the OS and other programs keep room for their swap, caches and
 //! logs.
 //!
-//! The reserve is the volume's motion's margin ([`StoreMotion::margin`]) over
-//! the writer's reaction time, and nothing else: neither macOS nor Linux
+//! The reserve is what other programs may write to the volume within the
+//! writer's reaction time, and nothing else: neither macOS nor Linux
 //! reports a line of its own on a volume. Available space (`f_bavail`)
 //! already leaves out what the filesystem reserves (ext4's reserved blocks),
 //! and APFS's low-disk levels are notifications (`VQ_LOWDISK`,
 //! `VQ_VERYLOWDISK`) that report no threshold.
 
-use super::policy::{MotionMeter, READING_INTERVAL, StoreMotion, machine_rate};
+use super::policy::machine_rate;
 use seismic::ObservationError;
 use std::io::Write as _;
 use seismic::VolumeId;
@@ -21,23 +21,37 @@ use std::time::{Duration, Instant};
 /// The bytes the write-rate probe writes and syncs.
 const WRITE_PROBE_BYTES: usize = 64 << 20;
 
+/// The interval a writer reads its volume at: a refused writer writes
+/// nothing more, so this is its whole reaction to a reading. It is the
+/// cadence of the download's volume writer (the download reserve), not of the
+/// memory model, which has no fixed timers: it sizes only that writer's
+/// margin, never a memory budget.
+const VOLUME_READING_INTERVAL: Duration = Duration::from_millis(100);
+
 /// The reserve of the volume one writer writes, and the space it leaves
 /// that writer.
 ///
 /// The writer asks for its space before each write, giving every byte it
 /// has written to the volume so far. The volume is read again once a reading
 /// interval has passed since the last reading; between readings, the space
-/// is the last reading's less what the writer wrote since. A writer refused
-/// writes nothing more, so its reaction to a reading is the interval alone,
-/// and the margin is the volume's motion over it: the fluctuation, plus
-/// what other programs write at their fastest rate within one interval.
+/// is the last reading's less what the writer wrote since. Its margin
+/// ([`Self::margin`]) is what other programs may write within one interval:
+/// the steady fluctuation (the largest fall within one interval), plus the
+/// fastest rate one program writes the volume at over the interval.
 ///
 /// Other programs' writes are judged on available space plus the writer's
-/// own written bytes, as [`MotionMeter`] judges a host's own holding: the
-/// writer's writes lower the one and raise the other by the same bytes.
+/// own written bytes: the writer's writes lower the one and raise the other
+/// by the same bytes.
 #[derive(Debug)]
 pub struct VolumeReserve {
-    meter: MotionMeter,
+    /// The fastest rate one program writes the volume at before any reading
+    /// of it: its sequential write rate ([`Self::of_volume`]).
+    write_rate: f64,
+    /// The largest fall of the judged space within one reading interval.
+    fluctuation: u64,
+    /// The fastest rate other programs were seen taking the volume at
+    /// across readings, past the fluctuation.
+    fastest: f64,
     last: Option<VolumeReading>,
 }
 
@@ -46,40 +60,26 @@ struct VolumeReading {
     at: Instant,
     space: u64,
     written: u64,
+    /// Available space plus the writer's own written bytes.
+    judged: u64,
 }
 
 impl VolumeReserve {
-    /// A reserve before any reading of the volume: `prior`, the volume's
-    /// sequential write rate ([`StoreMotion::of_volume`]).
-    pub fn new(prior: StoreMotion) -> Self {
-        Self { meter: MotionMeter::new(prior), last: None }
+    /// A reserve before any reading of the volume: other programs write it
+    /// at most at `write_rate` bytes a second.
+    ///
+    /// # Panics
+    /// Where `write_rate` is not a positive finite rate: what bounds a take
+    /// is measured, never zero.
+    pub fn new(write_rate: f64) -> Self {
+        assert!(write_rate.is_finite() && write_rate > 0.0, "a write rate is measured and positive, not {write_rate}");
+        Self { write_rate, fluctuation: 0, fastest: 0.0, last: None }
     }
 
-    /// The bytes the volume keeps free of its writer.
-    pub fn margin(&self) -> u64 {
-        self.meter.motion().margin(READING_INTERVAL, Duration::ZERO, None)
-    }
-
-    /// The bytes the writer may still write at `at`, having written
-    /// `written` so far; `available` reads the volume's available space, and
-    /// is called once a reading interval has passed since the last reading.
-    pub fn space<E>(&mut self, at: Instant, written: u64, available: impl FnOnce() -> Result<u64, E>) -> Result<u64, E> {
-        if let Some(last) = self.last.filter(|last| at.duration_since(last.at) < READING_INTERVAL) {
-            return Ok(last.space.saturating_sub(written.saturating_sub(last.written)));
-        }
-        let available = available()?;
-        self.meter.read(at, available, Some(written));
-        let space = available.saturating_sub(self.margin());
-        self.last = Some(VolumeReading { at, space, written });
-        Ok(space)
-    }
-}
-
-impl StoreMotion {
-    /// The motion of the volume holding `path` before any reading of it: no
-    /// measured fluctuation, and the volume's sequential write rate (bytes
-    /// written to a new file there and synced, timed, then the file
-    /// removed), the fastest one program writes it at.
+    /// The reserve of the volume holding `path` before any reading of it:
+    /// its sequential write rate (bytes written to a new file there and
+    /// synced, timed, then the file removed), the fastest one program writes
+    /// it at.
     ///
     /// A generic figure of the volume, measured once: where `cache` names a
     /// kernel cache and the volume reports a UUID, the rate that cache's
@@ -87,7 +87,36 @@ impl StoreMotion {
     /// keep none; elsewhere, measured.
     pub fn of_volume(path: &Path, volume: &VolumeId, cache: Option<&Path>) -> Result<Self, ObservationError> {
         let figure = cache.zip(volume.uuid.as_ref()).map(|(cache, uuid)| (cache, format!("volume-write:{uuid}")));
-        Ok(Self::prior(machine_rate(figure, || write_rate(path).map_err(|error| failed(path, error)))?))
+        Ok(Self::new(machine_rate(figure, || write_rate(path).map_err(|error| failed(path, error)))?))
+    }
+
+    /// The bytes the volume keeps free of its writer.
+    pub fn margin(&self) -> u64 {
+        let rate = self.write_rate.max(self.fastest);
+        self.fluctuation.saturating_add((rate * VOLUME_READING_INTERVAL.as_secs_f64()) as u64)
+    }
+
+    /// The bytes the writer may still write at `at`, having written
+    /// `written` so far; `available` reads the volume's available space, and
+    /// is called once a reading interval has passed since the last reading.
+    pub fn space<E>(&mut self, at: Instant, written: u64, available: impl FnOnce() -> Result<u64, E>) -> Result<u64, E> {
+        if let Some(last) = self.last.filter(|last| at.duration_since(last.at) < VOLUME_READING_INTERVAL) {
+            return Ok(last.space.saturating_sub(written.saturating_sub(last.written)));
+        }
+        let available = available()?;
+        let judged = available.saturating_add(written);
+        if let Some(last) = self.last {
+            let fall = last.judged.saturating_sub(judged);
+            let span = at.duration_since(last.at);
+            if span <= VOLUME_READING_INTERVAL {
+                self.fluctuation = self.fluctuation.max(fall);
+            } else if fall > self.fluctuation {
+                self.fastest = self.fastest.max(fall as f64 / span.as_secs_f64());
+            }
+        }
+        let space = available.saturating_sub(self.margin());
+        self.last = Some(VolumeReading { at, space, written, judged });
+        Ok(space)
     }
 }
 
@@ -132,13 +161,13 @@ impl VolumeReserves {
 
     /// The volume holding the directory `path`, written by this process:
     /// its reserve kept from now on, its prior the volume's write rate as
-    /// the kernel cache keeps it ([`StoreMotion::of_volume`]).
+    /// the kernel cache keeps it ([`VolumeReserve::of_volume`]).
     pub fn register(&self, path: &Path) -> Result<VolumeId, ObservationError> {
         let volume = seismic::volume_identity(path).map_err(|error| failed(path, error))?;
         let mut volumes = self.volumes();
         if !volumes.contains_key(&volume) {
-            let prior = StoreMotion::of_volume(path, &volume, self.cache.as_deref())?;
-            volumes.insert(volume.clone(), VolumeReserve::new(prior));
+            let reserve = VolumeReserve::of_volume(path, &volume, self.cache.as_deref())?;
+            volumes.insert(volume.clone(), reserve);
         }
         Ok(volume)
     }
@@ -189,8 +218,8 @@ mod tests {
     fn a_volume_keeps_its_write_rate_over_a_reading_interval() {
         let start = Instant::now();
         for rate in [1e9, 3e9] {
-            let mut reserve = VolumeReserve::new(StoreMotion::new(0, rate));
-            let margin = (rate * READING_INTERVAL.as_secs_f64()) as u64;
+            let mut reserve = VolumeReserve::new(rate);
+            let margin = (rate * VOLUME_READING_INTERVAL.as_secs_f64()) as u64;
             assert_eq!(reserve.margin(), margin);
             assert_eq!(reserve.space(start, 0, || Ok::<_, ObservationError>(100 * GB)), Ok(100 * GB - margin));
         }
@@ -202,7 +231,7 @@ mod tests {
     #[test]
     fn a_writers_own_writes_are_not_takes() {
         let start = Instant::now();
-        let mut reserve = VolumeReserve::new(StoreMotion::new(0, 1e9));
+        let mut reserve = VolumeReserve::new(1e9);
         let margin = reserve.margin();
         for second in 0..5 {
             let at = start + Duration::from_secs(second);
@@ -210,7 +239,7 @@ mod tests {
             assert_eq!(reserve.space(at, written, || Ok::<_, ObservationError>(100 * GB - written)), Ok(100 * GB - written - margin));
         }
         assert_eq!(reserve.margin(), margin);
-        let between = start + Duration::from_secs(4) + READING_INTERVAL / 2;
+        let between = start + Duration::from_secs(4) + VOLUME_READING_INTERVAL / 2;
         assert_eq!(reserve.space(between, 41 * GB, unread), Ok(59 * GB - margin));
         // Another program's write is a take at its rate.
         let at = start + Duration::from_secs(5);
@@ -225,20 +254,20 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("volume-write-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let identity = seismic::volume_identity(&directory).unwrap();
-        let measured = StoreMotion::of_volume(&directory, &identity, None).unwrap();
-        assert!(measured.take_rate() > 0.0 && measured.take_rate().is_finite());
-        assert_eq!(measured.fluctuation(), 0);
+        let measured = VolumeReserve::of_volume(&directory, &identity, None).unwrap();
+        assert!(measured.write_rate > 0.0 && measured.write_rate.is_finite());
+        assert_eq!(measured.fluctuation, 0);
         if let Some(uuid) = &identity.uuid {
             let cache = directory.join("kernels");
             let stored = machine_rate(Some((cache.as_path(), format!("volume-write:{uuid}"))), || Ok::<_, std::convert::Infallible>(7e9));
             assert_eq!(stored, Ok(7e9));
-            assert_eq!(StoreMotion::of_volume(&directory, &identity, Some(&cache)).unwrap().take_rate(), 7e9);
+            assert_eq!(VolumeReserve::of_volume(&directory, &identity, Some(&cache)).unwrap().write_rate, 7e9);
             // The fit and the writer read one reserve of the volume.
             let reserves = Arc::new(VolumeReserves::new(Some(cache)));
             assert_eq!(reserves.margin(&identity), None);
             let space = Arc::clone(&reserves).space(directory.clone());
             let available = seismic::volume_available(&directory).unwrap().value;
-            let margin = (7e9 * READING_INTERVAL.as_secs_f64()) as u64;
+            let margin = (7e9 * VOLUME_READING_INTERVAL.as_secs_f64()) as u64;
             assert!(space(0).unwrap() <= available.saturating_sub(margin));
             assert_eq!(reserves.margin(&identity), Some(margin));
         }

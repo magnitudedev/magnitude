@@ -24,13 +24,26 @@ pub mod toolchain;
 pub mod topology;
 pub mod transfer;
 
-/// The accounts a test opens a device with: none bounds or charges.
+/// The ledger a test's device and allocations charge: one tally of host
+/// RAM that bounds nothing, which every store and entry of a test is, so a
+/// range carved for a test's entry lies in its block's store.
 #[cfg(test)]
-pub(crate) fn test_accounts() -> MemoryAccounts {
-    let unbounded = || -> std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount> {
-        std::sync::Arc::new(seismic_compiler::executable::Unbounded)
-    };
-    MemoryAccounts { device: unbounded(), upload: unbounded(), host: unbounded() }
+fn test_tally() -> seismic_memory::entry::Tally {
+    static TALLY: std::sync::OnceLock<seismic_memory::entry::Tally> = std::sync::OnceLock::new();
+    TALLY.get_or_init(|| seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)).clone()
+}
+
+/// The stores a test opens a device with ([`test_tally`]).
+#[cfg(test)]
+pub(crate) fn test_stores() -> CudaStores {
+    let tally: std::sync::Arc<dyn seismic_memory::entry::Store> = std::sync::Arc::new(test_tally());
+    CudaStores { device: tally.clone(), host: tally }
+}
+
+/// The entry a test's allocations charge ([`test_tally`]).
+#[cfg(test)]
+pub(crate) fn test_entry() -> std::sync::Arc<dyn seismic_memory::entry::Entry> {
+    std::sync::Arc::new(test_tally())
 }
 
 /// Test-only: the first device, opened and held alone for the test; `None`
@@ -58,7 +71,7 @@ pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, Opene
             return None;
         }
     }
-    let opened = open(0, test_accounts()).unwrap_or_else(|error| panic!("the CUDA device fails to open: {error}"));
+    let opened = open(0, test_stores()).unwrap_or_else(|error| panic!("the CUDA device fails to open: {error}"));
     Some((exclusive, opened))
 }
 
@@ -90,8 +103,7 @@ pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
-pub use driver::{reservation_granule, RangeMemory, ReservedMemory, RESERVATION_CHUNKS};
-pub use executor::{CudaResizer, Device, Executor, MemoryAccounts, MemoryInfo, NativeStream};
+pub use executor::{CudaStores, Device, Executor, MemoryInfo, NativeStream};
 pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{

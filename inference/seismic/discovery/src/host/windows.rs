@@ -1,9 +1,17 @@
-//! Windows x64: `GlobalMemoryStatusEx` and job-object memory limits.
+//! Windows x64: `GlobalMemoryStatusEx`, the memory performance counters,
+//! job-object memory limits, hard faults and the low-memory resource
+//! notification.
 //!
 //! Physical RAM, commit limit and page files remain separate. The commit
 //! figures are process-scoped ("the maximum this process can commit").
 
-use super::{HostStatus, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
+use super::{
+    Counted, Harm, HostSample, Lag, ObservationError, OwnCold, OwnReclaimed, PressureLevel, ProcessLimitKind, ProcessMemoryLimit, Supply,
+    Widened,
+};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::System::Memory::QueryMemoryResourceNotification;
+use windows_sys::Win32::System::Performance::{PDH_HCOUNTER, PDH_HQUERY};
 use seismic_topology::{Reported, ReportedBy};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::System::JobObjects::{
@@ -11,7 +19,9 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
-use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+};
 use windows_sys::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW,
 };
@@ -344,20 +354,204 @@ pub(super) fn pin(cpus: &[usize]) -> Result<(), String> {
     }
 }
 
-pub(super) fn sample() -> Result<HostStatus, ObservationError> {
-    let status = memory_status().map_err(ObservationError::Failed)?;
-    Ok(HostStatus {
-        // Available physical memory is standby and free pages, neither of
-        // which holds another program's working set.
-        allocatable: Reported::new(
-            status.ullAvailPhys.min(status.ullAvailPageFile),
-            ReportedBy::WindowsPhysicalAndCommit,
-        ),
-        reclaimable: 0,
-        limits: job_limits()?,
-        limit_visibility: LimitVisibility::Complete,
-        held: None,
+/// Host RAM now: the free, zero and standby lists and the hard-fault page
+/// reads from one collection of the performance counters, bounded by the
+/// commit this process has left (`GlobalMemoryStatusEx`) and its job's
+/// limit; this process's hard faults, each one paging read ([`Harm`]); the
+/// low-memory notification.
+///
+/// # Panics
+/// Where a figure cannot be read, naming it.
+pub(super) fn sample() -> HostSample {
+    let at = Instant::now();
+    let status = memory_status().unwrap_or_else(|error| panic!("invariant violated: {error}"));
+    let counters = counters();
+    // What the lists hold, within the commit this process can still make:
+    // a page taken is committed first.
+    let room = (counters.free_zero + counters.standby).min(status.ullAvailPageFile);
+    let free_above_target = counters.free_zero.min(room);
+    let host = super::Scope {
+        total: status.ullTotalPhys,
+        supply: Supply { free_above_target, clean_cache: room - free_above_target, cold_reclaimable: 0 },
+    };
+    let limits = job_limits().unwrap_or_else(|error| panic!("invariant violated: this process's job limits: {error}"));
+    // A job's commit counts a growth in the call, whichever scope binds.
+    let scope = super::binding(host, &limits).scope;
+    // The process's own read after the machine's, so a fault between the
+    // two counts as its own alone: never another program's. Both are the
+    // kernel's own counts, read in the call: they show every event before
+    // the reading began.
+    let harm = Harm { machine: counters.page_reads, own: OWN_HARD_FAULTS.of(own_hard_faults()) };
+    let counted_at = Instant::now();
+    let counted = Counted { at: counted_at, lag: counted_at.duration_since(at) };
+    HostSample {
+        at,
+        page_bytes: page(),
+        total: scope.total,
+        supply: scope.supply,
+        counted,
+        // The working-set manager trims cold pages to the standby list,
+        // which `clean_cache` counts.
+        cold: 0,
+        own_cold: OwnCold::Unobserved,
+        own_reclaimed: own_trimmed(),
+        wired: None,
+        harm: Some(harm),
+        pressure: Some(if low_memory() { PressureLevel::Warn } else { PressureLevel::Normal }),
+        // A free decommits in the call, and a growth commits in it.
+        lag: Lag { release: Duration::ZERO, growth: Duration::ZERO },
+    }
+}
+
+/// The system's page (`GetSystemInfo`'s `dwPageSize`, through the one owner
+/// of the host page, `seismic_memory::host_page`), read once.
+fn page() -> u64 {
+    static PAGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| seismic_memory::host_page().unwrap_or_else(|error| panic!("invariant violated: the system's page: {error}")))
+}
+
+/// The performance counters a sample reads, collected together.
+struct Counters {
+    /// `\Memory\Free & Zero Page List Bytes`.
+    free_zero: u64,
+    /// `\Memory\Standby Cache {Core, Normal Priority, Reserve} Bytes`.
+    standby: u64,
+    /// `\Memory\Page Reads/sec`'s raw count: hard-fault reads since boot,
+    /// widened.
+    page_reads: u64,
+}
+
+/// The open query of [`Counters`], opened once.
+struct Query {
+    query: PDH_HQUERY,
+    /// Free & zero, the three standby lists, page reads.
+    counters: [PDH_HCOUNTER; 5],
+}
+
+// SAFETY: PDH's handles are process-wide; the query is only collected under
+// its lock.
+unsafe impl Send for Query {}
+
+const COUNTER_PATHS: [&str; 5] = [
+    "\\Memory\\Free & Zero Page List Bytes",
+    "\\Memory\\Standby Cache Core Bytes",
+    "\\Memory\\Standby Cache Normal Priority Bytes",
+    "\\Memory\\Standby Cache Reserve Bytes",
+    "\\Memory\\Page Reads/sec",
+];
+
+fn pdh(call: &str, status: u32) {
+    assert_eq!(status, 0, "invariant violated: {call} returned {status:#x}");
+}
+
+static PAGE_READS: Widened = Widened::new();
+static OWN_HARD_FAULTS: Widened = Widened::new();
+
+fn counters() -> Counters {
+    use windows_sys::Win32::System::Performance::{
+        PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetRawCounterValue, PdhOpenQueryW, PDH_RAW_COUNTER,
+    };
+    static QUERY: std::sync::OnceLock<std::sync::Mutex<Query>> = std::sync::OnceLock::new();
+    let query = QUERY.get_or_init(|| {
+        let mut query = std::ptr::null_mut();
+        pdh("PdhOpenQueryW", unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) });
+        let counters = COUNTER_PATHS.map(|path| {
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut counter = std::ptr::null_mut();
+            pdh(&format!("PdhAddEnglishCounterW({path})"), unsafe { PdhAddEnglishCounterW(query, wide.as_ptr(), 0, &mut counter) });
+            counter
+        });
+        std::sync::Mutex::new(Query { query, counters })
+    });
+    let query = query.lock().expect("the counters' query lock is never poisoned");
+    pdh("PdhCollectQueryData", unsafe { PdhCollectQueryData(query.query) });
+    let [free_zero, core, normal, reserve, reads] = std::array::from_fn(|index| {
+        let mut raw: PDH_RAW_COUNTER = unsafe { std::mem::zeroed() };
+        pdh(&format!("PdhGetRawCounterValue({})", COUNTER_PATHS[index]), unsafe {
+            PdhGetRawCounterValue(query.counters[index], std::ptr::null_mut(), &mut raw)
+        });
+        raw.FirstValue as u64
+    });
+    // `Page Reads/sec` counts in 32 bits (`PERF_COUNTER_COUNTER`).
+    Counters { free_zero, standby: core + normal + reserve, page_reads: PAGE_READS.of(reads as u32) }
+}
+
+/// This process's hard faults since it started: its
+/// `SYSTEM_PROCESS_INFORMATION` entry's `HardFaultCount` (offset 0x10 on
+/// x64, `UniqueProcessId` at 0x50), the one per-process count of them.
+fn own_hard_faults() -> u32 {
+    use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+    use windows_sys::Win32::Foundation::STATUS_INFO_LENGTH_MISMATCH;
+    let mut buffer = vec![0u64; 1 << 16];
+    loop {
+        let bytes = u32::try_from(buffer.len() * 8).expect("the process table's buffer fits u32");
+        let mut returned = 0u32;
+        let status =
+            unsafe { NtQuerySystemInformation(SystemProcessInformation, buffer.as_mut_ptr().cast(), bytes, &mut returned) };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            buffer.resize((returned as usize).div_ceil(8) * 2, 0);
+            continue;
+        }
+        assert!(status >= 0, "invariant violated: NtQuerySystemInformation(SystemProcessInformation) returned {status:#x}");
+        break;
+    }
+    // SAFETY: the buffer's bytes, as the OS wrote them.
+    let table: &[u8] = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), buffer.len() * 8) };
+    let field = |at: usize, width: usize| -> u64 {
+        let bytes = table.get(at..at + width).expect("invariant violated: the process table is cut short");
+        let mut value = [0u8; 8];
+        value[..width].copy_from_slice(bytes);
+        u64::from_le_bytes(value)
+    };
+    let here = u64::from(std::process::id());
+    let mut at = 0usize;
+    loop {
+        if field(at + 0x50, 8) == here {
+            return field(at + 0x10, 4) as u32;
+        }
+        match field(at, 4) {
+            0 => panic!("invariant violated: the process table lists no entry for this process"),
+            next => at += next as usize,
+        }
+    }
+}
+
+/// This process's private pages out of its working set: its private commit
+/// less its private working set ([`HostSample::own_reclaimed`]); none where
+/// the OS refuses the counters that hold the private working set (before
+/// Windows 10 1809).
+fn own_trimmed() -> Option<OwnReclaimed> {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
+        ..Default::default()
+    };
+    let read = unsafe {
+        K32GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX2).cast(), counters.cb)
+    };
+    // A copy-on-write page of a mapped image turns private in the working
+    // set with its commit charged to the image's section, so the private
+    // working set may exceed the private commit: none is then out of it.
+    // An upper bound ([`OwnReclaimed::exact`]), and a trimmed page waits in
+    // RAM on the modified or standby list, which no figure here separates:
+    // none is counted stored.
+    (read != 0).then(|| OwnReclaimed {
+        bytes: (counters.PrivateUsage as u64).saturating_sub(counters.PrivateWorkingSetSize as u64),
+        stored: 0,
+        exact: false,
     })
+}
+
+/// Whether the OS signals low memory now: the low-memory resource
+/// notification's state ([`crate::pressure`] waits on its changes).
+fn low_memory() -> bool {
+    let mut state = 0;
+    let low = crate::pressure::low_memory_notification();
+    assert!(
+        unsafe { QueryMemoryResourceNotification(low, &mut state) } != 0,
+        "invariant violated: QueryMemoryResourceNotification failed: {}",
+        std::io::Error::last_os_error()
+    );
+    state != 0
 }
 
 fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {

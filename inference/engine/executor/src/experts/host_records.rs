@@ -324,6 +324,9 @@ enum Host {
     /// that misses it (a cut-in the group's end waits behind among them)
     /// lands it apart, never waiting on the seed.
     Seeding { staged: Staged },
+    /// A hole: the store holds no storage for it, so nothing lands in it
+    /// until a growth backs it again ([`HostRecords::grow`]).
+    Absent,
 }
 
 impl Host {
@@ -384,6 +387,8 @@ pub(super) struct HostRecords {
     alone: Vec<usize>,
     holding: Vec<usize>,
     claimed: usize,
+    /// The records the store holds storage for: every one but the holes.
+    present: u32,
     /// How the steps resolving the records' map see an unmapping.
     resolution: Resolution,
     /// The device is past every point before this ([`Self::passed`]), none
@@ -451,6 +456,7 @@ impl HostRecords {
             alone: vec![0; layers],
             holding: vec![0; layers],
             claimed: 0,
+            present: 0,
             pool: 0,
             resolution,
             progress: None,
@@ -463,7 +469,7 @@ impl HostRecords {
             inbound,
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
-        host.grow(records);
+        host.grow(0..records);
         host
     }
 
@@ -501,6 +507,7 @@ impl HostRecords {
             Host::Graced { .. } => self.graced.retain(|&graced| graced != record),
             Host::Claimed => self.claimed -= 1,
             Host::Seeding { staged } => self.holding[staged.0] -= 1,
+            Host::Absent => self.present += 1,
         }
         match content {
             Host::Ready => assert!(self.ready.insert(record), "record {record} is listed ready once"),
@@ -523,6 +530,7 @@ impl HostRecords {
             Host::Graced { .. } => self.graced.push(record),
             Host::Claimed => self.claimed += 1,
             Host::Seeding { staged } => self.holding[staged.0] += 1,
+            Host::Absent => self.present -= 1,
         }
         match (old.present(), content.present()) {
             (left, entered) if left == entered => {}
@@ -538,35 +546,6 @@ impl HostRecords {
                 }
             }
         }
-    }
-
-    /// Move kept record `from`'s expert to ready record `to`, `from` ready
-    /// then: the expert never leaves the tier, so its word stays claimed and
-    /// no read, whoever's, can claim it while it moves. Its expert.
-    ///
-    /// The one change of two records that [`Self::set`] does not make, as
-    /// `set` changes one record and releases the word of an expert leaving
-    /// it. Of the indices `set` keeps, a move changes only those keyed by
-    /// record: `ready` (`to` leaves it, `from` joins), `kept` (the expert's
-    /// record) and `answering`. Those keyed by expert or counted by group
-    /// stay as they are, the same expert kept alone or as a copy: `alone`,
-    /// `holdings`, `lacking` and `landing`; neither record is graced or
-    /// claimed (`graced`, `claimed`).
-    fn relocate(&mut self, from: u32, to: u32) -> Staged {
-        let moved = self.records[from as usize];
-        let staged = moved.present().expect("a kept record keeps its expert");
-        assert!(matches!(moved, Host::Kept(_) | Host::Answering(..)), "record {from} moves only kept");
-        assert!(self.ready.remove(&to) && self.records[to as usize] == Host::Ready, "record {from} moves to a ready record, not {to}");
-        self.records[to as usize] = moved;
-        self.records[from as usize] = Host::Ready;
-        self.ready.insert(from);
-        self.kept.insert(staged, to);
-        for answering in &mut self.answering {
-            if *answering == from {
-                *answering = to;
-            }
-        }
-        staged
     }
 
     /// Map `staged`'s entry to `record`, or unmap it (none), from the first
@@ -591,8 +570,24 @@ impl HostRecords {
         Grant { map: self.maps[staged.0].clone(), staged, record, from, mapped: std::sync::atomic::AtomicBool::new(false) }
     }
 
-    /// Its records.
+    /// The records the store holds storage for: every one but the holes.
     pub fn records(&self) -> u32 {
+        self.present
+    }
+
+    /// The indices of the records the store holds storage for: every one
+    /// but the holes.
+    #[cfg(test)]
+    pub fn backed(&self) -> impl Iterator<Item = u32> + '_ {
+        self.records
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| !matches!(state, Host::Absent))
+            .map(|(record, _)| record as u32)
+    }
+
+    /// One past its last record, a hole or not: the bound of every index.
+    fn extent(&self) -> u32 {
         self.records.len() as u32
     }
 
@@ -694,12 +689,16 @@ impl HostRecords {
         self.holdings
     }
 
-    /// Commit records up to `records`, the new ones ready.
-    pub fn grow(&mut self, records: u32) {
-        let from = self.records();
-        assert!(records >= from, "a host tier of {from} records grows to {records}");
-        self.records.resize(records as usize, Host::Ready);
-        self.ready.extend(from..records);
+    /// Back `records`, each a hole or past every record: ready from now.
+    pub fn grow(&mut self, records: impl IntoIterator<Item = u32>) {
+        for record in records {
+            if record >= self.extent() {
+                // Past every record: holes up to it, which `set` fills.
+                self.records.resize(record as usize + 1, Host::Absent);
+            }
+            assert_eq!(self.records[record as usize], Host::Absent, "a growth backs record {record}, which the store holds");
+            self.set(record, Host::Ready);
+        }
     }
 
     /// Kept record `record`'s place in the taking order at `rank`; none for
@@ -737,7 +736,7 @@ impl HostRecords {
     ) -> Vec<(Option<(Kept, K, Staged)>, u32)> {
         let ready = self.ready.range(self.lent..).count().min(self.reserved().saturating_sub(reserve + self.pool));
         let free = self.ready.range(self.lent..).take(ready).map(|&record| (None, record));
-        let kept = (self.lent..self.records())
+        let kept = (self.lent..self.extent())
             .filter(|&record| self.unheld(record))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .filter(|&((.., staged), _)| !pinned(staged))
@@ -853,7 +852,7 @@ impl HostRecords {
             Host::Answering(Whole { staged, kept, read, .. }, _) if answers => Some(taking(kept, staged, read, rank)),
             _ => self.place(record, rank),
         };
-        let order = (0..self.records())
+        let order = (0..self.extent())
             .filter(|&record| admits(record))
             .filter_map(|record| Some((place(record)?, record)))
             .collect::<Vec<_>>();
@@ -983,11 +982,7 @@ impl HostRecords {
     /// resolution of its layer is not before the park: its grant. Every landing takes its record here, the lowest ready one
     /// past the lent records (a lent one only where none past them is
     /// ready, as a prompt group's claim waits for a landing into it). A
-    /// shrink keeps a landing in place and cuts only above it
-    /// ([`Self::shrink_floor`]), and from the top down; so a landing lies
-    /// past a cut only where every record past the lent ones below it was
-    /// taken as it began: right after a growth a landing fills the records
-    /// below the growth before it touches the new ones a shrink cuts first.
+    /// shrink never evicts a landing's record ([`Self::evictable`]).
     fn take_lacked(&mut self, staged: Staged, park: Option<&Park>, taking: Taking) -> Grant {
         let record = self.ready.range(self.lent..).next().or_else(|| self.ready.first()).copied().expect("a record taken is ready");
         let from = park.map(|park| park.unresolved(staged.0));
@@ -1150,7 +1145,7 @@ impl HostRecords {
     /// is a few passes old at most when a claim reads it, and each entry is
     /// checked again as it is taken.
     pub fn prepare_demand<K: Ord + Copy>(&mut self, rank: impl Rank<K>, shares: Option<&[usize]>, depth: usize, sequence: Step) {
-        let order = (0..self.records())
+        let order = (0..self.extent())
             .filter(|&record| self.unheld(record))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .collect::<Vec<_>>();
@@ -1284,7 +1279,7 @@ impl HostRecords {
         // The first in taking order at the shares: the least ranked of the
         // layers past theirs, else the least ranked ([`Self::by_shares`]).
         let shares = Shares { of: shares, landing: Some(staged.0) };
-        let first = (0..self.records())
+        let first = (0..self.extent())
             .filter(|&record| self.reclaims(record, &read, park))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .min_by_key(|&(place @ (.., (layer, _)), record)| (self.past(layer, shares) == 0, place, record));
@@ -1420,6 +1415,7 @@ impl HostRecords {
                 true
             }
             Host::Kept(_) | Host::Answering(..) | Host::Graced { .. } | Host::Landing { .. } | Host::Seeding { .. } => false,
+            Host::Absent => unreachable!("lent record {record} is a hole: the floor holds every lent record"),
         }
     }
 
@@ -1438,109 +1434,48 @@ impl HostRecords {
         }
     }
 
-    /// Whether record `record` is in flight, which a shrink keeps where it
-    /// is, never dropping it, moving it or moving another into it
-    /// ([`Self::shrink`]): a landing writes it, a copy reads it, a request's
-    /// answer is outstanding at it, or a prompt group holds it. A shrink
-    /// may change every other record: ready, graced, or kept and unheld.
-    fn in_flight(&self, record: u32) -> bool {
-        match self.records[record as usize] {
-            Host::Ready | Host::Graced { .. } | Host::Kept(Whole { holds: 0, .. }) => false,
-            Host::Landing { .. } | Host::Kept(_) | Host::Answering(..) | Host::Claimed | Host::Seeding { .. } => true,
-        }
-    }
-
-    /// The fewest records a shrink may leave ([`Self::shrink`]): every
-    /// record in flight lies below them, and the conveyor's lent records.
-    pub fn shrink_floor(&self) -> u32 {
-        let flying = (0..self.records()).rev().find(|&record| self.in_flight(record));
-        flying.map_or(self.lent, |record| self.lent.max(record + 1))
-    }
-
-    /// Shrink to `records` records, at least [`Self::shrink_floor`], between
-    /// flights (no step runs, so no graced record is read): every record in
-    /// flight stays where it is, landing, held or claimed as it was; of the
-    /// rest it drops the empty records first, then the kept first in taking
-    /// order at `rank` and `shares` (the shrunk store's), keeping the most
-    /// valuable, and each kept one at or
-    /// past `records` moves to a record below it that the rest leave,
-    /// mapped there from the first step not yet begun, each dropped one
-    /// unmapped. The moves, (from, to), whose bytes the caller copies before
-    /// any step reads them.
-    pub fn shrink<K: Ord + Copy>(&mut self, records: u32, rank: impl Rank<K>, shares: Option<&[usize]>) -> Vec<(u32, u32)> {
-        let count = self.records();
-        assert!(records <= count, "a host tier of {count} records shrinks to {records}");
-        let floor = self.shrink_floor();
-        assert!(records >= floor, "a host tier shrinks to {records} records, below its floor of {floor}");
-        let order = self.taking_order(&rank, Shares { of: shares, landing: None }, false, |record| !self.in_flight(record));
-        // Between flights no step reads a graced record: every one is empty.
-        for record in self.graced.clone() {
-            self.set(record, Host::Ready);
-        }
-        let empty = self.ready.clone();
-        let dropped_kept = ((count - records) as usize).saturating_sub(empty.len());
-        let (dropped, kept) = order.split_at(dropped_kept);
-        // The records below the shrink that the kept leave: the empty ones,
-        // then those whose experts are dropped.
-        let mut targets = empty.iter().copied().chain(dropped.iter().copied()).filter(|&record| record < records);
-        let moves = kept
+    /// The records a shrink may evict now, beside running steps or not, in
+    /// the order it takes them: past the lent ones (the floor's, which the
+    /// conveyor borrows), none in flight (a landing or a seed writes it, a
+    /// copy reads it, a request's answer is outstanding at it, or a prompt
+    /// group holds it); the ready ones first, then the graced, then the
+    /// kept and unheld first in taking order at `rank` and `shares` (the
+    /// store's), so it keeps the most valuable where their bytes are.
+    pub fn evictable<K: Ord + Copy>(&self, rank: impl Rank<K>, shares: Option<&[usize]>) -> Vec<u32> {
+        let past_lent = |record: &u32| *record >= self.lent;
+        let graced = self
+            .graced
             .iter()
-            .filter(|&&record| record >= records)
-            .map(|&from| (from, targets.next().expect("a kept record past the shrink has one below it")))
-            .collect::<Vec<_>>();
-        for &record in dropped {
-            let staged = self.unkeep(record);
-            self.store(staged, None);
-            self.set(record, Host::Ready);
-        }
-        for &(from, to) in &moves {
-            let staged = self.relocate(from, to);
-            self.store(staged, Some(to));
-        }
-        assert!(self.records[records as usize..].iter().all(|&content| content == Host::Ready), "a shrink keeps nothing past it");
-        self.records.truncate(records as usize);
-        self.ready.retain(|&record| record < records);
-        // A demand's prepared victims name records the shrink moved or
-        // dropped: none stands, and the next claim prepares again.
-        self.unprepare();
-        moves
+            .copied()
+            .filter(past_lent)
+            .filter(|&record| matches!(self.records[record as usize], Host::Graced { answer: None, .. }));
+        let kept = self.taking_order(&rank, Shares { of: shares, landing: None }, false, |record| record >= self.lent && self.unheld(record));
+        self.ready.iter().copied().filter(past_lent).chain(graced).chain(kept).collect()
     }
 
-    /// The fewest records a cut beside running steps may leave
-    /// ([`Self::cut_running`]): [`Self::shrink_floor`], and every graced
-    /// record still read as a request's outstanding answer, which the host
-    /// reads as well as the device.
-    pub fn running_floor(&self) -> u32 {
-        let answered = (0..self.records())
-            .rev()
-            .find(|&record| matches!(self.records[record as usize], Host::Graced { answer: Some(_), .. }));
-        answered.map_or(self.shrink_floor(), |record| self.shrink_floor().max(record + 1))
-    }
-
-    /// Cut to `records` records, at least [`Self::running_floor`], beside
-    /// running steps: every record at or past the cut is dropped, nothing
-    /// moved, and the expert each keeps or was graced from is unmapped from
+    /// Evict `records` ([`Self::evictable`] each): holes from now, nothing
+    /// moved. The expert each keeps or was graced from is unmapped from
     /// step `until(staged)` on where its entry still names that record
     /// ([`LandingMap::unmap_from`]): the first step that may no longer read
-    /// it, which no later than the first step not yet begun. Each dropped
-    /// expert is lacked from now, landed again as any miss is.
-    pub fn cut_running(&mut self, records: u32, until: impl Fn(Staged) -> Step) {
-        let count = self.records();
-        assert!(records <= count, "a host tier of {count} records is cut to {records}");
-        let floor = self.running_floor();
-        assert!(records >= floor, "a host tier is cut to {records} records beside running steps, below its floor of {floor}");
-        for record in records..count {
+    /// it, no later than the first step not yet begun, so the steps before
+    /// it still read it where its bytes are until the store releases them
+    /// behind them. Each evicted expert is lacked from now, landed again as
+    /// any miss is.
+    pub fn evict(&mut self, records: &[u32], until: impl Fn(Staged) -> Step) {
+        for &record in records {
+            assert!(record >= self.lent, "a shrink evicts lent record {record}");
             match self.records[record as usize] {
                 Host::Ready => {}
                 Host::Kept(Whole { staged, holds: 0, .. }) | Host::Graced { whole: Whole { staged, .. }, answer: None, .. } => {
                     self.unmap_from(staged, record, until(staged));
-                    self.set(record, Host::Ready);
                 }
-                other => unreachable!("record {record} past the running floor {floor} holds {other:?}"),
+                other => panic!("a shrink evicts record {record}, holding {other:?}"),
             }
+            self.set(record, Host::Absent);
         }
-        self.records.truncate(records as usize);
-        self.ready.retain(|&record| record < records);
+        // A demand's prepared victims may name an evicted record: none
+        // stands, and the next claim prepares again.
+        self.unprepare();
     }
 }
 
@@ -1780,7 +1715,7 @@ mod tests {
 
     /// A shrink leaves no prepared victim behind: a claim in the same step
     /// prepares again and takes a record the tier still has, never one the
-    /// shrink moved or dropped.
+    /// shrink evicted.
     #[test]
     fn a_claim_after_a_shrink_takes_no_victim_prepared_before_it() {
         let mut records = tier(3, 1, ONE, Resolution::BeforeStamp);
@@ -1789,7 +1724,9 @@ mod tests {
         }
         let ranked = [((0, 1), 5), ((0, 2), 1), ((0, 3), 3)];
         records.prepare_demand(reads(&ranked), None, 3, 5);
-        records.shrink(1, reads(&ranked), None);
+        let evicted = records.evictable(reads(&ranked), None);
+        assert_eq!(evicted, [1, 2, 0], "the least ranked first: 2 (step 1), 3 (step 3), then 1 (step 5)");
+        records.evict(&evicted[..2], |_| Step::MAX);
         assert!(records.unprepared(5), "the shrink's records want preparing again");
         assert_eq!(records.claim_prepared((0, 4), Demand::Lacked, |_| false, &park(at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
         let Claim::Taken(grant) = records.claim_demand((0, 4), Demand::Lacked, reads(&ranked), None, |_| false, &park(at(5), 1)) else { panic!("the kept record frees") };
@@ -1849,8 +1786,9 @@ mod tests {
         assert!(tier.complete());
         // One dropped and its record grown back: lacking one, the reserve
         // is one record.
-        tier.shrink(2, &rank, None);
-        tier.grow(3);
+        let evicted = tier.evictable(&rank, None)[0];
+        tier.evict(&[evicted], |_| Step::MAX);
+        tier.grow([evicted]);
         assert_eq!((tier.lacked(), tier.ready()), (1, 1));
         assert!(!refill(&mut tier, 2, &rank, &Unbegun::at(1)), "one record ready covers the one lacked");
         let lacked = (0..3).map(|expert| (0, expert)).find(|&staged| tier.located(staged) == Located::Lacked).expect("one lacked");
@@ -2039,12 +1977,12 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// A shrink keeps the most valuable records: it drops the empty first,
-    /// then the kept first in taking order, and moves a kept record past the
-    /// shrink into one below it that a dropped one leaves, each mapped
-    /// there and each dropped one unmapped; growth adds ready records.
+    /// A shrink keeps the most valuable records where they are: it evicts
+    /// the empty first, then the kept first in taking order (a banked copy
+    /// last), each evicted one unmapped and nothing moved, leaving holes; a
+    /// growth backs a hole again, ready.
     #[test]
-    fn a_host_tier_shrinks_to_its_most_valuable_records_and_grows_ready() {
+    fn a_host_tier_evicts_its_least_valuable_records_and_grows_ready() {
         let rank = reads(&[((0, 10), 8), ((0, 11), 2), ((0, 13), 2)]);
         let (mut tier, maps) = mapped(4, 1, ONE, Resolution::AfterStore);
         let grants = [13, 12, 11, 10].map(|expert| tier.grant_of((0, expert), 0).unwrap());
@@ -2057,24 +1995,27 @@ mod tests {
         }
         tier.banked((0, 11));
         tier.unlanded(1);
-        // Record 1 (empty), then record 0 (alone, step 2) are dropped:
-        // record 3 (alone, step 8) moves into record 1, record 2 (banked)
-        // into record 0.
-        assert_eq!(tier.shrink(2, &rank, None), [(3, 1), (2, 0)]);
+        // Record 1 (empty), record 0 (alone, step 2), record 3 (alone, step
+        // 8), then record 2 (banked).
+        let order = tier.evictable(&rank, None);
+        assert_eq!(order, [1, 0, 3, 2]);
+        tier.evict(&order[..2], |_| Step::MAX);
         assert_eq!(tier.records(), 2);
         assert!(tier.keeps((0, 10)) && tier.keeps((0, 11)) && !tier.keeps((0, 13)));
-        assert_eq!([10, 11, 13].map(|expert| maps.held((0, expert))), [Some(1), Some(0), None]);
+        assert_eq!([10, 11, 13].map(|expert| maps.held((0, expert))), [Some(3), Some(2), None], "the kept stay where their bytes are");
         assert_eq!(tier.alone(), [1]);
-        tier.grow(3);
-        assert_eq!(tier.take((0, 13), 0), Some(2), "the grown record is ready");
+        assert_eq!(tier.take((0, 12), 0), None, "a hole is never ready");
+        tier.grow([1]);
+        assert_eq!(tier.records(), 3);
+        assert_eq!(tier.take((0, 13), 0), Some(1), "the grown record is ready");
     }
 
-    /// A shrink keeps every record in flight where it is, below its floor:
-    /// a landing's record and one a copy holds are never dropped, moved or
-    /// moved into. The rest shrink around them, and the landing lands where
-    /// its claim took it.
+    /// A shrink never evicts a record in flight: a landing's record and one
+    /// a copy holds stay where they are, and the rest are evicted around
+    /// them; the landing lands where its claim took it, and once nothing is
+    /// in flight, every record is evictable.
     #[test]
-    fn a_host_tier_shrinks_around_its_records_in_flight() {
+    fn a_host_tier_evicts_around_its_records_in_flight() {
         let rank = reads(&[((0, 9), 8), ((0, 10), 6)]);
         let (mut tier, maps) = mapped(6, 1, ONE, Resolution::AfterStore);
         let grants = [14, 13, 12, 11, 10, 9].map(|expert| tier.grant_of((0, expert), 0).unwrap());
@@ -2090,29 +2031,31 @@ mod tests {
         // Expert 12 lands into record 2, in flight; a copy holds expert
         // 11's record 3.
         assert_eq!(tier.hold((0, 11)), Some(3));
-        assert_eq!(tier.shrink_floor(), 4, "every record in flight lies below the floor");
-        // Record 0 (empty), then record 1 (expert 13, never read) are
-        // dropped: record 4 (step 6) moves into record 0, record 5 (step 8)
-        // into record 1.
-        assert_eq!(tier.shrink(4, &rank, None), [(4, 0), (5, 1)]);
-        assert_eq!([9, 10, 11, 13].map(|expert| maps.held((0, expert))), [Some(1), Some(0), Some(3), None]);
+        // Record 0 (empty), record 1 (expert 13, never read), record 4
+        // (step 6), record 5 (step 8): never 2 or 3.
+        let order = tier.evictable(&rank, None);
+        assert_eq!(order, [0, 1, 4, 5]);
+        tier.evict(&order[..2], |_| Step::MAX);
+        assert_eq!([9, 10, 11, 13].map(|expert| maps.held((0, expert))), [Some(5), Some(4), Some(3), None]);
         assert!(tier.lands((0, 12)), "the landing is in flight where it was");
         grants[2].map();
         tier.landed(2, (0, 12), None, Kept::Alone);
         tier.unhold(3);
         assert_eq!(maps.held((0, 12)), Some(2));
-        assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
+        let mut order = tier.evictable(&rank, None);
+        order.sort_unstable();
+        assert_eq!(order, [2, 3, 4, 5], "nothing in flight");
     }
 
-    /// A cut beside running steps keeps every record in flight below it and
-    /// drops every record past it, moving nothing: each expert they kept is
-    /// lacked from then on and unmapped where its entry still names that
-    /// record, from the step `until` gives it, the running chain's first
-    /// step (900, steps begun through 1,000) or, for one the chain routed,
-    /// the first step not yet begun. Steps before then still read it; none
-    /// from then on does, and no landing takes a record past the cut.
+    /// A shrink beside running steps evicts what it chooses, moving
+    /// nothing: each expert its records kept is lacked from then on and
+    /// unmapped where its entry still names that record, from the step
+    /// `until` gives it, the running chain's first step (900, steps begun
+    /// through 1,000) or, for one the chain routed, the first step not yet
+    /// begun. Steps before then still read it; none from then on does, no
+    /// landing takes a hole, and a record in flight is never evicted.
     #[test]
-    fn a_cut_beside_running_steps_drops_what_lies_past_it_from_the_step_each_expert_needs() {
+    fn an_eviction_beside_running_steps_unmaps_from_the_step_each_expert_needs() {
         let (mut tier, maps) = mapped(6, 1, ONE, Resolution::BeforeStamp);
         let grants = [9, 10, 11, 12, 13, 14].map(|expert| tier.grant_of((0, expert), 0).unwrap());
         assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3, 4, 5], "each the lowest ready");
@@ -2122,22 +2065,22 @@ mod tests {
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
             }
         }
-        // Expert 11 lands into record 2, in flight: no cut lies below it.
-        assert_eq!(tier.running_floor(), 3, "every record in flight lies below the floor");
+        // Expert 11 lands into record 2, in flight: no shrink evicts it.
+        assert!(!tier.evictable(reads(&[]), None).contains(&2), "a landing's record is in flight");
         grants[2].map_at(Some(0));
         tier.landed(2, (0, 11), None, Kept::Alone);
-        assert_eq!(tier.running_floor(), 0, "nothing in flight");
+        assert!(tier.evictable(reads(&[]), None).contains(&2), "nothing in flight");
         // Expert 13 the chain routed; 12 and 14 it did not.
         let (first, unbegun) = (900, 1001);
-        tier.cut_running(3, |(_, expert)| if expert == 13 { Step::MAX } else { first });
+        tier.evict(&[3, 4, 5], |(_, expert)| if expert == 13 { Step::MAX } else { first });
         assert_eq!(tier.records(), 3);
-        assert_eq!([9, 10, 11].map(|expert| maps.held((0, expert))), [Some(0), Some(1), Some(2)], "below the cut, kept");
+        assert_eq!([9, 10, 11].map(|expert| maps.held((0, expert))), [Some(0), Some(1), Some(2)], "the rest kept where they are");
         for (expert, until) in [(12, first), (13, unbegun), (14, first)] {
             assert!(tier.kept_record((0, expert)).is_none(), "{expert} is lacked");
             assert!(maps.resolve((0, expert), until - 1).is_some(), "{expert} is read before step {until}");
             assert_eq!(maps.resolve((0, expert), until), None, "{expert} is read from no record from step {until}");
         }
-        assert_eq!(tier.take((0, 12), 0), None, "no record past the cut is ready");
+        assert_eq!(tier.take((0, 12), 0), None, "no hole is ready");
     }
 
     /// The interleaving of `a_parked_requests_answered_record_is_never_taken_by_its_other_miss`
@@ -2171,16 +2114,16 @@ mod tests {
 
     /// A demand landing that ends once the device is past its request (its
     /// step ended with its wait expired) answers nothing: kept, not an
-    /// outstanding answer, so nothing holds it in flight for a shrink.
+    /// outstanding answer, so a shrink may evict it.
     #[test]
     fn a_landing_past_its_request_is_kept_not_answering() {
         let mut tier = tier(2, 1, ONE, Resolution::AfterStore);
         let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), None, |_| false, &park(at(5), 1)) else { panic!("ready") };
-        assert_eq!(tier.shrink_floor(), 1, "the landing is in flight");
+        assert!(!tier.evictable(reads(&[]), None).contains(&0), "the landing is in flight");
         tier.retire(at(6), &played());
         tier.landed(grant.record(), (0, 1), Some(5), Kept::Alone);
         assert!(matches!(tier.records[0], Host::Kept(_)), "kept: the device is past its request");
-        assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
+        assert!(tier.evictable(reads(&[]), None).contains(&0), "nothing in flight");
     }
 
     /// A tier keeping an expert in a lent record is complete but not

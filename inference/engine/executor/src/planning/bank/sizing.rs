@@ -1,4 +1,4 @@
-use super::{ExpertBankPlan, Placer};
+use super::{BankTier, ExpertBankPlan, Placer};
 use crate::memory::ClaimDemand;
 use std::num::NonZeroU64;
 
@@ -76,8 +76,7 @@ impl ExpertBankPlan {
     /// progress: what the engine needs resident at once, the more of what a
     /// decode step ([`Self::decode_records`]) and a prompt group
     /// ([`Self::prompt_records`]) hold live at once, and never fewer than
-    /// the one record a reserved tensor commits (Seismic's
-    /// `committed_bytes`). Speed is not its concern (the assessment's
+    /// one record. Speed is not its concern (the assessment's
     /// estimate at the floor reports that).
     pub fn least_records(&self, group: usize) -> u64 {
         self.decode_records(group).max(self.prompt_records(group)).max(1)
@@ -148,17 +147,16 @@ impl ExpertBankPlan {
     /// without a tier. A tier of no host slots holds its landing reserve
     /// alone ([`Self::host_records`]).
     pub fn host_ceiling(&self) -> Option<u64> {
-        self.tier_reservation().map(|_| self.host_cap.unwrap_or(self.widest().get()))
+        self.tiered().then(|| self.host_cap.unwrap_or(self.widest().get()))
     }
 
     /// Records of group `group`'s host tier tensors (`TR`): every expert of
     /// its layers and, of the conveyor's lender, the conveyor's lent
-    /// records ([`ConveyorCarrier::HostTier`]), reserved so a resize keeps
-    /// every binding; none without a tier.
+    /// records ([`ConveyorCarrier::HostTier`]); none without a tier.
     pub fn host_extent(&self, group: usize) -> u64 {
-        match self.tier_reservation() {
-            Some(_) => self.member_experts(group).sum::<u64>() + self.tier_lent(group),
-            None => 0,
+        match self.tiered() {
+            true => self.member_experts(group).sum::<u64>() + self.host_lent(group),
+            false => 0,
         }
     }
 
@@ -167,38 +165,38 @@ impl ExpertBankPlan {
     /// fewer than the landing reserve ([`Self::landing_records`]), so a
     /// demand landing finds a record
     /// past its grace whatever the tier holds, beside the conveyor's lent
-    /// records ([`Self::tier_lent`]), its bottom ones, which a prompt group
+    /// records ([`Self::host_lent`]), its bottom ones, which a prompt group
     /// holds for its life; at most its extent; none without a tier.
     pub fn host_records(&self, group: usize, host_slots: u64) -> u64 {
-        match self.tier_reservation() {
-            Some(_) => (self
+        match self.tiered() {
+            true => (self
                 .member_experts(group)
                 .map(|experts| Self::layer_slots(host_slots, experts))
                 .sum::<u64>()
                 .max(self.landing_records())
-                + self.tier_lent(group))
+                + self.host_lent(group))
             .min(self.host_extent(group)),
-            None => 0,
+            false => 0,
         }
     }
 
-    /// What the host tier is charged at `host_slots` host slots: each
-    /// group's record tensors' committed records there, resident bytes in
-    /// whole granules of the tier's reservation (Seismic's rule); none
-    /// without a tier.
+    /// What the host tier's pool is charged at `host_slots` host slots: the
+    /// whole blocks ([`Self::pooled_charge`]) holding a granule of it
+    /// ([`Self::host_granule`]) for each record each group commits there
+    /// beyond its lent ones ([`Self::host_lent`], charged at
+    /// load as the lender's lent allocation); none without a tier.
     pub fn host_charge(&self, host_slots: u64) -> Result<u64, String> {
-        let Some(reservation) = self.tier_reservation() else {
+        if self.host_granule().is_none() {
             return Ok(0);
-        };
-        self.record_tensors().try_fold(0u64, |total, (group, kind, tensor)| {
-            let held = self.reserved_records(group, kind, tensor, crate::planning::BankTier::Host)?;
-            held.record
-                .get()
-                .checked_mul(self.host_records(group, host_slots))
-                .and_then(|bytes| reservation.charge(held, self.host_extent(group), bytes))
-                .and_then(|charge| total.checked_add(charge))
-                .ok_or_else(|| "host tier bytes overflow".to_owned())
-        })
+        }
+        let granules = (0..self.groups().len()).try_fold(0u64, |total, group| {
+            let pooled = self
+                .host_records(group, host_slots)
+                .checked_sub(self.host_lent(group))
+                .expect("a group's host records hold its lent ones");
+            total.checked_add(pooled).ok_or_else(|| "host tier records overflow".to_owned())
+        })?;
+        self.pooled_charge(granules).ok_or_else(|| "host tier bytes overflow".to_owned())
     }
 
     /// What the host tier at `host_slots` holds past its floor: cache,
@@ -221,35 +219,34 @@ impl ExpertBankPlan {
             .expect("a host tier is charged less than its floor"))
     }
 
-    /// The most slots each record tensor's committed bytes keep within the
-    /// device's single-allocation limit `max_allocation`, which bounds each
-    /// native allocation backing them (`seismic::Reservation::most_backed`).
-    pub fn most_slots(&self, max_allocation: u64) -> Result<u64, String> {
-        self.record_tensors().try_fold(self.widest().get(), |most, (group, kind, tensor)| {
-            let record = tensor.record_bytes()?;
-            let held = self.reserved_records(group, kind, tensor, crate::planning::BankTier::Bank)?;
-            let backed = self.reservation().of_records(held).most_backed(max_allocation) / record;
-            // The most slots whose records of every member layer fit; zero
-            // slots hold no records, so always fit.
-            let fitting = (1..=most)
-                .rev()
-                .find(|&slots| {
-                    self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>() <= backed
-                })
-                .unwrap_or(0);
-            Ok(fitting)
-        })
+    /// The largest of the bank's lent allocations (`BankAllocation::Lent`):
+    /// each is one allocation, so the device's single-allocation limit
+    /// bounds it.
+    pub fn largest_lent(&self) -> Result<u64, String> {
+        let layout = self.layout()?;
+        let largest = layout.lent.iter().flat_map(|lent| lent.iter()).try_fold(0u64, |most, (_, allocation)| {
+            Ok::<_, String>(most.max(allocation.charged_bytes(self.host())?))
+        })?;
+        Ok(largest)
     }
 
     /// What the bank demands ([`Self::storage_demand`]), by the part that
-    /// owns each byte: its layout's ([`BankLayout::owned`]) and the places a
-    /// group holds at its floor's one, each part's sum.
+    /// owns each byte: its layout's ([`BankLayout::owned`]), the places a
+    /// group holds at its floor's one, and its pools' granules, its group
+    /// records' and its host tier's, each part's sum.
     pub fn charges(&self) -> Result<Vec<(&'static str, ClaimDemand)>, String> {
         let (layout, floor) = (self.layout()?, self.placed_allocations(NonZeroU64::MIN)?);
         let mut charges = Vec::<(&'static str, ClaimDemand)>::new();
         let owned = layout.owned().into_iter().chain(floor.iter().map(|allocation| ("places", allocation)));
-        for (owner, allocation) in owned {
-            let demand = allocation.storage_demand(&self.reservation_of(allocation)?)?;
+        let mut pooled = vec![("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?))];
+        if self.tiered() {
+            pooled.push(("host tier", ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?)));
+        }
+        let owned = owned
+            .map(|(owner, allocation)| Ok::<_, String>((owner, allocation.storage_demand(self.host())?)))
+            .chain(pooled.into_iter().map(Ok));
+        for owned in owned {
+            let (owner, demand) = owned?;
             match charges.iter_mut().find(|(of, _)| *of == owner) {
                 Some((_, total)) => *total = total.checked_plus(demand).ok_or("bank charges overflow")?,
                 None => charges.push((owner, demand)),

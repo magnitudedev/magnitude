@@ -237,10 +237,10 @@ impl<'a> QualificationView<'a> {
             }])
             .collect::<Vec<_>>();
         let token_region = regions.len() - 1;
-        let mut banks = seismic::SlabTensor::new(device, 2, 2, regions)
+        let banks = crate::experts::pooled_slabs(device, seismic::Contract::DeviceOnly, 2, 2, &regions, 1)
             .map_err(|error| qualification_dynamic(entry, label, error))?;
         banks
-            .add_slab()
+            .add_slab(seismic::SlabFill::Zeroed)
             .map_err(|error| qualification_dynamic(entry, label, error))?;
         let region = |index| {
             banks

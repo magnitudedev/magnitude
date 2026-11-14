@@ -30,7 +30,6 @@
 #define STREAMING_GROUP_PARAM threadgroup int *streaming_group
 #define STREAMING_GROUP(index) streaming_group[index]
 #define STREAMING_GROUP_ADD(index, value) streaming_group_add(&streaming_group[index], value)
-#define STREAMING_RECORDS_READ device const ulong *
 #define STREAMING_RECORDS device const ulong *
 
 typedef uint u32;

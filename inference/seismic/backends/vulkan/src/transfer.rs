@@ -3,7 +3,7 @@
 //! (`seismic_runtime::native::transfer`): each batch one command buffer of
 //! `vkCmdCopyBuffer` regions, and of each signal a `vkCmdFillBuffer` of its
 //! word behind a barrier over the copies before it, submitted to the second
-//! queue (`Facts::side_family`, which reservations' zero fills share),
+//! queue (`Facts::side_family`, which pool blocks' zero fills share),
 //! signalling the queue's own timeline semaphore with the batch's value.
 //! The semaphore's value is the last batch complete.
 //!
@@ -25,18 +25,26 @@
 //!   chain. No kernel waits on the transfer queue itself.
 
 use crate::device::{barrier, call, Device};
-use crate::memory::Range;
-use crate::{Buffer, ReservedBuffer};
+use crate::Buffer;
 use ash::vk;
 use seismic_compiler::errors::ExecutionError;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// One end of a run: bytes of a buffer, or of a reservation's committed
-/// bytes (split at its chunks).
-pub enum TransferEnd<'a> {
-    Buffer(&'a Buffer, u64),
-    Reserved(&'a ReservedBuffer, u64),
+/// One end of a run: a buffer's bytes from an offset.
+pub struct TransferEnd<'a>(pub &'a Buffer, pub u64);
+
+impl TransferEnd<'_> {
+    /// The `(buffer, offset)` of `bytes` bytes from the end's byte 0, which
+    /// lie within its buffer.
+    pub(crate) fn span(&self, bytes: u64) -> Result<(vk::Buffer, u64), ExecutionError> {
+        let TransferEnd(buffer, offset) = *self;
+        let range = buffer.range();
+        if offset.checked_add(bytes).is_none_or(|end| end > range.bytes()) {
+            return Err(ExecutionError::SubmissionFailed("a transfer run lies outside its buffer".into()));
+        }
+        Ok((range.raw(), range.offset() + offset))
+    }
 }
 
 /// One copy of a batch: `bytes` bytes from `source` into `destination`.
@@ -110,30 +118,6 @@ impl TransferQueue {
         })
     }
 
-    /// Each `(buffer, offset)` share of `bytes` bytes from `end`'s byte 0.
-    fn spans(end: &TransferEnd<'_>, bytes: u64) -> Result<Vec<(vk::Buffer, u64, u64)>, ExecutionError> {
-        let within = |range: &Range, offset: u64| {
-            if offset.checked_add(bytes).is_none_or(|end| end > range.bytes()) {
-                return Err(ExecutionError::SubmissionFailed("a transfer run lies outside its buffer".into()));
-            }
-            Ok(vec![(range.raw(), range.offset() + offset, bytes)])
-        };
-        match end {
-            TransferEnd::Buffer(buffer, offset) => within(buffer.range(), *offset),
-            TransferEnd::Reserved(reserved, offset) => {
-                if offset.checked_add(bytes).is_none_or(|end| end > reserved.len()) {
-                    return Err(ExecutionError::SubmissionFailed("a transfer run lies outside its reservation".into()));
-                }
-                let mut spans = Vec::new();
-                reserved.spans(*offset, bytes as usize, |chunk, at, _, len| {
-                    spans.push((chunk.range().raw(), chunk.range().offset() + at, len as u64));
-                    Ok(())
-                })?;
-                Ok(spans)
-            }
-        }
-    }
-
     /// Queue `items` as one batch, which raises the timeline to `value`
     /// once every run has landed and every signal is written: the caller
     /// numbers batches, each above the last. A batch that is invalid or
@@ -146,10 +130,7 @@ impl TransferQueue {
             let run = match item {
                 TransferItem::Run(run) => run,
                 TransferItem::Signal { word, value } => {
-                    let spans = Self::spans(word, 4)?;
-                    let &[(buffer, offset, 4)] = spans.as_slice() else {
-                        return Err(ExecutionError::SubmissionFailed("a transfer signal's word spans chunks".into()));
-                    };
+                    let (buffer, offset) = word.span(4)?;
                     if offset % 4 != 0 {
                         return Err(ExecutionError::SubmissionFailed("a transfer signal's word is not 4-byte aligned".into()));
                     }
@@ -157,17 +138,14 @@ impl TransferQueue {
                     continue;
                 }
             };
-            let (sources, destinations) = (Self::spans(&run.source, run.bytes)?, Self::spans(&run.destination, run.bytes)?);
-            // Pair the two sides' spans over the run's bytes.
-            let (mut s, mut d) = (sources.into_iter().peekable(), destinations.into_iter().peekable());
-            let (mut source, mut destination) = (s.next(), d.next());
-            while let (Some((sb, so, sl)), Some((db, dob, dl))) = (source, destination) {
-                let size = sl.min(dl);
-                if size > 0 {
-                    regions.push(Command::Copy(sb, db, vk::BufferCopy { src_offset: so, dst_offset: dob, size }));
-                }
-                source = if sl > size { Some((sb, so + size, sl - size)) } else { s.next() };
-                destination = if dl > size { Some((db, dob + size, dl - size)) } else { d.next() };
+            let ((source, source_offset), (destination, destination_offset)) =
+                (run.source.span(run.bytes)?, run.destination.span(run.bytes)?);
+            if run.bytes > 0 {
+                regions.push(Command::Copy(
+                    source,
+                    destination,
+                    vk::BufferCopy { src_offset: source_offset, dst_offset: destination_offset, size: run.bytes },
+                ));
             }
         }
         let raw = &self.device.inner.device;
@@ -306,51 +284,44 @@ impl Drop for TransferQueue {
 mod tests {
     use super::*;
 
-    /// On every device that reserves device storage, a batch copies upload
-    /// storage into a reservation's chunks byte for byte, the runs crossing
-    /// chunk boundaries, and completes at its value; a device without a
-    /// second queue forms no transfer queue. It prints the
-    /// rate of a batch of the whole reservation.
+    /// On every device with a second queue, a batch copies upload storage
+    /// into device storage byte for byte, each run signalling a word of its
+    /// own, and completes at its value; a device without one forms no
+    /// transfer queue. It prints the rate of a batch of the whole buffer.
     #[test]
-    fn a_batch_lands_its_runs_across_a_reservations_chunks() {
+    fn a_batch_lands_its_runs_and_signals() {
         for description in crate::test_devices() {
-            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             let queue = TransferQueue::new(&device);
             assert_eq!(queue.is_ok(), device.has_side_queue(), "{}: a transfer queue exactly where a side queue is", description.facts.name);
-            // A device whose memory is the host's reserves without a second
-            // queue, so it may transfer nothing.
-            let (Some(form), Ok(queue)) =
-                (device.facts().reservation(0).expect("reservation capability query"), queue)
-            else {
+            let Ok(queue) = queue else {
                 continue;
             };
-            let granule = form.granule;
-            let bytes = 4 * granule;
-            let (reserved, _resizer) =
-                device.allocate_reserved(&[0], bytes, bytes, granule, granule / 4).expect("a reservation");
-            let source = device.allocate_upload(bytes, 256, None).expect("upload storage");
-            let pattern = (0..bytes).map(|at| (at % 251) as u8 ^ (at / granule) as u8).collect::<Vec<_>>();
+            let own = device.own();
+            let bytes = 8u64 << 20;
+            let destination = device.allocate(bytes, 256, &own).expect("device storage");
+            let source = device.allocate_upload(bytes, 256, &own).expect("upload storage");
+            let pattern = (0..bytes).map(|at| (at % 251) as u8 ^ (at >> 20) as u8).collect::<Vec<_>>();
             device.write(&source, 0, &pattern).unwrap();
-            // The source's second half to the reservation's start and its
-            // first half after, each across two chunks, each run signalling a
-            // word of its own.
+            // The source's second half to the destination's start and its
+            // first half after, each run signalling a word of its own.
             let half = bytes / 2;
-            let words = device.allocate_upload(8, 256, None).expect("signal words");
+            let words = device.allocate_upload(8, 256, &own).expect("signal words");
             device.write(&words, 0, &[0; 8]).unwrap();
             queue
                 .copy(&[
                     TransferItem::Run(TransferRun {
-                        source: TransferEnd::Buffer(&source, half),
-                        destination: TransferEnd::Reserved(&reserved, 0),
+                        source: TransferEnd(&source, half),
+                        destination: TransferEnd(&destination, 0),
                         bytes: half,
                     }),
-                    TransferItem::Signal { word: TransferEnd::Buffer(&words, 0), value: 7 },
+                    TransferItem::Signal { word: TransferEnd(&words, 0), value: 7 },
                     TransferItem::Run(TransferRun {
-                        source: TransferEnd::Buffer(&source, 0),
-                        destination: TransferEnd::Reserved(&reserved, half),
+                        source: TransferEnd(&source, 0),
+                        destination: TransferEnd(&destination, half),
                         bytes: half,
                     }),
-                    TransferItem::Signal { word: TransferEnd::Buffer(&words, 4), value: 9 },
+                    TransferItem::Signal { word: TransferEnd(&words, 4), value: 9 },
                 ], 1)
                 .unwrap();
             assert!(queue.wait(1, Duration::from_secs(10)).unwrap(), "{}: the batch completes", description.facts.name);
@@ -358,19 +329,19 @@ mod tests {
             device.read(&words, 0, &mut signalled).unwrap();
             assert_eq!(signalled, [7, 0, 0, 0, 9, 0, 0, 0], "{}: each signal is written", description.facts.name);
             let mut landed = vec![0u8; bytes as usize];
-            reserved.read(0, &mut landed).unwrap();
+            device.read(&destination, 0, &mut landed).unwrap();
             let expected = pattern[half as usize..].iter().chain(&pattern[..half as usize]).copied().collect::<Vec<_>>();
             assert!(landed == expected, "{}: the runs land byte for byte", description.facts.name);
-            // Back to host storage: the reservation's first 4 KiB.
-            let back = device.allocate_upload(4096, 256, None).expect("upload storage");
-            let run = TransferRun { source: TransferEnd::Reserved(&reserved, 0), destination: TransferEnd::Buffer(&back, 0), bytes: 4096 };
+            // Back to host storage: the destination's first 4 KiB.
+            let back = device.allocate_upload(4096, 256, &own).expect("upload storage");
+            let run = TransferRun { source: TransferEnd(&destination, 0), destination: TransferEnd(&back, 0), bytes: 4096 };
             queue.copy(&[TransferItem::Run(run)], 2).unwrap();
             assert!(queue.wait(2, Duration::from_secs(10)).unwrap());
             let mut returned = vec![0u8; 4096];
             device.read(&back, 0, &mut returned).unwrap();
             assert!(returned == expected[..4096], "{}: the device's bytes return to the host", description.facts.name);
             let started = std::time::Instant::now();
-            let run = TransferRun { source: TransferEnd::Buffer(&source, 0), destination: TransferEnd::Reserved(&reserved, 0), bytes };
+            let run = TransferRun { source: TransferEnd(&source, 0), destination: TransferEnd(&destination, 0), bytes };
             queue.copy(&[TransferItem::Run(run)], 3).unwrap();
             assert!(queue.wait(3, Duration::from_secs(10)).unwrap());
             eprintln!(

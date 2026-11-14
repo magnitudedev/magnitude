@@ -18,9 +18,9 @@
 //   expected, desired)`, a relaxed device-scope compare-and-swap, storing
 //   `desired` only where the word holds `expected` and returning the word
 //   before it (a landing launch's poll).
-// - Record tables: `STREAMING_RECORDS_READ` and `STREAMING_RECORDS`, the
-//   handles a record copy's source and destination records are addressed
-//   from (below).
+// - Record tables: `STREAMING_RECORDS`, the handle a record copy's source
+//   and destination records are each addressed from (below): a record
+//   port's table of its records' addresses.
 // - Group memory, one array of int words per call: `STREAMING_GROUP_PARAM`,
 //   the parameter a function takes it by, and `STREAMING_GROUP(i)`, its
 //   word `i`; the caller passes its group words (a pointer to them, or on

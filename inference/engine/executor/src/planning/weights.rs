@@ -1692,13 +1692,13 @@ impl ModelLoadPlan {
     }
 
     /// The host tables' claim in the system-RAM domain: each is streamed,
-    /// and claims its row cache.
+    /// and claims its row cache, its slots and the buffer a step assembles
+    /// its rows in.
     pub fn host_table_bytes(&self) -> Result<u64, String> {
         self.host_tables.iter().try_fold(0u64, |total, table| {
-            let bytes =
-                table.bytes / table.shape[0] * crate::streamed_table::cached_rows(table.shape[0]);
-            total
-                .checked_add(bytes)
+            (table.bytes / table.shape[0])
+                .checked_mul(crate::streamed_table::cached_rows(table.shape[0]) + table.step_rows)
+                .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(|| "host table bytes overflow".to_owned())
         })
     }
@@ -1805,7 +1805,7 @@ impl ModelLoadPlan {
     pub fn weight_owners(&self) -> Result<Vec<(&'static str, u64)>, String> {
         // A component's weight byte: the host tier's are counted apart.
         let total = |demand: ClaimDemand| {
-            demand.device.checked_add(demand.reserved)?.checked_add(demand.upload)?.checked_add(demand.shared)
+            demand.device.checked_add(demand.upload)?.checked_add(demand.shared)
         };
         let overflow = || "resident weight byte count overflow".to_owned();
         let [target, head, vision] = self.weight_demands()?;
@@ -2142,7 +2142,10 @@ impl ModelLoadPlan {
                 ),
             ]
         });
-        // The per-layer entry's table is a host table.
+        // The per-layer entry's table is a host table; a step assembles at
+        // most its launch's row class of its rows.
+        let step_rows = magnitude_batching::row_class(limits.max_launch_rows)
+            .ok_or("the launch rows have no row class")? as u64;
         let host_tables = decoder
             .entry
             .per_layer
@@ -2155,6 +2158,7 @@ impl ModelLoadPlan {
                     role,
                     descriptor,
                     target_form,
+                    step_rows,
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2318,21 +2322,22 @@ impl ModelLoadPlan {
             .into_iter()
             .try_fold(0u64, u64::checked_add)
             .ok_or("device weight storage overflows")?;
+        // A banked weight's resident bytes are granules of the bank's pool.
+        let pooled = ClaimDemand::pooled(crate::planning::BankTier::Bank, weight.resident_bytes);
         if weight.banked().is_some() {
-            return Ok(ClaimDemand { reserved: weight.resident_bytes, device, ..ClaimDemand::default() });
+            return pooled.checked_plus(ClaimDemand { device, ..ClaimDemand::default() }).ok_or_else(|| "banked weight demand overflows".to_owned());
         }
         if weight.stored_in_slots() {
-            if let Some((bank, table)) = self.bank_table(weight) {
-                // StoredTable::new commits the complete reservation at load,
-                // not its floor. Its own table replaces the ordinary table.
-                let committed = table.record_bytes.get().checked_mul(table.records.get())
-                    .ok_or("stored table backing overflows")?;
-                let charges = bank.reservation().charges(bank.host().contract(crate::planning::BankTier::Bank), seismic::ReservedRecords::of(table.record_bytes), table.records.get(), committed)
-                    .ok_or("stored table demand overflows")?;
-                let mut demand = ClaimDemand::reservation(crate::planning::BankTier::Bank, charges);
-                demand.shared = demand.shared.checked_add(bytes.checked_sub(weight.resident_bytes)
-                    .ok_or("stored table directory charge underflows")?).ok_or("stored table demand overflows")?;
-                return Ok(demand);
+            if let Some(table) = self.bank_table(weight) {
+                // StoredTable::new claims every record at load, not its
+                // floor, a granule each (`BankTable::plan`). Its own slot
+                // address table (`Slots::allocate_table`) replaces the
+                // ordinary record table, in host-shared storage.
+                let directory = bytes.checked_sub(weight.resident_bytes).ok_or("stored table directory charge underflows")?;
+                let slot_table = seismic::record_table_bytes(table.records.get())
+                    .ok_or_else(|| "stored table record table byte count overflows".to_owned())?;
+                let shared = directory.checked_add(slot_table).ok_or("stored table shared demand overflows")?;
+                return pooled.checked_plus(ClaimDemand { shared, ..ClaimDemand::default() }).ok_or_else(|| "stored table demand overflows".to_owned());
             }
             return Ok(ClaimDemand { shared: bytes, device, ..ClaimDemand::default() });
         }
@@ -2346,10 +2351,8 @@ impl ModelLoadPlan {
 
     /// The bank's own table of `weight`, a table whose slots the host fills
     /// (`WeightPlan::stored_in_slots`), where the bank holds it.
-    fn bank_table(&self, weight: &WeightPlan) -> Option<(&super::ExpertBankPlan, &super::bank::BankTable)> {
-        self.bank.as_ref().and_then(|bank| {
-            bank.tables.iter().find(|table| table.role == weight.role).map(|table| (bank, table))
-        })
+    fn bank_table(&self, weight: &WeightPlan) -> Option<&super::bank::BankTable> {
+        self.bank.as_ref().and_then(|bank| bank.tables.iter().find(|table| table.role == weight.role))
     }
 
     /// The device storage `weight`, one of this load's, allocates from the
@@ -2366,9 +2369,9 @@ impl ModelLoadPlan {
     /// weight's device demand.
     pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
         let tables = match self.record_ports {
-            Some(backend) if backend.binds_record_tables() => seismic::record_table_bytes(weight.record_table_entries()?)
+            Some(_) => seismic::record_table_bytes(weight.record_table_entries()?)
                 .ok_or_else(|| "record table byte count overflows".to_owned())?,
-            Some(_) | None => 0,
+            None => 0,
         };
         let allocations = if weight.stored_in_slots() {
             // The bank's own table replaces the ordinary record table.
@@ -2776,6 +2779,8 @@ pub struct HostTablePlan {
     pub resident: Element,
     /// The table's bytes: its claim in the system-RAM domain.
     pub bytes: u64,
+    /// The most rows one step gathers: its launch's row class.
+    pub step_rows: u64,
 }
 
 impl HostTablePlan {
@@ -2793,6 +2798,7 @@ fn host_table(
     role: WeightRole,
     descriptor: &WeightDescriptor,
     form: ResidentForm,
+    step_rows: u64,
 ) -> Result<HostTablePlan, String> {
     let stored = inventory
         .iter()
@@ -2843,6 +2849,7 @@ fn host_table(
         source,
         resident,
         bytes,
+        step_rows,
     })
 }
 

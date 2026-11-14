@@ -204,8 +204,10 @@ fn main() {
     let option = |name: &str| options.get(name).unwrap_or_else(|| panic!("--{name} is required")).clone();
     let threads = option("threads").parse::<std::num::NonZeroUsize>().expect("--threads is a positive count");
     // The pool every CPU device of the process shares (`seismic_cpu::open_host`),
-    // held so the device opened next runs on exactly `threads` participants.
-    let pool = seismic_cpu::open_host(threads).expect("the host pool");
+    // held so the device opened next runs on exactly `threads` participants;
+    // what it holds of its own is charged to a tally of host RAM's.
+    let host = std::sync::Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
+    let pool = seismic_cpu::open_host(threads, host).expect("the host pool");
     assert_eq!(pool.executor.workers(), threads.get(), "the pool has the asked participants");
     let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).expect("the CPU device");
     let rotation: usize = option("rotation-bytes").parse().expect("--rotation-bytes is a byte count");

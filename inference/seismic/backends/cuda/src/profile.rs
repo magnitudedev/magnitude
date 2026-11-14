@@ -407,6 +407,9 @@ pub struct DeviceDescriptor {
     pub name: String,
     /// `cuDeviceTotalMem`: memory of the exposed device or partition.
     pub total_memory_bytes: u64,
+    /// `cuMemGetAllocationGranularity` (recommended) of its device memory:
+    /// what one allocation's size is rounded up to.
+    pub allocation_granularity: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device shares host memory.
     pub integrated: bool,
     /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`: zero for a device without one.
@@ -547,6 +550,7 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
             .to_string_lossy()
             .into_owned(),
         total_memory_bytes: memory as u64,
+        allocation_granularity: crate::driver::device_granularity(&driver, device).map_err(unavailable)?,
         integrated,
         l2_cache_bytes: u64::try_from(
             driver
@@ -1939,27 +1943,34 @@ fn acquire_core_services(
                     )?,
                 ),
                 // A reached instance's backing, as the executor acquires one:
-                // the device's allocation of a block range, released after.
-                CoreService::AllocationInstance => host(
-                    class,
-                    "probe_allocation_instance",
-                    measure_host(
-                        host_resolution,
-                        2,
-                        HostSpread::Confidence,
+                // the device's allocation of a block range, charged to the
+                // device store's own entry, released after.
+                CoreService::AllocationInstance => {
+                    let entry = service.stores().device.own();
+                    host(
+                        class,
                         "probe_allocation_instance",
-                        || {
-                            let instance = <crate::Device as seismic_compiler::executable::DeviceService<Cuda>>::allocate(
-                                service,
-                                seismic_estimator::ALLOCATION_INSTANCE_BYTES,
-                                256,
-                            )
-                            .map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?;
-                            drop(std::hint::black_box(instance));
-                            Ok(())
-                        },
-                    )?,
-                ),
+                        measure_host(
+                            host_resolution,
+                            2,
+                            HostSpread::Confidence,
+                            "probe_allocation_instance",
+                            || {
+                                let instance =
+                                    <crate::Device as seismic_compiler::executable::DeviceService<Cuda>>::allocate(
+                                        service,
+                                        crate::topology::DEVICE_KIND,
+                                        seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                                        256,
+                                        &entry,
+                                    )
+                                    .map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?;
+                                drop(std::hint::black_box(instance));
+                                Ok(())
+                            },
+                        )?,
+                    )
+                }
                 // A publication as the schedule's execution records it.
                 CoreService::TensorPublication => {
                     let mut probe = seismic_compiler::executable::TensorPublicationProbe::new();

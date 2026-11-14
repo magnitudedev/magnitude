@@ -179,17 +179,14 @@ pub enum WorkflowError {
     NativePortSlabGrid {
         port: usize,
     },
-    /// Chunked reserved storage, which has no one buffer, bound where device
-    /// work would bind it directly: a device tensor port (parameter or
-    /// result) not marked `records`, or a language kernel's argument. A
-    /// record port reaches it through a table and a host port, never bound,
-    /// orders by its packed span.
-    ChunkedBinding {
-        parameter: String,
-    },
     /// A tensor with elements other than a slab view bound to a slab port
     /// (`&slab`): its natives read its binding as a slab address table.
     PlainSlabBinding {
+        parameter: String,
+    },
+    /// A slab view with elements bound to a plain tensor port (neither
+    /// `&slab` nor `records`): its binding is an address table, not elements.
+    SlabPlainBinding {
         parameter: String,
     },
     /// A graph's record port bound other than to whole records of a
@@ -337,9 +334,9 @@ impl fmt::Display for CallError {
                 f,
                 "`{parameter}` is a slab port, which binds a slab view or no elements"
             ),
-            Self::Workflow(WorkflowError::ChunkedBinding { parameter }) => write!(
+            Self::Workflow(WorkflowError::SlabPlainBinding { parameter }) => write!(
                 f,
-                "`{parameter}`: chunked reserved storage binds only to a native record port"
+                "`{parameter}` is a plain tensor port, which binds elements, not a slab view's address table"
             ),
             Self::Workflow(WorkflowError::RecordPortBinding { parameter }) => write!(
                 f,
@@ -495,26 +492,6 @@ pub enum TensorError {
         extents: Vec<u64>,
         strides: Vec<u64>,
     },
-    /// Host access to `rows` leading rows of a reserved tensor with only
-    /// `committed` backed, or a recommit of a tensor that is not a whole
-    /// reserved tensor.
-    Uncommitted {
-        rows: u64,
-        committed: u64,
-    },
-    /// A commitment of `committed` rows of a reserved tensor of `rows`: it
-    /// commits at least one and at most all of them.
-    Uncommittable {
-        committed: u64,
-        rows: u64,
-    },
-    /// The backend reserves no address range for a reserved tensor under
-    /// its contract: none of its kinds would (`why` is `None`), or the one
-    /// that would cannot, for `why`.
-    Unreservable {
-        backend: BackendName,
-        why: Option<seismic_topology::Unreservable>,
-    },
     /// A view's store charges cannot be read.
     ViewCharge(ViewChargeError),
     /// A typed region of a view's bytes cannot be formed.
@@ -534,7 +511,7 @@ pub enum TensorError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedWordError {
     /// The view's storage is not one allocation the host addresses in place
-    /// (device memory, a reserved or slabbed tensor, a read-only mapping).
+    /// (device memory, a slabbed tensor, a read-only mapping).
     NotHostAddressed,
     /// The word at `offset` reaches past the view's `view_bytes`.
     Outside { offset: u64, view_bytes: u64 },
@@ -565,12 +542,6 @@ pub enum RegionError {
     /// The view is no one contiguous byte range of an allocation: it is
     /// slabbed or strided.
     NotContiguous,
-    /// A region of a reserved tensor would end at `end`, past its backed
-    /// `bytes`.
-    Unbacked { end: u64, bytes: u64 },
-    /// A recommit would back `bytes`, fewer than a live region of the
-    /// reserved tensor pins (`pinned`).
-    Pinned { pinned: u64, bytes: u64 },
     /// The region's `bytes` from `offset` reach past the view's.
     Outside {
         offset: u64,
@@ -580,12 +551,8 @@ pub enum RegionError {
     /// The region would start at `offset` in its allocation, off its
     /// layout's `alignment`.
     Unaligned { offset: u64, alignment: u64 },
-    /// On chunked storage, a `record`-byte record at `offset` would cross a
-    /// chunk (or be larger than one): a region starts where its records are
-    /// packed.
-    Straddles { offset: u64, record: u64 },
-    /// On chunked storage, a region at `offset` whose bytes are no leading
-    /// rows each in bytes of its own: chunked storage holds only records.
+    /// The view at `offset` has no records of its own: no leading rows each
+    /// in bytes of their own.
     Unrecorded { offset: u64 },
     /// A region of a dense floating tensor would view its bytes as another
     /// representation, letting a host read skip NaN canonicalization.
@@ -601,14 +568,6 @@ impl fmt::Display for RegionError {
             Self::NotContiguous => {
                 f.write_str("a region needs a contiguous view of an allocation")
             }
-            Self::Unbacked { end, bytes } => write!(
-                f,
-                "a region of a reserved tensor ending at byte {end} reaches past its {bytes} backed bytes"
-            ),
-            Self::Pinned { pinned, bytes } => write!(
-                f,
-                "a live region of a reserved tensor pins its first {pinned} bytes; a recommit cannot back {bytes}"
-            ),
             Self::Outside {
                 offset,
                 bytes,
@@ -621,13 +580,9 @@ impl fmt::Display for RegionError {
                 f,
                 "a region at allocation offset {offset} is off its layout's {alignment}-byte alignment"
             ),
-            Self::Straddles { offset, record } => write!(
-                f,
-                "a {record}-byte record at allocation offset {offset} would cross a chunk"
-            ),
             Self::Unrecorded { offset } => write!(
                 f,
-                "a region at allocation offset {offset} of chunked storage holds no records"
+                "the view at allocation offset {offset} has no records of its own"
             ),
             Self::FloatingReinterpret { from, to } => write!(
                 f,
@@ -713,20 +668,6 @@ impl fmt::Display for TensorError {
                 f,
                 "reshape requires contiguous storage, but the view of extents {extents:?} has strides {strides:?}"
             ),
-            Self::Uncommitted { rows, committed } => write!(
-                f,
-                "access to {rows} leading rows of a reserved tensor with {committed} committed rows"
-            ),
-            Self::Uncommittable { committed, rows } => write!(
-                f,
-                "a reserved tensor of {rows} rows commits between 1 and {rows} of them, not {committed}"
-            ),
-            Self::Unreservable { backend, why: None } => {
-                write!(f, "{backend:?} reserves no address range for a reserved tensor")
-            }
-            Self::Unreservable { backend, why: Some(why) } => {
-                write!(f, "{backend:?} cannot reserve an address range for a reserved tensor: {why}")
-            }
             Self::ViewCharge(error) => write!(f, "{error}"),
             Self::Region(error) => write!(f, "{error}"),
             Self::SharedWord(error) => write!(f, "{error}"),
@@ -747,62 +688,17 @@ impl From<ExecutionError> for TensorError {
 
 pub mod device {
     use crate::backends::OpenedKind;
-    use crate::devices::{BackendHeld, DeviceLedgerView, Ledger, Ledgers, LimitError, PathLedgerView, StoreLedgerView};
     use crate::driver::Allocation;
     use seismic_compiler::errors::ExecutionError;
-    use seismic_topology::{Contract, DeviceTopology, Executor, Placing, StoreId};
+    use seismic_topology::{Contract, DeviceTopology, Executor, StoreId};
     use std::sync::Arc;
 
-    /// The right to bound every ledger an opened device reaches
-    /// (`DeviceInner::bounds`), released as it drops.
-    pub struct Bounds {
-        memory: Arc<crate::memory::DeviceLedgers>,
-        topology: Arc<DeviceTopology>,
-        _bounder: Arc<crate::memory::Bounder>,
-    }
-
-    impl Bounds {
-        /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
-        /// revokes what is charged. A store's ledger lives only while an
-        /// open device reaches it, so only a store this device reaches can
-        /// be bound.
-        pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
-            match ledger {
-                Ledger::Path(path) => {
-                    self.memory.path(path).ok_or(LimitError::ForeignPath(path))?.share.account().set_bound(bound)
-                }
-                Ledger::Own(store) => {
-                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.set_bound(bound)
-                }
-                Ledger::Store(store) => {
-                    self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
-                    self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound(bound)
-                }
-            }
-            Ok(())
-        }
-
-        /// Hold store `store`'s bound to `source` of the store's claim,
-        /// read at each admission against the store from now on, in place of
-        /// any value set: its holder's room as the holder stands at the
-        /// admission, never as it stood at a reading.
-        pub fn bound_by(
-            &self,
-            store: StoreId,
-            source: impl Fn(u64) -> Option<u64> + Send + Sync + 'static,
-        ) -> Result<(), LimitError> {
-            self.topology.store(store).ok_or(LimitError::StaleStore(store))?;
-            self.memory.store(store).ok_or(LimitError::ForeignStore(store))?.store().set_bound_source(Arc::new(source));
-            Ok(())
-        }
-    }
-
     /// One opened executor: its immutable description, execution resources
-    /// and ledgers.
+    /// and the stores it charges.
     pub struct DeviceInner {
         pub(crate) info: Executor,
         pub(crate) topology: Arc<DeviceTopology>,
-        pub(crate) memory: Arc<crate::memory::DeviceLedgers>,
+        pub(crate) memory: Arc<crate::memory::DeviceStores>,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: OpenedKind,
         /// The device's properties, described once by its backend when it
@@ -1000,30 +896,6 @@ pub mod device {
                 .map_read_only_host_region(region, alignment)
                 .map_err(super::TensorError::Execution)
         }
-        /// Zero-filled storage of a reserved tensor of `rows` leading rows of
-        /// `row` bytes, `committed` of them backed, as the device reserves
-        /// (its executor's limits); see `OpenedKind::allocate_reserved_tensor`.
-        pub(crate) fn allocate_reserved_tensor(
-            self: &Arc<Self>,
-            contract: seismic_topology::ReservedContract,
-            (records, rows, committed): (seismic_topology::ReservedRecords, u64, u64),
-            alignment: u64,
-        ) -> Result<crate::driver::Resizer, super::TensorError> {
-            let unreservable = |why| super::TensorError::Unreservable {
-                backend: self.info().backend(),
-                why,
-            };
-            let span = self
-                .info()
-                .reserving(contract)
-                .map_err(|why| unreservable(Some(why.clone())))?
-                .ok_or_else(|| unreservable(None))?;
-            self.kind.allocate_reserved_tensor(
-                crate::driver::ReservedRange::new(contract, span, records, rows),
-                committed,
-                alignment,
-            )
-        }
         pub(crate) fn allocation_address(&self, allocation: &Arc<Allocation>, offset: u64) -> u64 {
             self.kind.allocation_address(allocation, offset)
         }
@@ -1084,85 +956,81 @@ pub mod device {
                 OpenedKind::Vulkan(_) => false,
             }
         }
-        /// The ledgers this device reaches: each store's, its paths'
-        /// accounts, and its own on each store.
-        pub fn ledgers(&self) -> Ledgers {
-            let memory = &self.memory;
-            let mut stores = Vec::new();
-            for (store, ledger) in &memory.stores {
-                let ledger = ledger.store();
-                stores.push(StoreLedgerView { store: *store, claim: ledger.claim(), bound: ledger.bound() });
-            }
-            Ledgers {
-                stores,
-                paths: memory
-                    .paths
-                    .iter()
-                    .map(|path| PathLedgerView {
-                        path: path.id,
-                        claim: path.share.account().claim(),
-                        bound: path.share.account().bound(),
-                    })
-                    .collect(),
-                own: memory.stores.iter().map(|(store, ledger)| (*store, ledger.view())).collect(),
+        /// The ledger entry an allocation of `contract` made now on this
+        /// thread is charged to: the one its caller names for the store
+        /// ([`crate::memory::charging`]), else the store's sole entry where
+        /// it counts every byte in one ([`crate::memory::Store::sole`]).
+        ///
+        /// # Panics
+        /// Where neither is: an embedder's ledger has no owner for the bytes.
+        pub fn entry(&self, contract: Contract) -> std::sync::Arc<dyn crate::memory::Entry> {
+            self.memory.entry(contract)
+        }
+        /// Run `allocate`, every allocation it makes on this thread through
+        /// this device landing in `kind` or refused
+        /// ([`crate::memory::DeviceStores::confined`]).
+        ///
+        /// # Panics
+        /// Where `kind` is none of the device's executor's kinds.
+        pub fn in_kind<T>(&self, kind: seismic_topology::NativeKind, allocate: impl FnOnce() -> T) -> T {
+            assert_eq!(
+                kind.backend,
+                self.info.backend(),
+                "invariant violated: allocations confined to a kind of another backend"
+            );
+            self.memory.confined(kind.id, allocate)
+        }
+        /// The bytes the embedder's ledger counts the process holding in the
+        /// store device storage is placed on ([`crate::memory::Store::allocated`]).
+        pub fn allocated(&self) -> u64 {
+            self.memory.store(Contract::DeviceOnly).allocated()
+        }
+        /// Bring the driver's own memory up to date before a reading: on
+        /// Vulkan the memory its driver took that only asking shows
+        /// (`seismic_vulkan::Device::reconcile_driver_memory`), charged to
+        /// the device's own entries, and the grant read in that same query;
+        /// on Metal the residency set requested resident, which a lapse
+        /// while the device idled may have un-wired
+        /// (`seismic_metal::MetalDevice::request_residency`), which re-wires
+        /// it with no completion the OS reports: the host's wired count, read
+        /// after this, may still fall short of our wired buffers. Every other backend
+        /// charges its driver's memory as it is taken and reads no grant
+        /// here.
+        pub fn reconcile_driver_memory(&self) -> Option<crate::memory::Grant> {
+            match &self.kind {
+                #[cfg(not(target_os = "macos"))]
+                OpenedKind::Vulkan(opened) => Some(crate::memory::Grant { left: opened.service().reconcile_driver_memory() }),
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(opened) => {
+                    opened.service().request_residency();
+                    None
+                }
+                _ => None,
             }
         }
-        /// The store device storage is placed on first: whose ledger is the
-        /// device's charge, on a device whose memory is the host's every
-        /// charge it makes in that memory.
+        /// The most [`Self::allocated`] has been since the last
+        /// [`Self::restart_high_water`].
+        pub fn high_water(&self) -> u64 {
+            self.memory.store(Contract::DeviceOnly).high_water()
+        }
+        /// Start [`Self::high_water`] again from what is allocated now.
+        pub fn restart_high_water(&self) {
+            self.memory.store(Contract::DeviceOnly).restart_high_water()
+        }
+        /// What an allocation of `contract` storage can take now
+        /// ([`crate::memory::Store::room`]): one needing more is refused as a
+        /// capacity shortfall.
+        pub fn room(&self, contract: Contract) -> u64 {
+            self.memory.store(contract).room()
+        }
+        /// The store device storage is placed on first.
         pub fn device_store(&self) -> StoreId {
             let path = self
                 .info
-                .paths(Placing::Fixed(Contract::DeviceOnly))
+                .paths(Contract::DeviceOnly)
                 .first()
                 .expect("an opened executor places device storage");
             self.topology.access_path(*path).expect("a placement's path belongs to its topology").store()
-        }
-        /// The device's own ledger on its device store
-        /// ([`Self::device_store`]).
-        pub fn device_ledger(&self) -> DeviceLedgerView {
-            self.memory.device_ledger().view()
-        }
-        /// The right to bound every ledger the device reaches: its paths'
-        /// accounts, its own ledgers, and each store's ledger, every
-        /// executor's of its scope that reaches the store. One live holder
-        /// per ledger; taking it while another holder lives panics, naming
-        /// both.
-        #[track_caller]
-        pub fn bounds(&self) -> Bounds {
-            let bounder = Arc::new(crate::memory::Bounder {
-                selector: self.info.selector(),
-                taken: std::panic::Location::caller(),
-            });
-            for path in &self.memory.paths {
-                path.share.account().right.take(&bounder);
-            }
-            for (_, ledger) in &self.memory.stores {
-                ledger.right.take(&bounder);
-                ledger.store().right.take(&bounder);
-            }
-            Bounds { memory: self.memory.clone(), topology: self.topology.clone(), _bounder: bounder }
-        }
-        /// Start the high-water mark of each of the device's own ledgers
-        /// again from what it charges now, and forget its refusals.
-        pub fn restart_high_water(&self) {
-            for (_, ledger) in &self.memory.stores {
-                ledger.restart_high_water();
-            }
-        }
-        /// What `kind` storage can still take on this device: what its
-        /// placement's paths, every level of the ledger above them, leave
-        /// to both its allocations' charges and what the backend holds
-        /// natively. An allocation needing more is refused as a capacity
-        /// shortfall.
-        pub fn room(&self, contract: Contract) -> u64 {
-            let placement = self.memory.placement(Placing::Fixed(contract));
-            placement.available().min(placement.physical().available())
-        }
-        /// What the backend holds for `kind` storage beyond its
-        /// allocations: a fact of the backend.
-        pub fn backend_held(&self, kind: Contract) -> BackendHeld {
-            self.kind.backend_held(kind)
         }
     }
 }
@@ -1172,7 +1040,8 @@ pub mod tensor {
         device::DeviceInner, HostRegion, RegionError, SharedWordError, TensorError,
         ViewChargeError,
     };
-    use crate::driver::{Allocation, RegionPin};
+    use crate::driver::Allocation;
+    use crate::pool::{GranuleHold, Slots};
     use crate::layout;
     use seismic_compiler::errors::ExecutionError;
     use seismic_compiler::prepared::TensorDescriptor;
@@ -1180,11 +1049,9 @@ pub mod tensor {
     use seismic_lang::registry::{representation_info, RepresentationKind};
     use seismic_topology::Contract;
     use std::sync::{
-        atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        Arc, OnceLock, Weak,
+        atomic::{fence, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
     };
-
-    pub use crate::driver::{PreparedRecommit, RecommitRefusal, RecommitRelease, Resizer};
 
     /// A non-owning observation of one physical tensor allocation. It keeps
     /// no storage alive and reads the same charge as the device ledger.
@@ -1192,8 +1059,6 @@ pub mod tensor {
         allocation: Weak<Allocation>,
         identity: u64,
         topology: Arc<seismic_topology::DeviceTopology>,
-        /// The accounting of the executor the allocation was made through.
-        memory: Arc<crate::memory::DeviceLedgers>,
     }
 
     impl TensorStorageObserver {
@@ -1209,7 +1074,7 @@ pub mod tensor {
         /// The bytes the allocation charges along each access path, while
         /// it lives.
         pub fn path_charges(&self) -> Option<Vec<(seismic_topology::AccessPathId, u64)>> {
-            Some(self.allocation.upgrade()?.path_charges(&self.memory))
+            Some(self.allocation.upgrade()?.path_charges())
         }
         pub fn identity(&self) -> u64 {
             self.identity
@@ -1304,10 +1169,9 @@ pub mod tensor {
         strides: Vec<u64>,
         slabs: Option<SlabView>,
         alias_identity: Option<u64>,
-        slab_lease: Option<Arc<AtomicUsize>>,
-        /// A region of a reserved tensor's backed bytes, and every view of
-        /// it, holds them backed ([`TensorInner::region`]).
-        pin: Option<Arc<RegionPin>>,
+        /// The granule of the pooled slab this view lies in, held while any
+        /// view of it lives (`crate::pool::GranuleHold`).
+        hold: Option<Arc<GranuleHold>>,
         /// This view's records as a native record port binds them, formed
         /// at its first such binding ([`TensorInner::records`]).
         records: OnceLock<Arc<Records>>,
@@ -1315,91 +1179,142 @@ pub mod tensor {
 
     /// A view's records as a native record port reaches them
     /// ([`TensorInner::records`]): through a table of their device
-    /// addresses, in the storage they lie in.
+    /// addresses.
     pub(crate) struct Records {
         /// The table's allocation, and the byte offset of the view's entry 0.
         pub(crate) table: Arc<Allocation>,
         pub(crate) table_offset: u64,
-        /// The view's allocation, which the encodings order by
-        /// (`native::hazard`), its records, and where they lie in it.
-        pub(crate) storage: Arc<Allocation>,
         pub(crate) count: u64,
-        pub(crate) placement: RecordPlacement,
+        /// The bytes of one record.
+        pub(crate) record: u64,
+        /// The allocation the records lie in, one after another from its
+        /// byte `.1`, which the encodings order by (`native::hazard`); none
+        /// for a slab view's, one record a slab, which its slab reach orders
+        /// ([`TensorInner::slab_reach`]).
+        #[cfg(any(test, target_os = "macos"))]
+        pub(crate) storage: Option<(Arc<Allocation>, u64)>,
     }
 
-    impl Records {
-        /// Where records `[first, first + count)` lie: their bytes' offset
-        /// in the storage, and the bytes they span (the encodings order by
-        /// them).
-        pub(crate) fn span(&self, first: u64, count: u64) -> (u64, u64) {
-            let record = self.placement.record();
-            self.placement.reach(first * record, count * record)
-        }
-    }
-
-    /// Where a view's records lie in its storage: records of a nonzero
-    /// size from the view's first byte, packed as its storage packs them
-    /// ([`seismic_topology::Packing`]). Only a view with records has one
-    /// ([`TensorInner::record_placement`]).
+    /// Where a view's records lie in its storage: records of a nonzero size
+    /// one after another from the view's first byte. Only a view with
+    /// records has one ([`TensorInner::record_placement`]).
     #[derive(Clone, Copy, Debug)]
     pub struct RecordPlacement {
         start: u64,
-        packing: seismic_topology::Packing,
+        record: std::num::NonZeroU64,
     }
 
     impl RecordPlacement {
         /// The bytes of one record.
         pub fn record(&self) -> u64 {
-            self.packing.record()
-        }
-
-        /// Where record `index` lies, in bytes from the storage's first.
-        fn at(&self, index: u64) -> u64 {
-            self.packing.at(self.start, index)
+            self.record.get()
         }
 
         /// Where record `index` lies, in bytes from the view's first.
         pub fn offset(&self, index: u64) -> u64 {
-            self.at(index) - self.start
+            index * self.record()
         }
 
-        /// The byte of the storage just past the view's first `records`
-        /// records.
-        fn end(&self, records: u64) -> u64 {
-            self.packing.end(self.start, records)
-        }
-
-        /// Where the view's canonical bytes `[offset, offset + bytes)` lie,
-        /// and the bytes they span: on chunked storage the records covering
-        /// them, as packed; otherwise those bytes.
-        pub(crate) fn reach(&self, offset: u64, bytes: u64) -> (u64, u64) {
-            match self.packing.chunked() && bytes != 0 {
-                true => {
-                    let at = self.at(offset / self.record());
-                    (at, self.end((offset + bytes).div_ceil(self.record())) - at)
-                }
-                false => (self.start + offset, bytes),
-            }
+        /// Where record `index` lies, in bytes from the storage's first.
+        fn at(&self, index: u64) -> u64 {
+            self.start + self.offset(index)
         }
     }
 
-    impl Drop for TensorInner {
-        fn drop(&mut self) {
-            if let Some(lease) = &self.slab_lease {
-                lease.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
+    /// What a slab view's binding reaches ([`TensorInner::slab_reach`]): its
+    /// address-table entries and, by address, each backed slab region
+    /// (allocation, byte offset, bytes).
+    pub(crate) struct SlabReach {
+        pub(crate) table_bytes: u64,
+        pub(crate) regions: Vec<(u64, u64, u64)>,
     }
 
+    /// A slab view's region of its store: its slots as they are when it is
+    /// read, never a snapshot, so the view stays valid as slabs are added,
+    /// freed and moved.
     struct SlabView {
+        slots: Arc<Slots>,
+        region: usize,
+        /// The store's first slot in this view, and the slots it spans.
+        first: usize,
+        count: usize,
         rows_per_slab: u64,
-        regions: Vec<Option<Arc<TensorInner>>>,
+        /// One slab's rows of the region, as this view shapes them:
+        /// `[rows_per_slab, ...]`.
+        slab_extents: Vec<u64>,
+        /// The bytes of one slab's rows of the region.
+        slab_bytes: u64,
+        /// What device work bound to the view reaches, with the store's
+        /// slab generation it was read at ([`SlabView::reach`]): formed
+        /// again only once a slab is added, freed or moved, so a dispatch
+        /// takes it without allocating.
+        reach: Mutex<Option<(u64, Arc<SlabReach>)>>,
+    }
+
+    impl SlabView {
+        fn new(
+            slots: Arc<Slots>,
+            region: usize,
+            first: usize,
+            count: usize,
+            rows_per_slab: u64,
+            slab_extents: Vec<u64>,
+            slab_bytes: u64,
+        ) -> Self {
+            Self {
+                slots,
+                region,
+                first,
+                count,
+                rows_per_slab,
+                slab_extents,
+                slab_bytes,
+                reach: Mutex::new(None),
+            }
+        }
+
+        /// What device work bound to the view reaches now: its address-table
+        /// entries (`[count, 2]` u32 from `first`) and each backed slab's
+        /// region in `first..first + count`. The generation is read before
+        /// the slabs, and the store moves it under its slab lock with every
+        /// change, so a reach is never kept past a change it does not show.
+        fn reach(&self) -> Arc<SlabReach> {
+            let mut cached = self.reach.lock().expect("slab reach lock poisoned");
+            let generation = self.slots.generation();
+            match &*cached {
+                Some((read, reach)) if *read == generation => reach.clone(),
+                _ => {
+                    let reach = Arc::new(SlabReach {
+                        table_bytes: seismic_lang::registry::record_table_entry(self.count as u64),
+                        regions: self
+                            .slots
+                            .reach(self.region, self.first, self.count, self.slab_bytes),
+                    });
+                    *cached = Some((generation, reach.clone()));
+                    reach
+                }
+            }
+        }
+
+        /// The region's rows of each slot's slab in `first..first + count`
+        /// now, `None` a free slot's.
+        fn regions(
+            &self,
+            representation: RepresentationId,
+        ) -> Result<Vec<Option<Arc<TensorInner>>>, TensorError> {
+            self.slots.region_views(
+                self.region,
+                self.first,
+                self.count,
+                representation,
+                &self.slab_extents,
+            )
+        }
     }
 
     /// A tensor's elements on the host ([`TensorInner::image`]).
     pub(crate) enum TensorImage {
         Whole(Vec<u8>),
-        Committed(Vec<u8>),
         Slabs(Vec<Option<Vec<u8>>>),
     }
 
@@ -1436,144 +1351,27 @@ pub mod tensor {
         Ok(table)
     }
 
-    /// A tensor over ordinary storage, never a reservation's: its device
-    /// address is fixed for its life (a reserved tensor's can change when it
-    /// is recommitted, on Metal). Only ordinary storage and views of it form
-    /// one.
-    #[derive(Clone)]
-    pub struct Ordinary(Arc<TensorInner>);
-
-    impl Ordinary {
-        /// New zeroed storage ordered by the same hazard domain as `other`.
-        pub fn zeros_sharing_access(
-            other: &Self,
-            representation: RepresentationId,
-            extents: &[u64],
-        ) -> Result<Self, TensorError> {
-            TensorInner::canonical_in(&other.device, representation, extents, |device, bytes, alignment| {
-                let allocation = device.kind.allocate_in(bytes, alignment, Some(other.allocation.access_group().clone()))?;
-                device.kind.zeroed(allocation, bytes)
-            }).map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// New initialized storage ordered by the same hazard domain as `other`.
-        pub fn from_host_sharing_access(
-            other: &Self,
-            representation: RepresentationId,
-            extents: &[u64],
-            bytes: &[u8],
-        ) -> Result<Self, TensorError> {
-            TensorInner::from_host_in(&other.device, representation, extents, bytes, Some(other.allocation.access_group().clone()))
-                .map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// `tensor`, unless it views a reservation.
-        pub fn of(tensor: Arc<TensorInner>) -> Option<Self> {
-            tensor.allocation.reservation().is_none().then_some(Self(tensor))
-        }
-
-        /// [`TensorInner::zeros`].
-        pub fn zeros(
-            device: &Arc<DeviceInner>,
-            representation: RepresentationId,
-            extents: &[u64],
-        ) -> Result<Self, TensorError> {
-            TensorInner::zeros(device, representation, extents).map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// [`TensorInner::from_host`].
-        pub fn from_host(
-            device: &Arc<DeviceInner>,
-            representation: RepresentationId,
-            extents: &[u64],
-            bytes: &[u8],
-        ) -> Result<Self, TensorError> {
-            TensorInner::from_host(device, representation, extents, bytes)
-                .map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// [`TensorInner::region`] of this tensor.
-        pub fn region(
-            &self,
-            representation: RepresentationId,
-            extents: &[u64],
-            offset: u64,
-        ) -> Result<Self, TensorError> {
-            self.0
-                .region(representation, extents, offset)
-                .map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// [`TensorInner::slice_leading`] of this tensor.
-        pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, TensorError> {
-            self.0.slice_leading(start, end).map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        /// [`TensorInner::reshape`] of this tensor.
-        pub fn reshape(&self, extents: &[u64]) -> Result<Self, TensorError> {
-            self.0.reshape(extents).map(|tensor| Self(Arc::new(tensor)))
-        }
-
-        pub fn tensor(&self) -> &Arc<TensorInner> {
-            &self.0
-        }
-    }
-
-    impl std::ops::Deref for Ordinary {
-        type Target = TensorInner;
-
-        fn deref(&self) -> &TensorInner {
-            &self.0
-        }
-    }
-
     impl TensorInner {
-        /// A logical tensor whose native binding is a slab address table.
-        /// Each present region view retains its slab allocation; a launch
-        /// snapshots this list and tracks every allocation it can address.
-        /// The table holds its regions' device addresses, fixed for their
-        /// lives: table and regions are ordinary tensors.
-        pub fn slabbed(
-            table: &Ordinary,
+        /// The logical tensor of region `region` of a slab store's `slots`:
+        /// `logical_rows` rows of `row_shape`, `rows_per_slab` a slab, bound
+        /// through the region's address table, which device work reads as it
+        /// runs. Every slab of the store shares the table's hazard domain,
+        /// save its lent slabs ([`Self::bound_allocations`]).
+        pub(crate) fn slabbed(
+            slots: &Arc<Slots>,
+            region: usize,
             representation: RepresentationId,
             rows_per_slab: u64,
             logical_rows: u64,
+            row_shape: &[u64],
             alias_identity: u64,
-            regions: Vec<Option<Ordinary>>,
-            lease: Arc<AtomicUsize>,
         ) -> Result<Self, TensorError> {
-            if regions.is_empty() || rows_per_slab == 0 {
+            if rows_per_slab == 0 {
                 return Err(TensorError::SlabLayout("empty slab tensor".into()));
             }
-            if table.representation
-                != seismic_lang::registry::dense(seismic_lang::types::DType::U32)
-                || table.extents != [regions.len() as u64, 2]
-            {
-                return Err(TensorError::SlabLayout(
-                    "slab address table has the wrong representation or shape".into(),
-                ));
-            }
-            let example = regions
-                .iter()
-                .flatten()
-                .next()
-                .ok_or_else(|| TensorError::SlabLayout("no backed slab".into()))?;
-            if example.representation != representation
-                || example.extents.first().copied() != Some(rows_per_slab)
-                || regions.iter().flatten().any(|region| {
-                    !Arc::ptr_eq(&region.device, &table.device)
-                        || region.representation != representation
-                        || region.extents != example.extents
-                        || !region.allocation.shares_access_with(&table.allocation)
-                })
-            {
-                return Err(TensorError::SlabLayout(
-                    "slab region shapes or devices differ".into(),
-                ));
-            }
-            let capacity_rows = u64::try_from(regions.len())
-                .ok()
-                .and_then(|count| count.checked_mul(rows_per_slab))
+            let capacity = slots.capacity() as u64;
+            let capacity_rows = capacity
+                .checked_mul(rows_per_slab)
                 .ok_or_else(|| TensorError::SlabLayout("logical slab extent overflows".into()))?;
             if logical_rows == 0
                 || logical_rows > capacity_rows
@@ -1583,40 +1381,57 @@ pub mod tensor {
                     "logical extent does not match slab capacity".into(),
                 ));
             }
-            let mut extents = example.extents.clone();
-            extents[0] = logical_rows;
+            let extents = std::iter::once(logical_rows).chain(row_shape.iter().copied()).collect::<Vec<_>>();
             let layout = layout::canonical(representation, &extents)?;
-            lease.fetch_add(1, Ordering::AcqRel);
+            let slab_extents = std::iter::once(rows_per_slab).chain(row_shape.iter().copied()).collect::<Vec<_>>();
+            let slab_bytes = layout::canonical(representation, &slab_extents)?.byte_len;
             Ok(Self {
-                device: table.device.clone(),
-                allocation: table.allocation.clone(),
-                byte_offset: table.byte_offset,
+                device: slots.device().clone(),
+                allocation: slots.table().clone(),
+                byte_offset: slots.region_offset(region),
                 byte_len: layout.byte_len,
                 representation,
                 extents,
                 strides: layout.strides,
-                slabs: Some(SlabView {
-                    rows_per_slab,
-                    regions: regions
-                        .into_iter()
-                        .map(|region| region.map(|region| region.0))
-                        .collect(),
-                }),
+                slabs: Some(SlabView::new(slots.clone(), region, 0, slots.capacity(), rows_per_slab, slab_extents, slab_bytes)),
                 alias_identity: Some(alias_identity),
-                slab_lease: Some(lease),
-                pin: None,
+                hold: None,
                 records: OnceLock::new(),
             })
         }
 
-        pub fn new_slab_alias() -> u64 {
-            crate::driver::fresh_allocation_identity()
+        /// A canonical view of `representation` over `extents` at `offset`
+        /// of `allocation`, a slab's region, holding its granule where it is
+        /// a pool's.
+        pub(crate) fn in_slab(
+            device: &Arc<DeviceInner>,
+            allocation: Arc<Allocation>,
+            offset: u64,
+            representation: RepresentationId,
+            extents: &[u64],
+            hold: Option<Arc<GranuleHold>>,
+        ) -> Result<Self, TensorError> {
+            let layout = layout::canonical(representation, extents)?;
+            let mut view = Self::new_view(
+                device.clone(),
+                allocation,
+                offset,
+                layout.byte_len,
+                representation,
+                extents.to_vec(),
+                layout.strides,
+            );
+            view.hold = hold;
+            Ok(view)
         }
 
+        /// The allocations device work bound to this view reaches, each in
+        /// its own hazard domain: its own (a slab view's table, which every
+        /// pooled slab of its store shares a domain with), and a slab
+        /// view's lent slabs' storage.
         pub(crate) fn bound_allocations(&self) -> impl Iterator<Item = Arc<Allocation>> + '_ {
-            // Every slab region shares the address table's hazard group.
-            // One fence orders host access and release for all backed slots.
             std::iter::once(self.allocation.clone())
+                .chain(self.slabs.iter().flat_map(|slabs| slabs.slots.lenders().iter().cloned()))
         }
 
         /// Whether the tensor is a slab view: its binding is an address table,
@@ -1632,63 +1447,41 @@ pub mod tensor {
             self.is_slab_view() || self.extents.contains(&0)
         }
 
-        /// Whether a call bound to this view must hold it until its
-        /// submission records its fences: a slab view's placement, or a
-        /// pinned region of reserved storage. From then on the allocation
-        /// fences defer any physical release to the work's completion.
+        /// Whether a call bound to this view holds it until its submission
+        /// records its fences: a slab view, whose store's slots device work
+        /// reads through its table as it runs.
         pub(crate) fn holds_binding_lease(&self) -> bool {
-            self.slabs.is_some() || self.pin.is_some()
+            self.slabs.is_some()
         }
 
-        /// What device work bound to a slab view reaches: its address-table
+        /// What device work bound to a slab view reaches now: its address-table
         /// entries (the binding, `[slabs, 2]` u32 at the view's offset) and
-        /// each backed slab region; `None` for any other view.
-        pub(crate) fn slab_reach(&self) -> Option<crate::native::hazard::SlabReach> {
-            self.slabs
-                .as_ref()
-                .map(|slabs| crate::native::hazard::SlabReach {
-                    table_bytes: slabs.regions.len() as u64 * 8,
-                    regions: slabs
-                        .regions
-                        .iter()
-                        .flatten()
-                        .map(|region| {
-                            (region.allocation.clone(), region.byte_offset, region.byte_len)
-                        })
-                        .collect(),
-                })
+        /// each backed slab's region ([`SlabView::reach`]); `None` for any
+        /// other view.
+        pub(crate) fn slab_reach(&self) -> Option<Arc<SlabReach>> {
+            self.slabs.as_ref().map(SlabView::reach)
         }
 
         /// The device bytes the tensor's elements occupy: a slab view's
-        /// backed slabs, a reserved tensor's committed rows, otherwise its
-        /// byte length.
+        /// backed slabs, otherwise its byte length.
         pub(crate) fn occupied_bytes(&self) -> u64 {
             match &self.slabs {
-                Some(slabs) => slabs.regions.iter().flatten().map(|r| r.byte_len).sum(),
-                None => self
-                    .byte_len
-                    .min(self.allocation.bytes().saturating_sub(self.byte_offset)),
+                Some(slabs) => slabs.reach().regions.len() as u64 * slabs.slab_bytes,
+                None => self.byte_len,
             }
         }
 
         /// The bytes a device copy of the tensor is written from
-        /// ([`TensorInner::copy_of`]), in canonical layout: all of them, a
-        /// reserved tensor's committed rows (only they are backed), or each
-        /// backed slab's region of a slab view.
+        /// ([`TensorInner::copy_of`]), in canonical layout: all of them, or
+        /// each backed slab's region of a slab view.
         pub(crate) fn image(&self) -> Result<TensorImage, TensorError> {
             if let Some(slabs) = &self.slabs {
                 return Ok(TensorImage::Slabs(
                     slabs
-                        .regions
+                        .regions(self.representation)?
                         .iter()
                         .map(|region| region.as_ref().map(|r| r.read_to_host()).transpose())
                         .collect::<Result<_, _>>()?,
-                ));
-            }
-            if self.reaches_uncommitted() {
-                return Ok(TensorImage::Committed(
-                    self.slice_leading(0, self.committed_rows())?
-                        .read_to_host()?,
                 ));
             }
             Ok(TensorImage::Whole(self.read_to_host()?))
@@ -1704,84 +1497,37 @@ pub mod tensor {
         pub(crate) fn copy_of(&self, image: &TensorImage) -> Result<Self, TensorError> {
             let device = &self.device;
             match (image, &self.slabs) {
-                (TensorImage::Whole(bytes), None) if !self.reaches_uncommitted() => {
-                    match self.host_address() {
-                        Some(_) => {
-                            let copy = Self::shared(device, self.representation, &self.extents)?;
-                            copy.write_from_host(bytes)?;
-                            Ok(copy)
-                        }
-                        None => Self::from_host(device, self.representation, &self.extents, bytes),
+                (TensorImage::Whole(bytes), None) => match self.host_address() {
+                    Some(_) => {
+                        let copy = Self::shared(device, self.representation, &self.extents)?;
+                        copy.write_from_host(bytes)?;
+                        Ok(copy)
                     }
-                }
-                (TensorImage::Committed(bytes), None) if self.reaches_uncommitted() => {
-                    let committed = self.committed_rows();
-                    // The copy keeps its rows, never resized, in storage
-                    // of the kind the call reads this tensor's from.
-                    let reservation = self
-                        .allocation
-                        .reservation()
-                        .expect("a view reaching past its backed bytes is of a reservation");
-                    let (copy, _) = Self::reserved(
-                        device,
-                        reservation.contract,
-                        self.representation,
-                        &self.extents,
-                        committed,
-                        reservation.carries,
-                    )?;
-                    copy.slice_leading(0, committed)?.write_from_host(bytes)?;
-                    Ok(copy)
-                }
-                (TensorImage::Slabs(images), Some(slabs))
-                    if images.len() == slabs.regions.len() =>
-                {
-                    let dense_u32 = seismic_lang::registry::dense(seismic_lang::types::DType::U32);
-                    let table =
-                        Ordinary::zeros(device, dense_u32, &[slabs.regions.len() as u64, 2])?;
-                    let regions = slabs
-                        .regions
-                        .iter()
-                        .zip(images)
-                        .map(|(region, bytes)| match (region, bytes) {
-                            (Some(region), Some(bytes)) => {
-                                let copy = Ordinary::from_host_sharing_access(
-                                    &table,
-                                    region.representation,
-                                    &region.extents,
-                                    bytes,
-                                )?;
-                                Ok(Some(copy))
-                            }
-                            _ => Ok(None),
-                        })
-                        .collect::<Result<Vec<_>, TensorError>>()?;
-                    // An unbacked slot names the first backed slab, as a
-                    // slab store's table does.
-                    let stand_in = regions
-                        .iter()
-                        .flatten()
-                        .next()
-                        .map(|region| region.device_address())
-                        .unwrap_or(0);
-                    let words = regions
-                        .iter()
-                        .flat_map(|region| {
-                            region
-                                .as_ref()
-                                .map_or(stand_in, |region| region.device_address())
-                                .to_le_bytes()
-                        })
-                        .collect::<Vec<_>>();
-                    table.write_from_host(&words)?;
+                    None => Self::from_host(device, self.representation, &self.extents, bytes),
+                },
+                (TensorImage::Slabs(images), Some(slabs)) if images.len() == slabs.count => {
+                    if slabs.count == 0 {
+                        let slots = Slots::copy(device, self.representation, &slabs.slab_extents, &[None])?;
+                        let whole = Self::slabbed(
+                            &slots,
+                            0,
+                            self.representation,
+                            slabs.rows_per_slab,
+                            slabs.rows_per_slab,
+                            &self.extents[1..],
+                            crate::driver::fresh_allocation_identity(),
+                        )?;
+                        return whole.slice_leading(0, 0);
+                    }
+                    let slots = Slots::copy(device, self.representation, &slabs.slab_extents, images)?;
                     Self::slabbed(
-                        &table,
+                        &slots,
+                        0,
                         self.representation,
                         slabs.rows_per_slab,
                         self.extents[0],
-                        Self::new_slab_alias(),
-                        regions,
-                        Arc::new(AtomicUsize::new(0)),
+                        &self.extents[1..],
+                        crate::driver::fresh_allocation_identity(),
                     )
                 }
                 _ => Err(TensorError::SlabLayout(
@@ -1804,18 +1550,36 @@ pub mod tensor {
         /// allocation's lifetime into a launch. This view must be one
         /// contiguous byte range of an allocation (not slabbed), and the
         /// region must lie within it, starting at a multiple of its layout's
-        /// alignment in the allocation. A region of a reserved tensor lies
-        /// within its backed bytes and pins them: while any view of the
-        /// region lives, a recommit backs no fewer. On chunked storage its
-        /// records are packed, none crossing a chunk: it starts where its
-        /// first record fits in one chunk (a packed start, such as the end
-        /// of an earlier packed view) and spans its records as they are
-        /// packed ([`TensorInner::record_placement`]).
+        /// alignment in the allocation. A dense floating view is viewed only
+        /// as its own representation ([`RegionError::FloatingReinterpret`]).
         pub fn region(
             &self,
             representation: RepresentationId,
             extents: &[u64],
             offset: u64,
+        ) -> Result<Self, TensorError> {
+            self.region_as(representation, extents, offset, false)
+        }
+
+        /// [`Self::region`] of another form's records this view's records
+        /// carry whole (an expert bank's lent records, carrying its conveyor
+        /// or its scratch): a dense floating view may also be viewed as a
+        /// non-dense form, whose records its own lend their bytes to.
+        pub fn carried_region(
+            &self,
+            representation: RepresentationId,
+            extents: &[u64],
+            offset: u64,
+        ) -> Result<Self, TensorError> {
+            self.region_as(representation, extents, offset, true)
+        }
+
+        fn region_as(
+            &self,
+            representation: RepresentationId,
+            extents: &[u64],
+            offset: u64,
+            carried: bool,
         ) -> Result<Self, TensorError> {
             if !self.device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
@@ -1825,11 +1589,7 @@ pub mod tensor {
             }
             let from = representation_info(self.representation);
             let to = representation_info(representation);
-            let carries_packed = self
-                .allocation
-                .reservation()
-                .is_some_and(|reservation| reservation.carries.is_some())
-                && !matches!(to.kind, RepresentationKind::Dense(_));
+            let carries_packed = carried && !matches!(to.kind, RepresentationKind::Dense(_));
             if matches!(from.kind, RepresentationKind::Dense(dtype) if dtype.is_float())
                 && representation != self.representation
                 && !carries_packed
@@ -1840,59 +1600,25 @@ pub mod tensor {
                 }));
             }
             if self.slabs.is_some()
-                || self.packed()
                 || layout::canonical(self.representation, &self.extents)?.strides != self.strides
             {
                 return Err(TensorError::Region(RegionError::NotContiguous));
             }
             let layout = layout::canonical(representation, extents)?;
-            let outside = |bytes| {
-                TensorError::Region(RegionError::Outside {
+            if offset.checked_add(layout.byte_len).is_none_or(|end| end > self.byte_len) {
+                return Err(TensorError::Region(RegionError::Outside {
                     offset,
-                    bytes,
+                    bytes: layout.byte_len,
                     view_bytes: self.byte_len,
-                })
-            };
-            let start = self.byte_offset.checked_add(offset).ok_or(outside(layout.byte_len))?;
-            // On chunked storage the region's records are packed from an
-            // already packed start ([`seismic_topology::Packing`]).
-            let packed = self.allocation.reservation().map(|reservation| reservation.span);
-            let span = match packed {
-                Some(span) if span.chunked() && layout.byte_len != 0 => {
-                    let record = seismic_lang::registry::record_bytes(representation, extents)
-                        .ok_or(TensorError::Region(RegionError::Unrecorded { offset: start }))?
-                        .get();
-                    let packing = span
-                        .packing(record)
-                        .filter(|packing| packing.at(start, 0) == start)
-                        .ok_or(TensorError::Region(RegionError::Straddles {
-                            offset: start,
-                            record,
-                        }))?;
-                    packing.end(start, extents[0]) - start
-                }
-                _ => layout.byte_len,
-            };
-            if offset.checked_add(span).is_none_or(|end| end > self.byte_len) {
-                return Err(outside(span));
+                }));
             }
+            let start = self.byte_offset + offset;
             if start % layout.alignment != 0 {
                 return Err(TensorError::Region(RegionError::Unaligned {
                     offset: start,
                     alignment: layout.alignment,
                 }));
             }
-            let pin = match self.allocation.reservation() {
-                Some(_) => Some(Arc::new(
-                    self.allocation
-                        .pin(start + span)
-                        .ok_or(TensorError::Region(RegionError::Unbacked {
-                            end: start + span,
-                            bytes: self.allocation.bytes(),
-                        }))?,
-                )),
-                None => None,
-            };
             let mut region = Self::new_view(
                 self.device.clone(),
                 self.allocation.clone(),
@@ -1902,17 +1628,14 @@ pub mod tensor {
                 extents.to_vec(),
                 layout.strides,
             );
-            region.pin = pin;
+            region.hold = self.hold.clone();
             Ok(region)
         }
 
         /// Records `start..end` of this view (its leading-axis rows, where
         /// [`Self::record_placement`] lays them) as a region of their own:
         /// the view a [`Self::region`] of its storage at the first of them
-        /// forms, which pins a reservation's backed bytes only through the
-        /// last of them, where any view derived from this one pins what this
-        /// one does. So a holder of a few records of a reserved tensor never
-        /// holds a recommit above them.
+        /// forms.
         pub fn record_region(&self, start: u64, end: u64) -> Result<Self, TensorError> {
             let placement = self
                 .record_placement()
@@ -1930,15 +1653,6 @@ pub mod tensor {
                 .chain(self.extents[1..].iter().copied())
                 .collect::<Vec<_>>();
             let layout = layout::canonical(self.representation, &extents)?;
-            let pin = match self.allocation.reservation() {
-                Some(_) => Some(Arc::new(self.allocation.pin(placement.end(end)).ok_or(
-                    TensorError::Region(RegionError::Unbacked {
-                        end: placement.end(end),
-                        bytes: self.allocation.bytes(),
-                    }),
-                )?)),
-                None => None,
-            };
             let mut region = Self::new_view(
                 self.device.clone(),
                 self.allocation.clone(),
@@ -1948,7 +1662,7 @@ pub mod tensor {
                 extents,
                 layout.strides,
             );
-            region.pin = pin;
+            region.hold = self.hold.clone();
             Ok(region)
         }
 
@@ -1956,233 +1670,96 @@ pub mod tensor {
             self.device.allocation_address(&self.allocation, self.byte_offset)
         }
 
-        /// Where this canonical view's records (leading-axis rows) lie: on
-        /// chunked reserved storage packed from the view's first byte, none
-        /// crossing a chunk ([`TensorInner::region`]), otherwise one after
-        /// another. None for a view without records of their own
-        /// ([`record_bytes`]), or whose records no chunk of its storage
-        /// holds whole ([`seismic_topology::Reservation::packing`]).
+        /// Where this canonical view's records (leading-axis rows) lie: one
+        /// after another from its first byte. None for a view without
+        /// records of their own ([`record_bytes`]).
+        ///
+        /// [`record_bytes`]: seismic_lang::registry::record_bytes
         pub fn record_placement(&self) -> Option<RecordPlacement> {
             let record = seismic_lang::registry::record_bytes(self.representation, &self.extents)?;
-            let packing = match self.allocation.reservation() {
-                Some(reservation) => reservation.span.packing(record.get())?,
-                None => seismic_topology::Packing::contiguous(record),
-            };
             Some(RecordPlacement {
                 start: self.byte_offset,
-                packing,
-            })
-        }
-
-        /// The bytes from its first that this view reaches: its records as
-        /// packed on chunked storage ([`RecordPlacement::reach`]),
-        /// otherwise its bytes.
-        pub(crate) fn reached_bytes(&self) -> u64 {
-            self.record_placement()
-                .map_or(self.byte_len, |placement| placement.reach(0, self.byte_len).1)
-        }
-
-        /// Whether this view lies in chunked reserved storage, which device
-        /// work reaches only through native record ports (or, never bound,
-        /// host ports).
-        pub(crate) fn chunked(&self) -> bool {
-            self.allocation
-                .reservation()
-                .is_some_and(|reservation| reservation.span.chunked())
-        }
-
-        /// Whether this view's records are packed in chunks with room left
-        /// between them: its bytes are no one canonical range.
-        fn packed(&self) -> bool {
-            self.record_placement().is_some_and(|placement| {
-                placement.end(self.extents[0]) != self.byte_offset + self.byte_len
+                record,
             })
         }
 
         /// This canonical view's records as a native record port binds them.
-        /// It binds a table its storage holds: a view of a reservation's own
-        /// records the reservation's table (its entries kept as chunks
-        /// change); a view of a fixed allocation the allocation's table of
-        /// records of its size and phase, or for a single record any table
-        /// the allocation holds with an entry at its address
-        /// (`Allocation::view_table`), formed at the first such binding and
-        /// charged with the storage. A view
-        /// formed per run binds the same table and allocates nothing. A
-        /// pinned view of other records of reserved storage forms a table
-        /// of its own, kept with the view (its records stay at those
-        /// addresses only while its pin holds them) and charged with the
-        /// storage while it lives (`Allocation::hold_table`); an unpinned
-        /// one is refused. [`Self::hold_records`] forms the table before
-        /// the first binding.
+        /// A slab view of one row a slab binds its region's address table,
+        /// entry `i` its slot `i`'s record, as its slabs change. Any other
+        /// view binds a table its allocation holds of records of its size
+        /// and phase, or for a single record any table the allocation holds
+        /// with an entry at its address (`Allocation::view_table`), formed
+        /// at the first such binding and charged with the storage; a view
+        /// formed per run binds the same table and allocates nothing.
+        /// [`Self::hold_records`] forms the table before the first binding.
         ///
         /// Device work reaches the records by address alone, so they must
         /// lie in storage the device holds resident (on Metal, its
         /// residency set): a read-only host mapping, which the device makes
         /// resident only where it is bound, is refused.
         pub(crate) fn records(&self) -> Result<Arc<Records>, TensorError> {
-            match self.records.get() {
-                Some(records) => Ok(records.clone()),
+            if let Some(records) = self.records.get() {
+                return Ok(records.clone());
+            }
+            let record = seismic_lang::registry::record_bytes(self.representation, &self.extents)
+                .ok_or(TensorError::Region(RegionError::Unrecorded { offset: self.byte_offset }))?
+                .get();
+            let records = match &self.slabs {
+                Some(slabs) if slabs.rows_per_slab == 1 => Records {
+                    table: self.allocation.clone(),
+                    table_offset: self.byte_offset,
+                    count: self.extents[0],
+                    record,
+                    #[cfg(any(test, target_os = "macos"))]
+                    storage: None,
+                },
+                Some(_) => {
+                    return Err(TensorError::SlabLayout(
+                        "a record port binds a slab view of one row a slab".into(),
+                    ))
+                }
                 None => {
-                    let placement = self
-                        .record_placement()
-                        .ok_or(TensorError::Region(RegionError::NotContiguous))?;
-                    let (table, table_offset) = self.form_record_table(placement)?;
-                    let records = Records {
+                    let (table, table_offset) = self.form_record_table(record)?;
+                    Records {
                         table,
                         table_offset,
-                        storage: self.allocation.clone(),
                         count: self.extents[0],
-                        placement,
-                    };
-                    Ok(self.records.get_or_init(|| Arc::new(records)).clone())
+                        record,
+                        #[cfg(any(test, target_os = "macos"))]
+                        storage: Some((self.allocation.clone(), self.byte_offset)),
+                    }
                 }
-            }
+            };
+            Ok(self.records.get_or_init(|| Arc::new(records)).clone())
         }
 
         /// Form now the table a native record port binds this view through
-        /// ([`Self::records`]), where its backend binds record tables, so no
-        /// later binding allocates: for a view first bound while its
-        /// device's storage may refuse an allocation (memory short).
+        /// ([`Self::records`]), so no later binding allocates: for a view
+        /// first bound while its device's storage may refuse an allocation
+        /// (memory short).
         pub fn hold_records(&self) -> Result<(), TensorError> {
-            match self.device.info().backend().binds_record_tables() {
-                true => self.records().map(drop),
-                false => Ok(()),
-            }
+            self.records().map(drop)
         }
 
-        /// The table a record port binds this view's records, at
-        /// `placement`, through, and the byte of its first entry
+        /// The table a record port binds this unslabbed view's
+        /// `record`-byte records through, and the byte of its first entry
         /// ([`Self::records`]).
-        fn form_record_table(
-            &self,
-            placement: RecordPlacement,
-        ) -> Result<(Arc<Allocation>, u64), TensorError> {
-            let not_contiguous = TensorError::Region(RegionError::NotContiguous);
-            if self.slabs.is_some()
-                || layout::canonical(self.representation, &self.extents)?.strides != self.strides
-            {
-                return Err(not_contiguous);
+        fn form_record_table(&self, record: u64) -> Result<(Arc<Allocation>, u64), TensorError> {
+            if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
+                return Err(TensorError::Region(RegionError::NotContiguous));
             }
             if self.allocation.storage().read_only() {
                 return Err(TensorError::HostRegion(
                     "a record port's records cannot lie in a read-only host mapping".into(),
                 ));
             }
-            let (record, records) = (placement.record(), self.extents[0]);
-            match (self.allocation.reservation(), self.allocation.record_table()) {
-                (Some(reservation), Some(table))
-                    if reservation.record.get() == record && self.byte_offset % record == 0 =>
-                {
-                    let entry = seismic_lang::registry::record_table_entry(self.byte_offset / record);
-                    Ok((table.clone(), entry))
-                }
-                (Some(_), _) if self.pin.is_none() => Err(not_contiguous),
-                // Its records' chunks are backed, at those addresses, only
-                // while the view's pin holds them: the table is the view's.
-                (Some(_), _) => {
-                    let table = record_table(
-                        &self.device,
-                        &self.allocation,
-                        (0..records).map(|index| placement.at(index)),
-                    )?;
-                    self.allocation.hold_table(&table);
-                    Ok((table, 0))
-                }
-                (None, _) => self.allocation.view_table(
-                    record,
-                    self.byte_offset,
-                    records,
-                    |phase, records| {
-                        record_table(
-                            &self.device,
-                            &self.allocation,
-                            (0..records).map(|index| phase + index * record),
-                        )
-                    },
-                ),
-            }
-        }
-
-        /// A zero-filled tensor over `extents` whose leading rows
-        /// `[0, committed)` are physically backed, and the resizer that
-        /// changes them. The remaining rows are an address reservation:
-        /// binding the tensor is legal only for device work that stays within
-        /// the committed rows, and host access to them is refused. Its
-        /// storage is of `kind`: device storage, or host storage the host
-        /// addresses in place, where its backend reserves it
-        /// (`seismic_topology::Limits::reservation`). Its records may carry
-        /// views of up to `carries` bytes whole (another form's records
-        /// packed in them), which no chunk boundary then crosses either.
-        pub fn reserved(
-            device: &Arc<DeviceInner>,
-            kind: seismic_topology::ReservedContract,
-            representation: RepresentationId,
-            extents: &[u64],
-            committed: u64,
-            carries: Option<std::num::NonZeroU64>,
-        ) -> Result<(Self, Resizer), TensorError> {
-            if !device.supports_representation(representation) {
-                return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend(),
-                    representation: representation_info(representation).name,
-                });
-            }
-            let layout = layout::canonical(representation, extents)?;
-            let row = seismic_lang::registry::record_bytes(representation, extents)
-                .ok_or(TensorError::Uncommitted {
-                    rows: extents.first().copied().unwrap_or(0),
-                    committed: 0,
-                })?;
-            let resizer =
-                device.allocate_reserved_tensor(kind, (seismic_topology::ReservedRecords { record: row, carries }, extents[0], committed), layout.alignment)?;
-            let tensor = Self::new_view(
-                device.clone(),
-                resizer.allocation().clone(),
-                0,
-                layout.byte_len,
-                representation,
-                extents.to_vec(),
-                layout.strides,
-            );
-            Ok((tensor, resizer))
-        }
-
-        /// Whether this view reaches past its allocation's backed bytes: a
-        /// view of a reserved tensor beyond its committed rows.
-        fn reaches_uncommitted(&self) -> bool {
-            self.byte_offset + self.byte_len > self.allocation.bytes()
-        }
-
-        /// Leading rows physically backed: all of them unless this view
-        /// reaches past its allocation's committed bytes.
-        pub fn committed_rows(&self) -> u64 {
-            match (
-                self.reaches_uncommitted(),
-                seismic_lang::registry::record_bytes(self.representation, &self.extents),
-            ) {
-                (true, Some(row)) => (self.allocation.bytes().saturating_sub(self.byte_offset)
-                    / row.get())
-                .min(self.extents[0]),
-                _ => self.extents.first().copied().unwrap_or(1),
-            }
-        }
-
-        /// Refuse host access reaching past the committed rows. A resize's
-        /// install changes them only under exclusive access, so a caller
-        /// holding a permit of the allocation reads them stable.
-        fn backed(&self) -> Result<(), TensorError> {
-            // A packed view's records are not its canonical bytes: the host
-            // addresses them at their `record_placement`.
-            if self.packed() {
-                return Err(TensorError::Region(RegionError::NotContiguous));
-            }
-            if self.reaches_uncommitted() {
-                return Err(TensorError::Uncommitted {
-                    rows: self.extents.first().copied().unwrap_or(0),
-                    committed: self.committed_rows(),
-                });
-            }
-            Ok(())
+            self.allocation.view_table(record, self.byte_offset, self.extents[0], |phase, records| {
+                record_table(
+                    &self.device,
+                    &self.allocation,
+                    (0..records).map(|index| phase + index * record),
+                )
+            })
         }
 
         /// Exact canonical storage charge for a representation and logical
@@ -2322,15 +1899,12 @@ pub mod tensor {
 
         /// The host address of this view's first byte, where the host
         /// addresses its storage in place: a view of one host-addressed
-        /// allocation (see [`Self::shared`]), not slabbed, and of a
-        /// reservation only a region, whose pin keeps its bytes backed (a
-        /// reservation's host range never moves). Valid while the view
-        /// lives, for staging writes and in-engine co-processor storage;
+        /// allocation (see [`Self::shared`]), not slabbed. Valid while the
+        /// view lives, for staging writes and in-engine co-processor storage;
         /// floating values read out to a caller leave through `read_with` or
         /// `canonicalize_in_place` so NaN bits are never exposed.
         pub fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
-            let unpinned = self.allocation.reservation().is_some() && self.pin.is_none();
-            if unpinned || self.slabs.is_some() {
+            if self.slabs.is_some() {
                 return None;
             }
             let base = self.allocation.storage().host_address()?;
@@ -2497,7 +2071,7 @@ pub mod tensor {
             Self::from_host_in(device, representation, extents, bytes, None)
         }
 
-        fn from_host_in(
+        pub(crate) fn from_host_in(
             device: &Arc<DeviceInner>,
             representation: RepresentationId,
             extents: &[u64],
@@ -2549,7 +2123,7 @@ pub mod tensor {
                 .checked_add(byte_len)
                 .expect("TensorInner view byte range overflowed");
             assert!(
-                end <= allocation.span(),
+                end <= allocation.bytes(),
                 "TensorInner view exceeds its physical allocation"
             );
             Self {
@@ -2562,8 +2136,7 @@ pub mod tensor {
                 strides,
                 slabs: None,
                 alias_identity: None,
-                slab_lease: None,
-                pin: None,
+                hold: None,
                 records: OnceLock::new(),
             }
         }
@@ -2574,13 +2147,11 @@ pub mod tensor {
                         "slab tensor is too large for a host byte vector".into(),
                     )
                 })?;
-                let row_bytes = self.byte_len / self.extents[0];
-                let slab_bytes =
-                    usize::try_from(row_bytes * slabs.rows_per_slab).map_err(|_| {
-                        ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
-                    })?;
+                let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
+                    ExecutionError::AllocationFailed("slab exceeds host byte domain".into())
+                })?;
                 let mut bytes = vec![0u8; length];
-                for (index, region) in slabs.regions.iter().enumerate() {
+                for (index, region) in slabs.regions(self.representation)?.iter().enumerate() {
                     if let Some(region) = region {
                         let start = index * slab_bytes;
                         let keep = slab_bytes.min(length - start);
@@ -2596,7 +2167,6 @@ pub mod tensor {
             &self,
             access: &crate::driver::AllocationPermit,
         ) -> Result<Vec<u8>, TensorError> {
-            self.backed()?;
             let canonical = crate::layout::canonical(self.representation, &self.extents)?;
             let length = usize::try_from(canonical.byte_len).map_err(|_| {
                 ExecutionError::AllocationFailed(
@@ -2631,17 +2201,16 @@ pub mod tensor {
                         actual,
                     });
                 }
-                if slabs.regions.iter().any(Option::is_none) {
+                let regions = slabs.regions(self.representation)?;
+                if regions.iter().any(Option::is_none) {
                     return Err(TensorError::SlabLayout(
                         "host write reaches a free slab".into(),
                     ));
                 }
-                let slab_bytes =
-                    usize::try_from(self.byte_len / self.extents[0] * slabs.rows_per_slab)
-                        .map_err(|_| {
-                            TensorError::SlabLayout("slab exceeds host byte domain".into())
-                        })?;
-                for (index, region) in slabs.regions.iter().enumerate() {
+                let slab_bytes = usize::try_from(slabs.slab_bytes).map_err(|_| {
+                    TensorError::SlabLayout("slab exceeds host byte domain".into())
+                })?;
+                for (index, region) in regions.iter().enumerate() {
                     let start = index * slab_bytes;
                     let keep = slab_bytes.min(bytes.len() - start);
                     let region = region.as_ref().expect("checked backed slab");
@@ -2693,7 +2262,6 @@ pub mod tensor {
                     .expect("storage written as idle is used by no device work in flight"),
                 false => self.allocation.acquire(true)?,
             };
-            self.backed()?;
             crate::layout::transfer_ranges(
                 self.representation,
                 &self.extents,
@@ -2736,7 +2304,6 @@ pub mod tensor {
                 ));
             }
             let _guard = self.allocation.acquire(true)?;
-            self.backed()?;
             let mut write = |at: u64, bytes: &[u8]| -> std::io::Result<()> {
                 let end = at.checked_add(bytes.len() as u64).filter(|end| *end <= self.byte_len);
                 if end.is_none() {
@@ -2802,7 +2369,6 @@ pub mod tensor {
                 allocation: Arc::downgrade(&self.allocation),
                 identity: self.allocation.identity(),
                 topology: self.device.topology.clone(),
-                memory: self.device.memory.clone(),
             }
         }
         /// The bytes of this contiguous view charged to each store: the
@@ -2813,7 +2379,7 @@ pub mod tensor {
             if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
                 return Err(TensorError::ViewCharge(ViewChargeError::NotContiguous));
             }
-            let paths = self.allocation.storage_path_charges(&self.device.memory);
+            let paths = self.allocation.storage_path_charges();
             let mut skip = self.byte_offset;
             let mut remaining = self.byte_len;
             let mut held = Vec::new();
@@ -2876,25 +2442,87 @@ pub mod tensor {
                     })
                 })
         }
+        fn slab_subview(
+            &self,
+            slabs: &SlabView,
+            first: usize,
+            count: usize,
+            rows: u64,
+        ) -> Result<Self, TensorError> {
+            let mut extents = self.extents.clone();
+            extents[0] = rows;
+            let layout = layout::canonical(self.representation, &extents)?;
+            Ok(Self {
+                device: self.device.clone(),
+                allocation: self.allocation.clone(),
+                byte_offset: slabs.slots.entry(slabs.region, first),
+                byte_len: layout.byte_len,
+                representation: self.representation,
+                extents,
+                strides: layout.strides,
+                slabs: Some(SlabView::new(
+                    slabs.slots.clone(),
+                    slabs.region,
+                    first,
+                    count,
+                    slabs.rows_per_slab,
+                    slabs.slab_extents.clone(),
+                    slabs.slab_bytes,
+                )),
+                alias_identity: self.alias_identity,
+                hold: None,
+                records: OnceLock::new(),
+            })
+        }
+
         pub fn slice_leading(&self, start: u64, end: u64) -> Result<Self, TensorError> {
             if let Some(slabs) = &self.slabs {
-                if start >= end || end > self.extents[0] {
+                if start > end || end > self.extents[0] {
                     return Err(TensorError::SliceOutOfBounds {
                         extent: self.extents[0],
                         start,
                         end,
                     });
                 }
+                // An empty view names no slab: a zero-slot slab view anchored
+                // at its slot boundary in the region's address table.
+                if start == end {
+                    let local = usize::try_from(start / slabs.rows_per_slab)
+                        .unwrap_or(slabs.count)
+                        .min(slabs.count);
+                    return self.slab_subview(slabs, slabs.first + local, 0, 0);
+                }
+                // A span of whole slabs starting on a slab boundary (including
+                // a partial final slab at the view's end) stays a slab view
+                // over those slots' table entries, holding no granule.
+                if start % slabs.rows_per_slab == 0
+                    && (end % slabs.rows_per_slab == 0 || end == self.extents[0])
+                {
+                    let local = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
+                        TensorError::SlabLayout("slab index exceeds host domain".into())
+                    })?;
+                    let count = usize::try_from((end - start).div_ceil(slabs.rows_per_slab))
+                        .map_err(|_| {
+                            TensorError::SlabLayout("slab count exceeds host domain".into())
+                        })?;
+                    return self.slab_subview(slabs, slabs.first + local, count, end - start);
+                }
                 if start / slabs.rows_per_slab != (end - 1) / slabs.rows_per_slab {
                     return Err(TensorError::SlabLayout(
                         "slice crosses a slab boundary".into(),
                     ));
                 }
-                let slab_index = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
+                let local = usize::try_from(start / slabs.rows_per_slab).map_err(|_| {
                     TensorError::SlabLayout("slab index exceeds host domain".into())
                 })?;
-                let region = slabs.regions[slab_index]
-                    .as_ref()
+                let region = slabs
+                    .slots
+                    .region_view(
+                        slabs.first + local,
+                        slabs.region,
+                        self.representation,
+                        &slabs.slab_extents,
+                    )?
                     .ok_or_else(|| TensorError::SlabLayout("slice refers to a free slab".into()))?;
                 let local_start = start % slabs.rows_per_slab;
                 return region.slice_leading(local_start, local_start + end - start);
@@ -2920,25 +2548,9 @@ pub mod tensor {
                         extents: extents.to_vec(),
                     },
                 )?;
-                let region_extents = std::iter::once(slabs.rows_per_slab)
+                let slab_extents = std::iter::once(slabs.rows_per_slab)
                     .chain(extents.iter().skip(1).copied())
                     .collect::<Vec<_>>();
-                let regions = slabs
-                    .regions
-                    .iter()
-                    .map(|region| {
-                        region
-                            .as_ref()
-                            .map(|region| region.reshape(&region_extents).map(Arc::new))
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, TensorError>>()?;
-                let lease = self
-                    .slab_lease
-                    .as_ref()
-                    .expect("slab view has a binding lease")
-                    .clone();
-                lease.fetch_add(1, Ordering::AcqRel);
                 return Ok(Self {
                     device: self.device.clone(),
                     allocation: self.allocation.clone(),
@@ -2947,13 +2559,17 @@ pub mod tensor {
                     representation: self.representation,
                     extents: view.extents,
                     strides: view.strides,
-                    slabs: Some(SlabView {
-                        rows_per_slab: slabs.rows_per_slab,
-                        regions,
-                    }),
+                    slabs: Some(SlabView::new(
+                        slabs.slots.clone(),
+                        slabs.region,
+                        slabs.first,
+                        slabs.count,
+                        slabs.rows_per_slab,
+                        slab_extents,
+                        slabs.slab_bytes,
+                    )),
                     alias_identity: self.alias_identity,
-                    slab_lease: Some(lease),
-                    pin: None,
+                    hold: None,
                     records: OnceLock::new(),
                 });
             }
@@ -2963,9 +2579,6 @@ pub mod tensor {
         }
         /// This tensor seen through one view operation (`layout::apply_view`).
         fn view(&self, operation: &crate::api::kernel::ViewOperation) -> Result<Self, TensorError> {
-            if self.packed() {
-                return Err(TensorError::Region(RegionError::NotContiguous));
-            }
             let view = layout::apply_view(
                 self.representation,
                 layout::ViewGeometry {
@@ -2985,13 +2598,13 @@ pub mod tensor {
                 view.extents,
                 view.strides,
             );
-            derived.pin = self.pin.clone();
+            derived.hold = self.hold.clone();
             Ok(derived)
         }
         /// The view's range in its alias space. A slab view's alias space is
-        /// its own logical tensor, which starts at 0; its `byte_offset` is
-        /// where its address table's entries lie, what it binds, not where
-        /// its elements do.
+        /// its region's logical tensor, where slot `first` starts at
+        /// `first * slab_bytes`; its `byte_offset` is where its address
+        /// table's entries lie, what it binds, not where its elements do.
         pub fn descriptor(&self) -> TensorDescriptor {
             TensorDescriptor {
                 device: self.device.kind.identity(),
@@ -2999,7 +2612,10 @@ pub mod tensor {
                 extents: self.extents.clone(),
                 strides: self.strides.clone(),
                 allocation: self.alias_identity(),
-                byte_offset: if self.slabs.is_some() { 0 } else { self.byte_offset },
+                byte_offset: match &self.slabs {
+                    Some(slabs) => slabs.first as u64 * slabs.slab_bytes,
+                    None => self.byte_offset,
+                },
                 byte_len: self.byte_len,
             }
         }
@@ -3171,66 +2787,6 @@ pub mod tensor {
             assert_eq!(view.observe_storage().charged_bytes(), Some(128));
         }
 
-        /// A reserved tensor's first commitment and its recommits are
-        /// admitted by one rule, and a refusal names the commitment and the
-        /// rows the reservation spans.
-        #[test]
-        fn a_commitment_outside_the_reservation_names_both() {
-            let device = crate::devices::Devices::discover(&[])
-                .unwrap()
-                .open_backend(registry::BackendName::Cpu)
-                .unwrap();
-            let device_storage = seismic_topology::ReservedContract::DeviceOnly;
-            let dense = registry::dense(DType::U32);
-            assert!(matches!(
-                TensorInner::reserved(&device, device_storage, dense, &[4, 8], 0, None),
-                Err(crate::api::TensorError::Uncommittable { committed: 0, rows: 4 })
-            ));
-            let (_, resizer) = TensorInner::reserved(&device, device_storage, dense, &[4, 8], 2, None).unwrap();
-            let Err(refusal) = resizer.recommit(5) else {
-                panic!("a commitment past the reservation is refused")
-            };
-            assert!(matches!(
-                refusal.error,
-                crate::api::TensorError::Uncommittable { committed: 5, rows: 4 }
-            ));
-        }
-
-        /// A region reaching past a reserved tensor's backed bytes is
-        /// refused as unbacked; a recommit beneath a live region, as pinned.
-        #[test]
-        fn a_region_past_the_backed_bytes_is_unbacked_and_a_shrink_beneath_one_is_pinned() {
-            use crate::api::{RegionError, TensorError};
-            let device = crate::devices::Devices::discover(&[])
-                .unwrap()
-                .open_backend(registry::BackendName::Cpu)
-                .unwrap();
-            let dense = registry::dense(DType::U32);
-            let (rows, n) = (8192u64, 256u64);
-            let (reserved, resizer) = TensorInner::reserved(
-                &device,
-                seismic_topology::ReservedContract::DeviceOnly,
-                dense,
-                &[rows, n],
-                4096,
-                None,
-            )
-            .unwrap();
-            assert!(matches!(
-                reserved.region(dense, &[4097, n], 0),
-                Err(TensorError::Region(RegionError::Unbacked { end, .. })) if end == 4097 * n * 4
-            ));
-            let region = reserved.region(dense, &[1024, n], 1024 * n * 4).unwrap();
-            let Err(refusal) = resizer.recommit(2047) else {
-                panic!("a shrink beneath a live region is refused")
-            };
-            assert!(matches!(
-                refusal.error,
-                TensorError::Region(RegionError::Pinned { pinned, .. }) if pinned == 2048 * n * 4
-            ));
-            drop(region);
-        }
-
         /// A view's bytes are attributed from its storage's own bytes alone:
         /// the record tables the storage holds lie elsewhere, so a range
         /// past the storage reaches past its charge however many it holds.
@@ -3255,8 +2811,8 @@ pub mod tensor {
 
         /// A dense floating tensor refuses raw shared reads, word accesses and
         /// re-interpretation as another representation, while admitting
-        /// same-representation regions and carrier reservations lending
-        /// non-dense weight records.
+        /// same-representation regions and, as carried regions, records
+        /// lent to a non-dense weight form.
         #[test]
         fn floating_views_refuse_shared_word_and_reinterpreted_region_bypasses() {
             use crate::api::{RegionError, TensorError};
@@ -3313,18 +2869,14 @@ pub mod tensor {
                 );
             }
 
-            let (carrier, _resizer) = TensorInner::reserved(
-                &device,
-                seismic_topology::ReservedContract::DeviceOnly,
-                bf16_repr,
-                &[4, 2048],
-                4,
-                std::num::NonZeroU64::new(4096),
-            )
-            .unwrap();
-            assert!(carrier.region(q8_repr, &[1, 64], 0).is_ok());
+            let carrier = TensorInner::zeros(&device, bf16_repr, &[4, 2048]).unwrap();
             assert!(matches!(
-                carrier.region(i32_repr, &[32], 0),
+                carrier.region(q8_repr, &[1, 64], 0),
+                Err(TensorError::Region(RegionError::FloatingReinterpret { .. }))
+            ));
+            assert!(carrier.carried_region(q8_repr, &[1, 64], 0).is_ok());
+            assert!(matches!(
+                carrier.carried_region(i32_repr, &[32], 0),
                 Err(TensorError::Region(RegionError::FloatingReinterpret { .. }))
             ));
         }
@@ -3356,6 +2908,9 @@ pub mod kernel {
         pub fn scalar_result_bytes(&self) -> u64 {
             self.inner.scalar_result_bytes()
         }
+        pub fn records_result(&self, ordinal: usize) -> bool {
+            self.inner.records_result(ordinal)
+        }
         pub fn artifact(&self) -> &crate::native::NativeArtifactIdentity {
             self.inner.artifact()
         }
@@ -3380,6 +2935,14 @@ pub mod kernel {
             rotation: Vec<EncodedArgs>,
         ) -> Result<crate::native::KernelPoint, super::CallError> {
             crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)
+        }
+        /// The unrounded byte span placed in a standalone call's scratch
+        /// arena for `args` (`SYNC_RESERVE` plus placed scratch buffers).
+        pub fn standalone_scratch_bytes(
+            &self,
+            args: EncodedArgs,
+        ) -> Result<u64, super::CallError> {
+            self.inner.standalone_scratch_bytes(args)
         }
     }
 
@@ -4120,6 +3683,161 @@ pub mod kernel {
                 drop(completion);
             });
             assert!(dropped.is_ok());
+        }
+
+        #[test]
+        fn slab_subviews_scope_reach_occupied_bytes_and_copy_of() {
+            let catalog = crate::devices::Devices::discover(&[]).unwrap();
+            let id = catalog
+                .resolve(seismic_topology::ExecutorSelector::HostCpu)
+                .unwrap();
+            let device = catalog.open(id).unwrap();
+            let topology = catalog.topology();
+            let info = topology.executor(id).unwrap();
+            let store = topology
+                .first_store(info, seismic_topology::Contract::DeviceOnly)
+                .unwrap();
+            let identity = topology.store_identity(store).unwrap();
+            let entry: Arc<dyn crate::memory::Entry> =
+                Arc::new(crate::memory::Tally::unbounded(identity));
+            let pool = crate::pool::Pool::open(
+                &device,
+                seismic_topology::Contract::DeviceOnly,
+                1 << 16,
+                1 << 18,
+                crate::pool::PoolEntries::one(entry),
+            )
+            .unwrap();
+            let f32_rep = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
+            let geometry = crate::pool::SlabGeometry {
+                rows_per_slab: 4,
+                logical_rows: 14,
+                capacity: 4,
+                slab_bytes: crate::pool::BLOCK_ALIGNMENT,
+                slab_alignment: crate::pool::BLOCK_ALIGNMENT,
+                regions: vec![(f32_rep, vec![2], 0)],
+            };
+            let slabs = crate::pool::SlabStore::in_pool(&pool, geometry, &[]).unwrap();
+            for _ in 0..4 {
+                slabs.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
+            }
+            // Free slot 0 and slot 2: slots 1 and 3 stay backed.
+            assert!(slabs.free_slab(0).unwrap());
+            assert!(slabs.free_slab(2).unwrap());
+
+            let logical = slabs.logical_region(0).unwrap();
+            let sub = logical.slice_leading(4, 14).unwrap(); // slots 1..4 (3 slots, 2 backed)
+            let reach = sub.slab_reach().unwrap();
+            assert_eq!(
+                reach.table_bytes,
+                seismic_lang::registry::record_table_entry(3)
+            );
+            assert_eq!(reach.regions.len(), 2);
+            assert_eq!(sub.occupied_bytes(), 2 * (4 * 2 * 4));
+
+            let img = sub.image().unwrap();
+            let copy = sub.copy_of(&img).unwrap();
+            assert_eq!(copy.extents(), &[10, 2]);
+            assert_eq!(copy.occupied_bytes(), 2 * (4 * 2 * 4));
+            assert_eq!(copy.read_to_host().unwrap(), sub.read_to_host().unwrap());
+
+            // Empty sub-view (`count == 0`): 0 table bytes, 0 regions, round-trips `copy_of`.
+            let empty = sub.slice_leading(4, 4).unwrap();
+            let empty_reach = empty.slab_reach().unwrap();
+            assert_eq!(empty_reach.table_bytes, 0);
+            assert!(empty_reach.regions.is_empty());
+            assert_eq!(empty.occupied_bytes(), 0);
+            let empty_copy = empty.copy_of(&empty.image().unwrap()).unwrap();
+            assert_eq!(empty_copy.extents(), &[0, 2]);
+            assert!(empty_copy.read_to_host().unwrap().is_empty());
+        }
+
+        /// A pool's absent granule, which every free slot names and no slab
+        /// holds, is charged to its own entry as the pool opens, and its
+        /// blocks to theirs: what the blocks' entry holds is granules a slab
+        /// claims, and nothing more.
+        #[test]
+        fn a_pools_absent_granule_is_charged_apart_from_its_blocks() {
+            let catalog = crate::devices::Devices::discover(&[]).unwrap();
+            let id = catalog
+                .resolve(seismic_topology::ExecutorSelector::HostCpu)
+                .unwrap();
+            let device = catalog.open(id).unwrap();
+            let topology = catalog.topology();
+            let info = topology.executor(id).unwrap();
+            let store = topology
+                .first_store(info, seismic_topology::Contract::DeviceOnly)
+                .unwrap();
+            let identity = topology.store_identity(store).unwrap();
+            let (blocks, absent) = (
+                crate::memory::Tally::unbounded(identity.clone()),
+                crate::memory::Tally::unbounded(identity),
+            );
+            let pool = crate::pool::Pool::open(
+                &device,
+                seismic_topology::Contract::DeviceOnly,
+                1 << 16,
+                1 << 18,
+                crate::pool::PoolEntries { blocks: Arc::new(blocks.clone()), absent: Arc::new(absent.clone()) },
+            )
+            .unwrap();
+            assert_eq!((blocks.held(), absent.held()), (0, 1 << 16), "the open allocates the absent granule alone");
+            pool.grow().unwrap();
+            assert_eq!((blocks.held(), absent.held()), (1 << 18, 1 << 16), "a block is the blocks' entry's");
+            assert_eq!(pool.held_bytes(), blocks.held() + absent.held());
+        }
+
+        #[test]
+        fn cached_slab_reach_does_not_retain_removed_pool_blocks() {
+            let catalog = crate::devices::Devices::discover(&[]).unwrap();
+            let id = catalog
+                .resolve(seismic_topology::ExecutorSelector::HostCpu)
+                .unwrap();
+            let device = catalog.open(id).unwrap();
+            let topology = catalog.topology();
+            let info = topology.executor(id).unwrap();
+            let store = topology
+                .first_store(info, seismic_topology::Contract::DeviceOnly)
+                .unwrap();
+            let identity = topology.store_identity(store).unwrap();
+            let tally = crate::memory::Tally::unbounded(identity);
+            let entry: Arc<dyn crate::memory::Entry> = Arc::new(tally.clone());
+            let pool = crate::pool::Pool::open(
+                &device,
+                seismic_topology::Contract::DeviceOnly,
+                1 << 16,
+                1 << 18,
+                crate::pool::PoolEntries::one(entry),
+            )
+            .unwrap();
+            let absent = tally.held();
+            assert_eq!(absent, 1 << 16);
+            let f32_rep = seismic_lang::registry::dense(seismic_lang::types::DType::F32);
+            let geometry = crate::pool::SlabGeometry {
+                rows_per_slab: 4,
+                logical_rows: 16,
+                capacity: 4,
+                slab_bytes: crate::pool::BLOCK_ALIGNMENT,
+                slab_alignment: crate::pool::BLOCK_ALIGNMENT,
+                regions: vec![(f32_rep, vec![2], 0)],
+            };
+            let slabs = crate::pool::SlabStore::in_pool(&pool, geometry, &[]).unwrap();
+            for _ in 0..4 {
+                slabs.add_slab(crate::pool::SlabFill::Zeroed).unwrap();
+            }
+            assert_eq!(tally.held(), absent + (1 << 18));
+
+            // Populate `SlabView.reach` on a live view, then free every slab without
+            // refreshing `logical.slab_reach()`: `return_freed` must still drop the
+            // idle pool block back to the store (`tally.held() == absent`).
+            let logical = slabs.logical_region(0).unwrap();
+            assert_eq!(logical.slab_reach().unwrap().regions.len(), 4);
+            for slot in 0..4 {
+                assert!(slabs.free_slab(slot).unwrap());
+            }
+            assert_eq!(pool.return_freed(1 << 18).unwrap(), 1 << 18);
+            assert_eq!(tally.held(), absent, "stale cached SlabReach must not keep freed pool blocks alive");
+            assert_eq!(logical.extents(), &[16, 2]);
         }
     }
 }

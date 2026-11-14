@@ -12,19 +12,18 @@ fn slabbed_rows(
     bytes: &[u8],
     slab_rows: u64,
 ) -> seismic::SlabTensor {
-    let mut slabs = seismic::SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         device,
         slab_rows,
         rows,
-        vec![seismic::SlabRegion {
+        &[seismic::SlabRegion {
             element,
             row_shape: row_shape.to_vec(),
         }],
-    )
-    .unwrap();
+    );
     let row_bytes = bytes.len() / rows as usize;
     for index in 0..rows.div_ceil(slab_rows) {
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let start = index * slab_rows;
         let count = slab_rows.min(rows - start);
         slabs

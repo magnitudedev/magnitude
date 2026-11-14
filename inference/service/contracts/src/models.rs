@@ -1151,7 +1151,8 @@ pub enum ModelInstanceFailure {
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum MemoryShortage {
     /// Memory that cannot be moved is in the way of the load's claim in its limiting memory
-    /// domain. `available_bytes` is what a load may claim there: the reserve is already taken out.
+    /// domain. `available_bytes` is what the domain's ledger could give the claim there once
+    /// every cache yielded.
     #[serde(rename_all = "camelCase")]
     Blocked {
         required_bytes: u64,
@@ -2751,7 +2752,6 @@ pub struct MemoryAssessment {
     pub memory_domain_id: crate::MemoryDomainId,
     pub capacity_bytes: u64,
     pub required_bytes: u64,
-    pub compatibility_reserve_bytes: u64,
     pub remaining_bytes: i64,
 }
 

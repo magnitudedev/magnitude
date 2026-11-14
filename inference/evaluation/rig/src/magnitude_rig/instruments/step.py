@@ -587,41 +587,8 @@ def _bar(bar: dict | None, bank: dict | None) -> list[str]:
     return lines
 
 
-REFUSED = "magnitude-harness: memory "
-
-
 def _failed(label: str, result: JobResult) -> list[str]:
-    """A harness that exited unmeasured: refused by memory admission, with the reading the band
-    was judged on, when it says so (`admission refused`); otherwise its exit and last lines."""
-    for line in result.output():
-        start = line.find(REFUSED)
-        if start < 0:
-            continue
-        record = json.loads(line[start + len(REFUSED):])
-        if record.get("moment") != "admission refused":
-            continue
-        def gb(value):
-            return "unread" if value is None else f"{value / 1e9:.2f} GB"
-
-        cause = record["distress"] or (
-            f"{record['constraint']} headroom {gb(record['headroom_bytes'])} at or below the "
-            f"planning reserve {gb(record['planning_bytes'])}"
-        )
-        lines = [
-            f"{label}refused by memory admission ({record['store']}): {cause}",
-            (f"  headroom {gb(record['headroom_bytes'])} · planning reserve {gb(record['planning_bytes'])} · "
-             f"wired {gb(record['wired_bytes'])} · compressed {gb(record['compressed_bytes'])}"),
-        ]
-        if record.get("windows"):
-            windows = record["windows"]
-            total = lambda name: sum(window[name] for window in windows)
-            lines.append(
-                f"  {len(windows)} displacement windows over {total('ms') / 1000:.1f} s · "
-                f"swapped out {total('swapped_out_pages')} pages in "
-                f"{sum(1 for window in windows if window['swapped_out_pages'])} of them · "
-                f"compressed {total('compressed_pages')} · decompressed {total('decompressed_pages')}"
-            )
-        return lines
+    """A harness that exited unmeasured: its exit and last lines."""
     return [f"{label}harness time exited {result.code}", *result.output()[-15:]]
 
 
@@ -671,14 +638,18 @@ def _graphs(detail: dict, prefill: dict) -> str:
             f"{(budget['device_bytes'] + budget['upload_bytes']) / 1e6:.0f} MB")
 
 
-def _unsteady(detail: dict, prefill: dict) -> list[str]:
+def _unsteady(detail: dict, prefill: dict) -> tuple[list[str], bool]:
     """The decode windows and warm prefill samples the harness discarded, the expert bank not at
-    rest across them (a tier filling, a resize): every figure is of the steady ones."""
-    windows = len(detail.get("window", {}).get("unsteady") or [])
+    rest across them (a tier filling, a resize): every figure is of the steady ones. A decode
+    window is discarded only once its warm-up ran at rest, so every resize begun across one was
+    begun in steady decode, which makes none: the lines, and whether the decode made none."""
+    windows = detail.get("window", {}).get("unsteady") or []
     samples = len(prefill.get("unsteady") or [])
-    if not windows and not samples:
-        return []
-    return [f"  discarded, the bank not at rest: {windows} decode windows, {samples} warm prefill samples"]
+    resizes = sum((window.get("moved") or window["warm"])["resizes_begun"] for window in windows)
+    lines = [f"  discarded, the bank not at rest: {len(windows)} decode windows, {samples} warm prefill samples"]
+    if resizes:
+        lines.append(f"  {resizes} resizes begun in steady decode, which makes none · FAILED")
+    return (lines if windows or samples else []), resizes == 0
 
 
 def _streamed(arguments, cap: int, result: JobResult, resident: dict | None) -> tuple[list[str], dict, bool]:
@@ -761,7 +732,8 @@ def _streamed(arguments, cap: int, result: JobResult, resident: dict | None) -> 
         lines.append(f"  expert pages cached {pages['cached_before']} before, {pages['cached_after']} after, "
                      f"of {pages['pages']}" + (" · VOID: its reads were served from the file cache" if served else ""))
     lines += _group(prefill.get("group"))
-    lines += _unsteady(detail, prefill)
+    unsteady, steady = _unsteady(detail, prefill)
+    lines += unsteady
     lines.append(_graphs(detail, prefill))
     tuning, tuned = _tuning(arguments, f"streamed {cap} ", result)
     lines.append(tuning)
@@ -771,8 +743,8 @@ def _streamed(arguments, cap: int, result: JobResult, resident: dict | None) -> 
         f"{harness.streamed(cap)} prefill_ms": Measure(prefill_ms, "ms", prefill_half, lower_is_better=True),
     }
     # A cell is void when its record says its reads were cache-served, or its tuning stopped
-    # at its budget.
-    return lines, measures, not served and tuned
+    # at its budget; it fails when its bank resized in steady decode.
+    return lines, measures, not served and tuned and steady
 
 
 def _idle(detail) -> list[str]:
@@ -859,12 +831,14 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     ]
     if arguments.resident is not None:
         lines.insert(0, f"resident step recorded by run {arguments.resident}, not timed again")
-    lines += _unsteady(detail, prefill)
+    unsteady, steady = _unsteady(detail, prefill)
+    lines += unsteady
     lines.append(_graphs(detail, prefill))
     if arguments.untimed:
         # Run without the thermal gate: its times are not a measurement.
         lines.insert(0, "UNTIMED (no thermal gate): the times below are not judged")
     tuning, ok = _tuning(arguments, "resident ", result)
+    ok = ok and steady
     if entries:
         lines += _table("decode entry", entries, "ms/step")
     if prefill_entries:

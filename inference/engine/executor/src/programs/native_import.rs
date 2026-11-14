@@ -86,9 +86,10 @@ fn stream_stored(
 }
 
 /// Write a staged upload from its stored source, the one way every import
-/// does: each chunk of the stored range written into the upload as it lands
-/// ([`stream_stored`]), or, where the host prepares the bytes, the range
-/// gathered whole and transformed.
+/// does: where the host addresses the upload in place (host memory, unified
+/// memory), the stored range read straight into it; otherwise each chunk of
+/// the range written into it as it lands ([`stream_stored`]); or, where the
+/// host prepares the bytes, the range gathered whole and transformed.
 pub(crate) fn fill_staged_source(
     stored: &Stored,
     plan: &crate::WeightPlan,
@@ -103,8 +104,20 @@ pub(crate) fn fill_staged_source(
         }
         return upload.write_from_host(&bytes).map_err(|error| transfer(error.to_string()));
     }
-    if upload.byte_len() != stored.file_range().2 {
+    let (source, offset, length) = stored.file_range();
+    if upload.byte_len() != length {
         return Err(transfer("staged source byte length differs from its tensor".into()));
+    }
+    // The file's pieces land in the upload itself: no chunk passes through
+    // a host buffer between, so an import stages nothing on the heap (whose
+    // freed chunks the allocator keeps resident) and copies nothing twice.
+    if let Some(base) = upload.shared_address() {
+        let length = usize::try_from(length).map_err(|_| transfer("staged source exceeds the host address range".into()))?;
+        // SAFETY: the upload is this import's alone, bound to no device work
+        // until it is filled (`ResourceAllocator::import_workspace`), and its
+        // `length` bytes from its first byte are its own (its byte length).
+        let bytes = unsafe { std::slice::from_raw_parts_mut(base.as_ptr(), length) };
+        return source.read_into_for(offset, bytes, Want::undated(0.)).map_err(|error| transfer(error.to_string()));
     }
     upload.write_chunks(|write| stream_stored(stored, write)).map_err(|error| transfer(error.to_string()))
 }
@@ -212,6 +225,31 @@ pub(crate) fn enqueue_into(
             .map_err(execution),
         None => Ok(()),
     }
+}
+
+/// Queue one import per leading matrix of `source` into its record's plain
+/// view (`record_at`), completed in one batch: for a backend whose import
+/// entries write ordinary storage rather than a record table
+/// (`!AttestedImport::writes_records`).
+pub(crate) fn import_records(
+    handle: &AttestedImport,
+    device: &seismic::Device,
+    source: &Tensor,
+    extents: &[u64],
+    record_at: &dyn Fn(u64) -> Result<Tensor, String>,
+) -> Result<(), SubmitError> {
+    let transfer = |detail: String| SubmitError::Device(DeviceError::Transfer(detail));
+    let view = import_view(extents)?;
+    let source = shaped(source, &view, "source")?;
+    let mut batch = NativeTensorBatch::new(device);
+    for index in 0..view[0] {
+        let matrix = source
+            .slice_leading(index, index + 1)
+            .map_err(|error| transfer(error.to_string()))?;
+        let record = record_at(index).map_err(transfer)?;
+        enqueue_into(handle, &mut batch, &matrix, &record, None)?;
+    }
+    batch.submit().and_then(|done| done.wait()).map_err(execution)
 }
 
 /// The entry that makes the packing bound of a weight `handle` imports.

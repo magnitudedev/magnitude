@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     ReservedResources, StateBindings, TokenId, WorkKind,
 };
@@ -30,7 +30,7 @@ use magnitude_scheduler::{
     prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
 };
-use magnitude_state::{KvCodec, ShrinkPolicy};
+use magnitude_state::KvCodec;
 use owner_host::Host;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -69,7 +69,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -265,7 +265,7 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// The prefixes a growing conversation leaves cached never take the state
@@ -303,7 +303,6 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
             host.owner().cached_prefixes(),
         );
         assert!(occupied <= workload, "turn {turn} occupies {occupied} of {workload}");
-        assert_eq!(charge.unattributed, 0);
         previous = Some(done.prompt.len() + done.output.len());
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 300));
@@ -342,7 +341,6 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
             committed <= workload,
             "conversation {conversation} commits {committed} of {workload}"
         );
-        assert_eq!(charge.unattributed, 0);
     }
     assert!(released, "the conversations filled the workload state");
 }
@@ -412,7 +410,7 @@ fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
         assert_ne!(reply[0], suffix[0]);
         history.extend(reply);
     }
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// A long system prompt, then a last message that changes on every request,
@@ -454,7 +452,7 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
         cached.push(done.cached);
     }
     assert_eq!(cached, [0, system.len(), system.len()]);
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// Without a declared cache point, a changed last message diverges below
@@ -556,7 +554,7 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
             assert!(turn.cached < turn.prompt.len());
         }
         finished.extend(turns);
-        assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+        host.owner().reconcile_memory_charge().unwrap();
     }
 }
 
@@ -678,12 +676,12 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let charged = |domain: &ExecutorDomain| {
         let device = domain.resources().device();
-        device.device_ledger().charged
+        device.allocated()
     };
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
         domain.install_input(request, input.clone()).unwrap();
-        let encodes = domain.open_state(&mut bindings, request, None).unwrap();
+        let encodes = domain.open_state(&mut bindings, request, None, 0).unwrap();
         assert_eq!(encodes.len(), 1);
         let opened = charged(&domain);
         bindings = encode(&mut domain, bindings, encodes);
@@ -693,12 +691,11 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         // Vision's free slots release on the load's release thread: the
         // charge falls by what it released once the boundary that finds it
         // ended records it.
-        let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
+        let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings);
         let idle = charged(&domain);
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");
-        let accounted = domain.reconcile_memory_charge(&[]).unwrap();
-        assert_eq!(accounted.unattributed, 0, "{accounted:?}");
+        domain.reconcile_memory_charge(&[]).unwrap();
         eprintln!(
             "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
         );
@@ -740,11 +737,10 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Uninterrupted: encode, the image chunk, then the rest.
     let reference = RequestId(1);
     domain.install_input(reference, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, reference, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, reference, None, 0).unwrap();
     assert_eq!(encodes.len(), 1);
     bindings = encode(&mut domain, bindings, encodes);
-    let encoded = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(encoded.unattributed, 0, "{encoded:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
     bindings = forward(&mut domain, bindings, reference, &input, 0..split).1;
     let after_image = domain.resume_state(reference).unwrap();
     let (expected, next) = forward(&mut domain, bindings, reference, &input, split..end);
@@ -755,11 +751,11 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Becoming resident again re-encodes the image for the replay.
     let evicted = RequestId(2);
     domain.install_input(evicted, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, evicted, None, 0).unwrap();
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
     domain.release_state(&[evicted]).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
+    let encodes = domain.open_state(&mut bindings, evicted, None, 0).unwrap();
     assert_eq!(encodes.len(), 1, "replay re-encodes the released image");
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
@@ -772,16 +768,14 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let resumed = RequestId(3);
     domain.install_input(resumed, input.clone()).unwrap();
     let encodes = domain
-        .open_state(&mut bindings, resumed, Some(&after_image))
+        .open_state(&mut bindings, resumed, Some(&after_image), 0)
         .unwrap();
     assert!(encodes.is_empty(), "an image before the resume position is not re-encoded");
     let (continued, _) = forward(&mut domain, bindings, resumed, &input, split..end);
     assert_eq!(bits(&continued), bits(&expected));
     domain.close(resumed).unwrap();
 
-    let held = domain.reconcile_memory_charge(&[&after_image]).unwrap();
-    assert_eq!(held.unattributed, 0, "{held:?}");
+    domain.reconcile_memory_charge(&[&after_image]).unwrap();
     drop(after_image);
-    let released = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(released.unattributed, 0, "{released:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
 }

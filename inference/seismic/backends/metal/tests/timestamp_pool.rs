@@ -11,7 +11,10 @@ use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 
 #[test]
 fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let device = MetalDevice::open(
+        DeviceHandle::system_default().unwrap(),
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
+    ).unwrap();
     let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
     let toolchain = MetalToolchain::new(device.clone(), description.facts());
     let source = ProgramSource {
@@ -22,7 +25,10 @@ fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
         entries: vec![ProgramEntry::named("bump")],
     };
     let pipelines = toolchain.compile(&source).unwrap().1;
-    let values = device.allocate(256, 16).unwrap();
+    let entry: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(
+        seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam),
+    );
+    let values = device.allocate(seismic_metal::topology::SHARED_KIND, 256, 16, &entry).unwrap();
     let launch = DirectLaunch {
         pipeline: &pipelines[0],
         buffers: &[(&values, 0)],

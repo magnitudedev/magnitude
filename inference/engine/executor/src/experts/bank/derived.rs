@@ -3,13 +3,18 @@
 //! The bank is cache: it holds whatever room no committed claim, no other
 //! cache and the speed guarantee hold, between its floor
 //! and the slot count past which the measured miss curve saves nothing.
-//! [`bank_room`] and [`shared_targets`] are that arithmetic on one
-//! [`Snapshot`], recomputed at every reading; nothing of it is stored, so a reading after memory frees
-//! derives the larger bank whatever came before. [`bank_move`] turns a
-//! target and the slots held into the one resize a store may run.
+//! The ledger's estimate gives that room (`Estimate::target`), and
+//! [`shared_targets`] divides it among a store's holdings, recomputed at
+//! every reading; nothing of it is stored, so a reading after memory frees
+//! derives the larger bank whatever came before. The block is the one
+//! threshold, both ways ([`held_target`]): the bank grows once the room
+//! holds a block more than it holds, and shrinks once it holds a block more
+//! than the room, so a move of the room within a block (others' jitter)
+//! resizes nothing. [`bank_move`] turns a target and the slots held into
+//! the one resize a store may run.
 
 use crate::domain::BankHolding;
-use crate::memory::ledger::{CacheKind, DeviceLedgers, Snapshot};
+use crate::memory::ledger::{DeviceLedgers, Estimate};
 use crate::planning::BankTier;
 
 /// Facts of one store's bank for one load: its floor and ceiling from the
@@ -17,7 +22,7 @@ use crate::planning::BankTier;
 /// them is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankShape {
-    /// The granule pool's block: the least growth worth a resize.
+    /// The granule pool's block: the least resize either way.
     block_bytes: u64,
     /// The slots one decode step holds at once, held as committed memory
     /// (`CommittedKind::BankFloor`), never cache.
@@ -38,6 +43,26 @@ impl BankShape {
     pub fn new(block_bytes: u64, floor: u64, ceiling: u64, curve: u64) -> Self {
         assert!(floor <= ceiling, "invariant violated: a bank floor of {floor} slots past its ceiling of {ceiling}");
         Self { block_bytes, floor_slots: floor, saturation_slots: ceiling.min(curve).max(floor) }
+    }
+
+    /// The shape of a holding of `floor` to `ceiling` slots holding `at`,
+    /// growing by `block_bytes`, priced by a miss curve that found its
+    /// deepest reuse `curve` slots deep (none before it found one, which
+    /// bounds nothing): [`Self::new`], the curve's saturation never below
+    /// `at`. The curve counts every step since the load, so its deepest
+    /// reuse only deepens; a slot past it is one no step has shown useful
+    /// yet, not one shown useless, so it bounds a growth and never shrinks
+    /// what the holding holds (Gemma 4 26B on an M4 Pro: 78 slots deep
+    /// after a dozen steps, 123 seconds later).
+    pub fn curved(block_bytes: u64, floor: u64, ceiling: u64, curve: Option<u64>, at: u64) -> Self {
+        Self::new(block_bytes, floor, ceiling, curve.map_or(ceiling, |curve| curve.max(at)))
+    }
+
+    /// The granule pool's block: the least resize either way, so a target
+    /// moves what the holding holds only once it lies a block from it
+    /// ([`held_target`]).
+    pub fn block_bytes(&self) -> u64 {
+        self.block_bytes
     }
 
     /// The shape of a host tier of at most `ceiling` host slots, growing by
@@ -131,22 +156,6 @@ pub fn slots_within<E>(room: u64, (from, to): (u64, u64), charge: &dyn Fn(u64) -
     Ok(fits)
 }
 
-/// The room the bank's cache may hold in the store of `snapshot`: the
-/// budget less committed memory (the bank's floor among it), every other
-/// cache and the speed guarantee (`in_process`, one prompt group's
-/// mandatory growth, and others' rise between the last two readings). The
-/// bank's own cache and the pool's spare granules are the room it derives;
-/// every other cache stays where it is. Blind, or committed memory filling
-/// the budget, leaves none.
-pub fn bank_room(snapshot: &Snapshot, in_process: u64) -> u64 {
-    let others = snapshot.cache() - snapshot.cache_of(CacheKind::Bank) - snapshot.cache_of(CacheKind::Spare);
-    let taken = snapshot
-        .committed()
-        .saturating_add(others)
-        .saturating_add(snapshot.guarantee(in_process));
-    snapshot.budget().saturating_sub(taken)
-}
-
 /// The slots a holding of `shape` holds within `room` bytes above its
 /// floor, as `charge` holds slots ([`slots_within`]), within
 /// `[floor, saturation]`: its floor where the room holds no step.
@@ -155,82 +164,127 @@ pub fn target_slots(room: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -
         .unwrap_or_else(|never| match never {})
 }
 
-/// The state the largest batch a load of `execution` admits grows by at
-/// once, its arena's `places` prompt-group places each a launch of rows: the
-/// pages the ledger sizes state rows by (`LoadShape::state_bytes`), and
-/// the slab the stores add in each stored domain to hold them, which
-/// they grow by whole: the in-process term of the speed guarantee
-/// (`memory::ledger::Snapshot::guarantee`) every derived target and a load's
-/// import leave, so a growth the bank has left room for is never refused.
-pub fn in_process_growth(execution: &crate::ExecutionPlan, places: std::num::NonZeroUsize) -> u64 {
-    let launch = execution.policy().limits().max_launch_rows as u64;
-    let rows = launch * places.get() as u64;
-    let resources = execution.resources();
-    let slabs = std::iter::once(resources.target_state())
-        .chain(resources.head_state())
-        .map(|state| state.history_slab_bytes().expect("invariant violated: a load's history domains lay out their slabs"))
-        .sum::<u64>();
-    crate::memory::ledger::LoadShape::of(execution).state_bytes(rows) + slabs
+/// The one in-process figure (design §3.2) of a load whose state stores
+/// are `shape`: the state the largest launch the arena admits grows by at
+/// once, `launch_rows` rows in each of its `places` prompt-group places,
+/// sized by the ledger's page rule
+/// (`memory::ledger::LoadShape::state_bytes`). A load prices its room
+/// beside it from its plan on, before it searches or claims
+/// (`memory::ledger::DeviceReading::room_after`).
+///
+/// This is the only derivation: the load computes it once at plan time and
+/// carries the value to its domain, which holds it for its life
+/// (`memory::ledger::Ledger::in_process`). Every input is fixed before any
+/// search or claim, so none can change under it: `shape` is the draft's
+/// state plan, `launch_rows` the service's `max_launch_rows` (set when the
+/// execution is planned and never rewritten), `places` the pass the
+/// assessment holds (`PassLaunches`), which the prepared graphs certify to
+/// be the pass they hold.
+pub fn in_process_bytes(shape: &crate::memory::ledger::LoadShape, launch_rows: usize, places: usize) -> u64 {
+    let rows = (launch_rows as u64).checked_mul(places as u64).expect("a launch's rows fit u64");
+    shape.state_bytes(rows)
 }
 
 /// The experts' slots a load imports its bank `plan` at, `floor` the
 /// import's weights with the bank at its floor: [`import_target`] in the
-/// bank's store, of what those weights place there beside every claim the
-/// store's ledger holds (the allocations after the import claimed before
-/// it), held at most at the plan's slots.
+/// bank's store at the load's estimate `at_load`
+/// (`memory::ledger::DeviceReading::room_after`), of what those weights
+/// place there beside every claim the store's ledger holds (the
+/// allocations after the import claimed before it), held at most at the
+/// plan's slots.
 pub fn import_slots(
+    at_load: &crate::memory::ledger::LoadEstimate,
     ledgers: &DeviceLedgers,
     device: &seismic::Device,
     plan: &crate::planning::ExpertBankPlan,
     floor: crate::memory::ClaimDemand,
-    in_process: u64,
 ) -> u64 {
-    let shape = BankShape::new(plan.reservation().granule, plan.floor(), plan.ceiling, plan.slots);
+    let shape = BankShape::new(plan.granule(), plan.floor(), plan.ceiling, plan.slots);
     let charge = |slots| plan.resident_charge(slots).expect("invariant violated: a bank plan charges every size within its ceiling");
     let beside = ledgers.placed_in(device, floor, BankTier::Bank);
-    import_target(&ledgers.of(BankTier::Bank).snapshot(), in_process, beside, &shape, &charge)
+    import_target(at_load.of(BankTier::Bank), beside, &shape, &charge)
 }
 
 /// The experts' target a load's import holds, `beside` the bytes the
 /// import (its bank at its floor) places in the bank's store: the target as a reading of the store derives it once
-/// they are held ([`bank_room`] beside the guarantee of `in_process`, held
-/// by [`target_slots`]), so a load imports what its first reading keeps.
-pub fn import_target(snapshot: &Snapshot, in_process: u64, beside: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -> u64 {
-    target_slots(bank_room(snapshot, in_process).saturating_sub(beside), shape, charge)
+/// they are held (the estimate's bank room, `Estimate::import_room`, held by
+/// [`target_slots`]), so a load imports what its first reading keeps.
+pub fn import_target(estimate: &Estimate, beside: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -> u64 {
+    target_slots(estimate.import_room().saturating_sub(beside), shape, charge)
+}
+
+/// The slots a holding of `shape` holding `at` slots keeps within `room`
+/// bytes above its floor, owing claims `owed` bytes, as `charge` holds
+/// slots: the block is the one threshold both ways for the room's own
+/// movement. It grows to what the room fits ([`target_slots`])
+/// once that is a block or more above what it holds; it shrinks to what
+/// the room fits once what it holds lies a block or more past the room, or
+/// past its saturation; otherwise it keeps what it holds.
+///
+/// `owed` is cache claims of the process took that its slots still hold
+/// (`BankCache::owed`): a fact of the ledger, which those claims allocate
+/// only once the slots free it, never the room's movement. So whatever the
+/// threshold says, a holding owing claims sheds at least what it owes, in
+/// whole blocks rounded up, and grows by none. Cache a shortage took to
+/// fit the budget as others moved owes nothing: the threshold judges it as
+/// it judges the room.
+pub fn held_target(room: u64, at: u64, owed: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -> u64 {
+    let fits = target_slots(room, shape, charge);
+    let block = shape.block_bytes.max(1);
+    let above_floor = charge(at).saturating_sub(charge(shape.floor_slots));
+    let keeps = match fits.cmp(&at) {
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Greater => charge(fits) - charge(at) < block,
+        std::cmp::Ordering::Less => at <= shape.saturation_slots && above_floor.saturating_sub(room) < block,
+    };
+    let held = match keeps {
+        true => at,
+        false => fits,
+    };
+    if owed == 0 {
+        return held;
+    }
+    let left = above_floor.saturating_sub(owed.div_ceil(block).saturating_mul(block));
+    let sheds = slots_within(left, (shape.floor_slots, at), &|slots| Ok::<_, std::convert::Infallible>(charge(slots)))
+        .unwrap_or_else(|never| match never {});
+    held.min(sheds)
 }
 
 /// The targets of one store's bank holdings sharing its `room`
-/// ([`bank_room`]), in the order given: each holds what its slots fit of
-/// the room those before it leave ([`target_slots`]).
-pub fn shared_targets(room: u64, holdings: &[(BankShape, &dyn Fn(u64) -> u64)]) -> Vec<u64> {
+/// (`Estimate::target`), each with the slots it holds now and what it owes
+/// claims, in the order given: each keeps what [`held_target`] keeps of the
+/// room those before it leave.
+pub fn shared_targets(room: u64, holdings: &[(BankShape, u64, u64, &dyn Fn(u64) -> u64)]) -> Vec<u64> {
     let mut left = room;
     holdings
         .iter()
-        .map(|(shape, charge)| {
-            let target = target_slots(left, shape, *charge);
-            left -= charge(target) - charge(shape.floor_slots);
+        .map(|(shape, at, owed, charge)| {
+            let target = held_target(left, *at, *owed, shape, *charge);
+            left = left.saturating_sub(charge(target) - charge(shape.floor_slots));
             target
         })
         .collect()
 }
 
 /// A bank holding as its derived target reads it: the tier whose store it
-/// lies in, its size now, its shape and its charge at any size
+/// lies in, its size now, what it owes claims that took its cache
+/// (`BankCache::owed`), its shape and its charge at any size
 /// (`ElasticBank::targets`).
 pub struct HoldingTarget<'a> {
     pub holding: BankHolding,
     pub tier: BankTier,
     pub at: u64,
+    pub owed: u64,
     pub shape: BankShape,
     pub charge: Box<dyn Fn(u64) -> u64 + 'a>,
 }
 
 /// Each of `targets` with its derived target, read from `ledgers` now: in
-/// each store, the room its snapshot leaves the bank's cache beside the
-/// guarantee's `in_process` growth ([`bank_room`]), shared by the store's
-/// holdings in `targets`' order ([`shared_targets`]). The one derivation
-/// that following the targets and reporting them read.
-pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>], in_process: u64) -> Vec<(&'t HoldingTarget<'t>, u64)> {
+/// each store, the room its estimate leaves the bank's cache
+/// (`Estimate::target`), shared by the store's holdings in `targets'`
+/// order ([`shared_targets`]). The one derivation that following the
+/// targets and reporting them read.
+pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>]) -> Vec<(&'t HoldingTarget<'t>, u64)> {
     let mut stores: Vec<seismic::StoreIdentity> = Vec::new();
     for target in targets {
         let store = ledgers.of(target.tier).store();
@@ -242,8 +296,9 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>], in_
         .into_iter()
         .flat_map(|store| {
             let members: Vec<&'t HoldingTarget<'t>> = targets.iter().filter(|target| ledgers.of(target.tier).store() == store).collect();
-            let room = bank_room(&ledgers.of(members[0].tier).snapshot(), in_process);
-            let shapes: Vec<(BankShape, &dyn Fn(u64) -> u64)> = members.iter().map(|target| (target.shape, &*target.charge)).collect();
+            let room = ledgers.of(members[0].tier).estimate().target();
+            let shapes: Vec<(BankShape, u64, u64, &dyn Fn(u64) -> u64)> =
+                members.iter().map(|target| (target.shape, target.at, target.owed, &*target.charge)).collect();
             let slots = shared_targets(room, &shapes);
             members.into_iter().zip(slots).collect::<Vec<_>>()
         })
@@ -253,10 +308,8 @@ pub fn derive<'t>(ledgers: &DeviceLedgers, targets: &'t [HoldingTarget<'t>], in_
 /// The one resize toward `derived` targets ([`derive`]): a shrink before
 /// any growth; none where each holding holds its target.
 pub fn next_move(derived: &[(&HoldingTarget<'_>, u64)]) -> Option<(BankHolding, BankMove)> {
-    let moves: Vec<(BankHolding, BankMove)> = derived
-        .iter()
-        .filter_map(|(target, slots)| bank_move(*slots, target.at, &target.shape, &*target.charge).map(|resize| (target.holding, resize)))
-        .collect();
+    let moves: Vec<(BankHolding, BankMove)> =
+        derived.iter().filter_map(|(target, slots)| bank_move(*slots, target.at).map(|resize| (target.holding, resize))).collect();
     let shrink = moves.iter().copied().find(|(_, resize)| matches!(resize, BankMove::Shrink { .. }));
     shrink.or_else(|| moves.first().copied())
 }
@@ -269,6 +322,8 @@ pub struct DerivedTarget {
     pub store: seismic::StoreIdentity,
     pub held: u64,
     pub target: u64,
+    /// Its pool's block ([`BankShape::block_bytes`]): the least it shrinks by.
+    pub block: u64,
 }
 
 /// The one resize a holding runs toward its target.
@@ -278,15 +333,14 @@ pub enum BankMove {
     Shrink { to: u64 },
 }
 
-/// The resize toward `target` from `held` slots: a shrink whenever the
-/// target is below what the holding holds; a growth only once the target's
-/// charge (`charge`, as [`target_slots`] reads it) is a block or more above
-/// what it holds, as a growth is made of blocks; otherwise none.
-pub fn bank_move(target: u64, held: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -> Option<BankMove> {
-    if target < held {
-        return Some(BankMove::Shrink { to: target });
+/// The resize toward `target` from `held` slots, the target a block or
+/// more away wherever it differs ([`held_target`]).
+pub fn bank_move(target: u64, held: u64) -> Option<BankMove> {
+    match target.cmp(&held) {
+        std::cmp::Ordering::Less => Some(BankMove::Shrink { to: target }),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(BankMove::Grow { to: target }),
     }
-    (charge(target).saturating_sub(charge(held)) >= shape.block_bytes.max(1)).then_some(BankMove::Grow { to: target })
 }
 
 #[cfg(test)]

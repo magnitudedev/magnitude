@@ -1,12 +1,13 @@
 // Shared pieces of the routed (mixture-of-experts) CPU entries, built on the
-// projection library: expert row offsets in expert-stacked weights, the
+// projection library: the record an expert's weights are read from, the
 // paired gate/up expansion with the routed SiLU . mul epilogue, the live-row
 // count of a grouped block and the router's top-K selection (`ranked`). The
 // counterpart of `metal/lib/routed/routed.h`, `cuda/lib/routed/routed.cuh`
 // and `vulkan/lib/routed/routed.glsl`.
 //
-// Expert-stacked weights: an [E, N, K] tensor is a `Weights` operand of E * N
-// rows, so expert e's row n is row e * N + n.
+// Expert-stacked weights: an [E, N, K] tensor is a record port, bound as its
+// records' address table (`Records`), and an expert's weights are the N rows
+// of its record, wherever that record lies.
 //
 // Numerics (routed.seismic): the expansion accumulates gate and up in F32 and
 // publishes their `glu` (functions.seismic); down projections are published
@@ -16,13 +17,16 @@ use super::super::core::{activation, functions, reduce};
 use super::super::projection::projection;
 use super::ranked;
 use seismic::cpu::quant::Q8Block;
+use seismic::cpu::slab::Records;
 use seismic::cpu::{Dense, Scratch, Store, Weights};
 
-/// First row of expert `expert` in an [E, N, K] tensor of `rows` = N rows per
-/// expert.
+/// An expert-stacked weight's records, each an expert's weights.
+pub type Stack<'w> = Records<Weights<'w>>;
+
+/// The weights of record `record` of `stack`.
 #[inline(always)]
-pub fn expert_row(expert: i32, rows: usize) -> usize {
-    usize::try_from(expert).expect("a routed expert index is non-negative") * rows
+pub fn record<'w>(stack: &Stack<'w>, record: i32) -> Weights<'w> {
+    stack.record(usize::try_from(record).expect("a routed record index is non-negative"))
 }
 
 /// The expansion of weight rows `first..first + out.len()` (at most
@@ -129,25 +133,25 @@ pub fn held(map: impl Fn(usize) -> i32, step: impl Fn(usize) -> i32) -> i32 {
     if held { record } else { -1 }
 }
 
-/// The weights holding expert `expert`, and its index in them: the record
-/// `held(expert)` of `records` while the layer's map (of `mapped` rows)
-/// holds one for the step (>= 0), else its place in `experts` (the stack,
-/// or the scratch tier), which is every expert's without a map.
+/// The weights of expert `expert`: record `held(expert)` of `records` while
+/// the layer's map (of `mapped` rows) holds one for the step (>= 0), else
+/// its record of `experts` by index (the stack, or the scratch tier), which
+/// is every expert's without a map.
 #[inline(always)]
-pub fn expert_weights<'a, 'w>(
-    experts: &'a Weights<'w>,
-    records: &'a Weights<'w>,
+pub fn expert_weights<'w>(
+    experts: &Stack<'w>,
+    records: &Stack<'w>,
     mapped: u64,
     held: impl Fn(usize) -> i32,
     expert: i32,
-) -> (&'a Weights<'w>, i32) {
+) -> Weights<'w> {
     let slot = match mapped {
         0 => -1,
         _ => held(usize::try_from(expert).expect("a routed expert index is non-negative")),
     };
     match slot {
-        0.. => (records, slot),
-        _ => (experts, expert),
+        0.. => record(records, slot),
+        _ => record(experts, expert),
     }
 }
 
@@ -160,12 +164,12 @@ pub enum Place {
 }
 
 impl Place {
-    /// The stack of `bank` and `tier` this place reads, and its record.
+    /// The weights this place reads: its record of `bank` or of `tier`.
     #[inline(always)]
-    pub fn of<'a, T>(self, bank: &'a T, tier: &'a T) -> (&'a T, i32) {
+    pub fn of<'w>(self, bank: &Stack<'w>, tier: &Stack<'w>) -> Weights<'w> {
         match self {
-            Place::Bank(record) => (bank, record),
-            Place::Tier(record) => (tier, record),
+            Place::Bank(index) => record(bank, index),
+            Place::Tier(index) => record(tier, index),
         }
     }
 }

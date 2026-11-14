@@ -9,7 +9,7 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
+use seismic::{BackendName, Device, Pool, SlabLayout};
 use std::{num::NonZeroUsize, rc::Rc};
 
 /// Rows of one prefill forward in the evaluation harness's loads, as the
@@ -465,6 +465,10 @@ pub struct ResourceCapacity {
     /// the same graphs. A plan for no concrete device states which it
     /// assumes.
     pub tensor_operations: TensorOperations,
+    /// How the selected device makes its native allocations
+    /// (`seismic::Limits::allocations`): what the state pool's blocks are,
+    /// and so what its slabs are charged in whole blocks of.
+    pub allocations: seismic::NativeAllocations,
 }
 
 /// Whether a device forms Metal tensor operations.
@@ -742,6 +746,13 @@ pub struct StateStorePlan {
     pub recurrent_bank_bytes: u64,
     pub zero_seed_bytes: u64,
     pub recurrent_pool_bytes: u64,
+    /// The bytes of a granule of the state's pool ([`state_granule`]): each
+    /// slab takes one, and holds as many whole pages or banks as fit it.
+    pub granule: u64,
+    /// The state pool's block of those granules (`seismic::block_bytes`),
+    /// what a load opens it at: its slabs are charged in whole blocks
+    /// ([`Self::slab_charge`]).
+    pub block: seismic::BlockSize,
 }
 
 /// One stored history domain of a store plan: exactly what the store derives
@@ -833,15 +844,7 @@ impl HistoryStorePlan {
     }
 
     pub fn slab_layout(&self) -> Result<SlabLayout, String> {
-        let regions = self
-            .components
-            .iter()
-            .flat_map(ComponentDescriptor::planes)
-            .map(|plane| SlabRegion {
-                element: Element::dense(plane.dtype),
-                row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
-            })
-            .collect::<Vec<_>>();
+        let regions = magnitude_state::slab_regions(&self.components);
         SlabLayout::for_regions(u64::from(self.slab_rows), self.rows as u64, &regions)
             .map_err(|error| error.to_string())
     }
@@ -994,7 +997,8 @@ impl StateStorePlan {
     }
 
     pub fn bank_slab_banks(&self) -> Result<u32, String> {
-        u32::try_from(magnitude_state::banks_per_slab(self.recurrent_bank_bytes)?)
+        let regions = magnitude_state::bank_regions(&self.recurrent_components);
+        u32::try_from(magnitude_state::banks_per_slab(&regions, self.granule)?)
             .map_err(|_| "bank slab count exceeds u32".into())
     }
 
@@ -1002,14 +1006,7 @@ impl StateStorePlan {
         if self.recurrent_components.is_empty() {
             return Ok(None);
         }
-        let regions = self
-            .recurrent_components
-            .iter()
-            .map(|component| SlabRegion {
-                element: Element::dense(component.dtype),
-                row_shape: component.shape.iter().map(|&size| size as u64).collect(),
-            })
-            .collect::<Vec<_>>();
+        let regions = magnitude_state::bank_regions(&self.recurrent_components);
         let logical_banks = self
             .bank_capacity
             .storage_total()
@@ -1023,24 +1020,15 @@ impl StateStorePlan {
         .map_err(|error| error.to_string())
     }
 
-    /// Every stored domain's address table and first slab.
+    /// Every stored domain's address table and first slab, a granule.
     pub fn startup_history_bytes(&self) -> Result<u64, String> {
         self.domains.iter().try_fold(0u64, |total, domain| {
-            let layout = domain.slab_layout()?;
-            layout
+            domain
+                .slab_layout()?
                 .address_table_bytes
-                .checked_add(layout.slab_bytes)
+                .checked_add(self.granule)
                 .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(|| "initial history slab charge overflows".into())
-        })
-    }
-
-    /// What a history's growth beyond the rows it holds can add past their
-    /// pages: a whole slab in each stored domain, the unit the stores grow by
-    /// (`magnitude_state::StateStore::growth_claim`).
-    pub fn history_slab_bytes(&self) -> Result<u64, String> {
-        self.domains.iter().try_fold(0u64, |total, domain| {
-            total.checked_add(domain.slab_layout()?.slab_bytes).ok_or_else(|| "history slab bytes overflow".into())
         })
     }
 
@@ -1050,73 +1038,80 @@ impl StateStorePlan {
         self.bank_bytes_at_count(self.bank_capacity.startup_banks().map_err(|error| error.to_string())? as u64)
     }
 
-    /// The histories of `conversations` requests at `depth` tokens each: a
-    /// Token domain holds `depth` rows of each, a Window domain its steady
-    /// footprint of `n` plus one advance, independent of the depth; each
-    /// request's rows in whole pages of its own, all of them rounded to
-    /// whole slabs of its domain.
-    pub fn history_bytes_at_depth(&self, depth: u64, conversations: u64) -> Result<u64, String> {
-        self.domains.iter().try_fold(0u64, |total, domain| {
-            let layout = domain.slab_layout()?;
-            let rows = match domain.kind {
-                HistoryDomainKind::Token => depth,
-                kind => u64::try_from(
-                    kind.row_limit(
-                        usize::try_from(depth).map_err(|_| "fit depth exceeds host range")?,
-                        self.max_advance,
-                    )
-                    .map_err(|error| error.to_string())?,
-                )
-                .map_err(|_| "window rows exceed u64")?,
-            };
-            // Whole pages: a Window history's are its row limit's and the
-            // partial page at its front (`window_pages`); every other
-            // history's last page may be partial.
-            let page = u64::from(domain.page_rows);
-            let per = match domain.kind {
-                HistoryDomainKind::Window { .. } => {
-                    let rows = usize::try_from(rows.max(1)).map_err(|_| "window rows exceed host range")?;
-                    u64::try_from(magnitude_state::window_pages(domain.page_rows as usize, rows)).map_err(|_| "window pages exceed u64")?
-                }
-                _ => rows.max(1).div_ceil(page),
-            };
-            let pages = per
-                .checked_mul(conversations)
-                .ok_or("history page fit count overflows")?;
-            let slabs = (pages * page).div_ceil(u64::from(domain.slab_rows));
-            layout
-                .slab_bytes
-                .checked_mul(slabs)
-                .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
-                .and_then(|bytes| total.checked_add(bytes))
-                .ok_or_else(|| "history slab fit charge overflows".into())
-        })
+    pub fn bank_slab_bytes_at_count(&self, banks: u64) -> Result<u64, String> {
+        if self.bank_slab_layout()?.is_none() {
+            return Ok(0);
+        }
+        let slabs = banks.max(1).div_ceil(u64::from(self.bank_slab_banks()?));
+        self.granule
+            .checked_mul(slabs)
+            .ok_or_else(|| "bank slab fit charge overflows".into())
     }
 
     pub fn bank_bytes_at_count(&self, banks: u64) -> Result<u64, String> {
         let Some(layout) = self.bank_slab_layout()? else {
             return Ok(0);
         };
-        let slabs = banks.max(1).div_ceil(u64::from(self.bank_slab_banks()?));
-        layout
-            .slab_bytes
-            .checked_mul(slabs)
-            .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
+        self.bank_slab_bytes_at_count(banks)?
+            .checked_add(layout.address_table_bytes)
             .ok_or_else(|| "bank slab fit charge overflows".into())
     }
 
     /// Address tables and the first history and bank slabs committed by
     /// `StateStore::new` for each present store.
     pub fn initial_committed_bytes(&self) -> Result<u64, String> {
-        self.startup_history_bytes()?
-            .checked_add(self.startup_bank_bytes()?)
-            .ok_or_else(|| "initial state slab charge overflows".into())
+        self.initial_slab_bytes()?
+            .checked_add(self.table_bytes()?)
+            .ok_or_else(|| "initial state charge overflows".into())
     }
 
-    /// The planned store and its one binding right.
-    pub fn allocate(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
+    /// The address tables `StateStore::new` allocates: every stored
+    /// domain's and the banks'. They lie outside the pool
+    /// (`memory::ledger::CommittedKind::StateTables`).
+    pub fn table_bytes(&self) -> Result<u64, String> {
+        let banks = self.bank_slab_layout()?.map_or(0, |layout| layout.address_table_bytes);
+        self.domains.iter().try_fold(banks, |total, domain| {
+            total
+                .checked_add(domain.slab_layout()?.address_table_bytes)
+                .ok_or_else(|| "state table charge overflows".into())
+        })
+    }
+
+    /// The first slabs `StateStore::new` backs, granules of the pool
+    /// beside its tables: what the store holds of them
+    /// (`magnitude_state::StateStore::committed_bytes`) and its state floor
+    /// claims. The rest of the blocks holding them is the pool's own spare,
+    /// which its entry holds (`memory::ledger::Ledger::pool_block`) and the
+    /// plan charges once for every store sharing the pool
+    /// ([`Self::slab_charge`]).
+    pub fn initial_slab_bytes(&self) -> Result<u64, String> {
+        self.startup_history_bytes()?
+            .checked_add(self.startup_bank_bytes()?)
+            .ok_or("initial state slab charge overflows")?
+            .checked_sub(self.table_bytes()?)
+            .ok_or_else(|| "state tables exceed the state's committed bytes".into())
+    }
+
+    /// What `slab_bytes` of the state pool's granules cost: the whole blocks
+    /// holding them ([`seismic::BlockSize::charge`]).
+    pub fn slab_charge(&self, slab_bytes: u64) -> Result<u64, String> {
+        self.block.charge(self.granule, slab_bytes.div_ceil(self.granule)).ok_or_else(|| "state slab charge overflows".into())
+    }
+
+    /// The planned store and its one binding right, its slabs granules of
+    /// `pool`, the granule pool of the store on `device` the state lies in,
+    /// whose granule is the plan's.
+    pub fn allocate(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
+        if pool.granule() != self.granule {
+            return Err(format!(
+                "state planned in {}-byte granules given a pool of {}-byte granules",
+                self.granule,
+                pool.granule()
+            ));
+        }
         let (store, bindings) = StateStore::new(
             device,
+            pool,
             self.context_rows,
             self.max_advance,
             self.history.clone(),
@@ -1255,15 +1250,8 @@ impl ResourcePlan {
         &self.state_graph
     }
 
-    pub fn allocate_target_state(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
-        self.target_state.allocate(device)
-    }
-
-    pub fn allocate_head_state(&self, device: Rc<Device>) -> Result<Option<StoreBindings>, String> {
-        self.head_state
-            .as_ref()
-            .map(|plan| plan.allocate(device))
-            .transpose()
+    pub fn allocate_target_state(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
+        self.target_state.allocate(device, pool)
     }
 }
 
@@ -1285,27 +1273,6 @@ pub struct StateResourcePlan {
     retained_entry_bytes: u64,
     history_bytes: u64,
     recurrent_banks_bytes: u64,
-}
-
-/// The state slabs `conversations` histories of `depth` rows and `banks`
-/// recurrent banks occupy.
-fn fit_state_bytes(
-    target: &StateStorePlan,
-    head: Option<&StateStorePlan>,
-    depth: u64,
-    conversations: u64,
-    banks: u64,
-) -> Result<u64, String> {
-    let target_history = target.history_bytes_at_depth(depth, conversations)?;
-    let head_history = head
-        .map(|state| state.history_bytes_at_depth(depth, conversations))
-        .transpose()?
-        .unwrap_or(0);
-    let target_banks = target.bank_bytes_at_count(banks)?;
-    target_history
-        .checked_add(head_history)
-        .and_then(|bytes| bytes.checked_add(target_banks))
-        .ok_or_else(|| "state fit charge overflows".into())
 }
 
 impl StateResourcePlan {
@@ -1390,21 +1357,19 @@ impl ResourcePlanner {
         if capacity_bytes.domain_bytes == 0 {
             return Err("device domain has zero capacity".into());
         }
-        let drafter = if load.head.is_some() {
-            crate::operators::draft::drafter_blocks(definition)
-        } else {
-            Vec::new()
-        };
-        let layout =
-            ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
+        let layout = state_layout(definition, load, method, codec)?;
         let history_domains = || layout.target_history.iter().chain(&layout.head_history);
         let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
             .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row byte count overflow")?;
         let recurrent_bank_bytes = recurrent_bank_bytes(&layout.target_recurrent)?;
-        let context = usize::try_from(definition.decoder.context_limit)
-            .map_err(|_| "context limit exceeds host domain")?;
+        let context = state_context(definition)?;
         let max_advance = limits.max_launch_rows;
+        let granule = state_granule(&layout, context, max_advance)?;
+        // The state pool's block, by the rule a load opens it by
+        // (`memory::ledger::Ledgers::open_pool`).
+        let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
+            .map_err(|error| format!("the state pool's blocks: {error:?}"))?;
         // A checkpoint's window rows: `n` per Window(n) domain.
         let checkpoint_window_bytes = history_domains()
             .filter(|domain| matches!(domain.kind(), HistoryDomainKind::Window { .. }))
@@ -1495,9 +1460,11 @@ impl ResourcePlanner {
             layout.target_history,
             layout.target_recurrent,
             bank_capacity,
+            granule,
+            block,
         )?;
         let head_state = (!layout.head_history.is_empty())
-            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity))
+            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity, granule, block))
             .transpose()?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
@@ -1512,16 +1479,6 @@ impl ResourcePlanner {
         }
         // Seismic's fixed address tables and first history and bank slabs are
         // committed at store construction. Further slabs use heap claims.
-        let history = target_state
-            .startup_history_bytes()?
-            .checked_add(
-                head_state
-                    .as_ref()
-                    .map(|state| state.startup_history_bytes())
-                    .transpose()?
-                    .unwrap_or(0),
-            )
-            .ok_or("startup history slab charge overflows")?;
         let planned_recurrent = target_state
             .startup_bank_bytes()?
             .checked_add(
@@ -1532,15 +1489,39 @@ impl ResourcePlanner {
                     .unwrap_or(0),
             )
             .ok_or("startup bank slab charge overflows")?;
+        // What the stores' construction commits: their tables and the whole
+        // blocks of the one state pool holding their first slabs (their
+        // state floor claims and the pool's spare beside them), of which the
+        // history's share is the rest beside the banks'.
+        let stores = || std::iter::once(&target_state).chain(head_state.as_ref());
+        let slabs = stores().try_fold(0u64, |total, store| total.checked_add(store.initial_slab_bytes()?).ok_or_else(|| String::from("startup slab charge overflows")))?;
+        let tables = stores().try_fold(0u64, |total, store| total.checked_add(store.table_bytes()?).ok_or_else(|| String::from("startup table charge overflows")))?;
+        let history = target_state
+            .slab_charge(slabs)?
+            .checked_add(tables)
+            .and_then(|committed| committed.checked_sub(planned_recurrent))
+            .ok_or("startup history slab charge overflows")?;
         // What the standard workload charges of the stores, exactly as
         // assessment does: retained prefixes are held only within it.
-        let workload_state_bytes = fit_state_bytes(
-            &target_state,
-            head_state.as_ref(),
-            assessment::fit_depth(definition),
-            limits.conversations.get() as u64,
-            assessment::conversation_banks(limits)?,
-        )?;
+        // The page rule's slabs of `conversations` histories at the fit depth
+        // (`magnitude_state::state_bytes`, the one state-size estimator), plus
+        // each stored domain's address table, which a slab count leaves out
+        // and `StateStore::new` commits.
+        let fit_depth = assessment::fit_depth(definition);
+        let conversations = limits.conversations.get() as u64;
+        let mut workload_slabs = 0u64;
+        for store in std::iter::once(&target_state).chain(head_state.as_ref()) {
+            let slabs = crate::memory::ledger::StoreShape::of(store)
+                .state_bytes(magnitude_state::StateUnit::Slabs { granule: store.granule }, conversations, fit_depth)
+                .map_err(|error| error.to_string())?;
+            workload_slabs = workload_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
+        }
+        let bank_slabs = target_state.bank_slab_bytes_at_count(assessment::conversation_banks(limits)?)?;
+        workload_slabs = workload_slabs.checked_add(bank_slabs).ok_or("state fit charge overflows")?;
+        let workload_state_bytes = target_state
+            .slab_charge(workload_slabs)?
+            .checked_add(tables)
+            .ok_or("state fit charge overflows")?;
         let capacity = StateCapacityPlan {
             live_requests: possible_requests,
             checkpoints: possible_requests,
@@ -1723,11 +1704,67 @@ impl HistoryRows {
     }
 }
 
+/// The state layout of a load of `definition` planned as `load`, `method`
+/// and `codec`: its drafter's history where the load holds a head.
+fn state_layout(
+    definition: &ModelDefinition,
+    load: &ModelLoadPlan,
+    method: PlannedMethod,
+    codec: KvCodec,
+) -> Result<ModelStateLayout, String> {
+    let drafter = if load.head.is_some() {
+        crate::operators::draft::drafter_blocks(definition)
+    } else {
+        Vec::new()
+    };
+    ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())
+}
+
+/// The context a load's state stores hold for a request.
+fn state_context(definition: &ModelDefinition) -> Result<usize, String> {
+    usize::try_from(definition.decoder.context_limit).map_err(|_| "context limit exceeds host domain".into())
+}
+
+/// The granule of the pool `layout`'s state slabs lie in, its histories at
+/// `context` advanced at most `max_advance` rows at a time: the state's own
+/// class (§4.7), whatever bank lies beside it, of its smallest slabs
+/// ([`state_pool_granule`]).
+pub(crate) fn state_granule(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<u64, String> {
+    state_pool_granule(smallest_slab(layout, context, max_advance)?)
+}
+
+/// The granule of a state pool whose slab stores each fit `slab`: `slab`'s
+/// bytes at a multiple of its alignment, so each granule holds a store's
+/// smallest slab, and the pool's blocks gather granules to the backend's
+/// allocations (`seismic::block_bytes`); the least a granule is
+/// ([`seismic::BLOCK_ALIGNMENT`]) without state slabs, whose pool holds
+/// none. The one rule of a state pool's granule; an expert bank's records
+/// are pooled at their own (`ExpertBankPlan::granule`).
+pub(crate) fn state_pool_granule(slab: Option<super::PoolSlab>) -> Result<u64, String> {
+    slab.map_or(Ok(seismic::BLOCK_ALIGNMENT), super::PoolSlab::granule)
+}
+
+/// The slab every slab store of `layout`'s state stores fits: the largest
+/// of their smallest slabs, at a multiple of every one's alignment; none
+/// without state slabs.
+fn smallest_slab(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<Option<super::PoolSlab>, String> {
+    let stores = [(&layout.target_history, &layout.target_recurrent[..]), (&layout.head_history, &[][..])];
+    stores.into_iter().try_fold(None, |slab: Option<super::PoolSlab>, (history, recurrent)| {
+        magnitude_state::smallest_slabs(history, recurrent, context, max_advance)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(super::PoolSlab::of)
+            .try_fold(slab, |slab, store| slab.map_or(Ok(store), |slab| slab.with(store)).map(Some))
+    })
+}
+
 fn state_store_plan(
     rows: HistoryRows,
     history: Vec<HistoryDomainLayout>,
     recurrent_components: Vec<ComponentSpec>,
     bank_capacity: BankCapacity,
+    granule: u64,
+    block: seismic::BlockSize,
 ) -> Result<StateStorePlan, String> {
     let layouts = history;
     // The rows the store reserves for each stored domain (whole pages), which
@@ -1738,7 +1775,7 @@ fn state_store_plan(
             let logical_rows = match layout {
                 HistoryDomainLayout::Shared { .. } => 0,
                 _ => layout
-                    .geometry(&layouts, rows.context, rows.max_advance)
+                    .pages(&layouts, rows.context, rows.max_advance)
                     .map_err(|error| error.to_string())?
                     .reserved_rows(rows.rows(layout)?)
                     .ok_or("history rows overflow whole pages")?,
@@ -1756,7 +1793,7 @@ fn state_store_plan(
             let row_bytes = plan.layout.row_bytes().map_err(|error| error.to_string())?;
             let geometry = plan
                 .layout
-                .geometry(&layouts, rows.context, rows.max_advance)
+                .geometry(&layouts, rows.context, rows.max_advance, granule)
                 .map_err(|error| error.to_string())?;
             Ok(HistoryStorePlan {
                 kind: plan.layout.kind(),
@@ -1792,6 +1829,8 @@ fn state_store_plan(
         recurrent_bank_bytes,
         zero_seed_bytes: recurrent_bank_bytes,
         recurrent_pool_bytes,
+        granule,
+        block,
     })
 }
 
@@ -1888,6 +1927,9 @@ mod slab_plan_tests {
         assert_eq!(DecodedHistoryForm::Staged.smallest_listing_tiles(), None);
     }
 
+    /// The state granule the slab storage test plans at.
+    const GRANULE: u64 = 64 << 20;
+
     #[test]
     fn startup_and_fit_charges_match_slab_storage() {
         let history = ComponentDescriptor::new(
@@ -1915,48 +1957,55 @@ mod slab_plan_tests {
                 in_flight: 2,
                 retained: 1,
             },
+            GRANULE,
+            // A block of three granules the backend rounds up, as CUDA's and
+            // Vulkan's are: the store's slabs are granules of it whatever
+            // the block, and the plan agrees with the store.
+            seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20) },
         )
         .unwrap();
+        // Each slab is a granule of the store's pool.
+        let granule = plan.granule;
         let history = plan.domains[0].slab_layout().unwrap();
         let banks = plan.bank_slab_layout().unwrap().unwrap();
         assert_eq!(plan.bank_slab_banks().unwrap(), 4);
+        assert!(history.slab_bytes <= granule && banks.slab_bytes <= granule);
         assert_eq!(
             plan.initial_committed_bytes().unwrap(),
-            history.address_table_bytes
-                + history.slab_bytes
-                + banks.address_table_bytes
-                + banks.slab_bytes
+            history.address_table_bytes + granule + banks.address_table_bytes + granule
         );
         let device = Rc::new(
             crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
                 .unwrap(),
         );
-        let store = plan.allocate(device).unwrap();
+        let entry = device.entry(seismic::Contract::DeviceOnly);
+        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).unwrap();
+        let store = plan.allocate(device, pool).unwrap();
         assert_eq!(
             store.committed_bytes(),
             plan.initial_committed_bytes().unwrap()
         );
+        // The pool's blocks holding the first two slabs: one, rounded.
+        assert_eq!(plan.slab_charge(2 * granule).unwrap(), 3 * GRANULE + (1 << 20));
+        assert_eq!(plan.slab_charge(4 * granule).unwrap(), 2 * (3 * GRANULE + (1 << 20)));
 
         let history_depth = u64::from(plan.domains[0].slab_rows) + 1;
-        assert_eq!(
-            plan.history_bytes_at_depth(0, 1).unwrap(),
-            history.address_table_bytes + history.slab_bytes
-        );
-        assert_eq!(
-            plan.history_bytes_at_depth(history_depth, 1).unwrap(),
-            history.address_table_bytes + 2 * history.slab_bytes
-        );
+        let slabs = |conversations| {
+            crate::memory::ledger::StoreShape::of(&plan)
+                .state_bytes(magnitude_state::StateUnit::Slabs { granule }, conversations, history_depth)
+                .unwrap()
+        };
+        assert_eq!(slabs(1), 2 * granule);
         // Each conversation's rows in pages of its own, slabs over them all.
         let page = u64::from(plan.domains[0].page_rows);
         let slab = u64::from(plan.domains[0].slab_rows);
         assert_eq!(
-            plan.history_bytes_at_depth(history_depth, 3).unwrap(),
-            history.address_table_bytes
-                + (3 * history_depth.div_ceil(page) * page).div_ceil(slab) * history.slab_bytes
+            slabs(3),
+            (3 * history_depth.div_ceil(page) * page).div_ceil(slab) * granule
         );
         assert_eq!(
             plan.bank_bytes_at_count(5).unwrap(),
-            banks.address_table_bytes + 2 * banks.slab_bytes
+            banks.address_table_bytes + 2 * granule
         );
     }
 }
@@ -1964,7 +2013,7 @@ mod slab_plan_tests {
 /// History bytes per token of context: the rows of every Token domain, and
 /// a `rate`-th of every Block domain's (rounded up). Window domains hold a
 /// bounded number of rows whatever the context (see
-/// `StateStorePlan::history_bytes_at_depth`).
+/// `magnitude_state::state_bytes`).
 pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
     domains
         .iter()

@@ -1,5 +1,9 @@
 # Weight import over the [B, N, K] view of a weight: B leading matrices of N
 # rows of K values (a rank-2 weight is [1, N, K], a rank-1 weight [1, 1, K]).
+# On a backend that streams experts the result is a record port (`records
+# (result 0)`): a bank's records import through their table, each matrix
+# written from its own record's address. The CPU streams none, so its imports
+# write ordinary storage.
 
 # Dense import between every qualified dense source/destination representation.
 fn import_dense[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
@@ -17,6 +21,7 @@ native import_dense for metal from "metal/import_dense.metal":
         threads_per_threadgroup (256, 1, 1)
 
 native import_dense for cuda from "cuda/import_dense.cu":
+    records (result 0)
     launch import_dense:
         threadgroups (ceil_div(B * N * K, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -75,6 +80,7 @@ native repack_weight for metal from "metal/repack_weight.metal":
 # unit's columns (`unit_columns(U)`), a lane per row (the other 16 lanes help
 # stage and store), so it runs one stream of compile-time record words.
 native repack_weight for cuda from "cuda/repack_weight.cu":
+    records (result 0)
     launch repack_weight:
         threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)
@@ -87,8 +93,7 @@ native repack_weight for cpu from "cpu/repack_weight.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Vulkan: a grid-stride loop over every element; the x grid is capped at the
-# 65535-group floor (Vulkan spec §5.3). The result is a record port, as
-# `repack_weight`'s.
+# 65535-group floor (Vulkan spec §5.3).
 native import_dense for vulkan from "vulkan/import_dense.comp":
     records (result 0)
     launch import_dense:
@@ -106,8 +111,7 @@ native import_dense for cpu from "cpu/import_dense.rs":
 # Vulkan: one workgroup converts one 16-row tile of a conversion unit's
 # columns (`unit_columns(U)`) into rows16 (the Vulkan resident layout).
 # N / 16 stays below 65535 for every model weight (the largest, the
-# 248320-row head, gives 15520). The result is a record port: Vulkan's
-# reserved storage is chunked, so bank records import through their table.
+# 248320-row head, gives 15520).
 native repack_weight for vulkan from "vulkan/repack_weight.comp":
     records (result 0)
     launch repack_weight:

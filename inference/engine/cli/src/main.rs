@@ -21,7 +21,7 @@ use magnitude_engine::options::{
 use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_stderr};
 use magnitude_engine::worker::transport::stdio_worker_transport;
 use magnitude_engine::worker::{EngineClient, WorkerExit, serve_worker};
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{ExecutionPath, WeightBound, TuningSettings};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
@@ -352,7 +352,7 @@ fn run() -> Result<(), String> {
         Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
         None => None,
     };
-    let reserves = MemoryReserves::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
+    let release = ReleaseRate::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
@@ -374,7 +374,7 @@ fn run() -> Result<(), String> {
         path: ExecutionPath::Native,
         device: options.device,
         kernel_cache: options.kernel_cache,
-        reserves,
+        release,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

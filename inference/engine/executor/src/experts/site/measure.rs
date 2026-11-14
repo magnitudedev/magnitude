@@ -24,7 +24,7 @@ pub(crate) fn measure_cpu_site(device: &Device, form: &crate::assessment::CpuFor
         // model's words, none of them all zero.
         // SAFETY: nothing reads the tensor yet.
         unsafe { tensor.write_shared(0, &vec![0x55; tensor.byte_len() as usize]) }.map_err(|error| format!("a site's records: {error}"))?;
-        let views = Records::new(tensor, record.record_bytes()?, count)?;
+        let views = Records::rows(&tensor, record.record_bytes()?, count)?;
         let [rows, columns] = record.matrix.map(|extent| extent as usize);
         SiteRecords::new(views, rows, columns, record.resident)
     };

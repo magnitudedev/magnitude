@@ -57,12 +57,11 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     };
     let (bank_gate, tier_gate, bank_up, tier_up) =
         (cx.arg_expert_gate(), cx.arg_tier_gate(), cx.arg_expert_up(), cx.arg_tier_up());
-    let ((gate, record), (up, _)) = (place.of(&bank_gate, &tier_gate), place.of(&bank_up, &tier_up));
-    let first = routed::expert_row(record, f) + rows.start;
+    let (gate, up) = (place.of(&bank_gate, &tier_gate), place.of(&bank_up, &tier_up));
     routed::expand_into::<E::A>(
-        gate,
-        up,
-        first,
+        &gate,
+        &up,
+        rows.start,
         &staged[row * h..(row + 1) * h],
         q8,
         cx.arg_activation(),

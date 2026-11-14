@@ -10,99 +10,112 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// The records of a host-shared tensor that reads land in: `count` records
-/// of `bytes` each, its whole extent, each one contiguous range where the
-/// tensor lays it, checked once when they are made. Shared: each clone,
-/// and each read's request, holds the one destination they lie in.
+/// Records the host addresses: reads land in them, landings convert into
+/// them, copies and the CPU site read them. Each is a view the host
+/// addresses of at least `bytes` bytes, by record index, or a hole where its
+/// store holds no storage for it: a record's place never matters, so the
+/// records of a store that allows holes are addressed as they are. Shared:
+/// each clone, and each read's request, holds the views they lie in.
 #[derive(Clone)]
-pub(crate) struct Records(Arc<Region>);
+pub(crate) struct Records(Arc<Set>);
 
-/// The memory records lie in ([`Records`]).
-struct Region {
+struct Set {
+    bytes: u64,
+    records: Vec<Option<Arc<Record>>>,
+}
+
+/// One record's memory: its view, which keeps it alive, and where the host
+/// addresses it.
+struct Record {
     tensor: Tensor,
     base: NonNull<u8>,
-    placement: seismic::RecordPlacement,
-    count: u64,
+    bytes: u64,
 }
 
 // SAFETY: `base` addresses host-shared memory that `tensor`, held beside
 // it, keeps alive; the host writes it only through the read engine's
-// requests (`ExpertSource::request`) and record copies (`Records::copy_record`).
-unsafe impl Send for Region {}
-unsafe impl Sync for Region {}
+// requests (`ExpertSource::request`), landings and record copies
+// (`Records::copy_record`).
+unsafe impl Send for Record {}
+unsafe impl Sync for Record {}
 
-// SAFETY: the tensor's host-shared bytes from `base`, which the tensor the
-// region holds keeps where they are while it lives.
-unsafe impl seismic_io::Destination for Region {
-    /// Through its last record where the tensor lays it: chunked storage
-    /// leaves each chunk's remainder unused, so the tensor's canonical bytes
-    /// fall short of its last records.
+// SAFETY: the record's host-shared bytes from `base`, which the tensor it
+// holds keeps where they are while it lives.
+unsafe impl seismic_io::Destination for Record {
     fn region(&self) -> (NonNull<u8>, usize) {
-        let end = self.count.checked_sub(1).map_or(0, |last| self.placement.offset(last) + self.placement.record());
-        (self.base, end as usize)
+        (self.base, self.bytes as usize)
+    }
+}
+
+impl Record {
+    fn of(tensor: Tensor, bytes: u64) -> Result<Arc<Self>, String> {
+        if tensor.byte_len() < bytes {
+            return Err(format!("a record of {bytes} bytes in a view of {}", tensor.byte_len()));
+        }
+        let base = tensor.shared_address().ok_or_else(|| format!("a record of {bytes} bytes is no memory the host reads into"))?;
+        Ok(Arc::new(Self { tensor, base, bytes }))
     }
 }
 
 impl Records {
-    /// `tensor` as `count` records of `bytes` each, its leading extent's,
-    /// where the tensor lays them (`Tensor::record_placement`): refused
-    /// unless they are its whole extent and the host addresses it.
-    pub fn new(tensor: Tensor, bytes: u64, count: u64) -> Result<Self, String> {
-        let placement = tensor
-            .record_placement()
-            .filter(|placement| {
-                tensor.extents().first() == Some(&count) && placement.record() == bytes
-            })
-            .ok_or_else(|| format!("{} bytes are not {count} records of {bytes}", tensor.byte_len()))?;
-        let base = tensor
-            .shared_address()
-            .ok_or_else(|| format!("{count} records of {bytes} bytes are no memory the host reads into"))?;
-        Ok(Self(Arc::new(Region {
-            tensor,
-            base,
-            placement,
-            count,
-        })))
+    /// Records of `bytes` each, `views[r]` record `r`'s (none a hole): each
+    /// refused unless it holds `bytes` and the host addresses it.
+    pub fn new(views: Vec<Option<Tensor>>, bytes: u64) -> Result<Self, String> {
+        let records = views.into_iter().map(|view| view.map(|view| Record::of(view, bytes)).transpose()).collect::<Result<_, _>>()?;
+        Ok(Self(Arc::new(Set { bytes, records })))
     }
 
-    /// Its records `start..end` as records of their own, which hold the
-    /// tensor's storage only through the last of them
-    /// (`Tensor::record_region`): a recommit of the tensor to `end` records
-    /// or more never meets them.
-    pub fn range(&self, start: u64, end: u64) -> Result<Self, String> {
-        let tensor = self
-            .0
-            .tensor
-            .record_region(start, end)
-            .map_err(|error| format!("records {start}..{end} of {}: {error}", self.0.count))?;
-        Self::new(tensor, self.bytes(), end - start)
+    /// `tensor`'s `count` leading rows as records of `bytes` each, one after
+    /// another from its first byte (a staging pool's, a conveyor's): refused
+    /// unless they are its whole extent and the host addresses it.
+    pub fn rows(tensor: &Tensor, bytes: u64, count: u64) -> Result<Self, String> {
+        if tensor.extents().first() != Some(&count) || tensor.byte_len() != count * bytes {
+            return Err(format!("{} bytes are not {count} records of {bytes}", tensor.byte_len()));
+        }
+        let views = (0..count)
+            .map(|record| tensor.slice_leading(record, record + 1).map(Some).map_err(|error| format!("record {record} of {count}: {error}")))
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::new(views, bytes)
+    }
+
+    /// These records, record `record` (a hole, or past every record) now
+    /// `view`, or a hole where none: a growth's, or an eviction's.
+    pub fn with(&self, record: u64, view: Option<Tensor>) -> Result<Self, String> {
+        let mut records = self.0.records.clone();
+        let index = usize::try_from(record).map_err(|_| "a record index exceeds the host")?;
+        if index >= records.len() {
+            records.resize(index + 1, None);
+        }
+        records[index] = view.map(|view| Record::of(view, self.0.bytes)).transpose()?;
+        Ok(Self(Arc::new(Set { bytes: self.0.bytes, records })))
     }
 
     /// The bytes of one record.
     pub fn bytes(&self) -> u64 {
-        self.0.placement.record()
+        self.0.bytes
     }
 
-    /// The records.
+    /// One past the last record, a hole or not.
     pub fn count(&self) -> u64 {
-        self.0.count
+        self.0.records.len() as u64
     }
 
-    /// Where its records lie.
-    #[cfg(test)]
-    pub fn placement(&self) -> seismic::RecordPlacement {
-        self.0.placement
+    /// Whether record `record` is held: no hole.
+    pub fn holds(&self, record: u64) -> bool {
+        self.held(record).is_some()
     }
 
-    /// The tensor the records lie in.
-    #[cfg(test)]
-    pub fn tensor(&self) -> &Tensor {
-        &self.0.tensor
+    fn held(&self, record: u64) -> Option<&Arc<Record>> {
+        usize::try_from(record).ok().and_then(|record| self.0.records.get(record)).and_then(Option::as_ref)
     }
 
-    /// Where record `record` lies, in bytes from the first's.
-    pub fn offset(&self, record: u64) -> u64 {
-        self.0.placement.offset(record)
+    fn at(&self, record: u64) -> &Arc<Record> {
+        self.held(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()))
+    }
+
+    /// The view record `record` lies in: what a device copy reads or writes.
+    pub fn tensor(&self, record: u64) -> &Tensor {
+        &self.at(record).tensor
     }
 
     /// The first `bytes` of record `record`, to read.
@@ -112,46 +125,19 @@ impl Records {
     /// No read lands in the record, and no device work writes it, while the
     /// slice lives.
     pub unsafe fn record(&self, record: u64, bytes: u64) -> &[u8] {
-        assert!(record < self.0.count && bytes <= self.bytes(), "{bytes} bytes of record {record} of {}", self.0.count);
-        // SAFETY: the record lies within the host-shared tensor `self`
-        // keeps alive, and the caller excludes every writer.
-        unsafe { std::slice::from_raw_parts(self.0.base.as_ptr().add(self.offset(record) as usize), bytes as usize) }
+        let held = self.at(record);
+        assert!(bytes <= held.bytes, "{bytes} bytes of record {record} of {}", held.bytes);
+        // SAFETY: the record lies within the host-shared view `self` keeps
+        // alive, and the caller excludes every writer.
+        unsafe { std::slice::from_raw_parts(held.base.as_ptr(), bytes as usize) }
     }
 
     /// Where record `record` begins in host memory: what a writer of part
     /// of it (one piece of a landing's conversion) writes through.
-    pub fn address(&self, record: u64) -> std::ptr::NonNull<u8> {
-        assert!(record < self.0.count, "record {record} of {}", self.0.count);
-        // SAFETY: the record lies within the host-shared tensor `self`
-        // keeps alive.
-        unsafe { self.0.base.add(self.offset(record) as usize) }
+    pub fn address(&self, record: u64) -> NonNull<u8> {
+        self.at(record).base
     }
 
-    /// Copy the first `bytes` of record `source` of `from` into record
-    /// `record`, where a read of the same bytes would land them.
-    ///
-    /// # Safety
-    ///
-    /// No read lands in either record, and no device work reads or writes
-    /// them, until the copy returns.
-    pub unsafe fn copy_record(&self, record: u64, from: &Records, source: u64, bytes: u64) {
-        assert!(
-            record < self.0.count && source < from.0.count && bytes <= self.bytes().min(from.bytes()),
-            "a copy of {bytes} bytes from record {source} of {} into record {record} of {}",
-            from.0.count,
-            self.0.count
-        );
-        // SAFETY: both records lie within their host-shared tensors, which
-        // `self` and `from` keep alive, and the caller excludes every other
-        // access to them; `copy` allows the two to overlap.
-        unsafe {
-            std::ptr::copy(
-                from.0.base.as_ptr().add(from.offset(source) as usize),
-                self.0.base.as_ptr().add(self.offset(record) as usize),
-                bytes as usize,
-            );
-        }
-    }
 }
 
 /// One range of a model file read into a record: `bytes` at `offset` of
@@ -174,9 +160,9 @@ impl Read {
     /// (checked at its start) gives.
     pub fn new(file: usize, offset: u64, bytes: u64, into: &Records, record: u64, within: u64) -> Self {
         assert!(
-            record < into.0.count && within.checked_add(bytes).is_some_and(|end| end <= into.bytes()),
+            into.holds(record) && within.checked_add(bytes).is_some_and(|end| end <= into.bytes()),
             "a read of {bytes} bytes {within} into record {record} of {} of {} bytes",
-            into.0.count,
+            into.count(),
             into.bytes()
         );
         Self {
@@ -406,8 +392,8 @@ impl ExpertSource {
         for (at, read) in reads.into_iter().enumerate() {
             let (ranges, served) = &mut by_file[read.file];
             served.push((at, read.file, read.offset, read.bytes));
-            let at = (read.into.offset(read.record) + read.within) as usize;
-            ranges.push(Range { offset: read.offset, length: read.bytes, into: read.into.0, at });
+            let into: Arc<dyn seismic_io::Destination> = read.into.at(read.record).clone();
+            ranges.push(Range { offset: read.offset, length: read.bytes, into, at: read.within as usize });
         }
         let mut requests = Vec::new();
         for (file, (ranges, served)) in self.files.iter().zip(by_file) {
@@ -443,7 +429,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
-        let records = Records::new(staging.clone(), 128, 2).unwrap();
+        let records = Records::rows(&staging, 128, 2).unwrap();
         let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record, 0);
         let demand = Want::now();
         let failed = source.request(vec![read(bytes.len() as u64 - 64, 0)], demand).unwrap();
@@ -457,7 +443,7 @@ mod tests {
         assert_eq!(&host[128..], &bytes[40_000..40_128]);
         // Records that are not their tensor's whole extent are refused when
         // made, before anything is read.
-        assert!(Records::new(staging.clone(), 128, 3).is_err());
+        assert!(Records::rows(&staging, 128, 3).is_err());
         drop((failed, landed));
         std::fs::remove_file(path).unwrap();
     }
@@ -466,9 +452,10 @@ mod tests {
     /// whose memory is the host's), the uncached reads land in a bank's
     /// reserved records in place, as prompt groups read into the conveyor
     /// lent from them: two 2 MiB records of a 4 MiB file, each read whole,
-    /// hold the file's bytes. A CUDA device across a link reserves its
-    /// device storage in its own memory, which the host never addresses:
-    /// there the records are refused. Run on a CUDA host with `--ignored`.
+    /// hold the file's bytes. Each record is a view of its own, as a bank's
+    /// records are. A CUDA device across a link reserves its device storage
+    /// in its own memory, which the host never addresses: there the records
+    /// are refused. Run on a CUDA host with `--ignored`.
     #[test]
     #[ignore]
     fn uncached_reads_land_in_a_host_reserved_bank_in_place() {
@@ -478,17 +465,15 @@ mod tests {
             .is_some_and(|executor| topology.shared_ranges_lie_in_device_memory(executor));
         let device = crate::test_support::open_backend(&catalog, BackendName::Cuda).expect("a CUDA device opens");
         const RECORD: u64 = 2 << 20;
-        let (bank, _resizer) =
-            crate::planning::BankAllocation::reserve(&device, crate::planning::BankTier::Bank.contract_on(&device), Element::i32(), &[2, RECORD / 4], 2, None)
-                .unwrap();
-        // The host addresses reserved records through a region that pins them, as a bank's view does.
-        let region = bank.region(Element::i32(), &[2, RECORD / 4], 0).unwrap();
+        // The host addresses each record through its slab's region, as a bank's views do.
+        let pooled = pooled(&device, 2, RECORD);
+        let views = || pooled.views.iter().cloned().map(Some).collect::<Vec<_>>();
         if !unified {
-            let refused = Records::new(region, RECORD, 2).err();
+            let refused = Records::new(views(), RECORD).err();
             assert!(refused.as_deref().is_some_and(|why| why.contains("no memory the host reads into")), "a linked device's reserved records are refused: {refused:?}");
             return;
         }
-        let records = Records::new(region, RECORD, 2).expect("the host addresses the device's reserved storage");
+        let records = Records::new(views(), RECORD).expect("the host addresses the device's reserved storage");
         let path = std::env::temp_dir().join(format!("expert-source-reserved-{}", std::process::id()));
         let bytes = (0..2 * RECORD).map(|index| (index % 251) as u8 ^ (index >> 20) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
@@ -499,45 +484,9 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
-        let mut host = vec![0u8; 2 * RECORD as usize];
-        unsafe { records.tensor().read_shared(0, &mut host) }.unwrap();
-        assert!(host[..RECORD as usize] == bytes[RECORD as usize..], "record 0 holds the file's second half");
-        assert!(host[RECORD as usize..] == bytes[..RECORD as usize], "record 1 holds its first half");
-        drop(landed);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// A read lands in the last record of a view of a chunked bank: on Metal
-    /// a conveyor's view holds records of the stored form inside its lender's
-    /// larger records, whole in chunks of those, so the last ones lie past the
-    /// view's canonical bytes (Qwen3.6 35B q4's 589824-byte stacks in 655360-byte
-    /// records).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_read_lands_in_the_last_record_of_a_chunked_bank() {
-        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Metal).unwrap();
-        const RECORD: u64 = 589824;
-        const LENT: u64 = 655360;
-        const COUNT: u64 = 64;
-        let (bank, _resizer) = crate::planning::BankAllocation::reserve(
-            &device,
-            crate::planning::BankTier::Bank.contract_on(&device),
-            Element::i32(),
-            &[COUNT, LENT / 4],
-            COUNT,
-            None,
-        )
-        .unwrap();
-        let records = Records::new(bank.region(Element::i32(), &[COUNT, RECORD / 4], 0).unwrap(), RECORD, COUNT).unwrap();
-        assert!(records.offset(COUNT - 1) > (COUNT - 1) * RECORD, "the last record lies past the canonical bytes, or this tests nothing");
-        let path = std::env::temp_dir().join(format!("expert-source-padded-{}", std::process::id()));
-        let bytes = (0..RECORD).map(|index| (index % 251) as u8).collect::<Vec<_>>();
-        std::fs::write(&path, &bytes).unwrap();
-        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap();
-        let landed = source.request(vec![Read::new(0, 0, RECORD, &records, COUNT - 1, 0)], Want::now()).unwrap();
-        assert!(matches!(landed.wait_until(Instant::now() + std::time::Duration::from_secs(30)), Some(Outcome::Read)));
-        // SAFETY: the job has ended, and no device work touches the record.
-        assert!(unsafe { records.record(COUNT - 1, RECORD) } == bytes);
+        // SAFETY: the job has ended, and no device work touches the records.
+        assert!(unsafe { records.record(0, RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
+        assert!(unsafe { records.record(1, RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
         drop(landed);
         std::fs::remove_file(path).unwrap();
     }
@@ -603,22 +552,22 @@ mod tests {
                 .collect()
         }
 
-        /// Two layers' records of a CUDA device's bank, reserved as a load
-        /// reserves them and pinned through a region, as a bank's view
-        /// addresses them.
-        fn bank(&self, device: &seismic::Device) -> Records {
-            let slots = 2 * self.read as u64;
-            let (bank, _resizer) = crate::planning::BankAllocation::reserve(
-                device,
-                crate::planning::BankTier::Bank.contract_on(device),
-                Element::i32(),
-                &[slots, self.record / 4],
-                slots,
-                None,
-            )
-            .unwrap();
-            Records::new(bank.region(Element::i32(), &[slots, self.record / 4], 0).unwrap(), self.record, slots).expect("the host addresses the device's reserved storage")
+        /// Two layers' records of a CUDA device's bank, claimed from its
+        /// pool as a load claims them, each its slab's region, as a bank's
+        /// views address them.
+        /// The records, and their store, held while they are.
+        fn bank(&self, device: &seismic::Device) -> (Records, crate::experts::PooledRecords) {
+            let pooled = pooled(device, 2 * self.read as u64, self.record);
+            let records = Records::new(pooled.views.iter().cloned().map(Some).collect(), self.record).expect("the host addresses the device's pooled storage");
+            (records, pooled)
         }
+    }
+
+    /// `records` records of `bytes` each claimed as a bank claims its own
+    /// (`experts::pooled_records`), each its slab's view.
+    fn pooled(device: &seismic::Device, records: u64, bytes: u64) -> crate::experts::PooledRecords {
+        let contract = crate::planning::BankTier::Bank.contract_on(device);
+        crate::experts::pooled_records(device, contract, Element::i32(), &[bytes / 4], records, records).unwrap()
     }
 
     /// Memory a test frees only once every job reading into it has ended.
@@ -705,7 +654,7 @@ mod tests {
         let reader = Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap();
         let mut seed = 0x9a0bu64;
         let device = cuda();
-        let bank = model.bank(&device);
+        let (bank, _pooled) = model.bank(&device);
         let (slots, record) = (2 * model.read as u64, model.record);
         let layout = std::alloc::Layout::from_size_align((slots * record) as usize, 4096).unwrap();
         // SAFETY: a nonzero layout; freed below with it.
@@ -778,7 +727,7 @@ mod tests {
         let model = Arc::new(PromptExperts::acquired());
         let reader = Arc::new(Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap());
         let device = cuda();
-        let bank = model.bank(&device);
+        let (bank, _pooled) = model.bank(&device);
         let sink = (0..2 * model.read as u64).map(|slot| bank.address(slot).as_ptr() as usize).collect::<Vec<_>>();
         let spin = |length: Duration| {
             let began = Instant::now();

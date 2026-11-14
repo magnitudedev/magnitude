@@ -1,7 +1,7 @@
 //! The service executable's build identity: target, toolchain and engine build.
 
 use magnitude_engine::worker::protocol::EngineBuild;
-use magnitude_service_contracts::bootstrap_protocol::IcnBinaryIdentity;
+use magnitude_service_contracts::bootstrap_protocol::{API_VERSION, IcnBinaryIdentity};
 
 pub const TARGET: &str = env!("SERVICE_BUILD_TARGET");
 pub const PROFILE: &str = env!("SERVICE_BUILD_PROFILE");
@@ -10,7 +10,7 @@ pub const RUSTC_VERSION: &str = env!("SERVICE_RUSTC_VERSION");
 pub fn identity() -> IcnBinaryIdentity {
     IcnBinaryIdentity {
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        api_version: 1,
+        api_version: API_VERSION,
         native_build: native_build(),
         capabilities: [
             "hardware",

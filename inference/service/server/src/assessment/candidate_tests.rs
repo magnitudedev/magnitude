@@ -1069,7 +1069,7 @@ fn cpu_environment() -> Arc<AssessmentEnvironment> {
         &catalog,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
         None,
-        magnitude_executor::platform::MemoryReserves::of_machine(None),
+        magnitude_executor::platform::ReleaseRate::of_machine(None),
         crate::assessment::environment::serving_policy(),
         magnitude_engine::options::standard_service_limits(),
     )
@@ -4008,7 +4008,7 @@ async fn live_fixture_reaching(
     let configurations = crate::configurations::ResolvedConfigurations::new(
         Arc::clone(&models),
         directory.path().join("kernels"),
-        magnitude_executor::platform::MemoryReserves::of_machine(None),
+        magnitude_executor::platform::ReleaseRate::of_machine(None),
         crate::assessment::environment::ServingDevice::of(seismic::ExecutorSelector::HostCpu),
         Default::default(),
     );
@@ -4908,9 +4908,8 @@ async fn a_catalog_drafter_matched_by_shape_alone_is_never_automatic() {
 }
 
 /// What a file needs on the standard CPU environment served plain, with its built-in heads, and
-/// with the catalog DFlash: the host's capacity and each composition's required bytes.
+/// with the catalog DFlash: each composition's required bytes.
 struct Requirements {
-    capacity: u64,
     plain: u64,
     heads: u64,
     dflash: u64,
@@ -4948,7 +4947,7 @@ impl Requirements {
                     false,
                     BTreeMap::new(),
                     true,
-                    budget_environment(capacity, budget),
+                    budget_environment(budget),
                 )
                 .await;
                 let assessment = fixture
@@ -4987,7 +4986,6 @@ impl Requirements {
             "the heads and the drafter each need more than the model served plain"
         );
         Self {
-            capacity,
             plain,
             heads,
             dflash,
@@ -5008,29 +5006,33 @@ impl Requirements {
     }
 
     fn with_budget(&self, budget: u64) -> Arc<AssessmentEnvironment> {
-        budget_environment(self.capacity, budget)
+        budget_environment(budget)
     }
 }
 
-/// A CPU environment whose host of `capacity` may use `budget`.
-fn budget_environment(capacity: u64, budget: u64) -> Arc<AssessmentEnvironment> {
+/// A CPU environment whose host may use `budget`: its host RAM bound by a limit of `budget`
+/// bytes, as a cgroup or job binds it, so every plan's host demand fits within it.
+fn budget_environment(budget: u64) -> Arc<AssessmentEnvironment> {
     let catalog = seismic::Devices::discover(&[]).expect("device catalog");
-    // The planning line is the margin: `capacity - budget`.
-    let reserves =
-        magnitude_executor::platform::MemoryReserves::new(magnitude_executor::platform::StoreMotion::new(
-            (capacity - budget).saturating_sub(1),
-            10.0,
-        ), magnitude_executor::platform::ReleaseRate::new(1e9));
-    let structure = magnitude_engine::assessment::AssessmentStructure::discover(
+    let release = magnitude_executor::platform::ReleaseRate::new(1e9);
+    let mut structure = magnitude_engine::assessment::AssessmentStructure::discover(
         &catalog,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
         None,
-        reserves,
+        release,
         crate::assessment::environment::serving_policy(),
         magnitude_engine::options::standard_service_limits(),
     )
     .expect("the CPU backend is selectable");
-    // The reserves enter the environment's identity, so each budget is its own.
+    structure.status.sample.host.total = budget;
+    let selected = &structure.selected;
+    structure.selected = magnitude_executor::platform::selected(
+        &structure.topology,
+        &structure.status,
+        &release,
+        selected.info.clone(),
+        selected.graph_cost,
+    );
     Arc::new(
         AssessmentEnvironment::new(
             Arc::new(structure),
@@ -6182,7 +6184,7 @@ async fn a_model_refused_at_the_graph_bound_is_offered_once_its_graph_cost_lands
         &devices,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
         Some(records.path()),
-        magnitude_executor::platform::MemoryReserves::of_machine(None),
+        magnitude_executor::platform::ReleaseRate::of_machine(None),
         crate::assessment::environment::serving_policy(),
         magnitude_engine::options::standard_service_limits(),
     )

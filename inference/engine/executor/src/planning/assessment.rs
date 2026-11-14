@@ -16,7 +16,7 @@ use super::{
 };
 use crate::assessment::{DomainFit, MemoryBreakdown};
 use crate::memory::ClaimDemand;
-use crate::platform::{DomainRole, Fit, FitMode, HostRoom, StorageDemand};
+use crate::platform::{DomainRole, Fit, FitMode, StorageDemand};
 use crate::{AttestedPrograms, GraphError};
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{BankCapacity, KvCodec, ModelStateLayout};
@@ -470,12 +470,12 @@ pub struct AssessmentFit {
 
 impl AssessmentFit {
     /// The bytes a plan's holdings settle within: its allocation domain's
-    /// stable room, its planning reserve aside (`StableRoom`).
+    /// stable room (`StableRoom`).
     pub fn settle_bound(&self) -> Result<u64, String> {
         self.domains
             .iter()
             .find(|domain| domain.role == DomainRole::Allocation)
-            .map(|domain| domain.capacity_bytes - domain.reserve_bytes)
+            .map(|domain| domain.capacity_bytes)
             .ok_or_else(|| "the fit reaches no allocation domain".to_owned())
     }
 }
@@ -1218,6 +1218,16 @@ impl AssessmentMemoryCharge {
             .ok_or_else(|| "host charge overflows".to_owned())
     }
 
+    /// What this charge asks of host RAM: its host-side bytes, its host
+    /// storage (a linked host tier's records) and its staging window, all
+    /// held together from the binding of the weights on.
+    pub fn host_demand(&self) -> Result<u64, String> {
+        self.host_bytes()?
+            .checked_add(self.weight_demand.host)
+            .and_then(|bytes| bytes.checked_add(self.staging_bytes))
+            .ok_or_else(|| "host charge overflows".to_owned())
+    }
+
     /// What `domains`, this charge's fit, require in all: the weights (their
     /// complete physical demand, [`Self::weight_demand`], in every storage
     /// it lies in: of a streamed plan, what its bank and host tier hold),
@@ -1243,21 +1253,19 @@ impl AssessmentMemoryCharge {
     /// storage, upload storage, reserved host backing and its host RAM ([`Self::host_bytes`] and the
     /// staging fit charges there) placed by
     /// [`Fit::demand`], which alone interprets placements, stores, grants
-    /// and reserves. Returns each store the demand reached, with what it
+    /// and grants. Returns each store the demand reached, with what it
     /// required and what of its room remains (negative: its deficit), and
     /// the verdict: fits, or the store of the largest deficit. A store's
     /// room is what fit can place there along the executor's placements
     /// beside the same host demand, so a grant below the store (Metal's
-    /// working set, CUDA's usable memory) bounds it; its capacity is that
-    /// room with the store's planning reserve.
+    /// working set, CUDA's usable memory) bounds it; its capacity is that room.
     pub fn assess_fit(
         &self,
         topology: &DeviceTopology,
         executor: &Executor,
         status: &Status,
-        reserves: &crate::platform::MemoryReserves,
     ) -> Result<AssessmentFit, String> {
-        let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
+        let fit = Fit::new(topology, status);
         // The staging window is part of `allocation_bytes`
         // (`startup_additional_bytes`); fit decides whether host RAM also
         // holds it as a demand of its own.
@@ -1282,14 +1290,9 @@ impl AssessmentMemoryCharge {
         }
         let result = place(bytes)?;
         // Each store's room: what all physical placements can place there.
-        let rooms = place(crate::memory::CLAIMED.map(|kind| if executor.paths(seismic::Placing::Fixed(kind)).is_empty() { 0 } else { u64::MAX }))?.placed;
+        let rooms = place(crate::memory::CLAIMED.map(|kind| if executor.paths(kind).is_empty() { 0 } else { u64::MAX }))?.placed;
         let mut domains = Vec::new();
         for (store, placed) in result.placed {
-            let reserve = fit
-                .store(store)
-                .map_err(|error| error.to_string())?
-                .thresholds
-                .planning_bytes;
             let room = rooms
                 .iter()
                 .find(|(of, _)| *of == store)
@@ -1311,9 +1314,8 @@ impl AssessmentMemoryCharge {
             domains.push(DomainFit {
                 role: DomainRole::of(topology, executor, store),
                 domain: store,
-                capacity_bytes: room.saturating_add(reserve),
+                capacity_bytes: room,
                 required_bytes,
-                reserve_bytes: reserve,
                 remaining_bytes,
             });
         }

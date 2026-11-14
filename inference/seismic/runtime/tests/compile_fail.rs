@@ -35,7 +35,7 @@ fn run_fixture(root: &Path, runtime: &Path) {
     );
     fs::write(directory.join("Cargo.toml"), manifest).expect("write fixture manifest");
 
-    let output = Command::new(std::env::var_os("CARGO").expect("cargo sets CARGO"))
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args(["check", "--quiet", "--offline"])
         .current_dir(&directory)
         .env("CARGO_TARGET_DIR", root.join("target"))

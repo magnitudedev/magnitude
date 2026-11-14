@@ -3,9 +3,7 @@
 use crate::blocks::Blocks;
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
-use crate::driver::{
-    Context, Driver, DriverError, HostMapped, PinnedUpload, RangeMemory, ReservedMemory, Stream,
-};
+use crate::driver::{Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
 use crate::{Cuda, CudaLaunchMode};
 use seismic_compiler::errors::{ExecutionError, RefusalReading};
 use seismic_compiler::executable::{
@@ -17,7 +15,7 @@ use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
-use seismic_reservation::{time_backing, Backing, BackingPhase, Reserved, Resizer};
+use seismic_memory::entry::{Entry, Store};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -31,20 +29,21 @@ pub enum NativeStream {
     Fill,
 }
 
-/// The accounts a device's own allocations are charged to, which it is
-/// opened with: device memory (blocks, graphs' driver memory), pinned host
-/// memory the device reads (`upload`) and pinned host staging (`host`).
+/// The embedder's ledgers of the stores a device's memory lies in, which it
+/// is opened with: its device memory (`device`: blocks, graphs' driver
+/// memory, the stack the driver grows) and host RAM (`host`: pinned host
+/// memory, staging and the words device work signals). Where the device's
+/// memory is the host's, one store twice.
 #[derive(Clone)]
-pub struct MemoryAccounts {
-    pub device: Arc<dyn seismic_compiler::executable::MemoryAccount>,
-    pub upload: Arc<dyn seismic_compiler::executable::MemoryAccount>,
-    pub host: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+pub struct CudaStores {
+    pub device: Arc<dyn Store>,
+    pub host: Arc<dyn Store>,
 }
 
 #[derive(Clone)]
 pub struct Device {
     context: Arc<Context>,
-    accounts: MemoryAccounts,
+    stores: CudaStores,
     stream: Arc<Stream>,
     /// The fill stream ([`NativeStream::Fill`]).
     fill: Arc<Stream>,
@@ -53,7 +52,6 @@ pub struct Device {
     /// The word a graph's word nodes name as it is recorded, before a
     /// replay binds its run's own ([`Self::placeholder_word`]).
     placeholder: Arc<crate::direct::HostWord>,
-    stack_growth: Arc<crate::driver::StackGrowth>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -89,8 +87,9 @@ pub(crate) fn memory_info(context: &Context) -> Result<MemoryInfo, ExecutionErro
 }
 
 impl Device {
-    /// Device `ordinal`, its own allocations charged to `accounts`.
-    pub fn open(ordinal: u32, accounts: MemoryAccounts) -> Result<Self, ExecutionError> {
+    /// Device `ordinal`, what it holds that no caller names charged to its
+    /// stores' own entries.
+    pub fn open(ordinal: u32, stores: CudaStores) -> Result<Self, ExecutionError> {
         let driver = Driver::load().map_err(ExecutionError::SubmissionFailed)?;
         let ordinal = i32::try_from(ordinal).map_err(|_| {
             ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into())
@@ -98,25 +97,24 @@ impl Device {
         let context = Context::retain(driver, ordinal).map_err(submission_error)?;
         let stream = Stream::new(&context).map_err(submission_error)?;
         let fill = Stream::new(&context).map_err(submission_error)?;
-        let blocks = Arc::new(Blocks::new(context.clone(), accounts.device.clone()).map_err(submission_error)?);
+        let blocks = Arc::new(Blocks::new(context.clone(), stores.device.own()).map_err(submission_error)?);
         if let Some(memory) = counted_driver_memory(context.ordinal() as u32)? {
             assert!(
                 context.driver_memory.set(memory).is_ok(),
                 "a context's driver memory is counted once, at its opening"
             );
         }
-        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &accounts.upload)?);
-        let graphs = Arc::new(crate::graph_cost::GraphPool::new(accounts.device.clone(), context.clone()));
-        context.charge_stack_to(accounts.device.clone());
+        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own())?);
+        let graphs = Arc::new(crate::graph_cost::GraphPool::new(stores.device.own(), context.clone()));
+        context.charge_own_to(stores.device.own());
         Ok(Self {
             context,
-            accounts,
+            stores,
             stream,
             fill,
             blocks,
             graphs,
             placeholder,
-            stack_growth: crate::driver::stack_growth(ordinal),
         })
     }
 
@@ -143,30 +141,13 @@ impl Device {
         memory_info(&self.context)
     }
 
-    /// Device storage of `bytes` as a range of a block. `room`, when given,
-    /// is the device memory this allocation may add, before the free space
-    /// the device's blocks already hold is taken off it.
-    pub fn allocate_within(
-        &self,
-        bytes: u64,
-        alignment: u64,
-        room: Option<u64>,
-    ) -> Result<Buffer, ExecutionError> {
+    /// Device storage of `bytes` as a range of a block, its bytes carved
+    /// for `entry`, an entry of the device store.
+    pub fn allocate_device(&self, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
         if alignment > 256 || !alignment.is_power_of_two() {
             panic!("prepared CUDA allocation asks for unsupported alignment")
         }
-        let room = room.map(|room| room.saturating_sub(self.blocks.unallocated_bytes()));
-        self.blocks
-            .allocate(bytes, alignment, room)
-            .map(Buffer::device)
-    }
-
-    /// Device memory held beyond the live ranges: the blocks' free space,
-    /// the instantiated graphs' driver memory and the stack the driver
-    /// reserved beyond what every context reserves. Held by this process,
-    /// charged to no allocation.
-    pub fn held_beyond_ranges(&self) -> u64 {
-        self.blocks.unallocated_bytes() + self.graphs.bytes() + self.stack_growth.bytes()
+        self.blocks.allocate(bytes, alignment, entry).map(Buffer::device)
     }
 
     /// The word every graph's word nodes name as it is recorded, held from
@@ -186,9 +167,9 @@ impl Device {
         &self.context
     }
 
-    /// The accounts the device was opened with.
-    pub(crate) fn accounts(&self) -> &MemoryAccounts {
-        &self.accounts
+    /// The stores the device was opened with.
+    pub(crate) fn stores(&self) -> &CudaStores {
+        &self.stores
     }
 
     /// The compute stream.
@@ -217,162 +198,54 @@ impl Device {
         Ok(self.stream.query().map_err(submission_error)? && self.fill.query().map_err(submission_error)?)
     }
 
-    /// Storage of `kind` (`crate::topology`) that is allocated whole: device
-    /// memory or pinned host memory. `room` as for [`Self::allocate_within`].
-    pub fn allocate_kind(&self, kind: u32, bytes: u64, alignment: u64, room: Option<u64>) -> Result<Buffer, ExecutionError> {
-        match kind {
-            crate::topology::DEVICE_KIND => self.allocate_within(bytes, alignment, room),
-            crate::topology::PINNED_KIND => self.allocate_mapped(bytes),
-            kind => Err(ExecutionError::AllocationFailed(format!("CUDA allocates no whole storage of kind {kind}"))),
-        }
-    }
-
     /// Pinned host memory mapped into the device address space, for inputs
     /// the host fills before each submission: the host writes it in place,
-    /// without a driver copy that would wait for queued device work.
-    pub fn allocate_mapped(&self, bytes: u64) -> Result<Buffer, ExecutionError> {
+    /// without a driver copy that would wait for queued device work. Its
+    /// whole host pages are charged to `entry`, an entry of host RAM.
+    pub fn allocate_mapped(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
         let bytes = usize::try_from(bytes).map_err(|_| {
             ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
         })?;
-        HostMapped::new(&self.context, &self.accounts.upload, bytes).map(Buffer::mapped)
+        HostMapped::new(&self.context, entry, bytes).map(Buffer::mapped)
     }
 
-    /// `memory` over a reserved address range of `reserved` bytes in
-    /// `granule`-byte granules ([`crate::reservation_granule`]), charged to
-    /// `account`, with the leading `committed` bytes backed and zeroed, and
-    /// its resizer ([`Resizer::prepare`]), which changes the backed prefix
-    /// without moving it.
-    pub fn allocate_reserved(
-        &self,
-        committed: u64,
-        reserved: u64,
-        granule: u64,
-        memory: RangeMemory,
-        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
-    ) -> Result<(Buffer, CudaResizer), ExecutionError> {
-        let host = |bytes: u64| {
-            usize::try_from(bytes).map_err(|_| {
-                ExecutionError::AllocationFailed(
-                    "CUDA reservation exceeds host address space".into(),
-                )
-            })
-        };
-        let (reserved, granule) = (host(reserved)?, host(granule)?);
-        let memory = ReservedMemory::new(&self.context, reserved, granule, memory, account)
-            .map_err(allocation_error(reserved as u64, || device_free(&self.context)))?;
-        let (reservation, resizer) = Reserved::new(memory, committed)?;
-        Ok((Buffer::reserved(reservation), resizer))
-    }
-}
-
-/// The right to resize one reserved buffer ([`Device::allocate_reserved`]).
-pub type CudaResizer = Resizer<ReservedMemory>;
-
-/// Granules mapped in one address range, in place: nothing device work binds
-/// changes with them.
-impl Backing for ReservedMemory {
-    type Error = ExecutionError;
-    type View = ();
-    type Change = ();
-    type Retired = ();
-
-    fn granule(&self) -> usize {
-        self.granularity
-    }
-
-    fn granules(&self) -> usize {
-        self.reserved / self.granularity
-    }
-
-    /// Map granules `[from, to)`, zero: those their backing did not give
-    /// zeroed (created granules, or registered ones it kept) are zeroed.
-    fn back(&self, from: usize, to: usize) -> Result<(), ExecutionError> {
-        let (start, end) = (from * self.granularity, to * self.granularity);
-        let zeroed = self.commit(end)?;
-        let stale = start as u64..end.min(zeroed) as u64;
-        if stale.is_empty() {
-            return Ok(());
-        }
-        // Nothing is published: the new granules are retracted.
-        time_backing(BackingPhase::Zero, || self.zero(stale)).inspect_err(|_| self.retract(from, to))
-    }
-
-    /// Unmap the granules from `from`, the tail. Driver failures after the
-    /// first unmap cannot leave the backing valid, so `commit` treats them
-    /// as fatal; an unmap is refused nothing else.
-    fn unback(&self, from: usize, to: usize) {
-        if from < to {
-            self.commit(from * self.granularity).expect("a CUDA reservation unmaps what it backs");
+    /// One block of a granule pool, of `kind`: a native allocation of its
+    /// own (never a range of a shared block), every byte backed and zero,
+    /// charged exactly to `entry` and returned to the driver and the OS as
+    /// it drops. Device memory is one `cuMemAlloc`; host memory is a range
+    /// of host pages (large pages where the host has them) backed whole and
+    /// registered for the device (`cuMemHostRegister`), which reads it in
+    /// place.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        match kind {
+            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry).map(Buffer::block),
+            crate::topology::PINNED_KIND => {
+                if self.allocations_in_process_footprint()
+                    && crate::driver::can_create_host_node(&self.context).map_err(submission_error)?
+                {
+                    crate::driver::HostNodeBlock::new(&self.context, entry, bytes).map(Buffer::host_node)
+                } else {
+                    crate::registered::RegisteredBlock::new(&self.context, entry, bytes).map(Buffer::registered)
+                }
+            }
+            kind => panic!("invariant violated: CUDA has no memory kind {kind}"),
         }
     }
 
-    /// Registered host granules stay registered and charged, uncommitted
-    /// (their unregistration waits for the device, beside the growth's
-    /// flights); created granules are unmapped.
-    fn retract(&self, from: usize, to: usize) {
-        if from >= to {
-            return;
-        }
-        match self.registered() {
-            Some(registered) => registered.uncommit(from),
-            None => self.unback(from, to),
-        }
-    }
-
-    /// Zero `bytes`, which no queued device work reaches: host memory in
-    /// place (the driver refuses a memset across its separately created
-    /// granules: `cuMemsetD8Async` returned `CUDA_ERROR_INVALID_VALUE` on an
-    /// RTX 3090), device memory on the reservation's own stream, waited
-    /// for: behind none of the device's queued work, which a resize prepared
-    /// while decode runs would otherwise wait out.
-    fn zero(&self, bytes: std::ops::Range<u64>) -> Result<(), ExecutionError> {
-        let (pointer, length) = (self.base + bytes.start, (bytes.end - bytes.start) as usize);
-        if self.memory.host_addressed() {
-            // SAFETY: backed bytes of the reservation, which the host maps
-            // and no device work reaches.
-            unsafe { std::ptr::write_bytes(pointer as *mut u8, 0, length) };
-            return Ok(());
-        }
-        let context = self.context();
-        {
-            let _current = context.enter().map_err(submission_error)?;
-            let status = unsafe { context.enqueue().memset_d8_async(pointer, 0, length, self.stream.raw()) };
-            context.driver.check(status, "reservation zero fill").map_err(submission_error)?;
-        }
-        self.stream.synchronize().map_err(submission_error)
-    }
-
-    fn view(&self, _: usize) -> Result<(), ExecutionError> {
-        Ok(())
-    }
-
-    fn change(&self, _: usize, _: usize) -> Result<(), ExecutionError> {
-        Ok(())
-    }
-
-    fn apply(&self, _: &mut (), _: ()) {}
 }
 
 impl DeviceService<Cuda> for Device {
     type Buffer = Buffer;
     /// CUDA maps no read-only host memory: every buffer is one it allocated.
     type Writable = Buffer;
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        Device::allocate_within(self, bytes, alignment, None)
-    }
-    fn allocate_within(
-        &self,
-        bytes: u64,
-        alignment: u64,
-        room: Option<u64>,
-    ) -> Result<Buffer, ExecutionError> {
-        Device::allocate_within(self, bytes, alignment, room)
-    }
-    fn held_beyond_allocations(&self) -> u64 {
-        self.held_beyond_ranges()
-    }
-    fn unallocated(&self) -> u64 {
-        self.blocks.unallocated_bytes()
+    /// Storage of `kind` (`crate::topology`): a range of a device block, or
+    /// pinned host memory.
+    fn allocate(&self, kind: u32, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        match kind {
+            crate::topology::DEVICE_KIND => self.allocate_device(bytes, alignment, entry),
+            crate::topology::PINNED_KIND => self.allocate_mapped(bytes, entry),
+            kind => panic!("invariant violated: CUDA has no memory kind {kind}"),
+        }
     }
     fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
@@ -514,8 +387,8 @@ impl NativeExecution for Execution {
 }
 
 impl Submission {
-    /// One fill of `bytes` bytes at device address `pointer`, within one of
-    /// its buffer's copy spans ([`Submission::fill`]).
+    /// One fill of `bytes` bytes at device address `pointer`
+    /// ([`Submission::fill`]).
     fn fill_piece(
         &self,
         issue: &crate::enqueue::Enqueue,
@@ -758,7 +631,7 @@ impl Submission {
         if total == 0 {
             return Ok(());
         }
-        let mut staging = PinnedUpload::new(&self.device.context, &self.device.accounts.host, total)?;
+        let mut staging = PinnedUpload::new(&self.device.context, &self.device.stores.host.own(), total)?;
         let mut segments = Vec::with_capacity(uploads.len());
         let mut source_offset = 0usize;
         for (buffer, bytes) in uploads {
@@ -799,33 +672,23 @@ impl Submission {
         let destination = env.resolve_view(destination)?;
         let _current = self.device.context.enter().map_err(submission_error)?;
         let issue = self.device.context.enqueue();
-        // No copy crosses a host reservation's granule (`copy_pieces`).
-        for (from, to, piece) in crate::buffer::copy_pieces(
-            source.buffer,
-            source.byte_offset,
-            destination.buffer,
-            destination.byte_offset,
-            bytes,
-        ) {
-            let count =
-                usize::try_from(piece).unwrap_or_else(|_| panic!("prepared CUDA copy exceeds usize"));
-            unsafe {
-                self.device
-                    .context
-                    .driver
-                    .check(
-                        issue.memcpy_device_async(
-                            destination.buffer.pointer() + to,
-                            source.buffer.pointer() + from,
-                            count,
-                            self.device.stream.raw(),
-                        ),
-                        "device copy",
-                    )
-                    .map_err(submission_error)?;
-            }
+        let count =
+            usize::try_from(bytes).unwrap_or_else(|_| panic!("prepared CUDA copy exceeds usize"));
+        unsafe {
+            self.device
+                .context
+                .driver
+                .check(
+                    issue.memcpy_device_async(
+                        destination.buffer.pointer() + destination.byte_offset,
+                        source.buffer.pointer() + source.byte_offset,
+                        count,
+                        self.device.stream.raw(),
+                    ),
+                    "device copy",
+                )
+                .map_err(submission_error)
         }
-        Ok(())
     }
     fn fill(
         &self,
@@ -840,12 +703,7 @@ impl Submission {
         }
         let _current = self.device.context.enter().map_err(submission_error)?;
         let issue = self.device.context.enqueue();
-        // No fill crosses a host reservation's granule (`fill_pieces`); a
-        // granule is whole elements, so each piece is.
-        for (offset, piece) in crate::buffer::fill_pieces(destination.buffer, destination.byte_offset, bytes) {
-            self.fill_piece(issue, destination.buffer.pointer() + offset, value, piece)?;
-        }
-        Ok(())
+        self.fill_piece(issue, destination.buffer.pointer() + destination.byte_offset, value, bytes)
     }
     fn scalar_read(
         &mut self,

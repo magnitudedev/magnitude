@@ -92,9 +92,9 @@ pub(crate) fn census_bytes(device: &Device, census: seismic_compiler::graph_cost
 /// ([`census_bytes`]), rounded to the granule once over them all, as the
 /// driver takes it. Never read from the device's memory, which other work
 /// moves. Each graph instantiated or dropped moves it by the change in that
-/// price, which the device account holds as one charge.
+/// price, which the device store's own entry holds as one charge.
 pub(crate) struct GraphPool {
-    account: std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    own: std::sync::Arc<dyn seismic_memory::entry::Entry>,
     context: std::sync::Arc<driver::Context>,
     state: Mutex<Pooled>,
     held: std::sync::atomic::AtomicU64,
@@ -103,48 +103,53 @@ pub(crate) struct GraphPool {
 /// The live graphs' census and the charge that holds their price.
 struct Pooled {
     census: GraphCensus,
-    charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
+    charge: Option<seismic_memory::entry::Charge>,
 }
 
 impl GraphPool {
     pub(crate) fn new(
-        account: std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount>,
+        own: std::sync::Arc<dyn seismic_memory::entry::Entry>,
         context: std::sync::Arc<driver::Context>,
     ) -> Self {
-        Self { account, context, state: Mutex::new(Pooled { census: GraphCensus::default(), charge: None }), held: 0.into() }
+        Self { own, context, state: Mutex::new(Pooled { census: GraphCensus::default(), charge: None }), held: 0.into() }
     }
 
-    /// What the live graphs hold now.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.held.load(std::sync::atomic::Ordering::Relaxed)
+    /// The entry the graphs' memory is charged to: a graph's instantiation
+    /// and its record are one change, and so are its destruction and its
+    /// record.
+    pub(crate) fn entry(&self) -> &std::sync::Arc<dyn seismic_memory::entry::Entry> {
+        &self.own
     }
 
     /// A graph of `census` instantiated on `device`.
-    pub(crate) fn instantiated(&self, device: &Device, census: GraphCensus) -> Result<(), ExecutionError> {
-        self.moved(device, |live| live.plus(census))
+    pub(crate) fn instantiated(&self, change: &seismic_memory::entry::Change, device: &Device, census: GraphCensus) -> Result<(), ExecutionError> {
+        self.moved(change, device, |live| live.plus(census))
     }
 
     /// A graph of `census` dropped on `device`.
-    pub(crate) fn dropped(&self, device: &Device, census: GraphCensus) {
-        self.moved(device, |live| {
+    pub(crate) fn dropped(&self, change: &seismic_memory::entry::Change, device: &Device, census: GraphCensus) {
+        self.moved(change, device, |live| {
             let left = |live: u64, dropped: u64| live.checked_sub(dropped).expect("a dropped graph was counted live");
             Some(GraphCensus { graphs: left(live.graphs, census.graphs), launches: left(live.launches, census.launches), ..live })
         })
         .expect("fewer live graphs price within what more did");
     }
 
-    fn moved(&self, device: &Device, change: impl FnOnce(GraphCensus) -> Option<GraphCensus>) -> Result<(), ExecutionError> {
+    /// The pool's charge moved to the price of the census `moved` makes of
+    /// the live graphs, recorded inside `change`, the one the graph's
+    /// instantiation or destruction is made in.
+    fn moved(&self, change: &seismic_memory::entry::Change, device: &Device, moved: impl FnOnce(GraphCensus) -> Option<GraphCensus>) -> Result<(), ExecutionError> {
         let mut pooled = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let census = change(pooled.census).ok_or_else(|| failure("the live graphs' census overflows"))?;
+        let census = moved(pooled.census).ok_or_else(|| failure("the live graphs' census overflows"))?;
         let price = census_bytes(device, census);
         if price == u64::MAX {
             return Err(failure("the live graphs' census prices past the address range"));
         }
         let was = self.held.swap(price, std::sync::atomic::Ordering::Relaxed);
         pooled.census = census;
-        // The new charge before the old one ends, so the account never shows
+        // The new charge before the old one ends, so the entry never shows
         // less than either.
-        let charge = self.account.record(price);
+        let charge = seismic_memory::entry::Charge::took(change, &self.own, price, seismic_memory::entry::Wiring::Pageable);
         drop(pooled.charge.replace(charge));
         if price > was {
             self.context.driver_allocated(price - was);
@@ -349,7 +354,7 @@ mod tests {
         let launch = node(function, &mut parameters);
         let other = (0..256).map(|count| prepared(&device, chain(context, &launch, 1 + count % 64).unwrap()).unwrap()).collect::<Vec<_>>();
         drop(other);
-        let buffers = (0..8).map(|_| device.allocate_within(64 << 20, 256, None).unwrap()).collect::<Vec<_>>();
+        let buffers = (0..8).map(|_| device.allocate_device(64 << 20, 256, &crate::test_entry()).unwrap()).collect::<Vec<_>>();
         drop(buffers);
         let (GraphCost::Pooled { graph, launch, granule }, Ok(GraphCost::Pooled { graph: again, launch: launched, .. })) = (first, measure(&device, &programs)) else {
             eprintln!("the measurement after other work was refused");
@@ -513,7 +518,7 @@ mod tests {
              \tsub.u64 %c, %c, %s;\n\tsetp.lt.u64 %p, %c, %n;\n\t@%p bra LOOP;\n\tret;\n}\n\0";
         let (_spin_module, spin) = driver::load_module(context, spin_source.as_bytes(), "spin").unwrap();
         const ELEMENTS: usize = 1024;
-        let out = driver::HostMapped::new(context, &device.accounts().upload, ELEMENTS * 4).unwrap();
+        let out = driver::HostMapped::new(context, &device.stores().host.own(), ELEMENTS * 4).unwrap();
         out.write_at(0, &[0u8; ELEMENTS * 4]);
         let read = || {
             let mut bytes = vec![0u8; ELEMENTS * 4];

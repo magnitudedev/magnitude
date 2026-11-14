@@ -10,7 +10,7 @@ use seismic_topology::fixtures::{
 };
 use seismic_topology::{
     Availability, BackendName, Contract, DeviceTopology, ExecutorSelector, PhysicalIdentity,
-    Placing, Reports, Revision, StoreKind,
+    Reports, Revision, StoreKind,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ fn identifiers(topology: &DeviceTopology) -> Vec<Revision> {
         for kind in Contract::ALL {
             revisions.extend(
                 executor
-                    .paths(Placing::Fixed(kind))
+                    .paths(kind)
                     .iter()
                     .map(|id| id.revision()),
             );
@@ -100,7 +100,7 @@ fn a_changed_refresh_leaves_no_identifier_at_its_old_revision() {
     assert!(after.executor(old.id()).is_none());
     assert!(after.store(before.host_ram().id()).is_none());
     assert!(after
-        .access_path(old.paths(Placing::Fixed(Contract::DeviceOnly))[0])
+        .access_path(old.paths(Contract::DeviceOnly)[0])
         .is_none());
     assert_eq!(
         volume(&after, Path::new("/models")).unwrap().revision(),
@@ -166,8 +166,7 @@ fn the_machine_is_discovered_and_sampled() {
         .map(|executor| executor.id())
         .collect::<Vec<_>>();
     let sample = inventory.sample(&topology, &every);
-    let host = sample.host_ram.as_ref().unwrap();
-    assert!(host.allocatable.value > 0);
+    assert!(sample.host.total > 0 && sample.host.supply.total() > 0);
     assert_eq!(sample.volumes.len(), 1);
     assert_eq!(sample.volumes[0].0, served);
     assert!(sample.volumes[0].1.as_ref().unwrap().value > 0);

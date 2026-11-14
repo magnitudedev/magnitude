@@ -1,7 +1,7 @@
 use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
-use crate::memory::{DeviceLedgers, LedgerScope};
+use crate::memory::{DeviceStores, Store, Tally};
 use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
 use seismic_topology::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
@@ -61,12 +61,32 @@ impl Devices {
         self.open_with(id, DeviceOptions::default())
     }
 
-    /// Open `id` with `options`. An executor already open is shared; asking
-    /// it for a different artifact store is an error.
-    pub fn open_with(
+    /// Open `id` with `options`, outside any embedder's ledger: an executor
+    /// already open is shared, and one not open yet charges a [`Tally`] of
+    /// each store it reaches, its own. Asking an open executor for a
+    /// different artifact store is an error.
+    pub fn open_with(&self, id: ExecutorId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_shared(id, options, None)
+    }
+
+    /// Open `id` with `options`, charging `stores`, the embedder's ledger of
+    /// every store it reaches: the product's open. An executor already open
+    /// is shared where it charges these same stores; asking it for others,
+    /// or for a different artifact store, is an error.
+    pub fn open_in(
         &self,
         id: ExecutorId,
         options: DeviceOptions,
+        stores: Vec<Arc<dyn Store>>,
+    ) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_shared(id, options, Some(stores))
+    }
+
+    fn open_shared(
+        &self,
+        id: ExecutorId,
+        options: DeviceOptions,
+        stores: Option<Vec<Arc<dyn Store>>>,
     ) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
         let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
@@ -76,6 +96,9 @@ impl Devices {
             if options.artifacts.as_ref().is_some_and(|requested| !Arc::ptr_eq(&device.artifacts, requested)) {
                 return Err(OpenError::ArtifactStoreConflict(info.selector()));
             }
+            if stores.as_ref().is_some_and(|stores| !device.memory.opened_with(stores)) {
+                return Err(OpenError::StoreConflict(info.selector()));
+            }
             return Ok(device);
         }
         if let Availability::Unavailable { reason } = info.availability() {
@@ -84,18 +107,24 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = DeviceLedgers::new(LedgerScope::process(), &topology, &info);
+        let embedded = stores.is_some();
+        let stores = stores.unwrap_or_else(|| tallies(&topology, &info));
+        let memory = DeviceStores::new(&topology, &info, stores, embedded);
         let device = crate::backends::open(info, topology, memory, options)?;
         opened.insert(id, Arc::downgrade(&device));
         Ok(device)
     }
 
-    /// Open `id` with `options` as a device of its own: in a ledger scope
-    /// of its own, shared with no other open, so it charges and bounds no
-    /// store another device of the process reaches. For a test, whose
-    /// process other tests share.
+    /// Open `id` with `options` as a device of its own, charging `stores`,
+    /// shared with no other open: for a test, whose process other tests
+    /// share, reading and bounding what its own stores count.
     #[doc(hidden)]
-    pub fn open_own_ledgers(&self, id: ExecutorId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+    pub fn open_own(
+        &self,
+        id: ExecutorId,
+        options: DeviceOptions,
+        stores: Vec<Arc<dyn Store>>,
+    ) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
         let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
         if let Availability::Unavailable { reason } = info.availability() {
@@ -104,7 +133,7 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = DeviceLedgers::new(LedgerScope::own(), &topology, &info);
+        let memory = DeviceStores::new(&topology, &info, stores, true);
         crate::backends::open(info, topology, memory, options)
     }
 
@@ -193,34 +222,24 @@ impl Devices {
             .collect::<Vec<_>>();
         Status {
             sample: self.inventory.sample(topology, &[executor]),
-            runtime: Self::runtime_status(&LedgerScope::process(), &devices, topology, executor),
+            runtime: Self::runtime_status(&devices, topology, executor),
         }
     }
 
-    /// The status of opened `device`, as [`Self::status`] reads it, with
-    /// what the devices of its ledger scope hold: the process's opened
-    /// executors, or, for a device of its own scope, itself.
+    /// The status of opened `device`, as [`Self::status`] reads it.
     pub fn device_status(&self, device: &Arc<DeviceInner>) -> Status {
         let (topology, executor) = (device.topology(), device.info().id());
-        let scope = &device.memory.scope;
-        if Arc::ptr_eq(scope, &LedgerScope::process()) {
-            return self.status(topology, executor);
-        }
         Status {
             sample: self.inventory.sample(topology, &[executor]),
-            runtime: Self::runtime_status(scope, std::slice::from_ref(device), topology, executor),
+            runtime: Self::runtime_status(std::slice::from_ref(device), topology, executor),
         }
     }
 
-    /// What only opened executors know: each store's ledger in `scope`, and
-    /// what is left of each grant of `of` when it is one of `devices`, an
-    /// opened CUDA executor.
-    fn runtime_status(scope: &LedgerScope, devices: &[Arc<DeviceInner>], topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
-        let charges = topology
-            .stores()
-            .iter()
-            .map(|store| (store.id(), scope.store_ledger(topology, store.id()).claim()))
-            .collect();
+    /// What only opened executors know: what is left of each grant of `of`
+    /// on its own memory when it is one of `devices`, an opened CUDA
+    /// executor (`cuMemGetInfo`'s free). A grant on host memory is the
+    /// host's figure, read by the embedder's ledger beside what it holds.
+    fn runtime_status(devices: &[Arc<DeviceInner>], topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
         let free = devices
             .iter()
             .filter(|device| {
@@ -235,44 +254,38 @@ impl Devices {
             });
         let mut grants = Vec::new();
         if let Some(free) = free {
-            let executor = topology
-                .executor(of)
-                .expect("opened executor belongs to topology");
+            let executor = topology.executor(of).expect("opened executor belongs to topology");
             let memory = topology
                 .physical_device(executor.physical())
                 .expect("an executor's device belongs to topology")
                 .memory();
-            for path in topology
-                .access_paths()
-                .iter()
-                .filter(|path| path.executor() == of)
-            {
-                let Some(grant) = path.grant() else {
-                    continue;
-                };
-                let remaining = match memory {
-                    // CUDA's free figure for its own memory bounds the grant.
-                    DeviceMemory::Own => free
-                        .clone()
-                        .map(|value| Reported::new(value, ReportedBy::CudaFree)),
-                    // The free figure of a device whose memory is the host's
-                    // excludes reclaimable page cache and is no bound: the
-                    // grant less what the executor holds is.
-                    DeviceMemory::Host => Ok(Reported::new(
-                        grant
-                            .value
-                            .saturating_sub(scope.path_claim(topology, executor, path)),
-                        grant.by,
-                    )),
-                    DeviceMemory::Undecided => {
-                        unreachable!("an executor of an undecided device has no access path")
-                    }
-                };
-                grants.push((path.id(), remaining));
+            if memory == DeviceMemory::Own {
+                for path in topology.access_paths().iter().filter(|path| path.executor() == of && path.grant().is_some()) {
+                    grants.push((path.id(), free.clone().map(|value| Reported::new(value, ReportedBy::CudaFree))));
+                }
             }
         }
-        RuntimeStatus { charges, grants }
+        RuntimeStatus { grants }
     }
+}
+
+/// An unbounded [`Tally`] of every store `executor` of `topology` reaches:
+/// the stores of a device opened outside any embedder's ledger.
+fn tallies(topology: &DeviceTopology, executor: &seismic_topology::Executor) -> Vec<Arc<dyn Store>> {
+    let mut identities = Vec::new();
+    let reached = topology
+        .access_paths()
+        .iter()
+        .filter(|path| path.executor() == executor.id())
+        .map(|path| path.store())
+        .chain([topology.host_ram().id()]);
+    for store in reached {
+        let identity = topology.store_identity(store).expect("a path's store belongs to its topology");
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    identities.into_iter().map(|identity| Arc::new(Tally::unbounded(identity)) as Arc<dyn Store>).collect()
 }
 
 /// Vulkan is not built on macOS: there a Vulkan request is refused with the

@@ -230,7 +230,7 @@ mod shared_graph_tests {
             crate::PlannedMethod::Plain,
             codec,
             limits,
-            crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+            crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
         )
         .unwrap();
         let plan = load.program_plan(&definition, codec).unwrap();
@@ -277,7 +277,7 @@ mod shared_graph_tests {
                 crate::PlannedMethod::Plain,
                 codec,
                 limits,
-                crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+                crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
             )
             .unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
@@ -295,14 +295,10 @@ mod shared_graph_tests {
         let definition = qwen4exp_fixture_definition_of(4, 32);
         let manifest = streamed_experts_manifest(&definition);
         let selection = crate::ComponentSelection { head: false, vision: false };
-        let load = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-            .unwrap()
-            .with_expert_bank_at_floor(&definition, crate::planning::BankSubstrate {
-                backend,
-                reservation: seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None },
-                host: crate::planning::HostTier::Unified(crate::planning::Parking::InKernels),
-            })
-            .unwrap();
+        let resident = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
+        let host = crate::planning::HostTier::Unified(crate::planning::Parking::InKernels);
+        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+        let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
         (definition, load)
     }
 
@@ -382,7 +378,7 @@ mod resource_template_tests {
                 method,
                 KvCodec::Dense,
                 LIMITS,
-                ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+                ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -511,6 +507,7 @@ mod resource_template_tests {
             ResourceCapacity {
                 domain_bytes: 1 << 30,
                 tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
             },
         )
         .unwrap();
@@ -619,6 +616,7 @@ mod resource_template_tests {
             ResourceCapacity {
                 domain_bytes,
                 tensor_operations: crate::TensorOperations::of(tensor_operations),
+                allocations: seismic::NativeAllocations::EXACT,
             },
         )
         .unwrap();
@@ -807,7 +805,7 @@ mod resource_template_tests {
                 limits,
             )
             .unwrap();
-            let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state =
                 ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -939,6 +937,7 @@ mod resource_template_tests {
                     ResourceCapacity {
                         domain_bytes: 64 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -1149,12 +1148,12 @@ mod resource_template_tests {
         let definition = qwen4exp_fixture_definition_of(4, 32);
         let manifest = streamed_experts_manifest(&definition);
         let selection = ComponentSelection { head: false, vision: false };
-        let reservation = seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None };
-        let substrate = crate::planning::BankSubstrate { backend, reservation, host: crate::planning::HostTier::Unified(crate::planning::Parking::of(backend)) };
         let derived = ModelLoadPlan::derive(&manifest, &definition, selection, resident_layout(ExecutionPath::Native, backend), PlannedMethod::Plain, limits).unwrap();
+        let host = crate::planning::HostTier::Unified(crate::planning::Parking::of(backend));
+        let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
         let floor = derived.bank_floor(&definition, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
         let whole = derived.with_expert_bank(&definition, floor, chain as u64, crate::FlightDepth::PIPELINED, substrate).unwrap();
-        let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent };
+        let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
         let state = ResourcePlanner::state_plan(&definition, &whole, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
         let plan = whole.program_plan(&definition, KvCodec::Dense).unwrap();
         let budget = whole.pass(limits);
@@ -1221,7 +1220,7 @@ mod sinkhorn_graph_tests {
         for backend in BackendName::ALL {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
-            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
             let classes = [(1, RunStage::Whole), (512, RunStage::Whole), (512, RunStage::Front), (512, RunStage::Combine)];
@@ -1256,7 +1255,7 @@ mod sinkhorn_graph_tests {
         for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
-            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
             for (index, rows) in (0..2).flat_map(|index| [1, 5, 64, 512].map(|rows| (index, rows))) {
@@ -1296,19 +1295,17 @@ mod sinkhorn_graph_tests {
         let codec = KvCodec::Dense;
         let selection = ComponentSelection { head: false, vision: false };
         let limits = crate::planning::fixtures::LIMITS;
-        let reservation = |host_addressed| seismic::Reservation { granule: 2 << 20, host_addressed, chunks: None };
         for (backend, tier) in [
             (BackendName::Metal, HostTier::Unified(Parking::InKernels)),
             (BackendName::Cuda, HostTier::Unified(Parking::InKernels)),
-            (BackendName::Cuda, HostTier::Linked(reservation(true))),
-            (BackendName::Vulkan, HostTier::Linked(reservation(true))),
+            (BackendName::Cuda, HostTier::Linked),
+            (BackendName::Vulkan, HostTier::Linked),
         ] {
             let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits)
-                .unwrap()
-                .with_expert_bank_at_floor(&definition, crate::planning::BankSubstrate { backend, reservation: reservation(true), host: tier })
-                .unwrap();
-            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
+            let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(tier), &definition).unwrap();
+            let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT };
             let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
             let certified = crate::programs::native_target_graph::checked_target_family_storage(

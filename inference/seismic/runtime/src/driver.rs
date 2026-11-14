@@ -9,7 +9,7 @@ use crate::api::kernel::{
 };
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
-use crate::memory::{DeviceLedgers, MemoryCharge, MemoryReservation, Placement};
+use crate::memory::DeviceStores;
 use crate::native::NativeQueue;
 use crate::resources::{AdmissionDomain, AdmittedResources, PersistentTable};
 use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
@@ -97,7 +97,7 @@ where
     analytical_loader: AnalyticalLoader<T, E>,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<T, E>>>>,
     /// Its ledgers.
-    memory: Arc<DeviceLedgers>,
+    memory: Arc<DeviceStores>,
     admission: AdmissionDomain,
 }
 
@@ -128,7 +128,7 @@ where
             + Send
             + Sync
             + 'static,
-        memory: Arc<DeviceLedgers>,
+        memory: Arc<DeviceStores>,
     ) -> Self {
         Self {
             identity: fresh_device_identity(),
@@ -188,94 +188,62 @@ where
             .lock()
             .expect("Opened preparation-cache lock poisoned while mutating private cache state")
     }
-    /// What the backend holds for fixed buffers of `contract` beyond their
-    /// allocations: for `DeviceOnly`, its blocks' free space and its driver
-    /// objects (such as instantiated CUDA graphs). These backends allocate
-    /// the host-mapped contracts whole, one native allocation per tensor,
-    /// holding nothing beyond their charges.
-    pub(crate) fn backend_held(&self, contract: seismic_topology::Contract) -> crate::devices::BackendHeld {
-        match contract {
-            seismic_topology::Contract::DeviceOnly => crate::devices::BackendHeld {
-                unallocated: self.service.unallocated(),
-                beyond: self.service.held_beyond_allocations(),
-            },
-            seismic_topology::Contract::Upload | seismic_topology::Contract::Shared | seismic_topology::Contract::Words => {
-                crate::devices::BackendHeld::default()
-            }
-        }
-    }
-
-    /// The ledgers its allocations are charged to.
-    pub(crate) fn memory(&self) -> &Arc<DeviceLedgers> {
-        &self.memory
-    }
+    /// Charge and allocate device storage in a hazard domain of its own.
     pub(crate) fn allocate_storage(
         self: &Arc<Self>,
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_storage_in(bytes, alignment, None)
+        self.allocate_contract(seismic_topology::Contract::DeviceOnly, bytes, alignment, None)
     }
 
-    /// Charge and allocate device storage, ordered by `access`'s hazard
-    /// domain where given (a slab its address table's, or a table that of
-    /// the storage its slabs view), otherwise by a domain of its own.
-    pub(crate) fn allocate_storage_in(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        access: Option<Arc<AccessGroup>>,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        // The device memory this allocation may add: what the ledgers let
-        // the backend hold beyond what it holds now.
-        let room = Some(self.memory.device().physical().available());
-        let mut reservation = reserve(self.memory.device(), bytes)?;
-        allocate_reserved_in(self.allocation_limits(), bytes, alignment, &mut reservation, access, || {
-            Ok(buffer_storage::<T, E>(&self.service, self.service.allocate_within(bytes, alignment, room)?))
-        })
-    }
-
-    /// Charge `bytes` of a host-visible `contract` and allocate it by
-    /// `make`.
-    pub(crate) fn allocate_visible_with(
+    /// Charge and allocate `bytes` of `contract` in the first of the kinds
+    /// it is allocated from now ([`DeviceStores::kinds`]), ordered by
+    /// `access`'s hazard domain where given (a slab its address table's, or
+    /// a table that of the storage its slabs view), otherwise by a domain
+    /// of its own. These backends allocate in exactly the kind asked
+    /// (`DeviceService::allocate`), never moving on to another.
+    pub(crate) fn allocate_contract(
         self: &Arc<Self>,
         contract: seismic_topology::Contract,
         bytes: u64,
         alignment: u64,
-        make: impl FnOnce(&Service<T, E>) -> Result<Writable<T, E>, ExecutionError>,
+        access: Option<Arc<AccessGroup>>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let mut reservation = reserve(self.memory.placement(seismic_topology::Placing::Fixed(contract)), bytes)?;
-        self.allocate_reserved_with(bytes, alignment, &mut reservation, make)
+        let kind = self.memory.kinds(contract)?[0];
+        let entry = self.entry(contract);
+        allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, access, || {
+            Ok((kind, buffer_storage::<T, E>(&self.service, self.service.allocate(kind, bytes, alignment, &entry)?)))
+        })
     }
 
-    /// Charge and allocate the storage of a reserved tensor, one row per
-    /// record of `reservation`: the backend reserved `reservation` and
-    /// backs its leading `committed` bytes (`make`, given chunked storage's
-    /// record table, a charged allocation of its own), and the returned
-    /// [`Resizer`] resizes it in place. Only the backed granules are charged,
-    /// to the placement of the reservation's contract, and only they are
-    /// allocated: the device's single-allocation limit bounds each native
-    /// allocation backing them (all of them, or one chunk of chunked
-    /// storage), never the address range.
-    pub(crate) fn allocate_reservation_with(
-        self: &Arc<Self>,
-        reservation: ReservedRange,
-        committed: u64,
-        alignment: u64,
-        make: impl FnOnce(
-            &Arc<Service<T, E>>,
-        ) -> Result<
-            (Box<dyn Storage>, crate::backends::ReservedResizer, Option<Writable<T, E>>),
-            ExecutionError,
-        >,
-    ) -> Result<Resizer, ExecutionError> {
-        allocate_reservation(self.allocation_limits(), &self.memory, reservation, committed, alignment, || {
-            let (storage, backend, table) = make(&self.service)?;
-            let table = table.map(|table| {
-                (self.service.buffer_len(table.borrow()), buffer_storage::<T, E>(&self.service, table))
-            });
-            Ok((storage, backend, table))
-        })
+    /// The ledger entry an allocation of `contract` through this device on
+    /// this thread is charged to ([`crate::memory::DeviceStores::entry`]).
+    pub(crate) fn entry(&self, contract: seismic_topology::Contract) -> Arc<dyn crate::memory::Entry> {
+        self.memory.entry(contract)
+    }
+
+    /// One block of a granule pool (`crate::pool`) of `bytes` of `kind`,
+    /// which `make` allocates with the backend's block allocator (one
+    /// native allocation, never sub-allocated, every page backed and
+    /// reading zero, charged exactly to its entry and returned to the OS or
+    /// driver when dropped), in `access`'s hazard domain.
+    pub(crate) fn allocate_block(
+        &self,
+        kind: u32,
+        bytes: u64,
+        access: Arc<AccessGroup>,
+        make: impl FnOnce(&Service<T, E>) -> Result<Writable<T, E>, ExecutionError>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocation_limits().admit_bytes(bytes)?;
+        let block = make(&self.service)?;
+        Ok(Allocation::new_in(
+            fresh_allocation_identity(),
+            bytes,
+            self.memory.path_of(kind),
+            buffer_storage::<T, E>(&self.service, block),
+            Some(access),
+        ))
     }
 
     fn allocation_limits(&self) -> AllocationLimits {
@@ -297,39 +265,15 @@ where
         alignment: u64,
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let mut reservation = reserve(self.memory.device(), bytes)?;
-        allocate_reserved(self.allocation_limits(), bytes, alignment, &mut reservation, || {
+        // The mapped memory is the host's, the backend's one kind.
+        let kind = self.memory.kinds(seismic_topology::Contract::DeviceOnly)?[0];
+        allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, None, || {
             let buffer = make(&self.service)?;
-            Ok(Box::new(ReadOnlyStorage::<T, E> {
+            let storage: Box<dyn Storage> = Box::new(ReadOnlyStorage::<T, E> {
                 service: self.service.clone(),
                 buffer,
-            }))
-        })
-    }
-
-    pub(crate) fn allocate_reserved(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        reservation: &mut MemoryReservation,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        // What the ledgers let the backend hold beyond what it holds now,
-        // the reservation's untaken bytes among it.
-        let room = Some(self.memory.device().physical().available());
-        self.allocate_reserved_with(bytes, alignment, reservation, |service| {
-            service.allocate_within(bytes, alignment, room)
-        })
-    }
-
-    fn allocate_reserved_with(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        reservation: &mut MemoryReservation,
-        make: impl FnOnce(&Service<T, E>) -> Result<Writable<T, E>, ExecutionError>,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        allocate_reserved(self.allocation_limits(), bytes, alignment, reservation, || {
-            Ok(buffer_storage::<T, E>(&self.service, make(&self.service)?))
+            });
+            Ok((kind, storage))
         })
     }
 }
@@ -356,7 +300,7 @@ impl AllocationLimits {
     }
 
     /// Refuse an allocation of `bytes` beyond the single-allocation limit.
-    fn admit_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
+    pub(crate) fn admit_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
         if bytes > self.max_allocation_bytes {
             return Err(ExecutionError::AllocationCapacity {
                 required: bytes.into(),
@@ -367,105 +311,22 @@ impl AllocationLimits {
     }
 }
 
-/// Reserve `bytes` in `memory` for an allocation.
-pub(crate) fn reserve(
-    memory: &Arc<Placement>,
-    bytes: u64,
-) -> Result<MemoryReservation, ExecutionError> {
-    memory
-        .reserve(bytes)
-        .map_err(|capacity| ExecutionError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
-}
-
-/// What a backend forms for a reserved tensor: its storage, its resizer,
-/// and on chunked storage its record table's bytes and storage.
-pub(crate) type ReservedParts = (
-    Box<dyn Storage>,
-    crate::backends::ReservedResizer,
-    Option<(u64, Box<dyn Storage>)>,
-);
-
-/// The backend-neutral core of a reserved tensor's allocation
-/// (`Opened::allocate_reservation_with`): its committed backing is admitted
-/// against `limits` (the largest native allocation backing it: all of it,
-/// or one chunk of chunked storage), as is its table. Each is charged to
-/// the placement of its own storage kind; a table in the backing's own
-/// placement shares the backing's grant, a table placed elsewhere gets one
-/// of its own. Every grant is taken before `make` forms storage, and the
-/// returned [`Resizer`] resizes it in place.
-pub(crate) fn allocate_reservation(
-    limits: AllocationLimits,
-    memory: &DeviceLedgers,
-    reservation: ReservedRange,
-    committed: u64,
-    alignment: u64,
-    make: impl FnOnce() -> Result<ReservedParts, ExecutionError>,
-) -> Result<Resizer, ExecutionError> {
-    let rows = reservation.rows();
-    let overflow = || ExecutionError::AllocationFailed(format!("the charge of a {rows}-record reservation overflows"));
-    let charges = reservation.span.charges(reservation.contract, reservation.records(), rows, committed)
-        .ok_or_else(overflow)?;
-    limits.admit(reservation.largest_allocation(charges.backing), alignment)?;
-    if let Some(table) = charges.table {
-        limits.admit(table.bytes(), seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES)?;
-    }
-    let backing_memory = memory.placement(seismic_topology::Placing::Reserved(reservation.contract));
-    // A table charged with the backing takes the backing's grant; one
-    // placed elsewhere a grant of its own.
-    let (backing_request, mut table_grant) = match charges.table {
-        Some(seismic_topology::TableCharge::Separate { placement, bytes }) =>
-            (charges.backing, Some(reserve(memory.placement(seismic_topology::Placing::Fixed(placement)), bytes)?)),
-        Some(seismic_topology::TableCharge::WithBacking { .. }) | None =>
-            (charges.total().ok_or_else(overflow)?, None),
-    };
-    let mut backing_grant = reserve(backing_memory, backing_request)?;
-    let (storage, backend, table) = make()?;
-    // The table and the backing it addresses share one hazard domain.
-    let access = Arc::new(AccessGroup::default());
-    let table = table.map(|(bytes, storage)| {
-        let grant = table_grant.as_mut().unwrap_or(&mut backing_grant);
-        Allocation::new_in(fresh_allocation_identity(), bytes, grant.take(bytes), storage, Some(access.clone()))
-    });
-    let allocation = Allocation::new_in(fresh_allocation_identity(), committed,
-        backing_grant.take(charges.backing), storage, Some(access))
-        .reserving(reservation, table);
-    Ok(Resizer::new(allocation, backing_memory.clone(), limits, backend))
-}
-
 /// The backend-neutral allocation core: check `bytes` and `alignment`
-/// against `limits`, form the storage with `make`, and charge it to
-/// `reservation`.
-pub(crate) fn allocate_reserved(
+/// against `limits` and form the storage with `make`, which charges its
+/// entry exactly and names the kind it landed in; it lies along that
+/// kind's access path in `memory`, ordered by `access`'s hazard domain
+/// where given.
+pub(crate) fn allocate_in(
     limits: AllocationLimits,
+    memory: &DeviceStores,
     bytes: u64,
     alignment: u64,
-    reservation: &mut MemoryReservation,
-    make: impl FnOnce() -> Result<Box<dyn Storage>, ExecutionError>,
-) -> Result<Arc<Allocation>, ExecutionError> {
-    allocate_reserved_in(limits, bytes, alignment, reservation, None, make)
-}
-
-/// [`allocate_reserved`], ordered by `access`'s hazard domain where given.
-pub(crate) fn allocate_reserved_in(
-    limits: AllocationLimits,
-    bytes: u64,
-    alignment: u64,
-    reservation: &mut MemoryReservation,
     access: Option<Arc<AccessGroup>>,
-    make: impl FnOnce() -> Result<Box<dyn Storage>, ExecutionError>,
+    make: impl FnOnce() -> Result<(u32, Box<dyn Storage>), ExecutionError>,
 ) -> Result<Arc<Allocation>, ExecutionError> {
     limits.admit(bytes, alignment)?;
-    let storage = make()?;
-    Ok(Allocation::new_in(
-        fresh_allocation_identity(),
-        bytes,
-        reservation.take(bytes),
-        storage,
-        access,
-    ))
+    let (kind, storage) = make()?;
+    Ok(Allocation::new_in(fresh_allocation_identity(), bytes, memory.path_of(kind), storage, access))
 }
 
 pub(crate) fn capability_summaries<T: TargetFamily>(device: &DeviceDescription<T>) -> Vec<String> {
@@ -548,342 +409,22 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for ReadOnlyStorage<T, E> {
 /// One physical allocation. Views share it, so access exclusion is allocation-wide.
 pub(crate) struct Allocation {
     identity: u64,
-    /// Backed bytes. Only an installed resize of a reservation changes them,
-    /// under exclusive access.
-    bytes: AtomicU64,
-    /// The address range the backend reserved for an in-place recommit.
-    reservation: Option<ReservedRange>,
-    /// A chunked reservation's record table: one device address per record
-    /// of the range, written by its backing as chunks are formed, in this
-    /// allocation's access group.
-    records: Option<Arc<Allocation>>,
+    bytes: u64,
     /// The record tables of the views record ports bind
     /// ([`Allocation::view_table`]), one for each record size and phase,
     /// formed once and held with the storage they address.
     view_tables: Mutex<Vec<ViewTable>>,
-    /// The record tables graph workspaces and pinned views of reserved
-    /// storage formed over this allocation ([`Allocation::hold_table`]),
+    /// The record tables graph workspaces formed over this allocation
+    /// ([`Allocation::hold_table`]),
     /// each part of its storage while it lives: charged and observed with
     /// it.
     tables: Mutex<Vec<Weak<Allocation>>>,
-    /// What the backing is charged: its bytes, or a reservation's backed
-    /// granules.
-    charge: Mutex<MemoryCharge>,
-    /// The end of each live region of a reservation's backed bytes
-    /// ([`Allocation::pin`]): a recommit backs no fewer.
-    pins: Mutex<Vec<u64>>,
+    /// The access path its storage lies along: that of the kind it landed
+    /// in, whose store's ledger entry its backend charged its exact bytes
+    /// to.
+    path: seismic_topology::AccessPathId,
     storage: Box<dyn Storage>,
     access: Arc<AccessGroup>,
-}
-
-/// The right to resize one reserved tensor's committed rows in place
-/// (`Tensor::reserved` hands it out with the tensor). A resize consumes it;
-/// the resize's release, abandonment or refusal returns it, so the tensor's
-/// resizes follow one another. It and each step of a resize are `Send`: a
-/// resize is prepared and released off the thread that submits device work,
-/// which installs a shrink between submissions; a growth installs on any
-/// thread ([`PreparedRecommit::install`]). Once installed the tensor, every
-/// view of it, bound work and sealed graphs stay valid, at the same address
-/// on CUDA and the CPU backend (on Metal and Vulkan, through the record
-/// table its backing keeps as chunks change);
-/// kept rows keep their contents and rows past the old commitment read zero.
-pub struct Resizer {
-    allocation: Arc<Allocation>,
-    /// The device's ledger and single-allocation limit, which a growth is
-    /// admitted and charged against.
-    memory: Arc<Placement>,
-    limits: AllocationLimits,
-    backend: crate::backends::ReservedResizer,
-}
-
-/// A refused resize: why, and the resizer back.
-pub struct RecommitRefusal {
-    pub resizer: Resizer,
-    pub error: crate::api::TensorError,
-}
-
-impl std::fmt::Debug for RecommitRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecommitRefusal").field("error", &self.error).finish()
-    }
-}
-
-impl Resizer {
-    pub(crate) fn new(
-        allocation: Arc<Allocation>,
-        memory: Arc<Placement>,
-        limits: AllocationLimits,
-        backend: crate::backends::ReservedResizer,
-    ) -> Self {
-        Self {
-            allocation,
-            memory,
-            limits,
-            backend,
-        }
-    }
-
-    pub(crate) fn allocation(&self) -> &Arc<Allocation> {
-        &self.allocation
-    }
-
-    /// Prepare backing the tensor's leading `committed` rows in place,
-    /// beside device work that uses it: nothing any view, bound work or the
-    /// host sees changes until [`PreparedRecommit::install`]. A growth is
-    /// admitted and granted here and its memory backed (on Metal, its new
-    /// chunks' buffers formed). Committing no rows, more than the
-    /// reservation spans, beyond the device's single-allocation limit or
-    /// fewer than a live region pins is refused, the tensor as it was.
-    pub fn prepare(self, committed: u64) -> Result<PreparedRecommit, RecommitRefusal> {
-        let (bytes, backing, grant) = match self.admit(committed) {
-            Ok(admitted) => admitted,
-            Err(error) => return Err(RecommitRefusal { resizer: self, error }),
-        };
-        let Self {
-            allocation,
-            memory,
-            limits,
-            backend,
-        } = self;
-        match backend.prepare(bytes) {
-            Ok(prepared) => Ok(PreparedRecommit {
-                next: Some(Next {
-                    resizer: Parts {
-                        allocation,
-                        memory,
-                        limits,
-                    },
-                    bytes,
-                    backing,
-                    grant,
-                    backend: prepared,
-                }),
-            }),
-            Err((backend, error)) => Err(RecommitRefusal {
-                resizer: Parts {
-                    allocation,
-                    memory,
-                    limits,
-                }
-                .with(backend),
-                error: error.into(),
-            }),
-        }
-    }
-
-    /// Back the tensor's leading `committed` rows in place at once:
-    /// [`Self::prepare`], its install, then its release.
-    pub fn recommit(self, committed: u64) -> Result<Self, RecommitRefusal> {
-        Ok(self.prepare(committed)?.install()?.release())
-    }
-
-    /// The bytes of `committed` rows, their backing and the grant a growth
-    /// to them needs, admitted; no grant for a shrink. The bytes are counted
-    /// once the rows are known to lie within the reservation, whose bytes
-    /// were counted.
-    fn admit(
-        &self,
-        committed: u64,
-    ) -> Result<(u64, u64, Option<MemoryReservation>), crate::api::TensorError> {
-        let reservation = self
-            .allocation
-            .reservation()
-            .expect("a resizer's allocation is a reservation");
-        let bytes = reservation.committed_bytes(committed)?;
-        let charge = self
-            .allocation
-            .charge
-            .lock()
-            .expect("allocation charge lock poisoned");
-        self.allocation.unpinned(bytes)?;
-        let backing = reservation.backing(bytes)?;
-        let growth = backing.saturating_sub(charge.bytes());
-        if growth == 0 {
-            return Ok((bytes, backing, None));
-        }
-        self.limits.admit_bytes(reservation.largest_allocation(backing))?;
-        Ok((bytes, backing, Some(reserve(&self.memory, growth)?)))
-    }
-}
-
-/// A resizer's parts but its backend's, which each step of a resize changes.
-struct Parts {
-    allocation: Arc<Allocation>,
-    memory: Arc<Placement>,
-    limits: AllocationLimits,
-}
-
-impl Parts {
-    fn with(self, backend: crate::backends::ReservedResizer) -> Resizer {
-        Resizer::new(self.allocation, self.memory, self.limits, backend)
-    }
-}
-
-/// A resize of a reserved tensor prepared beside device work that uses it
-/// ([`Resizer::prepare`]): its bytes, a growth's grant, and its backend's
-/// prepared commitment. Dropped, it is abandoned, its resizer with it.
-pub struct PreparedRecommit {
-    next: Option<Next>,
-}
-
-struct Next {
-    resizer: Parts,
-    bytes: u64,
-    /// The backing of `bytes`, as admitted.
-    backing: u64,
-    grant: Option<MemoryReservation>,
-    backend: crate::backends::ReservedPrepared,
-}
-
-impl PreparedRecommit {
-    /// Publish the resize: device work encoded from now sees the new
-    /// commitment, while work submitted before keeps the old one, whose
-    /// bytes beyond the new stay backed until the returned release. It waits
-    /// for host access and encoding of the tensor, never for device work. A
-    /// growth's grant becomes its charge. A region pinned since the prepare
-    /// refuses a shrink below it, abandoning it. A shrink installs between
-    /// submissions (never between queuing a sequence that binds the tensor
-    /// and submitting it), and the caller guarantees that no device work
-    /// submitted afterwards touches rows it released. A growth installs on
-    /// any thread, beside submission: its prepare formed everything device
-    /// work reaches its new rows through (CUDA's mapped granules, the CPU
-    /// backend's pages, Metal's chunks wired into the queue's residency set,
-    /// Vulkan's chunks with their record table entries), and its install
-    /// only publishes the length (on Metal it also appends the formed chunks
-    /// to the view). Its new rows are the backing's for device work
-    /// submitted after the install: an encoding holds its permit until its
-    /// work is committed and recorded as a use, and the install waits for
-    /// every permit, so work submitted before it is among the uses its
-    /// release waits for. On Metal a command buffer takes the queue's residency sets
-    /// as they are when it commits, and whether a set's later commit reaches
-    /// one already committed Metal does not state. Every resize's release
-    /// returns once the device work submitted before its install completes,
-    /// so a holder that hands a growth's new rows to device work only after
-    /// its release (`magnitude_executor`'s growth joins) lets no earlier
-    /// work reach them, on any backend.
-    pub fn install(mut self) -> Result<RecommitRelease, RecommitRefusal> {
-        let next = self.next.take().expect("a resize installs once");
-        let allocation = next.resizer.allocation.clone();
-        let exclusive = allocation.acquire_exclusive();
-        let mut charge = allocation
-            .charge
-            .lock()
-            .expect("allocation charge lock poisoned");
-        if let Err(error) = allocation.unpinned(next.bytes) {
-            drop((charge, exclusive));
-            return Err(RecommitRefusal {
-                resizer: next.resizer.with(next.backend.abandon()),
-                error,
-            });
-        }
-        let backend = next.backend.install();
-        let backing = next.backing;
-        if let Some(mut grant) = next.grant {
-            let growth = backing - charge.bytes();
-            grant.extend(&mut charge, growth);
-        }
-        allocation.bytes.store(next.bytes, Ordering::Release);
-        let submitted = allocation.last_device_uses();
-        drop((charge, exclusive));
-        Ok(RecommitRelease {
-            released: Some(Released {
-                resizer: next.resizer,
-                backing,
-                submitted,
-                backend,
-            }),
-        })
-    }
-
-    /// Abandon the resize: the backend releases what it backed and the grant
-    /// returns. It returns the resizer.
-    pub fn abandon(mut self) -> Resizer {
-        let next = self.next.take().expect("a resize is abandoned once");
-        next.resizer.with(next.backend.abandon())
-    }
-}
-
-impl Drop for PreparedRecommit {
-    fn drop(&mut self) {
-        if let Some(next) = self.next.take() {
-            drop(next.backend.abandon());
-        }
-    }
-}
-
-/// An installed resize's release ([`PreparedRecommit::install`]): what the
-/// reservation backs beyond its commitment. Dropped, it is released, its
-/// resizer with it.
-pub struct RecommitRelease {
-    released: Option<Released>,
-}
-
-struct Released {
-    resizer: Parts,
-    /// What the commitment's backing is charged.
-    backing: u64,
-    /// The last device work of each queue submitted before the install,
-    /// which may still use what the release frees.
-    submitted: DeviceUses,
-    backend: crate::backends::ReservedPending,
-}
-
-impl RecommitRelease {
-    /// Wait for the device work submitted before the install, which may
-    /// still use what the release frees: a [`Self::release`] after it frees
-    /// without waiting.
-    pub fn retire(&self) {
-        self.released.as_ref().expect("a resize is retired before its release").submitted.retire();
-    }
-
-    /// Once the device work submitted before the install completes, free
-    /// what the reservation backs beyond the tensor's rows; its charge
-    /// follows. It returns the resizer.
-    pub fn release(mut self) -> Resizer {
-        Self::unback(self.released.take().expect("a resize is released once"))
-    }
-
-    fn unback(released: Released) -> Resizer {
-        released.submitted.retire();
-        let backend = released.backend.release();
-        let mut charge = released
-            .resizer
-            .allocation
-            .charge
-            .lock()
-            .expect("allocation charge lock poisoned");
-        if charge.bytes() > released.backing {
-            charge.shrink(released.backing);
-        }
-        drop(charge);
-        released.resizer.with(backend)
-    }
-}
-
-impl Drop for RecommitRelease {
-    fn drop(&mut self) {
-        if let Some(released) = self.released.take() {
-            drop(Self::unback(released));
-        }
-    }
-}
-
-/// A region's hold on its reservation's backed bytes up to `end`, released
-/// when the last view of the region drops.
-pub(crate) struct RegionPin {
-    allocation: Arc<Allocation>,
-    end: u64,
-}
-
-impl Drop for RegionPin {
-    fn drop(&mut self) {
-        let mut pins = self.allocation.pins();
-        let index = pins
-            .iter()
-            .position(|&end| end == self.end)
-            .expect("a live pin is listed");
-        pins.swap_remove(index);
-    }
 }
 
 /// The record table of an allocation's `records` `record`-byte records from
@@ -893,73 +434,6 @@ struct ViewTable {
     phase: u64,
     records: u64,
     table: Arc<Allocation>,
-}
-
-/// An allocation's reserved address range: `bytes` of address space of
-/// `record`-byte records, backed over a leading prefix as its device
-/// reserves (`span`, of its records), in `kind` storage: device storage, or
-/// host storage the host addresses in place.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ReservedRange {
-    pub(crate) bytes: u64,
-    pub(crate) record: std::num::NonZeroU64,
-    /// The largest view its records carry beside their own
-    /// (`seismic_topology::ReservedRecords`).
-    pub(crate) carries: Option<std::num::NonZeroU64>,
-    pub(crate) span: seismic_topology::Reservation,
-    pub(crate) contract: seismic_topology::ReservedContract,
-}
-
-impl ReservedRange {
-    /// The range of `rows` records of `records` under `contract`, reserved
-    /// as `span` says (its device's reservation, as discovery reports it).
-    pub(crate) fn new(
-        contract: seismic_topology::ReservedContract,
-        span: seismic_topology::Reservation,
-        records: seismic_topology::ReservedRecords,
-        rows: u64,
-    ) -> Self {
-        Self {
-            bytes: records.record.get() * rows,
-            record: records.record,
-            carries: records.carries,
-            span: span.of_records(records),
-            contract,
-        }
-    }
-
-    /// What its records are.
-    pub(crate) fn records(&self) -> seismic_topology::ReservedRecords {
-        seismic_topology::ReservedRecords { record: self.record, carries: self.carries }
-    }
-
-    /// The records the range spans.
-    fn rows(&self) -> u64 {
-        self.bytes / self.record
-    }
-
-    /// The bytes of `committed` leading records, admitted: a reserved
-    /// tensor commits at least one record and at most the range's.
-    pub(crate) fn committed_bytes(&self, committed: u64) -> Result<u64, crate::api::TensorError> {
-        let rows = self.rows();
-        if committed == 0 || committed > rows {
-            return Err(crate::api::TensorError::Uncommittable { committed, rows });
-        }
-        Ok(self.record.get() * committed)
-    }
-
-    /// What backing `bytes` of the range holds, and is charged; refused
-    /// past the bytes a `u64` counts.
-    fn backing(&self, bytes: u64) -> Result<u64, ExecutionError> {
-        self.span.backing(bytes).ok_or_else(|| {
-            ExecutionError::AllocationFailed(format!("the backing of {bytes} reserved bytes overflows"))
-        })
-    }
-
-    /// The largest single native allocation of the range's `backing`.
-    fn largest_allocation(&self, backing: u64) -> u64 {
-        self.span.largest_allocation(backing)
-    }
 }
 
 #[derive(Default)]
@@ -1035,6 +509,11 @@ impl DeviceUses {
     fn is_empty(&self) -> bool {
         self.0.iter().all(Option::is_none)
     }
+
+    /// Whether every use has ended (completed or faulted). Never waits.
+    pub(crate) fn ended(&self) -> bool {
+        self.0.iter().flatten().all(|fence| !matches!(fence.completed(), Ok(false)))
+    }
 }
 
 /// Who holds an allocation's permits, by kind: host access, and device
@@ -1062,8 +541,7 @@ impl Holders {
 /// work; device encodings exclude conflicting host access but not each
 /// other, each queue ordering its own work, native queues ordering against
 /// each other by their fences and the caller ordering transfers
-/// ([`Allocation::acquire_for_device`]). A resize's
-/// install excludes every holder ([`Allocation::acquire_exclusive`]).
+/// ([`Allocation::acquire_for_device`]).
 #[derive(Default)]
 struct AllocationAccess {
     host: Holders,
@@ -1110,25 +588,18 @@ impl AllocationAccess {
 }
 
 impl Allocation {
-    /// The bytes the allocation's own storage, one of `memory`'s executor,
-    /// charges along each of its access paths, in the order its bytes lie
-    /// on them: what a view's byte range is attributed from.
-    pub(crate) fn storage_path_charges(
-        &self,
-        memory: &DeviceLedgers,
-    ) -> Vec<(seismic_topology::AccessPathId, u64)> {
-        memory.path_charges(&self.charge.lock().expect("allocation charge lock poisoned"))
+    /// The bytes the allocation's own storage lies in along its access
+    /// path: what a view's byte range is attributed from.
+    pub(crate) fn storage_path_charges(&self) -> Vec<(seismic_topology::AccessPathId, u64)> {
+        vec![(self.path, self.bytes)]
     }
 
-    /// The bytes the allocation charges along each of its access paths: its
+    /// The bytes the allocation holds along each of its access paths: its
     /// storage's ([`Self::storage_path_charges`]) and its record tables',
     /// part of its storage, held and released with it.
-    pub(crate) fn path_charges(
-        &self,
-        memory: &DeviceLedgers,
-    ) -> Vec<(seismic_topology::AccessPathId, u64)> {
-        let mut charges = self.storage_path_charges(memory);
-        for (path, bytes) in self.record_tables().iter().flat_map(|table| table.path_charges(memory)) {
+    pub(crate) fn path_charges(&self) -> Vec<(seismic_topology::AccessPathId, u64)> {
+        let mut charges = self.storage_path_charges();
+        for (path, bytes) in self.record_tables().iter().flat_map(|table| table.path_charges()) {
             match charges.iter_mut().find(|(charged, _)| *charged == path) {
                 Some((_, charged)) => {
                     *charged = charged
@@ -1141,115 +612,48 @@ impl Allocation {
         charges
     }
     #[cfg(test)]
-    fn new(
-        identity: u64,
-        bytes: u64,
-        charge: MemoryCharge,
-        storage: Box<dyn Storage>,
-    ) -> Arc<Self> {
-        Self::new_in(identity, bytes, charge, storage, None)
+    fn new(identity: u64, bytes: u64, storage: Box<dyn Storage>) -> Arc<Self> {
+        let path = seismic_topology::fixtures::recorded::rtx3090().access_paths()[0].id();
+        Self::new_in(identity, bytes, path, storage, None)
     }
 
     /// A fresh allocation in `access`'s hazard domain, or one of its own:
     /// the domain is fixed at construction, before anything can use it.
-    fn new_in(
+    pub(crate) fn new_in(
         identity: u64,
         bytes: u64,
-        charge: MemoryCharge,
+        path: seismic_topology::AccessPathId,
         storage: Box<dyn Storage>,
         access: Option<Arc<AccessGroup>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
-            bytes: AtomicU64::new(bytes),
-            reservation: None,
-            records: None,
+            bytes,
             view_tables: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
-            charge: Mutex::new(charge),
+            path,
             storage,
             access: access.unwrap_or_default(),
-            pins: Mutex::new(Vec::new()),
         })
     }
 
-    /// This fresh allocation as the backed prefix of `reservation`, with its
-    /// record table where its storage is chunked.
-    fn reserving(
-        mut self: Arc<Self>,
-        reservation: ReservedRange,
-        records: Option<Arc<Allocation>>,
-    ) -> Arc<Self> {
-        debug_assert!(records.as_ref().is_none_or(|table| table.shares_access_with(&self)));
-        let fresh = Arc::get_mut(&mut self).expect("a fresh allocation is unshared");
-        fresh.reservation = Some(reservation);
-        fresh.records = records;
-        self
-    }
-
-    /// A chunked reservation's record table ([`Allocation::records`]).
-    pub(crate) fn record_table(&self) -> Option<&Arc<Allocation>> {
-        self.records.as_ref()
-    }
     pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
-    /// Backed bytes; a reservation's change only under exclusive access.
     pub(crate) fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Acquire)
+        self.bytes
     }
-    /// Pin a reservation's backed bytes up to `end` while the pin lives;
-    /// `None` when `end` reaches past them. The charge lock orders it with
-    /// recommits.
-    pub(crate) fn pin(self: &Arc<Self>, end: u64) -> Option<RegionPin> {
-        let _charge = self.charge.lock().expect("allocation charge lock poisoned");
-        (end <= self.bytes()).then(|| {
-            self.pins().push(end);
-            RegionPin {
-                allocation: self.clone(),
-                end,
-            }
-        })
-    }
-    fn pins(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
-        self.pins.lock().expect("allocation pins lock poisoned")
-    }
-    /// Refuse backing fewer than `bytes` than a live region pins. The caller
-    /// holds the charge lock, which orders it with pinning.
-    fn unpinned(&self, bytes: u64) -> Result<(), crate::api::TensorError> {
-        match self.pins().iter().max() {
-            Some(&pinned) if bytes < pinned => Err(crate::api::TensorError::Region(
-                crate::api::RegionError::Pinned { pinned, bytes },
-            )),
-            _ => Ok(()),
-        }
-    }
-    pub(crate) fn reservation(&self) -> Option<ReservedRange> {
-        self.reservation
-    }
-    /// Bytes a view of the allocation may span: a reservation's address
-    /// range, otherwise the backed bytes.
-    pub(crate) fn span(&self) -> u64 {
-        self.reservation
-            .map_or_else(|| self.bytes(), |reservation| reservation.bytes)
-    }
-    /// What the allocation is charged, its record tables included: part of
+    /// The bytes the allocation holds, its record tables included: part of
     /// its storage, held and released with it.
     pub(crate) fn charged_bytes(&self) -> u64 {
-        let storage = self
-            .charge
-            .lock()
-            .expect("allocation charge lock poisoned")
-            .bytes();
         self.record_tables()
             .iter()
-            .try_fold(storage, |charged, table| charged.checked_add(table.charged_bytes()))
+            .try_fold(self.bytes, |charged, table| charged.checked_add(table.charged_bytes()))
             .expect("an allocation's charges sum within u64")
     }
 
-    /// Hold `table`, a record table a graph workspace or a pinned view of
-    /// reserved storage formed over this allocation's records, as part of
-    /// its storage while the table lives.
+    /// Hold `table`, a record table a graph workspace formed over this
+    /// allocation's records, as part of its storage while the table lives.
     pub(crate) fn hold_table(&self, table: &Arc<Allocation>) {
         let mut tables = self.tables.lock().expect("allocation tables lock poisoned");
         tables.retain(|held| held.strong_count() > 0);
@@ -1310,16 +714,14 @@ impl Allocation {
         Ok(found)
     }
 
-    /// The record tables over this allocation's records that live: a
-    /// chunked reservation's own, its views', and those graph workspaces
-    /// and pinned views of reserved storage formed.
+    /// The record tables over this allocation's records that live: its
+    /// views' and those graph workspaces formed.
     fn record_tables(&self) -> Vec<Arc<Allocation>> {
         let views = self.view_tables.lock().expect("allocation view tables lock poisoned");
         let tables = self.tables.lock().expect("allocation tables lock poisoned");
-        self.records
+        views
             .iter()
-            .cloned()
-            .chain(views.iter().map(|held| held.table.clone()))
+            .map(|held| held.table.clone())
             .chain(tables.iter().filter_map(Weak::upgrade))
             .collect()
     }
@@ -1396,24 +798,6 @@ impl Allocation {
                 .expect("tensor allocation access lock poisoned while waiting");
         }
         self.grant(state, Holder::Device, write)
-    }
-
-    /// Access that excludes every other: host access and the encoding of
-    /// device work, never waiting for device work (a resize's install,
-    /// between submissions).
-    pub(crate) fn acquire_exclusive(self: &Arc<Self>) -> AllocationPermit {
-        let group = self.access_group();
-        let mut state = group
-            .state
-            .lock()
-            .expect("tensor allocation access lock poisoned");
-        while state.host.any() || state.device.any() {
-            state = group
-                .changed
-                .wait(state)
-                .expect("tensor allocation access lock poisoned while waiting");
-        }
-        self.grant(state, Holder::Host, true)
     }
 
     /// Record work submitted to `queue` so later host access, and the
@@ -1500,7 +884,7 @@ impl Allocation {
 
     /// The newest submitted work of each queue that still uses this
     /// allocation: every use completes once these have.
-    fn last_device_uses(&self) -> DeviceUses {
+    pub(crate) fn last_device_uses(&self) -> DeviceUses {
         self.access_group()
             .state
             .lock()
@@ -1631,13 +1015,13 @@ pub(crate) fn buffer_storage<T: TargetFamily, E: NativeExecutor<T>>(
     })
 }
 
-pub(crate) fn write_zeros(storage: &dyn Storage, byte_len: u64) -> Result<(), ExecutionError> {
+pub(crate) fn write_zeros(storage: &dyn Storage, start: u64, byte_len: u64) -> Result<(), ExecutionError> {
     const CHUNK: usize = 1 << 20;
     let zeros = vec![0u8; CHUNK.min(usize::try_from(byte_len).unwrap_or(CHUNK))];
     let mut offset = 0u64;
     while offset < byte_len {
         let length = usize::try_from((byte_len - offset).min(CHUNK as u64)).unwrap_or(CHUNK);
-        storage.write(offset, &zeros[..length])?;
+        storage.write(start + offset, &zeros[..length])?;
         offset += length as u64;
     }
     Ok(())
@@ -2264,102 +1648,6 @@ mod physical_slot_tests {
         }
     }
 
-    fn split_memory() -> DeviceLedgers {
-        let placement = || Placement::on(crate::memory::StoreLedger::new());
-        DeviceLedgers::split(placement(), placement(), placement(), placement())
-    }
-
-    fn split_span(granule: u64) -> seismic_topology::Reservation {
-        seismic_topology::Reservation {
-            granule,
-            host_addressed: true,
-            chunks: Some(seismic_topology::ReservationChunks {
-                unit: granule,
-                table: seismic_topology::Contract::Upload,
-            }),
-        }
-    }
-
-    fn split_reservation() -> ReservedRange {
-        ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(4096),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(4096).unwrap()), 8)
-    }
-
-    #[test]
-    fn reservation_placement_refuses_each_placement_and_cleans_up_before_make() {
-        let memory = split_memory();
-        let limits = AllocationLimits { max_allocation_bytes: 4096, max_allocation_alignment: 4096 };
-        for (host, upload) in [(4095, 64), (4096, 63)] {
-            memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().set_bound(Some(host));
-            memory.upload().ledger().set_bound(Some(upload));
-            assert!(allocate_reservation(limits, &memory, split_reservation(), 4096, 4096,
-                || panic!("refused before allocating native storage")).is_err());
-            assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 0);
-            assert_eq!(memory.upload().ledger().view().charged, 0);
-        }
-        memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().set_bound(Some(4096));
-        memory.upload().ledger().set_bound(Some(64));
-        assert!(allocate_reservation(limits, &memory, split_reservation(), 4096, 4096, || {
-            assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 4096);
-            assert_eq!(memory.upload().ledger().view().charged, 64);
-            Err(ExecutionError::AllocationFailed("native allocation refused".into()))
-        }).is_err());
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 0);
-        assert_eq!(memory.upload().ledger().view().charged, 0);
-        let mut large_table = split_reservation();
-        large_table.bytes = 4096 * 1024;
-        assert!(allocate_reservation(limits, &memory, large_table, 4096, 4096,
-            || panic!("table size refused before allocation")).is_err());
-    }
-
-    #[test]
-    fn reservation_placement_shared_source_admits_combined_charge() {
-        let memory = split_memory();
-        let limits = AllocationLimits { max_allocation_bytes: 4096, max_allocation_alignment: 4096 };
-        let mut reservation = split_reservation();
-        reservation.contract = seismic_topology::ReservedContract::DeviceOnly;
-        reservation.span.chunks.as_mut().unwrap().table = seismic_topology::Contract::DeviceOnly;
-        memory.device().ledger().set_bound(Some(4096 + 63));
-        assert!(allocate_reservation(limits, &memory, reservation, 4096, 4096,
-            || panic!("combined backing and table exceed their shared placement")).is_err());
-        assert_eq!(memory.device().ledger().view().charged, 0);
-        memory.device().ledger().set_bound(Some(4096 + 64));
-        assert!(allocate_reservation(limits, &memory, reservation, 4096, 4096, || {
-            assert_eq!(memory.device().ledger().view().charged, 4096 + 64);
-            Err(ExecutionError::AllocationFailed("native allocation refused".into()))
-        }).is_err());
-        assert_eq!(memory.device().ledger().view().charged, 0);
-    }
-
-    #[test]
-    fn reservation_placement_keeps_table_charge_when_backing_shrinks() {
-        let memory = split_memory();
-        let granule = seismic_reservation::host_page().unwrap();
-        let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
-        let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
-        let service = Arc::new(seismic_cpu::Device);
-        let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {
-            let (buffer, resizer) = service.allocate_reserved(2 * granule, 8 * granule, granule)?;
-            Ok((buffer_storage::<seismic_cpu::Cpu, seismic_cpu::Executor>(&service, buffer),
-                crate::backends::ReservedResizer::Cpu(resizer), Some((64, Box::new(EmptyStorage)))))
-        }).unwrap();
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 2 * granule);
-        assert_eq!(memory.upload().ledger().view().charged, 64);
-        assert_eq!(memory.device().ledger().view().charged, 0);
-        let pending = resizer.prepare(1).unwrap().install().unwrap();
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 2 * granule);
-        let resizer = pending.release();
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, granule);
-        assert_eq!(memory.upload().ledger().view().charged, 64);
-        let resizer = resizer.recommit(2).unwrap();
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 2 * granule);
-        assert_eq!(memory.upload().ledger().view().charged, 64);
-        drop(resizer);
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 0);
-        assert_eq!(memory.upload().ledger().view().charged, 0);
-    }
-
     /// Transfer-queue work, pending until a waiter completes it.
     #[derive(Default)]
     struct TransferBatch {
@@ -2387,9 +1675,7 @@ mod physical_slot_tests {
 
     #[test]
     fn dropping_an_allocation_waits_for_its_in_flight_transfer() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(8).unwrap();
-        let allocation = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
         let batch = transfer_beside_finished_compute(&allocation, true);
         assert!(!allocation.device_idle(), "a transfer still uses it");
         drop(allocation);
@@ -2398,10 +1684,8 @@ mod physical_slot_tests {
 
     #[test]
     fn host_access_waits_for_an_in_flight_transfer() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let source = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
-        let destination = Allocation::new(2, 8, reservation.take(8), Box::new(EmptyStorage));
+        let source = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let destination = Allocation::new(2, 8, Box::new(EmptyStorage));
         let read = transfer_beside_finished_compute(&source, false);
         let written = transfer_beside_finished_compute(&destination, true);
         // A host read of the source does not wait for the copy reading it.
@@ -2426,9 +1710,7 @@ mod physical_slot_tests {
 
     #[test]
     fn a_faulted_write_ends_its_use_and_fails_what_reads_after_it() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(8).unwrap();
-        let allocation = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
         allocation.record_device_use(DeviceQueue::Native(NativeQueue::Fill), Arc::new(FaultedUse), true);
         assert!(allocation.device_idle(), "a fault ends the use");
         assert!(allocation.acquire(false).is_err(), "a host read receives the fault");
@@ -2444,9 +1726,7 @@ mod physical_slot_tests {
     /// nothing.
     #[test]
     fn native_work_follows_the_other_native_queues_conflicting_fences() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let allocation = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
         let pending = || Arc::new(PendingUse(Arc::new(AtomicBool::new(false))));
         let order = |queue, write| allocation.queue_order(queue, write).unwrap().len();
         // Compute reads it; a fill read follows nothing, a fill write the read.
@@ -2466,7 +1746,7 @@ mod physical_slot_tests {
         read.0.store(true, Ordering::SeqCst);
         assert_eq!(order(NativeQueue::Fill, true), 0, "the compute read completed");
         // Words whose users' protocol orders them order no queue.
-        let words = Allocation::new(2, 8, reservation.take(8), Box::new(EmptyStorage));
+        let words = Allocation::new(2, 8, Box::new(EmptyStorage));
         words.order_by_protocol();
         words.record_device_use(DeviceQueue::Native(NativeQueue::Fill), pending(), true);
         assert!(words.queue_order(NativeQueue::Compute, true).unwrap().is_empty());
@@ -2481,13 +1761,10 @@ mod physical_slot_tests {
     /// A transfer is encoded while compute work is being encoded into the
     /// same allocation (a step's submission, which can block in the driver
     /// behind a parked kernel the transfer answers): device encodings never
-    /// exclude each other. Host access still excludes both, and an install
-    /// excludes every holder.
+    /// exclude each other. Host access still excludes both.
     #[test]
     fn a_device_encoding_never_waits_for_another_queues_encoding() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(8).unwrap();
-        let allocation = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
         let compute = allocation.acquire_for_device(true);
         let transfer = allocation.acquire_for_device(true);
         assert!(allocation.try_acquire(false).is_none(), "host access waits for an encoding");
@@ -2503,40 +1780,12 @@ mod physical_slot_tests {
         assert!(!waiting.is_finished(), "a device write waits for a host read");
         drop(host);
         waiting.join().unwrap();
-        let exclusive = allocation.acquire_exclusive();
-        assert!(allocation.try_acquire(false).is_none(), "an install excludes host access");
-        drop(exclusive);
-    }
-
-    #[test]
-    fn shrinking_a_reservation_waits_for_its_in_flight_transfer() {
-        let memory = split_memory();
-        let granule = seismic_reservation::host_page().unwrap();
-        let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
-        let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
-        let service = Arc::new(seismic_cpu::Device);
-        let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {
-            let (buffer, resizer) = service.allocate_reserved(2 * granule, 8 * granule, granule)?;
-            Ok((buffer_storage::<seismic_cpu::Cpu, seismic_cpu::Executor>(&service, buffer),
-                crate::backends::ReservedResizer::Cpu(resizer), Some((64, Box::new(EmptyStorage)))))
-        }).unwrap();
-        let batch = transfer_beside_finished_compute(&resizer.allocation, true);
-        let pending = resizer.prepare(1).unwrap().install().unwrap();
-        assert!(!batch.waited.load(Ordering::SeqCst));
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, 2 * granule, "nothing is released before the copy completes");
-        let resizer = pending.release();
-        assert!(batch.waited.load(Ordering::SeqCst), "the shrink unbacks after the copy");
-        assert_eq!(memory.placement(seismic_topology::Placing::Fixed(seismic_topology::Contract::Shared)).ledger().view().charged, granule);
-        drop(resizer);
     }
 
     #[test]
     fn slab_and_table_share_one_hazard_group() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let table = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
-        let slab = Allocation::new_in(2, 8, reservation.take(8), Box::new(EmptyStorage), Some(table.access_group().clone()));
+        let table = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let slab = Allocation::new_in(2, 8, table.path, Box::new(EmptyStorage), Some(table.access_group().clone()));
         assert_eq!(table.access_identity(), slab.access_identity());
         let merged = crate::native::merge_access([(table.clone(), false), (slab.clone(), true)]);
         assert_eq!(merged.len(), 1);
@@ -2550,71 +1799,61 @@ mod physical_slot_tests {
         assert!(slab.try_acquire(true).is_some());
         drop(slab);
         drop(table);
-        assert_eq!(memory.ledger().view().charged, 0);
     }
 
     #[test]
     fn admitted_slot_owns_backing_charge_and_exclusive_access() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 16, Box::new(EmptyStorage));
         let weak = Arc::downgrade(&allocation);
         let permit = allocation.acquire(true).unwrap();
-        let resources = AdmittedResources::new(reservation, vec![permit]);
+        let resources = AdmittedResources::new(vec![permit]);
         drop(allocation);
-        assert_eq!(memory.ledger().view().charged, 16);
         assert!(resources.allocation(1).try_acquire(false).is_none());
         assert!(resources
             .access(resources.allocation(1))
             .owns(resources.allocation(1)));
         drop(resources);
         assert!(weak.upgrade().is_none());
-        assert_eq!(memory.ledger().view().charged, 0);
     }
 
     #[test]
-    fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
+    fn native_allocation_owner_enforces_target_limits_without_charging() {
         let devices = crate::devices::Devices::discover(&[]).unwrap();
-        let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
+        let id = devices.executor_of(registry::BackendName::Cpu).unwrap();
+        let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let device = devices.open_own(id, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
-        let baseline = opened.memory.device_ledger().view().charged;
+        let baseline = tally.held();
         let maximum = opened.device_description().limits().max_allocation_bytes;
-        let host_ram = device.topology().host_ram().capacity().value;
-        // The CPU's largest allocation is its address space, beyond host
-        // RAM, so host RAM's ledger refuses the request before the target
-        // limit is reached: what it could take is within host RAM. (Its
-        // exact room moves with the other tests charging host RAM in this
-        // process.) Nothing is allocated or kept.
-        assert!(host_ram < maximum);
+        // An allocation beyond the target's limit is refused before the
+        // backend allocates or charges anything.
         let error = opened
             .allocate_storage(maximum.checked_add(1).unwrap(), 4)
             .err()
-            .expect("an allocation beyond every bound is refused before allocating");
+            .expect("an allocation beyond the target limit is refused before allocating");
         assert!(matches!(
             error,
             ExecutionError::AllocationCapacity { required, available }
-                if required == (maximum + 1).into() && available <= host_ram
+                if required == (maximum + 1).into() && available == maximum
         ));
-        assert_eq!(opened.memory.device_ledger().view().charged, baseline);
+        assert_eq!(tally.held(), baseline);
         assert!(matches!(
             opened.allocate_storage(4, 0),
             Err(ExecutionError::ConstructionContradiction(_))
         ));
-        assert_eq!(opened.memory.device_ledger().view().charged, baseline);
+        assert_eq!(tally.held(), baseline);
     }
 
     #[test]
     fn reached_slots_release_dead_capacity_and_preserve_live_permits_on_refusal() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        let mut resources = AdmittedResources::new(vec![]);
         resources.set_reached_budget(24);
         resources.declare_private(100);
         resources.declare_private(101);
         let make = |id, bytes| {
-            let mut reservation = memory.reserve(bytes).unwrap();
-            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+            Allocation::new(id, bytes, Box::new(EmptyStorage))
         };
         let first = make(1, 16);
         resources.check_reached_capacity(16).unwrap();
@@ -2633,29 +1872,23 @@ mod physical_slot_tests {
             .try_acquire(false)
             .is_none());
         resources.retire_private(100);
-        assert_eq!(memory.ledger().view().charged, 0);
         resources.check_reached_capacity(24).unwrap();
         let second = make(2, 24);
         resources.install_private(101, second.acquire(true).unwrap());
         drop(second);
-        assert_eq!(memory.ledger().view().charged, 24);
         assert_eq!(resources.reached_allocated(), 40);
         drop(resources);
-        assert_eq!(memory.ledger().view().charged, 0);
     }
 
     #[test]
     fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        memory.ledger().set_bound(Some(24));
-        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        let mut resources = AdmittedResources::new(vec![]);
         resources.set_reached_budget(24);
         for slot in [100, 101, 102] {
             resources.declare_private(slot);
         }
         let make = |id, bytes| {
-            let mut reservation = memory.reserve(bytes).unwrap();
-            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+            Allocation::new(id, bytes, Box::new(EmptyStorage))
         };
         let dead = make(1, 16);
         let live = make(2, 8);
@@ -2664,44 +1897,34 @@ mod physical_slot_tests {
         let pending = dead.clone();
         drop(dead);
         drop(live);
-        assert!(memory.reserve(16).is_err());
         assert!(resources.check_reached_capacity(16).is_err());
-        assert_eq!(memory.ledger().view().charged, 24);
         // The compiler's successful prefix completion precedes this release;
         // backend references and the slot's permit must both be gone.
         drop(pending);
         resources.retire_private(100);
-        assert_eq!(memory.ledger().view().charged, 8);
         resources.check_reached_capacity(16).unwrap();
         let replacement = make(3, 16);
         resources.install_private(102, replacement.acquire(true).unwrap());
         drop(replacement);
-        assert_eq!(memory.ledger().view().charged, 24);
         assert!(resources
             .private_backing(101)
             .unwrap()
             .try_acquire(false)
             .is_none());
-        assert!(memory.reserve(1).is_err());
         drop(resources);
-        assert_eq!(memory.ledger().view().charged, 0);
     }
 
     #[test]
     fn published_backing_survives_slot_release_without_retaining_its_permit() {
-        let memory = Placement::on(crate::memory::StoreLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
-        let resources = AdmittedResources::new(reservation, vec![allocation.acquire(true).unwrap()]);
+        let allocation = Allocation::new(1, 16, Box::new(EmptyStorage));
+        let resources = AdmittedResources::new(vec![allocation.acquire(true).unwrap()]);
         drop(allocation);
         let published = resources.allocation(1).clone();
         drop(resources);
-        assert_eq!(memory.ledger().view().charged, 16);
         let read = published
             .try_acquire(false)
             .expect("completed run released its exclusive access");
         drop(read);
         drop(published);
-        assert_eq!(memory.ledger().view().charged, 0);
     }
 }

@@ -243,19 +243,21 @@ impl<'a> QualificationView<'a> {
         let width = element.dtype().expect("dense qualified binding").bytes() as usize;
         let source = (0..4 * width).map(|byte| byte as u8).collect::<Vec<_>>();
         let make_store = |initial: &[u8]| -> Result<seismic::SlabTensor, CatalogFailure> {
-            let mut store = seismic::SlabTensor::new(
+            let store = crate::experts::pooled_slabs(
                 device,
+                seismic::Contract::DeviceOnly,
                 1,
                 2,
-                vec![seismic::SlabRegion {
+                &[seismic::SlabRegion {
                     element,
                     row_shape: vec![1, 2],
                 }],
+                2,
             )
             .map_err(|error| qualification("copy_rows", binding, error))?;
             for row in 0..2 {
                 store
-                    .add_slab()
+                    .add_slab(seismic::SlabFill::Zeroed)
                     .map_err(|error| qualification("copy_rows", binding, error))?;
                 store
                     .region_rows(0, row, 1)

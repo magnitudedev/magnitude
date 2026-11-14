@@ -677,16 +677,12 @@ mod tests {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
         let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).expect("the CPU backend opens");
         let shape = std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() });
-        let ledgers = DeviceLedgers::open_in(&Ledgers::new(), &device, shape);
-        let at = std::time::Instant::now();
-        for ledger in [ledgers.device(), ledgers.host()] {
-            ledger.read(ledger.sampled(at), Ok(crate::memory::ledger::Available::new(8 << 30, 8 << 30, None).expect("a reading")));
-        }
+        let (ledgers, _) = DeviceLedgers::open_in(&Ledgers::new(), &device, shape)
+            .read_scripted(crate::memory::supply::Reading::device(8 << 30, 8 << 30, crate::domain::fixtures::NO_LAG));
         let held = ledgers.claim(&device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() }).expect("room");
         let slot = super::Claimed::allocate(held, || Ok::<_, ()>(())).expect("made");
-        assert_eq!(ledgers.device().snapshot().allocated(), 1 << 20, "the freed slot's claim is held until its release");
+        assert_eq!(ledgers.device().estimate().committed(), 1 << 20, "the freed slot's claim is held until its release");
         assert_eq!(slot.release(|()| 0), 0);
-        assert_eq!(ledgers.device().snapshot().committed(), 0, "the released slot's claim is gone");
-        assert_eq!(ledgers.device().snapshot().allocated(), 0);
+        assert_eq!(ledgers.device().estimate().committed(), 0, "the released slot's claim is gone");
     }
 }

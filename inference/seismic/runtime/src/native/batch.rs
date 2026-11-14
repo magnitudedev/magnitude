@@ -104,7 +104,8 @@ impl DispatchList for BatchCalls<'_> {
         }
     }
 
-    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>) {
+    #[cfg(any(test, target_os = "macos"))]
+    fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>) {
         self.0[index].1.reaches(reaches);
     }
 

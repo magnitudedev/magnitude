@@ -284,9 +284,10 @@ impl KernelCache {
     }
 
     /// The machine's own generic figures kept in the kernel cache at `root`,
-    /// measured once per machine and keyed by its identity (the host's page
-    /// fill rate, `platform::StoreMotion::of_machine`). Eviction leaves them
-    /// alone.
+    /// measured once per machine and keyed by its identity (the host's
+    /// page-release rate, `platform::ReleaseRate::of_machine`; a volume's
+    /// write rate, `platform::VolumeReserve::of_volume`). Eviction leaves
+    /// them alone.
     pub fn machine_figures(root: &Path) -> JsonFileStore {
         JsonFileStore::new(&root.join(MACHINE_FIGURES))
     }

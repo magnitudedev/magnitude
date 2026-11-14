@@ -2194,29 +2194,25 @@ pub(super) fn rotation_sets(cache: u64, bytes: u64) -> u64 {
 }
 
 /// One allocation route of the executor's placements, and how an operand
-/// is allocated along it: in the first storage kind whose placement reaches
-/// it, passing over the paths before it there. A route is one of the
-/// executor's kinds (`seismic::NativeKind`), whose memory every path it is
-/// charged along allocates, so one rate is measured per route.
+/// is allocated along it: in the first storage kind whose placement names
+/// it, confined to the route's kind ([`Device::in_kind`]). A route is one
+/// of the executor's kinds (`seismic::NativeKind`), whose memory every path
+/// it is charged along allocates, so one rate is measured per route.
 struct Route {
     route: NativeKind,
     storage: OperandStorage,
-    /// The placement's paths before the route's first: each is held at what
-    /// it has charged while an operand allocates, so the allocation moves
-    /// on along the placement (spec §2.3).
-    passed: Vec<AccessPathId>,
     /// The placement's paths along the route, where an operand must land.
     along: Vec<AccessPathId>,
 }
 
 /// The kinds of `storage`'s placement an operand can be allocated along,
 /// in order: a kind every path of which an earlier one of the placement is
-/// charged along is no route of its own, as an allocation is steered only
-/// by the paths it passes over.
+/// charged along is no route of its own, as its memory is measured along
+/// those paths already.
 fn routes_of<'a>(topology: &'a DeviceTopology, executor: &Executor, storage: OperandStorage) -> Vec<&'a seismic::Kind> {
     let mut reached: Vec<AccessPathId> = Vec::new();
     let mut routes = Vec::new();
-    for id in executor.placement(seismic::Placing::Fixed(storage.kind())) {
+    for id in executor.placement(storage.kind()) {
         let kind = topology.kind(*id).expect("a placement's kinds belong to its topology");
         if kind.paths().iter().any(|path| !reached.contains(path)) {
             reached.extend(kind.paths());
@@ -2242,18 +2238,12 @@ impl Routes {
 }
 
 impl Route {
-    /// The route of `kind`, one of `storage`'s placement on `executor`: in
-    /// `storage`, passing over the placement's paths before its first.
-    fn of(executor: &Executor, storage: OperandStorage, kind: &seismic::Kind) -> Self {
-        let placement = executor.paths(seismic::Placing::Fixed(storage.kind()));
-        let first = placement
-            .iter()
-            .position(|path| *path == kind.paths()[0])
-            .expect("a placement's kinds are charged along its paths");
+    /// The route of `kind`, one of `storage`'s placement: in `storage`,
+    /// confined to `kind`.
+    fn of(storage: OperandStorage, kind: &seismic::Kind) -> Self {
         Self {
             route: kind.native(),
             storage,
-            passed: placement[..first].to_vec(),
             along: kind.paths().to_vec(),
         }
     }
@@ -2284,7 +2274,6 @@ impl Route {
         };
         let mut routes = Routes {
             device: Self::of(
-                executor,
                 OperandStorage::Device,
                 routes_of(topology, executor, OperandStorage::Device)[0],
             ),
@@ -2293,7 +2282,7 @@ impl Route {
         for storage in OperandStorage::ALL {
             for kind in routes_of(topology, executor, storage) {
                 if !routes.iter().any(|known| known.route == kind.native()) {
-                    routes.others.push(Self::of(executor, storage, kind));
+                    routes.others.push(Self::of(storage, kind));
                 }
             }
         }
@@ -2308,46 +2297,14 @@ impl Route {
         ]
     }
 
-    /// `allocate`'s tensors, allocated passing over the route's earlier
-    /// paths, each landed along the route. The job's device holds no path
-    /// limit of its own (the measurement job opens it without a ceiling),
-    /// so the passed paths are released to none after.
+    /// `allocate`'s tensors, allocated confined to the route's kind
+    /// ([`Device::in_kind`]), each landed along the route.
     fn place(
         &self,
         device: &Device,
         allocate: impl FnOnce() -> Result<Vec<Tensor>, ExecutorCostsError>,
     ) -> Result<Vec<Tensor>, ExecutorCostsError> {
-        let error = failed("placing an operand");
-        let charges = device
-            .ledgers()
-            .paths
-            .into_iter()
-            .map(|path| (path.path, path.claim))
-            .collect::<BTreeMap<_, _>>();
-        // Every path held is released whatever fails: the limits set before
-        // a failure to set one, and after the allocation.
-        let bounds = device.bounds();
-        let mut held = Vec::with_capacity(self.passed.len());
-        let mut holding = Ok(());
-        for path in &self.passed {
-            let charged = charges.get(path).copied().unwrap_or(0);
-            holding = bounds.bound(seismic::Ledger::Path(*path), Some(charged));
-            if holding.is_err() {
-                break;
-            }
-            held.push(*path);
-        }
-        let allocated = holding
-            .map_err(|cause| error(&cause))
-            .and_then(|()| allocate());
-        let released = held
-            .iter()
-            .fold(Ok(()), |released, path| {
-                released.and(bounds.bound(seismic::Ledger::Path(*path), None))
-            })
-            .map_err(|cause| error(&cause));
-        let tensors = allocated?;
-        released?;
+        let tensors = device.in_kind(self.route, allocate)?;
         for tensor in &tensors {
             let charges = tensor
                 .observe_storage()
@@ -2891,9 +2848,10 @@ fn largest_plane(layout: KvCodec, depth: u64) -> Result<u64, ExecutorCostsError>
 }
 
 /// The slab store of one sequence's `layout` history at `depth` tokens, as
-/// the engine's geometry rule lays out a store of its `depth` + 1 rows: its
+/// the engine's geometry rule lays out a store of its `depth` + 1 rows in
+/// the granules of a state pool of it alone (`planning::state_pool_granule`): its
 /// rows per slab, regions, slab layout and slabs. A slab holds no more
-/// pages than the rows take: the rule's slabs fill a byte target that a
+/// pages than the rows take: the rule's slabs fill a granule that a
 /// shallow history reads a small part of, and every argument set of a
 /// rotation holds a store of its own, so a rotation of many shallow sets
 /// would allocate many times the bytes it spans (625 sets of 64 MiB, 41 GB,
@@ -2903,14 +2861,6 @@ fn history_store(
     depth: u64,
 ) -> Result<(u64, Vec<SlabRegion>, SlabLayout, u64), ExecutorCostsError> {
     let rows = depth + 1;
-    let geometry = magnitude_state::history_geometry(
-        token_bytes(layout)?,
-        usize::try_from(rows).map_err(|_| ExecutorCostsError("depth exceeds usize".into()))?,
-        0,
-    )
-    .map_err(ExecutorCostsError)?;
-    let page_rows = geometry.page_rows as u64;
-    let rows_per_slab = (geometry.slab_rows as u64).min(rows.next_multiple_of(page_rows));
     let regions = planes(layout)?
         .into_iter()
         .map(|(element, width)| SlabRegion {
@@ -2918,25 +2868,49 @@ fn history_store(
             row_shape: vec![KV_HEADS, width],
         })
         .collect::<Vec<_>>();
+    let pages = magnitude_state::history_pages(
+        usize::try_from(rows).map_err(|_| ExecutorCostsError("depth exceeds usize".into()))?,
+        0,
+    );
+    let page_rows = pages.page_rows as u64;
+    let page = SlabLayout::for_regions(page_rows, page_rows, &regions).map_err(|cause| failed("history slabs")(&cause))?;
+    let granule = crate::planning::state_pool_granule(Some(crate::planning::PoolSlab::of(&page))).map_err(ExecutorCostsError)?;
+    let geometry = pages.in_granule(token_bytes(layout)?, granule).map_err(ExecutorCostsError)?;
+    let rows_per_slab = (geometry.slab_rows as u64).min(rows.next_multiple_of(page_rows));
     let slab = SlabLayout::for_regions(rows_per_slab, rows, &regions)
         .map_err(|cause| failed("history slabs")(&cause))?;
     Ok((rows_per_slab, regions, slab, rows.div_ceil(rows_per_slab)))
 }
 
-/// The bytes from one slab's start to the next's in a run of them: its
-/// bytes, to the next multiple of its alignment.
-fn slab_stride(slab: &SlabLayout) -> u64 {
-    slab.slab_bytes.next_multiple_of(slab.slab_alignment)
+/// A history's run of storage: each region's plane of the `slabs` slabs'
+/// rows, one after another, each starting at a multiple of the slab
+/// alignment. The offset of each plane, and the run's bytes.
+fn history_planes(
+    regions: &[SlabRegion],
+    rows_per_slab: u64,
+    slabs: u64,
+    slab: &SlabLayout,
+) -> Result<(Vec<u64>, u64), ExecutorCostsError> {
+    let mut end = 0;
+    let mut offsets = Vec::with_capacity(regions.len());
+    for region in regions {
+        offsets.push(end);
+        let extents = std::iter::once(slabs * rows_per_slab).chain(region.row_shape.iter().copied()).collect::<Vec<_>>();
+        let (bytes, _) = Tensor::canonical_layout(region.element, &extents).map_err(|cause| failed("history planes")(&cause))?;
+        end += bytes.next_multiple_of(slab.slab_alignment);
+    }
+    Ok((offsets, end))
 }
 
 impl AttendCase {
     /// The rotated operand of `sets` argument sets: each set's history, one
     /// run of its store's slabs.
     fn operand(layout: KvCodec, depth: u64, sets: u64) -> Result<Operand, ExecutorCostsError> {
-        let (_, _, slab, slabs) = history_store(layout, depth)?;
+        let (rows_per_slab, regions, slab, slabs) = history_store(layout, depth)?;
+        let (_, bytes) = history_planes(&regions, rows_per_slab, slabs, &slab)?;
         Ok(Operand {
             element: Element::bool(),
-            extents: vec![slabs * slab_stride(&slab)],
+            extents: vec![bytes],
             count: sets,
             alignment: slab.slab_alignment,
         })
@@ -3056,22 +3030,24 @@ impl AttendCase {
         let destinations = host(Element::i32(), &[1], words(&history.destinations))?;
         // Each set's history in a store of its own over its run of slabs.
         let (rows_per_slab, regions, slab, slabs) = history_store(layout, depth)?;
+        let (offsets, _) = history_planes(&regions, rows_per_slab, slabs, &slab)?;
+        let pool = crate::experts::fixture_pool(device, seismic::Contract::DeviceOnly, rows_per_slab, rows, &regions, slabs)
+            .map_err(|cause| error(&cause))?;
         let slab_rows = u32::try_from(rows_per_slab)
             .map_err(|_| ExecutorCostsError("history slab rows exceed u32".into()))?;
         histories
             .into_iter()
             .map(|run| {
-                let views = (0..slabs)
-                    .map(|index| {
-                        run.region(
-                            Element::bool(),
-                            &[slab.slab_bytes],
-                            index * slab_stride(&slab),
-                        )
+                let lent = regions
+                    .iter()
+                    .zip(&offsets)
+                    .map(|(region, &offset)| {
+                        let extents = std::iter::once(slabs * rows_per_slab).chain(region.row_shape.iter().copied()).collect::<Vec<_>>();
+                        run.region(region.element, &extents, offset)
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|cause| error(&cause))?;
-                let store = SlabTensor::over(device, rows_per_slab, rows, regions.clone(), views)
+                let store = SlabTensor::in_pool_over(&pool, rows_per_slab, rows, &regions, lent)
                     .map_err(|cause| error(&cause))?;
                 // The row the call appends, at `depth`, in every plane.
                 backings.writes(
@@ -3352,12 +3328,6 @@ fn output(weight: Element, features: u64) -> Formation<dense_output::Entry> {
 fn copy() -> Formation<conditioning_overlay::Entry> {
     Formation::new(conditioning_overlay::native_entry(), &[])
 }
-
-/// The records a move point moves at once, here and in a bank form's move
-/// line (`MoveForm`): a whole bank's first shrink moves tens a layer, and
-/// `routed_move` copies `LIST_ROWS` records at a time, so its time grows by
-/// one such pass per `LIST_ROWS` records from here on.
-pub(super) const MOVED_RECORDS: u64 = 32;
 
 fn attend<E: Attention>(layout: KvCodec) -> Result<Formation<E>, ExecutorCostsError> {
     Ok(Formation::new(E::entry(), &attention_values(layout)?))
@@ -4825,8 +4795,8 @@ pub(super) fn executor_identity(
 /// what became of each point as soon as it is known. A standing point its
 /// time ends before any sample is priced ([`unreached`]), unless it reads a
 /// required figure; that one and a load's expire ([`Outcome::Expired`]),
-/// unrecorded. The device holds no path limit: a walk passes over a
-/// placement's paths by holding them. The walks share
+/// unrecorded. A walk allocates a route's operands confined to its kind
+/// ([`Route::place`]). The walks share
 /// the job's kernels and backings, so a point one walk stored another
 /// loads.
 pub(super) struct Walks<'a, 'd> {
@@ -5327,7 +5297,6 @@ mod tests {
         let route = |storage| Route {
             route: crate::assessment::fixtures::kind(0),
             storage,
-            passed: Vec::new(),
             along: Vec::new(),
         };
         let (device, upload) = (route(OperandStorage::Device), route(OperandStorage::Upload));
@@ -5364,7 +5333,6 @@ mod tests {
         let route = |kind, storage| Route {
             route: crate::assessment::fixtures::kind(kind),
             storage,
-            passed: Vec::new(),
             along: Vec::new(),
         };
         let (device, pinned, upload) =

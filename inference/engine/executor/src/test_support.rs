@@ -22,25 +22,39 @@ pub(crate) fn process_placement() -> MutexGuard<'static, ()> {
 /// Open executor `id` of `catalog` as every test does: forming through the
 /// user store, the one store of the process (`seismic::ProgramStore::user`),
 /// so each program is compiled once however many tests and test processes
-/// load it, and as a
-/// device of its own, in its own ledger scope
-/// (`seismic::testing::open_own_ledgers`). Tests share a process, and a
-/// ledger has one holder of the right to bound it: a device of the test's
-/// own shares no ledger with another test's, so neither moves the other's
-/// room, and a test that still shares one panics as a second holder takes
-/// that right (`seismic::Device::bounds`).
+/// load it, and as a device of its own over unbounded tallies of its stores
+/// (`seismic::testing::open_tallied`), with its device store's tally. Tests
+/// share a process, and a device of the test's own shares no store counts
+/// with another test's, so neither moves the other's room.
+pub(crate) fn open_tallied(
+    catalog: &seismic::Devices,
+    id: seismic::ExecutorId,
+) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    seismic::testing::open_tallied(catalog, id, Default::default())
+}
+
+/// [`open_tallied`] without the tally, for a test that reads no memory.
 pub(crate) fn open(catalog: &seismic::Devices, id: seismic::ExecutorId) -> Result<seismic::Device, seismic::OpenError> {
-    seismic::testing::open_own_ledgers(catalog, id, Default::default())
+    open_tallied(catalog, id).map(|(device, _)| device)
 }
 
 /// Open the first executor of `backend` in `catalog` as every test does
-/// ([`open`]).
+/// ([`open_tallied`]).
+#[cfg(test)]
+pub(crate) fn open_backend_tallied(
+    catalog: &seismic::Devices,
+    backend: seismic::BackendName,
+) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    seismic::testing::open_backend_tallied(catalog, backend, Default::default())
+}
+
+/// [`open_backend_tallied`] without the tally.
 #[cfg(test)]
 pub(crate) fn open_backend(
     catalog: &seismic::Devices,
     backend: seismic::BackendName,
 ) -> Result<seismic::Device, seismic::OpenError> {
-    seismic::testing::open_backend_own_ledgers(catalog, backend, Default::default())
+    open_backend_tallied(catalog, backend).map(|(device, _)| device)
 }
 
 /// Whether a test runs on `backend` ([`seismic::testing::selected`]): the
@@ -70,17 +84,14 @@ pub(crate) fn check_kernels(
 /// figure, never the host's reading of the moment, so a test checks the same
 /// thing wherever it runs.
 pub(crate) fn selected_with_room(catalog: &seismic::Devices, host_bytes: u64) -> crate::platform::SelectedDevice {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
-    let real = crate::platform::select_device(catalog, crate::ExecutionPath::Native, crate::platform::DeviceRequest::Automatic, &reserves)
+    let release = crate::platform::ReleaseRate::of_machine(None);
+    let real = crate::platform::select_device(catalog, crate::ExecutionPath::Native, crate::platform::DeviceRequest::Automatic, &release)
         .expect("the host has a device");
     let mut status = real.reading.status.clone();
-    let host = status.sample.host_ram.as_mut().expect("the host reads its memory");
-    host.allocatable = seismic::Reported::new(host_bytes, host.allocatable.by);
-    host.reclaimable = 0;
-    host.limits.clear();
+    status.sample.host.total = host_bytes;
+    status.sample.host.supply = seismic::Supply { free_above_target: host_bytes, clean_cache: 0, cold_reclaimable: 0 };
     status.sample.grants.clear();
-    crate::platform::selected(&real.reading.topology, &status, &reserves, real.info, real.graph_cost)
-        .expect("a device with a fixed room is selected")
+    crate::platform::selected(&real.reading.topology, &status, &release, real.info, real.graph_cost)
 }
 
 /// Whether `selected` is a device backend: a test that streams experts or

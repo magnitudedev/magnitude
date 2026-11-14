@@ -1,8 +1,8 @@
 use magnitude_state::{
     BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainId,
     HistoryDomainLayout, HistoryDomainPlan, Holder, LayerRef, OwnedAdvanceResolution,
-    OwnedStateAdvance, OwnedTailRelocation, SLAB_ROW_TILE, SequenceState, StateStore,
-    StoreBindings,
+    NextSteps, OwnedStateAdvance, OwnedTailRelocation, SLAB_ROW_TILE,
+    SequenceState, StateStore, StoreBindings,
 };
 
 /// The one history domain of these stores.
@@ -18,13 +18,23 @@ fn occupied(store: &StateStore) -> usize {
         .map(|domain| store.occupied_rows(domain))
         .sum()
 }
-use seismic::{BackendName, DType, Device, Tensor};
-use std::rc::Rc;
-fn device() -> Device {
-    seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap()
+use seismic::{BackendName, DType, Device, Pool, Tensor};
+use std::{rc::Rc, sync::Arc};
+/// The granule of these stores' pool: 64 MiB, which every slab of their
+/// rows fits.
+const GRANULE: u64 = 64 << 20;
+
+/// A store's own CPU device and the granule pool of its device store, of
+/// [`GRANULE`]-byte granules, one a block: each slab a block of its own.
+fn device() -> (Rc<Device>, Pool) {
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let (device, tally) =
+        seismic::testing::open_backend_tallied(&catalog, BackendName::Cpu, Default::default()).unwrap();
+    let entry: Arc<dyn seismic::memory::Entry> = Arc::new(tally);
+    let pool = device
+        .pool(seismic::Contract::DeviceOnly, GRANULE, GRANULE, seismic::PoolEntries::one(entry))
+        .unwrap();
+    (Rc::new(device), pool)
 }
 fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_state::Error> {
     let mut tensor = tensor.clone();
@@ -56,8 +66,10 @@ fn store(history: bool, values: bool) -> StoreBindings {
 /// A store of histories of at most `context` rows, with `pages` history
 /// pages.
 fn store_with(history: bool, values: bool, context: usize, pages: usize) -> StoreBindings {
+    let (device, pool) = device();
     StateStore::new(
-        Rc::new(device()),
+        device,
+        pool,
         context,
         16,
         if history {
@@ -315,6 +327,15 @@ fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
     assert_eq!(c.history_ranges(TOKEN), [(4, 3)]);
     assert_eq!(occupied(&store), 3);
 }
+/// Release an idle store's slabs: with no live sequence its next steps
+/// claim nothing, so every slab without a referenced row goes (the banks
+/// keep the zero seed's), and the pool returns what they freed to the OS,
+/// every byte of it: the bytes returned.
+fn shrink_idle(store: &mut StoreBindings) -> u64 {
+    let freed = store.shrink(&NextSteps::default()).unwrap();
+    assert_eq!(store.pool().return_freed(freed).unwrap(), freed, "an idle store's freed slabs return whole");
+    freed
+}
 #[test]
 fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
@@ -322,7 +343,9 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         let mut parent = store.create().unwrap();
         // A store starts with one backed history slab per history domain.
         assert_eq!(store.history_planes().unwrap().is_empty(), !history);
-        assert_eq!(store.release_idle().unwrap(), 0);
+        // A live sequence's next step keeps the slab it grows into.
+        let next = NextSteps { rows: parent.demands(1), banks: 1 };
+        assert_eq!(store.shrink(&next).unwrap(), 0);
         parent = accept(&store, parent, 4);
         let old = store.history_planes().unwrap();
         let checkpoint = parent.checkpoint();
@@ -338,15 +361,16 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         drop(parent);
         drop(branch);
         drop(checkpoint);
-        // Slab placement cannot change under a live binding of its planes:
-        // releasing them is refused until the binding is dropped.
+        // A live binding of its planes reads through the slab store's
+        // address table, which stays valid as slabs are released: it holds
+        // no slab, and the idle store returns its one history slab's block.
         for buffer in &old {
             let bytes = read(&buffer.buffer.slice_leading(0, 4).unwrap());
             assert!(!bytes.is_empty());
         }
-        assert_eq!(store.release_idle().is_err(), history);
+        assert_eq!(shrink_idle(&mut store), if history { GRANULE } else { 0 });
         drop(old);
-        store.release_idle().unwrap();
+        assert_eq!(shrink_idle(&mut store), 0);
         assert!(store.history_planes().unwrap().is_empty());
         // An idle store returns its committed history. Advances never grow
         // the store: the binding right provisions first.
@@ -354,15 +378,8 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         store.provision(&parent.demands(4), 1).unwrap();
         parent = accept(&store, parent, 4);
         drop(parent);
-        // Its one history slab, the full slab byte target.
-        assert_eq!(
-            store.release_idle().unwrap() as u64,
-            if history {
-                magnitude_state::SLAB_BYTE_TARGET
-            } else {
-                0
-            }
-        );
+        // Its one history slab, a whole granule.
+        assert_eq!(shrink_idle(&mut store), if history { GRANULE } else { 0 });
     }
 }
 #[test]
@@ -420,8 +437,10 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let fork = fork.abort();
     drop(pinned);
     assert_eq!(reclaimable(&[&fork]), 48);
+    let (device, pool) = device();
     let other = StateStore::new(
-        Rc::new(device()),
+        device,
+        pool,
         16,
         16,
         vec![],

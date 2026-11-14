@@ -48,13 +48,13 @@ fn clamped_fixture(device: &seismic::Device, limit: Option<GluLimit>) -> (SiteLa
     let records = |data: &[f32], rows: usize, columns: usize| {
         let bytes = data.iter().flat_map(|value| Bf16::narrow(*value).to_le_bytes()).collect::<Vec<u8>>();
         let tensor = Tensor::shared(device, element, &[RECORDS as u64, rows as u64, columns as u64]).unwrap();
-        let placement = tensor.record_placement().unwrap();
+        let records = Records::rows(&tensor, (rows * columns * 2) as u64, RECORDS as u64).unwrap();
         for record in 0..RECORDS {
             let at = record * rows * columns * 2;
-            // SAFETY: no work uses the tensor.
-            unsafe { tensor.write_shared(placement.offset(record as u64), &bytes[at..at + rows * columns * 2]).unwrap() };
+            // SAFETY: no work uses the records.
+            unsafe { records.tensor(record as u64).write_shared(0, &bytes[at..at + rows * columns * 2]).unwrap() };
         }
-        SiteRecords::new(Records::new(tensor, (rows * columns * 2) as u64, RECORDS as u64).unwrap(), rows, columns, element).unwrap()
+        SiteRecords::new(records, rows, columns, element).unwrap()
     };
     let tensors = SiteTensors { gate: Some(records(&values[0], f, h)), up: records(&values[1], f, h), down: records(&values[2], h, f) };
     (SiteLayer::owned(device, tensors, scales(), shape).unwrap(), values)
@@ -386,16 +386,15 @@ fn packed(device: &seismic::Device, h: usize, f: usize, count: usize) -> SiteTen
         let record = [1, rows as u64, columns as u64];
         let stored_bytes = source.canonical_byte_len(&record).unwrap() as usize;
         let tensor = Tensor::shared(device, resident, &[count as u64, rows as u64, columns as u64]).unwrap();
-        let placement = tensor.record_placement().unwrap();
+        let records = Records::rows(&tensor, tensor.byte_len() / count as u64, count as u64).unwrap();
         for index in 0..count as u32 {
             let bytes = (0..stored_bytes).map(|at| ((at as u32).wrapping_mul(2_654_435_761).wrapping_add(seed + index) >> 24) as u8).collect();
             let stored = resident.finite_source(source, &record, bytes).unwrap();
             let converted = resident.repack_host(source, &record, &stored).unwrap();
-            // SAFETY: no work uses the tensor.
-            unsafe { tensor.write_shared(placement.offset(u64::from(index)), &converted).unwrap() };
+            // SAFETY: no work uses the records.
+            unsafe { records.tensor(u64::from(index)).write_shared(0, &converted).unwrap() };
         }
-        let bytes = placement.record();
-        SiteRecords::new(Records::new(tensor, bytes, count as u64).unwrap(), rows, columns, resident).unwrap()
+        SiteRecords::new(records, rows, columns, resident).unwrap()
     };
     SiteTensors {
         gate: Some(tensor("q4k@mma16", "gguf_q4_k", f, h, 1)),

@@ -51,22 +51,6 @@ pub enum ResidentTable {
 }
 
 impl ResidentTable {
-    /// Visit the tensors the table holds beside its weight: a streamed
-    /// table's directory, staging, landing staging and notice, a stored
-    /// table's directory.
-    pub(crate) fn visit_extra_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
-        match self {
-            Self::Whole => {}
-            Self::Streamed(table) => {
-                visit(&table.shared.directory);
-                table.staging.borrow().values().for_each(&mut *visit);
-                visit(&table.shared.landing_staging);
-                visit(&table.shared.notice);
-            }
-            Self::Stored(table) => visit(table.directory()),
-        }
-    }
-
     /// A table the device holds whole: a row is its own index.
     pub fn whole() -> Self {
         Self::Whole

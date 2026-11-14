@@ -43,6 +43,16 @@ pub enum HostTableError {
         expected: usize,
         actual: usize,
     },
+    /// The ledger refused a streamed table's row cache.
+    Refused(seismic::memory::Refused),
+    /// The host refused a streamed table's row cache.
+    Unallocated(seismic::memory::AllocationFailure),
+}
+
+impl From<seismic::memory::Refused> for HostTableError {
+    fn from(refused: seismic::memory::Refused) -> Self {
+        Self::Refused(refused)
+    }
 }
 
 impl fmt::Display for HostTableError {
@@ -57,6 +67,8 @@ impl fmt::Display for HostTableError {
                 formatter,
                 "host table gather buffer holds {actual} bytes where {expected} are gathered"
             ),
+            Self::Refused(refused) => write!(formatter, "host table row cache: {refused}"),
+            Self::Unallocated(failure) => write!(formatter, "host table row cache: {failure}"),
         }
     }
 }

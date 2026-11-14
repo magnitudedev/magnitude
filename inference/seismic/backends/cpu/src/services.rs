@@ -4,6 +4,8 @@
 use crate::Cpu;
 use seismic_compiler::executable::DeviceService;
 use crate::workers::{LaunchFrame, TeamBarrier, Workers};
+use seismic_memory::entry::Entry;
+use std::sync::Arc;
 use seismic_compiler::errors::TargetError;
 use seismic_estimator::{
     AnalyticalService, CoreService, CompositionQualificationCase, CompositionQualificationParts, ConcreteExecutionDemand,
@@ -333,20 +335,23 @@ pub(crate) fn probe_suite_revision() -> &'static str {
 /// Measurement-control constants affect acquisition only and never enter a
 /// duration expression. Every returned numeric service fact is observed on
 /// this open rather than copied from a nominal hardware table.
-pub(crate) fn probe_services(workers: &mut Workers) -> Result<Vec<ServiceDefinition>, TargetError> {
+/// `scratch` is the entry any scratch the probes' launches grow is charged
+/// to.
+pub(crate) fn probe_services(workers: &mut Workers, scratch: &Arc<dyn Entry>) -> Result<Vec<ServiceDefinition>, TargetError> {
     let worker_count = u32::try_from(workers.count())
         .map_err(|_| TargetError::UnsupportedDevice("CPU worker count exceeds u32::MAX".into()))?;
     let timer_resolution = timer_resolution()?;
     core_probes()
         .into_iter()
         .chain(backend_probes())
-        .map(|probe| probe_service(probe, workers, worker_count, timer_resolution))
+        .map(|probe| probe_service(probe, workers, scratch, worker_count, timer_resolution))
         .collect()
 }
 
 pub(crate) fn qualify_compositions(
     workers: &mut Workers,
     services: &[ServiceDefinition],
+    scratch: &Arc<dyn Entry>,
 ) -> Result<CompositionQualificationParts, TargetError> {
     let integer = backend_probes()
         .into_iter()
@@ -360,8 +365,8 @@ pub(crate) fn qualify_compositions(
     // per worker.
     let compose = |workers: &mut Workers, iterations: u64| -> Result<u64, TargetError> {
         let started = Instant::now();
-        run_probe(integer, ProbeShape::Capacity, workers, iterations)?;
-        run_probe(memory, ProbeShape::Capacity, workers, iterations)?;
+        run_probe(integer, ProbeShape::Capacity, workers, scratch, iterations)?;
+        run_probe(memory, ProbeShape::Capacity, workers, scratch, iterations)?;
         Ok(u64::try_from(started.elapsed().as_nanos())
             .map_err(|_| {
                 TargetError::UnsupportedDevice("CPU composition qualification duration exceeds u64".into())
@@ -449,6 +454,7 @@ fn timer_resolution() -> Result<DurationInterval, TargetError> {
 fn probe_service(
     probe: CpuServiceProbe,
     workers: &mut Workers,
+    scratch: &Arc<dyn Entry>,
     worker_count: u32,
     timer_resolution: DurationInterval,
 ) -> Result<ServiceDefinition, TargetError> {
@@ -471,7 +477,7 @@ fn probe_service(
             |units| {
                 time_run(|| {
                     for _ in 0..units {
-                        run_probe(probe, shape, workers, 0)?;
+                        run_probe(probe, shape, workers, scratch, 0)?;
                     }
                     Ok(())
                 })
@@ -486,7 +492,7 @@ fn probe_service(
             relative_percent,
             required_ns.max(seismic_estimator::required_beyond_ns(setup_width_ns, relative_percent)),
             setup_ns,
-            |units| time_run(|| run_probe(probe, shape, workers, units)),
+            |units| time_run(|| run_probe(probe, shape, workers, scratch, units)),
             |observations, units| differential_interval(observations, setup.interval, units),
         )?;
         Ok((setup, work))
@@ -724,16 +730,20 @@ fn run_probe(
     probe: CpuServiceProbe,
     shape: ProbeShape,
     workers: &mut Workers,
+    scratch: &Arc<dyn Entry>,
     iterations: u64,
 ) -> Result<(), TargetError> {
     if matches!(probe.path, CpuProbePath::Core) {
         match probe.kind {
             CpuProbeKind::Allocation => {
+                let kind = crate::topology::kind().id;
                 for _ in 0..iterations {
                     let instance = <crate::executor::Device as DeviceService<Cpu>>::allocate(
                         &crate::executor::Device,
+                        kind,
                         seismic_estimator::ALLOCATION_INSTANCE_BYTES,
                         64,
+                        scratch,
                     )
                     .map_err(|error| {
                         TargetError::DeviceUnavailable(format!(
@@ -775,6 +785,7 @@ fn run_probe(
     };
     workers
         .run(
+            scratch,
             worker_probe,
             &frame,
             workgroups as u64,

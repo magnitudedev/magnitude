@@ -202,35 +202,8 @@ impl Scheduler {
     }
 }
 
-/// Candidate eligibility (live, resident, unsubmitted, unprotected, unselected)
-/// belongs to the service. Byte prices come from the model for actual ownership.
-pub struct Victim {
-    pub identity: RequestId,
-    pub output_blocked: bool,
-    pub preemption_debt: u32,
-    pub exclusive_bytes: u64,
-    pub replay_tokens: u64,
-    pub service_ns: u64,
-}
-/// Ordered candidates only. The service must price growing *sets* again because
-/// shared allocations may become reclaimable only after several owners close.
-pub fn order_victims(victims: &mut [Victim]) {
-    victims.sort_by(|a, b| {
-        b.output_blocked
-            .cmp(&a.output_blocked)
-            .then_with(|| a.preemption_debt.cmp(&b.preemption_debt))
-            .then_with(|| {
-                let left = u128::from(a.exclusive_bytes) * u128::from(b.replay_tokens.max(1));
-                let right = u128::from(b.exclusive_bytes) * u128::from(a.replay_tokens.max(1));
-                right.cmp(&left)
-            })
-            .then_with(|| a.service_ns.cmp(&b.service_ns))
-            .then_with(|| a.identity.cmp(&b.identity))
-    });
-}
-
-/// Counts the events that free capacity. A request short of capacity retries
-/// only after it moves.
+/// Counts the events that free memory. A request waiting on memory (a blind
+/// reading) retries only after it moves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AvailabilityEpoch(u64);
 impl AvailabilityEpoch {

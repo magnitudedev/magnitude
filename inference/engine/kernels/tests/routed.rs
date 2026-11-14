@@ -8,7 +8,7 @@ use seismic::BackendName;
 
 use magnitude_kernels::{
     SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
-    routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_move, routed_output,
+    routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
     routed_pass_map, routed_round, routed_route, routed_route_shared, routed_scratch_grids, routed_scratch_request,
     routed_select, routed_select_streamed, routed_step, routed_up,
 };
@@ -4924,13 +4924,35 @@ impl StreamedKind {
     }
 }
 
-/// A host tier tensor of `element` over `shape` holding `bytes`, every
-/// record committed (`Tensor::reserved_in`, as a bank's host tier is
-/// allocated) reserved `Shared`; its resizer, which must outlive it.
-fn host_tier(device: &seismic::Device, element: seismic::Element, shape: &[u64], bytes: &[u8]) -> (seismic::Tensor, seismic::Resizer) {
-    let (mut tier, resizer) = seismic::Tensor::reserved_in(seismic::ReservedContract::Shared, device, element, shape, shape[0], None).unwrap();
-    tier.write_from_host(bytes).unwrap();
-    (tier, resizer)
+/// The granule pool of `contract`'s store for record stores of `layouts`'
+/// records, its granules each the largest record and its blocks of
+/// `per_block` granules.
+fn record_pool(device: &seismic::Device, contract: seismic::Contract, per_block: u64, layouts: &[seismic::SlabLayout]) -> seismic::Pool {
+    let granule = layouts.iter().map(|layout| layout.slab_bytes.next_multiple_of(layout.slab_alignment)).max().unwrap().next_multiple_of(256);
+    device.pool(contract, granule, per_block * granule, seismic::PoolEntries::one(device.entry(contract))).unwrap()
+}
+
+/// The regions of a record store of `element` over `shape` (`[records,
+/// ...record]`): one, a record a row.
+fn record_regions(element: seismic::Element, shape: &[u64]) -> [seismic::SlabRegion; 1] {
+    [seismic::SlabRegion { element, row_shape: shape[1..].to_vec() }]
+}
+
+/// The layout of one record of `element` over `shape`.
+fn record_layout(element: seismic::Element, shape: &[u64]) -> seismic::SlabLayout {
+    seismic::SlabLayout::for_regions(1, shape[0], &record_regions(element, shape)).unwrap()
+}
+
+/// A record store in `pool` of `element` over `shape`, a slab a record,
+/// every record holding `bytes`: the records as a kernel's record port
+/// binds them, and the store, which must outlive them.
+fn record_store(pool: &seismic::Pool, element: seismic::Element, shape: &[u64], bytes: &[u8]) -> (seismic::Tensor, seismic::SlabTensor) {
+    let store = seismic::SlabTensor::in_pool(pool, 1, shape[0], &record_regions(element, shape)).unwrap();
+    for _ in 0..shape[0] {
+        store.add_slab(seismic::SlabFill::Zeroed).unwrap();
+    }
+    store.region_rows(0, 0, shape[0]).unwrap().write_from_host(bytes).unwrap();
+    (store.logical_region(0).unwrap(), store)
 }
 
 /// A record form a host tier serves on the 3090: its tensors' kinds, gate
@@ -4975,9 +4997,9 @@ enum Served {
 /// bank record E - 1 - x and in tier record (5 x + 3) mod E.
 struct TierServing {
     experts: u64,
-    /// Each tensor's bank, tier (with its resizer) and decoy bank (every
+    /// Each tensor's bank, tier (with its store) and decoy bank (every
     /// record expert 0's).
-    stores: Vec<(seismic::Tensor, (seismic::Tensor, seismic::Resizer), seismic::Tensor)>,
+    stores: Vec<(seismic::Tensor, (seismic::Tensor, seismic::SlabTensor), seismic::Tensor)>,
 }
 
 impl TierServing {
@@ -4996,6 +5018,8 @@ impl TierServing {
     /// its stored bytes.
     fn new(device: &seismic::Device, kinds: &[StreamedKind], experts: u64) -> Self {
         let mut serving = Self { experts, stores: Vec::new() };
+        let layouts = kinds.iter().map(|kind| record_layout(kind.resident, &kind.shape(experts))).collect::<Vec<_>>();
+        let pool = record_pool(device, seismic::Contract::Shared, experts, &layouts);
         for (index, kind) in kinds.iter().enumerate() {
             let imports = (0..experts as usize).map(|expert| kind.import(&kind.stored(expert, index))).collect::<Vec<_>>();
             let bank = kind.tensor(device, kind.resident, experts, |record| Some(&imports[(experts - 1) as usize - record]));
@@ -5003,7 +5027,7 @@ impl TierServing {
             for expert in 0..experts {
                 tier[serving.tier_record(expert) as usize] = imports[expert as usize].clone();
             }
-            let tier = host_tier(device, kind.resident, &kind.shape(experts), &tier.concat());
+            let tier = record_store(&pool, kind.resident, &kind.shape(experts), &tier.concat());
             let decoy = kind.tensor(device, kind.resident, experts, |_| Some(&imports[0]));
             serving.stores.push((bank, tier, decoy));
         }
@@ -5488,7 +5512,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt groups: a round's landing launch, `routed_copy` and `routed_move`.
+// Prompt groups: a round's landing launch and `routed_copy`.
 
 /// The resident layouts a bank record takes: Metal's, CUDA's, the others'.
 const RESIDENT_LAYOUTS: [registry::Layout; 3] = [
@@ -5874,7 +5898,7 @@ struct TierFill {
     plan: seismic::NativeGraphPlan,
     ports: [seismic::NativePort; 5],
     tensors: [seismic::Tensor; 5],
-    _tier: seismic::Resizer,
+    _tier: seismic::SlabTensor,
 }
 
 impl TierFill {
@@ -5884,7 +5908,8 @@ impl TierFill {
         let byte = seismic::Element::bool();
         let shape = [records, 1, per];
         let bytes = (0..records).flat_map(|record| std::iter::repeat_n((record % 251) as u8, per as usize)).collect::<Vec<_>>();
-        let (tier, resizer) = host_tier(device, byte, &shape, &bytes);
+        let pool = record_pool(device, seismic::Contract::Shared, records, &[record_layout(byte, &shape)]);
+        let (tier, store) = record_store(&pool, byte, &shape, &bytes);
         let destination = seismic::Tensor::zeros(device, byte, &shape).unwrap();
         let step = streaming_step(device);
         let pairs = (0..copied as i32).map(|record| (record, record)).collect::<Vec<_>>();
@@ -5911,7 +5936,7 @@ impl TierFill {
                 },
             )
             .unwrap();
-        Self { plan: graph.seal().unwrap(), ports, tensors: [tier, staged, step, destination, grid], _tier: resizer }
+        Self { plan: graph.seal().unwrap(), ports, tensors: [tier, staged, step, destination, grid], _tier: store }
     }
 
     /// The slots it copies into.
@@ -6058,13 +6083,13 @@ fn streaming_copy_copies_the_listed_records_byte_for_byte() {
     }
 }
 
-/// On every backend that streams, a conveyor in reserved device records (as
-/// lent bank records are, the host writing them as a transfer does)
+/// On every backend that streams, a conveyor in device record stores (as
+/// bank records are, the host writing them as a transfer does)
 /// lands bit for bit as one in host-shared records: the 35B's gated
 /// records of four experts landed from each give one scratch tier, every
 /// slot its expert's resident import.
 #[test]
-fn streaming_a_reserved_conveyor_lands_as_a_host_shared_one() {
+fn streaming_a_record_store_conveyor_lands_as_a_host_shared_one() {
     let Some(device) = streaming_device() else {
         return;
     };
@@ -6077,13 +6102,12 @@ fn streaming_a_reserved_conveyor_lands_as_a_host_shared_one() {
         let stored = (0..experts as usize).map(|expert| form.stored(expert, tensor)).collect::<Vec<_>>();
         shared_bytes(&device, kind.source, &kind.shape(experts), &stored.concat())
     });
-    let reserved = [0, 1, 2].map(|tensor| {
+    let layouts = [0, 1, 2].map(|tensor| record_layout(form.kind(tensor).source, &form.kind(tensor).shape(experts)));
+    let pool = record_pool(&device, seismic::Contract::DeviceOnly, experts, &layouts);
+    let recorded = [0, 1, 2].map(|tensor| {
         let kind = form.kind(tensor);
         let stored = (0..experts as usize).map(|expert| form.stored(expert, tensor)).collect::<Vec<_>>();
-        let (mut reserved, resizer) =
-            seismic::Tensor::reserved(&device, kind.source, &kind.shape(experts), experts).unwrap();
-        reserved.write_from_host(&stored.concat()).unwrap();
-        (reserved, resizer)
+        record_store(&pool, kind.source, &kind.shape(experts), &stored.concat())
     });
     let landed = |conveyor: &[seismic::Tensor; 3]| {
         let pairs = [(0, 0), (1, 1), (2, 2), (3, 3)];
@@ -6093,10 +6117,10 @@ fn streaming_a_reserved_conveyor_lands_as_a_host_shared_one() {
         scratch.map(|slots| slots.read_to_host().unwrap())
     };
     let from_shared = landed(&shared);
-    let [gate, up, down] = &reserved;
+    let [gate, up, down] = &recorded;
     assert!(
         landed(&[gate.0.clone(), up.0.clone(), down.0.clone()]) == from_shared,
-        "the reserved conveyor lands as the shared one"
+        "the record-store conveyor lands as the shared one"
     );
     for (tensor, slots) in from_shared.iter().enumerate() {
         let width = form.kind(tensor).slot_bytes();
@@ -6109,12 +6133,11 @@ fn streaming_a_reserved_conveyor_lands_as_a_host_shared_one() {
 
 /// On every backend that streams, a prompt group's pass reads each hit from
 /// its bank record and each cold expert from the layer's scratch tier, a
-/// view at an offset into the scratch lender's records of another form (on
-/// chunked storage packed whole in chunks, across several), which a round's
-/// landing filled from the conveyor: at the 35B's record forms, gated, the
-/// pass's rows equal the resident pass's over the same experts bit for bit.
+/// record store a round's landing filled from the conveyor: at the 35B's
+/// record forms, gated, the pass's rows equal the resident pass's over the
+/// same experts bit for bit.
 #[test]
-fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
+fn streaming_pass_reads_cold_experts_from_a_scratch_tier() {
     let Some(device) = streaming_device() else {
         return;
     };
@@ -6129,26 +6152,15 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
     let step = streaming_step(&device);
     let q = STREAMING_SEQUENCE as u64;
 
-    // The scratch lender's records are the down form's, carrying a record of
-    // any kind whole; the scratch region starts past its first record (where
-    // the conveyor's lent records lie).
-    let record = |kind: &StreamedKind| std::num::NonZeroU64::new(kind.slot_bytes() as u64).unwrap();
-    let lender = kinds[2];
-    let widest = kinds.iter().map(record).max().unwrap();
-    let reserved = device
-        .info()
-        .reserving(seismic::ReservedContract::DeviceOnly)
-        .expect("a streaming device says how it reserves")
-        .expect("a streaming device reserves device storage")
-        .of_records(seismic::ReservedRecords::of(record(&lender)).carrying(widest));
-    let own = reserved.packing(record(&lender).get()).unwrap();
-    let offset = own.end(0, 1);
+    // The bank's and the scratch tier's records of every kind lie in one
+    // pool.
+    let layouts = kinds.iter().map(|kind| record_layout(kind.resident, &kind.shape(experts))).collect::<Vec<_>>();
+    let pool = record_pool(&device, seismic::Contract::DeviceOnly, experts + hits, &layouts);
 
     let mut reference = Vec::new();
     let mut streamed = Vec::new();
     let mut conveyors = Vec::new();
     for (index, kind) in kinds.iter().enumerate() {
-        let label = format!("{} -> {}", kind.source.name(), kind.resident.name());
         let stored = (0..experts as usize).map(|expert| kind.stored(expert, index)).collect::<Vec<_>>();
         let imports = stored.iter().map(|bytes| kind.import(bytes)).collect::<Vec<_>>();
         reference.push(kind.tensor(&device, kind.resident, experts, |expert| Some(imports[expert].as_slice())));
@@ -6157,32 +6169,11 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
         for expert in (0..experts).step_by(2) {
             bank_bytes[bank_record(expert) as usize] = imports[expert as usize].clone();
         }
-        let (mut bank, bank_resizer) = seismic::Tensor::reserved(&device, kind.resident, &kind.shape(hits), hits).unwrap();
-        bank.write_from_host(&bank_bytes.concat()).unwrap();
-
-        // The lender's records of this kind, every one committed and zero,
-        // as many as reach past the scratch region.
-        let end = reserved.packing(record(kind).get()).unwrap().end(offset, experts);
-        let lent = (1..).find(|&records| own.end(0, records) >= end).unwrap();
-        let (mut lender_records, lender_resizer) = seismic::Tensor::reserved_in(
-            seismic::ReservedContract::DeviceOnly,
-            &device,
-            lender.resident,
-            &lender.shape(lent),
-            lent,
-            Some(widest),
-        )
-        .unwrap();
-        lender_records.write_from_host(&vec![0u8; (lent * record(&lender).get()) as usize]).unwrap();
-        let scratch = lender_records.region(kind.resident, &kind.shape(experts), offset).unwrap();
-        let placement = scratch.record_placement().expect("the scratch tier's records lie whole in chunks");
-        if reserved.chunked() {
-            let last = offset + placement.offset(experts - 1);
-            assert!(last / reserved.granule > offset / reserved.granule, "{label}: the scratch tier spans chunks");
-        }
+        let bank = record_store(&pool, kind.resident, &kind.shape(hits), &bank_bytes.concat());
+        let scratch = record_store(&pool, kind.resident, &kind.shape(experts), &vec![0u8; experts as usize * kind.slot_bytes()]);
 
         conveyors.push(kind.tensor(&device, kind.source, cold.len() as u64, |v| Some(stored[cold[v] as usize].as_slice())));
-        streamed.push((bank, scratch, (bank_resizer, lender_records, lender_resizer)));
+        streamed.push((bank, scratch));
     }
     // One round lands every cold expert's record, conveyor record v into its
     // scratch slot.
@@ -6190,7 +6181,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
     let mut landing =
         shared_i32(&device, &[landing_extent(pairs.len() as u64)], &landing_words(STREAMING_SEQUENCE, pairs.len(), &pairs, pairs.len()));
     let conveyor: [seismic::Tensor; 3] = std::array::from_fn(|tensor| conveyors[tensor].clone());
-    let mut scratch: [seismic::Tensor; 3] = std::array::from_fn(|tensor| streamed[tensor].1.clone());
+    let mut scratch: [seismic::Tensor; 3] = std::array::from_fn(|tensor| streamed[tensor].1.0.clone());
     served_round(&device, &ServedForm::qwen35b(&device).round_kernel(&device), &step, &mut landing, &conveyor, &mut scratch);
 
     // The layer's map: each hit held in its bank record since step 1, each
@@ -6284,115 +6275,12 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
     let resident = [&reference[0], &reference[1], &reference[2]];
     let expected = run(resident, &absent_map(&device), &absent_step(&device), resident);
     let actual = run(
-        [&streamed[0].1, &streamed[1].1, &streamed[2].1],
+        [&streamed[0].1.0, &streamed[1].1.0, &streamed[2].1.0],
         &resolved,
         &pass_step,
-        [&streamed[0].0, &streamed[1].0, &streamed[2].0],
+        [&streamed[0].0.0, &streamed[1].0.0, &streamed[2].0.0],
     );
     assert!(actual == expected, "the streamed pass's rows differ from the resident pass's");
-}
-
-/// The move case: D records, record r holding pattern r.
-const MOVE_RECORDS: u64 = 5;
-
-/// A shrink's move list: record 4 into record 0 and record 3 into record 1,
-/// and an entry past the count.
-fn move_list() -> (Vec<(i32, i32)>, usize) {
-    (vec![(4, 0), (3, 1), (2, 3)], 2)
-}
-
-/// The record whose contents record `record` holds after `move_list`'s
-/// moves.
-fn moved_from(record: usize) -> usize {
-    match record {
-        0 => 4,
-        1 => 3,
-        _ => record,
-    }
-}
-
-/// `routed_move`'s reference moves exactly the listed records, whatever
-/// sequence the list names.
-#[test]
-fn streaming_move_reference_moves_exactly_the_listed_records() {
-    let module = module();
-    let (pairs, count) = move_list();
-    let (records, width) = (MOVE_RECORDS as usize, 3);
-    let values = pattern(records * width, 11, 1.0);
-    let outcome = interpret(
-        &module,
-        "routed_move",
-        &[("U", DType::F32)],
-        vec![
-            floats(&[records, 1, width], &values),
-            ints(&[list_extent(pairs.len() as u64) as usize], &list_words(-7, count, &pairs, pairs.len())),
-        ],
-    );
-    let expected = (0..records)
-        .flat_map(|record| {
-            let from = moved_from(record) * width;
-            values[from..from + width].iter().map(|&value| f64::from(value))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(input(&outcome, 0), expected);
-}
-
-/// On every backend that streams, `routed_move` moves each listed record
-/// byte for byte, at the 35B's record forms and at record scales (`f32`
-/// records of `[D, 1, 1]`), as its reference does: an entry past the count
-/// is skipped.
-#[test]
-fn streaming_move_moves_the_listed_records_byte_for_byte() {
-    let Some(device) = streaming_device() else {
-        return;
-    };
-    let (pairs, count) = move_list();
-    let words = list_words(-7, count, &pairs, pairs.len());
-    let list = shared_i32(&device, &[words.len() as u64], &words);
-    let records = MOVE_RECORDS as usize;
-    let call = |element: seismic::Element, mut tensor: seismic::Tensor| {
-        routed_move::native_for_device_with(
-            &device,
-            routed_move::Elements { U: element },
-            &seismic::NativeSpecialization::new(),
-        )
-        .unwrap()
-        .call(routed_move::Args {
-            records: &mut tensor,
-            list: &list,
-        })
-        .unwrap();
-        tensor.read_to_host().unwrap()
-    };
-    for form in RECORD_FORMS {
-        let kind = StreamedKind::qwen35b(&device)[form];
-        let imports = (0..records)
-            .map(|pattern| kind.import(&kind.stored(pattern, form)))
-            .collect::<Vec<_>>();
-        let bank = kind.tensor(&device, kind.resident, MOVE_RECORDS, |record| Some(imports[record].as_slice()));
-        let bytes = call(kind.resident, bank);
-        let width = kind.slot_bytes();
-        for record in 0..records {
-            assert!(
-                bytes[record * width..(record + 1) * width] == imports[moved_from(record)],
-                "{}: record {record}",
-                kind.resident.name()
-            );
-        }
-    }
-    let scales = expert_scales(records);
-    let held = seismic::Tensor::from_host(
-        &device,
-        seismic::Element::f32(),
-        &[MOVE_RECORDS, 1, 1],
-        &scales.iter().flat_map(|scale| scale.to_le_bytes()).collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let moved = call(seismic::Element::f32(), held)
-        .chunks(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(moved, (0..records).map(|record| scales[moved_from(record)]).collect::<Vec<_>>(), "scales");
 }
 
 /// On every backend that streams, a round lands its records byte-equal to a

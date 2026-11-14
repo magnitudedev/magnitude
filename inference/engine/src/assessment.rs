@@ -43,7 +43,7 @@ use magnitude_executor::{
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
     },
-    platform::{self, DeviceRequest, GraphPricing, MemoryReserves, PlatformError, SelectedDevice},
+    platform::{self, DeviceRequest, GraphPricing, ReleaseRate, PlatformError, SelectedDevice},
     held_storage, resident_layout, scaled_source_element, stored_weights,
     ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, FloorForms, KernelCache, UndraftedBounds,
 };
@@ -80,7 +80,7 @@ pub struct AssessmentStructure {
     pub status: Status,
     pub device: DeviceRequest,
     pub selected: SelectedDevice,
-    pub reserves: MemoryReserves,
+    pub release: ReleaseRate,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
     /// The one context every model is planned at, as a load serving it at
@@ -99,11 +99,11 @@ impl AssessmentStructure {
         catalog: &Devices,
         device: DeviceRequest,
         kernels: Option<&Path>,
-        reserves: MemoryReserves,
+        release: ReleaseRate,
         policy: ModelPolicy,
         service: ServiceLimits,
     ) -> Result<Self, ModelAssessmentError> {
-        let selected = platform::select_recorded(catalog, ExecutionPath::Native, device, &reserves, kernels)
+        let selected = platform::select_recorded(catalog, ExecutionPath::Native, device, &release, kernels)
             .map_err(ModelAssessmentError::Platform)?;
         let topology = catalog.topology();
         Ok(Self {
@@ -111,7 +111,7 @@ impl AssessmentStructure {
             topology,
             device,
             selected,
-            reserves,
+            release,
             policy,
             service,
             served_context: None,
@@ -135,7 +135,7 @@ impl AssessmentStructure {
                     graph_cost: pricing,
                     ..self.selected.clone()
                 },
-                reserves: self.reserves,
+                release: self.release,
                 policy: self.policy.clone(),
                 service: self.service.clone(),
                 served_context: self.served_context,
@@ -592,7 +592,6 @@ pub fn finish_model_assessment(
             pricing,
             &structure.topology,
             &structure.status,
-            &structure.reserves,
         )
         .map_err(ModelAssessmentError::Assessment)?;
         Ok::<_, ModelAssessmentError>(match fit {
@@ -616,7 +615,7 @@ pub fn finish_model_assessment(
     let request = AssessmentRequest {
         context_limit: fit.fit_context_tokens,
         performance_depths: performance_depths.to_vec(),
-        reserves: structure.reserves,
+        release: structure.release,
         sequences,
     };
     let residency = match fit.residency() {
@@ -836,7 +835,7 @@ fn plan_package(
         policy: &structure.policy,
         service: &structure.service,
         device: structure.device,
-        reserves: structure.reserves,
+        release: structure.release,
     };
     let plain = environment
         .plain(admitted, admitted.definition.clone())
@@ -939,7 +938,7 @@ pub fn kernel_inventory(
         policy,
         service,
         device: DeviceRequest::Backend(backend),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     };
     let plain = environment
         .plain(&admitted, admitted.definition.clone())
@@ -1068,7 +1067,7 @@ struct Environment<'a> {
     policy: &'a ModelPolicy,
     service: &'a ServiceLimits,
     device: DeviceRequest,
-    reserves: MemoryReserves,
+    release: ReleaseRate,
 }
 
 impl Environment<'_> {
@@ -1145,7 +1144,7 @@ impl Environment<'_> {
             self.device,
             None,
             None,
-            self.reserves,
+            self.release,
         )
     }
 }

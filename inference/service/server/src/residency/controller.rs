@@ -4,8 +4,8 @@
 //! A load resolves the model through the shared resolved-configuration cache (§8.5), previews the
 //! load on the serving device in the service's device catalog (the admission check and the load
 //! plan), waiting first, without the device, for the machine's standing figures its plan is priced
-//! on, takes its share of the device, waits for memory admission, previews again if it waited for
-//! either, and loads exactly that device in a worker. The worker's
+//! on, takes its share of the device, previews again if it waited for either, and loads exactly
+//! that device in a worker. The worker's
 //! measured load progress drives the instance's stage and fraction; readiness is verified against
 //! the host's resolution before the instance is Ready, and the Ready instance records the device
 //! the worker opened.
@@ -25,7 +25,6 @@ use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
-use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -43,7 +42,7 @@ use magnitude_service_models::{
 use seismic::{BackendName, Devices, ExecutorSelector};
 
 use super::optimization::{self, PreparationJobs};
-use super::supervisor::{HostMemoryObserver, MemorySupervisor};
+use super::supervisor::MemorySupervisor;
 use super::worker::{EngineWorker, SpawnedWorker};
 use super::{
     LoadSequence, LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
@@ -85,9 +84,6 @@ pub struct ResidencyEnvironment {
     pub configurations: Arc<ResolvedConfigurations>,
     /// The service process's device catalog: previews read it.
     pub catalog: Arc<Devices>,
-    pub reserves: MemoryReserves,
-    /// System-RAM headroom for the memory guard ([`SeismicHostMemory`] on the service catalog).
-    pub host_memory: Arc<dyn HostMemoryObserver>,
     /// [`MODEL_IDLE_TIMEOUT`] in the service.
     pub idle_timeout: std::time::Duration,
     pub launcher: WorkerLauncher,
@@ -123,18 +119,11 @@ pub struct ModelInstances {
 }
 
 impl ModelInstances {
-    /// Start the residency actor and the memory supervisor.
+    /// Start the residency actor and the resident-worker supervisor.
     pub fn start(environment: ResidencyEnvironment) -> Self {
         let environment = Arc::new(environment);
         let (client, inbox) = ResidencyClient::channel();
-        // The reserves of what this process may use, as fit reads them.
-        let thresholds = environment.reserves.thresholds(environment.catalog.topology().host_ram());
-        let supervisor = MemorySupervisor::start(
-            Arc::clone(&environment.host_memory),
-            thresholds,
-            client.notifier(),
-            environment.device.clone(),
-        );
+        let supervisor = MemorySupervisor::new(client.notifier());
         let preparations = PreparationJobs::default();
         let driver = EngineResidency {
             environment: Arc::clone(&environment),
@@ -835,13 +824,6 @@ impl EngineResidency {
                 device
             }
         };
-        if !self.supervisor.admission_open() {
-            self.progress(instance_id, ModelLoadStage::Queued, None);
-            tracing::info!("load waits for system memory to recover from pressure");
-            self.supervisor.admission().await;
-            previewed = None;
-            self.progress(instance_id, ModelLoadStage::Preparing, None);
-        }
         let preview = match previewed {
             Some(preview) => preview,
             None => {
@@ -860,10 +842,7 @@ impl EngineResidency {
         // with none it is the load, one worker. Otherwise it places nothing and ends, a
         // Prepare worker searches what is missing and is proven gone, and a second Load worker
         // serves what is stored (the engine's one sequence, `load_prepared`).
-        // The load's reserves hold their margin at the host's motion as the service measured it
-        // up to now.
-        let mut manifest = resolved.manifest.clone();
-        manifest.reserves = manifest.reserves.measured(Some(environment.host_memory.motion()), None);
+        let manifest = resolved.manifest.clone();
         // The sequence runs on a blocking thread, which outlives this task when the load is
         // stopped: it starts each worker through `sequence`, which a stop closes, and holds it
         // until it is done with every worker, which the stop waits for.

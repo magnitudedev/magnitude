@@ -63,13 +63,13 @@ fn a_setup_run_reads_each_setup_without_a_device() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout);
-    eprintln!("{stdout}{}", String::from_utf8_lossy(&run.stderr));
+    let stderr = String::from_utf8_lossy(&run.stderr);
     // The message a case's panic left in its captured output.
     let ended = |case: &str| {
         let section = stdout
             .split(&format!("---- setup_run::{case} stdout ----"))
             .nth(1)
-            .unwrap_or_else(|| panic!("{case} has no captured output"));
+            .unwrap_or_else(|| panic!("{case} has no captured output:\n{stdout}{stderr}"));
         section.lines().skip_while(|line| !line.contains("panicked at")).nth(1).unwrap_or("").to_owned()
     };
     assert_eq!(

@@ -1,8 +1,85 @@
-//! Address rows in a slab-stored tensor through its bound address table.
+//! Address rows in a slab-stored tensor through its bound address table,
+//! and the records of a record port through theirs.
 
 use crate::element::{Dense, Element, Stored, U32};
 use crate::tensor::{Scalars, Tensor};
 use std::marker::PhantomData;
+
+/// A view of one record of a record port (`records`): the port's tensor
+/// view without its leading record axis, which [`Records`] places at each
+/// record's address.
+pub trait RecordView: Copy {
+    /// This view, of the same shape, at `base`.
+    ///
+    /// # Safety
+    /// `base` addresses a record of this view's shape, valid for the view's
+    /// life.
+    unsafe fn at(self, base: *const u8) -> Self;
+}
+
+impl<E: Element, const RANK: usize> RecordView for Tensor<'_, E, RANK> {
+    #[inline(always)]
+    unsafe fn at(self, base: *const u8) -> Self {
+        // SAFETY: as `at`'s.
+        unsafe {
+            Tensor::from_raw(base.cast_mut(), self.extents().map(|extent| extent as u64), self.strides().map(|stride| stride as u64))
+        }
+    }
+}
+
+impl<T: Copy, const RANK: usize> RecordView for Scalars<'_, T, RANK> {
+    #[inline(always)]
+    unsafe fn at(self, base: *const u8) -> Self {
+        // SAFETY: as `at`'s.
+        unsafe {
+            Scalars::from_raw(base.cast_mut(), self.extents().map(|extent| extent as u64), self.strides().map(|stride| stride as u64))
+        }
+    }
+}
+
+/// A record port's records as the runtime binds them: a table of their
+/// addresses, one native pointer a record (the record table,
+/// `seismic_lang::registry::record_table`), each record a view `V` from its
+/// address. Records lie wherever their storage holds them: nothing reads
+/// one record's address from another's.
+#[derive(Clone, Copy)]
+pub struct Records<V> {
+    table: *const u64,
+    count: usize,
+    /// The view of one record; its own base is never read.
+    view: V,
+}
+
+// SAFETY: the same work-item read/write contract as `tensor::Tensor` applies.
+unsafe impl<V: RecordView> Send for Records<V> {}
+unsafe impl<V: RecordView> Sync for Records<V> {}
+
+impl<V: RecordView> Records<V> {
+    /// The `count` records whose addresses the table at `table` holds, each
+    /// of `view`'s shape (whose base is not read).
+    ///
+    /// # Safety
+    /// `table` addresses `count` entries, each the address of a record of
+    /// `view`'s shape valid for the view's life.
+    pub unsafe fn from_table(table: *const u8, count: u64, view: V) -> Self {
+        Self { table: table.cast(), count: count as usize, view }
+    }
+
+    /// The records' count, the port's leading extent.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Record `index`: the view from its address (an expert's weights: rows
+    /// 0.. of its record).
+    #[inline(always)]
+    pub fn record(&self, index: usize) -> V {
+        assert!(index < self.count, "record {index} of {}", self.count);
+        // SAFETY: the table holds a record's address at every entry below
+        // its count (`from_table`).
+        unsafe { self.view.at(region::<u8>(self.table, index)) }
+    }
+}
 
 /// A typed logical tensor whose leading axis resolves through a slab table.
 #[derive(Clone, Copy)]
@@ -149,6 +226,15 @@ impl<E: Dense, const RANK: usize> SlabTensor<'_, E, RANK> {
     #[inline(always)]
     pub unsafe fn set(&self, index: [usize; RANK], value: f32) {
         unsafe { *self.pointer(index) = E::narrow(value) };
+    }
+}
+
+impl Records<crate::Weights<'_>> {
+    /// Whether products over these records take their activation rows as
+    /// NVFP4 operands: the port's operand recipe, every record's
+    /// (`Weights::nvfp4_operands`).
+    pub fn nvfp4_operands(&self) -> bool {
+        self.view.nvfp4_operands()
     }
 }
 

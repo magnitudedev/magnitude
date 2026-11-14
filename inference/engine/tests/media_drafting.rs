@@ -23,7 +23,7 @@ use magnitude_engine::{
     worker::{serve_worker, transport::stdio_worker_transport, RequestEvent, RequestOptions},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath,
 };
 use magnitude_generation::{
@@ -181,7 +181,7 @@ fn run(arguments: &Arguments) -> Result<(), String> {
         path: ExecutionPath::Native,
         device: arguments.device,
         kernel_cache: arguments.cache_dir.clone(),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .map_err(|error| error.to_string())?;

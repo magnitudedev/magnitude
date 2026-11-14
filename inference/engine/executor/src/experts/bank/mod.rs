@@ -1,8 +1,8 @@
-//! A streamed load's expert bank on the device: each group's record tensors,
-//! every layer's and group's words, the
-//! staging, and a discrete device's host tier, all
-//! allocated at load and empty (no warming), and the watcher that serves
-//! its steps.
+//! A streamed load's expert bank on the device: each group's records, a
+//! slab store in the device's granule pool, every layer's and group's
+//! words, the staging, and a discrete device's host tier in a pool of host
+//! storage, all allocated at load and empty (no warming), and the watcher
+//! that serves its steps.
 
 mod open;
 mod resize;
@@ -12,10 +12,9 @@ pub(crate) mod cache;
 
 pub use super::watcher::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 pub(crate) use super::watcher::{ExpertStep, Recording, StepFailure, StepRoute};
-use super::source::Records;
 use super::watcher::{PlacedLayerWords, PlacedWords, Watcher};
 use super::Words;
-use crate::planning::{BankLayout, BankPart, ExpertBankPlan, PlacedAllocations, Placer, RecordTensors, RoutedTensor};
+use crate::planning::{BankLayout, BankPart, BankTier, ExpertBankPlan, PlacedAllocations, RecordTensors, RoutedTensor};
 use crate::domain::{BankResize, DomainError, ExpertResidency, HostResidency};
 use crate::programs::Chain;
 use magnitude_family_contracts::{WeightRole, WeightScope};
@@ -23,8 +22,9 @@ use seismic::{Device, Tensor};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use super::{copies, HostCompute, Machine};
-use resize::{Commitment, HostTier};
-use crate::storage_thread::{Releases, StorageThread};
+use resize::{Commitment, HostTier, Stores};
+use crate::storage_thread::StorageThread;
+pub use open::LoadPools;
 pub(crate) use served::ServedBank;
 
 /// The holdings the bank itself resizes (`BankHolding`): its experts'
@@ -69,9 +69,9 @@ impl ChainServing {
     }
 }
 
-/// A staging pool's conveyor, a view of the lender's records, which reads
-/// land in, the converts read in place, and the scratch rounds' waits bind
-/// as the host's (`BankPart::Conveyor`).
+/// A staging pool's conveyor, a view of the lender's lent records, which
+/// reads land in, the converts read in place, and the scratch rounds' waits
+/// bind as the host's (`BankPart::Conveyor`).
 struct PoolConveyor {
     conveyor: Tensor,
 }
@@ -92,22 +92,25 @@ pub(crate) struct ExpertBank {
     /// Each staging pool's conveyor views.
     conveyors: Vec<PoolConveyor>,
     /// Each layer's scratch tier view of each routed tensor: its form's view
-    /// of the scratch the lender lends prompt groups, its leading experts
+    /// of the scratch in the lender's lent records, its leading experts
     /// (`BankPart::Scratch`).
     scratch: Vec<RecordTensors<Tensor>>,
     /// Each layer's home records of each routed tensor, of a bank planned
     /// whole (`ExpertBankPlan::resident`): the leading view of its
     /// experts from its home record in its group's records, where a whole
     /// bank holds expert `e` at record `home + e`, which its resident form
-    /// reads in place (`WeightPart::Home`). An unpinned view of the
-    /// reservation's own records, so a shrink releases what it spans; bound,
-    /// it is read only while the bank is whole, and so backed.
+    /// reads in place (`WeightPart::Home`). A view of its store's region,
+    /// which reaches whatever records the store holds; bound, it is read
+    /// only while the bank is whole, and so held.
     homes: Option<Vec<RecordTensors<Tensor>>>,
     /// The decode steps begun resident ([`Self::resident_decodes`]).
     #[cfg(test)]
     resident_decodes: std::sync::atomic::AtomicU64,
-    /// A host tier's record tensors' resizers and the host slots they
-    /// commit; none on unified memory.
+    /// Each group's records' store in the device's pool
+    /// (`BankAllocation::Records`): what the bank's slots commit.
+    stores: Arc<Stores>,
+    /// A host tier's records' stores and the host slots they commit; none
+    /// on unified memory.
     host: Option<Mutex<HostTier>>,
     /// Each layer's slot map: its view of its group's map
     /// (`BankPart::SlotMap`).
@@ -120,19 +123,14 @@ pub(crate) struct ExpertBank {
     /// (`assessment::BankLines::of_bank`), each sited layer's CPU lines and
     /// each layer's landing line among them where the bank measured them.
     lines: std::sync::Arc<[crate::assessment::BankLines]>,
-    /// Each group's move list (`routed_move`), over its layout's.
-    move_lists: Vec<Words>,
     /// What the bank commits, and the resize running.
     commitment: Mutex<Commitment>,
     /// Its experts' slots' last finished resize
     /// ([`ElasticBank::record_resize`]).
     last_resize: Mutex<Option<BankResize>>,
-    /// The thread its records' resizes prepare and back their storage on
-    /// (a host tier's runs on its own, `HostTier::thread`).
+    /// The thread its records' growths claim their storage on (a host
+    /// tier's runs on its own, `HostTier::thread`).
     resize_thread: StorageThread,
-    /// The load's thread its shrinks release their device storage on
-    /// (`Releases`).
-    release_thread: Releases,
     /// Held across every rise of the bank's charge off the domain's thread
     /// ([`Self::hold_rises`]).
     rises: Arc<Mutex<()>>,
@@ -147,9 +145,6 @@ pub(crate) struct ExpertBank {
     /// recorded allocated in as their storage is backed, on the resize
     /// thread ([`resize::grow_by_slots`]).
     pub(super) cache: Arc<cache::BankCache>,
-    /// The record tensors the host lands file misses into, group by group
-    /// ([`landed_tensors`]); none where it lands into none.
-    landed: Option<Arc<[RecordTensors<Tensor>]>>,
 }
 
 /// The threads a bank's resizes keep busy beside decode: the host tier's
@@ -162,7 +157,7 @@ impl Drop for ExpertBank {
     /// the bank's fields join as they drop, backs nothing more for a bank
     /// that is gone.
     fn drop(&mut self) {
-        for tier in crate::planning::BankTier::ALL {
+        for tier in BankTier::ALL {
             self.stop_growth(tier);
         }
     }
@@ -184,30 +179,34 @@ impl ExpertBank {
     /// `[E, N, K]`).
     pub fn import_whole(
         &self,
-        import: &mut dyn FnMut(&crate::WeightPlan, &Tensor) -> Result<(), String>,
+        import: &mut dyn FnMut(
+            &crate::WeightPlan,
+            &Tensor,
+            &dyn Fn(u64) -> Result<Tensor, String>,
+        ) -> Result<(), String>,
     ) -> Result<(), String> {
-        let plan = &self.plan;
-        for (index, layer) in plan.layers().iter().enumerate() {
-            let records = &self.layout.groups[layer.group].records;
-            for (((_, record), (_, records)), (_, resident)) in
-                plan.groups()[layer.group].record.iter().zip(records.iter()).zip(layer.resident.iter())
-            {
-                let stack = records
-                    .region(
-                        record.resident,
-                        &[layer.experts, record.matrix[0], record.matrix[1]],
-                        plan.home(index) * record.record_bytes()?,
-                    )
-                    .map_err(|error| format!("a layer's home records: {error}"))?;
-                import(resident, &stack)?;
+        let homes = self.homes.as_ref().ok_or("a whole bank's import beside no home records")?;
+        for (index, (layer, homes)) in self.plan.layers().iter().zip(homes).enumerate() {
+            let first = self.plan.home(index);
+            for ((kind, home), (_, resident)) in homes.iter().zip(layer.resident.iter()) {
+                let region = self
+                    .plan
+                    .regions(layer.group)
+                    .iter()
+                    .position(|(of, _)| *of == kind)
+                    .ok_or("a home record of a tensor its group's regions lack")?;
+                import(resident, home, &|expert| {
+                    let slot = usize::try_from(first + expert)
+                        .map_err(|_| "an expert record exceeds the host".to_owned())?;
+                    self.stores
+                        .view(layer.group, region, slot)
+                        .ok_or_else(|| format!("home record {slot} of group {} is not held", layer.group))
+                })?;
             }
         }
         Ok(())
     }
 
-    fn commitment(&self) -> std::sync::MutexGuard<'_, Commitment> {
-        self.commitment.lock().expect("bank commitment")
-    }
 
     /// The plan the bank opened with.
     pub fn plan(&self) -> &ExpertBankPlan {
@@ -243,7 +242,7 @@ impl ExpertBank {
     pub fn host_tier(&self) -> Option<(u64, u64)> {
         self.host.as_ref().map(|host| {
             let tier = host.lock().expect("host tier");
-            (tier.slots.load(Ordering::Acquire), tier.ceiling)
+            (tier.commitment.slots.load(Ordering::Acquire), tier.ceiling)
         })
     }
 
@@ -265,23 +264,40 @@ impl ExpertBank {
         }
     }
 
-    /// [`ElasticBank::residency`]: the slots committed now, and the record
-    /// tensors' charge in each store, as Seismic measures it.
+    /// [`ElasticBank::residency`]: the slots committed now, and the records'
+    /// charge in each store: the granules their pool's store charges the
+    /// bank's records (`Stores::charged`), and the lent records' allocations
+    /// as Seismic measures them.
     fn residency(&self) -> Result<ExpertResidency, DomainError> {
         let slots = self.slots();
+        let topology = self.device.topology();
+        let identity = |store| {
+            topology
+                .store_identity(store)
+                .ok_or_else(|| DomainError::invariant("a charged store belongs to the topology"))
+        };
         let mut stores = std::collections::BTreeMap::<(bool, seismic::StoreIdentity), u64>::new();
-        for tensor in self.layout.groups.iter().flat_map(|group| group.records.iter().map(|(_, tensor)| tensor)) {
-            let device = tensor.device();
-            let topology = device.topology();
+        let mut charge = |identity: seismic::StoreIdentity, bytes: u64| {
+            *stores.entry((identity == seismic::StoreIdentity::HostRam, identity)).or_default() += bytes;
+        };
+        let pooled = |tier: BankTier| {
+            let contract = self.plan.host().contract(tier);
+            topology
+                .first_store(self.device.info(), contract)
+                .ok_or_else(|| DomainError::invariant(format!("the {tier:?} pool's contract places in no store")))
+                .and_then(identity)
+        };
+        charge(pooled(BankTier::Bank)?, self.charged());
+        if self.host.is_some() {
+            charge(pooled(BankTier::Host)?, self.host_charged());
+        }
+        for tensor in self.layout.lent.iter().flat_map(|lent| lent.iter().map(|(_, tensor)| tensor)) {
             let charges = tensor
                 .observe_storage()
                 .store_charges()
                 .ok_or_else(|| DomainError::invariant("a held allocation is charged"))?;
             for (store, bytes) in charges {
-                let identity = topology
-                    .store_identity(store)
-                    .ok_or_else(|| DomainError::invariant("a charged store belongs to the topology"))?;
-                *stores.entry((identity == seismic::StoreIdentity::HostRam, identity)).or_default() += bytes;
+                charge(identity(store)?, bytes);
             }
         }
         // Each layer's experts the bank holds and those its host tier holds
@@ -305,10 +321,9 @@ impl ExpertBank {
                 .as_ref()
                 .map(|tier| {
                     let tier = tier.lock().expect("host tier");
-                    (tier.slots.load(Ordering::Acquire), tier.ceiling, tier.last_resize)
-                })
-                .map(|(slots, ceiling, last_resize)| self.host_charged().map(|bytes| HostResidency { slots, ceiling, bytes, last_resize }))
-                .transpose()?,
+                    let slots = tier.commitment.slots.load(Ordering::Acquire);
+                    HostResidency { slots, ceiling: tier.ceiling, bytes: tier.stores.charged(), last_resize: tier.last_resize }
+                }),
             cover: self.watcher.shared().cover(),
             // The tables are the served bank's (`ServedBank::residency`).
             tables: Vec::new(),
@@ -370,18 +385,15 @@ impl ExpertBank {
 
     /// Whether the group `begin` is beginning is resident, which its
     /// resident word then holds for its fronts (`BankPart::Resident`): every
-    /// streamed layer's group is whole, each expert at its home record, and
-    /// the bank holds resident forms (`ExpertBankPlan::resident`): one
-    /// planned banked, or one whose resident launches cannot read its home
-    /// records (`BankSubstrate::reads_homes`), has none, and grown whole it
-    /// is served streamed.
-    /// Residency publishes the
-    /// policy words only while no step runs (`Residency::publish_policy`), under
-    /// the lock `begin` reads them in, and only a shrink clears one, which
-    /// the owner asks for between flights, once every begun step has ended
-    /// and the device is past it (`Steps::between_flights`), and waits on:
-    /// what this reads holds until the group ends, so no record a resident
-    /// group's runs read is moved, evicted or released before they end.
+    /// streamed layer's group is whole, each expert at its home record,
+    /// which its resident forms read through their store's regions
+    /// (`Self::homes`), and the bank holds resident forms
+    /// (`ExpertBankPlan::resident`): one planned banked has none, and
+    /// grown whole it is served streamed. Residency publishes the policy
+    /// words only while no step runs (`Residency::publish_policy`), under the lock `begin` reads
+    /// them in, and a shrink clears one before it evicts a record: what this
+    /// reads holds until the group ends, so no record a resident group's
+    /// runs read is evicted or released before they end.
     fn resident(&self) -> Result<bool, String> {
         let word = |tensor: &Tensor| {
             tensor
@@ -578,10 +590,17 @@ impl ExpertBank {
         })
     }
 
-    /// Visit every allocation the bank holds: its layout's, the floor's
-    /// placed words and a group's more places'.
+    /// Visit every allocation the bank holds: its layout's but its records,
+    /// which are views of their pool's granules (`Self::charged`), the
+    /// floor's placed words and a group's more places'.
     pub fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        self.layout.iter().chain(self.floor.iter()).for_each(&mut *visit);
+        self.layout
+            .owned()
+            .into_iter()
+            .filter(|(part, _)| !matches!(*part, "group: records" | "host tier"))
+            .map(|(_, tensor)| tensor)
+            .chain(self.floor.iter())
+            .for_each(&mut *visit);
         if let Some(held) = self.held.lock().expect("held places").as_ref() {
             held.iter().for_each(visit);
         }
@@ -618,14 +637,14 @@ impl ExpertBank {
         Ok(())
     }
 
-    /// Every byte the bank is charged: its reserved records' backed
-    /// granules, and every other allocation's bytes. Off the domain's
-    /// thread its charge rises only under [`Self::hold_rises`], which the
-    /// domain holds while it observes Seismic's charge and classifies the
-    /// bank against it, so one reading and its classification are of one
-    /// state; a release off the thread only ever lowers it.
+    /// Every byte the bank is charged: its records' granules in each pool,
+    /// and every other allocation's bytes. Off the domain's thread its
+    /// charge rises only under [`Self::hold_rises`], which the domain holds
+    /// while it observes Seismic's charge and classifies the bank against
+    /// it, so one reading and its classification are of one state; a
+    /// release off the thread only ever lowers it.
     pub fn storage_bytes(&self) -> Result<u64, &'static str> {
-        let mut bytes = Some(0u64);
+        let mut bytes = self.charged().checked_add(self.host_charged());
         self.visit_storage(&mut |tensor| {
             let charged = tensor.observe_storage().charged_bytes().expect("a held allocation is charged");
             bytes = bytes.and_then(|bytes| bytes.checked_add(charged));
@@ -634,7 +653,7 @@ impl ExpertBank {
     }
 
     /// Hold every rise of the bank's charge off the domain's thread (a
-    /// growth's installs on the resize thread, [`grow_by_slots`]) until the
+    /// growth's claims on its resize thread, `resize::grow_by_slots`) until the
     /// guard drops: what the domain holds across one observation of
     /// Seismic's charge and the classification read against it.
     pub fn hold_rises(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -661,44 +680,74 @@ impl ExpertBank {
     }
 }
 
-/// The record tensors the host lands file misses into, group by group: a
-/// host tier's where the device places, the bank's own where the host does
-/// (the one store); none where it lands into neither.
-fn landed_tensors(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Option<Vec<RecordTensors<Tensor>>> {
-    match plan.placer() {
-        Placer::Tier => layout.host.clone(),
-        Placer::Bank => Some(layout.groups.iter().map(|group| group.records.clone()).collect()),
-    }
+/// The granule pool a fixture's slab stores of `regions` (`rows_per_slab`
+/// rows a slab over `logical_rows`) lie in: one of the store `contract`
+/// places in on `device`, in blocks of `block_granules` granules, charged to
+/// the entry the device charges for that store now ([`Device::entry`]): the
+/// claim a qualification or a measurement allocates under, else the store's
+/// own. Each is a pool of its own, beside the device's others.
+pub(crate) fn fixture_pool(
+    device: &Device,
+    contract: seismic::Contract,
+    rows_per_slab: u64,
+    logical_rows: u64,
+    regions: &[seismic::SlabRegion],
+    block_granules: u64,
+) -> Result<seismic::Pool, seismic::TensorError> {
+    let slab = seismic::SlabLayout::for_regions(rows_per_slab, logical_rows, regions)?;
+    let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
+    device.pool(contract, granule, block_granules.max(1) * granule, seismic::PoolEntries::one(device.entry(contract)))
 }
 
-/// Each group's landed `tensors` ([`landed_tensors`]) at its `committed`
-/// records, as the host addresses them: what landings convert into and a
-/// resize's moves copy within. A view pins its records backed until it
-/// drops (`Tensor::region`), so the host addresses no record a recommit
-/// could release.
-fn host_views(
-    plan: &ExpertBankPlan,
-    tensors: &[RecordTensors<Tensor>],
-    committed: impl Fn(usize) -> u64,
-) -> Result<Vec<Vec<Records>>, String> {
-    tensors
-        .iter()
-        .enumerate()
-        .map(|(group, tensors)| {
-            let committed = committed(group);
-            tensors
-                .iter()
-                .zip(plan.groups()[group].record.iter())
-                .map(|((_, tensor), (_, record))| {
-                    let view = tensor
-                        .region(record.resident, &[committed, record.matrix[0], record.matrix[1]], 0)
-                        .map_err(|error| format!("the {} host records: {error}", record.resident.name()))?;
-                    Records::new(view, record.record_bytes()?, committed)
-                        .map_err(|error| format!("the {} host records: {error}", record.resident.name()))
-                })
-                .collect()
+/// A slab store of `regions` in a fixture's pool ([`fixture_pool`]), every
+/// slot free.
+pub(crate) fn pooled_slabs(
+    device: &Device,
+    contract: seismic::Contract,
+    rows_per_slab: u64,
+    logical_rows: u64,
+    regions: &[seismic::SlabRegion],
+    block_granules: u64,
+) -> Result<seismic::SlabTensor, seismic::TensorError> {
+    let pool = fixture_pool(device, contract, rows_per_slab, logical_rows, regions, block_granules)?;
+    seismic::SlabTensor::in_pool(&pool, rows_per_slab, logical_rows, regions)
+}
+
+/// A fixture's records as a load's bank holds a group's: a slab store of a
+/// record a slab in a granule pool of its own, of the store `contract`
+/// places in on `device`, charged to a tally of that store
+/// (`seismic::memory::Tally`). What a fixture binds where a load binds a
+/// bank's records (a qualification's, a measurement's).
+pub(crate) struct PooledRecords {
+    /// Its region, which kernels bind as the bank's records.
+    pub records: Tensor,
+    /// Each held record's view, which the host writes and reads.
+    pub views: Vec<Tensor>,
+    /// The store, whose granules the views lie in, held while they are.
+    _store: seismic::SlabTensor,
+}
+
+/// `records` records of `element` rows of `row_shape`, the first `held`
+/// claimed ([`PooledRecords`]).
+pub(crate) fn pooled_records(
+    device: &Device,
+    contract: seismic::Contract,
+    element: seismic::Element,
+    row_shape: &[u64],
+    records: u64,
+    held: u64,
+) -> Result<PooledRecords, seismic::TensorError> {
+    let regions = [seismic::SlabRegion { element, row_shape: row_shape.to_vec() }];
+    let store = pooled_slabs(device, contract, 1, records, &regions, held)?;
+    let views = (0..held)
+        .map(|_| {
+            let record = store.add_slab(seismic::SlabFill::Zeroed)?;
+            store
+                .slab_region(record, 0)?
+                .ok_or_else(|| seismic::TensorError::SlabLayout("a claimed record has a region".into()))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PooledRecords { records: store.logical_region(0)?, views, _store: store })
 }
 
 /// Instance `place` of placed part `part` of `layer` of its allocation
@@ -777,7 +826,7 @@ fn slot_maps(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<T
 }
 
 /// Each layer's home records of each routed tensor (`ExpertBank::homes`):
-/// its group's records' view of its experts from its home record
+/// its group's records' region's view of its experts from its home record
 /// (`ExpertBankPlan::home`), as its slot map is its map's.
 fn homes(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<RecordTensors<Tensor>>, String> {
     plan.layers()

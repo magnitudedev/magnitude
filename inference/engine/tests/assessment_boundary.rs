@@ -19,7 +19,7 @@ use magnitude_engine::{
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
 };
 use magnitude_executor::assessment::ExecutionFit;
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -688,7 +688,7 @@ fn cpu_structure() -> AssessmentStructure {
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
         None,
-        MemoryReserves::of_machine(None),
+        ReleaseRate::of_machine(None),
         ModelPolicy::default(),
         standard_service_limits(),
     )
@@ -870,7 +870,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
         None,
-        MemoryReserves::of_machine(None),
+        ReleaseRate::of_machine(None),
         policy,
         standard_service_limits(),
     )

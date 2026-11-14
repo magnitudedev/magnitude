@@ -3,10 +3,9 @@
 //! Workflow planning owns symbolic resource requirements. This module owns the
 //! mutable device-side state needed to turn those requirements into one
 //! admitted transaction: admission serialization and persistent allocations.
-//! Memory accounting remains in `memory` because allocations own its charges.
+//! Memory is charged by the backends, each allocation's charge held with it.
 
 use crate::driver::{Allocation, AllocationPermit};
-use crate::memory::MemoryReservation;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -15,7 +14,6 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 /// its actual allocation access for observation. It cannot manufacture the
 /// constituent reservation, leases, or access permits.
 pub(crate) struct AdmittedResources {
-    _reservation: MemoryReservation,
     preclaims: BTreeMap<(u64, usize, usize), PersistentGrowth>,
     // Each permit owns its backing Arc. One slot per physical allocation,
     // shared by every staged alias in the run.
@@ -146,7 +144,7 @@ impl AdmittedResources {
         self.reached_peak = self.reached_peak.max(self.reached_live);
         *destination = Some(permit);
     }
-    pub(crate) fn new(reservation: MemoryReservation, access: Vec<AllocationPermit>) -> Self {
+    pub(crate) fn new(access: Vec<AllocationPermit>) -> Self {
         let mut slots = BTreeMap::new();
         for permit in access {
             let identity = permit.allocation().identity();
@@ -156,7 +154,6 @@ impl AdmittedResources {
             );
         }
         Self {
-            _reservation: reservation,
             preclaims: BTreeMap::new(),
             slots,
             reached_live: 0,

@@ -276,16 +276,6 @@ pub(super) struct Wants {
     pub releases: Vec<Release>,
 }
 
-/// How a group shrinks to `records` ([`Directory::plan_shrink`]): the
-/// experts it evicts, (layer, expert), and the kept ones it moves, (layer,
-/// expert, from, to).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Shrink {
-    pub records: usize,
-    pub evicted: Vec<(usize, usize)>,
-    pub moved: Vec<(usize, usize, usize, usize)>,
-}
-
 pub(super) struct Directory {
     /// The bank's records: what each holds, and the maps naming them.
     bank: BankRecords,
@@ -615,7 +605,7 @@ impl Directory {
     pub fn reserve(&mut self, group: usize, records: usize) {
         assert!(self.placer == crate::planning::Placer::Tier, "the one store promotes nothing");
         let members = self.layer_groups().iter().filter(|&&of| of == group).count();
-        let count = self.bank.records(group).len();
+        let count = self.bank.counts()[group];
         let most = most_reserved(count, members);
         assert!(records <= most, "a reserve of {records} of group {group}'s {count} records, beyond {most}");
         if std::mem::replace(&mut self.reserve[group], records) != records {
@@ -643,7 +633,8 @@ impl Directory {
     /// records less its reserve, over its members.
     pub fn shares(&self) -> Vec<usize> {
         let groups = self.layer_groups();
-        groups.iter().map(|&group| share(self.bank.records(group).len() - self.reserve[group], &groups, group)).collect()
+        let counts = self.bank.counts();
+        groups.iter().map(|&group| share(counts[group] - self.reserve[group], &groups, group)).collect()
     }
 
     /// The read path's mirror of where every expert is
@@ -1111,7 +1102,7 @@ impl Directory {
     fn stay(&self, group: usize, now: Step) -> Option<f64> {
         let Asked { first, count } = self.asked[group]?;
         let steps = now.checked_sub(first).filter(|&steps| steps > 0)? as f64;
-        Some(self.bank.records(group).len() as f64 / (count as f64 / steps))
+        Some(self.bank.counts()[group] as f64 / (count as f64 / steps))
     }
 
     /// The promotions every group has asked since the load.
@@ -1197,51 +1188,42 @@ impl Directory {
         self.host(self.bank.group(layer)).alone()[layer]
     }
 
-    /// Grow group `group`'s host tier to `records` records, the new ones
-    /// empty: the ranking's shares too where the tier is the one store.
-    pub fn grow_host(&mut self, group: usize, records: u32) {
+    /// Back group `group`'s host `records`, holes or past every record:
+    /// ready from now, the ranking's shares too where the tier is the one
+    /// store.
+    pub fn grow_host(&mut self, group: usize, records: Vec<u32>) {
         self.host[group].grow(records);
         if self.placer == crate::planning::Placer::Bank {
-            self.resized(group, records as usize);
+            let count = self.host[group].records() as usize;
+            self.resized(group, count);
         }
     }
 
-    /// The fewest records group `group`'s host tier may shrink to: every
-    /// record in flight lies below them ([`HostRecords::shrink_floor`]).
-    pub fn host_floor(&self, group: usize) -> u32 {
-        self.host[group].shrink_floor()
-    }
-
-    /// Shrink group `group`'s host tier to `records` records, at least its
-    /// floor ([`Self::host_floor`]), between flights with no placement
-    /// pending, every record in flight kept in place
-    /// ([`HostRecords::shrink`]): the moves whose bytes the caller copies.
-    /// The ranking's shares shrink too where the tier is the one store.
-    pub fn shrink_host(&mut self, group: usize, records: u32) -> Vec<(HostRecord, HostRecord)> {
-        assert!(self.bank.no_fills(), "a host tier shrinks while fills are pending");
-        if self.placer == crate::planning::Placer::Bank {
-            self.resized(group, records as usize);
-        }
+    /// The host records group `group` evicts to hold `target` records
+    /// ([`HostRecords::evictable`]), changing nothing yet: the most valuable
+    /// kept where their bytes are, by the one store's rank. None where it
+    /// holds no more than `target`, and fewer than it lacks where too few
+    /// are evictable.
+    pub fn host_evictions(&self, group: usize, target: u32) -> Vec<u32> {
+        let excess = self.host[group].records().saturating_sub(target) as usize;
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        let shares = self.store_shares(&reuse);
-        self.host[group].shrink(records, rank, shares).into_iter().map(|(from, to)| (HostRecord(from), HostRecord(to))).collect()
+        let mut evicted = self.host[group].evictable(rank, self.store_shares(&reuse));
+        evicted.truncate(excess);
+        evicted
     }
 
-    /// The fewest records group `group`'s one store may be cut to beside
-    /// running steps ([`HostRecords::running_floor`]).
-    pub fn running_floor(&self, group: usize) -> u32 {
-        self.host[group].running_floor()
-    }
-
-    /// Cut group `group`'s one store to `records` records beside running
-    /// steps, at least [`Self::running_floor`], nothing moved: each expert
-    /// kept at or past the cut unmapped from `until` of it on
-    /// ([`HostRecords::cut_running`]). The ranking's shares shrink too.
-    pub fn cut_running(&mut self, group: usize, records: u32, until: impl Fn(Staged) -> Step) {
-        assert!(self.placer == crate::planning::Placer::Bank, "only the one store is cut beside running steps");
-        self.resized(group, records as usize);
-        self.host[group].cut_running(records, until);
+    /// Evict group `group`'s host `records` ([`Self::host_evictions`],
+    /// nothing changed since), beside running steps or not: holes from now,
+    /// nothing moved, each kept expert unmapped from `until(expert)` on
+    /// ([`HostRecords::evict`]). The ranking's shares shrink too where the
+    /// tier is the one store.
+    pub fn evict_host(&mut self, group: usize, records: &[u32], until: impl Fn(Staged) -> Step) {
+        self.host[group].evict(records, until);
+        if self.placer == crate::planning::Placer::Bank {
+            let count = self.host[group].records() as usize;
+            self.resized(group, count);
+        }
     }
 
     /// The bank no longer holds `layer`'s `expert`, last read at `read`: its
@@ -1638,93 +1620,57 @@ impl Directory {
         typed(least)
     }
 
-    /// Each group's records, its committed ones.
+    /// Each group's records the bank holds storage for: every one but the
+    /// holes.
     pub fn records(&self) -> Vec<usize> {
         self.bank.counts()
     }
 
-    /// How group `group` retires its records from `target` up, between
-    /// flights (no fill pending), changing nothing yet. The shrink keeps
-    /// the group's most reused experts, by their rank ([`Ranked`]) beside
-    /// `last_read(layer, expert)` (the step that last read it, none before
-    /// any: least recent), as many as its records below `target` hold. Of
-    /// the experts from `target` up, each it keeps moves to a record below
-    /// `target` (a free one, else one whose expert it drops, least recent
-    /// first, which is evicted), and the rest are evicted. The evictions
-    /// are taken first ([`Self::evict`]),
-    /// then the device moves each move's bytes, then
-    /// [`Self::commit_shrink`] takes the rest of the plan. Between flights
-    /// the conveyor has returned what it was lent.
-    pub fn plan_shrink(
-        &self,
-        group: usize,
-        target: usize,
-        last_read: impl Fn(usize, usize) -> Option<Step>,
-    ) -> Shrink {
-        let contents = self.bank.records(group);
-        assert!(target <= contents.len(), "a shrink of {} records to {target}", contents.len());
-        let held = contents
-            .iter()
-            .enumerate()
-            .filter_map(|(record, content)| match *content {
-                Record::Held((layer, expert)) => Some((layer, expert, last_read(layer, expert), record)),
-                Record::Free => None,
-                Record::Filling(..) => unreachable!("between flights no fill is pending"),
-                Record::Promoting(..) | Record::Releasing { .. } => unreachable!("between flights every promotion and release has ended"),
-                Record::Lent { .. } => unreachable!("the conveyor returned its records"),
-                Record::Shrinking | Record::Moving(_) => unreachable!("a shrink planned while another's is uncommitted"),
-            })
-            .collect::<Vec<_>>();
-        // Ranked by one hold of the ranking, after `last_read` (which may
-        // hold it) has answered.
-        let mut held = {
-            let reuse = self.reuse_now();
-            held.into_iter().map(|(layer, expert, read, record)| (self.ranked(&reuse, layer, expert, read), record)).collect::<Vec<_>>()
-        };
-        held.sort_unstable_by(|a, b| b.cmp(a));
-        let (kept, dropped) = held.split_at(target.min(held.len()));
-        let movers = kept.iter().filter(|held| held.1 >= target).collect::<Vec<_>>();
-        // Below the target, the free records, then those whose experts the
-        // target drops, least recent first.
-        let displaced = dropped
-            .iter()
-            .rev()
-            .filter(|held| held.1 < target)
-            .take(movers.len().saturating_sub((0..target).filter(|&record| contents[record] == Record::Free).count()))
-            .collect::<Vec<_>>();
-        let mut to = (0..target)
-            .filter(|&record| contents[record] == Record::Free)
-            .chain(displaced.iter().map(|held| held.1));
-        Shrink {
-            records: target,
-            evicted: dropped
-                .iter()
-                .filter(|held| held.1 >= target)
-                .chain(displaced.iter().copied())
-                .map(|&(Ranked { layer, expert, .. }, _)| (layer, expert))
-                .collect(),
-            moved: movers
-                .into_iter()
-                .map(|&(Ranked { layer, expert, .. }, from)| {
-                    let to = to.next().expect("a kept expert has a record below the target");
-                    (layer, expert, from, to)
-                })
-                .collect(),
+    /// The records group `group` evicts to hold `target` records
+    /// ([`BankRecords::evictable`]), changing nothing yet: its free ones
+    /// first, then those releasing, then the held ones least ranked first
+    /// ([`Ranked`]) beside `last_read(layer, expert)` (the step that last
+    /// read it, none before any: least recent), so it keeps its most reused
+    /// experts where their bytes are. None where it holds no more than
+    /// `target`, and fewer than it lacks where too few are evictable.
+    pub fn evictions(&self, group: usize, target: usize, last_read: impl Fn(usize, usize) -> Option<Step>) -> Vec<usize> {
+        let excess = self.bank.counts()[group].saturating_sub(target);
+        let (mut idle, mut held) = (Vec::new(), Vec::new());
+        for (record, content) in self.bank.evictable(group) {
+            match content {
+                Record::Free => idle.push((0, record)),
+                Record::Releasing { .. } => idle.push((1, record)),
+                Record::Held((layer, expert)) => held.push((layer, expert, last_read(layer, expert), record)),
+                _ => unreachable!("an evictable record is free, releasing or held"),
+            }
         }
+        idle.sort_unstable();
+        let mut evicted = idle.into_iter().map(|(_, record)| record).take(excess).collect::<Vec<_>>();
+        if evicted.len() < excess {
+            // Ranked by one hold of the ranking, after `last_read` (which
+            // may hold it) has answered.
+            let mut held = {
+                let reuse = self.reuse_now();
+                held.into_iter().map(|(layer, expert, read, record)| (self.ranked(&reuse, layer, expert, read), record)).collect::<Vec<_>>()
+            };
+            held.sort_unstable();
+            evicted.extend(held.into_iter().map(|(_, record)| record).take(excess - evicted.len()));
+        }
+        evicted
     }
 
-    /// Evict what `plan` ([`Self::plan_shrink`], nothing changed since)
-    /// evicts, from the first step not yet begun, and hold every record it
-    /// moves into or retires from every placement until it commits
-    /// ([`BankRecords::shrinking`]): always safe, as the group only loses
-    /// experts, and no promotion takes a record a move writes meanwhile.
-    /// The host tier learns each, ranked by `last_read` (the plan's
-    /// ranking): one whose copy it keeps is held alone there, and the rest
-    /// are dropped, the file holding them. Nothing is written back.
-    pub fn evict(&mut self, group: usize, plan: &Shrink, last_read: impl Fn(usize, usize) -> Option<Step>, at: &Unbegun) {
-        for (layer, expert) in self.bank.shrinking(group, plan, at) {
+    /// Evict group `group`'s `records` ([`Self::evictions`], nothing changed
+    /// since): holes from now, nothing moved, each held expert unmapped from
+    /// `until(expert)` on ([`BankRecords::evict`]). The host tier learns
+    /// each expert, ranked by `last_read`: one whose copy it keeps is held
+    /// alone there, and the rest are dropped, the file holding them. Nothing
+    /// is written back.
+    pub fn evict(&mut self, group: usize, records: &[usize], last_read: impl Fn(usize, usize) -> Option<Step>, until: impl Fn(Staged) -> Step) {
+        for (layer, expert) in self.bank.evict(group, records, until) {
             self.left_bank(layer, expert, last_read(layer, expert));
         }
+        let count = self.bank.counts()[group];
+        self.resized(group, count);
     }
 
     /// The first record of group `group` a seed may take: what a seed list
@@ -1738,32 +1684,12 @@ impl Directory {
         }
     }
 
-    /// Whether a shrink is planned and not yet committed
-    /// ([`BankRecords::shrink_pending`]): residency promotes and releases
-    /// nothing until it commits or is dropped.
-    pub fn shrink_pending(&self) -> bool {
-        self.bank.shrink_pending()
-    }
-
-    /// A shrink planned and never committed (its owner dropped the plan)
-    /// holds its records no more ([`BankRecords::unshrink`]): a new plan
-    /// replaces it.
-    pub fn unshrink(&mut self) {
-        self.bank.unshrink();
-    }
-
-    /// Retire group `group`'s records as `plan` says, its evictions taken
-    /// ([`Self::evict`]) and its moves queued on the device ahead of any
-    /// later step that reads the records.
-    pub fn commit_shrink(&mut self, group: usize, plan: &Shrink, at: &Unbegun) {
-        self.bank.commit_shrink(group, plan, at);
-        self.resized(group, plan.records);
-    }
-
-    /// Commit group `group`'s records up to `records`, the new ones free.
-    pub fn grow(&mut self, group: usize, records: usize) {
+    /// Back group `group`'s `records`, holes or past every record: free
+    /// from now.
+    pub fn grow(&mut self, group: usize, records: Vec<usize>) {
         self.bank.grow(group, records);
-        self.resized(group, records);
+        let count = self.bank.counts()[group];
+        self.resized(group, count);
     }
 }
 

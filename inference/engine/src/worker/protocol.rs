@@ -181,7 +181,6 @@ pub enum RequestState {
     /// It never ran, and waits for memory to be reclaimed; it may yet be
     /// refused for memory.
     MemoryBlocked,
-    CapacityBlocked { required: u64, available: u64 },
     Finished(FinishReason),
 }
 
@@ -287,6 +286,11 @@ pub enum WorkerMessage {
     },
     Observed {
         observation: Result<MemoryObservation, RequestError>,
+    },
+    /// The census changed: sent as the owner counts a change of its
+    /// memory, never on a timer.
+    Census {
+        census: AllocationCensus,
     },
     /// The answer to `ClaimMeasurementRoom` `claim`, or why the worker
     /// cannot answer it. A claim the host released is answered by no

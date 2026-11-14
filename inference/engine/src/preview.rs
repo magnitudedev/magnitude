@@ -107,10 +107,11 @@ impl ExecutionManifest {
             policy.codec(),
             policy.limits(),
             ResourceCapacity {
-                domain_bytes: selected.assessment_capacity_bytes,
+                domain_bytes: magnitude_executor::StableRoom::of_selected(&selected).capacity().map_err(|error| internal(error.to_string()))?,
                 tensor_operations: magnitude_executor::TensorOperations::of(
                     selected.info.forms_tensor_operations(),
                 ),
+                allocations: selected.info.limits().allocations(),
             },
         )
         .map_err(|error| internal(error.to_string()))?;
@@ -151,7 +152,7 @@ impl ExecutionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::{fixtures, platform::{DeviceRequest, MemoryReserves}, ExecutionPath};
+    use magnitude_executor::{fixtures, platform::{DeviceRequest, ReleaseRate}, ExecutionPath};
     use std::cell::Cell;
 
     /// A load on a host with nothing of its executor's costs measured plans
@@ -173,7 +174,7 @@ mod tests {
             DeviceRequest::Backend(BackendName::Cpu),
             Some(cache.path().to_owned()),
             Some(cache.path().to_owned()),
-            MemoryReserves::of_machine(None),
+            ReleaseRate::of_machine(None),
         )
         .unwrap();
         let catalog = Devices::discover(&[]).unwrap();

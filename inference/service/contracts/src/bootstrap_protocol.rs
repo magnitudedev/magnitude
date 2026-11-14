@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+/// The version of the HTTP API the service serves, stated in its identity
+/// and its startup record. ACN refuses a service of any other version
+/// (`supportedApiVersion`), so it rises with every change a client of the
+/// version before cannot read.
+pub const API_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

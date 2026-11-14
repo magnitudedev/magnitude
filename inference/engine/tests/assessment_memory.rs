@@ -6,7 +6,7 @@ use magnitude_engine::{
     assessment::{ModelPackagePaths, assess_model},
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::ReleaseRate;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -108,15 +108,22 @@ fn packages(directory: &Path) -> Vec<(String, ModelPackagePaths)> {
         .collect()
 }
 
+fn main() {
+    let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
+    if filter.is_some_and(|filter| !"a_repeated_assessment_keeps_nothing".contains(&filter)) {
+        return;
+    }
+    a_repeated_assessment_keeps_nothing();
+}
+
 /// What an assessment keeps is the checked module and what it forms once
 /// per entry binding and geometry: assessing every fixture again keeps
 /// nothing more.
-#[test]
 fn a_repeated_assessment_keeps_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let packages = packages(directory.path());
     let setup =
-        recorded::m4_pro_setup(MemoryReserves::of_machine(None), ModelPolicy::default(), standard_service_limits());
+        recorded::m4_pro_setup(ReleaseRate::of_machine(None), ModelPolicy::default(), standard_service_limits());
     let mut passes = Vec::new();
     for pass in 0..2 {
         let started = std::time::Instant::now();

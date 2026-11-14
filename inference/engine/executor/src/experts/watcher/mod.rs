@@ -114,8 +114,8 @@ pub(in crate::experts) use self::core::{
     Extents, Group, Layer, ListRecords, LoadWords, PlacedLayerWords, PlacedWords, Pool, StoredPart, StoredTensor,
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
-pub(in crate::experts) use promotions::{Copier, CopyTensor};
-pub(crate) use resize::{Candidates, Join};
+pub(in crate::experts) use promotions::{BankRecordViews, Copier};
+pub(crate) use resize::{Candidates, Evicted, Evicting, Join};
 pub(crate) use steps::{ExpertStep, Recording, Step, StepFailure, StepRoute, low_word};
 pub use telemetry::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 

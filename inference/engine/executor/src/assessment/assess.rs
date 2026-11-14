@@ -12,7 +12,7 @@ use super::executor_costs::ExecutorCosts;
 use super::launches::Declarations;
 use super::misses::HeldSlots;
 use super::AssessmentError;
-use crate::platform::{DomainRole, MemoryReserves};
+use crate::platform::{DomainRole, ReleaseRate};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
@@ -34,7 +34,7 @@ pub struct AssessmentRequest {
     /// The conversations decoding together: the serving profile's decode
     /// concurrency.
     pub sequences: u32,
-    pub reserves: MemoryReserves,
+    pub release: ReleaseRate,
 }
 
 /// Fit of the standard workload in one memory domain the load touches.
@@ -43,13 +43,10 @@ pub struct DomainFit {
     pub role: DomainRole,
     pub domain: StoreId,
     /// What the executor's placements can hold in the store, within the
-    /// store and the grants of the paths into it, with its planning
-    /// reserve.
+    /// store and the grants of the paths into it.
     pub capacity_bytes: u64,
     pub required_bytes: u64,
-    /// The domain's planning reserve.
-    pub reserve_bytes: u64,
-    /// `capacity − reserve − required`.
+    /// `capacity − required`.
     pub remaining_bytes: i64,
 }
 
@@ -216,13 +213,13 @@ impl ExpertShares {
             bank.slots,
             bank.widest(),
             match bank.host() {
-                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => {
+                crate::planning::HostTier::Linked if bank.host_slots > 0 => {
                     let cache_bytes = bank
                         .host_cache(bank.host_slots)
                         .expect("a planned host tier's cache was computed when the plan sized it");
                     ColdSource::HostTier { slots: bank.host_slots, cache_bytes }
                 }
-                crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
+                crate::planning::HostTier::Linked => ColdSource::File(FileOnly::NoHostRoom),
                 crate::planning::HostTier::Unified(_) => ColdSource::File(FileOnly::Unified),
             },
         )
@@ -558,8 +555,11 @@ fn state_plan(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Resul
         policy.codec(),
         policy.limits(),
         ResourceCapacity {
-            domain_bytes: draft.device().assessment_capacity_bytes(),
+            domain_bytes: crate::StableRoom::of(draft.device())
+                .capacity()
+                .map_err(|error| AssessmentError::Plan(error.to_string()))?,
             tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
+            allocations: draft.device().allocations(),
         },
     )
     .map_err(AssessmentError::Plan)
@@ -610,11 +610,10 @@ pub fn assess_execution_fit(
     pricing: crate::platform::GraphPricing,
     topology: &DeviceTopology,
     status: &Status,
-    reserves: &MemoryReserves,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let forms = &prepared.forms;
     let device = planned_executor(prepared.draft(), topology)?;
-    let room = crate::planning::StableRoom { topology, executor: device, status, reserves };
+    let room = crate::planning::StableRoom { topology, executor: device, status };
     let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
     // The charge of `draft` of `form`'s structure and its fit.
@@ -674,7 +673,7 @@ pub fn assess_execution_fit(
                 }
                 let slots = bank.points[fitting];
                 let (charge, fit) = held;
-                match bank.with_host_tier(slots, &charge)? {
+                match bank.with_host_tier(slots, &charge, &room)? {
                     Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
                     Err(reason) => {
                         return Err(AssessmentError::Plan(format!(
@@ -783,36 +782,38 @@ pub(crate) mod tests {
             prepare_execution_assessment(&self.definition, forms).unwrap()
         }
 
-        /// The prepared draft's fit at `request`'s reserves.
-        fn fit(&self, prepared: &PreparedExecutionAssessment, request: &AssessmentRequest) -> Result<ExecutionAssessment, AssessmentError> {
+        /// The prepared draft's fit.
+        fn fit(&self, prepared: &PreparedExecutionAssessment) -> Result<ExecutionAssessment, AssessmentError> {
             assess_execution_fit(
                 &self.definition,
                 prepared,
                 self.draft.device().graph_pricing(),
                 &self.topology,
                 &self.status,
-                &request.reserves,
             )
         }
     }
 
     fn environment(context_limit: u64) -> Environment {
-        environment_within(context_limit, u64::MAX)
+        environment_within(context_limit, None)
     }
 
-    /// The fixture planned on the host's device with at most
-    /// `capacity_bytes` of its stable capacity.
-    fn environment_within(context_limit: u64, capacity_bytes: u64) -> Environment {
+    /// The fixture planned on the host's device, selected as if the host
+    /// had exactly `host_room` bytes free where it is given
+    /// (`test_support::selected_with_room`).
+    fn environment_within(context_limit: u64, host_room: Option<u64>) -> Environment {
         let inventory = std::sync::Arc::new(seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap());
         let catalog = seismic::Devices::new(inventory.clone());
-        let mut selected = crate::platform::select_device(
-            &catalog,
-            ExecutionPath::Native,
-            crate::platform::DeviceRequest::Automatic,
-            &MemoryReserves::of_machine(None),
-        )
-        .unwrap();
-        selected.assessment_capacity_bytes = selected.assessment_capacity_bytes.min(capacity_bytes);
+        let selected = match host_room {
+            Some(bytes) => crate::test_support::selected_with_room(&catalog, bytes),
+            None => crate::platform::select_device(
+                &catalog,
+                ExecutionPath::Native,
+                crate::platform::DeviceRequest::Automatic,
+                &ReleaseRate::of_machine(None),
+            )
+            .unwrap(),
+        };
         let mut definition = crate::planning::fixtures::fixture_definition();
         definition.decoder.context_limit = context_limit;
         let manifest = crate::planning::fixtures::fixture_manifest(&definition);
@@ -843,12 +844,13 @@ pub(crate) mod tests {
             context_limit,
             performance_depths: depths.to_vec(),
             sequences: 1,
-            reserves: MemoryReserves::of_machine(None),
+            release: ReleaseRate::of_machine(None),
         }
     }
 
-    fn assess(environment: &Environment, request: &AssessmentRequest) -> ExecutionAssessment {
-        environment.fit(&environment.prepared(), request).unwrap()
+    /// The fit, whatever depths `_asked` names: it reads none.
+    fn assess(environment: &Environment, _asked: &AssessmentRequest) -> ExecutionAssessment {
+        environment.fit(&environment.prepared()).unwrap()
     }
 
     #[test]
@@ -881,7 +883,6 @@ pub(crate) mod tests {
             assert_eq!(
                 i128::from(domain.remaining_bytes),
                 i128::from(domain.capacity_bytes)
-                    - i128::from(domain.reserve_bytes)
                     - i128::from(domain.required_bytes)
             );
         }
@@ -936,9 +937,8 @@ pub(crate) mod tests {
     fn a_context_beyond_the_domains_history_capacity_is_assessed() {
         // The fixture stores 256 bytes of history per token: 150,000 tokens
         // are 38.4 MB, beyond a 16 MiB domain.
-        let environment = environment_within(150_000, 16 << 20);
-        let request = request(150_000, &[25_000]);
-        let fit_context_tokens = match environment.fit(&environment.prepared(), &request).unwrap() {
+        let environment = environment_within(150_000, Some(16 << 20));
+        let fit_context_tokens = match environment.fit(&environment.prepared()).unwrap() {
             ExecutionAssessment::Fits(fit) => fit.fit_context_tokens,
             ExecutionAssessment::DoesNotFit(shortfall) => shortfall.fit_context_tokens,
         };

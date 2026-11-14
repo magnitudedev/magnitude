@@ -50,9 +50,7 @@ use std::time::Instant;
 
 pub use command::Pipeline;
 pub use compile::NativeCandidate;
-pub use device::{
-    DeviceHandle, Granules, MetalBuffer, MetalDevice, MetalResizer, ReservedBuffer, WritableMetalBuffer,
-};
+pub use device::{DeviceHandle, MetalBuffer, MetalDevice, WritableMetalBuffer};
 pub use direct::{
     host_seconds, DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, LaunchTimestamps,
     SharedEvent, DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,

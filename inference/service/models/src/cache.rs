@@ -431,7 +431,6 @@ mod tests {
                 memory_domain_id: MemoryDomainId::system(),
                 capacity_bytes: 100,
                 required_bytes: 50,
-                compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
             memory_breakdown: MemoryBreakdown {
@@ -464,7 +463,6 @@ mod tests {
                 memory_domain_id: MemoryDomainId::system(),
                 capacity_bytes: 100,
                 required_bytes: 101,
-                compatibility_reserve_bytes: 0,
                 remaining_bytes: -1,
             }],
             limiting_resource: "system memory".to_owned(),

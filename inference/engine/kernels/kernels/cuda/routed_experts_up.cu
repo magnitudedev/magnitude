@@ -85,7 +85,7 @@ __device__ void routed_experts_up_expand_block(SEISMIC_KERNEL_PARAMS) {
                                      SEISMIC_ORDER_STRIDE_1};
     routed::routed_gemm<SHARED, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
                                      blockIdx.x, SEISMIC_DIM_F,
-                                     ROUTED_EXPERT_MATRIX(KERNEL_W0, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
+                                     ROUTED_EXPERT_RECORD(KERNEL_W0, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
                                                           SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), slot, expert),
                                      projection::NoWeight{}, epi);
 }
@@ -125,7 +125,7 @@ __device__ void routed_experts_up_down_block(SEISMIC_KERNEL_PARAMS) {
                                             SEISMIC_DIM_F};
     routed::routed_gemm<SHARED, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
                                      blockIdx.x, SEISMIC_DIM_H,
-                                     ROUTED_EXPERT_MATRIX(KERNEL_W1, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
+                                     ROUTED_EXPERT_RECORD(KERNEL_W1, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
                                                           SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), slot, expert),
                                      projection::NoWeight{}, epi);
 }

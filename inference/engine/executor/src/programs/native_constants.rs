@@ -1029,7 +1029,7 @@ mod tests {
     use seismic::BackendName;
 
     #[test]
-    fn zero_constants_keep_metadata_symbolic_and_bind_exact_bytes() {
+    fn zero_constants_keep_metadata_symbolic_and_bind_one_allocation() {
         let large = GraphConstant::zeros_value(1 << 20, 1 << 16).unwrap();
         assert!(matches!(large.value().value, ConstantValue::Zero));
         assert_eq!(large.storage_bytes().unwrap(), 1 << 38);
@@ -1050,38 +1050,56 @@ mod tests {
         for backend in backends {
             let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), backend)
                 .unwrap();
-            let charged = || device.device_ledger().charged;
-            let before = charged();
+            let before = device.allocated();
+            let lone = charge_of(&device, &[&zero]);
             let mut uploaded = ConstantTensors::new(device.clone());
             let tensor = uploaded.tensor(&zero).unwrap();
             assert_eq!(tensor.read_to_host().unwrap(), vec![0; 24]);
             let tied = uploaded.tensor(&explicit).unwrap();
             assert_eq!(tied.read_to_host().unwrap(), vec![0; 24]);
-            assert_eq!(charged() - before, 24);
+            assert_eq!(uploaded.uploaded.len(), 1, "{backend:?}: tied constants share one allocation");
+            assert_eq!(device.allocated() - before, lone, "{backend:?}: tied constants charge one allocation's bytes");
             drop(tensor);
             drop(tied);
             drop(uploaded);
-            assert_eq!(charged(), before);
+            assert_eq!(device.allocated(), before);
         }
     }
 
+    /// What `device` charges for `constants` uploaded alone, each once,
+    /// returned once they drop: the backend's charge for those
+    /// allocations, which a CPU's carved block rounds past their bytes
+    /// (`seismic_cpu::buffer::Carver`).
+    fn charge_of(device: &seismic::Device, constants: &[&GraphConstant]) -> u64 {
+        let before = device.allocated();
+        let mut uploaded = ConstantTensors::new(device.clone());
+        for constant in constants {
+            uploaded.tensor(constant).unwrap();
+        }
+        let charged = device.allocated() - before;
+        drop(uploaded);
+        assert_eq!(device.allocated(), before, "uploaded constants return their charge as they drop");
+        charged
+    }
+
     #[test]
-    fn binding_claim_matches_distinct_physical_constant_charge() {
+    fn binding_claim_counts_each_distinct_constant_once() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         let mut graph = device.native_graph();
         let first = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let tied = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let other = GraphConstant::f32(&mut graph, &[1.0, 2.0]).unwrap();
-        let claim = distinct_storage_bytes([&first, &tied, &other]).unwrap();
-        let charged = || device.device_ledger().charged;
-        let before = charged();
+        assert_eq!(distinct_storage_bytes([&first, &tied, &other]).unwrap(), 20, "the claim counts each distinct value once");
+        let distinct = charge_of(&device, &[&first, &other]);
+        let before = device.allocated();
         let mut uploaded = ConstantTensors::new(device.clone());
         uploaded.tensor(&first).unwrap();
         uploaded.tensor(&tied).unwrap();
         uploaded.tensor(&other).unwrap();
-        assert_eq!(charged() - before, claim);
+        assert_eq!(uploaded.uploaded.len(), 2, "one allocation a distinct value");
+        assert_eq!(device.allocated() - before, distinct, "a tied constant charges nothing past its value's");
         drop(uploaded);
-        assert_eq!(charged(), before);
+        assert_eq!(device.allocated(), before);
     }
 }

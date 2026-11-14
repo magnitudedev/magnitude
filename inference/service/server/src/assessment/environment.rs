@@ -5,7 +5,7 @@ use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measure
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
 use magnitude_engine::worker::protocol::EngineBuild;
 use magnitude_executor::ExecutionPath;
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves, SelectionError, select};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate, SelectionError, select};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
 use seismic::{Devices, ExecutorSelector};
 use serde_json::json;
@@ -68,7 +68,7 @@ pub fn assessment_structure(
         devices,
         serving.request(),
         kernels,
-        MemoryReserves::of_machine(kernels.zip(Some(&*devices.topology()))),
+        ReleaseRate::of_machine(kernels.zip(Some(&*devices.topology()))),
         serving_policy(),
         standard_service_limits(),
     )?;
@@ -99,7 +99,7 @@ impl AssessmentEnvironment {
         structure: Arc<AssessmentStructure>,
         measurements: Measurements,
     ) -> anyhow::Result<Self> {
-        let structure_id = structure_id(&structure)?;
+        let structure_id = structure_id(&structure);
         Ok(Self::of(structure, structure_id, measurements))
     }
 
@@ -147,37 +147,24 @@ impl AssessmentEnvironment {
 }
 
 /// The identity of `structure`'s [`structure_identity`].
-fn structure_id(structure: &AssessmentStructure) -> anyhow::Result<Arc<str>> {
-    let identity = structure_identity(structure)?;
-    Ok(format!("structure_{:x}", Sha256::digest(identity.to_string().as_bytes())).into())
+fn structure_id(structure: &AssessmentStructure) -> Arc<str> {
+    let identity = structure_identity(structure);
+    format!("structure_{:x}", Sha256::digest(identity.to_string().as_bytes())).into()
 }
 
 /// What of `structure` enters identity: the engine build, the selected device, the topology's
-/// normalized structure, the process limits and their visibility, the reserves and the
-/// configuration models are assessed with. Its graphs' cost, which the records price, enters
+/// normalized structure, the bytes of host RAM's binding scope (the host's, or the process
+/// limit that binds), and the configuration models are assessed with. Its graphs' cost, which the records price, enters
 /// the environment's ([`AssessmentEnvironment::of`]).
-fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_json::Value> {
-    let host = structure
-        .status
-        .sample
-        .host_ram
-        .as_ref()
-        .map_err(Clone::clone)?;
-    let process_limits = host
-        .limits
-        .iter()
-        .map(|limit| json!({ "kind": limit.kind, "bytes": limit.limit_bytes }))
-        .collect::<Vec<_>>();
-    Ok(json!({
+fn structure_identity(structure: &AssessmentStructure) -> serde_json::Value {
+    json!({
         "engine_build": EngineBuild::current().0,
         "device": structure.selected.info.selector().to_string(),
         "topology": structure.topology.normalized(),
-        "process_limits": process_limits,
-        "limit_visibility": host.limit_visibility,
-        "reserves": structure.reserves.identity(),
+        "host_scope_bytes": structure.status.sample.host.total,
         "policy": structure.policy,
         "service": structure.service,
-    }))
+    })
 }
 
 #[cfg(test)]

@@ -28,12 +28,12 @@ impl ModelLoadPlan {
     /// expert bank of `slots` committed records per layer (at least its
     /// floor, [`ExpertBankPlan::floor`], at most the widest layer's experts)
     /// for prompt groups of up to `places` chain places, on `substrate`:
-    /// its records reserved as its reservation says, beside the host tier
-    /// it holds (a bank streams only beside one). Each expert stack is
-    /// planned `Banked`, its shape its group's records (their ceiling), charged its
-    /// committed records (and its per-expert second-level scale, which the
-    /// bank holds), its values the bank's. Each stored table's slots the
-    /// device can reserve are held in the bank's records too
+    /// its records in its store's records pool, beside the host tier it holds (a bank streams only
+    /// beside one). Each expert stack is planned `Banked`, its shape its
+    /// group's records (their ceiling), charged its committed records (and
+    /// its per-expert second-level scale, which the bank holds), its values
+    /// the bank's. Where the host writes the bank's pool in place (unified
+    /// memory), each stored table's slots are held in granules of it too
     /// (`BankTable`), so one owner prices the table against the slots.
     /// Layers whose record form or selected experts differ, layers that
     /// select in different orders or whose weights a route reads of the next
@@ -48,7 +48,7 @@ impl ModelLoadPlan {
         flights: FlightDepth,
         substrate: BankSubstrate,
     ) -> Result<Self, PlanError> {
-        let BankSubstrate { backend, reservation, host } = substrate;
+        let BankSubstrate { backend, allocations, host } = substrate;
         if self.bank.is_some() {
             return Err(PlanError::Topology("the load plan already streams its experts"));
         }
@@ -119,27 +119,36 @@ impl ModelLoadPlan {
         let (_, selected) = shape.ok_or(PlanError::Unstreamed(UnstreamedExperts::Unrouted))?;
         // A routed layer streamed has experts to stream.
         let layers = BankLayers::new(layers).ok_or(PlanError::Topology("a streamed routed layer has no experts"))?;
-        // Every stored table, its slots held in the bank's reservation.
+        // A conveyor or a scratch without a layout, or a pool without a
+        // granule, is refused here, so every sizing past this may rely on
+        // them (`ExpertBankPlan::prompt_records`, `ExpertBankPlan::granule`).
+        let structured = conveyor::Structured::new(selected, host, groups, layers)
+            .map_err(PlanError::InvalidDefinition)?;
+        // Every stored table whose slots the host fills in place, held in
+        // granules of the bank's pool: only where the host writes it.
         let mut tables = Vec::new();
-        for weight in self.target.iter_mut().filter(|weight| weight.stored_in_slots()) {
+        let granule = structured.granule();
+        // The records pools' blocks, which every charge of their granules is
+        // whole blocks of: the rule a load opens them by
+        // (`memory::ledger::Ledgers::open_pool`).
+        let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations })
+            .map_err(|error| PlanError::ResourcePlanning(format!("the bank's records pool blocks: {error:?}")))?;
+        for weight in self.target.iter_mut().filter(|weight| weight.stored_in_slots() && matches!(host, super::HostTier::Unified(_))) {
             let heads = stored_table_heads(definition, weight.role)?;
             let step_rows = heads
                 .checked_mul(magnitude_batching::MAX_CLASS_ROWS as u64)
                 .ok_or(PlanError::Arithmetic("a step's table rows overflow"))?;
-            let Some(table) = BankTable::of(weight, step_rows, reservation).map_err(PlanError::InvalidDefinition)? else {
+            let Some(table) = BankTable::of(weight, step_rows, granule).map_err(PlanError::InvalidDefinition)? else {
                 continue;
             };
-            *weight = table.plan(reservation).map_err(PlanError::ResourcePlanning)?;
+            *weight = table.plan(block, granule).map_err(PlanError::ResourcePlanning)?;
             tables.push(table);
         }
-        // A conveyor or a scratch no record of its lender holds whole is
-        // refused here, so every sizing past this may rely on them
-        // (`ExpertBankPlan::prompt_records`).
-        let structured = conveyor::Structured::new(selected, reservation, host, groups, layers)
-            .map_err(PlanError::InvalidDefinition)?;
         let bank = ExpertBankPlan {
             structured,
             backend,
+            allocations,
+            block,
             slots,
             ceiling: slots,
             resident: false,
@@ -188,7 +197,7 @@ impl ModelLoadPlan {
         }
         bank.slots = slots;
         bank.ceiling = ceiling;
-        bank.resident = slots == bank.widest().get() && bank.substrate().reads_homes();
+        bank.resident = slots == bank.widest().get();
         let bank = self.bank.as_ref().expect("the bank was just resized");
         for weight in &mut self.target {
             let Some((index, _)) = bank.layer(weight.role.scope) else {

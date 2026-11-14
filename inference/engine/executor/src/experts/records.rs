@@ -26,13 +26,11 @@
 //!   dropped; never a copy's record, a fill's, or a release's whose expert
 //!   the group's steps may still read. `Lent → Free`:
 //!   [`BankRecords::unlend`].
-//! - `Held | Free → Shrinking`, `Held → Moving`: [`BankRecords::shrinking`],
-//!   a shrink's evictions unmapped, the records it moves into or retires
-//!   and those it moves from held from every other transition until it
-//!   commits, residency asking no promotion or release meanwhile;
-//!   `Shrinking → Held`, the rest truncated: [`BankRecords::commit_shrink`];
-//!   `Shrinking → Free`, `Moving → Held`, a plan dropped uncommitted:
-//!   [`BankRecords::unshrink`]. [`BankRecords::grow`] adds free ones.
+//! - `Free | Held | Releasing → Absent`: [`BankRecords::evict`], a shrink's,
+//!   beside running steps or not: the record's storage leaves the bank, its
+//!   expert unmapped from the step its caller names, and nothing moves (the
+//!   records allow holes). `Absent → Free`: [`BankRecords::grow`], a slot
+//!   whose storage the bank holds again.
 //!
 //! A mapping from the first step not yet begun takes the steps' [`Unbegun`]
 //! (`Steps::unbegun`, its one maker), so it is stored under the lock every
@@ -41,7 +39,7 @@
 //! takes one a promotion could use marks the records changed
 //! ([`BankRecords::take_changed`]), so the promotions are asked again.
 
-use super::directory::{BankRecord, HostRecord, Point, Promotion, Shrink, bank_record};
+use super::directory::{BankRecord, HostRecord, Point, Promotion, bank_record};
 use super::map::{MapView, StampedMap};
 use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Unbegun};
@@ -66,12 +64,9 @@ pub(super) enum Record {
     /// Lent to the prompt group whose first step is `from`: its scratch
     /// slots, which no step reads through the map.
     Lent { from: Step },
-    /// A shrink's, planned and not yet committed: a move's target, or a
-    /// record past it.
-    Shrinking,
-    /// A move's source of a shrink planned and not yet committed: it holds
-    /// the expert, mapped, until the commit maps it to its target.
-    Moving(Staged),
+    /// A hole: the bank holds no storage for it, so nothing is placed in it
+    /// until a growth backs it again.
+    Absent,
 }
 
 /// Where a promotion is.
@@ -84,20 +79,22 @@ pub(super) enum Moving {
     Copying { tier: HostRecord, batch: u64 },
 }
 
-/// A group's records, a bit per record set while it is free. Every change
-/// of a record goes through [`Self::set`], so the bits are the free records
-/// by construction, and a placement finds free records without ranking the
-/// group's held ones (that ranking, over 8,880 records, measured 167 µs of
-/// each miss's service).
+/// A group's records, a bit per record set while it is free, and the count
+/// the bank holds storage for (every one but the holes). Every change of a
+/// record goes through [`Self::set`], so the bits and the count are the
+/// free and present records by construction, and a placement finds free
+/// records without ranking the group's held ones (that ranking, over 8,880
+/// records, measured 167 µs of each miss's service).
 struct Records {
     contents: Vec<Record>,
     free: Vec<u64>,
+    present: usize,
 }
 
 impl Records {
     fn new(count: usize) -> Self {
-        let mut records = Self { contents: Vec::new(), free: Vec::new() };
-        records.grow(count);
+        let mut records = Self { contents: Vec::new(), free: Vec::new(), present: 0 };
+        records.grow(0..count);
         records
     }
 
@@ -117,23 +114,20 @@ impl Records {
             Record::Free => self.free[word] |= bit,
             _ => self.free[word] &= !bit,
         }
-        self.contents[record] = content;
+        let old = std::mem::replace(&mut self.contents[record], content);
+        self.present = self.present + usize::from(old == Record::Absent) - usize::from(content == Record::Absent);
     }
 
-    fn truncate(&mut self, records: usize) {
-        self.contents.truncate(records);
-        self.free.truncate(records.div_ceil(64));
-        if let Some(last) = self.free.last_mut().filter(|_| records % 64 != 0) {
-            *last &= (1u64 << (records % 64)) - 1;
-        }
-    }
-
-    fn grow(&mut self, records: usize) {
-        let from = self.contents.len();
-        self.contents.resize(records, Record::Free);
-        self.free.resize(records.div_ceil(64), 0);
-        for record in from..records {
-            self.free[record / 64] |= 1u64 << (record % 64);
+    /// Back `records`, each a hole or past every record: free from now.
+    fn grow(&mut self, records: impl IntoIterator<Item = usize>) {
+        for record in records {
+            if record >= self.contents.len() {
+                // Past every record: holes up to it, which `set` then fills.
+                self.contents.resize(record + 1, Record::Absent);
+                self.free.resize((record + 1).div_ceil(64), 0);
+            }
+            assert_eq!(self.contents[record], Record::Absent, "a growth backs record {record}, which the bank holds");
+            self.set(record, Record::Free);
         }
     }
 }
@@ -163,10 +157,6 @@ pub(super) struct BankRecords {
     /// Whether a record was freed, or one a promotion could use was taken,
     /// since the promotions last asked ([`Self::take_changed`]).
     changed: bool,
-    /// The records a shrink planned and not yet committed holds, shrinking
-    /// or moving: while any, no transition but the commit or the plan's
-    /// drop takes a record ([`Self::shrink_pending`]).
-    shrink_held: usize,
     /// Beside a host tier, each layer's map, whose one writer this is, and
     /// the lender's bank group and its lent records, `[0, records)`: none
     /// without a device (an offline replay) or where the host places, whose
@@ -194,7 +184,6 @@ impl BankRecords {
             releasing: Vec::new(),
             filling: Vec::new(),
             changed: false,
-            shrink_held: 0,
             tier,
             holdings: 0,
         }
@@ -249,9 +238,10 @@ impl BankRecords {
         self.groups[group].free()
     }
 
-    /// The groups' record counts.
+    /// The records of each group the bank holds storage for: every one but
+    /// the holes.
     pub fn counts(&self) -> Vec<usize> {
-        self.groups.iter().map(|records| records.contents.len()).collect()
+        self.groups.iter().map(|records| records.present).collect()
     }
 
     /// The first record of group `group` a seed may take: past the lent
@@ -316,8 +306,6 @@ impl BankRecords {
         };
         let old = self.groups[group].contents[record];
         self.changed |= kind(old) != kind(content);
-        let shrink = |content: Record| matches!(content, Record::Shrinking | Record::Moving(_));
-        self.shrink_held = self.shrink_held + usize::from(shrink(content)) - usize::from(shrink(old));
         self.groups[group].set(record, content);
     }
 
@@ -331,13 +319,6 @@ impl BankRecords {
     /// since [`Self::take_changed`] was last asked.
     pub fn changed(&self) -> bool {
         self.changed
-    }
-
-    /// Whether a shrink is planned and not yet committed: it holds the
-    /// records it moves from, into, and past until its commit or its drop,
-    /// and residency asks no promotion or release meanwhile.
-    pub fn shrink_pending(&self) -> bool {
-        self.shrink_held > 0
     }
 
     /// Whether a promotion may take record `record` of group `group`, a
@@ -597,11 +578,6 @@ impl BankRecords {
         }
     }
 
-    /// Whether no fill is pending.
-    pub fn no_fills(&self) -> bool {
-        self.filling.is_empty()
-    }
-
     /// The first group a pending fill was placed in.
     pub fn pending_from(&self) -> Option<Step> {
         self.filling.iter().map(|&taken| self.fill_of(taken).1.group).min()
@@ -698,78 +674,41 @@ impl BankRecords {
         }
     }
 
-    /// Group `group` shrinks by `plan` (`Directory::plan_shrink`), between
-    /// flights: each expert it evicts leaves, unmapped from the first step
-    /// not yet begun, and every record a move writes or the shrink retires
-    /// is the shrink's until it commits ([`Self::commit_shrink`]), so no
-    /// placement takes one meanwhile. The evicted experts.
-    pub fn shrinking(&mut self, group: usize, plan: &Shrink, at: &Unbegun) -> Vec<Staged> {
-        let mut evicted = Vec::with_capacity(plan.evicted.len());
-        for &(layer, expert) in &plan.evicted {
-            let record = self.layers[layer].1[expert].expect("an evicted expert is held");
-            evicted.extend(self.vacate(group, record, at.next()));
-            self.set(group, record, Record::Shrinking);
-        }
-        for &(layer, expert, from, to) in &plan.moved {
-            match self.groups[group].contents[to] {
-                Record::Free => self.set(group, to, Record::Shrinking),
-                Record::Shrinking => {}
-                other => panic!("a shrink moves into record {to} of group {group}, holding {other:?}"),
-            }
-            assert_eq!(self.groups[group].contents[from], Record::Held((layer, expert)), "a shrink moves {:?} from where it is held", (layer, expert));
-            self.set(group, from, Record::Moving((layer, expert)));
-        }
-        for record in plan.records..self.groups[group].contents.len() {
+    /// The records of group `group` a shrink may evict now, beside running
+    /// steps or not: past the lent ones (the floor's, which the conveyor
+    /// borrows), and free, releasing or held, so none a promotion, a seed
+    /// or a prompt group writes or reads in place. Each with what it holds.
+    pub fn evictable(&self, group: usize) -> impl Iterator<Item = (usize, Record)> + '_ {
+        let lent = self.seeded_from(group);
+        self.groups[group].contents.iter().copied().enumerate().skip(lent).filter(|(_, content)| matches!(content, Record::Free | Record::Releasing { .. } | Record::Held(_)))
+    }
+
+    /// Evict `records` of group `group` ([`Self::evictable`] each): holes
+    /// from now, nothing moved. A held one's expert leaves, unmapped from
+    /// step `until(expert)` on, so the steps before it still read it where
+    /// its bytes are until the bank releases its storage behind them; a
+    /// releasing one's expert left already. The experts that left.
+    pub fn evict(&mut self, group: usize, records: &[usize], until: impl Fn(Staged) -> Step) -> Vec<Staged> {
+        let mut evicted = Vec::new();
+        for &record in records {
+            assert!(!self.lends(group, record), "a shrink evicts lent record {record} of group {group}");
             match self.groups[group].contents[record] {
-                Record::Free => self.set(group, record, Record::Shrinking),
-                Record::Shrinking | Record::Moving(_) => {}
-                other => panic!("record {record} past a shrink to {} of group {group} holds {other:?}, neither moved nor evicted", plan.records),
+                Record::Free => {}
+                Record::Releasing { .. } => self.releasing.retain(|&taken| taken != (group, record)),
+                Record::Held(staged) => evicted.extend(self.vacate(group, record, until(staged))),
+                other => panic!("a shrink evicts record {record} of group {group}, holding {other:?}"),
             }
+            self.set(group, record, Record::Absent);
         }
         evicted
     }
 
-    /// A shrink planned and never committed (its owner dropped the plan
-    /// before queueing its moves) holds its records no more: each it moved
-    /// from holds its expert as it did, and each other is free, as nothing
-    /// maps it; a new plan replaces it.
-    pub fn unshrink(&mut self) {
-        for group in 0..self.groups.len() {
-            for record in 0..self.groups[group].contents.len() {
-                match self.groups[group].contents[record] {
-                    Record::Shrinking => self.set(group, record, Record::Free),
-                    Record::Moving(staged) => self.set(group, record, Record::Held(staged)),
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Group `group`'s shrink by `plan` ([`Self::shrinking`]) commits, its
-    /// moves queued on the device ahead of every later step: each kept
-    /// expert is held at its new record, mapped from the first step not yet
-    /// begun, and the group ends at `plan.records`.
-    pub fn commit_shrink(&mut self, group: usize, plan: &Shrink, at: &Unbegun) {
-        for &(layer, expert, from, to) in &plan.moved {
-            assert_eq!(self.groups[group].contents[from], Record::Moving((layer, expert)), "a moved expert moves from where the plan found it");
-            assert_eq!(self.groups[group].contents[to], Record::Shrinking, "a move writes a record its shrink holds");
-            self.layers[layer].1[expert] = None;
-            self.set(group, from, Record::Shrinking);
-            self.hold((layer, expert), to);
-            self.map((layer, expert), to, at.next());
-        }
-        let contents = &self.groups[group].contents;
-        assert!(contents[plan.records..].iter().all(|&content| content == Record::Shrinking), "a shrink retires a record it does not hold");
-        assert!(!contents[..plan.records].iter().any(|content| matches!(content, Record::Shrinking | Record::Moving(_))), "a shrink holds a record it keeps");
-        self.shrink_held -= contents.len() - plan.records;
-        self.groups[group].truncate(plan.records);
-    }
-
-    /// Commit group `group`'s records up to `records`, the new ones free.
-    pub fn grow(&mut self, group: usize, records: usize) {
-        assert!(records >= self.groups[group].contents.len(), "a growth to fewer records");
-        self.changed |= records > self.groups[group].contents.len();
+    /// Back group `group`'s `records`, holes or past every record: free
+    /// from now.
+    pub fn grow(&mut self, group: usize, records: impl IntoIterator<Item = usize>) {
+        let before = self.groups[group].present;
         self.groups[group].grow(records);
+        self.changed |= self.groups[group].present > before;
     }
 }
 
@@ -977,49 +916,44 @@ mod tests {
         assert!(bank.take_changed() && lent.lock().take_freed(), "the lend took free records, the release freed the reservation");
     }
 
-    /// A release between a shrink's plan and its commit of a record the
-    /// plan moves from (its expert outside its layer's share, ranked across
-    /// layers by the plan): refused, as the commit would find it gone.
+    /// A shrink evicts with holes and moves nothing: an evicted held
+    /// expert is unmapped from the step its caller names, so the steps
+    /// before it still read it where it was, a free record evicts at once,
+    /// the lent ones are never evictable, and every kept expert stays in its
+    /// record. A growth backs a hole again, free, and one past every record.
     #[test]
-    #[should_panic(expected = "is taken from Moving")]
-    fn a_release_of_a_shrinks_source_panics() {
-        let (mut bank, _) = bank();
-        promoted(&mut bank, 0, 1, 1);
-        promoted(&mut bank, 3, 2, 1);
-        let plan = Shrink { records: 2, evicted: vec![(0, 1)], moved: vec![(0, 2, 3, 0)] };
-        bank.shrinking(0, &plan, &Unbegun::at(5));
-        assert!(bank.shrink_pending());
-        let lent = LentRecords::new();
-        bank.release(0, BankRecord(3), &Unbegun::at(5), &lent.lock());
-    }
-
-    /// A shrink's plan dropped uncommitted returns what it held: its
-    /// sources held as they were, the rest free.
-    #[test]
-    fn a_dropped_shrink_returns_its_records() {
+    fn a_shrink_evicts_with_holes_and_a_growth_backs_them_again() {
         let (mut bank, view) = bank();
-        promoted(&mut bank, 0, 1, 1);
-        promoted(&mut bank, 3, 2, 1);
-        let plan = Shrink { records: 2, evicted: vec![(0, 1)], moved: vec![(0, 2, 3, 0)] };
-        bank.shrinking(0, &plan, &Unbegun::at(5));
-        bank.unshrink();
-        assert!(!bank.shrink_pending());
-        assert_eq!((bank.held(0, 2), view.held(2)), (Some(3), Some(3)), "the source keeps its expert, mapped");
-        assert_eq!(bank.free(0).collect::<Vec<_>>(), [0, 1, 2]);
+        promoted(&mut bank, 2, 3, 4);
+        promoted(&mut bank, 3, 5, 4);
+        assert_eq!(bank.evictable(0).map(|(record, _)| record).collect::<Vec<_>>(), [2, 3], "the lent records are the floor's");
+        assert_eq!(bank.evict(0, &[2], |_| 9), [(0, 3)]);
+        assert_eq!((bank.held(0, 3), view.resolve(3, 8), view.resolve(3, 9)), (None, Some(2), None), "read by the steps before 9 where it was");
+        assert_eq!((bank.held(0, 5), view.resolve(5, 9)), (Some(3), Some(3)), "the kept expert stays in its record");
+        assert_eq!(bank.counts(), [3]);
+        assert!(!bank.free(0).any(|record| record == 2), "a hole is never free");
+        bank.grow(0, [2, 5]);
+        assert_eq!(bank.counts(), [5]);
+        assert!(bank.free(0).any(|record| record == 2) && bank.free(0).any(|record| record == 5));
+        assert_eq!(bank.records(0)[4], Record::Absent, "a growth past every record leaves the holes below it");
+        assert!(bank.evict(0, &[2, 5], |_| 9).is_empty(), "free records leave nothing");
+        assert_eq!(bank.counts(), [3]);
     }
 
-    /// A shrink's records are its own from its plan to its commit: no
-    /// promotion takes a move's target or a record past it meanwhile, which
-    /// the commit would overwrite or truncate.
+    /// A shrink never evicts a lent record: the floor holds them for the
+    /// conveyor.
     #[test]
-    #[should_panic(expected = "a promotion takes a free record")]
-    fn a_promotion_into_a_shrinks_record_panics() {
+    #[should_panic(expected = "a shrink evicts lent record 1")]
+    fn evicting_a_lent_record_panics() {
         let (mut bank, _) = bank();
-        promoted(&mut bank, 0, 1, 1);
-        promoted(&mut bank, 3, 2, 1);
-        let plan = Shrink { records: 2, evicted: vec![(0, 1)], moved: vec![(0, 2, 3, 0)] };
-        bank.shrinking(0, &plan, &Unbegun::at(5));
-        let lent = LentRecords::new();
-        bank.promote(&promotion(0, 4), &lent.lock());
+        bank.evict(0, &[1], |_| 9);
+    }
+
+    /// A growth of a record the bank holds is a broken invariant.
+    #[test]
+    #[should_panic(expected = "which the bank holds")]
+    fn growing_a_held_record_panics() {
+        let (mut bank, _) = bank();
+        bank.grow(0, [3]);
     }
 }

@@ -52,21 +52,30 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
     /// into free banks changes no bindings; growing one orphans the queued
-    /// steps first. Admission: refused, changing nothing, where the device's
-    /// ledger cannot hold a row of the sequence beside what is committed
-    /// (`Ledger::admit`); opened, the sequence holds its state claim.
+    /// steps first. Admission is new work's: refused, changing nothing,
+    /// where the device's ledger cannot hold the rows the residency
+    /// restores (`replay`, the position a preempted sequence held when it
+    /// was evicted; none for a fresh one), at least one, past where it
+    /// resumes, beside the guarantee (`Ledger::admit`): a preempted sequence
+    /// comes back only once its rows fit, so the growth that preempted it
+    /// does not evict it again at its next page. Opened, the sequence holds
+    /// its state claim, and the idle optional components are committed
+    /// again for it to draft and encode with.
     pub fn open_state(
         &mut self,
         bindings: &mut StateBindings,
         request: RequestId,
         from: Option<&ResumeState>,
+        replay: u64,
     ) -> Result<Vec<Operation>, DomainError> {
         use crate::memory::ledger::Need;
+        let resumes = from.map_or(0, ResumeState::position) as u64;
         let ledgers = self.resources.ledgers();
         ledgers
             .device()
-            .admit(&Need::StateRows { sequence: request, from: 0, to: 1 })
+            .admit(&Need::StateRows { sequence: request, from: resumes, to: replay.max(resumes + 1) })
             .map_err(|short| DomainError::short(short, ledgers))?;
+        self.activate_components();
         self.orphan_queue(bindings)?;
         let installed = self
             .input
@@ -243,63 +252,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// State bytes released by evicting exactly these requests, priced as a
-    /// set: rows and banks shared with anything outside it are not counted.
-    pub fn reclaimable(&self, requests: &[RequestId]) -> Result<u64, String> {
-        let target = requests
-            .iter()
-            .map(|request| {
-                self.target.get(request).map(Holder::State).ok_or_else(|| {
-                    "reclamation request has unresolved or absent target state".to_owned()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut bytes = self
-            .target_store
-            .exclusive_bytes(&target)
-            .map_err(|error| error.to_string())?;
-        if let Some(store) = &self.head_store {
-            let head = requests
-                .iter()
-                .map(|request| {
-                    self.head.get(request).map(Holder::State).ok_or_else(|| {
-                        "reclamation request has unresolved or absent head state".to_owned()
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            bytes = bytes
-                .checked_add(
-                    store
-                        .exclusive_bytes(&head)
-                        .map_err(|error| error.to_string())?,
-                )
-                .ok_or("reclaim byte count overflow")?;
-        }
-        let features = requests
-            .iter()
-            .filter_map(|request| self.input.get(request))
-            .flat_map(|input| {
-                input.boundary.iter().chain(
-                    input
-                        .images
-                        .values()
-                        .filter_map(|image| image.features.as_ref()),
-                )
-            })
-            .collect::<Vec<_>>();
-        bytes = bytes
-            .checked_add(
-                FeatureRef::reclaimable_bytes(&features).map_err(|error| error.to_string())?,
-            )
-            .ok_or("feature reclaim byte count overflows")?;
-        Ok(bytes)
-    }
-
     /// Evict these requests: release their numerical state and encoded
     /// features. Their input stays installed for when they are resident
-    /// again.
-    pub fn release_state(&mut self, requests: &[RequestId]) -> Result<u64, String> {
-        let bytes = self.reclaimable(requests)?;
+    /// again. Refused, releasing nothing, where one holds no resolved
+    /// state (a head priming not yet completed).
+    pub fn release_state(&mut self, requests: &[RequestId]) -> Result<(), String> {
+        if !requests.iter().all(|request| self.target.contains_key(request)) {
+            return Err("an evicted request has unresolved or absent target state".into());
+        }
+        if self.head_store.is_some() && !requests.iter().all(|request| self.head.contains_key(request)) {
+            return Err("an evicted request has unresolved or absent head state".into());
+        }
         // Prefetched for the residency that ends; a state opened again
         // prefetches its own.
         self.release_prefetches(requests)?;
@@ -317,32 +280,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.head.remove(request);
         }
         self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
-        Ok(bytes)
-    }
-
-    /// Release every slab of a store no sequence or checkpoint owns. That
-    /// changes bindings, so the queued steps are orphaned first.
-    pub fn reclaim_idle(&mut self, bindings: &mut StateBindings) -> Result<u64, String> {
-        self.orphan_queue(bindings)
-            .map_err(|error| error.to_string())?;
-        self.change_state(|_| {
-            let mut bytes = u64::try_from(
-                bindings
-                    .target
-                    .release_idle()
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|_| "target idle bytes exceed u64")?;
-            if let Some(store) = &mut bindings.head {
-                bytes = bytes
-                    .checked_add(
-                        u64::try_from(store.release_idle().map_err(|error| error.to_string())?)
-                            .map_err(|_| "head idle bytes exceed u64")?,
-                    )
-                    .ok_or("idle reclaim byte count overflow")?;
-            }
-            Ok::<u64, String>(bytes)
-        })
+        Ok(())
     }
 }
 

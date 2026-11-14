@@ -25,7 +25,7 @@ use magnitude_engine::{
     LoadAttempt,
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath, UnpreparedUnits,
 };
 use magnitude_generation::{
@@ -90,7 +90,7 @@ fn configuration(arguments: &Arguments) -> EngineConfiguration {
         path: ExecutionPath::Native,
         device: arguments.device,
         kernel_cache: arguments.cache_dir.clone(),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
 }
 

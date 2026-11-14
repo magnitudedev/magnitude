@@ -570,7 +570,7 @@ const encode = <A>(document: { readonly encode: (value: A) => Effect.Effect<unkn
   JSON.parse(JSON.stringify(Effect.runSync(document.encode(value)))) as Record<string, unknown>
 
 const domain = LocalInferenceMemoryDomainIdSchema.make("cuda0")
-const memoryEvidence = { memoryDomainId: domain, capacityBytes: 100, requiredBytes: 10, compatibilityReserveBytes: 1, remainingBytes: 89 }
+const memoryEvidence = { memoryDomainId: domain, capacityBytes: 100, requiredBytes: 10, remainingBytes: 89 }
 const allocation = {
   contextWindowTokens: 4096,
   memoryDomains: [{ memoryDomainId: domain, modelBytes: 8, contextBytes: 1, computeBytes: 1, auxiliaryBytes: 0 }],

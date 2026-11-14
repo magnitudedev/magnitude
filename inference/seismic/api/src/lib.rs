@@ -39,17 +39,56 @@ pub mod testing {
     };
 
     /// Open executor `id` of `devices` with `options` as a device of its
-    /// own, sharing no ledger with another open: a test's, beside other
-    /// tests in one process, bounds its ledgers alone.
+    /// own, charging `stores`, shared with no other open: a test's, beside
+    /// other tests in one process, reads and bounds what its own stores
+    /// count ([`super::memory::Tally`]).
     #[cfg(feature = "fixtures")]
-    pub fn open_own_ledgers(devices: &super::Devices, id: super::ExecutorId, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
-        devices.inner.open_own_ledgers(id, options).map(|inner| super::Device { inner })
+    pub fn open_own(
+        devices: &super::Devices,
+        id: super::ExecutorId,
+        options: super::DeviceOptions,
+        stores: Vec<std::sync::Arc<dyn super::memory::Store>>,
+    ) -> Result<super::Device, super::OpenError> {
+        devices.inner.open_own(id, options, stores).map(|inner| super::Device { inner })
     }
 
-    /// [`open_own_ledgers`] of the first executor of `backend`.
+    /// [`open_own`] of the first executor of `backend`.
     #[cfg(feature = "fixtures")]
-    pub fn open_backend_own_ledgers(devices: &super::Devices, backend: BackendName, options: super::DeviceOptions) -> Result<super::Device, super::OpenError> {
-        open_own_ledgers(devices, devices.inner.executor_of(backend)?, options)
+    pub fn open_backend_own(
+        devices: &super::Devices,
+        backend: BackendName,
+        options: super::DeviceOptions,
+        stores: Vec<std::sync::Arc<dyn super::memory::Store>>,
+    ) -> Result<super::Device, super::OpenError> {
+        open_own(devices, devices.inner.executor_of(backend)?, options, stores)
+    }
+
+    /// Open executor `id` of `devices` with `options` as a device of its
+    /// own ([`open_own`]) over unbounded tallies of its stores
+    /// ([`super::Devices::tallies`]): the device, and its device store's
+    /// tally, which a test reads and bounds.
+    #[cfg(feature = "fixtures")]
+    pub fn open_tallied(
+        devices: &super::Devices,
+        id: super::ExecutorId,
+        options: super::DeviceOptions,
+    ) -> Result<(super::Device, super::memory::Tally), super::OpenError> {
+        let tallies = devices.tallies(id);
+        let stores = tallies.iter().map(|tally| std::sync::Arc::new(tally.clone()) as std::sync::Arc<dyn super::memory::Store>).collect();
+        let device = open_own(devices, id, options, stores)?;
+        let identity = device.topology().store_identity(device.device_store()).expect("the device store is of its topology");
+        let tally = tallies.into_iter().find(|tally| super::memory::Store::identity(tally) == &identity).expect("a tally of every store the device reaches");
+        Ok((device, tally))
+    }
+
+    /// [`open_tallied`] of the first executor of `backend`.
+    #[cfg(feature = "fixtures")]
+    pub fn open_backend_tallied(
+        devices: &super::Devices,
+        backend: BackendName,
+        options: super::DeviceOptions,
+    ) -> Result<(super::Device, super::memory::Tally), super::OpenError> {
+        open_tallied(devices, devices.inner.executor_of(backend)?, options)
     }
 
     /// The executor a test runs `backend` on: the first available one of
@@ -115,13 +154,20 @@ pub use seismic_runtime::artifacts::{
     ArtifactKey, ArtifactStore, DeviceOptions, DirectoryStore, Eviction, MemoryStore, ProgramStore,
     DEFAULT_CAPACITY as DEFAULT_STORE_CAPACITY,
 };
-pub use seismic_runtime::api::device::Bounds;
+/// The embedder's ledger as Seismic charges it: every byte a device takes is
+/// charged to one [`memory::Entry`] of the [`memory::Store`] it lies in.
+pub mod memory {
+    pub use seismic_runtime::memory::{
+        charging, AllocationFailure, Backed, Carved, Change, Charge, Charging, DropScope, Entry, Grant, HostBlock, PageSize, Refused,
+        Store, Tally, Wiring,
+    };
+}
 pub use seismic_runtime::probes::{carry as carry_probe_results, probe_misses, probe_runs, serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.
 pub use seismic_lang::device;
 pub use seismic_runtime::formation::FormedPrograms;
-pub use seismic_runtime::{backing_times, large_page_backing, unmeasured_graph_cost, BackingTimes, LargePageBacking};
+pub use seismic_runtime::{large_page_backing, unmeasured_graph_cost, LargePageBacking};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
@@ -283,9 +329,7 @@ pub use seismic_lang::registry::{
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
-pub use seismic_runtime::api::tensor::{
-    PreparedRecommit, RecommitRefusal, RecommitRelease, RecordPlacement, Resizer,
-};
+pub use seismic_runtime::api::tensor::RecordPlacement;
 pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{
     CallError, OutputError, RegionError, SharedWordError, TensorError, ViewChargeError,
@@ -320,41 +364,43 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 }
 mod slab;
 pub use seismic_discovery::{
-    device_node, host_available, host_room, pin, HostAvailable, place_process, volume_available, volume_identity, Core, DeviceNode,
-    DiscoveryError, HostHeld, HostStatus, Inventory, LimitVisibility, MemoryNode, ObservationError,
-    PciLocation, ProcessLimitKind, ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy,
-    Reclaim, RuntimeStatus, Sample, Status,
+    device_node, host_sample, pin, place_process, volume_available, volume_identity, Core, DeviceNode, DiscoveryError,
+    Counted, Harm, HostSample, Inventory, Lag, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
+    PressureEvents, PressureLevel, PressureWaker, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus,
+    Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
 };
 pub use seismic_lang::forms::MetalPacking;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
 /// sustained clock, the statistics and the records of measured points. The
 /// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].
 pub use seismic_measure as measure;
-pub use seismic_runtime::devices::{
-    BackendHeld, DeviceLedgerView, Ledger, Ledgers, LimitError, OpenError, PathLedgerView,
-    ResolveError, StoreLedgerView,
-};
+pub use seismic_runtime::devices::{OpenError, ResolveError};
 pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
     AccessPath, AccessPathId, AllocationLimit, Availability, DeviceAllocationBound, Contract, DeviceMemory, DeviceTopology,
     Diagnostic, DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
-    Kind, KindId, KindMemory, Limits, NativeKind, Obtained, Packing, PhysicalDevice,
-    PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy, Reservation,
-    ReservationCharges, ReservationChunks, ReservedContract, ReservedRecords, Revision, Placing, Store, StoreId,
-    StoreIdentity, StoreKind, TableCharge, TransferPath, TransferPathId, Unreservable, VolumeId,
+    Kind, KindId, KindMemory, Limits, NativeKind, PhysicalDevice,
+    PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy,
+    Revision, Store, StoreId,
+    StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
 };
 mod measurer;
 pub use measurer::{KernelIdentity, Measurer, PointKey};
 /// The recorded machines (`fixtures::recorded`), for other crates' tests.
 #[cfg(feature = "fixtures")]
 pub use seismic_topology::fixtures;
-pub use slab::{Slab, SlabLayout, SlabRegion, SlabTensor};
+/// Host samples recorded on real machines (`seismic_discovery::fixtures`),
+/// for other crates' tests.
+#[cfg(feature = "fixtures")]
+pub use seismic_discovery::fixtures as host_samples;
+mod pool;
+pub use pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, Pool, PoolEntries, SizingError, BLOCK_ALIGNMENT};
+pub use slab::{SlabFill, SlabLayout, SlabRegion, SlabTensor};
 
 use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::ids::RepresentationId;
-use seismic_runtime::api::tensor::Ordinary;
 use std::fmt;
 use std::sync::Arc;
 
@@ -403,11 +449,50 @@ impl Devices {
         self.inner.open(id).map(|inner| Device { inner })
     }
 
-    /// Open with `options` (for example an artifact store). An executor
-    /// already open is shared; asking it for a different store is an error.
+    /// Open with `options` (for example an artifact store), outside any
+    /// embedder's ledger: an executor already open is shared, and one not
+    /// open yet counts its memory in tallies of its own. Asking an open
+    /// executor for a different artifact store is an error.
     pub fn open_with(&self, id: ExecutorId, options: DeviceOptions) -> Result<Device, OpenError> {
         self.inner
             .open_with(id, options)
+            .map(|inner| Device { inner })
+    }
+
+    /// Every store executor `id` reaches, host RAM's among them, each once:
+    /// the stores a device is opened charging ([`Self::open_in`]).
+    pub fn reached_stores(&self, id: ExecutorId) -> Vec<StoreIdentity> {
+        let topology = self.topology();
+        let mut identities: Vec<StoreIdentity> = Vec::new();
+        let reached = topology
+            .access_paths()
+            .iter()
+            .filter(|path| path.executor() == id)
+            .map(|path| path.store())
+            .chain([topology.host_ram().id()]);
+        for store in reached {
+            let identity = topology.store_identity(store).expect("a path's store belongs to its topology");
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        identities
+    }
+
+    /// An unbounded tally of each store executor `id` reaches: the stores a
+    /// device is opened in ([`Self::open_in`]) by a user with no ledger of
+    /// its own, which reads and bounds them.
+    pub fn tallies(&self, id: ExecutorId) -> Vec<memory::Tally> {
+        self.reached_stores(id).into_iter().map(memory::Tally::unbounded).collect()
+    }
+
+    /// Open with `options`, charging `stores`, the embedder's ledger of
+    /// every store the executor reaches: an executor already open is shared
+    /// where it charges these same stores; asking it for others, or for a
+    /// different artifact store, is an error.
+    pub fn open_in(&self, id: ExecutorId, options: DeviceOptions, stores: Vec<Arc<dyn memory::Store>>) -> Result<Device, OpenError> {
+        self.inner
+            .open_in(id, options, stores)
             .map(|inner| Device { inner })
     }
 
@@ -447,9 +532,7 @@ impl Devices {
         self.inner.status(topology, executor)
     }
 
-    /// The status of opened `device`, with what the devices of its ledger
-    /// scope hold: as [`Self::status`] reads it for every open of the
-    /// product.
+    /// The status of opened `device`, as [`Self::status`] reads it.
     pub fn device_status(&self, device: &Device) -> Status {
         self.inner.device_status(&device.inner)
     }
@@ -610,32 +693,50 @@ impl Device {
     pub fn allocations_in_process_footprint(&self) -> bool {
         self.inner.allocations_in_process_footprint()
     }
-    /// The ledgers this device reaches: each store's (every executor of
-    /// the process), each of its paths' accounts (every open of its
-    /// executor), and its own on each store.
-    pub fn ledgers(&self) -> Ledgers {
-        self.inner.ledgers()
-    }
-    /// The store device storage is placed on first, whose own ledger is the
-    /// device's charge: on a device whose memory is the host's, every charge
-    /// it makes in that memory.
+    /// The store device storage is placed on first.
     pub fn device_store(&self) -> StoreId {
         self.inner.device_store()
     }
-    /// The device's own ledger on its device store ([`Self::device_store`]).
-    pub fn device_ledger(&self) -> DeviceLedgerView {
-        self.inner.device_ledger()
+    /// The ledger entry an allocation of `contract` made now on this thread
+    /// is charged to: the one its caller names for the store
+    /// ([`memory::charging`]), else the store's own ([`memory::Store::own`]).
+    /// What a pool a caller opens for its own use is charged to.
+    pub fn entry(&self, contract: Contract) -> Arc<dyn memory::Entry> {
+        self.inner.entry(contract)
     }
-    /// The right to bound every ledger this device reaches
-    /// ([`Bounds::bound`]): one live holder per ledger. Taking it while
-    /// another holder lives panics, naming both.
-    #[track_caller]
-    pub fn bounds(&self) -> Bounds {
-        self.inner.bounds()
+    /// Run `allocate`, confining every allocation it makes on this thread
+    /// through this device to `kind`, one of the executor's kinds: an
+    /// allocation of a contract whose placement names `kind` lands there
+    /// (and lies along its access path) or is refused, never moving on to
+    /// the placement's other kinds; any other allocation, a contract's
+    /// placement not naming `kind`, is refused. Allocations on other threads
+    /// and of other devices are not confined; scopes nest, the innermost
+    /// one of a device confining it.
+    ///
+    /// # Panics
+    /// Where `kind` is none of the executor's kinds.
+    pub fn in_kind<T>(&self, kind: NativeKind, allocate: impl FnOnce() -> T) -> T {
+        self.inner.in_kind(kind, allocate)
     }
-    /// Start the high-water mark of each of the device's own ledgers again
-    /// from what it charges now: the next reading is the most charged since
-    /// this call.
+    /// The bytes the embedder's ledger counts the process holding in the
+    /// device store ([`memory::Store::allocated`]).
+    pub fn allocated(&self) -> u64 {
+        self.inner.allocated()
+    }
+    /// Bring the memory the device's driver took that only asking shows
+    /// (Vulkan's) up to date in the ledger: called once before each reading
+    /// of the device's stores. Where the backend reads its grant in that
+    /// same query (Vulkan), the grant, of the same instant as the usage
+    /// just charged; otherwise none.
+    pub fn reconcile_driver_memory(&self) -> Option<memory::Grant> {
+        self.inner.reconcile_driver_memory()
+    }
+    /// The most [`Self::allocated`] has been since the last
+    /// [`Self::restart_high_water`].
+    pub fn high_water(&self) -> u64 {
+        self.inner.high_water()
+    }
+    /// Start [`Self::high_water`] again from what is allocated now.
     pub fn restart_high_water(&self) {
         self.inner.restart_high_water()
     }
@@ -643,11 +744,6 @@ impl Device {
     /// allocation needing more is refused as a capacity shortfall.
     pub fn room(&self, contract: Contract) -> u64 {
         self.inner.room(contract)
-    }
-    /// What the backend holds for fixed buffers of `kind` beyond their
-    /// allocations.
-    pub fn backend_held(&self, kind: Contract) -> BackendHeld {
-        self.inner.backend_held(kind)
     }
     /// A planned workflow on this device; refused on a native-only backend.
     pub fn workflow(&self) -> Result<WorkflowDraft, WorkflowError> {
@@ -1449,42 +1545,8 @@ impl TensorStorageObserver {
 }
 
 impl Tensor {
-    pub(crate) fn slabbed(
-        table: &Ordinary,
-        element: Element,
-        rows_per_slab: u64,
-        logical_rows: u64,
-        alias_identity: u64,
-        regions: Vec<Option<Ordinary>>,
-        lease: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Result<Tensor, TensorError> {
-        seismic_runtime::api::tensor::TensorInner::slabbed(
-            table,
-            element.id(),
-            rows_per_slab,
-            logical_rows,
-            alias_identity,
-            regions,
-            lease,
-        )
-        .map(|inner| Tensor {
-            inner: Arc::new(inner),
-        })
-    }
-
-    /// This tensor as an ordinary one, unless it views a reservation.
-    pub(crate) fn ordinary(&self) -> Option<Ordinary> {
-        Ordinary::of(self.inner.clone())
-    }
-
-    pub(crate) fn of_ordinary(tensor: &Ordinary) -> Tensor {
-        Tensor {
-            inner: tensor.tensor().clone(),
-        }
-    }
-
-    pub(crate) fn new_slab_alias() -> u64 {
-        seismic_runtime::api::tensor::TensorInner::new_slab_alias()
+    pub(crate) fn of_inner(inner: seismic_runtime::api::tensor::TensorInner) -> Tensor {
+        Tensor { inner: Arc::new(inner) }
     }
 
     /// Canonical storage footprint and required alignment of a tensor shape.
@@ -1497,12 +1559,7 @@ impl Tensor {
     /// device-use lifetime. This tensor must be one contiguous byte range of
     /// an allocation (not slabbed), and the region must lie within it,
     /// starting at a multiple of its layout's alignment in the allocation
-    /// ([`TensorError::Region`] otherwise). A region of a reserved tensor
-    /// lies within its backed bytes and pins them; on chunked storage
-    /// (Metal) its records are packed, none crossing a chunk: it starts
-    /// where its first record fits in one chunk (such as the end of an
-    /// earlier packed region, `seismic_topology::Packing::end`),
-    /// and its records are where [`Tensor::record_placement`] says.
+    /// ([`TensorError::Region`] otherwise).
     pub fn region(
         &self,
         element: Element,
@@ -1516,20 +1573,32 @@ impl Tensor {
             })
     }
 
-    /// Records `start..end` of this tensor as a region of their own, which
-    /// pins a reservation's backed bytes only through the last of them
-    /// (`TensorInner::record_region`): what a holder of a few records keeps,
-    /// so it never holds a recommit above them.
+    /// [`Self::region`] of another form's records this tensor's records
+    /// carry whole (an expert bank's lent records, carrying its conveyor or
+    /// its scratch): a dense floating tensor may also be viewed as a
+    /// non-dense form (`TensorInner::carried_region`).
+    pub fn carried_region(
+        &self,
+        element: Element,
+        extents: &[u64],
+        byte_offset: u64,
+    ) -> Result<Tensor, TensorError> {
+        self.inner
+            .carried_region(element.id(), extents, byte_offset)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+
+    /// Records `start..end` of this tensor (its leading-axis rows) as a
+    /// region of their own (`TensorInner::record_region`).
     pub fn record_region(&self, start: u64, end: u64) -> Result<Tensor, TensorError> {
         self.inner.record_region(start, end).map(|inner| Tensor { inner: Arc::new(inner) })
     }
 
-    /// Where this canonical tensor's records (leading-axis rows) lie:
-    /// packed from its first byte on chunked reserved storage
-    /// (`seismic_topology::Packing`), otherwise one after another. None for
-    /// a tensor without records of their own (no rows, rows of no bytes, or
-    /// rows laid out together), or on chunked storage with records larger
-    /// than a chunk, which no chunk holds whole.
+    /// Where this canonical tensor's records (leading-axis rows) lie: one
+    /// after another from its first byte. None for a tensor without records
+    /// of their own (no rows, rows of no bytes, or rows laid out together).
     pub fn record_placement(&self) -> Option<RecordPlacement> {
         self.inner.record_placement()
     }
@@ -1770,71 +1839,6 @@ impl Tensor {
         .map(|inner| Tensor {
             inner: Arc::new(inner),
         })
-    }
-    /// A zero-filled tensor over `extents` whose leading-axis rows
-    /// `[0, committed)` are physically backed and charged, and the
-    /// [`Resizer`] that backs and releases the rest of the leading extent's
-    /// reserved address space in place, one resize at a time. Its owner
-    /// installs a resize between submissions (never between queuing a
-    /// sequence that binds the tensor and submitting that sequence). Graphs
-    /// are sealed over the whole shape, while device work bound to the
-    /// tensor must stay within the committed rows, and host access reaching
-    /// past them is refused (views within them read and write as ordinary
-    /// tensors). The CPU backend, Metal and CUDA with virtual memory
-    /// management reserve; elsewhere it is refused
-    /// ([`TensorError::Unreservable`]). A reserved tensor is never slabbed.
-    pub fn reserved(
-        device: &Device,
-        element: Element,
-        extents: &[u64],
-        committed: u64,
-    ) -> Result<(Tensor, Resizer), TensorError> {
-        Self::reserved_in(
-            ReservedContract::DeviceOnly,
-            device,
-            element,
-            extents,
-            committed,
-            None,
-        )
-    }
-
-    /// [`Tensor::reserved`] under `contract`, where the device reserves it
-    /// (`Executor::reserving`); elsewhere it is refused
-    /// ([`TensorError::Unreservable`]). A `Shared` range is one the host
-    /// writes and reads in place while device work that uses it is queued
-    /// or running, wherever the placement rule puts it; its host address
-    /// never moves, and a region of its committed rows is host-addressed while it
-    /// pins them ([`Tensor::shared_address`]). Its records may carry views
-    /// of up to `carries` bytes whole (another form's records packed in
-    /// them, [`ReservedRecords::carries`]), which no chunk boundary crosses.
-    pub fn reserved_in(
-        kind: ReservedContract,
-        device: &Device,
-        element: Element,
-        extents: &[u64],
-        committed: u64,
-        carries: Option<std::num::NonZeroU64>,
-    ) -> Result<(Tensor, Resizer), TensorError> {
-        seismic_runtime::api::tensor::TensorInner::reserved(
-            device.inner(),
-            kind,
-            element.id(),
-            extents,
-            committed,
-            carries,
-        )
-        .map(|(inner, resizer)| {
-            let tensor = Tensor {
-                inner: Arc::new(inner),
-            };
-            (tensor, resizer)
-        })
-    }
-    /// Leading rows physically backed: every row unless the tensor reaches
-    /// past a reservation's committed rows.
-    pub fn committed_rows(&self) -> u64 {
-        self.inner.committed_rows()
     }
     pub fn read_to_host(&self) -> Result<Vec<u8>, TensorError> {
         self.inner.read_to_host()
@@ -5060,6 +5064,17 @@ impl<E: Entry> NativeKernel<E> {
     /// scalar-result slots ([`Entry::NATIVE_SCALAR_RESULT_BYTES`]).
     pub fn scalar_result_bytes(&self) -> u64 {
         self.inner.scalar_result_bytes()
+    }
+
+    /// The unrounded byte span placed in a standalone call's scratch arena
+    /// for `args` (`SYNC_RESERVE` plus placed scratch buffers).
+    pub fn standalone_scratch_bytes(&self, args: E::Args<'_>) -> Result<u64, CallError> {
+        self.inner.standalone_scratch_bytes(E::encode(args))
+    }
+
+    /// Whether result `ordinal` binds through a record table (`records (result ordinal)`).
+    pub fn records_result(&self, ordinal: usize) -> bool {
+        self.inner.records_result(ordinal)
     }
 
     fn prepare(

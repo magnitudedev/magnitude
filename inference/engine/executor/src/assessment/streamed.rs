@@ -273,7 +273,7 @@ impl StreamedLayers {
     pub fn of_bank(bank: &ExpertBankPlan, costs: &ExecutorCosts, figures: &StreamedFigures) -> Priced<Self> {
         let parts = || -> Result<(ExpertPass, Vec<HostLines>), StreamedError> {
             let pass = ExpertPass::of_bank(bank, costs.clone()).map_err(|error| StreamedError::Costs(error.to_string()))?;
-            let byte_seconds = bank.tier_reservation().and(figures.memory);
+            let byte_seconds = figures.memory.filter(|_| bank.tiered());
             let host = HostLines::of_bank(bank, &BankLines::of_bank(bank).map_err(StreamedError::Host)?, byte_seconds).map_err(StreamedError::Host)?;
             let host = host
                 .iter()

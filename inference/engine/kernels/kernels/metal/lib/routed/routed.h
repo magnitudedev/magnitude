@@ -87,14 +87,12 @@ inline int choice_record(device const ulong *, device const int *sources, ulong 
     return decode_source(sources, rows, row_stride, choice_stride, m, k, expert);
 }
 
-// Expert `expert`'s weights of an expert-stacked weight bound as it lies,
-// `rows` rows an expert (expert e's from row e * rows): the fused expansion's
-// held stack, one buffer. The base is the binding's, so the rows are one
-// load away.
+// The weights of record `record` of an expert-stacked weight's record table
+// `records`: rows 0.. of the record's base.
 template <typename W>
-inline projection::Weights<W> stack_weights(packets::weight_bytes stack, packets::Rows16 layout, int expert,
-    ulong rows, uint k) {
-    return weights<W>(stack, layout, ulong(expert) * rows, k);
+inline projection::Weights<W> record_weights(device const ulong *records, int record, packets::Rows16 layout,
+    uint k) {
+    return weights<W>(slab::region<const uchar, packets::space>(records, ulong(record)), layout, 0, k);
 }
 
 // The weights of `record` (`choice_record`, not -1): a bank or tier record

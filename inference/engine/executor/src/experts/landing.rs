@@ -325,13 +325,11 @@ impl TierTensor {
         Ok(Self { records, conversion: Conversion::Rows { conversion, rows, k } })
     }
 
-    /// Its record `record` alone, which a landing into it writes: held as
-    /// records of their own (`Records::range`), so a landing in flight holds
-    /// the tensor's storage only through the record it lands in, which a
-    /// shrink keeps in place (`HostRecords::shrink`).
+    /// Its record `record` alone, which a landing into it writes: held
+    /// whole while the landing is in flight, which a shrink never evicts
+    /// (`HostRecords::evictable`).
     pub fn landed(&self, record: u32) -> LandedRecord {
-        let record = u64::from(record);
-        let records = self.records.range(record, record + 1).expect("a committed tier record is records of its own");
+        let records = Records::new(vec![Some(self.records.tensor(u64::from(record)).clone())], self.records.bytes()).expect("a held tier record is a record of its own");
         LandedRecord(Self { records, conversion: self.conversion })
     }
 }

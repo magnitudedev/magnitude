@@ -3,15 +3,49 @@
 
 use crate::error::UnloadCause;
 use crate::execution::{LoadPricing, load_measures};
-use magnitude_executor::ProgramFamily;
+use magnitude_executor::{MemoryChargeReconciliation, ProgramFamily};
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
     protocol::{AdmitRequest, RoomGrant, WorkerCommand, WorkerReply},
     publication::{ModelUnloadCause, RequestError},
-    worker::{Driven, Event},
+    serving::ServingCensus,
+    worker::{Driven, Event, Reread},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::Waker;
+
+/// What the owner counts of its memory: the census's inputs.
+type Counted = (MemoryChargeReconciliation, ServingCensus);
+
+/// The census the owner counted last and the session has not sent yet:
+/// published by the owner as its count changes after a run, taken by the
+/// session, which sends it to the host. Pushed on change, never sampled.
+#[derive(Default)]
+pub(crate) struct CensusWatch {
+    state: Mutex<(Option<Counted>, Option<Waker>)>,
+}
+
+impl CensusWatch {
+    fn publish(&self, counted: Counted) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = Some(counted);
+        if let Some(waker) = state.1.take() {
+            waker.wake();
+        }
+    }
+
+    /// The census counted since the last take; otherwise `waker` is woken
+    /// once one is.
+    pub(crate) fn take(&self, waker: &Waker) -> Option<Counted> {
+        let mut state = self.state.lock().unwrap();
+        let counted = state.0.take();
+        if counted.is_none() {
+            state.1 = Some(waker.clone());
+        }
+        counted
+    }
+}
 
 /// The execution lifecycle. Every transition moves the owner by value.
 enum Execution<F: ProgramFamily> {
@@ -32,16 +66,42 @@ pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     /// What prices the load, which prices it again, measuring nothing,
     /// once the service stores new measurement records.
     pricing: LoadPricing,
+    /// Where the census goes as it changes, and what it was last.
+    census: Arc<CensusWatch>,
+    counted: Option<Counted>,
+    /// What the census was last counted at (`Owner::census_key`): nothing
+    /// it counts changes while it stands, and readings never move it.
+    counted_at: Option<(u64, Option<magnitude_executor::ExpertCover>)>,
 }
 
 impl<F: ProgramFamily> ExecutionOwner<F> {
-    pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: LoadPricing) -> Self {
+    pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: LoadPricing, census: Arc<CensusWatch>) -> Self {
         Self {
             execution: Execution::Serving(owner),
             ended: None,
             method,
             pricing,
+            census,
+            counted: None,
+            counted_at: None,
         }
+    }
+
+    /// Publish `owner`'s census where its count changed since the last,
+    /// counted only once what the ledgers hold, or the expert bank's cover,
+    /// moved since then (`Owner::census_key`).
+    fn count(&mut self, owner: &Owner<F>) -> Result<(), String> {
+        let key = owner.census_key();
+        if self.counted_at == Some(key) {
+            return Ok(());
+        }
+        self.counted_at = Some(key);
+        let counted = (owner.reconcile_memory_charge()?, owner.serving_census()?);
+        if self.counted.as_ref() != Some(&counted) {
+            self.counted = Some(counted.clone());
+            self.census.publish(counted);
+        }
+        Ok(())
     }
 
     /// Move the execution out for a transition. The placeholder is truthful:
@@ -147,6 +207,15 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 Execution::Serving(owner) | Execution::Draining(owner, _) => owner.cancel(request),
                 Execution::Stopped(_) => {}
             },
+            // The owner reads memory when it next runs: the reader marks the
+            // pressure event it was woken for.
+            Event::MemoryPressure => {}
+            // The worker's timed reading is due: the owner reads memory when
+            // it next runs.
+            Event::Reread => match &mut self.execution {
+                Execution::Serving(owner) | Execution::Draining(owner, _) => owner.reread(),
+                Execution::Stopped(_) => {}
+            },
             Event::Close => {
                 self.execution = match self.take() {
                     Execution::Serving(mut owner) => {
@@ -160,17 +229,20 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
         }
     }
 
-    fn run(&mut self, now: u64) -> Result<u64, UnloadCause> {
+    fn run(&mut self, now: u64) -> Result<Reread, UnloadCause> {
         loop {
             match self.take() {
                 Execution::Serving(owner) => match owner.run(now) {
                     Ok((owner, Ran { unload: true, .. })) => {
                         self.execution = Execution::Draining(owner, UnloadCause::MemoryPressure)
                     }
-                    Ok((owner, Ran { due, .. })) => {
-                        self.execution = Execution::Serving(owner);
-                        return Ok(due);
-                    }
+                    Ok((owner, Ran { reread, .. })) => match self.count(&owner) {
+                        Ok(()) => {
+                            self.execution = Execution::Serving(owner);
+                            return Ok(reread);
+                        }
+                        Err(reason) => self.execution = Execution::Stopped(UnloadCause::Internal { reason }),
+                    },
                     Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
                 },
                 Execution::Draining(owner, cause) => match owner.run(now) {
@@ -178,9 +250,11 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                         self.ended = Some(owner);
                         self.execution = Execution::Stopped(cause)
                     }
-                    Ok((owner, Ran { due, .. })) => {
+                    // A draining owner answers no shortage: its flight's end
+                    // is all it waits for.
+                    Ok((owner, Ran { .. })) => {
                         self.execution = Execution::Draining(owner, cause);
-                        return Ok(due);
+                        return Ok(Reread::Settled);
                     }
                     Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
                 },
@@ -214,6 +288,10 @@ mod tests {
         }
 
         fn publication(&self, _: RequestId, _: PublicationWake) {}
+
+        fn pressure(&self) -> Box<dyn Fn() + Send + Sync> {
+            Box::new(|| {})
+        }
     }
 
     /// The bank's slots and its last resize, as an observation reads them.
@@ -225,11 +303,12 @@ mod tests {
         (experts.slots, experts.last_resize)
     }
 
-    /// Run the owner over `observations` of its memory observations, as the
-    /// worker wakes for each, from `now`; the clock after.
-    fn observe<F: ProgramFamily>(execution: &mut ExecutionOwner<F>, mut now: u64, observations: usize) -> u64 {
-        for _ in 0..observations {
-            now = execution.run(now).unwrap().max(now + 1);
+    /// Run the owner at `events` events (each a flight boundary or an
+    /// arrival, which reads memory), from `now`; the clock after.
+    fn observe<F: ProgramFamily>(execution: &mut ExecutionOwner<F>, mut now: u64, events: usize) -> u64 {
+        for _ in 0..events {
+            execution.run(now).unwrap();
+            now += 1;
         }
         now
     }
@@ -287,9 +366,9 @@ mod tests {
         let mut owner = Owner::new(domain, bindings, limits, Arc::new(Unwoken)).unwrap();
         // Priced as the load is once its warm-up ends: the costs, no read line.
         owner.measure_load(load_measures(&pricing).unwrap());
-        let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), pricing);
-        // Memory stays free well past the growth's recovery wait: the bank
-        // grows to its 4 rows, its decode unpriced.
+        let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), pricing, Arc::default());
+        // Memory stays free across the events: the bank grows to its 4
+        // rows, its decode unpriced.
         let now = observe(&mut execution, 0, 100);
         let (grown, resize) = slots(&mut execution);
         assert_eq!(grown, 4, "the unpriced bank grew to its ceiling");

@@ -17,7 +17,7 @@
 //! they were queued, so the completion word's value is the last batch
 //! complete.
 
-use crate::buffer::{copy_pieces, Buffer};
+use crate::buffer::Buffer;
 use crate::direct::HostWord;
 use crate::driver::Stream;
 use crate::executor::Device;
@@ -101,7 +101,7 @@ impl TransferQueue {
     /// ([`Self::completed`]). The caller keeps every run's bytes untouched
     /// until the batch is complete.
     pub fn copy(&self, items: &[TransferItem<'_>], value: u32) -> Result<(), ExecutionError> {
-        let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let checked = items.iter().map(Self::check).collect::<Result<Vec<_>, _>>()?;
         let faulted = {
             let mut fault = self.fault.lock().expect("transfer fault lock is never poisoned");
             if let Some(fault) = fault.as_ref() {
@@ -135,9 +135,8 @@ impl TransferQueue {
     }
 
     /// A batch's item as the driver calls that queue it: a signal, or a
-    /// run's copies ([`copy_pieces`]: no copy crosses a host reservation's
-    /// granule).
-    fn check(item: &TransferItem<'_>) -> Result<Vec<Checked>, ExecutionError> {
+    /// run's copy.
+    fn check(item: &TransferItem<'_>) -> Result<Checked, ExecutionError> {
         let refused = |why: &str| ExecutionError::SubmissionFailed(why.into());
         let run = match item {
             TransferItem::Run(run) => run,
@@ -145,7 +144,7 @@ impl TransferQueue {
                 if offset % 4 != 0 || offset.checked_add(4).is_none_or(|end| end > word.len()) {
                     return Err(refused("a transfer signal's word lies outside its buffer or is unaligned"));
                 }
-                return Ok(vec![Checked::Signal { word: word.pointer() + offset, value: *value }]);
+                return Ok(Checked::Signal { word: word.pointer() + offset, value: *value });
             }
         };
         let within = |buffer: &Buffer, offset: u64| offset.checked_add(run.bytes).is_some_and(|end| end <= buffer.len());
@@ -157,22 +156,17 @@ impl TransferQueue {
         if source_host.is_some() && destination_host.is_some() {
             return Err(refused("a transfer run between host memory: the host copies it"));
         }
-        copy_pieces(run.source, run.source_offset, run.destination, run.destination_offset, run.bytes)
-            .into_iter()
-            .map(|(source_offset, destination_offset, bytes)| {
-                let bytes = host(bytes)?;
-                let (source, destination) = (run.source.pointer() + source_offset, run.destination.pointer() + destination_offset);
-                Ok(match (source_host, destination_host) {
-                    // SAFETY: within the source's mapped bytes, checked above.
-                    (Some(mapped), _) => Checked::Upload { source: unsafe { mapped.as_ptr().add(host(source_offset)?) }, destination, bytes },
-                    // SAFETY: within the destination's mapped bytes, checked above.
-                    (None, Some(mapped)) => {
-                        Checked::Download { source, destination: unsafe { mapped.as_ptr().add(host(destination_offset)?) }, bytes }
-                    }
-                    (None, None) => Checked::Within { source, destination, bytes },
-                })
-            })
-            .collect()
+        let bytes = host(run.bytes)?;
+        let (source, destination) = (run.source.pointer() + run.source_offset, run.destination.pointer() + run.destination_offset);
+        Ok(match (source_host, destination_host) {
+            // SAFETY: within the source's mapped bytes, checked above.
+            (Some(mapped), _) => Checked::Upload { source: unsafe { mapped.as_ptr().add(host(run.source_offset)?) }, destination, bytes },
+            // SAFETY: within the destination's mapped bytes, checked above.
+            (None, Some(mapped)) => {
+                Checked::Download { source, destination: unsafe { mapped.as_ptr().add(host(run.destination_offset)?) }, bytes }
+            }
+            (None, None) => Checked::Within { source, destination, bytes },
+        })
     }
 
     fn queue(&self, steps: &[Checked], value: u32) -> Result<(), crate::driver::DriverError> {
@@ -248,7 +242,6 @@ impl Drop for TransferQueue {
 mod tests {
     use super::*;
     use crate::direct::{DirectBatch, DirectLaunch, DirectModule, TimelineAnchor};
-    use crate::RangeMemory;
     use std::time::{Duration, Instant};
 
     /// One block spins `cycles` clock cycles, then writes 1.
@@ -263,18 +256,16 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
 
     const BYTES: u64 = 256 << 20;
 
-    /// Pinned host bytes holding `pattern(i)` at byte `i`, and a reserved
-    /// device range as large, as an expert bank's records are.
+    /// Pinned host bytes holding `pattern(i)` at byte `i`, and a device
+    /// block as large, as a pool's that an expert bank's records lie in.
     fn buffers(device: &Device, pattern: impl Fn(u64) -> u8) -> (Buffer, Buffer) {
-        let source = device.allocate_mapped(BYTES).unwrap();
+        let source = device.allocate_mapped(BYTES, &crate::test_entry()).unwrap();
         let host = source.host_address().unwrap();
         for at in 0..BYTES {
             // SAFETY: within the mapping, which no device work reaches yet.
             unsafe { host.as_ptr().add(at as usize).write(pattern(at)) };
         }
-        let granule = crate::reservation_granule(device.ordinal(), RangeMemory::Device).unwrap().unwrap();
-        let reserved = BYTES.div_ceil(granule) * granule;
-        let (destination, _resizer) = device.allocate_reserved(reserved, reserved, granule, RangeMemory::Device, std::sync::Arc::new(seismic_compiler::executable::Unbounded)).unwrap();
+        let destination = device.allocate_block(crate::topology::DEVICE_KIND, BYTES, &crate::test_entry()).unwrap();
         (source, destination)
     }
 
@@ -295,7 +286,7 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
         let half = BYTES / 2;
         // The second half first, then the first half, in one batch, each
         // signalling a word of its own (device memory) once landed.
-        let words = device.allocate_within(4096, 4, None).unwrap();
+        let words = device.allocate_device(4096, 4, &crate::test_entry()).unwrap();
         let signal = |offset: u64, value: u32| {
             // SAFETY of the lifetime: `words` outlives the batch.
             TransferItem::Signal { word: unsafe { &*(&words as *const Buffer) }, offset, value }
@@ -320,7 +311,7 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
         // Back to the host: the device's first 64 KiB into pinned memory,
         // after a copy within the device of its second 64 KiB over them.
         const BACK: u64 = 64 << 10;
-        let returned = device.allocate_mapped(BACK).unwrap();
+        let returned = device.allocate_mapped(BACK, &crate::test_entry()).unwrap();
         queue.copy(&[run(&destination, &destination, BACK, 0, BACK), run(&destination, &returned, 0, 0, BACK)], 2).unwrap();
         while !queue.completed(2).unwrap() {
             assert!(start.elapsed() < Duration::from_secs(10), "a transfer never completed");
@@ -364,8 +355,8 @@ extern "C" __global__ void spin(unsigned int* out, Words words, unsigned int* sc
         let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
         let cubin = crate::nvrtc::compile_cubin_named(SPIN, "spin.cu", architecture, &["spin"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
-        let out = device.allocate_mapped(4).unwrap();
-        let scalars = device.allocate_mapped(4).unwrap();
+        let out = device.allocate_mapped(4, &crate::test_entry()).unwrap();
+        let scalars = device.allocate_mapped(4, &crate::test_entry()).unwrap();
         let clock = Instant::now();
         let anchor = TimelineAnchor::record(&device, || clock.elapsed().as_secs_f64()).unwrap();
         let buffers = [(&out, 0)];
@@ -409,13 +400,13 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
 }
 "#;
 
-    /// Where the device's memory is the host's (GB10), device storage
-    /// reserved in pinned host memory, which the host addresses in place,
-    /// reads as fast as one reserved as device memory: a kernel reading
-    /// 1 GiB of each, in alternating rounds, takes within 3% of the other
-    /// at the median. Elsewhere it checks nothing.
+    /// Where the device's memory is the host's (GB10), a pool block of
+    /// registered host pages, which the host addresses in place, reads as
+    /// fast as one of device memory: a kernel reading 1 GiB of each, in
+    /// alternating rounds, takes within 3% of the other at the median.
+    /// Elsewhere it checks nothing.
     #[test]
-    fn where_memory_is_the_hosts_a_host_reservation_reads_as_a_device_one() {
+    fn where_memory_is_the_hosts_a_host_block_reads_as_a_device_one() {
         let Some((_exclusive, opened)) = crate::test_device() else { return };
         let descriptor = crate::describe(0).unwrap();
         if !descriptor.memory_is_host() {
@@ -427,16 +418,11 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
         let cubin = crate::nvrtc::compile_cubin_named(SUM, "sum.cu", architecture, &["sum"]).unwrap();
         let module = DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
         const READ: u64 = 1 << 30;
-        let reserved = |memory| {
-            let granule = crate::reservation_granule(device.ordinal(), memory).unwrap().unwrap();
-            let bytes = READ.div_ceil(granule) * granule;
-            device.allocate_reserved(bytes, bytes, granule, memory, std::sync::Arc::new(seismic_compiler::executable::Unbounded)).unwrap()
-        };
-        let (host, _host_resizer) = reserved(RangeMemory::HostNode);
-        let (own, _own_resizer) = reserved(RangeMemory::Device);
+        let block = |kind| device.allocate_block(kind, READ, &crate::test_entry()).unwrap();
+        let (host, own) = (block(crate::topology::PINNED_KIND), block(crate::topology::DEVICE_KIND));
         assert!(host.host_address().is_some() && own.host_address().is_none());
-        let out = device.allocate_mapped(8).unwrap();
-        let scalars = device.allocate_mapped(4).unwrap();
+        let out = device.allocate_mapped(8, &crate::test_entry()).unwrap();
+        let scalars = device.allocate_mapped(4, &crate::test_entry()).unwrap();
         let words = (READ / 8).to_le_bytes();
         let time = |data: &Buffer| {
             let buffers = [(data, 0), (&out, 0)];
@@ -468,122 +454,12 @@ extern "C" __global__ void sum(const unsigned long long* data, unsigned long lon
         };
         let (host, own) = (median(&mut on_host), median(&mut on_device));
         eprintln!(
-            "1 GiB read: host reservation {:.3} ms ({:.1} GB/s), device reservation {:.3} ms ({:.1} GB/s)",
+            "1 GiB read: host block {:.3} ms ({:.1} GB/s), device block {:.3} ms ({:.1} GB/s)",
             host * 1e3,
             READ as f64 / host / 1e9,
             own * 1e3,
             READ as f64 / own / 1e9
         );
-        assert!(host <= own * 1.03, "the host reservation read {host:.6} s against the device one's {own:.6} s");
-    }
-
-    /// A registered host tier's growth reads zero in every byte it makes
-    /// visible, zeroing only those its backing did not give zeroed: the
-    /// bytes a shrink left in the granule it kept are zeroed, a newly backed
-    /// granule is the host's, zeroed (`ReservedMemory::commit` says where they
-    /// start), and the bytes the tier still holds keep theirs.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn a_registered_host_tiers_growth_reads_zero() {
-        let Some((_exclusive, crate::OpenedCuda { service: device, .. })) = crate::test_device() else { return };
-        let Some(granule) = crate::reservation_granule(device.ordinal(), RangeMemory::Registered).unwrap() else {
-            eprintln!("this device reserves no registered host pages");
-            return;
-        };
-        let size = granule as usize;
-        let (tier, resizer) =
-            device.allocate_reserved(granule, 3 * granule, granule, RangeMemory::Registered, std::sync::Arc::new(seismic_compiler::executable::Unbounded)).unwrap();
-        let base = tier.host_address().unwrap().as_ptr();
-        // SAFETY: the committed granule, which no device work reaches.
-        unsafe { std::ptr::write_bytes(base, 7, size) };
-        let grow = |resizer: crate::CudaResizer, bytes: u64| match resizer.prepare(bytes) {
-            Ok(prepared) => prepared.install().release(),
-            Err((_, error)) => panic!("a {bytes}-byte commitment: {error}"),
-        };
-        let resizer = grow(grow(resizer, granule / 2), 2 * granule);
-        // SAFETY: two backed granules, which no device work reaches.
-        let bytes = unsafe { std::slice::from_raw_parts(base, 2 * size) };
-        assert!(bytes[..size / 2].iter().all(|&byte| byte == 7), "the bytes the tier held keep theirs");
-        assert!(bytes[size / 2..].iter().all(|&byte| byte == 0), "the growth reads zero");
-        assert_eq!(tier.reservation().unwrap().commit(3 * size).unwrap(), 2 * size, "only the third granule is newly backed");
-        drop(resizer);
-    }
-
-    /// A host tier over a link (registered host pages) grows, shrinks and
-    /// regrows granule by granule; its bytes read in place and copy to the
-    /// device across granules (one copy per granule, `copy_pieces`); a
-    /// growth whose registration the driver refuses (a granule already
-    /// registered elsewhere) leaves the tier as it was; and every backed
-    /// granule is counted large or small.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn a_registered_host_tier_grows_shrinks_and_rolls_back() {
-        let Some((_exclusive, crate::OpenedCuda { service: device, .. })) = crate::test_device() else { return };
-        let Some(granule) = crate::reservation_granule(device.ordinal(), RangeMemory::Registered).unwrap() else {
-            eprintln!("this device reserves no registered host pages");
-            return;
-        };
-        let before = seismic_reservation::large_page_backing();
-        let (tier, resizer) =
-            device.allocate_reserved(granule, 4 * granule, granule, RangeMemory::Registered, std::sync::Arc::new(seismic_compiler::executable::Unbounded)).unwrap();
-        let base = tier.host_address().unwrap().as_ptr();
-        let backed = |granules: u64| {
-            let now = seismic_reservation::large_page_backing();
-            assert_eq!(
-                (now.large_bytes - before.large_bytes) + (now.small_bytes - before.small_bytes),
-                granules * granule,
-                "each backed granule counted once"
-            );
-        };
-        let resize = |resizer: crate::CudaResizer, bytes: u64| match resizer.prepare(bytes) {
-            Ok(prepared) => prepared.install().release(),
-            Err((_, error)) => panic!("a {bytes}-byte commitment: {error}"),
-        };
-        let resizer = resize(resizer, 3 * granule);
-        backed(3);
-        let bytes = 3 * granule as usize;
-        for at in 0..bytes {
-            // SAFETY: within the three backed granules, which no device work reaches.
-            unsafe { base.add(at).write((at % 253) as u8) };
-        }
-        // A copy over all three granules, from a mid-granule offset.
-        let landed = device.allocate_within(bytes as u64, 16, None).unwrap();
-        let queue = TransferQueue::new(&device).unwrap();
-        let from = granule / 2 + 16;
-        queue.copy(&[run(&tier, &landed, from, 0, 2 * granule)], 1).unwrap();
-        while !queue.completed(1).unwrap() {
-            std::thread::yield_now();
-        }
-        let mut read = vec![0u8; 2 * granule as usize];
-        landed.download_at(0, &mut read).unwrap();
-        assert!(read.iter().enumerate().all(|(at, &byte)| byte == ((from as usize + at) % 253) as u8), "the copy across granules lands");
-        // Shrink to one granule, then refuse a regrowth: granule 1 is
-        // registered by someone else first.
-        let resizer = resize(resizer, granule);
-        // The shrink unregisters its granules.
-        assert_eq!(tier.reservation().unwrap().registered_granules(), Some(1));
-        backed(1);
-        let second = unsafe { base.add(granule as usize) };
-        let driver = &device.context().driver;
-        let _current = device.context().enter().unwrap();
-        unsafe {
-            assert_eq!(libc::mprotect(second.cast(), granule as usize, libc::PROT_READ | libc::PROT_WRITE), 0);
-            second.write(1);
-            driver.check((driver.host_register)(second.cast(), granule as usize, 1), "foreign registration").unwrap();
-        }
-        let Err((resizer, _)) = resizer.prepare(3 * granule) else {
-            panic!("a refused registration refuses the growth");
-        };
-        backed(1);
-        // SAFETY: granule 0 is still backed.
-        assert_eq!(unsafe { *base.add(17) }, 17, "the kept granule keeps its bytes");
-        unsafe { driver.check((driver.host_unregister)(second.cast()), "foreign unregistration").unwrap() };
-        let resizer = resize(resizer, 3 * granule);
-        backed(3);
-        // SAFETY: a regrown granule reads zero.
-        assert_eq!(unsafe { *second }, 0, "a regrown granule is fresh");
-        drop(resizer);
-        drop(tier);
-        assert_eq!(seismic_reservation::large_page_backing(), before, "a dropped tier is uncounted");
+        assert!(host <= own * 1.03, "the host block read {host:.6} s against the device one's {own:.6} s");
     }
 }

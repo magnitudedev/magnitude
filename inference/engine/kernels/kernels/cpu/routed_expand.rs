@@ -10,7 +10,6 @@
 use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
-use seismic::cpu::Weights;
 
 #[inline(always)]
 fn routed_expand_stage<L: Isa, E: Elements>(
@@ -41,14 +40,15 @@ fn routed_expand_stage<L: Isa, E: Elements>(
         [&cx.arg_expert_gate(), &cx.arg_expert_up()],
         [&cx.arg_shared_gate(), &cx.arg_shared_up()],
     );
-    let nvfp4 = [&routed, &shared]
-        .into_iter()
-        .find(|weights| weights[0].nvfp4_operands());
-    if let Some(weights) = nvfp4 {
+    let routed_nvfp4 = routed[0].nvfp4_operands();
+    if routed_nvfp4 || shared[0].nvfp4_operands() {
         // SAFETY: each work item writes its own row of the scratch.
         let operands = unsafe { cx.scratch_operands().slice_mut::<f32>(4 * row * h, h) };
         operands.copy_from_slice(staged);
-        projection::operand_row(&weights[..], operands);
+        match routed_nvfp4 {
+            true => projection::operand_row(&routed[..], operands),
+            false => projection::operand_row(&shared[..], operands),
+        }
     }
 }
 
@@ -56,7 +56,7 @@ fn routed_expand_stage<L: Isa, E: Elements>(
 /// declares that the pair shares it): the formed NVFP4 operand rows where it
 /// takes them, else the staged rows.
 #[inline(always)]
-fn rows_for<'a, E: Elements>(cx: &'a Context<'_, E>, gate: &Weights<'_>, m: usize, h: usize) -> &'a [f32] {
+fn rows_for<'a, E: Elements>(cx: &'a Context<'_, E>, gate: &impl projection::Recipe, m: usize, h: usize) -> &'a [f32] {
     // SAFETY: the stage launch wrote every row before this launch.
     unsafe {
         if gate.nvfp4_operands() {
@@ -93,16 +93,16 @@ fn routed_expand_rows<L: Isa, E: Elements>(
         }
         let (row, slot) = (choice / k, choice % k);
         let expert = cx.arg_routes().get([row, slot]);
-        let first = routed::expert_row(expert, f) + rows.start;
         let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
         // SAFETY: each work item writes its own features of its own choice.
         let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
-        let x = &rows_for(cx, &cx.arg_expert_gate(), m, h)[row * h..(row + 1) * h];
+        let (gate, up) = (cx.arg_expert_gate(), cx.arg_expert_up());
+        let x = &rows_for(cx, &gate, m, h)[row * h..(row + 1) * h];
         let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
         routed::expand_into::<E::A>(
-            &cx.arg_expert_gate(),
-            &cx.arg_expert_up(),
-            first,
+            &routed::record(&gate, expert),
+            &routed::record(&up, expert),
+            rows.start,
             x,
             q8,
             functions::SILU,

@@ -8,17 +8,14 @@ use crate::Metal;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions,
 };
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
-use seismic_lang::registry::{chunk_entries, record_table_bytes, record_table_entry, RECORD_TABLE_ENTRY_BYTES};
 use std::fmt;
-use seismic_reservation::{Backing, HostRange, PageSize, Reserved, Resizer};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use seismic_memory::entry::{Backed, DropScope, Entry, Store, Wiring};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::{any::Any, ptr::NonNull};
 
 /// A retained `MTLDevice`. `MTLDevice` is `Send + Sync`; identity is the
@@ -83,10 +80,9 @@ impl DeviceHandle {
 
     /// `MTLDevice.currentAllocatedSize`: bytes of resources this process has
     /// allocated on the device, including resources Seismic does not own.
-    /// Each buffer counts its whole length (a reservation's chunks each
-    /// once); the device holds the working set to that count (its command
-    /// buffers fail with out-of-memory beyond the recommended working set,
-    /// M4 Pro, 2026-10-27).
+    /// Each buffer counts its whole length; the device holds the working
+    /// set to that count (its command buffers fail with out-of-memory
+    /// beyond the recommended working set, M4 Pro, 2026-10-27).
     pub fn current_allocated_bytes(&self) -> u64 {
         self.device.currentAllocatedSize() as u64
     }
@@ -123,30 +119,31 @@ impl fmt::Debug for DeviceHandle {
     }
 }
 
-/// macOS lets a residency set's requested residency lapse about 1 s after
-/// the set's last GPU work and un-wires its allocations until the next GPU
-/// work wires them again, about 10 ms per GB before that work's first result
-/// (M1 Ultra, macOS 26.7: 26 GB un-wired 1.05 s after a request, +0.26 s to
-/// the next first token). Renewing ten times inside that second keeps them
-/// wired through every idle gap; stopping wakes the renewer at once, so the
-/// interval adds no latency to an unload or exit.
-const RESIDENCY_RENEWAL: Duration = Duration::from_millis(100);
-
-/// The device's residency set and its renewal. While the set holds an
-/// allocation one thread renews the set's residency every
-/// `RESIDENCY_RENEWAL`; the release of its last allocation stops and joins
-/// that thread, and the next allocation starts another. Wired memory is
-/// released by releasing allocations, never by letting residency lapse.
+/// The device's residency set: every buffer the device allocates, made
+/// resident as it joins, and so wired while the process holds it (its
+/// charge is [`Wiring::Wired`]). macOS may let the set's residency lapse and
+/// un-wire its allocations until the next request or GPU work wires them
+/// again; the GPU work wires the set itself (the queue has it attached), so
+/// the set's residency is requested only where a host reading needs it
+/// wired, and never on a timer:
+/// - each change of the set (a buffer added or freed);
+/// - a reading of the host's wired count
+///   ([`MetalDevice::request_residency`], which the embedder's reading runs
+///   before it reads the count).
+///
+/// A change holds the set's lock across its commit; a reading never waits
+/// on it: where a change holds it, that change's own request, made after its
+/// commit, wires the set again.
 struct Residency {
     wired: Mutex<Wired>,
-    stop: Condvar,
 }
 
 struct Wired {
     set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    renewer: Option<JoinHandle<()>>,
-    generation: u64,
-    renewals: u64,
+    /// The residency requests made: one per event that asks for one while
+    /// the set holds anything.
+    #[cfg(test)]
+    requests: u64,
 }
 
 // The set is used only under the residency mutex, on whichever thread holds
@@ -158,11 +155,9 @@ impl Residency {
         Arc::new(Self {
             wired: Mutex::new(Wired {
                 set,
-                renewer: None,
-                generation: 0,
-                renewals: 0,
+                #[cfg(test)]
+                requests: 0,
             }),
-            stop: Condvar::new(),
         })
     }
 
@@ -170,83 +165,174 @@ impl Residency {
         self.wired.lock().expect("Metal residency lock poisoned")
     }
 
-    /// Add `buffers` to the set and wire them now, on the calling thread, in
-    /// one commit. A buffer the set only holds is wired by the first GPU
-    /// work that binds it, on the thread submitting that work (a 20 GiB
-    /// buffer: +142 ms before its first read, M4 Pro, 2026-10-25), which a
-    /// reservation's resize prepares away from.
-    fn add(self: &Arc<Self>, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
-        if buffers.is_empty() {
-            return;
-        }
+    /// Add `buffer` to the set and wire it now, on the calling thread: every
+    /// page of it backed and resident before this returns. A buffer the set
+    /// only holds is wired by the first GPU work that binds it, on the
+    /// thread submitting that work (a 20 GiB buffer: +142 ms before its
+    /// first read, M4 Pro, 2026-10-25), which an allocation is made away
+    /// from.
+    fn add(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
         let mut wired = self.lock();
-        crate::pooled(|| {
-            for buffer in buffers {
-                wired.set.addAllocation(ProtocolObject::from_ref(&**buffer));
-            }
-            wired.set.commit();
-            wired.set.requestResidency();
-        });
-        if wired.renewer.is_none() {
-            let residency = self.clone();
-            let generation = wired.generation;
-            let renewer = std::thread::Builder::new()
-                .name("metal-residency".into())
-                .spawn(move || residency.renew(generation))
-                .expect("could not start the Metal residency renewer");
-            wired.renewer = Some(renewer);
-        }
+        crate::pooled(|| wired.set.addAllocation(ProtocolObject::from_ref(buffer)));
+        wired.changed();
     }
 
-    /// Remove `buffers` from the set in one commit.
-    fn remove(&self, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
-        if buffers.is_empty() {
-            return;
-        }
-        let renewer = {
-            let mut wired = self.lock();
-            crate::pooled(|| {
-                for buffer in buffers {
-                    wired.set.removeAllocation(ProtocolObject::from_ref(&**buffer));
-                }
-                wired.set.commit();
-            });
-            if wired.set.allocationCount() > 0 {
-                return;
-            }
-            wired.generation += 1;
-            wired.renewer.take()
-        };
-        self.stop.notify_all();
-        if let Some(renewer) = renewer {
-            renewer.join().expect("the Metal residency renewer panicked");
-        }
+    /// Remove `buffer` from the set.
+    fn remove(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+        let mut wired = self.lock();
+        crate::pooled(|| wired.set.removeAllocation(ProtocolObject::from_ref(buffer)));
+        wired.changed();
     }
 
-    /// Renews residency until `generation` is stopped. The first renewal is
-    /// immediate: a request made before the set held anything may already
-    /// have lapsed.
-    fn renew(&self, generation: u64) {
-        let mut wired = self.lock();
-        while wired.generation == generation {
-            crate::pooled(|| wired.set.requestResidency());
-            wired.renewals += 1;
-            wired = self
-                .stop
-                .wait_timeout(wired, RESIDENCY_RENEWAL)
-                .expect("Metal residency lock poisoned")
-                .0;
+    /// A reading of the wired count: request the set's residency, without
+    /// waiting. A change holding the set's lock requests it itself once its
+    /// commit is made ([`Wired::changed`]), so that request stands for this
+    /// one.
+    fn before_reading(&self) {
+        match self.wired.try_lock() {
+            Ok(mut wired) => wired.request(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("Metal residency lock poisoned"),
         }
     }
 }
 
-/// Buffers' membership of their device's residency set. Each is wired from
-/// the commit that adds it until it leaves (dropped, or split off and that
-/// part dropped), so the kernel never compresses or swaps it while macOS
-/// honors the set's renewed residency.
+impl Wired {
+    /// The set changed: commit it, and request its residency again.
+    fn changed(&mut self) {
+        crate::pooled(|| self.set.commit());
+        self.request();
+    }
+
+    /// Request the set's residency where it holds anything.
+    fn request(&mut self) {
+        crate::pooled(|| {
+            if self.set.allocationCount() > 0 {
+                self.set.requestResidency();
+                #[cfg(test)]
+                {
+                    self.requests += 1;
+                }
+            }
+        });
+    }
+}
+
+/// One Metal buffer with the bytes Metal took for it, charged exactly to an
+/// entry ([`charged_buffer`]): its size class, admitted before the buffer
+/// was made, and what Metal's own count of it took beyond that after. Freed
+/// from the entry as it drops, with the buffer, in one change.
+type ChargedBuffer = Backed<Retained<ProtocolObject<dyn MTLBuffer>>>;
+
+/// A new buffer of `length` bytes in `options`' storage, its bytes charged
+/// exactly to `entry` as `wiring` ([`ChargedBuffer`]): wired where it joins
+/// the residency set. A refusal, the entry's or the device's, allocates
+/// nothing and charges nothing.
+fn charged_buffer(
+    handle: &DeviceHandle,
+    length: usize,
+    options: MTLResourceOptions,
+    entry: &Arc<dyn Entry>,
+    wiring: Wiring,
+) -> Result<ChargedBuffer, ExecutionError> {
+    // What Metal takes for a buffer of `length`: its size class.
+    let sized = handle.raw().heapBufferSizeAndAlignWithLength_options(length, options).size as u64;
+    // The admission, the buffer and the record of what it took are one
+    // change.
+    Backed::take(entry, sized, wiring, |charging| {
+        let buffer = crate::pooled(|| handle.raw().newBufferWithLength_options(length, options))
+            // Metal states no reason for a buffer it does not create; within
+            // `maxBufferLength` it is the device that refused it, with its
+            // working set as it reads now.
+            .ok_or_else(|| handle.refused(length as u64))?;
+        // Metal's own count of the buffer, which its working set holds: what it
+        // took beyond the size class, or the part it did not take.
+        let allocated = buffer.allocatedSize() as u64;
+        if allocated > sized {
+            charging.took_more(allocated - sized);
+        }
+        if allocated < sized {
+            charging.shrink(sized - allocated);
+        }
+        Ok::<_, ExecutionError>(buffer)
+    })
+}
+
+/// A pool block's own anonymous mapping: its own VM object, so unmapping it
+/// frees its pages at once, which a buffer Metal allocated does not (IOGPU
+/// frees those at a time of its own, M4 Pro, macOS 26, 2026-11-14: a
+/// touched 1 GiB buffer's footprint was held 3 s past its drop, and
+/// `setPurgeableState(.empty)` or `madvise` discarded none of it).
+struct Mapping {
+    pointer: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    /// A zero mapping of `len` bytes, whole host pages.
+    fn anonymous(len: usize) -> Result<Self, ExecutionError> {
+        let pointer = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        match (pointer != libc::MAP_FAILED).then(|| NonNull::new(pointer.cast::<u8>())).flatten() {
+            Some(pointer) => Ok(Self { pointer, len }),
+            None => Err(ExecutionError::AllocationFailed(format!("{len} bytes were not mapped: {}", std::io::Error::last_os_error()))),
+        }
+    }
+
+    /// Every page of it backed, zero: written once each, on the calling
+    /// thread, as a block's bytes are the process's the moment it returns.
+    fn back(&self, page: usize) {
+        for offset in (0..self.len).step_by(page) {
+            // SAFETY: within the mapping this owns.
+            unsafe { self.pointer.as_ptr().add(offset).write_volatile(0) };
+        }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        let unmapped = unsafe { libc::munmap(self.pointer.as_ptr().cast(), self.len) };
+        assert_eq!(unmapped, 0, "invariant violated: a mapping of {} bytes is unmapped: {}", self.len, std::io::Error::last_os_error());
+    }
+}
+
+/// A new buffer of `length` bytes over a mapping of its own, rounded up to
+/// whole host pages, every page backed, charged exactly to `entry` as
+/// `wiring`: no-copy, so Metal takes exactly the mapping's bytes. A refusal allocates and
+/// charges nothing.
+fn mapped_buffer(handle: &DeviceHandle, length: usize, entry: &Arc<dyn Entry>, wiring: Wiring) -> Result<(ChargedBuffer, Mapping), ExecutionError> {
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("a host page size is positive");
+    let length = length.checked_next_multiple_of(page).ok_or_else(|| ExecutionError::AllocationFailed(format!("{length} bytes exceed the host address space")))?;
+    let mut mapping = None;
+    let buffer = Backed::take(entry, length as u64, wiring, |_| {
+        let made = Mapping::anonymous(length)?;
+        made.back(page);
+        let buffer = crate::pooled(|| unsafe {
+            handle.raw().newBufferWithBytesNoCopy_length_options_deallocator(made.pointer.cast(), length, MTLResourceOptions::StorageModeShared, None)
+        })
+        .ok_or_else(|| handle.refused(length as u64))?;
+        mapping = Some(made);
+        Ok::<_, ExecutionError>(buffer)
+    })?;
+    Ok((buffer, mapping.expect("a charged buffer has its mapping")))
+}
+
+/// A buffer's membership of its device's residency set, and the charge of
+/// its bytes. It is requested resident from the commit that adds it until
+/// this is dropped ([`Residency`]); its bytes are charged to the entry its
+/// allocation named until then ([`MetalDevice::allocate_bytes`]).
 pub struct WiredAllocation {
     residency: Arc<Residency>,
-    buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    buffer: ChargedBuffer,
+    /// A pool block's mapping, unmapped as it is released ([`Self::drop`]):
+    /// after the buffer over it. Held only for its drop.
+    _mapping: Option<Mapping>,
+    /// The change its drop runs in ([`DropScope`]): last, so the charge's
+    /// free and the unmapping, an OS effect of the drop beside the
+    /// buffer's release, are one change.
+    scope: DropScope,
 }
 
 unsafe impl Send for WiredAllocation {}
@@ -255,32 +341,29 @@ unsafe impl Sync for WiredAllocation {}
 impl WiredAllocation {
     fn wire(
         residency: &Arc<Residency>,
-        buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        buffer: ChargedBuffer,
+        mapping: Option<Mapping>,
     ) -> Self {
-        residency.add(&buffers);
+        residency.add(&buffer);
         Self {
             residency: residency.clone(),
-            buffers,
-        }
-    }
-
-    /// Join `other`'s buffers, which stay wired.
-    fn append(&mut self, mut other: Self) {
-        self.buffers.append(&mut other.buffers);
-    }
-
-    /// The buffers from `at` on, which stay wired until it is dropped.
-    fn split_off(&mut self, at: usize) -> Self {
-        Self {
-            residency: self.residency.clone(),
-            buffers: self.buffers.split_off(at),
+            buffer,
+            _mapping: mapping,
+            scope: DropScope::default(),
         }
     }
 }
 
 impl Drop for WiredAllocation {
+    /// The buffer leaves the residency set first, then its fields drop in
+    /// order: the buffer is released, and a block's mapping, which no work
+    /// reads any more (the granule pool returns a block only after its
+    /// granules' fences), is unmapped, its pages free within the drop. So
+    /// our own release of a block shows in the next host reading with a
+    /// release λ of 0, as anonymous memory's does.
     fn drop(&mut self) {
-        self.residency.remove(&self.buffers);
+        self.scope.begin(self.buffer.entry());
+        self.residency.remove(&self.buffer);
     }
 }
 
@@ -367,55 +450,6 @@ impl MetalBuffer {
     }
 }
 
-/// The committed prefix of a host address reservation, resized in place
-/// ([`MetalResizer::prepare`]): chunks, each its own Metal buffer, which
-/// device work reaches only through the reservation's record table (a
-/// [`MetalBuffer`]), never bound. The host addresses the range in place.
-#[derive(Clone)]
-pub struct ReservedBuffer {
-    reservation: Arc<Reservation>,
-}
-
-impl ReservedBuffer {
-    /// Committed bytes.
-    pub fn len(&self) -> u64 {
-        self.reservation.state().bytes
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// The host address of byte 0: the range's base, which never moves.
-    pub fn host_base(&self) -> NonNull<u8> {
-        self.reservation.backing().range.base()
-    }
-
-    /// The record table device work reaches the records through, which the
-    /// reservation formed with it and keeps as its chunks change.
-    pub fn table(&self) -> WritableMetalBuffer {
-        self.reservation.backing().table.clone()
-    }
-
-    /// The GPU virtual address of byte `offset`, in the chunk holding it,
-    /// which must be backed; its address is fixed while it is.
-    pub fn gpu_address(&self, offset: u64) -> u64 {
-        let granule = self.reservation.backing().range.granule() as u64;
-        let chunk = &self.reservation.state().view.buffers[(offset / granule) as usize];
-        chunk.gpuAddress() + offset % granule
-    }
-
-    /// Write `bytes` at `offset` of the committed bytes.
-    pub fn write_bytes(&self, offset: u64, bytes: &[u8]) {
-        unsafe { host_write(self.host_base().as_ptr(), self.len(), offset, bytes) }
-    }
-
-    /// Read committed bytes from `offset` into `into`.
-    pub fn read_bytes(&self, offset: u64, into: &mut [u8]) {
-        unsafe { host_read(self.host_base().as_ptr(), self.len(), offset, into) }
-    }
-}
-
 /// The host address of `[offset, offset + len)` of `length` bytes at
 /// `base`. Precondition (FFI wrapper): the range lies inside them.
 fn host_range(base: *mut u8, length: u64, offset: u64, len: usize) -> *mut u8 {
@@ -441,272 +475,6 @@ unsafe fn host_read(base: *mut u8, length: u64, offset: u64, into: &mut [u8]) {
     unsafe { std::ptr::copy_nonoverlapping(source, into.as_mut_ptr(), into.len()) };
 }
 
-/// The least chunk in which a reservation backs its committed bytes. Each
-/// chunk is its own VM object (a named memory entry), so releasing one frees
-/// its pages at once: a VM object shared by kept and released bytes would
-/// keep the released pages while Metal still references the object.
-///
-/// A chunk costs a fixed ~4.9 us to form (its memory entry and mapping, its
-/// no-copy buffer and table entries; the residency set's commit is under
-/// 0.1 us of it) beside ~34 us per MiB to back its bytes, so the granule is
-/// the least power-of-two chunk whose fixed cost is at most 10% of its
-/// bytes': 2 MiB (7%; 1 MiB would be 14%). Backing 1 GiB at once
-/// (`reservation_chunk_cost`, M4 Pro):
-/// 355 ms in 16 KiB chunks, 54 ms in 256 KiB, 40 ms in 1 MiB,
-/// 37.6 ms in 2 MiB, 35.4 ms in 32 MiB; a growth by one chunk, 5.8 us at
-/// 16 KiB and 66 us at 2 MiB. GPU reads through the record table took
-/// 4.4-5.7 ms a GiB at every chunk size, so the chunk count costs device
-/// work nothing.
-pub const RESERVATION_GRANULE: usize = 2 << 20;
-
-/// Whether the host addresses a reservation's backed bytes in place: its
-/// buffer wraps the host range without copying (`newBufferWithBytesNoCopy`).
-pub const RESERVATIONS_HOST_ADDRESSED: bool = true;
-
-/// What device work reaches a reservation's backed bytes through chunks of:
-/// each chunk is its own buffer (a buffer GPU work touches is wired whole,
-/// so one buffer over the range would hold every page a release frees; M4
-/// Pro, macOS 15.7, 2026-10-27) of whole [`CHUNK_UNIT`]s.
-pub const RESERVATION_CHUNKS: Option<u64> = Some(CHUNK_UNIT);
-
-/// 16 KiB, the largest macOS page: every chunk's no-copy buffer starts and
-/// ends on a host page.
-const CHUNK_UNIT: u64 = 16 << 10;
-
-/// Metal's backing of a host reservation (`seismic_reservation`):
-/// granules of anonymous memory, each its own VM object and its own Metal
-/// buffer (a chunk), and the reservation's record table.
-///
-/// GPU work that touches a buffer wires all of it, so one buffer over the
-/// range would hold every page a shrink frees. Each chunk is wrapped once
-/// when it is backed (`newBufferWithBytesNoCopy`) and joins the residency
-/// set, so only committed chunks are wired; device work reaches records
-/// through the table, entry `r` the device address of record `r` in its
-/// chunk (no record crosses one). A growth forms only its new chunks; a
-/// shrink retires its tail chunks, dropped (leaving the set) by its release
-/// before their granules are unmapped, so device work never reads a page
-/// remapped under a live buffer.
-pub struct Granules {
-    /// The host address range the granules are of.
-    range: HostRange,
-    device: DeviceHandle,
-    residency: Arc<Residency>,
-    /// The record table, whose entries for a chunk's records are written as
-    /// it is formed: entries of released chunks are never read.
-    table: WritableMetalBuffer,
-    /// Bytes of one record, a divisor of the granule.
-    record: usize,
-}
-
-unsafe impl Send for Granules {}
-unsafe impl Sync for Granules {}
-
-/// A change of a reservation's chunks: the new chunks of a growth, or the
-/// chunks a shrink keeps.
-pub enum ChunkChange {
-    Grow(WiredAllocation),
-    Shrink(usize),
-}
-
-type Reservation = Reserved<Granules>;
-pub type MetalResizer = Resizer<Granules>;
-
-impl Granules {
-    /// The chunk buffers over granules `[from, to)` of `range`, wired, with
-    /// their records' table entries written.
-    fn form(&self, range: &HostRange, from: usize, to: usize) -> Result<WiredAllocation, ExecutionError> {
-        let granule = range.granule();
-        let buffers = (from..to)
-            .map(|index| {
-                crate::pooled(|| unsafe {
-                    self.device
-                        .raw()
-                        .newBufferWithBytesNoCopy_length_options_deallocator(
-                            NonNull::new_unchecked(range.at(index)).cast(),
-                            granule,
-                            MTLResourceOptions::StorageModeShared,
-                            None,
-                        )
-                })
-                // As for an allocated buffer, Metal states no reason for a
-                // buffer it does not create: the device refused it.
-                .ok_or_else(|| self.device.refused(granule as u64))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let records = self.table.len() / RECORD_TABLE_ENTRY_BYTES;
-        for (index, buffer) in (from as u64..to as u64).zip(&buffers) {
-            let (first, entries) = chunk_entries(index, granule as u64, self.record as u64, records, buffer.gpuAddress());
-            self.table.write_bytes(record_table_entry(first), &entries);
-        }
-        Ok(WiredAllocation::wire(&self.residency, buffers))
-    }
-}
-
-impl Backing for Granules {
-    type Error = ExecutionError;
-    /// The chunks over the backed granules, in order.
-    type View = WiredAllocation;
-    type Change = ChunkChange;
-    /// The chunks a shrink released.
-    type Retired = Option<WiredAllocation>;
-
-    fn granule(&self) -> usize {
-        self.range.granule()
-    }
-
-    fn granules(&self) -> usize {
-        self.range.granules()
-    }
-
-    /// Map fresh zero granules `[from, to)`. On failure nothing new stays
-    /// mapped.
-    fn back(&self, from: usize, to: usize) -> Result<(), ExecutionError> {
-        let range = &self.range;
-        for index in from..to {
-            if let Err(error) = unsafe { host::map_granule(range.at(index), range.granule(), range.page()) } {
-                range.unback(from, index);
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    fn unback(&self, from: usize, to: usize) {
-        self.range.unback(from, to);
-    }
-
-    fn zero(&self, bytes: std::ops::Range<u64>) -> Result<(), ExecutionError> {
-        self.range.zero(bytes);
-        Ok(())
-    }
-
-    /// The chunks over the first `granules` granules, wired.
-    fn view(&self, granules: usize) -> Result<WiredAllocation, ExecutionError> {
-        self.form(&self.range, 0, granules)
-    }
-
-    /// A growth forms its new chunks; a shrink keeps the leading ones.
-    fn change(&self, installed: usize, granules: usize) -> Result<ChunkChange, ExecutionError> {
-        match granules > installed {
-            true => self.form(&self.range, installed, granules).map(ChunkChange::Grow),
-            false => Ok(ChunkChange::Shrink(granules)),
-        }
-    }
-
-    fn apply(&self, view: &mut WiredAllocation, change: ChunkChange) -> Option<WiredAllocation> {
-        match change {
-            ChunkChange::Grow(chunks) => {
-                view.append(chunks);
-                None
-            }
-            ChunkChange::Shrink(granules) => Some(view.split_off(granules)),
-        }
-    }
-}
-
-/// Mach virtual memory for reservations' granules.
-mod host {
-    use seismic_compiler::errors::ExecutionError;
-
-    type KernReturn = libc::c_int;
-    type MachPort = libc::c_uint;
-    // <mach/memory_object_types.h>
-    const MAP_MEM_NAMED_CREATE: libc::c_int = 0x020000;
-    const VM_PROT_READ_WRITE: libc::c_int = 0x3;
-    const VM_INHERIT_NONE: libc::c_uint = 2;
-    // <mach/vm_statistics.h>
-    const VM_FLAGS_FIXED: libc::c_int = 0x0000;
-    const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
-    unsafe extern "C" {
-        fn mach_make_memory_entry_64(
-            target_task: MachPort,
-            size: *mut u64,
-            offset: u64,
-            permission: libc::c_int,
-            object_handle: *mut MachPort,
-            parent_entry: MachPort,
-        ) -> KernReturn;
-        fn mach_vm_map(
-            target_task: MachPort,
-            address: *mut u64,
-            size: u64,
-            mask: u64,
-            flags: libc::c_int,
-            object: MachPort,
-            offset: u64,
-            copy: libc::c_int,
-            cur_protection: libc::c_int,
-            max_protection: libc::c_int,
-            inheritance: libc::c_uint,
-        ) -> KernReturn;
-        fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
-    }
-
-    fn task() -> MachPort {
-        #[allow(deprecated)]
-        unsafe {
-            libc::mach_task_self()
-        }
-    }
-
-    /// Map one fresh, zero-filled granule of its own VM object at `address`,
-    /// every `page`-byte host page of it backed: a committed granule is
-    /// charged, so it is held as an allocated buffer's bytes are, and device
-    /// work never takes a first-touch fault on it.
-    ///
-    /// # Safety
-    /// The range lies inside a reservation of the caller's.
-    pub(super) unsafe fn map_granule(address: *mut u8, bytes: usize, page: usize) -> Result<(), ExecutionError> {
-        let failed = |what: &str, code: KernReturn| {
-            ExecutionError::AllocationFailed(format!(
-                "{what} for a reserved granule failed ({code})"
-            ))
-        };
-        let mut size = bytes as u64;
-        let mut entry: MachPort = 0;
-        let code = unsafe {
-            mach_make_memory_entry_64(
-                task(),
-                &mut size,
-                0,
-                MAP_MEM_NAMED_CREATE | VM_PROT_READ_WRITE,
-                &mut entry,
-                0,
-            )
-        };
-        if code != 0 {
-            return Err(failed("mach_make_memory_entry_64", code));
-        }
-        let mut at = address as u64;
-        let code = unsafe {
-            mach_vm_map(
-                task(),
-                &mut at,
-                bytes as u64,
-                0,
-                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-                entry,
-                0,
-                0,
-                VM_PROT_READ_WRITE,
-                VM_PROT_READ_WRITE,
-                VM_INHERIT_NONE,
-            )
-        };
-        // The mapping holds the object; the entry's port is not needed.
-        unsafe { mach_port_deallocate(task(), entry) };
-        if code != 0 {
-            return Err(failed("mach_vm_map", code));
-        }
-        // A write to each page makes the kernel back it with a zero page;
-        // the granule's bytes stay zero.
-        for offset in (0..bytes).step_by(page) {
-            unsafe { std::ptr::write_volatile(address.add(offset), 0) };
-        }
-        Ok(())
-    }
-}
-
 /// The device service: device plus one command queue.
 #[derive(Clone)]
 pub struct MetalDevice {
@@ -718,18 +486,27 @@ pub struct MetalDevice {
     /// A buffer every direct encoder declares it writes and no launch binds
     /// (`direct::DirectBatch`): hazard tracking then orders each encoder on
     /// the queue after the one before it.
-    order: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Its bytes are charged to the store's own entry, freed with it as the
+    /// last clone of the device drops.
+    order: Arc<ChargedBuffer>,
+    /// The store the device's memory lies in, unified with the host's: the
+    /// embedder's ledger of it, whose own entry holds what the device
+    /// allocates that no caller names.
+    store: Arc<dyn Store>,
 }
 
 unsafe impl Send for MetalDevice {}
 unsafe impl Sync for MetalDevice {}
 
 impl MetalDevice {
-    pub fn open(handle: DeviceHandle) -> Result<Self, TargetError> {
-        crate::pooled(|| Self::form(handle))
+    /// Device `handle`, its memory the store `store` ledgers: what it
+    /// allocates of its own (the order buffer, its profile's probe) is
+    /// charged to the store's own entry.
+    pub fn open(handle: DeviceHandle, store: Arc<dyn Store>) -> Result<Self, TargetError> {
+        crate::pooled(|| Self::form(handle, store))
     }
 
-    fn form(handle: DeviceHandle) -> Result<Self, TargetError> {
+    fn form(handle: DeviceHandle, store: Arc<dyn Store>) -> Result<Self, TargetError> {
         // Compilation is shared by every native entry formed on this device.
         // Metal defaults to a small compiler pool; allow the system to scale
         // compilation concurrency to the machine before forming any kernels.
@@ -744,18 +521,18 @@ impl MetalDevice {
                 "could not create a Metal residency set: {error}"
             )))?;
         queue.addResidencySet(&residency);
-        // Metal rejects a zero-length buffer; nothing reads or writes it.
-        let order = handle
-            .raw()
-            .newBufferWithLength_options(1, MTLResourceOptions::StorageModePrivate)
-            .ok_or_else(|| {
-                TargetError::DeviceUnavailable("could not create the Metal order buffer".into())
+        // Metal rejects a zero-length buffer; nothing reads or writes it. It
+        // stays outside the residency set: pageable.
+        let order =
+            charged_buffer(&handle, 1, MTLResourceOptions::StorageModePrivate, &store.own(), Wiring::Pageable).map_err(|error| {
+                TargetError::DeviceUnavailable(format!("could not create the Metal order buffer: {error}"))
             })?;
         Ok(Self {
             handle,
             queue,
             residency: Residency::new(residency),
-            order,
+            order: Arc::new(order),
+            store,
         })
     }
 
@@ -767,27 +544,62 @@ impl MetalDevice {
         &self.handle
     }
 
-    pub(crate) fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
-        &self.queue
+    /// The store the device was opened with.
+    pub fn store(&self) -> &Arc<dyn Store> {
+        &self.store
     }
 
-    /// Allocates a wired shared buffer of `bytes`. Metal rejects a
-    /// zero-length buffer, so a zero-byte allocation reserves one byte while
+    /// A new command buffer on the device's queue: the one way GPU work
+    /// begins on the device. None where Metal creates none.
+    pub(crate) fn command_buffer(&self) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        crate::pooled(|| self.queue.commandBuffer())
+    }
+
+    /// Request the residency set resident: run before each reading of the
+    /// host's wired count ([`Residency`]), without waiting on a change of
+    /// the set (which requests it itself). The request re-wires a lapsed set
+    /// by a mechanism that reports no completion, so the wired count read
+    /// right after may still fall short of our wired bytes
+    /// (`residency_probe` measures it).
+    pub fn request_residency(&self) {
+        self.residency.before_reading();
+    }
+
+    /// Allocates a wired shared buffer of `bytes`, every page backed and
+    /// zero (Metal initializes a new buffer's contents to zero, and wiring
+    /// it backs every page before it returns), its bytes charged exactly to
+    /// `entry` until its last handle drops. Metal rejects a zero-length
+    /// buffer, so a zero-byte allocation takes one byte's buffer while
     /// reporting its requested length.
-    pub(crate) fn allocate_bytes(&self, bytes: u64) -> Result<WritableMetalBuffer, ExecutionError> {
+    pub(crate) fn allocate_bytes(
+        &self,
+        bytes: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<WritableMetalBuffer, ExecutionError> {
+        self.allocate_shared(bytes, entry, false)
+    }
+
+    /// [`Self::allocate_bytes`], a pool block's where `block`: over a
+    /// mapping of its own, unmapped as it is released ([`Mapping`]).
+    fn allocate_shared(
+        &self,
+        bytes: u64,
+        entry: &Arc<dyn Entry>,
+        block: bool,
+    ) -> Result<WritableMetalBuffer, ExecutionError> {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
-        let buffer = crate::pooled(|| {
-            self.handle
-                .raw()
-                .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
-        })
-        // Metal states no reason for a buffer it does not create; within
-        // `maxBufferLength` it is the device that refused it, with its
-        // working set as it reads now.
-        .ok_or_else(|| self.handle.refused(bytes))?;
-        let wired = WiredAllocation::wire(&self.residency, vec![buffer.clone()]);
+        // Wired: it joins the residency set before it is handed out.
+        let (charged, mapping) = match block {
+            true => {
+                let (charged, mapping) = mapped_buffer(&self.handle, length, entry, Wiring::Wired)?;
+                (charged, Some(mapping))
+            }
+            false => (charged_buffer(&self.handle, length, MTLResourceOptions::StorageModeShared, entry, Wiring::Wired)?, None),
+        };
+        let buffer = Retained::clone(&charged);
+        let wired = WiredAllocation::wire(&self.residency, charged, mapping);
         Ok(WritableMetalBuffer(MetalBuffer {
             buffer,
             len: bytes,
@@ -796,48 +608,25 @@ impl MetalDevice {
         }))
     }
 
-    /// Zero-filled memory over a host address reservation of `reserved`
-    /// bytes of `record`-byte records in `granule`-byte granules (chunks of
-    /// whole records and whole [`RESERVATION_CHUNKS`] units, none smaller
-    /// than [`RESERVATION_GRANULE`]), the leading
-    /// `committed` bytes backed, and its resizer, which changes the backed
-    /// prefix without moving its host address. `table` holds one device
-    /// address per record of the range, written as chunks are formed. Each
-    /// chunk is a buffer: `maxBufferLength` bounds a chunk (the runtime
-    /// admits it), not the address range.
-    pub fn allocate_reserved(
+    /// One block of a granule pool (`seismic_memory::pool::Blocks`) of
+    /// `kind`, the device's one kind: a buffer over a mapping of its own
+    /// ([`Self::allocate_shared`]), zero, charged exactly to `entry`, its
+    /// pages returned to the OS within the drop of its last handle
+    /// ([`WiredAllocation`]'s drop).
+    pub fn allocate_block(
         &self,
-        committed: u64,
-        reserved: u64,
-        granule: u64,
-        record: u64,
-    ) -> Result<(ReservedBuffer, MetalResizer), ExecutionError> {
-        if granule < RESERVATION_GRANULE as u64
-            || granule % CHUNK_UNIT != 0
-            || record == 0
-            || granule % record != 0
-        {
-            return Err(ExecutionError::AllocationFailed(format!(
-                "a {granule}-byte granule of {record}-byte records is not whole {CHUNK_UNIT}-byte \
-                 units and whole records, at least {RESERVATION_GRANULE} bytes"
-            )));
-        }
-        // One device address a record of the range.
-        let table = self.allocate_bytes(record_table_bytes(reserved / record).ok_or_else(|| {
-            ExecutionError::AllocationFailed(format!("the record table of a {reserved}-byte reservation overflows"))
-        })?)?;
-        let backing = Granules {
-            range: HostRange::reserve(reserved.max(committed), granule, PageSize::Host).map_err(|failure| {
-                ExecutionError::AllocationFailed(format!("a Metal reservation's address range: {failure}"))
-            })?,
-            device: self.handle.clone(),
-            residency: self.residency.clone(),
-            table,
-            record: record as usize,
-        };
-        let (reservation, resizer) = Reserved::new(backing, committed)?;
-        Ok((ReservedBuffer { reservation }, resizer))
+        kind: u32,
+        bytes: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<WritableMetalBuffer, ExecutionError> {
+        assert_eq!(
+            kind,
+            crate::topology::SHARED_KIND,
+            "invariant violated: a Metal block of kind {kind}, which the device does not have"
+        );
+        self.allocate_shared(bytes, entry, true)
     }
+
 
     /// Wrap an immutable, page-aligned host mapping. The retained owner keeps
     /// the mapping live until the final Metal buffer reference is released,
@@ -892,11 +681,23 @@ impl DeviceService<Metal> for MetalDevice {
     type Buffer = MetalBuffer;
     type Writable = WritableMetalBuffer;
 
-    fn allocate(&self, bytes: u64, _alignment: u64) -> Result<Self::Writable, ExecutionError> {
+    /// Shared storage, the device's one kind.
+    fn allocate(
+        &self,
+        kind: u32,
+        bytes: u64,
+        _alignment: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<Self::Writable, ExecutionError> {
+        assert_eq!(
+            kind,
+            crate::topology::SHARED_KIND,
+            "invariant violated: a Metal allocation of kind {kind}, which the device does not have"
+        );
         // The profile advertises the alignment returned by
         // `heapBufferSizeAndAlignWithLength:options:` for this same shared
         // buffer class; direct device buffers satisfy that requirement.
-        self.allocate_bytes(bytes)
+        self.allocate_bytes(bytes, entry)
     }
 
     fn write(
@@ -933,6 +734,7 @@ impl DeviceService<Metal> for MetalDevice {
 #[cfg(test)]
 mod mapped_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     struct Mapping {
         pointer: NonNull<u8>,
@@ -953,7 +755,7 @@ mod mapped_tests {
         let Ok(handle) = DeviceHandle::system_default() else {
             return;
         };
-        let device = MetalDevice::open(handle).unwrap();
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let pointer = unsafe {
             libc::mmap(
@@ -998,7 +800,7 @@ mod mapped_tests {
         let Ok(handle) = DeviceHandle::system_default() else {
             return;
         };
-        let device = MetalDevice::open(handle).unwrap();
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
         let wired = |buffer: &MetalBuffer| {
             let set = &device.residency.lock().set;
             (
@@ -1007,8 +809,8 @@ mod mapped_tests {
                 set.allocatedSize(),
             )
         };
-        let first = device.allocate_bytes(1 << 20).unwrap();
-        let second = device.allocate(1 << 16, 16).unwrap();
+        let first = device.allocate_bytes(1 << 20, &crate::test_support::entry()).unwrap();
+        let second = device.allocate(crate::topology::SHARED_KIND, 1 << 16, 16, &crate::test_support::entry()).unwrap();
         assert_eq!(wired(&first), (true, 2, (1 << 20) + (1 << 16)));
         assert!(wired(&second).0);
 
@@ -1021,358 +823,331 @@ mod mapped_tests {
         assert_eq!(device.residency.lock().set.allocationCount(), 0);
     }
 
+    /// A buffer's bytes are charged exactly as Metal counts them (its size
+    /// class: a one-byte buffer takes a page) until its last handle drops,
+    /// and a refused charge allocates nothing.
     #[test]
-    fn residency_is_renewed_while_the_set_holds_an_allocation() {
+    fn a_buffer_is_charged_what_metal_takes_for_it_until_its_last_handle_drops() {
+        use seismic_memory::entry::Tally;
         let Ok(handle) = DeviceHandle::system_default() else {
             return;
         };
-        let device = MetalDevice::open(handle).unwrap();
-        let renewing = || {
-            let wired = device.residency.lock();
-            (wired.renewer.is_some(), wired.renewals)
-        };
-        assert_eq!(renewing(), (false, 0));
-
-        let first = device.allocate_bytes(1 << 16).unwrap();
-        let second = device.allocate_bytes(1 << 16).unwrap();
-        std::thread::sleep(RESIDENCY_RENEWAL * 3 + RESIDENCY_RENEWAL / 2);
-        let (running, renewals) = renewing();
-        assert!(running);
-        assert!((3..=5).contains(&renewals), "{renewals} renewals");
-
-        drop(first);
-        assert!(renewing().0);
-        drop(second);
-        let (running, stopped_at) = renewing();
-        assert!(!running);
-        std::thread::sleep(RESIDENCY_RENEWAL * 2);
-        assert_eq!(renewing(), (false, stopped_at));
-
-        let third = device.allocate_bytes(1 << 16).unwrap();
-        std::thread::sleep(RESIDENCY_RENEWAL / 2);
-        assert_eq!(renewing(), (true, stopped_at + 1));
-        drop(third);
-        assert!(!renewing().0);
-    }
-
-    #[test]
-    fn stopping_the_renewer_does_not_wait_for_its_interval() {
-        let Ok(handle) = DeviceHandle::system_default() else {
-            return;
-        };
-        let device = MetalDevice::open(handle).unwrap();
-        for _ in 0..20 {
-            let buffer = device.allocate_bytes(1 << 12).unwrap();
-            let started = std::time::Instant::now();
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let tally = Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let entry: Arc<dyn Entry> = Arc::new(tally.clone());
+        for bytes in [1u64, 1 << 16, (1 << 20) + 3] {
+            let buffer = device.allocate_bytes(bytes, &entry).unwrap();
+            assert_eq!(tally.held(), buffer.raw().allocatedSize() as u64);
+            assert!(tally.held() >= bytes);
+            let held = buffer.clone();
             drop(buffer);
-            assert!(started.elapsed() < RESIDENCY_RENEWAL / 2);
+            assert!(tally.held() >= bytes, "a handle keeps the charge");
+            drop(held);
+            assert_eq!(tally.held(), 0);
         }
-        assert_eq!(device.residency.lock().generation, 20);
+        tally.bound(0);
+        let before = device.handle().current_allocated_bytes();
+        assert!(matches!(
+            device.allocate_block(crate::topology::SHARED_KIND, 1 << 20, &entry),
+            Err(ExecutionError::AllocationCapacity { .. })
+        ));
+        assert_eq!(device.handle().current_allocated_bytes(), before);
     }
-}
 
-#[cfg(test)]
-mod reserved_tests {
-    use super::*;
-    use objc2_metal::{
-        MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePipelineState,
-        MTLLibrary, MTLSize,
-    };
-
-    const MIB: u64 = 1 << 20;
-
-    /// The process's `phys_footprint`, the memory macOS charges the process
-    /// with.
-    fn footprint() -> u64 {
-        let mut usage = unsafe { std::mem::zeroed::<libc::rusage_info_v2>() };
-        let status = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V2,
-                (&raw mut usage).cast(),
-            )
+    /// The set's residency is requested on each change while it holds
+    /// anything, and on a reading of the wired count; nothing requests
+    /// between our own events, however long the device idles, and a command
+    /// buffer requests nothing.
+    #[test]
+    fn residency_is_requested_on_changes_and_readings() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
         };
-        assert_eq!(status, 0);
-        usage.ri_phys_footprint
-    }
-
-    /// Reads `bytes` of a buffer as `uint4` words on the GPU: their wrapping
-    /// sum, and the GPU time of the read.
-    struct Reader {
-        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        output: WritableMetalBuffer,
-    }
-
-    impl Reader {
-        fn new(device: &MetalDevice) -> Self {
-            let source = objc2_foundation::NSString::from_str(
-                "#include <metal_stdlib>\nusing namespace metal;\n\
-                 kernel void total(device const ulong* table [[buffer(0)]],\n\
-                                   device atomic_uint* output [[buffer(1)]],\n\
-                                   constant uint2& shape [[buffer(2)]],\n\
-                                   uint index [[thread_position_in_grid]],\n\
-                                   uint threads [[threads_per_grid]]) {\n\
-                     uint4 sum = 0;\n\
-                     for (uint word = index; word < shape.x; word += threads)\n\
-                         sum += ((device const uint4*)table[word / shape.y])[word % shape.y];\n\
-                     atomic_fetch_add_explicit(output, sum.x + sum.y + sum.z + sum.w, memory_order_relaxed);\n\
-                 }",
-            );
-            let library = device
-                .handle()
-                .raw()
-                .newLibraryWithSource_options_error(&source, None)
-                .unwrap();
-            let function = library
-                .newFunctionWithName(&objc2_foundation::NSString::from_str("total"))
-                .unwrap();
-            let pipeline = device
-                .handle()
-                .raw()
-                .newComputePipelineStateWithFunction_error(&function)
-                .unwrap();
-            Self {
-                pipeline,
-                output: device.allocate_bytes(4).unwrap(),
-            }
-        }
-
-        /// The first `bytes` of the `GRANULE`-byte records `table` addresses.
-        fn total(&self, device: &MetalDevice, table: &MetalBuffer, bytes: u64) -> (u32, f64) {
-            self.total_of(device, table, bytes, GRANULE)
-        }
-
-        /// The first `bytes` of the `record`-byte records `table` addresses.
-        fn total_of(&self, device: &MetalDevice, table: &MetalBuffer, bytes: u64, record: u64) -> (u32, f64) {
-            self.output.write_bytes(0, &[0; 4]);
-            let shape = [u32::try_from(bytes / 16).unwrap(), (record / 16) as u32];
-            let command = device.queue().commandBuffer().unwrap();
-            let encoder = command.computeCommandEncoder().unwrap();
-            encoder.setComputePipelineState(&self.pipeline);
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.output.raw()), 0, 1);
-                encoder.setBytes_length_atIndex(NonNull::from(&shape).cast(), 8, 2);
-            }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: 1 << 18,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            encoder.endEncoding();
-            let time = crate::timing::SubmissionTime::before_commit();
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let requests = || device.residency.lock().requests;
+        device.request_residency();
+        drop(device.command_buffer().unwrap());
+        assert_eq!(requests(), 0, "an empty set requests nothing");
+        let first = device.allocate_bytes(1 << 16, &crate::test_support::entry()).unwrap();
+        let second = device.allocate_bytes(1 << 16, &crate::test_support::entry()).unwrap();
+        assert_eq!(requests(), 2, "one request per buffer added");
+        let command = device.command_buffer().unwrap();
+        assert_eq!(requests(), 2, "a command buffer requests nothing");
+        crate::pooled(|| {
             command.commit();
             command.waitUntilCompleted();
-            assert!(command.error().is_none(), "{:?}", command.error());
-            let mut total = [0; 4];
-            self.output.read_bytes(0, &mut total);
-            let (start, end) = time.interval(command.GPUStartTime(), command.GPUEndTime()).unwrap();
-            (u32::from_le_bytes(total), end - start)
-        }
+        });
+        device.request_residency();
+        assert_eq!(requests(), 3, "a reading requests it");
+        drop(first);
+        assert_eq!(requests(), 4, "a free leaving the set holding a buffer requests it again");
+        drop(second);
+        assert_eq!(requests(), 4, "an empty set requests nothing");
+        assert_eq!(device.residency.lock().set.allocationCount(), 0);
     }
 
-    const GRANULE: u64 = RESERVATION_GRANULE as u64;
-
-    /// A resize to `bytes`, prepared.
-    fn prepare(resizer: MetalResizer, bytes: u64) -> seismic_reservation::Prepared<Granules> {
-        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap()
-    }
-
-    /// One resize to `bytes`: prepared, installed, released.
-    fn resize(resizer: MetalResizer, bytes: u64) -> MetalResizer {
-        prepare(resizer, bytes).install().release()
-    }
-
-    fn pattern(bytes: u64) -> Vec<u8> {
-        (0..bytes).map(|index| (index % 251) as u8 + 1).collect()
-    }
-
-    /// The wrapping sum of `bytes` as little-endian `u32` words.
-    fn word_total(bytes: &[u8]) -> u32 {
-        bytes.chunks_exact(4).fold(0u32, |sum, word| {
-            sum.wrapping_add(u32::from_le_bytes(word.try_into().unwrap()))
-        })
-    }
-
-    /// A reserved buffer resizes in place after GPU use: its host address
-    /// and handles stay valid, kernels read the committed bytes through its
-    /// record table correctly after a shrink and a grow, only committed
-    /// chunks are wired, a shrink returns its pages to the system at once,
-    /// and kept chunks keep their buffers.
+    /// A reading of the wired count while a change of the set holds its lock
+    /// (a resize mid-commit, stood in for by the lock held here) neither
+    /// waits for it nor requests: the change requests after its commit.
     #[test]
-    fn a_reserved_buffer_resizes_in_place_and_releases_what_it_shrinks() {
-        let device = crate::test_support::metal_device();
-        let reader = Reader::new(&device);
-        // Chunk bytes the residency set wires beyond what was wired before,
-        // the reservation's record table aside.
-        let others = device.residency.lock().set.allocatedSize() as u64;
-        let (buffer, resizer) = device
-            .allocate_reserved(256 * MIB, 4096 * MIB, GRANULE, GRANULE)
-            .unwrap();
-        let table = buffer.table();
-        let wired = || device.residency.lock().set.allocatedSize() as u64 - others - table.len();
-        let handle = buffer.clone();
-        let address = buffer.host_base();
-        let first = buffer.gpu_address(0);
-        assert_eq!(wired(), 256 * MIB, "only committed chunks are wired");
-        let contents = pattern(256 * MIB);
-        buffer.write_bytes(0, &contents);
-        assert_eq!(
-            reader.total(&device, &table, 256 * MIB).0,
-            word_total(&contents)
-        );
-
-        let kept = 64 * MIB + 3;
-        let before = footprint();
-        let started = std::time::Instant::now();
-        let resizer = resize(resizer, kept);
-        let shrink = started.elapsed();
-        let released = before.saturating_sub(footprint());
-        eprintln!(
-            "a 192 MiB shrink after GPU use took {shrink:?} and lowered phys_footprint by {released} bytes"
-        );
-        assert!(
-            released.abs_diff(192 * MIB) <= 4 * MIB,
-            "a 192 MiB shrink released {released} bytes"
-        );
-        assert_eq!(handle.len(), kept);
-        assert_eq!(handle.host_base(), address);
-        assert_eq!(wired(), 66 * MIB);
-        assert_eq!(handle.gpu_address(0), first, "a kept chunk keeps its buffer");
-        let mut read = vec![0; kept as usize];
-        handle.read_bytes(0, &mut read);
-        assert!(
-            read == contents[..kept as usize],
-            "kept bytes survive a shrink"
-        );
-        let words = 64 * MIB;
-        assert_eq!(
-            reader.total(&device, &table, words).0,
-            word_total(&contents[..words as usize])
-        );
-
-        let mut grown = vec![1; (128 * MIB) as usize];
-        let before = footprint();
-        let resizer = resize(resizer, 128 * MIB);
-        assert_eq!(buffer.host_base(), address);
-        assert_eq!(wired(), 128 * MIB);
-        buffer.read_bytes(0, &mut grown);
-        let grown_by = footprint().saturating_sub(before);
-        assert!(grown[..kept as usize] == contents[..kept as usize]);
-        assert!(
-            grown[kept as usize..].iter().all(|byte| *byte == 0),
-            "bytes backed again read zero"
-        );
-        eprintln!("a 62 MiB growth raised phys_footprint by {grown_by} bytes once read");
-        assert_eq!(
-            reader.total(&device, &table, 128 * MIB).0,
-            word_total(&grown)
-        );
-        drop((buffer, handle, resizer));
-        assert_eq!(wired(), 0);
-        drop(table);
-    }
-
-    /// What a reservation's chunk costs against its size
-    /// ([`RESERVATION_GRANULE`]): for each chunk size, 1 GiB of chunk-sized
-    /// records backed whole at once as a load forms it (`Reserved::new`),
-    /// then GPU reads of it through its record table, and its unload; the
-    /// load's parts by hand (mapping the granules, forming their buffers and
-    /// table entries, the residency set's commit of them); and growths by
-    /// one chunk through the resizer. Without the validation layer the
-    /// other tests enable. Run on a quiet host:
-    /// `cargo test -p seismic-metal --release --lib reservation_chunk_cost -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "measurement"]
-    fn reservation_chunk_cost() {
-        use std::time::Instant;
-        const TOTAL: u64 = 1 << 30;
-        const KIB: u64 = 1 << 10;
-        let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
-        let reader = Reader::new(&device);
-        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1e3;
-        let granules = |chunk: u64| Granules {
-            range: HostRange::reserve(TOTAL, chunk, PageSize::Host).unwrap(),
-            device: device.handle.clone(),
-            residency: device.residency.clone(),
-            table: device.allocate_bytes(record_table_bytes(TOTAL / chunk).unwrap()).unwrap(),
-            record: chunk as usize,
+    fn a_reading_never_waits_behind_a_change_of_the_set() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
         };
-        eprintln!(
-            "{:>9} {:>7} | {:>9} {:>9} | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} | {:>8} | {:>9}",
-            "chunk", "chunks", "load ms", "us/chunk", "map ms", "buffers", "add ms", "remove", "read1 ms",
-            "read2 ms", "unload", "grow us"
-        );
-        for chunk in [16 * KIB, 64 * KIB, 256 * KIB, MIB, 2 * MIB, 4 * MIB, 8 * MIB, 32 * MIB] {
-            let chunks = (TOTAL / chunk) as usize;
+        let device = Arc::new(MetalDevice::open(handle, crate::test_support::store()).unwrap());
+        let _buffer = device.allocate_bytes(1 << 16, &crate::test_support::entry()).unwrap();
+        let changing = device.residency.lock();
+        let requests = changing.requests;
+        let (began, begun) = std::sync::mpsc::channel();
+        let reader = {
+            let device = device.clone();
+            std::thread::spawn(move || {
+                device.request_residency();
+                began.send(()).unwrap();
+            })
+        };
+        let returned = begun.recv_timeout(Duration::from_secs(10));
+        drop(changing);
+        reader.join().unwrap();
+        assert!(returned.is_ok(), "a reading waited on the set's lock");
+        assert_eq!(device.residency.lock().requests, requests, "the change in progress requests for it");
+    }
 
-            // A load: the whole commitment backed and formed at once.
-            let started = Instant::now();
-            let (reservation, resizer) = Reserved::new(granules(chunk), TOTAL).unwrap();
-            let load = ms(started);
-            assert_eq!(reservation.state().view.buffers.len(), chunks);
-            let table = reservation.backing().table.clone();
-            let (sum, first) = reader.total_of(&device, &table, TOTAL, chunk);
-            assert_eq!(sum, 0, "backed bytes read zero");
-            let (_, second) = reader.total_of(&device, &table, TOTAL, chunk);
-            let started = Instant::now();
-            drop((resizer, reservation));
-            let unload = ms(started);
-            drop(table);
+    /// The probe's set. It calls the set lapsed where the machine's wired
+    /// count has fallen by at least half of it since the set was held.
+    const PROBE_BYTES: u64 = 256 << 20;
+    const PROBE_POLL: Duration = Duration::from_millis(50);
+    const PROBE_SPAN: Duration = Duration::from_secs(5);
 
-            // The load's parts, over an empty reservation of the same range.
-            let (reservation, resizer) = Reserved::new(granules(chunk), 0).unwrap();
-            let backing = reservation.backing();
-            let range = &backing.range;
-            let started = Instant::now();
-            backing.back(0, chunks).unwrap();
-            let map = ms(started);
-            let started = Instant::now();
-            let wired = backing.form(range, 0, chunks).unwrap();
-            let form = ms(started);
-            let buffers = wired.buffers.clone();
-            let started = Instant::now();
-            device.residency.remove(&buffers);
-            let remove = ms(started);
-            let started = Instant::now();
-            device.residency.add(&buffers);
-            let add = ms(started);
-            drop((wired, buffers));
-            range.unback(0, chunks);
+    /// An empty command buffer's submit, wait and the time it takes.
+    fn submit_empty(device: &MetalDevice) -> Duration {
+        let started = Instant::now();
+        let command = device.command_buffer().unwrap();
+        crate::pooled(|| {
+            command.commit();
+            command.waitUntilCompleted();
+        });
+        started.elapsed()
+    }
 
-            // Growths by one chunk, each prepared, installed and released.
-            let mut resizer = resizer;
-            let mut steps = Vec::new();
-            for step in 1..=chunks.min(64) as u64 {
-                let started = Instant::now();
-                resizer = resize(resizer, step * chunk);
-                steps.push(ms(started) * 1e3);
+    /// Idle until the live wired count falls `PROBE_BYTES / 2` below `held`
+    /// (the set's observed lapse) or `PROBE_SPAN` passes: the time to the
+    /// fall, or none where the OS never un-wired within the span.
+    fn idle_until_lapsed(held: u64) -> Option<Duration> {
+        let started = Instant::now();
+        while started.elapsed() < PROBE_SPAN {
+            std::thread::sleep(PROBE_POLL);
+            if wire_count() + PROBE_BYTES / 2 <= held {
+                return Some(started.elapsed());
             }
-            steps.sort_by(f64::total_cmp);
-            drop((resize(resizer, 0), reservation));
-
-            eprintln!(
-                "{:>6} KiB {:>7} | {:>9.1} {:>9.2} | {:>8.1} {:>8.1} {:>8.1} {:>8.1} | {:>8.2} {:>8.2} | {:>8.1} | {:>9.1}",
-                chunk / KIB,
-                chunks,
-                load,
-                load * 1e3 / chunks as f64,
-                map,
-                form - add,
-                add,
-                remove,
-                first * 1e3,
-                second * 1e3,
-                unload,
-                steps[steps.len() / 2]
-            );
         }
+        None
+    }
+
+    /// Measures what the residency requests cost and show on this host,
+    /// asserting none of it: the set's observed lapse while idle, the time
+    /// of one request and the live wired count right after it, and the first
+    /// submit after an idle span with and without a request before it. Each
+    /// figure is one `RESIDENCY_PROBE key=value` line.
+    #[test]
+    fn residency_probe() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let buffer = device.allocate_bytes(PROBE_BYTES, &crate::test_support::entry()).unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let ones = vec![1u8; page as usize];
+        for offset in (0..PROBE_BYTES).step_by(page as usize) {
+            buffer.write_bytes(offset, &ones);
+        }
+        submit_empty(&device);
+        let held = wire_count();
+        assert!(held > 0, "the live wired count reads zero");
+        let ms = |time: Duration| time.as_secs_f64() * 1e3;
+        eprintln!("RESIDENCY_PROBE bytes={PROBE_BYTES} source={:?} held_wired={held}", wire_source());
+
+        let lapse = idle_until_lapsed(held);
+        eprintln!("RESIDENCY_PROBE observed_lapse_ms={:?}", lapse.map(ms));
+        let idle = wire_count();
+        let started = Instant::now();
+        device.request_residency();
+        let took = started.elapsed();
+        let right_after = wire_count();
+        eprintln!(
+            "RESIDENCY_PROBE idle_wired={idle} request_ms={:.3} wired_right_after={right_after} wired_at_once={}",
+            ms(took),
+            right_after + PROBE_BYTES / 2 > held,
+        );
+
+        // The first submit after an idle span, the span ended by the fall of
+        // the wired count (or its bound); the set is wired again by the
+        // submit that ends the first span, before the second begins.
+        submit_empty(&device);
+        idle_until_lapsed(wire_count());
+        eprintln!("RESIDENCY_PROBE first_submit_after_idle_ms={:.3}", ms(submit_empty(&device)));
+        idle_until_lapsed(wire_count());
+        device.request_residency();
+        eprintln!("RESIDENCY_PROBE first_submit_after_idle_with_request_ms={:.3}", ms(submit_empty(&device)));
+        drop(buffer);
+    }
+
+    /// The machine's wired bytes now: `vm.page_wired_count` where macOS
+    /// defines it (26 on), read live; before, `host_statistics64`'s
+    /// `wire_count`, which may serve a snapshot taken up to 1 s before.
+    fn wire_count() -> u64 {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        match live_wire_count() {
+            Some(pages) => pages * page,
+            None => {
+                let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+                let mut count = libc::HOST_VM_INFO64_COUNT;
+                #[allow(deprecated)]
+                let host = unsafe { libc::mach_host_self() };
+                let status = unsafe {
+                    libc::host_statistics64(host, libc::HOST_VM_INFO64, (&mut statistics as *mut libc::vm_statistics64).cast(), &mut count)
+                };
+                assert_eq!(status, libc::KERN_SUCCESS, "host_statistics64 returned {status}");
+                u64::from(statistics.wire_count) * page
+            }
+        }
+    }
+
+    fn wire_source() -> &'static str {
+        match live_wire_count() {
+            Some(_) => "vm.page_wired_count (live)",
+            None => "host_statistics64 (a snapshot up to 1 s old)",
+        }
+    }
+
+    fn live_wire_count() -> Option<u64> {
+        let mut bytes = [0u8; 8];
+        let mut length = bytes.len();
+        let status = unsafe {
+            libc::sysctlbyname(c"vm.page_wired_count".as_ptr(), bytes.as_mut_ptr().cast(), &mut length, std::ptr::null_mut(), 0)
+        };
+        match (status, length) {
+            (0, 4) => Some(u64::from(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))),
+            (0, 8) => Some(u64::from_ne_bytes(bytes)),
+            (0, length) => panic!("vm.page_wired_count returned {length} bytes"),
+            _ => None,
+        }
+    }
+
+    /// A buffer in the residency set is charged wired; the order buffer,
+    /// outside it, pageable.
+    #[test]
+    fn buffers_in_the_residency_set_are_charged_wired() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let entry = crate::test_support::entry();
+        let buffer = device.allocate_bytes(1 << 16, &entry).unwrap();
+        let wired = buffer._wired.as_ref().expect("an allocated buffer is in the set");
+        assert_eq!(wired.buffer.charge().wiring(), Wiring::Wired);
+        assert_eq!(device.order.charge().wiring(), Wiring::Pageable);
+    }
+
+    /// A pool's block is one buffer in the residency set: with a block of
+    /// one granule (Metal bounds no allocation count, so `least` is none),
+    /// the set holds one buffer per granule the pool holds. The count, and
+    /// what a change of the set costs at it, is what a load's pool puts
+    /// there.
+    #[test]
+    fn a_pool_block_is_one_buffer_in_the_residency_set() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let block = 1u64 << 21;
+        let count = || device.residency.lock().set.allocationCount() as u64;
+        let before = count();
+        let started = std::time::Instant::now();
+        let blocks = (0..512)
+            .map(|_| device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap())
+            .collect::<Vec<_>>();
+        let added = started.elapsed();
+        assert_eq!(count() - before, blocks.len() as u64, "one buffer per block");
+        let started = std::time::Instant::now();
+        drop(blocks);
+        let freed = started.elapsed();
+        assert_eq!(count(), before);
+        eprintln!(
+            "the residency set at 512 one-granule blocks of {block} bytes: a block's add {:.3} ms, its free {:.3} ms",
+            added.as_secs_f64() * 1e3 / 512.0,
+            freed.as_secs_f64() * 1e3 / 512.0
+        );
+    }
+
+    /// A pool block's pages are returned inside its release: its last
+    /// handle's drop unmaps the block's own mapping, so this process's
+    /// physical footprint (`task_vm_info.phys_footprint`, read live and
+    /// counting the IOGPU buffers it holds) falls by at least the block
+    /// between a reading just before the drop and one just after.
+    #[test]
+    fn a_released_block_leaves_the_footprint_within_the_release() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle, crate::test_support::store()).unwrap();
+        let block = 1u64 << 30;
+        let buffer = device.allocate_block(crate::topology::SHARED_KIND, block, &crate::test_support::entry()).unwrap();
+        // Touched: every page the process's.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let ones = vec![1u8; page as usize];
+        for offset in (0..block).step_by(page as usize) {
+            buffer.write_bytes(offset, &ones);
+        }
+        let before = footprint();
+        drop(buffer);
+        let after = footprint();
+        assert!(
+            before >= after + block,
+            "the release took {} of the block's {block} bytes off the footprint",
+            before.saturating_sub(after)
+        );
+    }
+
+    /// `task_vm_info` (`TASK_VM_INFO`) through `phys_footprint`, laid out as
+    /// the kernel writes it.
+    #[allow(dead_code)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVm {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+    }
+
+    /// This process's physical footprint now, read live.
+    fn footprint() -> u64 {
+        const TASK_VM_INFO: libc::task_flavor_t = 22;
+        let mut vm = TaskVm::default();
+        let words = (std::mem::size_of::<TaskVm>() / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        let mut count = words;
+        #[allow(deprecated)]
+        let task = unsafe { libc::mach_task_self() };
+        let status = unsafe { libc::task_info(task, TASK_VM_INFO, (&mut vm as *mut TaskVm).cast(), &mut count) };
+        assert_eq!(status, libc::KERN_SUCCESS, "task_info TASK_VM_INFO returned {status}");
+        assert_eq!(count, words, "task_vm_info reaches phys_footprint");
+        vm.phys_footprint
     }
 }

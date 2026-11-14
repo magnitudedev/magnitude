@@ -459,12 +459,21 @@ impl<S> PrefixCache<S> {
         Ok(())
     }
 
-    /// Capacity-ladder rung zero: drop the entry worth least without
-    /// submitted uses, preferring one no live request holds (`held`, see
-    /// [`Self::held`]): such an entry's rows are the holders' own, so
-    /// dropping it releases only its bank and loses the prefix they resume
-    /// from. Returns whether an entry was eligible; the heap observes what
-    /// the drop released.
+    /// The entry worth least without submitted uses ([`Self::worth`]): the
+    /// prefill tokens a hit on it saves and its hits since it was retained,
+    /// what the ledger values the prefixes' cache by, since it is the entry
+    /// their holder evicts first ([`Self::evict_one`]). None with no such
+    /// entry.
+    pub fn least_value(&self) -> Option<(u64, u64)> {
+        self.victim(|_| true).map(|index| (self.saved_tokens(index) as u64, self.entries[index].hits))
+    }
+
+    /// The ledger took the retained prefixes' cache: drop the entry worth
+    /// least without submitted uses, preferring one no live request holds
+    /// (`held`, see [`Self::held`]): such an entry's rows are the holders'
+    /// own, so dropping it releases only its bank and loses the prefix they
+    /// resume from. Returns whether an entry was eligible; the slabs settle
+    /// with what the drop released.
     pub fn evict_one(&mut self, held: &BTreeSet<u64>) -> bool {
         let unused = self.victim(|entry| !held.contains(&entry.id));
         match unused.or_else(|| self.victim(|_| true)) {

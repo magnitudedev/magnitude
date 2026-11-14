@@ -11,7 +11,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath, FeatureRows, Operation, PhysicalDecision, RequestId, ReservedResources, TokenId,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
@@ -62,7 +62,7 @@ fn plain_owner(
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -220,7 +220,6 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits, 0);
     let baseline = host.owner().reconcile_memory_charge().unwrap();
-    assert_eq!(baseline.unattributed, 0);
     eprintln!("cohort baseline: {baseline:?}");
 
     let mut spare = None;
@@ -242,8 +241,7 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
             Duration::from_secs(90),
             |host, streams| {
                 let charge = host.owner().reconcile_memory_charge().unwrap();
-                assert_eq!(charge.unattributed, 0);
-                if charge.charged > peak.charged {
+                if charge.allocated > peak.allocated {
                     peak = charge;
                 }
                 streams.iter().all(|stream| stream.finished())
@@ -266,20 +264,19 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
         host.settle();
         let idle = host.owner().reconcile_memory_charge().unwrap();
         eprintln!("cohort N={count}: peak={peak:?} completed={completed:?} idle={idle:?}");
-        assert_eq!(idle.unattributed, 0);
         assert_eq!(idle.target_state.live, 0);
         assert_eq!(idle.target_state.retained, 0);
         // Small cohorts fit the spare state held at load; the largest grows.
         if count == 16 {
-            assert!(peak.charged > baseline.charged);
+            assert!(peak.allocated > baseline.allocated);
         }
         // Idle release keeps occupied slabs plus one empty spare per store.
         // Once growth has left that spare, idle charge stays there: it never
         // accumulates across cohorts.
-        assert!(idle.charged >= baseline.charged);
+        assert!(idle.allocated >= baseline.allocated);
         match spare {
-            Some(settled) => assert_eq!(idle.charged, settled),
-            None if idle.charged != baseline.charged => spare = Some(idle.charged),
+            Some(settled) => assert_eq!(idle.allocated, settled),
+            None if idle.allocated != baseline.allocated => spare = Some(idle.allocated),
             None => {}
         }
     }
@@ -318,7 +315,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -326,7 +323,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     let package = resolved.host.shared_package();
     let (mut domain, mut bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
-        domain.resources().device().device_ledger().charged
+        domain.resources().device().allocated()
     };
     // Startup warms the optional head. Measure the unloaded baseline so both
     // cycles exercise the same lazy rebind and release lifecycle.
@@ -340,7 +337,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.open_state(&mut bindings, request, None, 0).unwrap();
         let head = Operation::Head {
             request,
             phase: magnitude_executor::HeadPhase::Priming { draft_from: 1 },
@@ -382,8 +379,6 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         assert_eq!(before - after, released);
         let idle = domain.reconcile_memory_charge(&[&retained]).unwrap();
         assert_eq!(idle.optional_weights, 0);
-        assert_eq!(resident.unattributed, 0);
-        assert_eq!(idle.unattributed, 0);
         assert_eq!(
             resident.head_state.unwrap().retained,
             idle.head_state.unwrap().retained
@@ -403,12 +398,10 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             first_cycle = Some((before, after));
         }
         eprintln!(
-            "MTP optional charge: loaded={before} released={released} idle={after} optional_weights={} bound_constants_before={} bound_constants_after={} unattributed_before={} unattributed_after={}",
+            "MTP optional charge: loaded={before} released={released} idle={after} optional_weights={} bound_constants_before={} bound_constants_after={}",
             resident.optional_weights,
             resident.bound_constants,
             idle.bound_constants,
-            resident.unattributed,
-            idle.unattributed,
         );
         drop(retained);
     }
@@ -445,7 +438,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -493,7 +486,6 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
     assert!(streams.iter().all(|stream| !stream.output.is_empty()));
     let charge = host.owner().reconcile_memory_charge().unwrap();
     assert!(charge.optional_weights > 0);
-    assert_eq!(charge.unattributed, 0);
 }
 
 #[cfg(target_os = "linux")]
@@ -534,7 +526,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -542,15 +534,13 @@ fn admission_reclaims_under_a_real_process_limit() {
     let package = resolved.host.shared_package();
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::of_machine(None);
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {
-        let readings = platform::observe_domains(&catalog, device, &reserves)
+        let readings = platform::observe_domains(&catalog, device)
             .map_err(|error| error.to_string())?;
         Ok(readings[0].clone())
     };
     let available = allocation(domain.resources().device()).unwrap();
     assert_eq!(available.constraint, MemoryConstraint::HostRam);
-    let planning = available.thresholds.planning_bytes;
     let seed_bytes = domain.state_holding_census(&[]).unwrap().0.model_seed;
     assert!(seed_bytes > 0, "fixture needs recurrent banks");
     let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits, wakes));
@@ -631,12 +621,9 @@ fn admission_reclaims_under_a_real_process_limit() {
         .unwrap_or(2)
         * 1024
         * 1024;
-    // The limit leaves the requested headroom above the planning reserve,
-    // so the incoming request meets a demand deficit.
-    let limit = vm_bytes
-        .checked_add(planning)
-        .and_then(|bytes| bytes.checked_add(headroom))
-        .unwrap();
+    // The limit leaves the requested headroom, so the incoming request
+    // meets a demand deficit.
+    let limit = vm_bytes.checked_add(headroom).unwrap();
     assert!(limit < previous.rlim_cur && limit <= previous.rlim_max);
     let restricted = libc::rlimit {
         rlim_cur: limit,
@@ -650,9 +637,9 @@ fn admission_reclaims_under_a_real_process_limit() {
         .unwrap();
     eprintln!(
         "admission deficit setup: seed={seed_bytes} vm={vm_bytes} limit={limit} available={} charged={} state={:?}",
-        observed.ceiling_bytes, before.charged, before.target_state
+        observed.headroom_bytes, before.allocated, before.target_state
     );
-    assert!(observed.ceiling_bytes <= headroom);
+    assert!(observed.headroom_bytes <= headroom);
     let prompt_tokens = std::env::var("MAGNITUDE_TEST_INCOMING_PROMPT_TOKENS")
         .ok()
         .map(|value| {
@@ -668,12 +655,12 @@ fn admission_reclaims_under_a_real_process_limit() {
         host.owner()
             .inspect_domain(|domain| {
                 let device = domain.resources().device();
-                Ok(device.device_ledger().charged)
+                Ok(device.allocated())
             })
             .unwrap()
     };
     let mut saw_preemption = false;
-    let mut lowest_charge = before.charged;
+    let mut lowest_charge = before.allocated;
     // Drive the owner as its worker does: each run observes memory when due,
     // then runs every possible transition.
     for tick in 128..192 {
@@ -715,26 +702,23 @@ fn admission_reclaims_under_a_real_process_limit() {
         .collect::<Vec<_>>();
     existing.iter_mut().for_each(Stream::drain);
     eprintln!(
-        "admission deficit result: saw_preemption={saw_preemption} existing={existing_snapshots:?} errors={:?} incoming={:?} incoming_error={:?} output={} charged_before={} lowest_charge={} charged_after={} state_after={:?} in_flight_before={} in_flight_after={} unattributed_before={} unattributed_after={}",
+        "admission deficit result: saw_preemption={saw_preemption} existing={existing_snapshots:?} errors={:?} incoming={:?} incoming_error={:?} output={} charged_before={} lowest_charge={} charged_after={} state_after={:?} in_flight_before={} in_flight_after={}",
         existing.iter().map(|stream| stream.failure().map(|error| format!("{error:?}"))).collect::<Vec<_>>(),
         host.snapshot(incoming.id),
         incoming.failure(),
         incoming.output.len(),
-        before.charged,
+        before.allocated,
         lowest_charge,
-        after.charged,
+        after.allocated,
         after.target_state,
         before.target_state.in_flight,
         after.target_state.in_flight,
-        before.unattributed,
-        after.unattributed,
     );
     assert!(saw_preemption);
-    assert!(lowest_charge < before.charged);
+    assert!(lowest_charge < before.allocated);
     assert!(!incoming.output.is_empty());
     assert!(incoming.failure().is_none());
     assert!(existing.iter().all(|stream| stream.failure().is_none()));
-    assert_eq!(after.unattributed, before.unattributed);
 }
 
 /// Idle slab release on the real device. Seven peers stay open, resident and
@@ -806,19 +790,16 @@ fn idle_shrink_preserves_a_retained_session() {
     host.settle();
     let after = host.owner().reconcile_memory_charge().unwrap();
     eprintln!(
-        "idle shrink: retained={} charged {} -> {} state {:?} -> {:?} unattributed {} -> {}",
+        "idle shrink: retained={} charged {} -> {} state {:?} -> {:?}",
         host.owner().cached_prefixes(),
-        before.charged,
-        after.charged,
+        before.allocated,
+        after.allocated,
         before.target_state,
         after.target_state,
-        before.unattributed,
-        after.unattributed,
     );
     // Idle shrink releases empty peer slabs while preserving the session's
     // retained history for the turn below.
-    assert!(after.charged < before.charged);
-    assert_eq!((before.unattributed, after.unattributed), (0, 0));
+    assert!(after.allocated < before.allocated);
     let (replayed, cached) = stopped_turn(&mut host, vocabulary, &next_turn, 16);
     eprintln!("idle shrink replay: reference={reference:?} replayed={replayed:?}");
     assert_eq!(
@@ -826,8 +807,5 @@ fn idle_shrink_preserves_a_retained_session() {
         "the retained session still serves the turn"
     );
     assert_eq!(replayed, reference);
-    assert_eq!(
-        host.owner().reconcile_memory_charge().unwrap().unattributed,
-        0
-    );
+    host.owner().reconcile_memory_charge().unwrap();
 }

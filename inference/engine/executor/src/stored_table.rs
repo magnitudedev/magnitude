@@ -3,9 +3,11 @@
 //! the artifact into the table's resident representation as it writes it
 //! (`row_conversion`), while the steps that read them wait at a gate.
 //!
-//! The slots and the table's directory live in host-shared storage
-//! (`seismic::Tensor::shared`), which the host writes in place while device
-//! work is queued. Every step that reads the table carries two timeline
+//! The slots and the table's directory live in host-shared storage, which
+//! the host writes in place while device work is queued: the directory a
+//! `seismic::Tensor::shared` tensor, and the slots a slab store of one slab
+//! per record (`StoredSlots`), whose records an expert bank's table holds as
+//! a set in the bank's granule pool (`StoredTable::resize`). Every step that reads the table carries two timeline
 //! nodes (`stored_table_rows`): a gate before its read, and a signal after
 //! it. Steps are numbered in queue order, and step `n` binds both at `n`:
 //!
@@ -295,9 +297,6 @@ pub struct StoredTable {
     filler: Option<JoinHandle<()>>,
     /// The last step queued.
     queued: Mutex<u64>,
-    /// What resizes reserved slots (`StoredSlots::Reserved`); none of slots
-    /// allocated whole.
-    resizer: Mutex<Option<seismic::Resizer>>,
     /// Whether the kept rows were written as the load settled.
     settled: crate::settle::Once,
 }
@@ -336,21 +335,98 @@ enum Work {
     Background(Background),
 }
 
-/// Where a stored table's slots lie: `[records, record_rows, width]` rows,
-/// resident, allocated whole, or reserved with their records committed
-/// from the first (`StoredTable::resize`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a stored table's slots lie: `records` records of `record_rows`
+/// rows of `width` resident values, one slab per record, the slabs of a
+/// store of `pool`. Allocated whole: every record backed for the table's
+/// life, lent from one shared allocation. Or banked: each record a granule
+/// of the expert bank's pool `pool` (`BankTable::of` sizes a record to a
+/// granule), every one claimed from the first and then held as a set
+/// (`StoredTable::resize`).
+#[derive(Clone)]
 pub enum StoredSlots {
-    Whole { records: u64, record_rows: u64 },
-    Reserved { records: u64, record_rows: u64 },
+    Whole { pool: seismic::Pool, records: u64, record_rows: u64 },
+    Banked { pool: seismic::Pool, records: u64, record_rows: u64 },
 }
 
 impl StoredSlots {
-    fn shape(self) -> (u64, u64, bool) {
-        match self {
-            Self::Whole { records, record_rows } => (records, record_rows, false),
-            Self::Reserved { records, record_rows } => (records, record_rows, true),
+    fn shape(&self) -> (u64, u64) {
+        match *self {
+            Self::Whole { records, record_rows, .. } | Self::Banked { records, record_rows, .. } => (records, record_rows),
         }
+    }
+}
+
+/// A stored table's slots: a slab store of one slab per record, slot `s`
+/// row `s % record_rows` of the slab of record `s / record_rows`. A record
+/// whose slab the store does not hold holds no row: its slots are never
+/// taken, and are `Named::Free` with no directory entry.
+struct Slots {
+    store: seismic::SlabTensor,
+    record_rows: usize,
+    backing: Backing,
+}
+
+enum Backing {
+    /// The one shared allocation every record's slab is a view of.
+    Whole(seismic::Tensor),
+    /// The bank's pool, which the records claim their granules from.
+    Banked(seismic::Pool),
+}
+
+impl Slots {
+    /// `records` records of `record_rows` rows of `width` `resident` values
+    /// as `layout` places them, every record held.
+    fn new(device: &seismic::Device, layout: &StoredSlots, resident: seismic::Element, width: u64) -> Result<Self, seismic::TensorError> {
+        let (records, record_rows) = layout.shape();
+        let rows = usize::try_from(record_rows)
+            .map_err(|_| seismic::TensorError::SlabLayout("record rows exceed host domain".into()))?;
+        let regions = vec![seismic::SlabRegion { element: resident, row_shape: vec![record_rows, width] }];
+        match layout {
+            StoredSlots::Whole { pool, .. } => {
+                // The store's one region lent whole: every record's rows,
+                // record after record, each record a lent slab.
+                let allocation = seismic::Tensor::shared(device, resident, &[records, record_rows, width])?;
+                let store = seismic::SlabTensor::in_pool_over(pool, 1, records, &regions, vec![allocation.clone()])?;
+                Ok(Self { store, record_rows: rows, backing: Backing::Whole(allocation) })
+            }
+            StoredSlots::Banked { pool, .. } => {
+                let store = seismic::SlabTensor::in_pool(pool, 1, records, &regions)?;
+                for _ in 0..records {
+                    store.add_slab(seismic::SlabFill::Zeroed)?;
+                }
+                Ok(Self { store, record_rows: rows, backing: Backing::Banked(pool.clone()) })
+            }
+        }
+    }
+
+    fn record_rows(&self) -> usize {
+        self.record_rows
+    }
+
+    /// The records held.
+    fn records(&self) -> impl Iterator<Item = usize> {
+        self.store.backed().into_iter()
+    }
+
+    /// The slots of the records held.
+    fn held(&self) -> usize {
+        self.records().count() * self.record_rows()
+    }
+
+    /// Whether the record of slot `slot` is held.
+    fn holds(&self, slot: usize) -> bool {
+        self.store.slab_region(slot / self.record_rows(), 0).expect("a slot's record lies in the store").is_some()
+    }
+
+    /// The resident row of `slot`, of a record held: one slab's view.
+    fn row(&self, slot: usize, slot_bytes: usize) -> (seismic::Tensor, u64) {
+        let record_rows = self.record_rows();
+        let rows = self
+            .store
+            .slab_region(slot / record_rows, 0)
+            .expect("a slot's record lies in the store")
+            .expect("a taken slot's record is held");
+        (rows, ((slot % record_rows) * slot_bytes) as u64)
     }
 }
 
@@ -442,15 +518,11 @@ impl RowStack {
 }
 
 struct Shared {
-    /// `[records, record_rows, width]` rows, resident (`StoredSlots`).
-    slots: seismic::Tensor,
-    /// Where the slots' storage lays each record.
-    placement: seismic::RecordPlacement,
-    /// The rows of a record: slot `s` is row `s % record_rows` of record
-    /// `s / record_rows`.
-    record_rows: u64,
     /// The rows steps read, ranked by recency.
     stack: Mutex<RowStack>,
+    /// The slots as kernels bind them: the slab store's logical region,
+    /// whose address table stays valid as records are added and freed.
+    slots: seismic::Tensor,
     /// `[entries, fields]` I32 (`DirectoryForm`).
     directory: seismic::Tensor,
     fields: u64,
@@ -481,8 +553,8 @@ struct Shared {
 }
 
 struct State {
-    /// The leading records whose slots hold rows: every one committed.
-    records: u64,
+    /// The slots, and which records hold rows: the records the store holds.
+    slots: Slots,
     directory: SlotDirectory,
     /// Per slot, what keeps its row.
     named: Vec<Named>,
@@ -499,7 +571,7 @@ impl StoredTable {
     /// stored as `stored` once assembled from `ranges` (one of each of its
     /// row tensors, `import_transforms::row_tensors`, in order), in
     /// `layout`'s slots of the `resident` representation, every record
-    /// committed, and a directory of `form`, on `device`. Its slots are
+    /// held, and a directory of `form`, on `device`. Its slots are
     /// empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -553,38 +625,27 @@ impl StoredTable {
                 assembled.len()
             )));
         }
-        let (records, record_rows, reserved) = layout.shape();
+        let (records, record_rows) = layout.shape();
         let slots = records * record_rows;
         if slots == 0 || slots > rows || slots > i32::MAX as u64 || rows > i32::MAX as u64 {
             return Err(failed(&format!("{slots} slots for {rows} rows")));
         }
+        // One slot to a tile: a record's slots leave the directory one by
+        // one as the record goes (`StoredTable::resize`).
         let directory = SlotDirectory::new(rows, slots, 1, form);
         let (entries, fields) = (form.entries(rows, slots), form.fields());
-        let extents = [records, record_rows, width];
-        let (slots_tensor, resizer) = match reserved {
-            true => seismic::Tensor::reserved_in(crate::planning::BankTier::Bank.contract_on(device), device, resident, &extents, records, None)
-                .map(|(tensor, resizer)| (tensor, Some(resizer))),
-            // `stored_rows` reads the slots through a record port: the table
-            // of their records is held from now (a reservation holds its own).
-            false => seismic::Tensor::shared(device, resident, &extents)
-                .and_then(|tensor| tensor.hold_record_table().map(|()| (tensor, None))),
-        }
-        .map_err(|error| failed(&error))?;
+        let slots_store = Slots::new(device, &layout, resident, width).map_err(|error| failed(&error))?;
+        let slots_view = slots_store.store.logical_region(0).map_err(|error| failed(&error))?;
         let directory_tensor =
             seismic::Tensor::words(device, seismic::Element::i32(), &[entries, fields])
                 .map_err(|error| failed(&error))?;
-        let placement = slots_tensor
-            .record_placement()
-            .ok_or_else(|| failed(&"the slots hold no records"))?;
         let curve_ranges = ranges
             .iter()
             .map(|range| crate::assessment::TableRange { first: range.first, bytes: range.bytes as u64 })
             .collect();
         let shared = Arc::new(Shared {
-            slots: slots_tensor,
-            placement,
-            record_rows,
             stack: Mutex::new(RowStack::new(records, record_rows, curve_ranges)),
+            slots: slots_view,
             directory: directory_tensor,
             fields,
             descriptor: descriptor.clone(),
@@ -598,7 +659,7 @@ impl StoredTable {
             jobs: Mutex::new(Jobs::default()),
             arrived: Condvar::new(),
             state: Mutex::new(State {
-                records,
+                slots: slots_store,
                 directory,
                 named: vec![Named::Free; slots as usize],
                 served: vec![false; slots as usize],
@@ -636,11 +697,12 @@ impl StoredTable {
             shared,
             filler: Some(filler),
             queued: Mutex::new(0),
-            resizer: Mutex::new(resizer),
             settled: Default::default(),
         })
     }
 
+    /// The slots as kernels bind them, `[records, record_rows, width]`:
+    /// the slab store's logical region, valid across resizes.
     pub fn slots_tensor(&self) -> &seismic::Tensor {
         &self.shared.slots
     }
@@ -658,7 +720,7 @@ impl StoredTable {
     /// Fill the slots with the rows steps named when the table was last
     /// served, before its first step.
     pub fn seed(&self) -> Result<(), String> {
-        let mut state = self.shared.state.lock().expect("stored table lock");
+        let state = self.shared.state.lock().expect("stored table lock");
         let rows = self
             .shared
             .kept
@@ -666,11 +728,11 @@ impl StoredTable {
             .map_or_else(Vec::new, KeptRows::read)
             .into_iter()
             .filter(|row| *row < self.shared.rows)
-            .take((state.records * self.shared.record_rows) as usize)
+            .take(state.slots.held())
             .collect::<Vec<_>>();
-        match self.shared.bring(&mut state, 0, &[rows], true) {
-            Ok((None, _)) => Ok(()),
-            Ok((Some(failure), _)) => Err(failure.error),
+        match self.shared.bring(state, 0, &[rows], true) {
+            Ok((_, None, _)) => Ok(()),
+            Ok((_, Some(failure), _)) => Err(failure.error),
             Err(error) => Err(error),
         }
     }
@@ -701,7 +763,7 @@ impl StoredTable {
 
     /// The records whose slots hold rows now.
     pub fn records(&self) -> u64 {
-        self.shared.state.lock().expect("stored table lock").records
+        self.shared.state.lock().expect("stored table lock").slots.records().count() as u64
     }
 
     /// What its decode steps read, by depth ([`RowStack`]).
@@ -709,81 +771,55 @@ impl StoredTable {
         self.shared.stack.lock().expect("stored table stack lock").curve.clone()
     }
 
-    /// What the slots are charged now, as Seismic measures it; none of
-    /// slots no longer held.
-    pub fn charged_bytes(&self) -> Option<u64> {
-        self.shared.slots.observe_storage().charged_bytes()
+    /// What the slots are charged now: of a banked table, a granule of its
+    /// pool per record held; of one allocated whole, its allocation, which
+    /// the table holds for its life. The slab store's address table, which
+    /// the slots' logical view lies in (`Self::slots_tensor`), is not theirs.
+    pub fn charged_bytes(&self) -> u64 {
+        let state = self.shared.state.lock().expect("stored table lock");
+        match &state.slots.backing {
+            Backing::Whole(allocation) => allocation.charged_bytes(),
+            Backing::Banked(pool) => state.slots.records().count() as u64 * pool.granule(),
+        }
     }
 
-    /// Hold the slots of `records` records of reserved slots
-    /// (`StoredSlots::Reserved`), at least one and at most every one; a shrink
-    /// with every step queued so far read (the domain brings the device past
-    /// every begun step first). A shrink takes the rows of the records it leaves
-    /// out of the directory, publishes it, then releases their storage; a
-    /// growth backs its records first, then fills them as steps name rows.
-    /// The storage's refusal (`Ok(Err)`) leaves the table serving the slots
-    /// it uses.
+    /// Hold `records` records of a banked table (`StoredSlots::Banked`), at
+    /// least one and at most every one; a shrink with every step queued so
+    /// far read (the domain brings the device past every begun step first).
+    /// A shrink evicts the records whose rows are worth least
+    /// ([`Shared::evict`]): it takes their rows out of the
+    /// directory, publishes it, then frees their slabs, moving no row; a
+    /// growth claims records from the pool (the store's lowest absent ones),
+    /// then fills them as steps name rows. The pool's refusal of a growth
+    /// (`Ok(Err)`) leaves the table serving the records it holds.
     pub fn resize(&self, records: u64) -> Result<Result<(), seismic::TensorError>, String> {
-        let mut resizer = self.resizer.lock().expect("stored table resizer lock");
         // Held throughout: no step is queued between the check that every
         // queued step read and the shrink that relies on it.
         let queued = self.queued.lock().expect("stored table queue lock");
-        let mut state = self.shared.state.lock().expect("stored table lock");
-        let current = resizer.take().ok_or("a stored table allocated whole has no resize")?;
-        let (next, resized) = self.resize_with(current, &mut state, *queued, records);
-        *resizer = Some(next);
-        resized
-    }
-
-    /// [`Self::resize`] with the resizer taken: it comes back on every path.
-    fn resize_with(
-        &self,
-        resizer: seismic::Resizer,
-        state: &mut State,
-        queued: u64,
-        records: u64,
-    ) -> (seismic::Resizer, Result<Result<(), seismic::TensorError>, String>) {
-        let extent = self.shared.slots.extents()[0];
-        let unread = match records < state.records {
-            true => self.shared.read.reached(queued).map(|read| !read),
-            false => Ok(false),
+        let mut guard = self.shared.state.lock().expect("stored table lock");
+        let state = &mut *guard;
+        let Backing::Banked(_) = &state.slots.backing else {
+            return Err("a stored table allocated whole has no resize".into());
         };
-        let unread = match unread {
-            Ok(unread) => unread,
-            Err(error) => return (resizer, Err(format!("a stored table's queued reads: {error}"))),
-        };
+        let (held, extent) = (state.slots.records().count() as u64, state.slots.store.capacity() as u64);
+        let unread = records < held
+            && !self.shared.read.reached(*queued).map_err(|error| format!("a stored table's queued reads: {error}"))?;
         if records == 0 || records > extent || unread {
-            return (
-                resizer,
-                Err(format!(
-                    "a stored table of {extent} records resizes to {records}, a shrink with every queued step read"
-                )),
-            );
+            return Err(format!(
+                "a stored table of {extent} records resizes to {records}, a shrink with every queued step read"
+            ));
         }
-        let record_rows = self.shared.record_rows as usize;
-        if records < state.records {
-            let held = records as usize * record_rows;
-            state.directory.limit(held);
-            state.named[held..].fill(Named::Free);
-            state.served[held..].fill(false);
-            // The rows the released records held are no longer held.
-            let State { holds, directory, .. } = &mut *state;
-            holds.retain(|row, _| directory.slot(*row).is_some());
-            state.records = records;
-            if let Err(error) = self.shared.publish(state) {
-                return (resizer, Err(error));
+        if records < held {
+            return self.shared.evict(state, (held - records) as usize);
+        }
+        // Each record a granule of the pool, which grows by a block where
+        // none is free, as its ledger entry admits.
+        for _ in held..records {
+            if let Err(error) = state.slots.store.add_slab(seismic::SlabFill::Zeroed) {
+                return Ok(Err(error));
             }
         }
-        match resizer.recommit(records) {
-            Ok(next) => {
-                if records > state.records {
-                    state.directory.limit(records as usize * record_rows);
-                    state.records = records;
-                }
-                (next, Ok(Ok(())))
-            }
-            Err(refused) => (refused.resizer, Ok(Err(refused.error))),
-        }
+        Ok(Ok(()))
     }
 
     /// A step that reads the table is being queued, with the rows it
@@ -942,8 +978,8 @@ impl Shared {
                 .lock()
                 .expect("stored table stack lock")
                 .read(&distinct.into_iter().collect::<Vec<_>>(), selected);
-            let mut state = self.state.lock().expect("stored table lock");
-            let (failure, read) = self.bring(&mut state, step, &rows, true)?;
+            let state = self.state.lock().expect("stored table lock");
+            let (state, failure, read) = self.bring(state, step, &rows, true)?;
             let mut waits = self.waits.lock().expect("stored table waits lock");
             match selected {
                 true => {
@@ -1013,7 +1049,7 @@ impl Shared {
     fn prefetch(&self, holder: u64, rows: &[u64], reserve: usize) -> bool {
         let mut guard = self.state.lock().expect("stored table lock");
         let state = &mut *guard;
-        let slots = (state.records * self.record_rows) as usize;
+        let slots = state.slots.held();
         let mut seen = HashSet::with_capacity(rows.len());
         let mut absent = Vec::new();
         let mut more = true;
@@ -1033,8 +1069,11 @@ impl Shared {
         let mut taken = Vec::with_capacity(absent.len());
         let mut claimed = HashSet::with_capacity(absent.len());
         for _ in &absent {
-            let (named, read) = (&state.named, &self.read);
-            let kept = |slot: usize| Ok::<_, seismic::ExecutionError>(claimed.contains(&slot) || !named[slot].free(read)?);
+            let (named, read, held) = (&state.named, &self.read, &state.slots);
+            // A slot of a record not held is never taken.
+            let kept = |slot: usize| {
+                Ok::<_, seismic::ExecutionError>(claimed.contains(&slot) || !held.holds(slot) || !named[slot].free(read)?)
+            };
             match state.directory.try_free(kept) {
                 Ok(Some((slot, _))) => {
                     // Free until its row is read in.
@@ -1053,7 +1092,7 @@ impl Shared {
         absent.truncate(taken.len());
         // A row that cannot be read is left to its step, which fails on it.
         // A fill, wanted at no instant: no step waits on it.
-        let errors = self.read_rows(&absent, &taken, Want::undated(0.));
+        let errors = self.read_rows(&state.slots, &absent, &taken, Want::undated(0.));
         for ((row, slot), error) in absent.iter().zip(&taken).zip(errors) {
             if error.is_none() {
                 state.directory.hold(*row, *slot, true);
@@ -1093,13 +1132,13 @@ impl Shared {
     /// slots that named them (`Ok(Some)`); a failure that is no row's fails
     /// the step (`Err`). Beside it, the rows it read. A step naming a row a
     /// prefetch holds takes the hold over: the row is held until it read it.
-    fn bring(
-        &self,
-        state: &mut State,
+    fn bring<'a>(
+        &'a self,
+        mut state: std::sync::MutexGuard<'a, State>,
         step: u64,
         rows: &[Vec<u64>],
         served: bool,
-    ) -> Result<(Option<StepFailure>, u64), String> {
+    ) -> Result<(std::sync::MutexGuard<'a, State>, Option<StepFailure>, u64), String> {
         // Each row once, with the batch slots that name it.
         let mut naming = BTreeMap::<u64, Vec<usize>>::new();
         for (slot, rows) in rows.iter().enumerate() {
@@ -1117,8 +1156,7 @@ impl Shared {
             }
             inside
         });
-        let held = (state.records * self.record_rows) as usize;
-        if naming.len() > held {
+        if naming.len() > state.slots.held() {
             return Err("a step names more rows than the table has slots".into());
         }
         let mut absent = Vec::new();
@@ -1139,20 +1177,30 @@ impl Shared {
         let mut claimed = std::collections::HashSet::with_capacity(absent.len());
         for _ in &absent {
             let slot = loop {
-                let (named, read) = (&state.named, &self.read);
+                let State {
+                    named,
+                    slots: held,
+                    directory,
+                    ..
+                } = &mut *state;
+                let read = &self.read;
                 // A slot is kept while a step that names its row may still
                 // read it: this step, or one whose read is not done, or not
                 // known to be (the device cannot say, which fails the step).
+                // A slot of a record not held is never taken.
                 let kept = |slot: usize| {
-                    Ok(claimed.contains(&slot) || named[slot] == Named::Step(step) || !named[slot].free(read)?)
+                    Ok(claimed.contains(&slot)
+                        || !held.holds(slot)
+                        || named[slot] == Named::Step(step)
+                        || !named[slot].free(read)?)
                 };
-                let free = state.directory.try_free(kept).map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
+                let free = directory.try_free(kept).map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
                 if let Some((slot, _)) = free {
                     break slot;
                 }
                 // Every slot holds a row a step still reads, or a prefetch
                 // holds: wait for the oldest such read.
-                let oldest = state.named[..held]
+                let oldest = state.named
                     .iter()
                     .filter_map(|named| match *named {
                         Named::Step(named) if named != step => Some(named),
@@ -1160,7 +1208,10 @@ impl Shared {
                     })
                     .min()
                     .ok_or("a step names more rows than the table has slots")?;
-                if !self.read.wait(oldest, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))? {
+                drop(state);
+                let waited = self.read.wait(oldest, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))?;
+                state = self.state.lock().expect("stored table lock");
+                if !waited {
                     return Err("no slot of the stored table came free".into());
                 }
             };
@@ -1170,7 +1221,7 @@ impl Shared {
         }
         // Read the absent rows into their slots, then publish those that
         // were read; a row that was not leaves its slot free.
-        let unread = self.read_rows(&absent, &taken, Want::now());
+        let unread = self.read_rows(&state.slots, &absent, &taken, Want::now());
         for ((row, slot), error) in absent.iter().zip(&taken).zip(unread) {
             match error {
                 None => {
@@ -1187,23 +1238,29 @@ impl Shared {
             // No step reads the directory while it is rebuilt: every step
             // before this one has read it, and this one and the ones after
             // it wait at their gates.
-            if step > 1 && !self.read.wait(step - 1, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))? {
-                return Err("the stored table's directory could not be rebuilt".into());
+            if step > 1 {
+                drop(state);
+                let waited = self.read.wait(step - 1, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))?;
+                state = self.state.lock().expect("stored table lock");
+                if !waited {
+                    return Err("the stored table's directory could not be rebuilt".into());
+                }
             }
             state.directory.rebuild();
         }
-        self.publish(state)?;
+        self.publish(&mut state)?;
         let failure = (!failed.is_empty()).then(|| StepFailure {
             slots: FailedSlots::Only(failed),
             error: format!("stored table rows: {}", errors.join("; ")),
         });
-        Ok((failure, absent.len() as u64))
+        Ok((state, failure, absent.len() as u64))
     }
 
     /// Read `absent`'s rows as stored, a range of each of the table's row
     /// tensors per row, wanted as `want`, then assemble and convert each into
-    /// its slot of `taken`: per row, why it was not, if it was not.
-    fn read_rows(&self, absent: &[u64], taken: &[usize], want: Want) -> Vec<Option<String>> {
+    /// its slot of `taken` in `slots`: per row, why it was not, if it was
+    /// not.
+    fn read_rows(&self, slots: &Slots, absent: &[u64], taken: &[usize], want: Want) -> Vec<Option<String>> {
         let mut unread = vec![None; absent.len()];
         if absent.is_empty() {
             return unread;
@@ -1265,17 +1322,12 @@ impl Shared {
             // SAFETY: the slot's previous row has been read by every step
             // that named it, and no queued step names the slot's new row
             // before its gate opens.
-            if let Err(error) = unsafe { self.slots.write_shared(self.slot_offset(*slot as u64), &converted) } {
+            let (rows, offset) = slots.row(*slot, self.slot_bytes);
+            if let Err(error) = unsafe { rows.write_shared(offset, &converted) } {
                 unread[index] = Some(error.to_string());
             }
         }
         unread
-    }
-
-    /// Where slot `slot` lies in the slots' storage: its row of its record,
-    /// where the storage lays the record (`Tensor::record_placement`).
-    fn slot_offset(&self, slot: u64) -> u64 {
-        self.placement.offset(slot / self.record_rows) + (slot % self.record_rows) * self.slot_bytes as u64
     }
 
     /// The slot row of the row `stored` as stored (`row_conversion`).
@@ -1286,6 +1338,47 @@ impl Shared {
         self.conversion
             .piece(self.width as usize, 1, 0..1, stored, slot)
             .expect("a stored row is one piece of the conversion into a slot's row");
+    }
+
+    /// Evict `count` of the records held, those whose rows are worth least:
+    /// fewest held for prefetches, then fewest steps named, then fewest
+    /// rows, then the last (the clock fills slots first to last, so the last
+    /// hold the least valuable). Their rows leave the directory, which is
+    /// published, and then their slabs are freed: no row moves. Every step
+    /// queued has read the table (`StoredTable::resize`). The store's
+    /// refusal (`Ok(Err)`) leaves the records not yet freed held, empty.
+    fn evict(&self, state: &mut State, count: usize) -> Result<Result<(), seismic::TensorError>, String> {
+        let record_rows = state.slots.record_rows();
+        let mut ranked = state
+            .slots
+            .records()
+            .map(|record| {
+                let slots = record * record_rows..(record + 1) * record_rows;
+                let held = slots.clone().filter(|slot| state.named[*slot] == Named::Held).count();
+                let served = slots.clone().filter(|slot| state.served[*slot]).count();
+                let rows = slots.filter(|slot| state.directory.held(*slot).is_some()).count();
+                ((held, served, rows, std::cmp::Reverse(record)), record)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable();
+        let evicted = ranked[..count].iter().map(|(_, record)| *record).collect::<Vec<_>>();
+        for &record in &evicted {
+            for slot in record * record_rows..(record + 1) * record_rows {
+                state.directory.release(slot);
+                state.named[slot] = Named::Free;
+                state.served[slot] = false;
+            }
+        }
+        // The rows the evicted records held are no longer held.
+        let State { holds, directory, .. } = &mut *state;
+        holds.retain(|row, _| directory.slot(*row).is_some());
+        self.publish(state)?;
+        for record in evicted {
+            if let Err(error) = state.slots.store.free_slab(record) {
+                return Ok(Err(error));
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// Write the directory entries that changed.
@@ -1366,14 +1459,15 @@ mod tests {
 
     fn table(name: &str, slots: u64, form: DirectoryForm) -> (std::path::PathBuf, StoredTable) {
         let path = file(name);
+        let device = device();
         let table = StoredTable::new(
-            &device(),
+            &device,
             &descriptor(),
             stored(),
             resident(),
             ROWS,
             WIDTH,
-            StoredSlots::Whole { records: 1, record_rows: slots },
+            StoredSlots::Whole { pool: pool(&device, resident(), WIDTH, slots), records: 1, record_rows: slots },
             form,
             ranges(&path),
             None,
@@ -1437,68 +1531,118 @@ mod tests {
         };
         let slot = usize::try_from(slot).ok()?;
         let mut bytes = vec![0u8; SLOT_BYTES];
+        let (rows, offset) = table.shared.state.lock().unwrap().slots.row(slot, SLOT_BYTES);
         // SAFETY: as above.
-        unsafe { table.slots_tensor().read_shared(table.shared.slot_offset(slot as u64), &mut bytes) }
-            .unwrap();
+        unsafe { rows.read_shared(offset, &mut bytes) }.unwrap();
         Some(bytes)
     }
 
-    /// A reserved table shrinks to its leading records: the rows the
-    /// records it releases held leave the directory, every other row stays
-    /// found, and its charge falls; a shrink with a queued step unread is
-    /// refused, and a step naming more rows than the slots it uses fails.
-    /// Grown again, steps fill the records it backs.
-    #[test]
-    fn a_reserved_table_resizes_by_records() {
-        let path = file("resize");
-        let device = device();
-        let table = StoredTable::new(
-            &device,
+    /// The slot the directory holds `row` in.
+    fn slot_of(table: &StoredTable, row: u64) -> Option<u64> {
+        table.shared.state.lock().unwrap().directory.slot(row)
+    }
+
+    /// The records a table holds.
+    fn held(table: &StoredTable) -> Vec<usize> {
+        table.shared.state.lock().unwrap().slots.records().collect()
+    }
+
+    /// A shared-storage pool of granules each one record of `record_rows`
+    /// slots `width` wide, as an expert bank opens its own beside unified
+    /// memory.
+    fn pool(device: &seismic::Device, element: Element, width: u64, record_rows: u64) -> seismic::Pool {
+        let regions = [seismic::SlabRegion { element, row_shape: vec![record_rows, width] }];
+        let slab = seismic::SlabLayout::for_regions(1, 1, &regions).unwrap();
+        let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
+        let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
+        device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap()
+    }
+
+    /// A banked table of `records` records of `record_rows` slots in
+    /// `pool`, over the rows `path` holds.
+    fn banked(device: &seismic::Device, pool: &seismic::Pool, records: u64, record_rows: u64, path: &std::path::Path) -> StoredTable {
+        StoredTable::new(
+            device,
             &descriptor(),
             stored(),
             resident(),
             ROWS,
             WIDTH,
-            StoredSlots::Reserved { records: 4, record_rows: 256 },
+            StoredSlots::Banked { pool: pool.clone(), records, record_rows },
             DirectoryForm::Hashed,
-            ranges(&path),
+            ranges(path),
             None,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A banked table claims a granule of its pool per record and is
+    /// charged for those it holds: a shrink with a queued step unread is
+    /// refused; one by records frees their granules, the rows the evicted
+    /// records held leave the directory, and every other row stays found;
+    /// a step naming more rows than the records held hold fails. Grown
+    /// again, steps fill the records it claims.
+    #[test]
+    fn a_banked_table_resizes_by_records() {
+        let path = file("resize");
+        let device = device();
+        let pool = pool(&device, resident(), WIDTH, 256);
+        let table = banked(&device, &pool, 4, 256, &path);
+        let granule = pool.granule();
+        assert_eq!(table.charged_bytes(), 4 * granule);
         let rows = |count: u64, from: u64| (from..from + count).map(|row| row * 3 % ROWS).collect::<Vec<_>>();
         let run = |rows: Vec<u64>| {
             let step = table.queue(StepRows::Known(vec![rows])).unwrap();
             assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
             step
         };
-        // Every slot holds a row.
+        // Every slot holds a row, exposed as a 3D `[records, record_rows, width]`
+        // slab view that `stored_rows` binds directly through its record port.
+        assert_eq!(table.slots_tensor().extents(), &[4, 256, WIDTH]);
         let every = rows(1024, 0);
         let step = run(every.clone());
         assert_eq!(table.failure(step.value), None);
+        let entry = magnitude_kernels::stored_rows::native_entry_with(
+            magnitude_kernels::stored_rows::Elements {
+                E: resident(),
+                A: Element::bf16(),
+            },
+        );
+        let spec = entry
+            .offered(&device)
+            .unwrap()
+            .unwrap()
+            .default_specialization(&seismic::NativeSpecialization::new().with_static("W", WIDTH))
+            .unwrap();
+        let kernel = entry.prepare(&device, &spec).unwrap();
+        let query = [every[0] as i32, 0, every[300] as i32, 0]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let tokens = seismic::Tensor::from_host(&device, Element::i32(), &[2, 2], &query).unwrap();
+        let decoded = kernel
+            .call(magnitude_kernels::stored_rows::Args {
+                slots: table.slots_tensor(),
+                tokens: &tokens,
+                directory: table.directory(),
+            })
+            .unwrap();
+        assert_eq!(decoded.value.extents(), &[2, WIDTH]);
         assert!(table.resize(2).is_err(), "a shrink waits for every queued step's read");
         read_done(&step);
-        let before = table.charged_bytes().unwrap();
         table.resize(2).unwrap().unwrap();
-        assert_eq!(table.records(), 2);
-        // It frees the whole granules the two records' bytes leave
-        // (none where the four lie in one granule, as on Metal's).
-        let backing = granules(&device, 256);
-        let record = record_bytes(256);
-        assert_eq!(
-            before - table.charged_bytes().unwrap(),
-            backing.backing(4 * record).unwrap() - backing.backing(2 * record).unwrap()
-        );
+        assert_eq!((table.records(), table.charged_bytes()), (2, 2 * granule));
         let kept = every.iter().filter(|row| found(&table, **row).is_some()).collect::<Vec<_>>();
         assert_eq!(kept.len(), 512);
         for row in kept {
             assert_eq!(found(&table, *row), Some(slot_row(*row)));
         }
-        // The slots in use hold 512 rows a step: 513 fail it.
+        // The slots held hold 512 rows a step: 513 fail it.
         let step = run(rows(513, 2000));
         assert!(table.failure(step.value).is_some());
         read_done(&step);
         table.resize(4).unwrap().unwrap();
-        assert_eq!((table.records(), table.charged_bytes().unwrap()), (4, before));
+        assert_eq!((table.records(), table.charged_bytes()), (4, 4 * granule));
         let step = run(rows(1024, 1024));
         assert_eq!(table.failure(step.value), None);
         for row in rows(1024, 1024) {
@@ -1509,66 +1653,45 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// The bytes of one record of `record_rows` slots.
-    fn record_bytes(record_rows: u64) -> u64 {
-        resident().canonical_byte_len(&[1, record_rows, WIDTH]).unwrap()
-    }
-
-    /// The reservation the test device backs a stored table's slots in, as
-    /// it reserves records of `record_rows` slots: its granule is what a
-    /// resize backs and frees whole.
-    fn granules(device: &seismic::Device, record_rows: u64) -> seismic::Reservation {
-        let contract = crate::planning::BankTier::Bank.contract_on(device);
-        let record = std::num::NonZeroU64::new(record_bytes(record_rows)).unwrap();
-        device
-            .info()
-            .reserving(contract)
-            .unwrap()
-            .expect("the test device reserves a stored table's slots")
-            .of_records(seismic::ReservedRecords::of(record))
-    }
-
-    /// A reserved table charges whole granules of its device's reservation
-    /// (read from the device): a shrink by records frees exactly the whole
-    /// granules its records' bytes leave, and none for a shrink within one
-    /// granule. Sized to three granules of 16-row records, at least two to a
-    /// granule.
+    /// A shrink evicts the records whose rows are worth least, wherever they
+    /// lie, and moves no row: the table's records are a set with holes,
+    /// whose absent records' slots no step takes; a growth claims the
+    /// lowest absent record again. The clock fills slots last to first, so
+    /// 48 rows in 4 records of 16 leave the first empty.
     #[test]
-    fn a_reserved_table_shrink_frees_whole_granules() {
+    fn a_shrink_evicts_the_least_valued_records_and_moves_no_row() {
+        let path = file("evict");
         let device = device();
-        let record_rows = 16;
-        let reservation = granules(&device, record_rows);
-        let (granule, record) = (reservation.granule, record_bytes(record_rows));
-        assert!(record * 2 <= granule, "{record}-byte records, {granule}-byte granules");
-        // The most records within three granules, and within one.
-        let (three, one) = (3 * granule / record, granule / record);
-        let rows = three * record_rows;
-        let path = std::env::temp_dir().join(format!("magnitude-stored-table-granules-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().set_len(100 + rows * ROW_BYTES as u64).unwrap();
-        let table = StoredTable::new(
-            &device,
-            &WeightDescriptor::stored("table", [rows, WIDTH]),
-            stored(),
-            resident(),
-            rows,
-            WIDTH,
-            StoredSlots::Reserved { records: three, record_rows },
-            DirectoryForm::Hashed,
-            ranges(&path),
-            None,
-        )
-        .unwrap();
-        let charged = || table.charged_bytes().unwrap();
-        let full = charged();
-        // One record less still lies in the third granule: nothing is freed.
-        table.resize(three - 1).unwrap().unwrap();
-        assert_eq!(charged(), full, "a shrink within a granule frees nothing");
-        // Down to one granule's records: the other two are freed whole.
-        table.resize(one).unwrap().unwrap();
-        assert_eq!(full - charged(), 2 * granule, "a shrink frees whole granules");
-        // Growing back backs them again.
-        table.resize(three).unwrap().unwrap();
-        assert_eq!(charged(), full);
+        let pool = pool(&device, resident(), WIDTH, 16);
+        let table = banked(&device, &pool, 4, 16, &path);
+        let run = |rows: Vec<u64>| {
+            let step = table.queue(StepRows::Known(vec![rows])).unwrap();
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
+            read_done(&step);
+            step
+        };
+        let first = (0..48).collect::<Vec<u64>>();
+        assert_eq!(table.failure(run(first.clone()).value), None);
+        let slots = first.iter().map(|row| slot_of(&table, *row).unwrap()).collect::<Vec<_>>();
+        assert!(slots.iter().all(|slot| *slot >= 16), "the first record holds no row");
+        table.resize(3).unwrap().unwrap();
+        assert_eq!(held(&table), [1, 2, 3]);
+        assert_eq!(table.charged_bytes(), 3 * pool.granule());
+        // Every row stays in its slot.
+        for (row, slot) in first.iter().zip(&slots) {
+            assert_eq!(slot_of(&table, *row), Some(*slot));
+            assert_eq!(found(&table, *row), Some(slot_row(*row)));
+        }
+        // The 48 slots held take a step's 16 new rows, never in the hole.
+        let next = (100..116).collect::<Vec<u64>>();
+        assert_eq!(table.failure(run(next.clone()).value), None);
+        for row in &next {
+            assert!(slot_of(&table, *row).unwrap() >= 16);
+            assert_eq!(found(&table, *row), Some(slot_row(*row)));
+        }
+        assert!(table.failure(run((200..249).collect()).value).is_some(), "49 rows exceed the slots held");
+        table.resize(4).unwrap().unwrap();
+        assert_eq!(held(&table), [0, 1, 2, 3]);
         drop(table);
         std::fs::remove_file(path).unwrap();
     }
@@ -1705,7 +1828,7 @@ mod tests {
                 resident,
                 ROWS,
                 WIDTH,
-                StoredSlots::Whole { records: 1, record_rows: ROWS },
+                StoredSlots::Whole { pool: pool(&device, resident, WIDTH, ROWS), records: 1, record_rows: ROWS },
                 DirectoryForm::Dense,
                 ranges,
                 None,
@@ -1962,6 +2085,8 @@ mod tests {
                 std::process::id()
             ));
             let path = file(&format!("cold-warm-{form:?}"));
+            // The pool is the store's one, opened once for the runs.
+            let pool = pool(&device, resident(), WIDTH, 4);
             // Each step's outputs, and the row slot 0 held when it read.
             let run = || {
                 let table = StoredTable::new(
@@ -1971,7 +2096,7 @@ mod tests {
                     resident(),
                     ROWS,
                     WIDTH,
-                    StoredSlots::Whole { records: 1, record_rows: 4 },
+                    StoredSlots::Whole { pool: pool.clone(), records: 1, record_rows: 4 },
                     form,
                     ranges(&path),
                     Some(KeptRows::of(&kept, "table")),

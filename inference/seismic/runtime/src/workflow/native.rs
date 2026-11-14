@@ -522,13 +522,7 @@ fn preclaim_resources<T: TargetFamily, E: NativeExecutor<T>>(
         .iter()
         .map(|(key, table)| (*key, table.claim_growth((key.1, key.2))))
         .collect();
-    let reservation = device.memory.device().reserve(0).map_err(|capacity| {
-        CallError::Invocation(InvocationError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
-    })?;
-    let mut resources = AdmittedResources::new(reservation, access);
+    let mut resources = AdmittedResources::new(access);
     resources.retain_preclaims(claims);
     drop(guard);
     Ok(resources)
@@ -578,16 +572,12 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
     resources
         .check_reached_capacity(required)
         .map_err(CallError::Execution)?;
-    let mut reservation = device.memory.device().reserve(required).map_err(|capacity| {
-        CallError::Invocation(InvocationError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
-    })?;
+    // Each allocation's backend charges it as it is made; a refusal drops
+    // those made before it, freeing their charges.
     let mut replacements = Vec::new();
     for (requirement, bytes) in demands {
         let allocation = device
-            .allocate_reserved(bytes, requirement.alignment, &mut reservation)
+            .allocate_storage(bytes, requirement.alignment)
             .map_err(CallError::Execution)?;
         if let ResourceId::Persistent {
             owner,
@@ -921,14 +911,8 @@ fn output_ref(reference: crate::api::kernel::WorkflowResultRef) -> OutputRef {
     OutputRef::from_raw(reference.workflow, reference.node, reference.result)
 }
 
-/// The binding of `tensor`, argument `ordinal` of a language kernel, which
-/// binds views whole: chunked storage, which has no one buffer, is refused.
+/// The binding of `tensor`, argument `ordinal` of a language kernel.
 fn tensor_descriptor(tensor: &TensorInner, ordinal: usize) -> Result<TensorDescriptor, CallError> {
-    if tensor.chunked() {
-        return Err(CallError::Workflow(crate::api::WorkflowError::ChunkedBinding {
-            parameter: format!("argument {ordinal}"),
-        }));
-    }
     let source = tensor.descriptor();
     Ok(TensorDescriptor {
         device: source.device,
@@ -1140,7 +1124,9 @@ mod preclaim_tests {
     #[test]
     fn opposite_graph_key_orders_preclaim_without_deadlock_or_unused_capacity() {
         let devices = crate::devices::Devices::discover(&[]).unwrap();
-        let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
+        let id = devices.executor_of(registry::BackendName::Cpu).unwrap();
+        let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let device = devices.open_own(id, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
@@ -1153,8 +1139,8 @@ mod preclaim_tests {
             capacity: 16,
         });
         drop(prior);
-        let baseline = opened.memory.device_ledger().view().charged;
-        opened.memory.device_ledger().set_bound(Some(baseline));
+        let baseline = tally.held();
+        tally.bound(baseline);
         let gate = Arc::new(std::sync::Barrier::new(3));
         let (send, receive) = std::sync::mpsc::channel();
         let mut workers = Vec::new();
@@ -1165,6 +1151,7 @@ mod preclaim_tests {
             let second = second.clone();
             let gate = gate.clone();
             let send = send.clone();
+            let tally = tally.clone();
             workers.push(std::thread::spawn(move || {
                 let mut keys = BTreeMap::new();
                 for slot in if reverse { [1, 0] } else { [0, 1] } {
@@ -1182,7 +1169,7 @@ mod preclaim_tests {
                 gate.wait();
                 let resources = preclaim_resources(&opened, &keys, &external).unwrap();
                 assert_eq!(resources.reached_allocated(), 0);
-                assert_eq!(opened.memory.device_ledger().view().charged, baseline);
+                assert_eq!(tally.held(), baseline);
                 // The absent key belongs to an unselected portfolio arm. No
                 // allocation is made even though the memory limit is full.
                 assert!(resources.preclaimed_binding((1, 0, 1)).is_none());
@@ -1203,6 +1190,6 @@ mod preclaim_tests {
             table.preclaim_availability((0, 1)),
             PersistentAvailability::Grow { old: None }
         ));
-        assert_eq!(opened.memory.device_ledger().view().charged, baseline);
+        assert_eq!(tally.held(), baseline);
     }
 }

@@ -98,10 +98,7 @@ impl Published {
 /// A panic while it is held is caught inside it, and serving ends before
 /// it is released (`Residency::keep`, `Requests::serve`): no thread serves
 /// from the state it left, which only the refusals read
-/// (`liveness::refuse`), so a poisoned lock is never observed. Every
-/// holder finds a shrink plan its owner dropped uncommitted undone already
-/// ([`Residency::unshrink`]): no holder, whichever thread, meets the
-/// records it held.
+/// (`liveness::refuse`), so a poisoned lock is never observed.
 pub(super) fn lock(residency: &Yielding<Residency>) -> Held<'_> {
     Held::new(residency.hold(POISONED))
 }
@@ -118,15 +115,13 @@ pub(super) fn lock_counted(residency: &Yielding<Residency>, counted: impl FnOnce
 /// Why residency's lock is never poisoned ([`lock`]).
 const POISONED: &str = "residency is never left by a panic";
 
-/// Residency held ([`lock`]): a shrink plan its owner dropped undone as it
-/// is taken; as it is released, what each layer holds published and then
+/// Residency held ([`lock`]): as it is released, what each layer holds published and then
 /// what waits on that publication answered (`Owed`), the one publisher of
 /// what any holder moved.
 pub(super) struct Held<'a>(MutexGuard<'a, Residency>);
 
 impl<'a> Held<'a> {
-    fn new(mut held: MutexGuard<'a, Residency>) -> Self {
-        held.unshrink();
+    fn new(held: MutexGuard<'a, Residency>) -> Self {
         Self(held)
     }
 
@@ -258,9 +253,8 @@ impl Residency {
     pub(super) const TURN: [Job<'static>; 5] = [&Self::learn, &Self::promote, &Self::clear, &Self::hasten, &Self::publish_turn];
 
     /// A growth's slots joined, the steps the frontier passed retired, the
-    /// landings that ended learned and the tier's reserve kept, and a cut
-    /// asked beside a running chain served; then a resize asked served,
-    /// which ends the turn. A fault of the executor's
+    /// landings that ended learned and the tier's reserve kept; then a
+    /// resize asked served, which ends the turn. A fault of the executor's
     /// work, or the device lost under the parks, ends serving, as
     /// residency's own panic does, and the turn.
     fn learn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
@@ -272,9 +266,7 @@ impl Residency {
         let retired = self.retire();
         let landed = self.prefetch.settle(&mut self.core.directory);
         self.refill_tier();
-        // A cut beside a running chain waits on nothing: served at once.
-        let cut = self.cut_running();
-        turn.changed = joined || retired || landed || cut;
+        turn.changed = joined || retired || landed;
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
             self.asked = self.resize(asked, copier);
             return false;
@@ -282,17 +274,14 @@ impl Residency {
         true
     }
 
-    /// The promotions asked and carried. A shrink planned and not yet
-    /// committed holds its records: nothing is promoted or released until
-    /// it commits or is dropped. Held for a measurement beside the idle
+    /// The promotions asked and carried. Held for a measurement beside the idle
     /// load, the copies running end and none is asked; a step running ends
     /// the hold at once, so no request waits on a measurement (the service
     /// preempts the measurement as a request arrives, and serving outranks
     /// it here until it has).
     fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
-        let promoted = !self.core.directory.shrink_pending()
-            && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, self.prefetch.reached()));
+        let promoted = copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, self.prefetch.reached()));
         turn.changed |= promoted;
         true
     }

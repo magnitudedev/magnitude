@@ -4,10 +4,9 @@ import { HardwareSnapshot, ModelInstancesSnapshot } from "@magnitudedev/icn-prot
 import { projectInferenceHardware, summarizeInferenceHardware } from "./inference-projection"
 
 const store = (id: string) => ({
-  id, total_capacity_bytes: 64, stable_capacity_bytes: 60, allocation_capacity_bytes: 64,
-  planning_reserve_bytes: 4, capacity_basis: "linux_mem_total",
+  id, total_capacity_bytes: 64, allocation_capacity_bytes: 64, capacity_basis: "linux_mem_total",
 })
-const host = { store: store("system"), available_bytes: 40, current_free_bytes: 32 }
+const host = { store: store("system"), current_free_bytes: 32 }
 const executor = (id: string, backend: string, paths: number[], reason?: string) => ({
   id, backend, name: "Test GPU", description: "Test GPU", device_placement: paths, upload_placement: paths,
   availability: reason === undefined ? { type: "available", stable_capacity_bytes: 60 }

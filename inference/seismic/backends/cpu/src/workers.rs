@@ -29,7 +29,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::Thread;
 
 use crate::buffer::WritableBuffer;
-use seismic_reservation::AllocationFailure;
+use seismic_compiler::errors::ExecutionError;
+use seismic_memory::entry::Entry;
 use crate::profile::SCRATCH_ALIGNMENT;
 
 /// Chunks each active participant's share of a native step's items is split
@@ -409,14 +410,15 @@ fn work(shared: &Shared, ordinal: usize) {
     }
 }
 
-fn grow(scratch: &mut Option<WritableBuffer>, bytes: u64) -> Result<(), AllocationFailure> {
+/// Grow `scratch` to at least `bytes`, a new buffer charged to `entry`.
+fn grow(scratch: &mut Option<WritableBuffer>, bytes: u64, entry: &Arc<dyn Entry>) -> Result<(), ExecutionError> {
     if scratch
         .as_ref()
         .is_some_and(|scratch| scratch.len() >= bytes)
     {
         return Ok(());
     }
-    *scratch = Some(WritableBuffer::new(bytes, SCRATCH_ALIGNMENT)?);
+    *scratch = Some(WritableBuffer::new(bytes, SCRATCH_ALIGNMENT, entry)?);
     Ok(())
 }
 
@@ -441,8 +443,8 @@ impl Scratch {
         }
     }
 
-    fn grow(&mut self, bytes: u64) -> Result<(), AllocationFailure> {
-        grow(&mut self.buffer, bytes)?;
+    fn grow(&mut self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<(), ExecutionError> {
+        grow(&mut self.buffer, bytes, entry)?;
         self.base = scratch_pointer(&self.buffer);
         Ok(())
     }
@@ -677,11 +679,11 @@ pub struct Workers {
 unsafe impl Send for Workers {}
 
 /// Why a launch could not be submitted to the pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchFailure {
     /// Workgroup or participant scratch could not be grown to the launch's
-    /// size.
-    Scratch(AllocationFailure),
+    /// size: its entry refused it, or the host did.
+    Scratch(ExecutionError),
 }
 
 impl Workers {
@@ -802,9 +804,11 @@ impl Workers {
     /// Runs `workgroups` workgroups of `team_size` threads each and returns
     /// after all complete. `team_size` is at most the participant count: the
     /// profile bounds every workgroup by it, so a larger value contradicts
-    /// the private prepared-kernel constructor (§13.3.6).
+    /// the private prepared-kernel constructor (§13.3.6). Scratch the launch
+    /// grows is charged to `charged`, and held by the pool.
     pub fn run(
         &mut self,
+        charged: &Arc<dyn Entry>,
         entry: LaunchEntry,
         frame: &LaunchFrame,
         workgroups: u64,
@@ -832,7 +836,7 @@ impl Workers {
             .take(teams)
         {
             scratch
-                .grow(workgroup_scratch_bytes)
+                .grow(workgroup_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -844,7 +848,7 @@ impl Workers {
             .take(members)
         {
             scratch
-                .grow(participant_scratch_bytes)
+                .grow(participant_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -855,7 +859,7 @@ impl Workers {
             .take(members)
         {
             scratch
-                .grow(register_scratch_bytes)
+                .grow(register_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -885,7 +889,8 @@ impl Workers {
     /// participants of each step claim its items and meet the next step's
     /// participants after it. Only the participants some step uses are
     /// woken; a job whose steps each have one runs on the submitter alone.
-    pub fn run_native(&mut self, steps: &dyn NativeSteps) -> Result<(), LaunchFailure> {
+    /// Scratch the job grows is charged to `charged`, and held by the pool.
+    pub fn run_native(&mut self, charged: &Arc<dyn Entry>, steps: &dyn NativeSteps) -> Result<(), LaunchFailure> {
         let count = steps.count();
         if count == 0 {
             return Ok(());
@@ -902,7 +907,7 @@ impl Workers {
             shared_bytes = shared_bytes.max(step.shared_bytes);
         }
         for (scratch, base) in self.worker_scratch.iter_mut().zip(&mut self.worker_bases) {
-            scratch.grow(shared_bytes).map_err(LaunchFailure::Scratch)?;
+            scratch.grow(shared_bytes, charged).map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
         if self.steps.len() < count {
@@ -1000,6 +1005,11 @@ impl Drop for SubmitterClass {
 mod tests {
     use super::*;
 
+    /// What the tests' scratch is charged to.
+    fn charged() -> Arc<dyn Entry> {
+        Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam))
+    }
+
     pub(super) static PARKS: AtomicU64 = AtomicU64::new(0);
 
     struct Counting {
@@ -1053,7 +1063,7 @@ mod tests {
         let mut workers = Workers::new(4).expect("pool");
         for round in 0..50 {
             let job = counting(&workers, &[37, 0, 5, 128, 1, 64 + round]);
-            workers.run_native(&job).expect("run");
+            workers.run_native(&charged(), &job).expect("run");
             assert!(job.ordered.load(Ordering::SeqCst));
             for hits in &job.hits {
                 assert!(hits.iter().all(|hit| hit.load(Ordering::SeqCst) == 1));
@@ -1065,7 +1075,7 @@ mod tests {
     fn a_single_participant_pool_runs_on_the_submitter() {
         let mut workers = Workers::new(1).expect("pool");
         let job = counting(&workers, &[3, 4]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         assert!(job
             .hits
             .iter()
@@ -1095,12 +1105,12 @@ mod tests {
         }
         let mut workers = Workers::new(3).expect("pool");
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            workers.run_native(&Panicking).expect("run")
+            workers.run_native(&charged(), &Panicking).expect("run")
         }));
         let payload = caught.expect_err("the panic reaches the submitter");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"item failed"));
         let job = counting(&workers, &[9, 9, 9]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         assert!(job
             .hits
             .iter()
@@ -1115,7 +1125,7 @@ mod tests {
             // Long enough for every pool thread to exhaust its spin and park.
             std::thread::sleep(std::time::Duration::from_millis(20));
             let job = counting(&workers, &[16, 16]);
-            workers.run_native(&job).expect("run");
+            workers.run_native(&charged(), &job).expect("run");
             assert!(job
                 .hits
                 .iter()
@@ -1128,7 +1138,7 @@ mod tests {
     fn an_idle_pool_parks_every_thread() {
         let mut workers = Workers::new(4).expect("pool");
         let job = counting(&workers, &[16, 16]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         let parked = || {
             workers.shared.parked[1..]
                 .iter()
@@ -1180,7 +1190,7 @@ mod tests {
             let mut samples = (0..15)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    workers.run_native(&job).expect("run");
+                    workers.run_native(&charged(), &job).expect("run");
                     started.elapsed().as_secs_f64()
                 })
                 .collect::<Vec<_>>();
@@ -1209,7 +1219,7 @@ mod tests {
             let mut samples = (0..12)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    workers.run_native(&job).expect("run");
+                    workers.run_native(&charged(), &job).expect("run");
                     started.elapsed().as_secs_f64() / job.steps as f64 * 1e6
                 })
                 .collect::<Vec<_>>();

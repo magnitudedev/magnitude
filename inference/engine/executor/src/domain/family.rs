@@ -174,6 +174,11 @@ pub trait ElasticBank {
     /// advance finishes as any shrink.
     fn running_begun(&self) -> Option<RunningBegun>;
 
+    /// Value the bank's cache, its slots above the floor
+    /// (`memory::ledger::Cached::value`): the order the ledger takes cache
+    /// in (`ExecutorDomain::value_cache`).
+    fn value(&self, value: crate::memory::ledger::Value);
+
     /// Whether no step runs: a gap between flights, where a shrink may ask
     /// the watcher. Steps begin and end on the owner's thread, so a gap it
     /// sees holds until it begins one.
@@ -262,25 +267,22 @@ pub enum BankResize {
 }
 
 /// What a chain's encoding finds memory short of between its submissions
-/// (`ExecutorDomain::submit_chain`'s probe): the bytes free room in the
-/// expert bank's store lacks of the speed guarantee now
-/// (`memory::ledger::Snapshot::short`), and what the process held as it
-/// read them.
+/// (`ExecutorDomain::submit_chain`'s probe): the bytes of the bank's cache
+/// the ledger took for a real shortage an OS pressure event showed
+/// (`memory::ledger::Ledger::yield_cache`), which the bank cuts beside the
+/// running chain.
 #[derive(Clone, Copy, Debug)]
 pub struct RunningPressure {
     pub bytes: u64,
-    pub held: super::MemoryMoment,
 }
 
 /// A cut of the expert bank begun beside a running chain
-/// ([`ElasticBank::running_begun`]): when it was decided, how long beginning
-/// it held the submitting thread, and what the process held as it was
-/// decided.
+/// ([`ElasticBank::running_begun`]): when it was decided, and how long
+/// beginning it held the submitting thread.
 #[derive(Clone, Copy, Debug)]
 pub struct RunningBegun {
     pub decided: std::time::Instant,
     pub held: std::time::Duration,
-    pub moment: super::MemoryMoment,
 }
 
 /// A component a load binds beside its target that serving may release
@@ -320,9 +322,14 @@ pub enum BankStep {
 /// A finished resize of one holding: its size before it (`from`) and after
 /// it (`to`), in its units (the experts' slots, a table's records), and
 /// Seismic's measured change of its charge, or why the storage refused it.
+/// A shrink `released` the bytes of its records' granules, of which its
+/// pool `returned` bytes to the OS: blocks out of the pool or emptied for
+/// it, each released as the device work that still reaches it, or the
+/// copies out of it, complete (`seismic::Pool::return_freed`). The ledger
+/// shows each as it is released, never with the shrink's record.
 #[derive(Debug)]
 pub enum BankResized {
-    Shrunk { holding: BankHolding, from: u64, to: u64, released: u64, times: ResizeTimes },
+    Shrunk { holding: BankHolding, from: u64, to: u64, released: u64, returned: u64, times: ResizeTimes },
     /// Grown by at least one joined slot, to the slots its joined slots
     /// reached (`refused` the storage's refusal of the next slot, where one
     /// cut it short of its target).
@@ -366,16 +373,15 @@ pub enum BankHolding {
 pub struct ResizeTimes {
     /// The bank was asked for the resize.
     pub decided: std::time::Instant,
-    /// A shrink's wait for the steps queued on the device, its watcher's
-    /// plan and commit, and its moves' submission (and any wait for them),
-    /// all on the submitting thread; zero for a growth.
+    /// A shrink's wait for the steps queued on the device, and its
+    /// watcher's plan and commit, all on the submitting thread; zero for a
+    /// growth.
     pub queued: std::time::Duration,
     pub planned: std::time::Duration,
     /// Of `planned`, each of a shrink's two asks of the watcher (its plan,
     /// then its commit): the time until the watcher took it up, and the
     /// watcher's serving of it.
     pub trips: [Trip; 2],
-    pub moves: std::time::Duration,
     /// A shrink's storage was prepared off the submitting thread; a
     /// growth's first slot joined.
     pub prepared: std::time::Instant,
@@ -384,10 +390,6 @@ pub struct ResizeTimes {
     pub installed: std::time::Instant,
     /// The surplus storage was released: the resize took effect.
     pub released: std::time::Instant,
-    /// Of a host tier's or table's shrink, its release's unregistration of
-    /// host pages ([`seismic::BackingTimes::unpin`]: CUDA's, which waits for
-    /// the device's work); zero for a device bank's resize and a growth.
-    pub unpinned: std::time::Duration,
 }
 
 /// An ask's trip through the expert watcher, as the submitting thread waits
@@ -449,9 +451,6 @@ pub trait ProgramFamily: 'static {
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {
         Ok(0)
     }
-
-    /// Physical allocations classified as model storage, including constants.
-    fn visit_model_storage(&self, _visit: &mut dyn FnMut(&seismic::Tensor)) {}
 
     fn prepared_program_bytes(&self) -> u64 {
         0
@@ -619,7 +618,7 @@ impl NativeFamily {
                         Ok(crate::experts::HeldTable { plan: plan.clone(), table, last_resize: std::sync::Mutex::new(None) })
                     })
                     .collect::<Result<Vec<_>, super::DomainError>>()?;
-                crate::experts::ServedBank::new(bank, &programs, tables, ledgers, recorded)
+                crate::experts::ServedBank::new(bank, tables, ledgers, recorded)
             })
             .transpose()?;
         Ok(Self {
@@ -771,17 +770,6 @@ impl ProgramFamily for NativeFamily {
 
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {
         self.resident.storage_bytes()
-    }
-
-    fn visit_model_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
-        self.resident.visit_storage(visit);
-        self.target.visit_constants(visit);
-        if let Some(head) = &self.head {
-            head.visit_constants(visit);
-        }
-        if let Some(vision) = &self.vision {
-            vision.visit_constants(visit);
-        }
     }
 
     fn prepared_program_bytes(&self) -> u64 {

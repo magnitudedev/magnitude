@@ -5533,10 +5533,10 @@ mod native_tests {
     }
 
     /// A record port is a device tensor parameter or tensor result with a
-    /// leading record axis, named once, on a backend that binds record tables
-    /// (`BackendName::binds_record_tables`): anything else is refused.
+    /// leading record axis, named once, on every backend: anything else is
+    /// refused.
     #[test]
-    fn a_record_port_is_a_device_tensor_named_once_where_record_tables_bind() {
+    fn a_record_port_is_a_device_tensor_named_once() {
         let declaration = |records: &str, backend: &str| {
             format!(
                 "fn scale[M, N](x: &tensor[M, N] f32, served: &host tensor[4] i32, factor: f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * factor\n    return result\n\nnative scale for {backend} from \"scale.src\":\n    records ({records})\n    launch scale:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
@@ -5556,10 +5556,10 @@ mod native_tests {
             native.records,
             vec![RecordPort::Parameter("x".to_owned()), RecordPort::Result(0)]
         );
-        check(declaration("x, result 0", "vulkan")).expect("Vulkan binds record tables");
+        for backend in ["vulkan", "cuda", "cpu"] {
+            check(declaration("x, result 0", backend)).expect("every backend binds record tables");
+        }
         for (records, backend, expected) in [
-            ("x", "cuda", "cuda binds no record tables"),
-            ("x", "cpu", "cpu binds no record tables"),
             ("served", "metal", "record port `served` must be a device tensor"),
             ("factor", "metal", "record port `factor` must be a device tensor"),
             ("y", "metal", "record port `y` is not an entry parameter"),

@@ -4,25 +4,19 @@
 use crate::DeviceHandle;
 use seismic_lang::registry::BackendName;
 use seismic_native_target::ArtifactStore;
-use seismic_topology::{
-    Contract, Diagnostic, HostReads, KindMemory, KindReport, MetalReport, Obtained, Reach, Reservation,
-    ReservationChunks,
-};
+use seismic_topology::{Diagnostic, HostReads, KindMemory, KindReport, MetalReport, Reach};
+
+/// The id of the backend's one kind ([`kind`]).
+pub const SHARED_KIND: u32 = 0;
 
 /// The backend's one kind: shared storage mode, which every contract is
 /// allocated in, in host RAM on a device whose memory is the host's.
 pub fn kind() -> KindReport {
     KindReport {
-        id: 0,
+        id: SHARED_KIND,
         name: "shared storage".into(),
         reach: Reach::Mapped { reads: HostReads::Cached },
-        obtained: Obtained::Allocated,
         memory: KindMemory::HostRam,
-        reservation: Ok(Some(Reservation {
-            granule: crate::device::RESERVATION_GRANULE as u64,
-            host_addressed: crate::device::RESERVATIONS_HOST_ADDRESSED,
-            chunks: crate::device::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly }),
-        })),
     }
 }
 

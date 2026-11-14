@@ -427,7 +427,6 @@ describe("LocalModelSchema invariants", () => {
         memoryDomainId: "system",
         capacityBytes: 10,
         requiredBytes: 4,
-        compatibilityReserveBytes: 1,
         remainingBytes: 5,
       }],
       totalRequiredBytes: 5,

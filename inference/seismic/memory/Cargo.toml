@@ -1,8 +1,9 @@
 [package]
-name = "seismic-reservation"
+name = "seismic-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 libc.workspace = true
+seismic-topology.workspace = true

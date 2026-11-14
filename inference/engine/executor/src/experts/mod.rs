@@ -80,15 +80,16 @@ pub(crate) use source::Records;
 pub use directory::{LayerCurve, MissCurve, RoutedRead};
 #[cfg(feature = "expert-routing")]
 pub use directory::{Recency, replay};
-pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, Recording, ServedBank, StepFailure, StepRoute};
+pub use bank::LoadPools;
+pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
 
 use magnitude_kernels::{constants, list_extent};
 
 /// The records a list's entries may name: each entry's from record below
 /// `from` and its to record below `to`, the leading extents of the tensors
 /// its device reader binds (`routed_copy`'s S and D, a landing launch's
-/// staging or conveyor records and destination, `routed_move`'s D,
-/// `routed_seed_commit`'s BANK); or, negative, one of `lent` slots of the to
+/// staging or conveyor records and destination, `routed_seed_commit`'s
+/// BANK); or, negative, one of `lent` slots of the to
 /// tensor, -1 - from (a scratch round's slots the host read stored bytes
 /// into, `routed_round`; none for another list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,7 +200,7 @@ impl Words {
     }
 
     /// Write a list's pairs, then its count: a list the device reads only
-    /// in work submitted after it (`routed_move`). The device reads every
+    /// in work submitted after it. The device reads every
     /// entry the count names unchecked, so a pair outside `bounds`, or more
     /// pairs than the list holds, is an invariant violation.
     pub(crate) fn write_list(&self, pairs: &[(i32, i32)], bounds: ListBounds) {

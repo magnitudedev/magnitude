@@ -185,7 +185,7 @@ fn held_records(device: &Device, tensor: RecordTensor, count: u64, seed: u64) ->
         unsafe { held.write_shared(placement.offset(index), &resident) }.map_err(|error| failed(&error))?;
     }
     let bytes = tensor.record_bytes().map_err(|error| failed(&error))?;
-    let records = crate::experts::Records::new(held, bytes, count).map_err(|error| failed(&error))?;
+    let records = crate::experts::Records::rows(&held, bytes, count).map_err(|error| failed(&error))?;
     let [rows, columns] = tensor.matrix.map(|extent| extent as usize);
     let records = SiteRecords::new(records, rows, columns, tensor.resident).map_err(|error| failed(&error))?;
     // The stored values: the resident form is their exact conversion, which

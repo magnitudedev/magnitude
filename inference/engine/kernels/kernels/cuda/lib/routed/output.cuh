@@ -76,7 +76,7 @@ __global__ void routed_output_stage(SEISMIC_KERNEL_PARAMS) {
 // Where choice (m, k) of `expert` reads its down weights: a bank record, or
 // its tier record in place. In the kernel's own scope, where its ports are.
 #define DOWN_WEIGHTS(m, k, expert)                                                                         \
-    routed::Place::of(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN),      \
+    routed::source_record(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN),  \
                       routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,           \
                                             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k),  \
                                             (expert)))
@@ -104,9 +104,9 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     // The arrival and the combine follow the launch before.
     if (slot < K) {
         const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
-        const routed::Place down =
+        const projection::u8 *down =
             DOWN_WEIGHTS(m, slot, routes[m * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1]);
-        if (down.stack == nullptr) {
+        if (down == nullptr) {
             // A choice reading no record: each
             // block publishes its channels of a zero projection.
             seismic_dependency_start();
@@ -114,7 +114,7 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
         } else {
             const Pro pro{EXPERT_ROWS + (m * EXPERT_STRIDE_0 + slot * EXPERT_STRIDE_1) * 2, 0, projection::AllRows{}};
             projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_F / 64, group, H,
-                                            KERNEL_W0_MATRIX(down.stack, down.record),
+                                            ROUTED_RECORD(KERNEL_W0, down),
                                             projection::NoWeight{}, epi);
         }
     } else {
@@ -181,9 +181,9 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
     if (projects) {
         const GatheredPublishEpi epi{published, published_at};
         if (slot < K) {
-            const routed::Place down = DOWN_WEIGHTS(
+            const projection::u8 *down = DOWN_WEIGHTS(
                 m, slot, routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)K, choice));
-            if (down.stack == nullptr) {
+            if (down == nullptr) {
                 // An expert reading no record: each
                 // block publishes its channels of each of its choices' zero
                 // projections.
@@ -194,7 +194,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
                 const routed::GatheredRows rows{EXPERT_ROWS, rows_at};
                 projection::gemv_segment_ready<Shape>(
                     shared, projection::after_dependency(rows), count, SEISMIC_DIM_F / 64, group, H,
-                    KERNEL_W0_MATRIX(down.stack, down.record), projection::NoWeight{}, epi);
+                    ROUTED_RECORD(KERNEL_W0, down), projection::NoWeight{}, epi);
             }
         } else {
             const routed::GatheredRows rows{SHARED_ROWS, rows_at};

@@ -10,11 +10,11 @@
 //! (`charged == base`, IF §2.8) and restores the limit.
 //!
 //! Every test opens its own device with its own ledgers
-//! (`seismic::testing::open_own_ledgers`), so concurrently running tests
+//! (`seismic::testing::open_tallied`), so concurrently running tests
 //! never share a limit or a charge.
 //! Budgets keep at least 4 KiB of margin for the run's own small acquisitions
 //! (failure record, scalar cells; each at most 64 bytes, IF §2.6).
-use crate::common::{device, prepare, Selection, CHECK_MEMORY_BYTES, CHECK_WORK_UNITS};
+use crate::common::{prepare, tallied_device, Selection, CHECK_MEMORY_BYTES, CHECK_WORK_UNITS};
 use seismic::dynamic::{Module, Scalar, Tensor, Value};
 use seismic::{BackendName, Element, PrecisionPolicy};
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
@@ -155,7 +155,7 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
 /// `charged + budget`, checks the outcome and every tensor argument against the
 /// interpreter, and checks that the run released everything it acquired.
 fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget: u64) -> Run {
-    let device = device(backend);
+    let (device, tally) = tallied_device(backend);
     let module = Module::source(MODULE, MODULE_PATH, false, None)
         .unwrap_or_else(|e| panic!("the resource module must load: {e}"));
     let values: Vec<Value> = inputs
@@ -173,9 +173,8 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
             Input::I32(value) => Value::Scalar(Scalar::I32(*value)),
         })
         .collect();
-    let usage = device.device_ledger();
-    let base = usage.charged;
-    device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(base + budget)).unwrap();
+    let base = tally.held();
+    tally.bound(base + budget);
     let function = module.function(entry).expect("declared entry");
     let (kernel, _) = prepare(
         &function,
@@ -232,11 +231,11 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         );
     }
     assert_eq!(
-        device.device_ledger().charged,
+        tally.held(),
         base,
         "{entry}: the run did not release every backing it acquired"
     );
-    device.bounds().bound(seismic::Ledger::Own(device.device_store()), usage.bound).unwrap();
+    tally.bound(u64::MAX);
     Run { failed, tensors }
 }
 

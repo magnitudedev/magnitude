@@ -279,11 +279,11 @@ impl Bound {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w, t) = (case.rows, case.geometry.w(), case.history_rows);
         assert_eq!(t % slab_rows, 0);
-        let mut slabs = SlabTensor::new(
+        let slabs = crate::common::slab_tensor(
             device,
             slab_rows as u64,
             t as u64,
-            vec![
+            &vec![
                 SlabRegion {
                     element: Element::u32(),
                     row_shape: vec![kv as u64, (w / 4) as u64],
@@ -300,16 +300,14 @@ impl Bound {
                     element: Element::f16(),
                     row_shape: vec![kv as u64, coefficient_elements(w) as u64],
                 },
-            ],
-        )
-        .unwrap();
+            ]);
         for index in 0..t / slab_rows {
-            assert_eq!(slabs.add_slab().unwrap(), index);
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), index);
         }
         if reuse {
             assert!(t / slab_rows >= 3);
             slabs.free_slab(1).unwrap();
-            assert_eq!(slabs.add_slab().unwrap(), 1);
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
         }
         for (region, bytes) in [
             encoded
@@ -3829,11 +3827,11 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
             let specialization = append_specialization(
                 &specialization_on(&device, geometry, &[]).with_static("NV", 1),
             );
-            let mut dense_slabs = SlabTensor::new(
+            let dense_slabs = crate::common::slab_tensor(
                 &device,
                 m as u64,
                 m as u64,
-                vec![
+                &vec![
                     SlabRegion {
                         element: Element::bf16(),
                         row_shape: vec![kv as u64, w as u64],
@@ -3842,10 +3840,8 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
                         element: Element::bf16(),
                         row_shape: vec![kv as u64, w as u64],
                     },
-                ],
-            )
-            .unwrap();
-            dense_slabs.add_slab().unwrap();
+                ]);
+            dense_slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let mut dense_key = dense_slabs.logical_region(0).unwrap();
             let mut dense_value = dense_slabs.logical_region(1).unwrap();
             let dense = magnitude_kernels::attention_append_dense::native_for_device_with(
@@ -4206,11 +4202,11 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
             let encoded_prep = Encoded::new(prep);
             let mut inputs = Bound::new(&device, &encoded_prep);
             inputs.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
-            let mut dense = SlabTensor::new(
+            let dense = crate::common::slab_tensor(
                 &device,
                 m as u64,
                 m as u64,
-                vec![
+                &vec![
                     SlabRegion {
                         element: Element::bf16(),
                         row_shape: vec![kv as u64, w as u64],
@@ -4219,10 +4215,8 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                         element: Element::bf16(),
                         row_shape: vec![kv as u64, w as u64],
                     },
-                ],
-            )
-            .unwrap();
-            dense.add_slab().unwrap();
+                ]);
+            dense.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let mut dk = dense.logical_region(0).unwrap();
             let mut dv = dense.logical_region(1).unwrap();
             let spec = dense_specialization(&append_specialization(

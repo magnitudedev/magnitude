@@ -360,8 +360,8 @@ const HINT_RANK = 1
 # consecutive, so no step's record is rewritten before the host has read it.
 
 # A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (`routed_copy`,
-# `routed_move`, `routed_seed_commit`): the sequence it was written for and
-# the count, then each entry's from and to words.
+# `routed_seed_commit`): the sequence it was written for and the count, then
+# each entry's from and to words.
 const LIST_SEQUENCE = 0
 const LIST_COUNT = 1
 const LIST_ENTRIES = 2
@@ -400,8 +400,8 @@ const LIST_PART = 16384
 # (unmeasured: each launch moves a few words, so no backend's choice is a
 # measured one): a launch whose work is one thread's (a step word,
 # a round's grids; SERIAL_THREADS), a group reading or staging a list or a
-# map, or copying listed records (LIST_THREADS, also `routed_copy`'s and
-# `routed_move`'s groups), and the scratch request's group, a thread a
+# map, or copying listed records (LIST_THREADS, also `routed_copy`'s
+# groups), and the scratch request's group, a thread a
 # choice of the widest decode (REQUEST_THREADS).
 const SERIAL_THREADS = 32
 const LIST_THREADS = 256

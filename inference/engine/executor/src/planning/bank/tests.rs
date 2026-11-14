@@ -1,6 +1,5 @@
 use super::*;
 use super::records::record_bytes;
-use super::table::gcd;
 use crate::error::{PlanError, UnstreamedExperts};
 use crate::operators::routed::fused_graph::DECODE_ROWS;
 use crate::planning::ModelLoadPlan;
@@ -15,47 +14,32 @@ impl ModelLoadPlan {
     }
 }
 
-/// A CUDA device's substrate of `reservation` beside `host`: its resident
-/// launches bind expert stacks directly.
-pub(crate) fn cuda(reservation: seismic::Reservation, host: HostTier) -> BankSubstrate {
-    BankSubstrate { backend: seismic::BackendName::Cuda, reservation, host }
+/// A CUDA device's substrate beside `host`, without KV slabs.
+pub(crate) fn cuda(host: HostTier) -> BankSubstrate {
+    BankSubstrate { backend: seismic::BackendName::Cuda, allocations: seismic::NativeAllocations::EXACT, host }
 }
 
 /// The fixture a partial bank streams through on the device
 /// (`ngram_steps_tests::a_partial_banks_shared_graphs_read_each_layers_own_experts`):
-/// at 128 experts a layer its banks' weights rise with their slots, on
-/// unified memory's one store and beside a linked host tier, so a cap
-/// below the whole bank's admits a partial one. At 32 experts a layer
-/// every bank weighs what the whole one does (a reservation's granules
-/// hold every slot), so no cap admits one.
+/// at 128 experts a layer its banks' weights rise with their slots, a
+/// granule of the pool a record, on unified memory's one store and beside
+/// a linked host tier, so a cap below the whole bank's admits a partial
+/// one.
 #[test]
 fn a_fixture_of_more_experts_admits_a_partial_bank() {
-    use crate::planning::fixtures::{HIDDEN, mix_site_hidden, qwen4exp_fixture_definition_of, streamed_experts_manifest};
-    // 2 MiB granules at the planning fixture's width, scaled with the
-    // fixtures' hidden width as their expert records are, so a granule
-    // holds the same share of the bank at any width.
-    let granule = (2 << 20) * mix_site_hidden() / HIDDEN;
-    let granules = |host_addressed| seismic::Reservation { granule, host_addressed, chunks: None };
-    for (backend, reservation, host) in [
-        (seismic::BackendName::Metal, granules(true), HostTier::Unified(Parking::InKernels)),
-        (seismic::BackendName::Cuda, granules(false), HostTier::Linked(granules(true))),
-    ] {
-        let weights = |experts: u64| {
-            let definition = qwen4exp_fixture_definition_of(3, experts);
-            let manifest = streamed_experts_manifest(&definition);
-            let selection = crate::ComponentSelection { head: false, vision: false };
-            let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-                .unwrap();
-            let substrate = BankSubstrate { backend, reservation, host };
-            let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, substrate).unwrap();
-            [floor, experts / 2, experts].map(|slots| {
-                resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
-            })
-        };
-        let [floor, half, whole] = weights(128);
+    use crate::planning::fixtures::{qwen4exp_fixture_definition_of, streamed_experts_manifest};
+    for (backend, host) in [(seismic::BackendName::Metal, HostTier::Unified(Parking::InKernels)), (seismic::BackendName::Cuda, HostTier::Linked)] {
+        let definition = qwen4exp_fixture_definition_of(3, 128);
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let resident = crate::ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
+            .unwrap();
+        let substrate = BankSubstrate { backend, allocations: seismic::NativeAllocations::EXACT, host };
+        let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, substrate).unwrap();
+        let [floor, half, whole] = [floor, 64, 128].map(|slots| {
+            resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, substrate).unwrap().weight_bytes().unwrap()
+        });
         assert!(floor < half && half < whole, "{backend:?}: {floor} {half} {whole}");
-        let [floor, _, whole] = weights(32);
-        assert_eq!(floor, whole, "{backend:?}");
     }
 }
 
@@ -112,24 +96,6 @@ fn resident() -> WeightPlan {
     }
 }
 
-/// Metal's reservation granule.
-const GRANULE: u64 = 2 << 20;
-
-/// Metal's reservations: host ranges backed in its granule.
-const RESERVATION: seismic::Reservation = seismic::Reservation {
-    granule: GRANULE,
-    host_addressed: true,
-    chunks: None,
-};
-
-/// Host reservations backed byte by byte: the weights follow the slots
-/// exactly.
-const BYTES: seismic::Reservation = seismic::Reservation {
-    granule: 1,
-    host_addressed: true,
-    chunks: None,
-};
-
 /// A list of no items is refused, so the greatest of a list made exists:
 /// a bank's widest layer and floor are its layers', never a default.
 #[test]
@@ -183,10 +149,14 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         })
         .collect();
     let layers = BankLayers::new(layers).unwrap();
-    let (reservation, host) = (RESERVATION, HostTier::Linked(RESERVATION));
+    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers).unwrap();
+    let allocations = seismic::NativeAllocations::EXACT;
+    let block = seismic::block_bytes(seismic::BlockSizing { granule: structured.granule(), allocations }).unwrap();
     ExpertBankPlan {
-        structured: conveyor::Structured::new(8, reservation, host, groups, layers).unwrap(),
+        structured,
         backend: seismic::BackendName::Cuda,
+        allocations,
+        block,
         slots,
         ceiling: slots,
         resident: false,
@@ -204,32 +174,37 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
 /// lending.
 fn restructured(
     plan: ExpertBankPlan,
-    change: impl FnOnce(&mut seismic::Reservation, &mut HostTier, &mut Vec<BankGroup>),
+    change: impl FnOnce(&mut HostTier, &mut Vec<BankGroup>),
 ) -> ExpertBankPlan {
-    let (selected, mut reservation, mut host, mut groups, layers) = plan.structured.into_parts();
-    change(&mut reservation, &mut host, &mut groups);
-    let structured = conveyor::Structured::new(selected, reservation, host, groups, layers).unwrap();
-    ExpertBankPlan { structured, ..plan }
+    let (selected, mut host, mut groups, layers) = plan.structured.into_parts();
+    change(&mut host, &mut groups);
+    let structured = conveyor::Structured::new(selected, host, groups, layers).unwrap();
+    let block = seismic::block_bytes(seismic::BlockSizing {
+        granule: structured.granule(),
+        allocations: plan.allocations,
+    })
+    .unwrap();
+    ExpertBankPlan { structured, block, ..plan }
 }
 
 /// `plan` beside `host`.
 fn beside(plan: ExpertBankPlan, host: HostTier) -> ExpertBankPlan {
-    restructured(plan, |_, tier, _| *tier = host)
+    restructured(plan, |tier, _| *tier = host)
 }
 
 /// The bank's minimum is its derivation (`least_records`), on groups of
 /// 37 layers and 3 of 256 experts, `K` 8 (Qwen3.6-35B-A3B's shape):
-/// across a link no step takes a bank record, so each group holds the
-/// one record a reservation commits and the floor is no slot; on
+/// across a link no step takes a bank record, so each group holds one
+/// record and the floor is no slot; on
 /// unified memory each group holds one decode launch's distinct experts
 /// (`DECODE_ROWS · K`, at most a layer's experts) beside the landing
 /// reserve (`DECODE_ROWS · K + 2K`), and the floor is the most slots
 /// within them. A group commits its least records at every slots up to
-/// the floor, its record tensors so committed, and no other group more
+/// the floor, its record regions so committed, and no other group more
 /// for it.
 #[test]
 fn the_minimum_is_what_progress_holds_at_once() {
-    let linked = beside(bank(&[37, 3], 0), HostTier::Linked(BYTES));
+    let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
     let request = (DECODE_ROWS * 8).min(256);
     // The tier's reserve: the reads ahead's, a record per hint staging
@@ -270,11 +245,8 @@ fn the_minimum_is_what_progress_holds_at_once() {
         }
         let layout = plan.layout().unwrap();
         for (group, records) in layout.groups.iter().enumerate() {
-            for (_, records) in records.records.iter() {
-                let BankAllocation::Reserved { committed, .. } = records else {
-                    panic!("a group's records are reserved");
-                };
-                assert_eq!(*committed, plan.records_at(group, plan.slots), "group {group} commits its records at its slots");
+            for (kind, records) in records.records.iter() {
+                assert_eq!(records, &BankAllocation::Records { tier: BankTier::Bank, group, kind }, "a group's records are its store's regions");
             }
         }
     }
@@ -288,52 +260,61 @@ fn the_minimum_is_what_progress_holds_at_once() {
     assert_eq!((linked.records_at(0, 11), linked.records_at(1, 1)), (37 * 11, 3));
 }
 
-/// In chunked records the lent conveyors pack their records whole into
-/// their carriers' chunks (`RecordForm::carrier`), the packing running
-/// on from one pool to the next in a carrier: no record crosses a
-/// chunk, no gap before a record, within a pool or between pools,
-/// reaches a record, and each carrier's bytes end where its last pool's
-/// last record does.
+/// The lent conveyors lie in their carriers' lent records
+/// (`RecordForm::carrier`) end to end, each pool from the first byte past
+/// the last that its layout's alignment admits, and each carrier's bytes
+/// end where its last pool's last record does.
 #[test]
-fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
-    let plan = restructured(bank(&[37, 3], 64), |reservation, host, groups| {
-        *reservation = seismic::Reservation {
-            chunks: Some(seismic::ReservationChunks { unit: 16 << 10, table: seismic::Contract::DeviceOnly }),
-            ..RESERVATION
-        };
+fn the_lent_conveyors_lie_end_to_end_in_their_carriers() {
+    let plan = restructured(bank(&[37, 3], 64), |host, groups| {
         *host = HostTier::Unified(Parking::InKernels);
-        // The lender stores down in Q5_K and holds it in Q4_K, so its Q5_K
-        // conveyor ends inside a chunk and the next pool packs on from there.
+        // The lender stores down in Q5_K and holds it in Q4_K, so a Q5_K
+        // conveyor follows the Q4_K one in down's carrier.
         groups[0].record.down = tensor("gguf_q5_k", "q4k");
     });
     let pools = plan.staging_pools().0;
     let form = plan.form();
-    let carriers = plan.groups()[0].record.map(|kind, tensor| plan.reservation().of_records(plan.reserved_records(0, kind, tensor, crate::planning::BankTier::Bank).unwrap()));
-    let conveyor = plan.structure().conveyor_layout(&pools, &carriers, plan.widest().get()).unwrap();
+    let records = plan.widest().get();
+    let conveyor = plan.structure().conveyor_layout(&pools, records).unwrap();
     let mut end = [0u64; 3];
     for (pool, &offset) in pools.iter().zip(&conveyor.offsets) {
-        let carrier = *carriers.get(form.carrier(pool.kind)).unwrap();
-        let (chunk, record) = (carrier.granule, pool.record_bytes().unwrap());
-        let packing = carrier.packing(record).unwrap();
+        let (_, alignment) = seismic::Tensor::canonical_layout(pool.source, &[records, pool.matrix[0], pool.matrix[1]]).unwrap();
         let end = &mut end[form.carrier(pool.kind) as usize];
-        assert_eq!(packing.at(offset, 0), offset);
-        for expert in 0..conveyor.records {
-            let start = packing.at(offset, expert);
-            assert_eq!(start / chunk, (start + record - 1) / chunk, "record {expert} crosses a chunk");
-            assert!(start - *end < record, "record {expert} wastes a record before it");
-            *end = start + record;
-        }
-        assert_eq!(packing.end(offset, conveyor.records), *end);
+        assert_eq!(offset, end.next_multiple_of(alignment.max(1)));
+        *end = offset + records * pool.record_bytes().unwrap();
     }
     for (kind, &bytes) in conveyor.bytes.iter() {
         assert_eq!(bytes, end[kind as usize], "{kind:?}'s conveyors end at their last record");
     }
-    // The lender's chunks are four of its 589,824-byte Q4_K records, and
-    // Q5_K records, 3 to a chunk, waste 196,608 bytes of each.
-    let record = tensor("gguf_q4_k", "q4k").record_bytes().unwrap();
-    let q5 = tensor("gguf_q5_k", "q5k").record_bytes().unwrap();
-    assert_eq!(carriers.get(RoutedTensor::Gate).unwrap().granule, 4 * record);
-    assert_eq!((4 * record / q5, 4 * record % q5), (3, 196_608));
+}
+
+/// A bank's granule holds a record of every group, a slab of its regions
+/// (each routed tensor's resident record, in its record's order), and no
+/// more: the largest group's slab at a multiple of every slab's alignment,
+/// whatever state is pooled beside it (each class at its own granule); a
+/// linked tier's own pool has the same granule, and a unified bank none.
+#[test]
+fn a_banks_granule_is_its_largest_record_slab() {
+    let plan = bank(&[3, 1], 64);
+    let slabs = (0..plan.groups().len())
+        .map(|group| {
+            let regions = plan.regions(group);
+            assert!(regions.iter().map(|(kind, _)| *kind).eq(plan.groups()[group].record.iter().map(|(kind, _)| kind)));
+            let regions = regions.into_iter().map(|(_, region)| region).collect::<Vec<_>>();
+            PoolSlab::of(&seismic::SlabLayout::for_regions(1, plan.records(group), &regions).unwrap())
+        })
+        .collect::<Vec<_>>();
+    for (group, slab) in slabs.iter().enumerate() {
+        let record = plan.groups()[group].record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>();
+        assert!(slab.bytes >= record, "group {group}'s slab holds its record");
+    }
+    let both = slabs[0].with(slabs[1]).unwrap();
+    assert_eq!(plan.granule(), both.bytes.next_multiple_of(both.alignment), "the largest record slab, aligned for every one");
+    assert_eq!(plan.host_granule(), Some(plan.granule()), "a linked tier pools its records at the bank's granule");
+    assert_eq!(beside(plan.clone(), HostTier::Unified(Parking::InKernels)).host_granule(), None);
+    // Each record committed past the lent ones is a granule of its pool.
+    let charge = (0..plan.groups().len()).map(|group| plan.records_at(group, 64) - plan.lent(group)).sum::<u64>() * plan.granule();
+    assert_eq!(plan.resident_charge(64).unwrap(), charge);
 }
 
 /// A host tier grows in one step from `from` toward every expert, its
@@ -342,7 +323,7 @@ fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
 #[test]
 fn a_host_tier_grows_toward_every_expert_within_its_room() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
-    let plan = beside(without.clone(), HostTier::Linked(BYTES));
+    let plan = beside(without.clone(), HostTier::Linked);
     let all = u64::MAX;
     let counts = plan.counts().unwrap();
     assert_eq!(counts.host_growth(0, 26, all), Some(256), "every expert");
@@ -368,7 +349,7 @@ fn a_host_tier_grows_toward_every_expert_within_its_room() {
 #[test]
 fn a_banks_counts_are_its_plans_derivations_at_every_count() {
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
-    let linked = beside(bank(&[37, 3], 0), HostTier::Linked(BYTES));
+    let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
     for plan in [unified, linked] {
         // Growth reaches every expert.
         let plan = ExpertBankPlan { ceiling: plan.widest().get(), ..plan };
@@ -429,16 +410,18 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
 }
 
 /// A host tier is each group's record tensors again in their resident
-/// form, reserved in host storage for every expert of the
-/// group's layers (what the host lands file misses into and the device
-/// reads in place and promotes from) and committed by host slots, a
-/// record of every layer each and at least the landing reserve; its charge is the resident bytes so committed,
-/// counted host-shared. Staging is the file form's one shared space
-/// with or without it, and a bank without a tier binds none.
+/// form, regions of a slab store in the tier's own pool for every expert
+/// of the group's layers (what the host lands file misses into and the
+/// device reads in place and promotes from) and committed by host slots,
+/// a record of every layer each and at least the landing reserve; its
+/// charge is a granule of its pool for each record so committed past the
+/// conveyor's lent ones, counted host storage. Staging is the file form's
+/// one shared space with or without it, and a bank without a tier binds
+/// none.
 #[test]
 fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
-    let plan = beside(without.clone(), HostTier::Linked(BYTES));
+    let plan = beside(without.clone(), HostTier::Linked);
     assert_eq!((plan.host_ceiling(), without.host_ceiling()), (Some(256), None));
     let lent = plan.conveyor().carrier.lender().records;
     assert_eq!((plan.host_extent(0), plan.host_extent(1), without.host_extent(0)), (3 * 256 + lent, 256, 0));
@@ -451,27 +434,18 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     let tiers = layout.host.as_ref().expect("a tier's record tensors");
     assert_eq!(tiers.len(), 2);
     for (group, tier) in tiers.iter().enumerate() {
-        for ((_, records), (kind, tensor)) in tier.iter().zip(plan.groups()[group].record.iter()) {
-            assert_eq!(
-                records,
-                &BankAllocation::Reserved {
-                    kind: crate::planning::BankTier::Host,
-                    contract: seismic::ReservedContract::Shared,
-                    element: tensor.resident,
-                    records: plan.host_extent(group),
-                    matrix: tensor.matrix,
-                    committed: plan.host_records(group, 0),
-                    carries: plan.reserved_records(group, kind, *tensor, crate::planning::BankTier::Host).unwrap().carries,
-                }
-            );
+        for (kind, records) in tier.iter() {
+            assert_eq!(records, &BankAllocation::Records { tier: BankTier::Host, group, kind });
         }
     }
     assert!(without.layout().unwrap().host.is_none());
     assert_eq!(layout.staging, without.layout().unwrap().staging, "staging is the tier's alike");
-    // Charged the resident bytes of the committed records, byte by byte.
-    let resident = |group: usize| plan.groups()[group].record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>();
-    assert_eq!(plan.host_charge(30).unwrap(), (90 + lent) * resident(0) + 80 * resident(1));
-    assert_eq!(plan.host_charge(0).unwrap(), (80 + lent) * resident(0) + 80 * resident(1));
+    // Charged a granule of the tier's pool a record past the lent ones,
+    // which their lent allocation holds.
+    let granule = plan.host_granule().unwrap();
+    assert_eq!(plan.host_lent(0), lent);
+    assert_eq!(plan.host_charge(30).unwrap(), (90 + 80) * granule);
+    assert_eq!(plan.host_charge(0).unwrap(), (80 + 80) * granule);
     assert_eq!(without.host_charge(2).unwrap(), 0);
     // A host tier adds its records, host memory, and the words the
     // device serves from it by: each layer's tier map; and each layer's
@@ -482,16 +456,24 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
         table.words() + table.slots() * 2 * constants::DECODE_ROWS * hidden
     };
     let words = plan.layers().iter().map(|layer| layer.experts).sum::<u64>() + (0..plan.layers().len()).map(site).sum::<u64>();
-    // No conveyor or scratch is an allocation of its own: they are
-    // records of the tier or the bank.
+    // The conveyor and the scratch lie in their lenders' lent records,
+    // allocations of their own beside the pools.
     let (held, bare) = (plan.storage_demand().unwrap(), without.storage_demand().unwrap());
-    // Beside the move lists and commits, each placer's own records' span.
-    let moves = |plan: &ExpertBankPlan| {
-        (0..plan.groups().len()).map(|group| 4 * (list_extent(plan.move_records(group)) + plan.records(group))).sum::<u64>()
+    let lent = |plan: &ExpertBankPlan| {
+        let layout = plan.layout().unwrap();
+        ClaimDemand::checked_sum(layout.lent.iter().flat_map(|lent| lent.iter().map(|(_, lent)| lent.storage_demand(plan.host()).unwrap()))).unwrap()
     };
+    // Beside the commits, each placer's own records' span.
+    let commits = |plan: &ExpertBankPlan| (0..plan.groups().len()).map(|group| 4 * plan.records(group)).sum::<u64>();
     // Every landing launch declares its list, whoever places.
-    assert_eq!(held.shared - moves(&plan), bare.shared - moves(&without) + 4 * words);
-    assert_eq!(held.host - bare.host, plan.host_charge(0).unwrap());
+    assert_eq!(
+        held.shared - lent(&plan).shared - commits(&plan),
+        bare.shared - lent(&without).shared - commits(&without) + 4 * words
+    );
+    assert_eq!(
+        (held.host - lent(&plan).host) - (bare.host - lent(&without).host),
+        plan.host_charge(0).unwrap()
+    );
     // Admission charges a site only for the layers it admitted one for,
     // and only where a tier lets the plan hold one; a refusal is kept.
     let sites = (0..plan.layers().len())
@@ -519,7 +501,7 @@ fn the_demand_reserve_follows_where_the_device_parks() {
     let parked = |parking| beside(bank(&[37, 3], 1), HostTier::Unified(parking));
     let (kernels, boundaries) = (parked(Parking::InKernels), parked(Parking::AtBoundaries));
     assert_eq!((kernels.demand_records(), boundaries.demand_records()), (8, (DECODE_ROWS * 8).min(256)));
-    assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked(BYTES)).demand_records(), 8);
+    assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), 8);
     let words = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
     for layer in [0, 39] {
         assert_eq!(words(kernels.part_shape(layer, BankPart::LandingList).unwrap()), magnitude_kernels::landing_extent(kernels.choices()));
@@ -537,10 +519,10 @@ fn the_demand_reserve_follows_where_the_device_parks() {
 #[test]
 fn a_unified_bank_is_one_store_the_host_places_into() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
-    let linked = beside(without.clone(), HostTier::Linked(BYTES));
+    let linked = beside(without.clone(), HostTier::Linked);
     let unified = beside(without.clone(), HostTier::Unified(Parking::InKernels));
     assert_eq!((linked.placer(), unified.placer()), (Placer::Tier, Placer::Bank));
-    assert_eq!((linked.tier_reservation(), unified.tier_reservation()), (Some(BYTES), None));
+    assert_eq!((linked.tiered(), unified.tiered()), (true, false));
     assert_eq!((unified.host_ceiling(), unified.host_extent(0), unified.host_records(0, 30)), (None, 0, 0));
     assert_eq!(unified.holding_storage(crate::BankHolding::Host), None);
     let layout = unified.layout().unwrap();
@@ -566,22 +548,20 @@ fn a_unified_bank_is_one_store_the_host_places_into() {
 /// layer's scratch view fits the region of its tensor.
 #[test]
 fn the_scratch_lender_holds_one_widest_layer_across_forms() {
-    let chunked = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 22, table: seismic::Contract::DeviceOnly }) };
-    for (groups, host, reservation) in [&[37, 2, 1][..], &[3, 1]]
+    for (groups, host) in [&[37, 2, 1][..], &[3, 1]]
         .into_iter()
-        .flat_map(|groups| [HostTier::Unified(Parking::InKernels), HostTier::Linked(BYTES)].map(|host| (groups, host)))
-        .flat_map(|(groups, host)| [RESERVATION, chunked].map(|reservation| (groups, host, reservation)))
+        .flat_map(|groups| [HostTier::Unified(Parking::InKernels), HostTier::Linked].map(|host| (groups, host)))
     {
         {
-            let plan = restructured(bank(groups, 26), |reserved, tier, _| (*reserved, *tier) = (reservation, host));
+            let plan = beside(bank(groups, 26), host);
             let scratch = plan.scratch();
             assert_eq!(scratch.lender.group, 0, "the group of the most experts lends");
             // Each tensor's region is its largest form's experts from
             // where the region starts (past the conveyor on the one
-            // store), packed whole into chunks where storage is chunked.
+            // store), end to end.
             let start = match host {
                 HostTier::Unified(_) => plan.conveyor().conveyor.bytes,
-                HostTier::Linked(_) => plan.form().each(|_| Ok::<_, String>(0)).unwrap(),
+                HostTier::Linked => plan.form().each(|_| Ok::<_, String>(0)).unwrap(),
             };
             let (forms, experts) = plan.structure().scratch_forms();
             for (kind, &bytes) in scratch.layout.bytes.iter() {
@@ -593,21 +573,11 @@ fn the_scratch_lender_holds_one_widest_layer_across_forms() {
                     .map(|(form, &rows)| {
                         let record = record_bytes(form.resident, form.matrix).unwrap();
                         let (_, alignment) = seismic::Tensor::canonical_layout(form.resident, &[rows, form.matrix[0], form.matrix[1]]).unwrap();
-                        let at = from.next_multiple_of(alignment.max(1));
-                        // Whole records to a chunk on chunked storage
-                        // (seismic's packing, `Reservation::packing`).
-                        let tensor = plan.groups()[0].record.get(kind).unwrap();
-                        let carrier = reservation.of_records(plan.reserved_records(0, kind, *tensor, crate::planning::BankTier::Bank).unwrap());
-                        let packing = carrier.packing(record).unwrap();
-                        let end = packing.end(packing.at(at, 0), rows);
-                        if reservation.chunks.is_none() {
-                            assert_eq!(end, at + rows * record, "unchunked storage packs records end to end");
-                        }
-                        end
+                        from.next_multiple_of(alignment.max(1)) + rows * record
                     })
                     .max()
                     .unwrap();
-                assert_eq!(bytes, largest, "{groups:?} {host:?} {reservation:?}: {kind:?}'s region is its largest form's");
+                assert_eq!(bytes, largest, "{groups:?} {host:?}: {kind:?}'s region is its largest form's");
             }
             let forms = plan.layer_scratch_forms();
             for (layer, of) in forms.iter().enumerate() {
@@ -636,8 +606,7 @@ fn the_scratch_lender_holds_one_widest_layer_across_forms() {
 
 /// Past every group's decode request, a slot commits `slot_bytes`, a
 /// record of every layer in its group's form, and nothing else the bank
-/// holds; each record tensor is charged its committed bytes in whole
-/// granules.
+/// holds; the pool is charged a granule for each record committed.
 #[test]
 fn a_slot_commits_a_record_of_every_layer() {
     // Past the slots at which a group commits only its least records.
@@ -656,62 +625,42 @@ fn a_slot_commits_a_record_of_every_layer() {
             .sum::<u64>()
     };
     assert_eq!(records(&large) - records(&small), small.slot_bytes().unwrap());
-    // The granules backing each record tensor's committed records
-    // beyond their bytes.
-    let rounding = |plan: &ExpertBankPlan| {
+    // A record of each of the five layers, a granule each.
+    let pooled = large.resident_charge(130).unwrap() - small.resident_charge(129).unwrap();
+    assert_eq!(pooled, 5 * small.granule());
+    assert_eq!(
+        large.charged_beyond_records().unwrap() - small.charged_beyond_records().unwrap(),
+        pooled - small.slot_bytes().unwrap(),
+        "beyond its records the bank holds only the granules' room past them"
+    );
+}
+
+/// The bank's lent allocations are each one allocation of its lender's
+/// lent records of a routed tensor: the largest is the most lent records
+/// of any of the lender's tiers in its largest record, which the
+/// device's single allocation bounds (`UnstreamedExperts::Allocation`).
+#[test]
+fn the_largest_lent_allocation_is_the_lenders_largest_record_tensor() {
+    for host in [HostTier::Unified(Parking::InKernels), HostTier::Linked] {
+        let plan = beside(bank(&[37, 3], 64), host);
+        let lender = plan.scratch().lender.group;
+        let record = plan.groups()[lender].record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).max().unwrap();
+        let lent = plan.lent(lender).max(plan.host_lent(lender));
+        assert_eq!(plan.largest_lent().unwrap(), lent * record, "{host:?}");
         let layout = plan.layout().unwrap();
-        layout
-            .groups
-            .iter()
-            .flat_map(|group| group.records.iter().map(|(_, records)| records))
-            .map(|records| {
-                let BankAllocation::Reserved {
-                    element,
-                    matrix,
-                    committed,
-                    ..
-                } = records
-                else {
-                    panic!("a group's records are reserved");
-                };
-                let record = record_bytes(*element, *matrix).unwrap();
-                records.charged_bytes(&RESERVATION).unwrap() - committed * record
-            })
-            .sum::<u64>()
-    };
-    let beside = |plan: &ExpertBankPlan| plan.charged_beyond_records().unwrap() - rounding(plan);
-    assert_eq!(beside(&large), beside(&small));
-    for plan in [&small, &large] {
-        let rounding = rounding(plan);
-        assert_eq!((records(plan) + rounding) % GRANULE, 0);
-        assert!(rounding < 6 * GRANULE);
+        assert_eq!(layout.lent.len(), match host {
+            HostTier::Unified(_) => 1,
+            HostTier::Linked => 2,
+        });
     }
 }
 
-/// The most slots keep every record tensor's backed granules within the
-/// single-allocation limit, and one more does not.
-#[test]
-fn the_allocation_limit_bounds_each_record_tensors_commitment() {
-    let limit = 3_000_000_000;
-    let most = bank(&[37, 3], 64).most_slots(limit).unwrap();
-    let largest = |slots| {
-        let plan = bank(&[37, 3], slots);
-        plan.record_tensors()
-            .map(|(group, _, tensor)| {
-                (plan.committed_records(group) * tensor.record_bytes().unwrap())
-                    .next_multiple_of(GRANULE)
-            })
-            .max()
-            .unwrap()
-    };
-    assert!(largest(most) <= limit && largest(most + 1) > limit);
-}
-
-/// A bank holds a stored table's slots in records of the least rows that
-/// fill whole granules, as many as the fixed slots hold, from the floor
-/// of the most rows a step names, and no more than its rows fill whole;
-/// unbanked, the table is planned fixed again. A device whose host does
-/// not address reserved bytes keeps it fixed.
+/// A bank holds a stored table's slots in records of the most rows a
+/// granule of its pool holds, as many as the fixed slots hold, from the
+/// floor of the most rows a step names, and no more than its rows fill
+/// whole; unbanked, the table is planned fixed again. Beside a link,
+/// where the host does not write the bank's pool, it stays fixed, as does
+/// a table whose row exceeds a granule.
 #[test]
 fn a_bank_holds_its_stored_table_in_granule_records() {
     use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
@@ -731,32 +680,41 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
     let fixed = resident.target().iter().find(|weight| weight.stored_in_slots()).unwrap().clone();
     assert_eq!(fixed.shape, [1, TABLE_ROWS, width]);
-    let reservation = seismic::Reservation { granule: 1 << 16, host_addressed: true, chunks: Some(seismic::ReservationChunks { unit: 1 << 14, table: seismic::Contract::DeviceOnly }) };
-    let banked = resident.clone().with_expert_bank_at_floor(&definition, cuda(reservation, HostTier::Linked(reservation))).unwrap();
-    let [table] = &banked.expert_bank().unwrap().tables[..] else {
+    let banked = resident.clone().with_expert_bank_at_floor(&definition, cuda(HostTier::Unified(Parking::InKernels))).unwrap();
+    let bank = banked.expert_bank().unwrap();
+    let [table] = &bank.tables[..] else {
         panic!("the bank holds the stored table");
     };
+    let granule = bank.granule();
     let row = representation_bytes(fixed.resident, &[1, width]).unwrap();
     let (records, record_rows, record_bytes) = (table.records.get(), table.record_rows.get(), table.record_bytes.get());
-    assert_eq!(record_bytes % reservation.granule, 0);
+    assert_eq!(record_rows, granule / row);
     assert_eq!(record_bytes, record_rows * row);
-    assert_eq!(record_bytes / reservation.granule, row / gcd(row, reservation.granule));
+    assert!(record_bytes <= granule && granule - record_bytes < row);
     assert_eq!(records, TABLE_ROWS / record_rows);
     assert!(records * record_rows <= TABLE_ROWS);
     let step_rows = heads * magnitude_batching::MAX_CLASS_ROWS as u64;
     assert_eq!(table.floor, step_rows.div_ceil(record_rows));
     let held = banked.target().iter().find(|weight| weight.role == fixed.role).unwrap();
     assert_eq!(held.shape, [records, record_rows, width]);
-    assert_eq!(held.resident_bytes, records * record_bytes);
+    assert_eq!(held.resident_bytes, records * granule);
+    assert_eq!(BankTable::charge(bank.block(), granule, records).unwrap(), held.resident_bytes);
     assert_eq!(held.record_table_entries().unwrap(), records);
+    let ported = banked.clone().with_record_ports(seismic::BackendName::Cuda);
+    assert_eq!(ported.weight_device_allocations(held).unwrap(), Vec::<u64>::new(), "banked stored table's slot table is host-shared, not device-only");
+    let directory = held.storage_bytes().unwrap() - held.resident_bytes;
+    let slot_table = seismic::record_table_bytes(records).unwrap();
+    assert_eq!(
+        ported.weight_storage_bytes(held).unwrap(),
+        held.resident_bytes + directory + slot_table,
+        "planned storage bytes include the banked stored table's host-shared slot address table"
+    );
     assert_eq!(banked.clone().unbanked().target(), resident.target());
-    let unaddressed = seismic::Reservation { host_addressed: false, ..reservation };
-    let fixed_table = resident.clone().with_expert_bank_at_floor(&definition, cuda(unaddressed, HostTier::Linked(unaddressed))).unwrap();
-    assert!(fixed_table.expert_bank().unwrap().tables.is_empty());
-    assert_eq!(fixed_table.target().iter().find(|weight| weight.role == fixed.role), Some(&fixed));
-    // A reservation that backs no granule holds no records: refused.
-    let ungranular = seismic::Reservation { granule: 0, ..reservation };
-    assert!(BankTable::of(&fixed, 1, ungranular).is_err());
+    let linked = resident.clone().with_expert_bank_at_floor(&definition, cuda(HostTier::Linked)).unwrap();
+    assert!(linked.expert_bank().unwrap().tables.is_empty());
+    assert_eq!(linked.target().iter().find(|weight| weight.role == fixed.role), Some(&fixed));
+    // A granule short of a row holds none: the table stays fixed.
+    assert_eq!(BankTable::of(&fixed, 1, row - 1).unwrap(), None);
 }
 
 /// A bank's layers are at least one, each of experts, so the most any
@@ -773,7 +731,7 @@ fn a_banks_layers_have_experts() {
 
 /// Every routed layer's expert stacks become its group's records: the
 /// shape every member addresses, charged its own slots, imported from
-/// nothing; the weights grow by `slot_bytes` a slot, and the program
+/// nothing; the weights grow by a granule a record a slot commits, and the program
 /// plan names each streamed block's bank.
 #[test]
 fn a_bank_plans_every_routed_layer_into_its_groups_records() {
@@ -797,12 +755,11 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
         crate::planning::fixtures::LIMITS,
     )
     .unwrap();
-    assert!(dense.with_expert_bank_at_floor(&definition, cuda(RESERVATION, HostTier::Linked(RESERVATION))).is_ok());
+    assert!(dense.with_expert_bank_at_floor(&definition, cuda(HostTier::Linked)).is_ok());
     let resident =
         ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    // Byte granules: the weights follow the slots exactly.
-    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
-    let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
+    let banked = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
+    let floor = resident.bank_floor(&definition, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
     let (three, four) = (banked(floor), banked(floor + 1));
     let bank = three.expert_bank().unwrap();
     assert_eq!((bank.widest().get(), bank.selected(), bank.groups().len()), (32, 2, 1));
@@ -824,10 +781,10 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
         assert_eq!(weight.source_bytes, 0);
     }
     assert_eq!(three.target().iter().filter(|weight| weight.banked().is_some()).count(), 6);
-    assert_eq!(
-        four.weight_bytes().unwrap() - three.weight_bytes().unwrap(),
-        bank.slot_bytes().unwrap()
-    );
+    // A slot past the floor commits a record of each layer, a granule of
+    // the pool each.
+    assert_eq!(four.weight_bytes().unwrap() - three.weight_bytes().unwrap(), 2 * bank.granule());
+    assert!(bank.granule() >= bank.slot_bytes().unwrap() / 2);
     let programs = three
         .program_plan(&definition, magnitude_state::KvCodec::AffineK8V4)
         .unwrap();
@@ -847,11 +804,11 @@ fn a_bank_plans_every_routed_layer_into_its_groups_records() {
     // From its floor to every expert: a bank of every expert is whole,
     // its layers' homes its records end to end. On unified memory a
     // bank below its floor is refused.
-    assert!(resident.clone().with_expert_bank(&definition, 33, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).is_err());
-    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Unified(Parking::InKernels)));
+    assert!(resident.clone().with_expert_bank(&definition, 33, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).is_err());
+    let unified = |slots| resident.clone().with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, cuda(HostTier::Unified(Parking::InKernels)));
     let floor = unified(32).unwrap().expert_bank().unwrap().floor();
     assert!(floor > 0 && unified(floor).is_ok() && unified(floor - 1).is_err(), "unified floor {floor}");
-    let whole = resident.clone().with_expert_bank(&definition, 32, 1, FlightDepth::PIPELINED, cuda(BYTES, HostTier::Linked(BYTES))).unwrap();
+    let whole = resident.clone().with_expert_bank(&definition, 32, 1, FlightDepth::PIPELINED, cuda(HostTier::Linked)).unwrap();
     let bank = whole.expert_bank().unwrap();
     assert!(bank.whole() && !three.expert_bank().unwrap().whole());
     assert_eq!((bank.home(0), bank.home(1)), (0, 32));
@@ -878,7 +835,7 @@ fn a_route_predicts_only_layers_of_its_own_elements() {
     let banked = |manifest| {
         ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
             .unwrap()
-            .with_expert_bank_at_floor(&definition, cuda(BYTES, HostTier::Linked(BYTES)))
+            .with_expert_bank_at_floor(&definition, cuda(HostTier::Linked))
     };
     let manifest = streamed_experts_manifest(&definition);
     let plan = banked(manifest.clone()).unwrap();
@@ -923,20 +880,7 @@ fn banked_target_graphs_build_on_metal() {
         head: false,
         vision: false,
     };
-    for host in [HostTier::Linked(RESERVATION), HostTier::Unified(Parking::InKernels)] {
-    let load = ModelLoadPlan::derive(
-        &manifest,
-        &definition,
-        selection,
-        resident_layout(ExecutionPath::Native, backend),
-        crate::PlannedMethod::Plain,
-        crate::planning::fixtures::LIMITS,
-    )
-    .unwrap()
-    .with_expert_bank_at_floor(&definition, BankSubstrate { backend, reservation: RESERVATION, host })
-    .unwrap();
     let codec = magnitude_state::KvCodec::Dense;
-    let plan = load.program_plan(&definition, codec).unwrap();
     let limits = ResourceLimits {
         max_launch_rows: 64,
         max_launch_slots: 8,
@@ -949,6 +893,19 @@ fn banked_target_graphs_build_on_metal() {
         chain_capacity: std::num::NonZeroUsize::MIN,
         conversations: std::num::NonZeroUsize::MIN,
     };
+    for host in [HostTier::Linked, HostTier::Unified(Parking::InKernels)] {
+    let resident = ModelLoadPlan::derive(
+        &manifest,
+        &definition,
+        selection,
+        resident_layout(ExecutionPath::Native, backend),
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let substrate = crate::planning::bank_substrate(backend, seismic::NativeAllocations::EXACT, Some(host), &definition).unwrap();
+    let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+    let plan = load.program_plan(&definition, codec).unwrap();
     let state = ResourcePlanner::state_plan(
         &definition,
         &load,
@@ -958,6 +915,7 @@ fn banked_target_graphs_build_on_metal() {
         ResourceCapacity {
             domain_bytes: 16 * 1024 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -979,39 +937,34 @@ fn banked_target_graphs_build_on_metal() {
     }
 }
 
-/// A recorded discrete Vulkan device (the RTX 3090's reservation facts,
-/// `seismic_vulkan::reservation_form`) reads files into its host tier,
-/// whatever its device reservation says: the plan's carrier is the
-/// tier's, in a reservation the host addresses, so a conveyor in memory
-/// the host does not read into has no representation.
+/// A recorded discrete Vulkan device (the RTX 3090's) reads files into its
+/// host tier, linked across its link: the plan's carrier is the tier's,
+/// so a conveyor in memory the host does not read into has no
+/// representation.
 #[test]
 fn a_discrete_vulkan_conveyor_lies_in_its_host_tier() {
     use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
     let topology = seismic::fixtures::recorded::rtx3090();
     let executor = topology.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Vulkan).unwrap();
-    let reservation = executor.reserving(seismic::ReservedContract::DeviceOnly).unwrap().unwrap();
-    let host = crate::platform::host_tier(&topology, executor).unwrap().unwrap();
-    let HostTier::Linked(tier) = host else {
-        panic!("a discrete device's tier is linked");
-    };
-    assert!(tier.host_addressed);
+    let host = crate::platform::host_tier(&topology, executor).unwrap();
+    assert_eq!(host, HostTier::Linked, "a discrete device's tier is linked");
     let definition = qwen4exp_fixture_definition();
     let manifest = streamed_experts_manifest(&definition);
     let selection = crate::ComponentSelection { head: false, vision: false };
     let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
-    let substrate = BankSubstrate { backend: seismic::BackendName::Vulkan, reservation, host };
-    let load = resident.with_expert_bank_at_floor(&definition, substrate).unwrap();
+    let load = resident.with_expert_bank_at_floor(&definition, BankSubstrate { backend: seismic::BackendName::Vulkan, allocations: seismic::NativeAllocations::EXACT, host }).unwrap();
     let bank = load.expert_bank().unwrap();
     assert!(matches!(bank.conveyor().carrier, ConveyorCarrier::HostTier(_)));
     assert!(bank.layout().unwrap().host.is_some());
 }
 
 /// The conveyor lies in the bottom records of the group of the most
-/// experts, two rounds' records of each staging pool laid as its
-/// lender's records pack them, in the store the host reads files into:
-/// on unified memory the bank's own, its lent records the scratch's too;
-/// beside a discrete device the host tier's, so the bank's least records
-/// count its lent scratch alone. No allocation of its own exists.
+/// experts, two rounds' records of each staging pool end to end, in the
+/// store the host reads files into: on unified memory the bank's own, its
+/// lent records the scratch's too; beside a discrete device the host
+/// tier's, so the bank's least records count its lent scratch alone. The
+/// lent records are each lender's allocation of their own, which the
+/// store's bottom records view.
 #[test]
 fn the_conveyor_lies_in_the_store_the_host_reads_into() {
     let discrete = bank(&[37, 3], 64);
@@ -1049,11 +1002,26 @@ fn the_conveyor_lies_in_the_store_the_host_reads_into() {
     assert_eq!(unified.prompt_records(1), 0, "a group that lends nothing");
     assert!(unified.least_records(0) >= unified.prompt_records(0));
     assert!(unified.records_at(0, unified.floor()) >= unified.prompt_records(0));
+    // Each lent allocation: the lender's lent records of each of its
+    // routed tensors, in its tier.
+    for (plan, lent) in [(&unified, vec![(BankTier::Bank, unified.lent(0))]), (&discrete, vec![(BankTier::Bank, discrete.lent(0)), (BankTier::Host, discrete.host_lent(0))])] {
+        let layout = plan.layout().unwrap();
+        assert_eq!(layout.lent.len(), lent.len());
+        for (allocations, (tier, records)) in layout.lent.iter().zip(lent) {
+            for ((kind, allocation), (_, tensor)) in allocations.iter().zip(plan.groups()[0].record.iter()) {
+                assert_eq!(
+                    allocation,
+                    &BankAllocation::Lent { tier, group: 0, kind, element: tensor.resident, extents: vec![records, tensor.matrix[0], tensor.matrix[1]] }
+                );
+            }
+        }
+    }
 }
 
-/// The bank's bytes are its layout's, each allocation as charged: every
-/// word part of every layer, group and the load at its graph ports'
-/// shape, and the staging pools.
+/// The bank's bytes are its layout's, each allocation as charged, and its
+/// pools' granules of the records it commits: every word part of every
+/// layer, group and the load at its graph ports' shape, the staging
+/// pools and the lent records.
 #[test]
 fn a_bank_charges_every_allocation_of_its_layout() {
     let plan = bank(&[3, 1], 64);
@@ -1079,8 +1047,10 @@ fn a_bank_charges_every_allocation_of_its_layout() {
     let total = layout
         .iter()
         .chain(&floor)
-        .map(|allocation| allocation.charged_bytes(&RESERVATION).unwrap())
-        .sum::<u64>();
+        .map(|allocation| allocation.charged_bytes(plan.host()).unwrap())
+        .sum::<u64>()
+        + plan.resident_charge(plan.slots).unwrap()
+        + plan.host_charge(0).unwrap();
     assert_eq!(plan.bytes().unwrap(), total);
     let records = (0..plan.layers().len()).map(|index| plan.banked_bytes(index).unwrap().into_iter().sum::<u64>());
     assert_eq!(plan.charged_beyond_records().unwrap(), total - records.sum::<u64>());
@@ -1163,7 +1133,7 @@ fn a_banked_stack_is_its_stored_experts_or_a_row_range_of_each() {
 #[test]
 fn every_byte_the_bank_demands_has_its_owner() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified(Parking::InKernels));
-    let with = beside(without.clone(), HostTier::Linked(BYTES));
+    let with = beside(without.clone(), HostTier::Linked);
     for plan in [without, with] {
         let charges = plan.charges().unwrap();
         let total = charges.iter().try_fold(ClaimDemand::default(), |total, &(_, demand)| total.checked_plus(demand)).unwrap();
@@ -1217,7 +1187,7 @@ fn every_placed_parts_stride_is_whole_u64s() {
 /// own records, which its floor holds.
 #[test]
 fn a_linked_tiers_landing_rows_are_its_loads_claim() {
-    let linked = beside(bank(&[37, 3], 0), HostTier::Linked(BYTES));
+    let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
     let row: u64 = linked
         .groups()

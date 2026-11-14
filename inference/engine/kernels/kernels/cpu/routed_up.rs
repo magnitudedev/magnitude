@@ -57,11 +57,10 @@ fn routed_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
         return;
     };
     let (bank, tier) = (cx.arg_expert_up(), cx.arg_tier_up());
-    let (up, record) = place.of(&bank, &tier);
-    let first = routed::expert_row(record, f) + rows.start;
+    let up = place.of(&bank, &tier);
     routed::activated_into::<E::A>(
-        up,
-        first,
+        &up,
+        rows.start,
         &staged[row * h..(row + 1) * h],
         q8,
         cx.arg_activation(),

@@ -1,7 +1,7 @@
 //! What moving a load's experts costs on this machine, beside what its
 //! kernels cost ([`super::executor_costs`]) and where a miss is computed
-//! ([`super::cost`]): the reads, landings, moves and transfers the cost
-//! function, the prompt-group model and the shrink take from measurement.
+//! ([`super::cost`]): the reads, landings and transfers the cost function
+//! and the prompt-group model take from measurement.
 //!
 //! - **The model store's read line** ([`StorageCosts`]): a read of `b`
 //!   bytes takes `λ + b / D`, measured by the job on a probe file of its
@@ -14,14 +14,6 @@
 //! - **The landing line** ([`FileLine`]): what a request's file misses add
 //!   past their reads as the host lands them into a host tier (on unified
 //!   memory the device's convert prices it, `cost::LandingLine`).
-//! - **The shrink's move line** ([`MoveCosts`]), per bank group: moving `n`
-//!   records of the group's own record form takes `μ₀ + n · μ₁`, its
-//!   `routed_move` launches (one per routed tensor) timed moving none and
-//!   the most one shrink moves, at most a move point's records (a move's
-//!   time grows by one copy pass per `LIST_ROWS` records, so the point holds
-//!   only what it moves). The heap charges a bank step's exchange each
-//!   moving group's line at the records it moves until a resize was timed
-//!   ([`MoveCosts::of_bank`], [`MoveLines`]).
 //! - **The convert's ceiling** ([`ConvertCosts`]), per bank group: a stored
 //!   record's conversion into its resident form by a landing launch
 //!   (`routed_land`, every routed tensor of each entry), from staging and
@@ -35,11 +27,11 @@
 //!   the slope through sweeps of none and of a span beyond the host's
 //!   caches.
 //!
-//! The move, convert and host memory lines are points a load requests of
-//! the measurement job (`PointRequest`), keyed by the executor and the form
-//! or readers they depend on ([`PointKey`]); the job measures them
-//! (`MoveForm::measure`, `ConvertForm::measure`, `MemoryCosts::measure`) and
-//! a load reads them from the records ([`MoveCosts::stored`]), measuring
+//! The convert and host memory lines are points a load requests of the
+//! measurement job (`PointRequest`), keyed by the executor and the form or
+//! readers they depend on ([`PointKey`]); the job measures them
+//! (`ConvertForm::measure`, `MemoryCosts::measure`) and a load reads them
+//! from the records ([`ConvertCosts::stored`]), measuring
 //! nothing: until they are stored, a load's decision runs its policy that
 //! needs no cost. No figure is fitted: each is a line through measured
 //! points (`seismic::measure::Sums::fit`), of no negative term by
@@ -49,7 +41,7 @@
 use super::executor_costs::{executor_identity, failed, named, ExecutorCostsError, Formation, Walks};
 use crate::operators::routed::streamed::land_launch;
 use crate::planning::{BankBinding, ExpertBankPlan, RecordTensor, RecordTensors};
-use magnitude_kernels::{constants, routed_copy, routed_land, routed_move};
+use magnitude_kernels::{constants, routed_copy, routed_land};
 use seismic::measure::{
     Gauge, InvalidLine, Pending, Reason, Record, RecordStore, StoreError, Sums, Terms, Timing, Unformed, Work,
 };
@@ -298,275 +290,6 @@ impl Pending<String> for Done {
         Ok(self.0)
     }
     fn wait(&self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// A bank group's records as its shrink moves them: each routed tensor's
-/// record (one `routed_move` launch apiece, as the bank moves them), and
-/// the most records one shrink moves (`L`, `ExpertBankPlan::move_records`).
-/// What a move line's points are requested by (`PointRequest::Moves`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MoveForm {
-    pub record: RecordTensors<RecordTensor>,
-    pub moves: u64,
-}
-
-/// A bank's shrink move lines ([`MoveCosts::of_bank`]): the line of each
-/// group whose shrink can move records (`ExpertBankPlan::move_records`, its
-/// `routed_move` list), at its own record form, with the group. Any other
-/// group holds the same records at every slots from the floor to the
-/// widest, so no shrink retires or moves a record of it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MoveLines(Vec<(usize, RecordLine)>);
-
-impl MoveLines {
-    /// The device seconds a shrink takes that moves `moved(g)` records of
-    /// each group `g` that can move: each moving group's launches, a group
-    /// moving none launching nothing.
-    pub fn seconds(&self, moved: impl Fn(usize) -> u64) -> f64 {
-        self.0
-            .iter()
-            .map(|&(group, line)| match moved(group) {
-                0 => 0.,
-                records => line.seconds(records),
-            })
-            .sum()
-    }
-}
-
-/// Why a move form's line could not be had; each point is named by the
-/// records it moves.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MoveError {
-    Executor(ExecutorCostsError),
-    Store(StoreError),
-    Unrecorded { moved: u64 },
-    Unobtainable { moved: u64, reason: Reason },
-    /// Moving more records took no longer: `(records, seconds)` each.
-    Flat { points: [(u64, f64); 2] },
-}
-
-impl fmt::Display for MoveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Executor(error) => write!(formatter, "{error}"),
-            Self::Store(error) => write!(formatter, "a move record: {error}"),
-            Self::Unrecorded { moved } => write!(formatter, "no record of a move of {moved} records"),
-            Self::Unobtainable { moved, reason } => {
-                write!(formatter, "a move of {moved} records is unobtainable: {reason}")
-            }
-            Self::Flat { points: [first, second] } => write!(
-                formatter,
-                "moving {} records took {:.3e} s, no longer than {} took {:.3e} s",
-                second.0, second.1, first.0, first.1
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MoveError {}
-
-impl From<ExecutorCostsError> for MoveError {
-    fn from(error: ExecutorCostsError) -> Self {
-        Self::Executor(error)
-    }
-}
-
-impl From<StoreError> for MoveError {
-    fn from(error: StoreError) -> Self {
-        Self::Store(error)
-    }
-}
-
-/// A move form's line on an executor, through a move of none and of the
-/// most records a point moves ([`MoveForm::moved`]), the launches' fixed
-/// cost in its fixed term.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MoveCosts {
-    pub line: RecordLine,
-}
-
-impl MoveForm {
-    /// The most records a point moves: the form's moves, at most a move
-    /// point's (`MOVED_RECORDS`). A move's time is a launch's plus one copy
-    /// pass per `LIST_ROWS` records, so the line through it holds at every
-    /// move up to the form's, and the point holds only the records it moves
-    /// (twice them, the upper moved onto the lower), not a whole shrink's.
-    fn moved(&self) -> u64 {
-        self.moves.min(super::executor_costs::MOVED_RECORDS)
-    }
-
-    /// Each routed tensor's `routed_move` over a point's records, its list
-    /// as the bank forms it at the form's moves (`L`).
-    fn moves(&self) -> RecordTensors<Formation<routed_move::Entry>> {
-        let (moves, records) = (self.moves, 2 * self.moved());
-        self.record.map(|_, tensor| {
-            let [n, k] = tensor.matrix;
-            Formation::new(
-                routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
-                &[("D", records), ("L", moves), ("N", n), ("K", k)],
-            )
-        })
-    }
-
-    /// The records a point moves: none, and [`Self::moved`].
-    fn points(&self) -> [u64; 2] {
-        [0, self.moved()]
-    }
-
-    fn key(
-        &self,
-        executor: &seismic::Identity,
-        backend: seismic::BackendName,
-        moved: u64,
-    ) -> Result<PointKey, ExecutorCostsError> {
-        let mut configuration = named(&[("L", self.moves)]);
-        for (index, (_, tensor)) in self.record.iter().enumerate() {
-            configuration.extend(named(&[
-                (&format!("{index}.n"), tensor.matrix[0]),
-                (&format!("{index}.k"), tensor.matrix[1]),
-            ]));
-        }
-        Ok(PointKey {
-            executor: executor.clone(),
-            kernels: self
-                .moves()
-                .iter()
-                .map(|(_, formation)| formation.identity(backend))
-                .collect::<Result<_, _>>()?,
-            configuration,
-            point: named(&[("moved", moved)]),
-        })
-    }
-}
-
-/// One move's graph: each routed tensor's `routed_move` of the first
-/// `moved` list entries, record `M + i` onto record `i`, over `2M` zero
-/// records (`M` the form's [`MoveForm::moved`]).
-fn move_point(
-    device: &Device,
-    kernels: &RecordTensors<NativeKernel<routed_move::Entry>>,
-    form: &MoveForm,
-    moved: u64,
-) -> Result<Point, ExecutorCostsError> {
-    let error = failed("move point");
-    let most = form.moved();
-    let mut graph = device.native_graph();
-    let words = magnitude_kernels::list_extent(form.moves);
-    let mut ports = Vec::new();
-    for ((_, kernel), (_, tensor)) in kernels.iter().zip(form.record.iter()) {
-        let [n, k] = tensor.matrix;
-        let mut records = graph.port(tensor.resident, &[2 * most, n, k]).map_err(|cause| error(&cause))?;
-        let list = graph.port(Element::i32(), &[words]).map_err(|cause| error(&cause))?;
-        graph
-            .enqueue(
-                kernel,
-                routed_move::WorkflowArgs {
-                    records: records.tensor_mut().into(),
-                    list: list.tensor().into(),
-                },
-            )
-            .map_err(|cause| error(&cause))?;
-        ports.push((records, list, *tensor));
-    }
-    let plan = graph.seal().map_err(|cause| error(&cause))?;
-    let mut list = vec![0i32; words as usize];
-    list[constants::LIST_COUNT as usize] = moved as i32;
-    for entry in 0..most {
-        let at = magnitude_kernels::list_extent(entry) as usize;
-        list[at + constants::LIST_FROM as usize] = (most + entry) as i32;
-        list[at + constants::LIST_TO as usize] = entry as i32;
-    }
-    let list = list.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    let mut bound = Vec::new();
-    for (records, port, tensor) in &ports {
-        let [n, k] = tensor.matrix;
-        bound.push((records, Tensor::zeros(device, tensor.resident, &[2 * most, n, k]).map_err(|cause| error(&cause))?));
-        bound.push((
-            port,
-            Tensor::from_host(device, Element::i32(), &[words], &list).map_err(|cause| error(&cause))?,
-        ));
-    }
-    let mut bindings = plan.bindings();
-    for (port, tensor) in &bound {
-        bindings.set(port, tensor).map_err(|cause| error(&cause))?;
-    }
-    plan.point(bindings, GraphTiming::Device)
-        .map(Point::Graph)
-        .map_err(|cause| error(&cause))
-}
-
-impl MoveCosts {
-    /// `form`'s move line on `executor` that `store`'s records give,
-    /// measuring and forming nothing; why there is none.
-    pub fn stored(
-        topology: &DeviceTopology,
-        executor: &Executor,
-        form: MoveForm,
-        store: &dyn RecordStore<PointKey>,
-    ) -> Result<Self, MoveError> {
-        let identity = executor_identity(topology, executor)?;
-        let [none, most] = form.points().map(|moved| {
-            let key = form.key(&identity, executor.backend(), moved)?;
-            let timing = match store.load(&key)? {
-                Some(Record::Measured(timing)) => timing,
-                Some(Record::Unobtainable { reason }) => return Err(MoveError::Unobtainable { moved, reason }),
-                None => return Err(MoveError::Unrecorded { moved }),
-            };
-            Ok((moved, timing.median))
-        });
-        let medians = [none?, most?];
-        let line = rising(medians).ok_or(MoveError::Flat { points: medians })?;
-        Ok(Self { line: RecordLine(line) })
-    }
-
-    /// The move lines of a shrink of `plan`'s bank on `executor`, which pace
-    /// a shrink to a decode step: each group's whose shrink can move records,
-    /// at its own records and the most records one shrink moves, as
-    /// `store`'s records give them ([`Self::stored`]); why there are none.
-    pub fn of_bank(
-        topology: &DeviceTopology,
-        executor: &Executor,
-        plan: &ExpertBankPlan,
-        store: &dyn RecordStore<PointKey>,
-    ) -> Result<MoveLines, MoveError> {
-        Self::forms(plan)
-            .map(|(group, form)| Ok((group, Self::stored(topology, executor, form, store)?.line)))
-            .collect::<Result<_, _>>()
-            .map(MoveLines)
-    }
-
-    /// Each group of `plan` whose shrink can move records, with its form:
-    /// what a load requests the move lines of (`PointRequest::Moves`).
-    pub fn forms(plan: &ExpertBankPlan) -> impl Iterator<Item = (usize, MoveForm)> + '_ {
-        plan.groups()
-            .iter()
-            .enumerate()
-            .map(|(group, members)| (group, MoveForm { record: members.record, moves: plan.move_records(group) }))
-            .filter(|(_, form)| form.moves > 0)
-    }
-}
-
-impl MoveForm {
-    /// Measure the form's points in the measurement job (`walks`): moves of
-    /// none and of [`Self::moved`] records, the kernels formed with the
-    /// first attempted.
-    pub(super) fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
-        let device = walks.device();
-        type Formed = Result<RecordTensors<NativeKernel<routed_move::Entry>>, ExecutorCostsError>;
-        let formed = OnceCell::<Formed>::new();
-        for moved in self.points() {
-            let key = self.key(&walks.identity(), device.backend(), moved)?;
-            let formed = &formed;
-            walks.time(key, false, move || {
-                let kernels = formed
-                    .get_or_init(|| self.moves().try_map(|_, formation| formation.form(device, None)))
-                    .as_ref()
-                    .map_err(|error| Unformed::Never(error.clone()))?;
-                move_point(device, kernels, self, moved).map_err(Unformed::Now)
-            });
-        }
         Ok(())
     }
 }
@@ -2051,9 +1774,6 @@ mod tests {
     }
     use seismic::Measurer;
 
-    use crate::source_element;
-    use magnitude_artifacts::gguf::Encoding;
-
     /// What a job's device holds per graph is what a load then reads, with
     /// nothing opened; nothing recorded reads as none.
     #[test]
@@ -2174,20 +1894,20 @@ mod tests {
         let step_words = (0..constants::STEP_WORDS).map(|word| i32::from(word == 0)).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
         let step = Tensor::from_host(&device, Element::i32(), &[constants::STEP_WORDS], &step_words).unwrap();
         let (sources, destinations) = (256u64, 512u64);
-        // Each side either the device's own memory or reserved as the bank
-        // is, as a lent scratch and the bank's records are.
-        let tensor = |reserved: bool, records: u64| match reserved {
+        // Each side either the device's own memory or pooled as the bank's
+        // records are.
+        let tensor = |pooled: bool, records: u64| match pooled {
             true => {
-                let (tensor, resizer) =
-                    crate::planning::BankAllocation::reserve(&device, crate::planning::BankTier::Bank.contract_on(&device), byte, &[records, 1, per], records, None).unwrap();
-                (tensor, Some(resizer))
+                let contract = crate::planning::BankTier::Bank.contract_on(&device);
+                let pooled = crate::experts::pooled_records(&device, contract, byte, &[1, per], records, records).unwrap();
+                (pooled.records.clone(), Some(pooled))
             }
             false => (Tensor::zeros(&device, byte, &[records, 1, per]).unwrap(), None),
         };
-        for (source_reserved, destination_reserved) in [(false, true), (false, false), (true, false), (true, true)] {
-            let (source, _source_resizer) = tensor(source_reserved, sources);
-            let (destination, _resizer) = tensor(destination_reserved, destinations);
-            let placed = |reserved: bool| if reserved { "reserved" } else { "device" };
+        for (source_pooled, destination_pooled) in [(false, true), (false, false), (true, false), (true, true)] {
+            let (source, _source_store) = tensor(source_pooled, sources);
+            let (destination, _destination_store) = tensor(destination_pooled, destinations);
+            let placed = |pooled: bool| if pooled { "pooled" } else { "device" };
             for (copied, sequence) in [(0u64, 0), (1, 1), (16, 1), (sources, 1)] {
                 let words = magnitude_kernels::list_extent(sources);
                 let mut list = vec![0i32; words as usize];
@@ -2274,111 +1994,14 @@ mod tests {
                 };
                 eprintln!(
                     "seed copy, {} {sources} -> {} {destinations}, {copied} records: {:.1} µs, {:.1} µs a record, {:.2} GB/s",
-                    placed(source_reserved),
-                    placed(destination_reserved),
+                    placed(source_pooled),
+                    placed(destination_pooled),
                     median * 1e6,
                     if copied > 0 { median * 1e6 / copied as f64 } else { 0. },
                     copied as f64 * per as f64 / median / 1e9,
                 );
             }
         }
-    }
-
-    /// A shrink's moves take each moving group's line at the records it
-    /// moves, its launches' fixed cost once; a group moving none launches
-    /// nothing.
-    #[test]
-    fn a_shrinks_moves_take_each_moving_groups_line() {
-        let line = |fixed_seconds, record_seconds| RecordLine::new(fixed_seconds, record_seconds).unwrap();
-        // Groups 0 and 2 can move; group 1 cannot.
-        let lines = MoveLines(vec![(0, line(1e-4, 1e-6)), (2, line(2e-4, 3e-6))]);
-        let moving = |moved: [u64; 3]| move |group: usize| moved[group];
-        assert_eq!(lines.seconds(moving([0, 0, 0])), 0.);
-        assert_eq!(lines.seconds(moving([10, 0, 0])), 1e-4 + 10. * 1e-6);
-        assert_eq!(lines.seconds(moving([10, 0, 2])), (1e-4 + 10. * 1e-6) + (2e-4 + 2. * 3e-6));
-    }
-
-    /// A shrink's move line is measured at each form's own records and
-    /// moves, on every native backend the run selects with an available
-    /// executor, as the measurement job measures a load's request of it with
-    /// nothing stored: it rises with the records moved, its fixed cost the
-    /// launches', each form its own line, restored once measured. Every such
-    /// backend opens and is measured, and the backends measured are printed;
-    /// a run that selects none (the CPU's) has none to measure.
-    #[test]
-    fn the_move_line_is_measured_at_the_banks_own_form() {
-        let devices = seismic::Devices::discover(&[]).unwrap();
-        let available = [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan]
-            .into_iter()
-            .filter(|&backend| crate::test_support::available(&devices, backend))
-            .collect::<Vec<_>>();
-        if available.is_empty() {
-            return;
-        }
-        let mut measured = Vec::new();
-        for &backend in &available {
-            let device = crate::test_support::open_backend(&devices, backend)
-                .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
-            move_lines_are_measured_at_the_banks_own_form(&device);
-            measured.push(backend);
-        }
-        eprintln!("move lines measured on {measured:?}");
-    }
-
-    fn move_lines_are_measured_at_the_banks_own_form(device: &Device) {
-        let records = std::env::temp_dir().join(format!("move-lines-{}-{:?}", std::process::id(), device.backend()));
-        let store = seismic::measure::JsonFileStore::new(&records);
-        let layout = crate::resident_layout(crate::ExecutionPath::Native, device.backend());
-        let form = |[features, hidden]: [u64; 2], moves| {
-            let tensor = |matrix: [u64; 2]| RecordTensor {
-                source: source_element(Encoding::Q4K, matrix[1]).unwrap(),
-                resident: crate::resident_element(
-                    Encoding::Q4K,
-                    magnitude_family_contracts::ScaledActivations::Rounded,
-                    matrix[1],
-                    seismic::DType::BF16,
-                    layout,
-                )
-                .unwrap(),
-                matrix,
-            };
-            MoveForm {
-                record: RecordTensors {
-                    gate: Some(tensor([features, hidden])),
-                    up: tensor([features, hidden]),
-                    down: tensor([hidden, features]),
-                },
-                moves,
-            }
-        };
-        // Each form requested of the job, which measures its points, then
-        // read from the records.
-        let measured = |form: MoveForm| {
-            let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = super::super::requests::JobDeadlines::new(Instant::now(), std::time::Duration::from_secs(120));
-            let requests = super::super::Outstanding { standing: Vec::new(), loads: vec![super::super::PointRequest::Moves(form)] };
-            let ended = super::super::requests::measure(&mut measurer, device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
-            assert!(ended.ended.is_empty() && ended.failures.is_empty(), "{ended:?}");
-            MoveCosts::stored(device.topology(), device.info(), form, &store).unwrap()
-        };
-        // Q4_K rows of whole 256-value blocks.
-        let (large, small) = (form([512, 2048], 32), form([256, 256], 32));
-        let costs = [large, small].map(measured);
-        for costs in &costs {
-            assert!(costs.line.0.slope() > 0. && costs.line.0.fixed() > 0., "{:?}", costs.line);
-        }
-        assert_ne!(costs[0].line, costs[1].line, "each form has its own line");
-        for (form, costs) in [large, small].into_iter().zip(&costs) {
-            assert_eq!(MoveCosts::stored(device.topology(), device.info(), form, &store).unwrap().line, costs.line);
-        }
-        // A whole bank's shrink (here a million records' list, gigabytes
-        // apiece were they all held) is measured at a move point's records:
-        // its point holds only what it moves.
-        let whole = form([512, 2048], 1 << 20);
-        assert_eq!(whole.points(), [0, 32]);
-        let whole = measured(whole);
-        assert!(whole.line.0.slope() > 0., "{:?}", whole.line);
-        std::fs::remove_dir_all(records).unwrap();
     }
 
     /// The landing launch is measured as the measurement job builds it, on
@@ -2402,7 +2025,7 @@ mod tests {
             let records = std::env::temp_dir().join(format!("convert-line-{}-{backend:?}", std::process::id()));
             let store = seismic::measure::JsonFileStore::new(&records);
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = super::super::requests::JobDeadlines::within(std::time::Duration::from_secs(120));
+            let deadline = super::super::requests::JobDeadlines::within(std::time::Duration::from_secs(300));
             let requests = super::super::Outstanding { standing: vec![super::super::PointRequest::Convert(form)], loads: Vec::new() };
             let mut visited = Vec::new();
             let ended = super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |key, outcome| {

@@ -153,7 +153,8 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     let devices = crate::devices::Devices::discover(&[]).unwrap();
     // Its own ledgers: the test bounds them alone.
     let cpu = devices.executor_of(registry::BackendName::Cpu).unwrap();
-    let device = devices.open_own_ledgers(cpu, Default::default()).unwrap();
+    let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let device = devices.open_own(cpu, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "reached-private.seismic".into(),
         text: source.into(),
@@ -182,8 +183,8 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
         )
         .unwrap(),
     );
-    let baseline = device.device_ledger().charged;
-    device.bounds().bound(crate::devices::Ledger::Own(device.device_store()), Some(baseline + 4096)).unwrap();
+    let baseline = tally.held();
+    tally.bound(baseline + 4096);
     let mut args = EncodedArgs::new();
     args.push_tensor(output.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(0));
@@ -199,7 +200,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     );
     assert_eq!(output.read_to_host().unwrap(), 7i32.to_le_bytes());
     assert_eq!(
-        device.device_ledger().charged,
+        tally.held(),
         baseline,
         "failed run released its private backing"
     );
@@ -225,7 +226,8 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let devices = crate::devices::Devices::discover(&[]).unwrap();
     // Its own ledgers: the test bounds them alone.
     let cpu = devices.executor_of(registry::BackendName::Cpu).unwrap();
-    let device = devices.open_own_ledgers(cpu, Default::default()).unwrap();
+    let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let device = devices.open_own(cpu, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "reached-geometry.seismic".into(),
         text: source.into(),
@@ -264,8 +266,8 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let output = tensor(&[4], &[0; 4]);
     let input = tensor(&[8, 2], &[0; 16]);
     let visible = tensor(&[4, 2], &[0, 0, 1, 4, 0, 8, 4, 5]);
-    let baseline = device.device_ledger().charged;
-    device.bounds().bound(crate::devices::Ledger::Own(device.device_store()), Some(baseline + 4096)).unwrap();
+    let baseline = tally.held();
+    tally.bound(baseline + 4096);
     let mut args = EncodedArgs::new();
     if with_inputs {
         args.push_tensor(input.clone());
@@ -280,7 +282,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
     assert_eq!(
-        device.device_ledger().charged,
+        tally.held(),
         baseline,
         "completed region releases private instances"
     );

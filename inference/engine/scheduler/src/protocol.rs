@@ -65,15 +65,12 @@ pub enum RoomRefusal {
     /// With the model's committed memory, it exceeds what the process may
     /// hold by `bytes`.
     Short { bytes: u64 },
-    /// The device's memory reading failed: no figure of it makes room.
-    Blind,
 }
 
 impl fmt::Display for RoomRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Short { bytes } => write!(f, "the model's committed memory leaves the measurement's room {bytes} bytes short"),
-            Self::Blind => f.write_str("the device's memory reading failed, so no room can be made"),
         }
     }
 }

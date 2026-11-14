@@ -1,15 +1,15 @@
-//! Status (spec §2.5): each store's headroom for this process and what is
-//! left of each grant, in backend-neutral types, from two sources. A
+//! Status (spec §2.5): host RAM at one instant, each volume's space and what
+//! is left of each grant, in backend-neutral types, from two sources. A
 //! [`Sample`] holds what needs no opened executor; a [`RuntimeStatus`] what
 //! only an opened executor knows, which the runtime reports. [`Status`]
-//! combines both, the input fit reads. Each driver figure's meaning is
-//! decided here, beside the reading.
+//! combines both. Each driver figure's meaning is decided here, beside the
+//! reading. What this process holds is the memory ledger's alone: no figure
+//! here counts it.
 
 use crate::gather::Natives;
-use crate::host::{HostStatus, ObservationError};
+use crate::host::{HostSample, ObservationError};
 use seismic_topology::{
-    AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, Store,
-    StoreId, StoreKind,
+    AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, StoreId, StoreKind,
 };
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -19,9 +19,8 @@ use std::time::SystemTime;
 pub struct Sample {
     /// When the sample was taken.
     pub taken: SystemTime,
-    /// Host RAM: the OS's availability, the process limits that bound it,
-    /// and distress.
-    pub host_ram: Result<HostStatus, ObservationError>,
+    /// Host RAM, read at the sample's instant ([`HostSample`]).
+    pub host: HostSample,
     /// Each volume's space available to this process.
     pub volumes: Vec<(StoreId, Result<Reported<u64>, ObservationError>)>,
     /// The executors whose grants the sample read.
@@ -35,9 +34,6 @@ pub struct Sample {
 /// What only opened executors know, as the runtime reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStatus {
-    /// Each store's ledger: the bytes this process's executors have charged
-    /// to it. A store absent here has no charge.
-    pub charges: Vec<(StoreId, u64)>,
     /// What is left of each grant of the status's executor only an opened
     /// executor reads: a discrete CUDA device's free memory (`ReportedBy::CudaFree`),
     /// and an integrated CUDA device's grant less what the executor holds.
@@ -55,45 +51,18 @@ pub struct Status {
 }
 
 impl Status {
-    /// The bytes this process has charged to `store`.
-    pub fn charged(&self, store: StoreId) -> u64 {
-        self.runtime
-            .charges
+    /// The space `volume` has available to this process. Host RAM's room is
+    /// [`HostSample::supply`]; a device's is the memory ledger's.
+    pub fn volume_space(&self, volume: StoreId) -> Result<u64, ObservationError> {
+        self.sample
+            .volumes
             .iter()
-            .filter(|(charged, _)| *charged == store)
-            .map(|(_, bytes)| bytes)
-            .sum()
-    }
-
-    /// What `store` has left for this process: host RAM's allocatable bytes
-    /// ([`HostStatus::allocatable_bytes`] under `reclaim`) within every process limit; a volume's space
-    /// available to this process; a device memory store's capacity less the
-    /// process's charges, which the OS does not report.
-    pub fn headroom(&self, store: &Store, reclaim: crate::host::Reclaim) -> Result<u64, ObservationError> {
-        match store.kind() {
-            StoreKind::HostRam => self
-                .sample
-                .host_ram
-                .as_ref()
-                .map(|host| host.allocatable_bytes(reclaim))
-                .map_err(Clone::clone),
-            StoreKind::Volume(_) => self
-                .sample
-                .volumes
-                .iter()
-                .find(|(volume, _)| *volume == store.id())
-                .ok_or_else(|| {
-                    ObservationError::Failed("the sample is of another topology revision".into())
-                })?
-                .1
-                .as_ref()
-                .map(|available| available.value)
-                .map_err(Clone::clone),
-            StoreKind::DeviceMemory(_) => Ok(store
-                .capacity()
-                .value
-                .saturating_sub(self.charged(store.id()))),
-        }
+            .find(|(of, _)| *of == volume)
+            .ok_or_else(|| ObservationError::Failed("the sample is of another topology revision".into()))?
+            .1
+            .as_ref()
+            .map(|available| available.value)
+            .map_err(Clone::clone)
     }
 
     /// What is left of `path`'s grant: the runtime's reading where an
@@ -126,9 +95,9 @@ pub(crate) fn sample(
     topology: &DeviceTopology,
     executors: &[ExecutorId],
     natives: &Natives,
-    host_ram: Result<HostStatus, ObservationError>,
 ) -> Sample {
     let taken = SystemTime::now();
+    let host = crate::host::host_sample();
     let volumes = topology
         .stores()
         .iter()
@@ -149,7 +118,7 @@ pub(crate) fn sample(
         .collect();
     Sample {
         taken,
-        host_ram,
+        host,
         volumes,
         executors: executors.to_vec(),
         grants,

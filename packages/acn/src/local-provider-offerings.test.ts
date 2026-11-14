@@ -209,7 +209,6 @@ describe("local provider offerings", () => {
             memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("system"),
             capacityBytes: 0,
             requiredBytes: 1,
-            compatibilityReserveBytes: 0,
             remainingBytes: -1,
           }],
           totalRequiredBytes: 1,

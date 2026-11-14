@@ -4,7 +4,6 @@ use crate::operators::routed::fused_graph::DECODE_ROWS;
 use crate::planning::weights::{Holding, WeightPlan, representation_bytes};
 use magnitude_family_contracts::{FeedForwardUp, ModelDefinition, Operator, RoutedFfn, WeightKind, WeightRole, WeightScope};
 use seismic::Element;
-use std::num::NonZeroU64;
 
 /// Each streamed layer's home, of `layers` in their order, each its group
 /// and its experts: the map word (and record) of its expert 0 in its
@@ -291,10 +290,72 @@ pub(super) fn record_bytes(element: Element, matrix: [u64; 2]) -> Result<u64, St
     representation_bytes(element, &[1, matrix[0], matrix[1]])
 }
 
-/// `bytes` as the record a reservation lays out
-/// (`seismic::Reservation::of_records`), which a record of none is not.
-pub(super) fn reserved_record(bytes: u64) -> Result<NonZeroU64, String> {
-    NonZeroU64::new(bytes).ok_or_else(|| "a reserved record has no bytes".to_owned())
+/// What a slab store needs of the granule pool it claims from: its slab's
+/// bytes, and the alignment each slab's start keeps
+/// (`seismic::SlabLayout::slab_alignment`). Several stores sharing one pool
+/// need the most bytes of any and an alignment every one keeps
+/// ([`Self::with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolSlab {
+    pub bytes: u64,
+    pub alignment: u64,
+}
+
+impl PoolSlab {
+    pub fn of(layout: &seismic::SlabLayout) -> Self {
+        Self { bytes: layout.slab_bytes, alignment: layout.slab_alignment }
+    }
+
+    /// The slab both `self`'s store and `other`'s fit in: the more bytes, at
+    /// the least multiple of both alignments.
+    pub fn with(self, other: Self) -> Result<Self, String> {
+        let (mut a, mut b) = (self.alignment, other.alignment);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let alignment = (self.alignment / a)
+            .checked_mul(other.alignment)
+            .ok_or_else(|| "a pool's slab alignment overflows".to_owned())?;
+        Ok(Self { bytes: self.bytes.max(other.bytes), alignment })
+    }
+
+    /// The pool's granule: the bytes rounded up to the alignment, so each
+    /// granule starts every slab aligned.
+    pub fn granule(self) -> Result<u64, String> {
+        self.bytes
+            .checked_next_multiple_of(self.alignment)
+            .ok_or_else(|| "a pool's granule overflows".to_owned())
+    }
+}
+
+/// The regions of a bank slab store of `record`'s tensors, one record a
+/// slab: each routed tensor's resident record (`[m0, m1]` of its resident
+/// element), in [`RecordTensors::iter`]'s order.
+pub(super) fn record_regions(record: &RecordTensors<RecordTensor>) -> Vec<(RoutedTensor, seismic::SlabRegion)> {
+    record
+        .iter()
+        .map(|(kind, tensor)| (kind, seismic::SlabRegion { element: tensor.resident, row_shape: tensor.matrix.to_vec() }))
+        .collect()
+}
+
+/// What a slab store of `record`'s tensors needs of its pool
+/// ([`record_regions`]). A slab's bytes are those of its one record,
+/// whatever the store's records, so one is laid out.
+pub(super) fn record_slab(record: &RecordTensors<RecordTensor>) -> Result<PoolSlab, String> {
+    let regions = record_regions(record).into_iter().map(|(_, region)| region).collect::<Vec<_>>();
+    seismic::SlabLayout::for_regions(1, 1, &regions)
+        .map(|layout| PoolSlab::of(&layout))
+        .map_err(|error| format!("a bank record's slab: {error}"))
+}
+
+/// The slab a slab store of each of `records` fits ([`PoolSlab::with`]).
+pub(super) fn records_slab<'a>(
+    records: impl IntoIterator<Item = &'a RecordTensors<RecordTensor>>,
+) -> Result<PoolSlab, String> {
+    records
+        .into_iter()
+        .map(record_slab)
+        .try_fold(PoolSlab { bytes: 0, alignment: 1 }, |pool, slab| pool.with(slab?))
 }
 
 /// The record form of an expert stack planned resident: refused when its

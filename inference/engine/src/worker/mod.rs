@@ -346,10 +346,10 @@ fn load(
     let ready_path = manifest.path;
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
-    // Readiness and the host-resident tables' bytes.
-    type Built = (ExecutionReady, u64);
+    let census = Arc::new(execution::CensusWatch::default());
+    let owner_census = census.clone();
     let factory = move |wakes: WorkerWakeHandle<UnloadCause>| -> Result<
-        (Box<dyn Driven<Stopped = UnloadCause>>, Built),
+        (Box<dyn Driven<Stopped = UnloadCause>>, ExecutionReady),
         Stopped,
     > {
         let catalog = seismic::Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
@@ -379,7 +379,6 @@ fn load(
             );
         }
         let backend = built.domain.execution_backend();
-        let host_table_bytes = built.domain.host_table_bytes();
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(
             built.domain,
@@ -391,7 +390,7 @@ fn load(
         .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
-            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, owner.serving_census()?))
+            .and_then(|charge| owner.serving_census().map(|serving| AllocationCensus::classify(&charge, serving)))
             .map_err(internal)?;
         let ready = ExecutionReady {
             model,
@@ -401,8 +400,8 @@ fn load(
             census,
         };
         Ok((
-            Box::new(ExecutionOwner::new(owner, method, built.pricing)) as Box<dyn Driven<Stopped = UnloadCause>>,
-            (ready, host_table_bytes),
+            Box::new(ExecutionOwner::new(owner, method, built.pricing, owner_census)) as Box<dyn Driven<Stopped = UnloadCause>>,
+            ready,
         ))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
@@ -440,7 +439,7 @@ fn load(
     };
     let (
         execution,
-        (execution_ready, host_table_bytes),
+        execution_ready,
         (binding, chat),
     ) = match Worker::spawn_ready_with(factory, usize::MAX, host) {
         Ok(spawned) => spawned,
@@ -471,7 +470,7 @@ fn load(
             execution,
             binding,
             definition: session_definition,
-            host_table_bytes,
+            census,
         },
         ready,
     )))

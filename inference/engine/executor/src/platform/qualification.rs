@@ -1,4 +1,4 @@
-use super::policy::{Fit, HostRoom, MemoryPolicyError, MemoryReserves};
+use super::policy::{MemoryPolicyError, ReleaseRate};
 use super::selection::{DeviceRequest, SelectionError, select};
 use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
@@ -16,8 +16,10 @@ pub struct PlatformConfig {
     pub graph_cost: Option<seismic::GraphCost>,
 }
 
-/// The automatically selected device and its stable assessment capacity.
-/// Planning input only: it reserves nothing and guarantees no later load.
+/// The automatically selected device. Planning input only: it reserves
+/// nothing and guarantees no later load, and it sizes none: a load is sized
+/// from the ledger's reading, an assessment from its stable fit's room
+/// (`planning::StableRoom`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedDevice {
     /// The executor, whose reported capabilities graphs are planned and
@@ -26,17 +28,11 @@ pub struct SelectedDevice {
     /// The executor's identity in the topology it was selected from, which
     /// keys what is measured of it.
     pub identity: seismic::Identity,
-    /// Device storage's stable fit: what its placement holds across its
-    /// stores, each within process limits and grants, less its planning
-    /// reserve (`Fit::placement`). It is not a reading of the moment: the
-    /// bounds sealed into a load's graphs are derived from it.
-    pub assessment_capacity_bytes: u64,
-    /// How an expert bank's host tier is reserved on this device, where it
-    /// has one, or why it has none ([`host_tier`]).
-    pub host_tier: Result<Option<HostTier>, String>,
-    /// What the selection's fit questions read, so a plan asks `Fit` of a
-    /// demand again: whether a linked host tier's size fits beside the
-    /// load's other host RAM demand (`ExecutionPlanDraft::with_host_tier`).
+    /// How an expert bank's host tier is held on this device, where it has
+    /// one ([`host_tier`]).
+    pub host_tier: Option<HostTier>,
+    /// What the selection's fit questions read, so the assessment asks `Fit`
+    /// of a demand again (`planning::StableRoom`).
     pub reading: FitReading,
     /// What a plan prices the executor's recorded graphs at
     /// ([`GraphPricing`]).
@@ -69,35 +65,32 @@ impl GraphPricing {
     }
 }
 
-/// The stores, grants and reserves a fit question reads, as one reading
+/// The stores and grants a fit question reads, as one reading
 /// of them found: `Fit`'s inputs, which alone interprets them, kept for a
 /// later question of the same reading.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FitReading {
     pub topology: seismic::DeviceTopology,
     pub status: seismic::Status,
-    pub reserves: MemoryReserves,
+    pub release: ReleaseRate,
 }
 
-/// How an expert bank's host tier is held on `executor`: where reserved
-/// `Shared` ranges lie in the store of its reserved `DeviceOnly` ranges
-/// (unified memory), the tier is the bank itself; elsewhere host RAM is a
-/// tier of its own across the link, reserved `Shared`; none, or why not,
-/// where `Shared` reserves nothing.
+/// How an expert bank's host tier is held on `executor`: where its
+/// `Shared` storage lies in the store of its `DeviceOnly` storage (unified
+/// memory), the tier is the bank itself; elsewhere host RAM is a tier of
+/// its own across the link, a granule pool of `Shared` storage; none where
+/// the executor places no `Shared` storage.
 /// Every backend's decode entries read tier records in place; only a
 /// linked tier's are promoted ([`HostTier::Linked`]). The host lands and
 /// converts file misses into a linked tier's records in place; on unified
 /// memory the device converts them into the bank's, its parking the
 /// executor's backend's ([`crate::planning::Parking::of`]).
-pub fn host_tier(
-    topology: &seismic::DeviceTopology,
-    executor: &Executor,
-) -> Result<Option<HostTier>, String> {
-    let reservation = executor.reserving(seismic::ReservedContract::Shared).map_err(ToString::to_string)?;
-    Ok(reservation.map(|reservation| match topology.shared_ranges_lie_in_device_memory(executor) {
+pub fn host_tier(topology: &seismic::DeviceTopology, executor: &Executor) -> Option<HostTier> {
+    topology.first_store(executor, Contract::Shared)?;
+    Some(match topology.shared_ranges_lie_in_device_memory(executor) {
         true => HostTier::Unified(crate::planning::Parking::of(executor.backend())),
-        false => HostTier::Linked(reservation),
-    }))
+        false => HostTier::Linked,
+    })
 }
 
 /// The selected device, resolved and opened in the executing process,
@@ -161,7 +154,7 @@ pub fn select_device(
     catalog: &Devices,
     path: ExecutionPath,
     request: DeviceRequest,
-    reserves: &MemoryReserves,
+    release: &ReleaseRate,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
     let topology = catalog.topology();
@@ -170,7 +163,7 @@ pub fn select_device(
     // Read after the status, whose fit the opening the measurement takes
     // must not lower.
     let graph_cost = catalog.graph_cost(info.id()).map_err(PlatformError::Open)?;
-    selected(&topology, &status, reserves, info, GraphPricing::Measured(graph_cost)).map_err(PlatformError::Memory)
+    Ok(selected(&topology, &status, release, info, GraphPricing::Measured(graph_cost)))
 }
 
 /// [`select_device`] with no device opened and nothing measured, what a
@@ -183,7 +176,7 @@ pub fn select_recorded(
     catalog: &Devices,
     path: ExecutionPath,
     request: DeviceRequest,
-    reserves: &MemoryReserves,
+    release: &ReleaseRate,
     root: Option<&std::path::Path>,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
@@ -191,7 +184,7 @@ pub fn select_recorded(
     let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
     let status = catalog.status(&topology, info.id());
     let graph_cost = graph_pricing(&topology, &info, root)?;
-    selected(&topology, &status, reserves, info, graph_cost).map_err(PlatformError::Memory)
+    Ok(selected(&topology, &status, release, info, graph_cost))
 }
 
 /// What `info`'s graphs are priced at from the kernel cache at `root`: the
@@ -215,29 +208,24 @@ pub fn graph_pricing(
     })
 }
 
-/// `info`, of `topology`, as selected under `status` and `reserves`: its
-/// stable device capacity, its host tier, the reading its fit questions
-/// read, and its graph cost.
+/// `info`, of `topology`, as selected under `status` and `release`: its host
+/// tier, the reading its fit questions read, and its graph cost.
 pub fn selected(
     topology: &seismic::DeviceTopology,
     status: &seismic::Status,
-    reserves: &MemoryReserves,
+    release: &ReleaseRate,
     info: Executor,
     graph_cost: GraphPricing,
-) -> Result<SelectedDevice, MemoryPolicyError> {
-    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
-    let placement = fit.placement(&info, Contract::DeviceOnly)?;
-    let assessment_capacity_bytes = placement.stable_bytes;
-    Ok(SelectedDevice {
+) -> SelectedDevice {
+    SelectedDevice {
         graph_cost,
         host_tier: host_tier(topology, &info),
         identity: topology
             .executor_identity(info.id())
             .expect("the selected executor is of the topology it was selected from"),
         info,
-        assessment_capacity_bytes,
-        reading: FitReading { topology: topology.clone(), status: status.clone(), reserves: *reserves },
-    })
+        reading: FitReading { topology: topology.clone(), status: status.clone(), release: *release },
+    }
 }
 
 /// Resolve the selected identity in this process's catalog and open it.
@@ -249,8 +237,10 @@ pub fn open_selected(
 ) -> Result<OpenedPlatform, PlatformError> {
     enforce_phase_one(config.path)?;
     let id = catalog.resolve(selector).map_err(PlatformError::Resolve)?;
+    // The device charges the process's ledger of each store it reaches.
+    let stores = crate::memory::ledger::Ledgers::process().stores(catalog.reached_stores(id));
     let device = catalog
-        .open_with(
+        .open_in(
             id,
             // The device forms through the process's one store
             // (`seismic::ProgramStore::user`).
@@ -258,6 +248,7 @@ pub fn open_selected(
                 artifacts: None,
                 graph_cost: config.graph_cost,
             },
+            stores,
         )
         .map_err(PlatformError::Open)?;
     Ok(OpenedPlatform { selector, device })

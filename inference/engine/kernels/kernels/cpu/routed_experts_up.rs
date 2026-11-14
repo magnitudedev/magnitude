@@ -57,8 +57,7 @@ fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let expert = cx.arg_blocks().get([block]);
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_up(), cx.arg_records_up());
-    let (up, index) = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
-    let first = routed::expert_row(index, f) + rows.start;
+    let up = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
     let function = cx.arg_activation();
     let up_scale = cx.arg_up_scale();
     let scale = routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert);
@@ -73,7 +72,7 @@ fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         // SAFETY: each work item writes its own features of its own block's rows.
         let out = unsafe { cx.scratch_product().slice_mut::<f32>(4 * ((block * t + lane) * f + rows.start), rows.len()) };
         let q8 = quantized.map(|q8| &q8[source * blocks..(source + 1) * blocks]);
-        projection::project_arithmetic(up, first, &staged[source * h..(source + 1) * h], q8, out);
+        projection::project_arithmetic(&up, rows.start, &staged[source * h..(source + 1) * h], q8, out);
         for value in out.iter_mut() {
             *value = E::A::widen(functions::activated::<E::A>(function, scale * *value));
         }
@@ -112,8 +111,7 @@ fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     let expert = cx.arg_blocks().get([block]);
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
     let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_down(), cx.arg_records_down());
-    let (down, index) = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
-    let first = routed::expert_row(index, h) + columns.start;
+    let down = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
     let output = cx.result_0();
     let order = cx.arg_order().row([block, 0]);
     // SAFETY: the expand launch wrote every live row before this launch.
@@ -126,7 +124,7 @@ fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     for lane in 0..routed::block_rows(order) {
         let row = block * t + lane;
         let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
-        projection::project_arithmetic(down, first, &product[row * f..(row + 1) * f], q8, projected);
+        projection::project_arithmetic(&down, columns.start, &product[row * f..(row + 1) * f], q8, projected);
         // SAFETY: each work item writes its own channels of its own block's rows.
         let out = unsafe { output.span_mut([block, lane, columns.start], columns.len()) };
         activation::store::<E::A>(projected, out);

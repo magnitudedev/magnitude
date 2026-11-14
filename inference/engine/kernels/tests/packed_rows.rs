@@ -1,3 +1,4 @@
+mod common;
 mod declared;
 
 use magnitude_kernels::{
@@ -101,11 +102,11 @@ fn packed_stages_on(device: &seismic::Device) {
     let previous_bank = indices(&device, &[1], &[0]);
     let previous_tape = indices(&device, &[1], &[0]);
     let following_bank = indices(&device, &[1], &[1]);
-    let mut slabs = seismic::SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         &device,
         2,
         2,
-        vec![
+        &vec![
             seismic::SlabRegion {
                 element: bf16,
                 row_shape: vec![2, channels as u64],
@@ -118,10 +119,8 @@ fn packed_stages_on(device: &seismic::Device) {
                 element: seismic::Element::f32(),
                 row_shape: vec![1, ((values + keys) * width + values) as u64],
             },
-        ],
-    )
-    .unwrap();
-    slabs.add_slab().unwrap();
+        ]);
+    slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
     let mut window = slabs.logical_region(0).unwrap();
     let mut delta = slabs.logical_region(1).unwrap();
     let mut tape = slabs.logical_region(2).unwrap();

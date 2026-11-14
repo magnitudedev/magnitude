@@ -1335,40 +1335,40 @@ mod tests {
     use super::*;
     use crate::{
         BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainLayout,
-        HistoryDomainPlan, LayerRef, StateStore, StoreBindings,
+        HistoryDomainPlan, LayerRef, OwnDevice, StoreBindings,
     };
-    use seismic::{BackendName, DType, Device};
+    use seismic::DType;
 
     const TOKEN: HistoryDomainId = HistoryDomainId(0);
 
     /// A store of one Token domain, as Qwen's stores are.
     fn token_store(
-        device: Rc<Device>,
+        device: &OwnDevice,
         context: usize,
         rows: usize,
         components: Vec<ComponentDescriptor>,
         specs: Vec<ComponentSpec>,
         banks: BankCapacity,
     ) -> Result<StoreBindings, Error> {
-        StateStore::new(
-            device,
-            context,
-            context,
-            vec![HistoryDomainPlan {
-                layout: HistoryDomainLayout::Token { components },
-                logical_rows: rows,
-            }],
-            specs,
-            banks,
-        )
-        .map(|(_, bindings)| bindings)
+        device
+            .store(
+                context,
+                context,
+                vec![HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Token { components },
+                    logical_rows: rows,
+                }],
+                specs,
+                banks,
+            )
+            .map(|(_, bindings)| bindings)
     }
 
     #[test]
     fn abort_recovers_source_and_releases_tentative_capacity() {
-        let device = cpu_device();
+        let device = OwnDevice::cpu();
         let store = token_store(
-            Rc::new(device),
+            &device,
             4,
             4,
             vec![ComponentDescriptor::new(
@@ -1431,9 +1431,9 @@ mod tests {
 
     #[test]
     fn successors_follow_in_flight_advances_and_attach_to_their_commits() {
-        let device = cpu_device();
+        let device = OwnDevice::cpu();
         let store = token_store(
-            Rc::new(device),
+            &device,
             8,
             8,
             vec![ComponentDescriptor::new(
@@ -1511,10 +1511,9 @@ mod tests {
 
     #[test]
     fn codec_conversion_reserves_and_publishes_only_after_completion() {
-        let device = cpu_device();
-        let device = Rc::new(device);
+        let device = OwnDevice::cpu();
         let source_store = token_store(
-            device.clone(),
+            &device,
             4,
             4,
             vec![ComponentDescriptor::new(
@@ -1532,7 +1531,7 @@ mod tests {
         )
         .unwrap();
         let destination_store = token_store(
-            device,
+            &device,
             4,
             4,
             vec![ComponentDescriptor::new(
@@ -1597,16 +1596,9 @@ mod tests {
         assert_eq!(destination_store.occupied_rows(TOKEN), 2);
     }
 
-    fn cpu_device() -> Device {
-        seismic::Devices::discover(&[])
-            .expect("devices are discovered")
-            .open_backend(BackendName::Cpu)
-            .expect("the CPU backend opens")
-    }
-
     fn recurrent_store(context: usize, in_flight: usize) -> StoreBindings {
         token_store(
-            Rc::new(cpu_device()),
+            &OwnDevice::cpu(),
             context,
             context,
             vec![ComponentDescriptor::new(

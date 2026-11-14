@@ -847,7 +847,6 @@ fn memory_assessments(
             memory_domain_id: domain_id(domain.domain, environment),
             capacity_bytes: domain.capacity_bytes,
             required_bytes: domain.required_bytes,
-            compatibility_reserve_bytes: domain.reserve_bytes,
             remaining_bytes: domain.remaining_bytes,
         })
         .collect()

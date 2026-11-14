@@ -1,8 +1,10 @@
 //! One actual Qwen3.5-4B block-zero recurrent path, independent CPU GGUF fixture.
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
+mod common;
+
 use magnitude_kernels::{attention_output, gated_delta_project, gated_delta_step, repack_weight};
-use seismic::{BackendName, Device, Element, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, SlabRegion, Tensor};
 use std::{fs, path::Path};
 
 fn bytes(path: &Path, name: &str, extension: &str) -> Vec<u8> {
@@ -202,11 +204,11 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     // Bank 0 is the zero seed the advance reads; bank 1 is its successor.
     // One tape row per bank: the window holds C - 1 + 1 rows.
     let tape_row = (32 + 16) * 128 + 32;
-    let mut slabs = SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         &device,
         2,
         2,
-        vec![
+        &vec![
             SlabRegion {
                 element: Element::bf16(),
                 row_shape: vec![4, 8192],
@@ -219,10 +221,8 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
                 element: Element::f32(),
                 row_shape: vec![1, tape_row as u64],
             },
-        ],
-    )
-    .unwrap();
-    slabs.add_slab().unwrap();
+        ]);
+    slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
     for (region, bytes) in [
         vec![0u8; 2 * 4 * 8192 * 2],
         vec![0u8; 2 * 32 * 128 * 128 * 4],

@@ -18,6 +18,7 @@
 // ```
 #![allow(dead_code)]
 
+mod common;
 mod declared;
 
 use magnitude_kernels::{
@@ -191,21 +192,19 @@ fn history(
     let kv = case.geometry.kv;
     let rows = case.history_rows;
     let planes = planes(case, affine);
-    let mut slabs = SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         device,
         slab_rows as u64,
         rows as u64,
-        planes
+        &planes
             .iter()
             .map(|plane| SlabRegion {
                 element: plane.element,
                 row_shape: vec![kv as u64, plane.width as u64],
             })
-            .collect(),
-    )
-    .unwrap();
+            .collect::<Vec<_>>());
     for index in 0..rows.div_ceil(slab_rows) {
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let start = index * slab_rows;
         let count = slab_rows.min(rows - start);
         for (region, plane) in planes.iter().enumerate() {

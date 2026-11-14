@@ -12,8 +12,8 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::bootstrap_protocol::{
-    IcnBinaryIdentity, IcnInstallationDeclaration, IcnParentCommand, IcnParentCommandType,
-    IcnStartupRecord, IcnStartupRecordType,
+    API_VERSION, IcnBinaryIdentity, IcnInstallationDeclaration, IcnParentCommand,
+    IcnParentCommandType, IcnStartupRecord, IcnStartupRecordType,
 };
 use magnitude_service_contracts::models::{
     CandidateInspection, CandidateInspectionEvent, CandidateInspectionProgress,
@@ -200,7 +200,7 @@ impl Default for ServerIdentity {
     fn default() -> Self {
         Self {
             instance_id: "embedded".to_owned(),
-            api_version: 1,
+            api_version: API_VERSION,
             native_build: "unknown".to_owned(),
         }
     }
@@ -2565,12 +2565,9 @@ mod tests {
                         "store": {
                             "id": "system",
                             "total_capacity_bytes": 1024,
-                            "stable_capacity_bytes": 768,
                             "allocation_capacity_bytes": 1024,
-                            "planning_reserve_bytes": 256,
                             "capacity_basis": "linux_mem_total"
                         },
-                        "available_bytes": 640,
                         "current_free_bytes": 512
                     },
                     "device_memory": [],
@@ -2612,7 +2609,7 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["topology_fingerprint"], "topology");
-        assert_eq!(body["host_ram"]["store"]["stable_capacity_bytes"], 768);
+        assert_eq!(body["host_ram"]["store"]["allocation_capacity_bytes"], 1024);
     }
 
     #[tokio::test]

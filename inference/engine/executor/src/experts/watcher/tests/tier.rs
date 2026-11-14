@@ -114,7 +114,7 @@ fn a_resize_ask_cancels_the_covers_queued_reads() {
     let outstanding = || residency::lock(&harness.watcher.state).prefetch.outstanding();
     eventually("the cover never read ahead", outstanding);
     let asking = shared.clone();
-    let shrink = std::thread::spawn(move || asking.plan_shrink(1, vec![1]).map(drop));
+    let shrink = std::thread::spawn(move || asking.shrink(Evicting::Landed, Candidates::one(1, vec![1]), None).map(drop));
     eventually("the shrink waited for the cover's queued reads", || shrink.is_finished());
     shrink.join().unwrap().expect("the shrink is planned");
     assert!(shared.cover().reading, "the ask pauses the cover");

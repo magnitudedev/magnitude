@@ -25,4 +25,4 @@ machine-line = ["seismic-runtime/machine-line", "seismic-native-cpu/machine-line
 # Offline formation coverage of native implementations (`seismic::coverage`).
 coverage = ["seismic-runtime/coverage"]
 # The recorded machines (`seismic::fixtures::recorded`), for other crates' tests.
-fixtures = ["seismic-topology/fixtures"]
+fixtures = ["seismic-topology/fixtures", "seismic-discovery/fixtures"]

@@ -10,6 +10,7 @@ use super::protocol::{
     LoadProgress, MemoryObservation, RequestProgress, RoomClaimId, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
+use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError};
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
@@ -105,6 +106,13 @@ struct State {
     next_claim: u64,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
+    /// The census the worker pushed last, and how many it pushed
+    /// ([`EngineClient::census`]).
+    census: Option<AllocationCensus>,
+    censuses: u64,
+    /// Waiters on the connection's end or the census's next change
+    /// ([`EngineClient::closed`], [`EngineClient::census`]).
+    watchers: Vec<Waker>,
     /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
     /// ends after that ends for the stop, however the worker's end came (its own unload, or
     /// its kill once it overran its exit).
@@ -145,6 +153,7 @@ impl State {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
         self.closed = Some(error);
+        self.watchers.drain(..).for_each(Waker::wake);
     }
 
     /// The pending measurement room claim's reply, which a claim while one
@@ -219,6 +228,11 @@ impl State {
                     .take()
                     .ok_or("observation reply without a query")?;
                 reply.lock().unwrap().fulfill(observation);
+            }
+            WorkerMessage::Census { census } => {
+                self.census = Some(census);
+                self.censuses += 1;
+                self.watchers.drain(..).for_each(Waker::wake);
             }
             WorkerMessage::MeasurementRoom { claim, room } => {
                 // A claim released before its answer has no one waiting, and
@@ -464,6 +478,43 @@ impl EngineClient {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    /// Why the worker stopped, once it has: the connection's end, awaited
+    /// rather than polled.
+    pub async fn closed(&self) -> RequestError {
+        std::future::poll_fn(|context| {
+            let mut state = self.connection.state.lock().unwrap();
+            match &state.closed {
+                Some(error) => Poll::Ready(error.clone()),
+                None => {
+                    state.watchers.push(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// The census once the worker pushed more than `seen` of them, with
+    /// how many it pushed: each is a change the worker counted, never a
+    /// sample. Why the worker stopped, once it has.
+    pub async fn census(&self, seen: u64) -> Result<(u64, AllocationCensus), RequestError> {
+        std::future::poll_fn(|context| {
+            let mut state = self.connection.state.lock().unwrap();
+            if state.censuses > seen {
+                let census = state.census.clone().expect("a pushed census is kept");
+                return Poll::Ready(Ok((state.censuses, census)));
+            }
+            match &state.closed {
+                Some(error) => Poll::Ready(Err(error.clone())),
+                None => {
+                    state.watchers.push(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// Admit `request`: answered once it began (became resident), or

@@ -1,13 +1,17 @@
 //! What the machine has: the reports
 //! the backend crates and the OS give of it, gathered into the inventory of
-//! its topology (`seismic_topology`), its status samples, and the host's
+//! its topology (`seismic_topology`), its status samples (host RAM at one
+//! instant among them), the OS's memory pressure events, and the host's
 //! processors and their pinning.
 
 #[cfg(windows)]
 mod adapters;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 mod gather;
 mod host;
 mod inventory;
+mod pressure;
 mod processors;
 mod status;
 mod volume;
@@ -17,13 +21,13 @@ mod tests;
 
 pub use gather::DiscoveryError;
 pub use host::{
-    host_available, host_room, HostAvailable, HostHeld, HostStatus, LimitVisibility, ObservationError,
-    ProcessLimitKind, ProcessMemoryLimit, Reclaim,
+    host_sample, Counted, Harm, HostSample, Lag, ObservationError, OwnCold, OwnReclaimed, PressureLevel, Supply, WiredFigures, WiredLimit,
 };
 pub use inventory::Inventory;
 pub use processors::{
     device_node, pin, place_process, Core, DeviceNode, MemoryNode, PciLocation, ProcessPlacement,
     Processors, ProcessorsReportedBy,
 };
+pub use pressure::{PressureEvents, PressureWaker, Wake};
 pub use status::{RuntimeStatus, Sample, Status};
 pub use volume::{identify as volume_identity, volume_available};

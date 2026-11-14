@@ -20,16 +20,13 @@ against its charge's runtime, vocabulary and program terms (`HostProcessCosts`).
 charges, term by term: what it charges must equal what it is observed to hold. `--context TOKENS`
 loads at that context; `--residency TOKENS` (under both) also reads the pages of the expert
 stacks the file cache holds once loaded and once the load has decoded TOKENS tokens of the
-`--fixture` set's first fixture (it must hold none). `--pressure BYTES` (under `--residency`) is the
-forced-pressure gate: a sibling process presses the load BYTES below its planning line (it takes
-everything above the line, read as the engine reads it, and BYTES more) from a quarter of that
-decode to three quarters of it, and the answer is the owner's releases in order (each rung, the bank's slots
-after each step, each step's stall, the charge and footprint on each side), then the same decode
-on a resident load: the streamed tokens must equal its tokens.
-
-`--recommit GB[,GB...]` (unified memory) loads nothing, and `--model` is not read: it times an
-in-place recommit of a reserved tensor, an elastic expert bank's resize, at each commitment (one
-2 MiB row shrunk and regrown, five times each way).
+`--fixture` set's first fixture (it must hold none). `--pressure-store STORE` (under `--residency`)
+is the forced-pressure gate: a sibling process takes what that physical store gives past the
+guarantee the load's ledger keeps free there (read from the load's own memory readings), then
+everything the store still gives, from a quarter of that decode to three quarters of it, and the
+answer is the owner's resizes and releases in order (the bank's slots after each step, each step's
+stall, what the process held on each side), then the same decode on a resident load: the streamed
+tokens must equal its tokens.
 
 Re-measuring `HostProcessCosts`: one `mrig memory --model M` on a unified-memory device per load the
 constants' comment names, then the fit over those runs' loads:
@@ -44,7 +41,7 @@ import json
 from ..engine import Step, Weights
 from ..host import memory
 from ..host.agent import PLAN
-from ..host.memory import RECOMMIT, RESULTS
+from ..host.memory import RESULTS
 from . import Answer, Instrument, JobResult, Plan, device, harness
 from .assess import priced
 from .binaries import ASSESS_BUILD, ENGINE_BUILD
@@ -59,18 +56,15 @@ def configure(parser: argparse.ArgumentParser) -> None:
                         help="under --weight-cap and --context: also read the pages of the expert stacks the file "
                              "cache holds once loaded and once the load has decoded TOKENS tokens of --fixture's "
                              "first fixture (it must hold none)")
-    parser.add_argument("--pressure", type=int, metavar="BYTES",
-                        help="under --residency: another process presses the load BYTES below its planning line "
-                             "from a quarter of the decode to three quarters of it; report the owner's releases in order (the bank's "
-                             "slots, each step's stall, charge and footprint) and the tokens against a resident "
-                             "decode's (the forced-pressure gate)")
-    parser.add_argument("--pressure-store", choices=("host", "device"), help="physical store to press (required with --pressure)")
+    parser.add_argument("--pressure-store", choices=("host", "device"),
+                        help="under --residency: another process takes what this physical store gives past the "
+                             "load's guarantee from a quarter of the decode to three quarters of it; report the "
+                             "owner's resizes and releases in order (the bank's slots, each step's stall, what the "
+                             "process held on each side) and the tokens against a resident decode's (the "
+                             "forced-pressure gate)")
     parser.add_argument("--pressure-prompt", action="store_true",
-                        help="under --pressure: the pressure starts once the request is admitted, so its prompt's "
-                             "groups run under it (the gate with a prompt group in flight)")
-    parser.add_argument("--recommit", metavar="GB[,GB...]",
-                        help="unified memory, loading nothing: what an in-place recommit of a reserved tensor (an "
-                             "elastic expert bank's resize) costs at each commitment")
+                        help="under --pressure-store: the pressure starts once the request is admitted, so its "
+                             "prompt's groups run under it (the gate with a prompt group in flight)")
 
 
 def _measurement(options: tuple[str, ...], fresh: bool) -> Step:
@@ -85,22 +79,18 @@ def plan(arguments, source, host) -> Plan:
     kind = device.memory(host, arguments.backend)
     cap =("--weight-cap", str(arguments.weight_cap)) if arguments.weight_cap else ()
     # Every option as given: the host's judge (`refusal`) refuses a pair it cannot measure.
-    pressure = (*(("--pressure", str(arguments.pressure)) if arguments.pressure else ()),
-                *(("--pressure-store", arguments.pressure_store) if arguments.pressure_store else ()),
+    pressure = (*(("--pressure-store", arguments.pressure_store) if arguments.pressure_store else ()),
                 *(("--pressure-prompt",) if arguments.pressure_prompt else ()))
     context = ("--context", str(arguments.context)) if arguments.context else ()
     residency = (("--residency", harness.EXECUTABLE, f"{{inputs}}/{arguments.fixture.name}",
                   str(arguments.residency)) if arguments.residency else ())
     given = ("--bin", "{target}/release", "--backend", arguments.backend, "--memory", kind, "--scratch", "{run_dir}",
              *cap, *context, *residency, *pressure)
-    if arguments.recommit:
-        job = _measurement((*given, "--recommit", arguments.recommit), fresh=False)
-        return Plan(builds=(harness.BUILD,), jobs=(("memory", job),), device="device")
     # A streamed load prepares from the host's kernel cache, as a served load does, after the
     # measurement job has stored the executor's costs there: its bank's growth is priced on them.
     kernels = ("--kernels", "{engine_cache}/kernels") if cap else ()
     job = _measurement((*given, "--artifacts", "{artifacts}", *kernels), fresh=bool(cap))
-    if kind == "dedicated" and not arguments.pressure:
+    if kind == "dedicated" and not arguments.pressure_store:
         return priced(Plan(builds=(ENGINE_BUILD, ASSESS_BUILD), jobs=(("memory", job),), device="timed",
                            acquires=Weights(arguments.model)), bool(cap), arguments.backend)
     # The load's own footprint, not the device's: the device is held so no other load runs.
@@ -120,7 +110,7 @@ def planned_memory(result: JobResult) -> str:
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
     result = results["memory"]
     output = [line for line in result.output() if not line.startswith("[stderr]")]
-    written = RECOMMIT if arguments.recommit else RESULTS[planned_memory(result)]
+    written = RESULTS[planned_memory(result)]
     if result.code != 0 or not (result.directory / written).exists():
         return Answer((f"memory exited {result.code}", *result.output()[-15:]), False)
     return Answer(tuple(output), True)

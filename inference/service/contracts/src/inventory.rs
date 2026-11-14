@@ -571,11 +571,8 @@ pub struct HardwareStore {
     pub total_capacity_bytes: u64,
     /// The interface that reported the capacity.
     pub capacity_basis: HardwareReportedBy,
-    /// The capacity within process limits, less the planning reserve.
-    pub stable_capacity_bytes: u64,
     /// The capacity within process limits.
     pub allocation_capacity_bytes: u64,
-    pub planning_reserve_bytes: u64,
 }
 
 /// Host RAM, memory the OS manages, with what the OS reports of it.
@@ -584,11 +581,9 @@ pub struct HardwareStore {
 #[serde(deny_unknown_fields)]
 pub struct HardwareHostRam {
     pub store: HardwareStore,
-    /// What the OS reports available to every program, before this
-    /// process's limits.
-    pub available_bytes: u64,
-    /// What this process may still take: the OS's availability within every
-    /// process limit.
+    /// What the OS can give this process within its binding scope (the
+    /// host, or the limit that binds): free pages above its target, clean
+    /// file cache and reclaimable cold pages.
     pub current_free_bytes: u64,
 }
 

@@ -290,5 +290,5 @@ pub fn project_pair_staged_arithmetic(
 }
 
 pub use super::stage::{
-    form_input, normalize, nvfp4_row, operand_row, quantize, rms_row, stage, sum_parts,
+    form_input, normalize, nvfp4_row, operand_row, quantize, rms_row, stage, sum_parts, Recipe,
 };

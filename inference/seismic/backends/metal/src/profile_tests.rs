@@ -14,8 +14,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
     MTLSize,
 };
 use seismic_ir::kernel::ops::SubgroupCombine;
@@ -132,7 +131,7 @@ fn stated_rows_equal_the_contract_table() {
             "the transcription states {key:?} twice"
         );
     }
-    let description = open_device(&metal_device(), crate::test_support::store()).expect("Metal device description");
+    let description = open_device(&metal_device(), crate::test_support::probes()).expect("Metal device description");
     let table = description.native_float();
     let mismatches: Vec<String> = every_key()
         .into_iter()
@@ -170,7 +169,7 @@ fn subgroup_width_is_the_pipeline_execution_width() {
 /// compiler accepts; the combinations include the two contract Fragment rows.
 #[test]
 fn fragment_formats_are_the_matrix_combinations() {
-    let description = open_device(&metal_device(), crate::test_support::store()).expect("Metal device description");
+    let description = open_device(&metal_device(), crate::test_support::probes()).expect("Metal device description");
     let combinations = &description.facts().matrix_combinations;
     for (left, accumulator) in [(DType::F16, DType::F32), (DType::F32, DType::F32)] {
         assert!(
@@ -211,7 +210,7 @@ const GROUP: usize = 256;
 impl NativeProbe {
     fn open() -> Self {
         let device = metal_device();
-        let description = open_device(&device, crate::test_support::store()).expect("Metal device description");
+        let description = open_device(&device, crate::test_support::probes()).expect("Metal device description");
         Self { device, description }
     }
 
@@ -278,8 +277,7 @@ impl NativeProbe {
         let pipeline = self.pipeline(source);
         let buffers: Vec<_> = inputs.iter().map(|bytes| self.buffer(bytes)).collect();
         let output = self.buffer(&vec![0u8; output_bytes]);
-        let queue = self.device.queue();
-        let command = queue.commandBuffer().expect("command buffer");
+        let command = self.device.command_buffer().expect("command buffer");
         let encoder = command.computeCommandEncoder().expect("compute encoder");
         encoder.setComputePipelineState(&pipeline);
         for (index, buffer) in buffers.iter().chain([&output]).enumerate() {

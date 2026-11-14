@@ -786,7 +786,7 @@ describe("adding models", () => {
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
           shortfall: { contextLength: 32_768 },
-          memory: [{ memoryDomainId: "system", capacityBytes: 8, compatibilityReserveBytes: 0, remainingBytes: -4, requiredBytes: 12 }],
+          memory: [{ memoryDomainId: "system", capacityBytes: 8, remainingBytes: -4, requiredBytes: 12 }],
           limitingResource: "system",
           deficitBytes: 4,
           projector: { _tag: "None" },

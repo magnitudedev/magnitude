@@ -1,5 +1,7 @@
 // Dense weight import over the [B, N, K] view; one thread per element in
-// row-major order. The CUDA form of `metal/import_dense.metal`.
+// row-major order. The CUDA form of `metal/import_dense.metal`. The result is
+// a record port (bank records import through it): matrix b is written from
+// its own record's base.
 
 #include "lib/core/activation.cuh"
 
@@ -13,8 +15,7 @@ extern "C" __global__ void import_dense(SEISMIC_KERNEL_PARAMS) {
     const unsigned long long k = index % SEISMIC_DIM_K;
     const unsigned long long n = index / SEISMIC_DIM_K % SEISMIC_DIM_N;
     const unsigned long long b = index / SEISMIC_DIM_K / SEISMIC_DIM_N;
-    destination.put(
-        b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
+    destination.region(b).put(n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
         element::at<Source>(source,
             b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + k * SEISMIC_SOURCE_STRIDE_2));
 }

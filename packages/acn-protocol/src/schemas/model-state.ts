@@ -514,7 +514,6 @@ export const MemoryAssessmentSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
   capacityBytes: NonNegativeSafeInteger,
   requiredBytes: NonNegativeSafeInteger,
-  compatibilityReserveBytes: NonNegativeSafeInteger,
   remainingBytes: Schema.Number.pipe(Schema.int()),
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type

@@ -1851,9 +1851,16 @@ mod causal_cache_tests {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
         let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).expect("the CPU backend opens");
         let device = Rc::new(device);
+        // The CPU's device store's pool, of 64 MiB granules, which every
+        // slab of the test's history rows fits.
+        let granule = 64 << 20;
+        let entry: std::sync::Arc<dyn seismic::memory::Entry> =
+            std::sync::Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
+        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).expect("the CPU opens its pool");
         for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
             let (store, mut bindings) = StateStore::new(
                 Rc::clone(&device),
+                pool.clone(),
                 16,
                 16,
                 vec![HistoryDomainPlan {

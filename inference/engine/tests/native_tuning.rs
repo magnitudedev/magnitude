@@ -13,9 +13,10 @@
 
 use magnitude_artifacts::Package;
 use magnitude_executor::{
-    platform::{self, DeviceRequest, MemoryReserves, PlatformConfig},
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, KernelCache,
-    PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning,
+    platform::{self, DeviceRequest, ReleaseRate, PlatformConfig},
+    memory::ledger::{DeviceLedgers, LoadShape},
+    AttestedPrograms, ComponentSelection, DeviceReader, ExecutionPath, ExecutionPlanner, KernelCache,
+    PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning, MachineReading,
     DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_state::KvCodec;
@@ -49,13 +50,13 @@ fn prepare_every_entry(
         .map(|relative| PathBuf::from(home.clone() + *relative))
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::of_machine(None);
+    let catalog = std::rc::Rc::new(seismic::Devices::discover(&[]).unwrap());
+    let release = ReleaseRate::of_machine(None);
     let selected = platform::select_device(
         &catalog,
         ExecutionPath::Native,
         DeviceRequest::Automatic,
-        &reserves,
+        &release,
     )
     .unwrap_or_else(|error| panic!("no accelerator: {error}"));
     let package = Package::open_without_projector(&path).unwrap();
@@ -95,6 +96,10 @@ fn prepare_every_entry(
         },
     )
     .unwrap();
+    // Its stores are read as a load's are once it opens: every judgment
+    // Seismic asks of them (tuning's room) follows that reading.
+    let reader = DeviceReader::open(std::rc::Rc::new(MachineReading::new(catalog.clone())), release, std::rc::Rc::new(opened.device().clone())).unwrap();
+    let (_ledgers, _) = reader.read_opened(DeviceLedgers::open(opened.device(), Arc::new(LoadShape { stores: Vec::new() })));
     let backend = opened.device().backend();
     let mut tunings = Vec::with_capacity(loads);
     for load in 0..loads {

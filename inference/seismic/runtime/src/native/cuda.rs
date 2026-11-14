@@ -142,6 +142,49 @@ pub(super) fn encode(
     }
 }
 
+/// Encode ordered moves (`super::moves`) on the compute stream, after
+/// `after` (the fill stream's work they follow), each step's ends at the
+/// device addresses `address` names: refused where none of them was
+/// issued.
+///
+/// # Panics
+/// Where issuing failed after a step was issued (`super::moves::submit`).
+pub(super) fn encode_moves(
+    device: &seismic_cuda::Device,
+    after: &[std::sync::Arc<dyn crate::completion::DeviceCompletion>],
+    steps: &[super::moves::MoveStep<'_>],
+    address: impl Fn(&std::sync::Arc<Allocation>, u64) -> u64,
+) -> Result<Committed, ExecutionError> {
+    use super::moves::MoveStep;
+    let mut batch = DirectBatch::new(device, NativeStream::Compute)?;
+    for fence in after {
+        let route = fence.native().expect("a native queue's fence is native work");
+        let Committed::Cuda(submission) = route.committed() else {
+            unreachable!("one device's native work is of its backend");
+        };
+        batch.follow(submission)?;
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let issued = match *step {
+            MoveStep::Copy { source, source_offset, destination, destination_offset, bytes } => {
+                batch.copy(address(destination, destination_offset), address(source, source_offset), bytes)
+            }
+            MoveStep::Word { destination, offset, value } => batch.write_u64(address(destination, offset), value),
+        };
+        if let Err(error) = issued {
+            assert!(index == 0, "invariant violated: ordered moves failed after {index} of them were issued: {error}");
+            // Only waits on the fill stream were issued: the batch ends
+            // behind them.
+            drop(batch.abandon());
+            return Err(error);
+        }
+    }
+    let committed = batch
+        .commit()
+        .unwrap_or_else(|error| panic!("invariant violated: ordered moves were issued but their end was not recorded: {error}"));
+    Ok(Committed::Cuda(committed))
+}
+
 /// Issue `work` on `batch`'s stream.
 fn issue(
     batch: &mut DirectBatch,

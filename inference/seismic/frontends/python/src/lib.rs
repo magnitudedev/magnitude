@@ -24,10 +24,49 @@ fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
     Ok(DISCOVERED.get().expect("devices discovered"))
 }
 
+/// Each executor opened in the process, with the tallies of its stores
+/// ([`seismic::Devices::tallies`]) it was opened over.
+static TALLIES: Mutex<Vec<(seismic::ExecutorId, Vec<seismic::memory::Tally>)>> = Mutex::new(Vec::new());
+
+/// Executor `id` of `devices`, opened once in the process over tallies of
+/// its stores, and its device store's tally.
+fn open_tallied(devices: &seismic::Devices, id: seismic::ExecutorId) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    let tallies = {
+        let mut held = TALLIES.lock().expect("tally list lock poisoned");
+        match held.iter().find(|(of, _)| *of == id) {
+            Some((_, tallies)) => tallies.clone(),
+            None => {
+                let tallies = devices.tallies(id);
+                held.push((id, tallies.clone()));
+                tallies
+            }
+        }
+    };
+    let stores = tallies.iter().map(|tally| std::sync::Arc::new(tally.clone()) as std::sync::Arc<dyn seismic::memory::Store>).collect();
+    let device = devices.open_in(id, Default::default(), stores)?;
+    let tally = device_tally(&device);
+    Ok((device, tally))
+}
+
+/// The tally of `device`'s own store, of those it was opened over
+/// ([`open_tallied`], the frontend's only open).
+fn device_tally(device: &seismic::Device) -> seismic::memory::Tally {
+    let identity = device.topology().store_identity(device.device_store()).expect("the device store is of its topology");
+    let held = TALLIES.lock().expect("tally list lock poisoned");
+    held.iter()
+        .find(|(of, _)| *of == device.info().id())
+        .and_then(|(_, tallies)| tallies.iter().find(|tally| seismic::memory::Store::identity(*tally) == &identity))
+        .cloned()
+        .expect("invariant violated: a device the frontend did not open over its tallies")
+}
+
 #[pyclass(name = "Device", frozen)]
 #[derive(Clone)]
 struct Device {
     inner: seismic::Device,
+    /// The tally of the device's own store, which counts and bounds what it
+    /// holds there: the frontend keeps no ledger of its own.
+    tally: seismic::memory::Tally,
 }
 #[pymethods]
 impl Device {
@@ -43,15 +82,12 @@ impl Device {
     fn capabilities(&self) -> Vec<String> {
         self.inner.capabilities().to_vec()
     }
-    fn device_ledger(&self) -> (u64, u64, Option<u64>, u64) {
-        let ledger = self.inner.device_ledger();
-        (ledger.charged, ledger.claim, ledger.bound, ledger.high_water)
+    fn device_ledger(&self) -> (u64, u64) {
+        (self.tally.held(), self.inner.high_water())
     }
     fn set_device_bound(&self, bytes: Option<u64>) -> PyResult<()> {
-        self.inner
-            .bounds()
-            .bound(seismic::Ledger::Own(self.inner.device_store()), bytes)
-            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+        self.tally.bound(bytes.unwrap_or(u64::MAX));
+        Ok(())
     }
     fn __repr__(&self) -> String {
         format!("Device({}, {:?})", self.backend(), self.name())
@@ -96,11 +132,8 @@ fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
                     ))
                 })?,
         };
-        Ok(Device {
-            inner: c
-                .open(id)
-                .map_err(|e| error(d::Error::new("TargetError", e)))?,
-        })
+        let (inner, tally) = open_tallied(&c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
+        Ok(Device { inner, tally })
     })
 }
 
@@ -147,9 +180,9 @@ impl Tensor {
     }
     #[getter]
     fn device(&self) -> PyResult<Device> {
-        Ok(Device {
-            inner: self.inner.device().map_err(error)?,
-        })
+        let inner = self.inner.device().map_err(error)?;
+        let tally = device_tally(&inner);
+        Ok(Device { inner, tally })
     }
     #[getter]
     fn nbytes(&self) -> PyResult<u64> {

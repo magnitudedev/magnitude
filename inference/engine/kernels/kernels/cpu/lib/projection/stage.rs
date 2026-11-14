@@ -1,6 +1,27 @@
 use super::super::core::{activation, reduce};
 use seismic::cpu::quant::{self, Q8Block};
+use seismic::cpu::slab::Records;
 use seismic::cpu::{Dense, Weights};
+
+/// An operand a staged row's products read, by its NVFP4 operand recipe:
+/// weights, or a record port's records of them, which share one.
+pub trait Recipe {
+    fn nvfp4_operands(&self) -> bool;
+}
+
+impl Recipe for Weights<'_> {
+    #[inline(always)]
+    fn nvfp4_operands(&self) -> bool {
+        Weights::nvfp4_operands(self)
+    }
+}
+
+impl Recipe for Records<Weights<'_>> {
+    #[inline(always)]
+    fn nvfp4_operands(&self) -> bool {
+        Records::nvfp4_operands(self)
+    }
+}
 
 #[inline(always)]
 pub fn quantize(row: &[f32], out: &mut [Q8Block]) {
@@ -76,7 +97,7 @@ pub fn stage<A: Dense>(row: &[A::Storage], out: &mut [f32]) {
 /// place, as NVFP4 operands where the weights take them (`nvfp4_row`), else
 /// as it is.
 #[inline(always)]
-pub fn operand_row(weights: &[&Weights<'_>], row: &mut [f32]) {
+pub fn operand_row<W: Recipe>(weights: &[&W], row: &mut [f32]) {
     let nvfp4 = weights[0].nvfp4_operands();
     assert!(
         weights.iter().all(|weights| weights.nvfp4_operands() == nvfp4),

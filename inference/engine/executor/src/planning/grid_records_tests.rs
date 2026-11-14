@@ -21,9 +21,6 @@ use seismic::{BackendName, Element};
 /// The routed shape: GLM-5.3-Flash's widths, two experts a layer.
 const SHAPE: RoutedShape = RoutedShape { layers: 1, experts: 2, selected: 1, hidden: 4096, intermediate: 2048 };
 
-/// Host reservations backed byte by byte.
-const BYTES: seismic::Reservation = seismic::Reservation { granule: 1, host_addressed: true, chunks: None };
-
 /// A grid's codes and tile (one scale per tile of values), the
 /// representation its stacks reside in, and an expert's read bytes at GLM's
 /// shape (3 × 8,388,608 codes, then the grid slices): the three admitted
@@ -177,7 +174,7 @@ fn fp8_experts_under_tile_grids_stream_records_of_their_stored_parts() {
         let codes = |kind| matrix(kind)[0] * matrix(kind)[1];
         let scale_bytes = codes_of_grid.stored().block_bytes();
         let grid = |kind| codes(kind) / (tile[0] * tile[1]) * scale_bytes;
-        for (backend, host) in [(BackendName::Metal, HostTier::Unified(super::Parking::of(BackendName::Metal))), (BackendName::Cuda, HostTier::Linked(BYTES))] {
+        for (backend, host) in [(BackendName::Metal, HostTier::Unified(super::Parking::of(BackendName::Metal))), (BackendName::Cuda, HostTier::Linked)] {
             let case = format!("{codes_of_grid:?} {tile:?} on {backend:?}");
             let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
             let resident = ModelLoadPlan::derive(&manifest, &definition, selection, layout, crate::PlannedMethod::Plain, LIMITS)
@@ -185,7 +182,7 @@ fn fp8_experts_under_tile_grids_stream_records_of_their_stored_parts() {
             let slots = routed_experts(&definition).unwrap();
             let banked = resident
                 .clone()
-                .with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, super::bank::BankSubstrate { backend, reservation: BYTES, host })
+                .with_expert_bank(&definition, slots, 1, FlightDepth::PIPELINED, super::bank::BankSubstrate { backend, allocations: seismic::NativeAllocations::EXACT, host })
                 .unwrap_or_else(|error| panic!("{case}: {error:?}"));
             let bank = banked.bank.as_ref().expect("a banked plan holds its bank");
             let [group] = bank.groups() else {
@@ -204,9 +201,6 @@ fn fp8_experts_under_tile_grids_stream_records_of_their_stored_parts() {
             assert_eq!(urgent.parts.iter().sum::<u64>(), read_bytes, "{case}");
             // One read per part of an expert's record: its three tensors' codes and grids.
             assert_eq!(urgent.parts.len(), 2 * RoutedTensor::ALL.len(), "{case}: a record is six reads");
-            // On a 24 GB device a record of these bytes keeps every expert a slot, the floor's one
-            // included: the stored parts are priced at the bytes the record holds.
-            assert_eq!(bank.most_slots(24 << 30).unwrap(), SHAPE.experts, "{case}: every expert has a slot");
 
             let [stacks] = &bank.stored_stacks(&artifact).unwrap()[..] else {
                 panic!("{case}: one routed layer");

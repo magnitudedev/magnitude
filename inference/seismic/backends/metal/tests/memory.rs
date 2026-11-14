@@ -6,7 +6,9 @@
 
 use seismic_compiler::executable::DeviceService;
 use seismic_metal::toolchain::MetalToolchain;
-use seismic_metal::{DeviceHandle, DirectBatch, DirectLaunch, MetalDevice, MetalResizer};
+use seismic_metal::{DeviceHandle, DirectBatch, DirectLaunch, MetalDevice};
+use seismic_memory::entry::{Entry, Tally};
+use seismic_topology::StoreIdentity;
 use seismic_native_target::process::{return_freed_pages, ProcessMemory};
 use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use std::sync::Mutex;
@@ -17,7 +19,10 @@ static ALONE: Mutex<()> = Mutex::new(());
 const SOFTFLOAT: &str = include_str!("../src/softfloat.metal");
 
 fn opened() -> (MetalDevice, MetalToolchain) {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let device = MetalDevice::open(
+        DeviceHandle::system_default().unwrap(),
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
+    ).unwrap();
     let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
     let toolchain = MetalToolchain::new(device.clone(), description.facts());
     (device, toolchain)
@@ -63,8 +68,9 @@ fn a_long_run_of_submissions_leaves_no_live_heap() {
         entries: vec![ProgramEntry::named("bump")],
     };
     let pipelines = toolchain.compile(&source).unwrap().1;
-    let values = device.allocate(4096, 16).unwrap();
-    let scalars = device.allocate(64, 16).unwrap();
+    let entry: std::sync::Arc<dyn Entry> = std::sync::Arc::new(Tally::unbounded(StoreIdentity::HostRam));
+    let values = device.allocate(seismic_metal::topology::SHARED_KIND, 4096, 16, &entry).unwrap();
+    let scalars = device.allocate(seismic_metal::topology::SHARED_KIND, 64, 16, &entry).unwrap();
     let submit = || {
         let mut batch = DirectBatch::observed(&device).unwrap();
         batch
@@ -174,34 +180,32 @@ fn programs_formed_and_released_leave_only_what_metal_keeps_a_pipeline() {
     }
 }
 
-/// Metal counts a reservation's backed bytes once in the device's
-/// allocated size (`currentAllocatedSize`, which the device's grant is read
-/// from), as Seismic charges them: an empty reservation holds its record
-/// table alone, each backed granule is one chunk, and a dropped reservation
-/// leaves the size where it started.
+/// A pool block is one buffer Metal counts once in the device's allocated
+/// size (`currentAllocatedSize`, which the device's grant is read from), at
+/// exactly the bytes charged to its entry, every page of it resident in the
+/// process's footprint as it returns, and a dropped block leaves both where
+/// they started.
 #[test]
-fn a_reservation_counts_its_backed_bytes_once_in_the_devices_allocated_size() {
+fn a_block_is_charged_and_counted_once_and_backed_as_it_returns() {
     let _alone = ALONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    const GRANULE: u64 = seismic_metal::device::RESERVATION_GRANULE as u64;
-    const ALL: u64 = 64 * GRANULE;
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    const BLOCK: u64 = 64 << 20;
+    let device = MetalDevice::open(
+        DeviceHandle::system_default().unwrap(),
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)),
+    ).unwrap();
+    let tally = Tally::unbounded(StoreIdentity::HostRam);
+    let entry: std::sync::Arc<dyn Entry> = std::sync::Arc::new(tally.clone());
     let allocated = || device.handle().current_allocated_bytes();
-    let resize = |resizer: MetalResizer, bytes: u64| {
-        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap().install().release()
-    };
-    // An empty reservation holds its record table alone, which a reservation
-    // of the same range always does.
-    let before = allocated();
-    let (buffer, resizer) = device.allocate_reserved(0, ALL, GRANULE, GRANULE).unwrap();
-    let table = allocated() - before;
-    assert!(table < GRANULE, "an empty reservation holds its table alone, no granule: {table} bytes");
-    let backed = || allocated() - before - table;
-    let resizer = resize(resizer, ALL / 2);
-    assert_eq!(backed(), ALL / 2, "half the granules");
-    let resizer = resize(resizer, ALL);
-    assert_eq!(backed(), ALL, "every granule");
-    let resizer = resize(resizer, ALL / 4);
-    assert_eq!(backed(), ALL / 4, "a shrink's release");
-    drop((buffer, resizer));
-    assert_eq!(allocated(), before);
+    let before = (allocated(), ProcessMemory::read());
+    let block = device.allocate_block(seismic_metal::topology::SHARED_KIND, BLOCK, &entry).unwrap();
+    assert_eq!(tally.held(), BLOCK, "a block of whole pages is charged its bytes");
+    assert_eq!(allocated() - before.0, BLOCK, "Metal counts the block once");
+    let footprint = grew(|reading| reading.footprint_bytes, &before.1, &ProcessMemory::read());
+    assert!(footprint >= BLOCK as i64 * 9 / 10, "the block's pages are backed as it returns: {footprint} bytes");
+    let mut bytes = vec![1; BLOCK as usize];
+    device.read(&block, 0, &mut bytes).unwrap();
+    assert!(bytes.iter().all(|byte| *byte == 0), "a block reads zero");
+    drop(block);
+    assert_eq!(tally.held(), 0);
+    assert_eq!(allocated(), before.0);
 }

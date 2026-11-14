@@ -166,24 +166,34 @@ impl Drop for Alone {
 /// through: each routed tensor's tier records, each layer's tier map, and
 /// each routed tensor's bank records, which promotions copy into.
 pub(super) struct HostWords {
-    /// Each routed tensor's tier records, reserved as a bank's are and every
-    /// one backed, so the host addresses only views of them, and their
-    /// resizers, which outlive them.
+    /// Each routed tensor's tier records, one host-shared row a record,
+    /// which the host addresses only through views of each.
     tier: Vec<Tensor>,
-    _resizers: Vec<seismic::Resizer>,
     pub(super) maps: Vec<Words>,
-    bank: Vec<Tensor>,
+    bank: Arc<BankRows>,
 }
 
 impl HostWords {
     /// Each routed tensor's first `records` tier records as the host
-    /// addresses them: a view pinning them, as a bank's are.
+    /// addresses them: a view of each record of its own, as a tier's are.
     pub(super) fn views(&self, records: u32) -> Vec<Records> {
-        let records = u64::from(records);
-        self.tier
-            .iter()
-            .map(|tensor| Records::new(tensor.region(Element::i32(), &[records, RECORD / 4], 0).unwrap(), RECORD, records).unwrap())
-            .collect()
+        self.tier.iter().map(|tensor| Records::new(rows(tensor, u64::from(records)), RECORD).unwrap()).collect()
+    }
+}
+
+/// `tensor`'s first `count` rows, each a view of its own.
+fn rows(tensor: &Tensor, count: u64) -> Vec<Option<Tensor>> {
+    (0..count).map(|row| Some(tensor.slice_leading(row, row + 1).unwrap())).collect()
+}
+
+/// Each routed tensor's bank records, one host-shared row a record of the
+/// bank's one group: what promotions copy into, a record at a time.
+struct BankRows(Vec<Tensor>);
+
+impl BankRecordViews for BankRows {
+    fn view(&self, group: usize, tensor: usize, record: usize) -> Tensor {
+        assert_eq!(group, 0, "the harness's bank is one group");
+        self.0[tensor].slice_leading(record as u64, record as u64 + 1).unwrap()
     }
 }
 
@@ -389,39 +399,22 @@ pub(super) fn lending_bank(
     // one store's.
     let bank_records = match placer { Placer::Tier => records, Placer::Bank => u64::from(tier).max(records) };
     let commits = words(bank_records, 0);
-    // The host tier: each tensor's tier records, reserved for every expert
-    // of every layer or its records if more (as a load reserves the most it
-    // grows to), in the bank's resident form, which here is the stored one;
-    // each layer's tier map, none kept; and each tensor's bank records.
-    let reserved = u64::from(tier).max(EXPERTS as u64 * layers as u64);
-    let reserve = |records: u64| Tensor::reserved_in(crate::planning::BankTier::Bank.contract_on(&device), &device, Element::i32(), &[records, RECORD / 4], records, None).unwrap();
-    let (tensors, _resizers) = (0..3).map(|_| reserve(reserved)).unzip::<_, _, Vec<_>, Vec<_>>();
-    let (bank, bank_resizers) = (0..3).map(|_| reserve(records)).unzip::<_, _, Vec<_>, Vec<_>>();
+    // The host tier: each tensor's tier records, a row for every expert of
+    // every layer or its records if more (the most a tier grows to), in the
+    // bank's resident form, which here is the stored one; each layer's tier
+    // map, none kept; and each tensor's bank records.
+    let extent = u64::from(tier).max(EXPERTS as u64 * layers as u64);
+    let shared_rows = |records: u64| Tensor::shared(&device, Element::i32(), &[records, RECORD / 4]).unwrap();
     let host = HostWords {
-        tier: tensors,
-        _resizers: _resizers.into_iter().chain(bank_resizers).collect(),
+        tier: (0..3).map(|_| shared_rows(extent)).collect(),
         maps: (0..layers).map(|_| words(EXPERTS as u64, -1)).collect(),
-        bank,
+        bank: Arc::new(BankRows((0..3).map(|_| shared_rows(records)).collect())),
     };
     // Beside a host tier, what promotions copy with: the device's transfers
     // (the CPU's, complete as queued), from each tensor's tier records into
     // its bank records.
     let copies = crate::experts::copies::Copies::new(seismic::Transfer::new(&device).unwrap(), steps.events().clone());
-    let copier = (placer == Placer::Tier && promotes).then(|| super::Copier {
-        copies: copies.clone(),
-        groups: vec![
-            host.tier
-                .iter()
-                .zip(&host.bank)
-                .map(|(tier, bank)| super::CopyTensor {
-                    tier: tier.clone(),
-                    tier_at: tier.record_placement().unwrap(),
-                    bank: bank.clone(),
-                    bank_at: bank.record_placement().unwrap(),
-                })
-                .collect(),
-        ],
-    });
+    let copier = (placer == Placer::Tier && promotes).then(|| super::Copier { copies: copies.clone(), bank: host.bank.clone() });
     let tier_tensors = host
         .views(tier)
         .into_iter()
@@ -443,7 +436,7 @@ pub(super) fn lending_bank(
         let view = tensor
             .region(Element::i32(), &[records, RECORD / 4], kind * records * RECORD)
             .unwrap();
-        Records::new(view, RECORD, records).unwrap()
+        Records::rows(&view, RECORD, records).unwrap()
     };
     let pools = (0..3)
         .map(|kind| Pool {
@@ -456,7 +449,7 @@ pub(super) fn lending_bank(
         records,
         pools: pools
             .iter()
-            .map(|pool| LentPool { record: bytes, offset: 0, conveyor: pool.placement() })
+            .map(|pool| LentPool { record: bytes, offset: 0, conveyor: pool.bytes() })
             .collect(),
     };
     // Each tensor's experts as the device's pass reads them, by expert:
@@ -516,7 +509,7 @@ pub(super) fn lending_bank(
                 policy: layer.5.clone(),
                 site: None,
                 stored: (0..3).map(stored_tensor).collect(),
-                slots: addressed.then(|| scratch.iter().map(|slots| Records::new(slots.clone(), RECORD, EXPERTS as u64).unwrap()).collect()),
+                slots: addressed.then(|| scratch.iter().map(|slots| Records::rows(slots, RECORD, EXPERTS as u64).unwrap()).collect()),
                 scratch_form: vec![0; 3],
                 landing: landing[index].clone(),
                 rounds: round_words[index].iter().map(|words| LandingList::new(words.clone(), round_bounds)).collect(),
@@ -524,7 +517,7 @@ pub(super) fn lending_bank(
                     bank: bank_records,
                     // `BankBinding::tier`: the one store has no tier to copy from.
                     tier: match placer {
-                        Placer::Tier => reserved,
+                        Placer::Tier => extent,
                         Placer::Bank => 0,
                     },
                 },
@@ -788,7 +781,7 @@ impl Ahead {
         std::fs::write(&path, vec![0u8; Self::FILE as usize]).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &urgent()).unwrap();
         let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
-        let records = Records::new(sink, Self::FILE, 1).unwrap();
+        let records = Records::rows(&sink, Self::FILE, 1).unwrap();
         let shape = seismic_io::link_shape(&seismic_io::OpenFile::open(&path).unwrap(), Some(&urgent())).unwrap();
         let bytes = shape.due_read.min(Self::FILE);
         let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), bytes, late, gate: Gate::new(open) });
@@ -1056,7 +1049,7 @@ impl Harness {
     /// The first byte of bank record `record` of tensor `kind`.
     pub(super) fn banked(&self, kind: usize, record: usize) -> u8 {
         let mut byte = [0u8];
-        unsafe { self.host.bank[kind].read_shared(record as u64 * RECORD, &mut byte) }.unwrap();
+        unsafe { self.host.bank.0[kind].read_shared(record as u64 * RECORD, &mut byte) }.unwrap();
         byte[0]
     }
 
@@ -1278,7 +1271,7 @@ impl Harness {
                 // SAFETY: the harness plays the device; nothing else
                 // writes the record or the slot meanwhile.
                 unsafe {
-                    records.tensor().read_shared(records.offset(record as u64), &mut bytes).unwrap();
+                    records.tensor(record as u64).read_shared(0, &mut bytes).unwrap();
                     slots.write_shared(expert as u64 * RECORD, &bytes).unwrap();
                 }
             }

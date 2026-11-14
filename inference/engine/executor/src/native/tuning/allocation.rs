@@ -1696,7 +1696,7 @@ pub(crate) struct Threads<U: Unit> {
 /// ([`super::host_room`]), its least as any of the burst's compiles ended,
 /// and the most threads the burst compiled on at once.
 struct Burst {
-    room: Option<u64>,
+    room: u64,
     lowest: Option<u64>,
     threads: usize,
 }
@@ -1744,10 +1744,8 @@ impl<U: Unit> Threads<U> {
         // process or a compiler's own (with whatever else took room
         // meanwhile, which only prices a compile higher).
         if let Some(burst) = &mut self.burst {
-            burst.lowest = match (burst.lowest, super::host_room()) {
-                (Some(lowest), Some(room)) => Some(lowest.min(room)),
-                (lowest, room) => lowest.or(room),
-            };
+            let room = super::host_room();
+            burst.lowest = Some(burst.lowest.map_or(room, |lowest| lowest.min(room)));
         }
         // The burst is over when its last compile ends. A burst that held
         // more than its compiles were priced at raises the price to what it

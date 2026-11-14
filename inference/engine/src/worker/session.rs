@@ -159,9 +159,8 @@ pub(crate) struct Loaded {
     pub execution: Worker<UnloadCause>,
     pub binding: GenerationBinding,
     pub definition: ModelDefinition,
-    /// The model's host-resident tables' bytes, which the census reports in
-    /// host RAM (`AllocationCensus::classify`).
-    pub host_table_bytes: u64,
+    /// The census as the owner counts it changing ([`WorkerMessage::Census`]).
+    pub census: Arc<super::execution::CensusWatch>,
 }
 
 pub(crate) struct Session {
@@ -544,29 +543,19 @@ impl Session {
                     reconciliation,
                     readings,
                     serving,
-                }) => match AllocationCensus::classify(
-                    &reconciliation,
-                    self.loaded.host_table_bytes,
-                    serving,
-                ) {
-                    Ok(census) => {
-                        let stores = readings
-                            .iter()
-                            .map(|reading| StoreHeadroom {
-                                store: reading.identity.clone(),
-                                headroom_bytes: reading.headroom_bytes,
-                            })
-                            .collect();
-                        self.send(WorkerMessage::Observed {
-                            observation: Ok(MemoryObservation { census, stores }),
-                        })?
-                    }
-                    Err(reason) => {
-                        return Ok(Flow::Exit(WorkerExit::Unloaded(UnloadCause::Internal {
-                            reason,
-                        })))
-                    }
-                },
+                }) => {
+                    let census = AllocationCensus::classify(&reconciliation, serving);
+                    let stores = readings
+                        .iter()
+                        .map(|reading| StoreHeadroom {
+                            store: reading.identity.clone(),
+                            headroom_bytes: reading.headroom_bytes,
+                        })
+                        .collect();
+                    self.send(WorkerMessage::Observed {
+                        observation: Ok(MemoryObservation { census, stores }),
+                    })?
+                }
                 Ok(_) => self.send(WorkerMessage::Observed {
                     observation: Err(RequestError::internal(
                         "execution owner returned an invalid observation reply",
@@ -579,6 +568,10 @@ impl Session {
                     observation: Err(RequestError::ModelUnloaded { cause }),
                 })?,
             }
+        }
+        if let Some((reconciliation, serving)) = self.loaded.census.take(&self.waker) {
+            let census = AllocationCensus::classify(&reconciliation, serving);
+            self.send(WorkerMessage::Census { census })?;
         }
         self.forward_streams()?;
         if let Some(cause) = &self.unloading {
@@ -740,13 +733,6 @@ fn progress(snapshot: RequestSnapshot) -> RequestProgress {
             Status::OutputBlocked => RequestState::OutputBlocked,
             Status::Preempted => RequestState::Preempted,
             Status::MemoryBlocked => RequestState::MemoryBlocked,
-            Status::CapacityBlocked {
-                required,
-                available,
-            } => RequestState::CapacityBlocked {
-                required,
-                available,
-            },
             Status::Terminal(finish) => RequestState::Finished(finish),
         },
         prompt_tokens: snapshot.prompt_tokens,
@@ -848,6 +834,8 @@ mod tests {
             locality_seconds: 1.0,
             conversations: std::num::NonZeroUsize::MIN,
         };
+        let census = Arc::new(crate::worker::execution::CensusWatch::default());
+        let owner_census = census.clone();
         let spawned = Worker::spawn(
             move |wakes| {
                 let (domain, bindings) = banked(backend, 4, 4);
@@ -855,7 +843,7 @@ mod tests {
                 // Priced by no kernel cache: every input unavailable.
                 let request = magnitude_executor::platform::DeviceRequest::Backend(backend);
                 let (pricing, _) = crate::execution::LoadPricing::fixture(request, true, None);
-                Ok(Box::new(ExecutionOwner::new(owner, Arc::new(Plain), pricing)) as Box<dyn Driven<Stopped = UnloadCause>>)
+                Ok(Box::new(ExecutionOwner::new(owner, Arc::new(Plain), pricing, owner_census)) as Box<dyn Driven<Stopped = UnloadCause>>)
             },
             usize::MAX,
         );
@@ -866,7 +854,7 @@ mod tests {
             execution,
             binding: binding(),
             definition: tiny_definition(),
-            host_table_bytes: 0,
+            census,
         };
         (Session::new(outbound, Arc::new(Signal::default()), loaded), sent)
     }

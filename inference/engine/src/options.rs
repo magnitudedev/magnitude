@@ -8,7 +8,7 @@ use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::generation::MethodPolicy;
 use magnitude_executor::{
     ExecutionPath, MAX_DRAFT_PROPOSALS, ResourcePlan, TuningSettings,
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
 };
 use magnitude_family_contracts::{DraftVariant, HeadHistory, ModelDefinition, ModelFamily};
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
@@ -419,9 +419,9 @@ pub struct ExecutionManifest {
     /// its reads. None of a manifest no package was opened for (an
     /// assessment's, of headers), which no load is resolved from.
     pub model_store: Option<PathBuf>,
-    /// The host's threshold policy: every engine claim keeps each domain's
-    /// headroom above its planning reserve.
-    pub reserves: MemoryReserves,
+    /// The machine's page-release rate, which a load's searches price giving
+    /// memory back by.
+    pub release: ReleaseRate,
     /// How the model's Prepare tunes, and the budget its load reads records
     /// under: [`TuningSettings::STANDARD`] unless a diagnostic host chooses
     /// a budget or fresh tuning. A load never searches and reads stored
@@ -555,7 +555,7 @@ impl ExecutionManifest {
         device: DeviceRequest,
         kernel_cache: Option<PathBuf>,
         model_store: Option<PathBuf>,
-        reserves: MemoryReserves,
+        release: ReleaseRate,
     ) -> Result<Self, String> {
         let definition = model.method.executed(definition);
         definition.validate().map_err(|error| error.to_string())?;
@@ -572,7 +572,7 @@ impl ExecutionManifest {
             device,
             kernel_cache,
             model_store,
-            reserves,
+            release,
             tuning: TuningSettings::STANDARD,
             tuning_trace: None,
         })
@@ -1144,16 +1144,13 @@ pub(crate) mod tests {
     /// The manifest crosses to a worker process in the protocol encoding, as
     /// the `Load` the host frames for it (`FramedTransport`), and arrives
     /// unchanged, whichever of its optional parts are known: every path the
-    /// host may or may not name, and reserves whose host motion has or has
-    /// not seen a sustained take, with or without a device's motion, either
-    /// way. Postcard is positional, so a field a serializer omits when absent
-    /// (`skip_serializing_if`) misreads everything after it; every field is
-    /// compared, not just the encoding.
+    /// host may or may not name. Postcard is positional, so a field a
+    /// serializer omits when absent (`skip_serializing_if`) misreads
+    /// everything after it; every field is compared, not just the encoding.
     #[test]
     fn execution_manifest_round_trips_through_the_worker_encoding() {
         use crate::worker::protocol::{HostMessage, WorkerMessage};
         use crate::worker::transport::{FramedTransport, MessageReceiver, MessageSender, Transport};
-        use magnitude_executor::platform::{MemoryReserves, StoreMotion};
         /// A byte stream both ends share.
         #[derive(Clone, Default)]
         struct Stream(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1167,54 +1164,47 @@ pub(crate) mod tests {
             }
         }
         let path = |known: bool, name: &str| known.then(|| PathBuf::from(name));
-        let base = manifest_with_kernel_cache(None).reserves;
-        let motions = [None, Some(StoreMotion::prior(1e9)), Some(StoreMotion::new(4096, 2e9))];
         for known in [false, true] {
-            for host in motions {
-                for device in motions {
-                    let mut manifest = manifest_with_kernel_cache(path(known, "/cache/kernels"));
-                    manifest.model_store = path(known, "/models");
-                    manifest.tuning_trace = path(known, "/traces/tuning.jsonl");
-                    manifest.reserves = MemoryReserves::measured(base, host, device);
-                    let stream = Stream::default();
-                    let (_, mut sender) =
-                        FramedTransport::<std::io::Empty, Stream, WorkerMessage, HostMessage>::new(
-                            std::io::empty(),
-                            stream.clone(),
-                        )
-                        .split();
-                    sender
-                        .send(HostMessage::Load {
-                            manifest: manifest.clone(),
-                            unprepared: magnitude_executor::UnpreparedUnits::Report,
-                        })
-                        .unwrap();
-                    let bytes = stream.0.lock().unwrap().clone();
-                    let (mut receiver, _) = FramedTransport::<_, std::io::Sink, HostMessage, WorkerMessage>::new(
-                        std::io::Cursor::new(bytes),
-                        std::io::sink(),
-                    )
-                    .split();
-                    let case = format!("paths known {known}, host {host:?}, device {device:?}");
-                    let Some(HostMessage::Load { manifest: decoded, .. }) =
-                        receiver.receive().unwrap_or_else(|error| panic!("{case}: {error}"))
-                    else {
-                        panic!("{case}: the frame is not the Load sent");
-                    };
-                    assert_eq!(decoded.package, manifest.package, "{case}");
-                    assert_eq!(decoded.definition, manifest.definition, "{case}");
-                    assert_eq!(decoded.model, manifest.model, "{case}");
-                    assert_eq!(format!("{:?}", decoded.service), format!("{:?}", manifest.service), "{case}");
-                    assert_eq!(decoded.path, manifest.path, "{case}");
-                    assert_eq!(decoded.device, manifest.device, "{case}");
-                    assert_eq!(decoded.kernel_cache, manifest.kernel_cache, "{case}");
-                    assert_eq!(decoded.model_store, manifest.model_store, "{case}");
-                    assert_eq!(decoded.reserves, manifest.reserves, "{case}");
-                    assert_eq!(decoded.tuning, manifest.tuning, "{case}");
-                    assert_eq!(decoded.tuning_trace, manifest.tuning_trace, "{case}");
-                    assert!(receiver.receive().unwrap().is_none(), "{case}: one frame");
-                }
-            }
+            let mut manifest = manifest_with_kernel_cache(path(known, "/cache/kernels"));
+            manifest.model_store = path(known, "/models");
+            manifest.tuning_trace = path(known, "/traces/tuning.jsonl");
+            let stream = Stream::default();
+            let (_, mut sender) =
+                FramedTransport::<std::io::Empty, Stream, WorkerMessage, HostMessage>::new(
+                    std::io::empty(),
+                    stream.clone(),
+                )
+                .split();
+            sender
+                .send(HostMessage::Load {
+                    manifest: manifest.clone(),
+                    unprepared: magnitude_executor::UnpreparedUnits::Report,
+                })
+                .unwrap();
+            let bytes = stream.0.lock().unwrap().clone();
+            let (mut receiver, _) = FramedTransport::<_, std::io::Sink, HostMessage, WorkerMessage>::new(
+                std::io::Cursor::new(bytes),
+                std::io::sink(),
+            )
+            .split();
+            let case = format!("paths known {known}");
+            let Some(HostMessage::Load { manifest: decoded, .. }) =
+                receiver.receive().unwrap_or_else(|error| panic!("{case}: {error}"))
+            else {
+                panic!("{case}: the frame is not the Load sent");
+            };
+            assert_eq!(decoded.package, manifest.package, "{case}");
+            assert_eq!(decoded.definition, manifest.definition, "{case}");
+            assert_eq!(decoded.model, manifest.model, "{case}");
+            assert_eq!(format!("{:?}", decoded.service), format!("{:?}", manifest.service), "{case}");
+            assert_eq!(decoded.path, manifest.path, "{case}");
+            assert_eq!(decoded.device, manifest.device, "{case}");
+            assert_eq!(decoded.kernel_cache, manifest.kernel_cache, "{case}");
+            assert_eq!(decoded.model_store, manifest.model_store, "{case}");
+            assert_eq!(decoded.release, manifest.release, "{case}");
+            assert_eq!(decoded.tuning, manifest.tuning, "{case}");
+            assert_eq!(decoded.tuning_trace, manifest.tuning_trace, "{case}");
+            assert!(receiver.receive().unwrap().is_none(), "{case}: one frame");
         }
     }
 
@@ -1254,7 +1244,7 @@ pub(crate) mod tests {
             "metal:00000001000004a5".parse().unwrap(),
             kernel_cache,
             Some(PathBuf::from("/models")),
-            MemoryReserves::of_machine(None),
+            ReleaseRate::of_machine(None),
         )
         .unwrap()
     }

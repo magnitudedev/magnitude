@@ -19,8 +19,7 @@ use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use crate::registered::{host_pages, Registered};
-use seismic_reservation::HostRange;
+use seismic_memory::entry::{Backed, Charge, DropScope, Entry, Wiring};
 
 pub type Handle = *mut c_void;
 type ResultCode = c_int;
@@ -156,7 +155,7 @@ driver! {
         function_load: unsafe extern "system" fn(Handle) -> ResultCode => "cuFuncLoad",
         // Driver API 12.3+: typed graph edges (programmatic dependent launch).
         graph_add_dependencies: unsafe extern "system" fn(Handle, *const Handle, *const Handle, *const EdgeData, usize) -> ResultCode => "cuGraphAddDependencies_v2",
-        // Driver API 10.2+: virtual memory management (reserved address ranges).
+        // Driver API 10.2+: virtual memory management and host-NUMA physical blocks (CUDA 12.2+).
         memory_granularity: unsafe extern "system" fn(*mut usize, *const AllocationProperties, c_uint) -> ResultCode => "cuMemGetAllocationGranularity",
         address_reserve: unsafe extern "system" fn(*mut u64, usize, usize, u64, u64) -> ResultCode => "cuMemAddressReserve",
         address_free: unsafe extern "system" fn(u64, usize) -> ResultCode => "cuMemAddressFree",
@@ -286,14 +285,15 @@ pub(crate) struct Context {
     /// Where the device's memory is the host's, what the driver holds for
     /// the process outside its resident set: each allocation below adds
     /// itself as it is made and takes itself off as it is freed (device
-    /// memory, reservations' granules of either kind, graphs' driver memory;
+    /// memory, graphs' driver memory;
     /// `cuMemHostAlloc` memory is resident shared memory, in the footprint
     /// already). Set once, at the device's opening.
     pub(crate) driver_memory: OnceLock<Arc<seismic_native_target::process::DriverMemory>>,
-    /// The device account the stack the driver grew beyond
-    /// `RESERVED_STACK_BYTES` is charged to (`Context::charge_stack_to`),
-    /// and the charges made to it, held while this context lives.
-    stack_account: OnceLock<Arc<dyn seismic_compiler::executable::MemoryAccount>>,
+    /// The device's own entry (`Context::charge_own_to`): the stack the
+    /// driver grew beyond `RESERVED_STACK_BYTES` and the modules loaded on
+    /// the device are charged to it, the stack's charges held while this
+    /// context lives, each module's while it is loaded.
+    own_entry: OnceLock<Arc<dyn Entry>>,
     /// The device's stack growth, shared by every context on it.
     stack: Arc<StackGrowth>,
     /// The per-thread stack this context's retain of the primary context is
@@ -304,7 +304,11 @@ pub(crate) struct Context {
     /// The driver's stack limit calls (queries and raises) this context made.
     #[cfg(test)]
     limit_calls: std::sync::atomic::AtomicUsize,
-    stack_charges: std::sync::Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
+    stack_charges: std::sync::Mutex<Vec<Charge>>,
+    /// The change its drop runs in, ended after the stack's charges are
+    /// freed ([`DropScope`]): last. A context's release and the free of its
+    /// charges are many effects, which no one [`Backed`] owns.
+    scope: DropScope,
 }
 
 // The raw handle is an opaque driver object usable from any thread once made
@@ -328,12 +332,13 @@ impl Context {
             ordinal,
             transfer: std::ptr::null_mut(),
             driver_memory: OnceLock::new(),
-            stack_account: OnceLock::new(),
+            own_entry: OnceLock::new(),
             stack: stack_growth(ordinal),
             stack_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             limit_calls: std::sync::atomic::AtomicUsize::new(0),
             stack_charges: std::sync::Mutex::new(Vec::new()),
+            scope: DropScope::default(),
         };
         context.transfer = {
             let _current = context.enter()?;
@@ -376,29 +381,62 @@ impl Context {
     /// A function the stack already covers costs no driver call and takes
     /// no lock: this context's known limit is read first
     /// ([`Context::stack_limit`]). A growth, which synchronizes the device,
-    /// is serialized only with the device's other growths, so its free
-    /// memory before and after is the raise's own, and never with loads
-    /// on any device.
+    /// is serialized only with the device's other measured driver calls
+    /// (its growths and module loads, [`Context::taken_by`]), so its free
+    /// memory before and after is the raise's own, and never with work on
+    /// any other device.
     fn raise_stack(&self, bytes: usize) -> Result<u64, DriverError> {
         if self.stack_limit.load(std::sync::atomic::Ordering::Acquire) >= bytes {
             return Ok(0);
         }
-        let _raising = self.stack.raising.lock().expect("a device's stack raise lock is never poisoned");
-        let _current = self.enter()?;
         let driver = &self.driver;
         let mut limit = 0usize;
-        #[cfg(test)]
-        self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            driver.check(
-                (driver.context_get_limit)(&mut limit, CU_LIMIT_STACK_SIZE),
-                "stack limit query",
-            )?;
+        {
+            let _current = self.enter()?;
+            #[cfg(test)]
+            self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                driver.check(
+                    (driver.context_get_limit)(&mut limit, CU_LIMIT_STACK_SIZE),
+                    "stack limit query",
+                )?;
+            }
         }
         self.stack_limit.fetch_max(limit, std::sync::atomic::Ordering::AcqRel);
         if limit >= bytes {
             return Ok(0);
         }
+        let ((), taken) = self.taken_by(|| {
+            #[cfg(test)]
+            self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                driver.check(
+                    (driver.context_set_limit)(CU_LIMIT_STACK_SIZE, bytes),
+                    "stack limit raise",
+                )
+            }
+        })?;
+        self.stack_limit.fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
+        Ok(taken)
+    }
+
+    /// Run `work`, driver calls that take device memory no allocation of
+    /// ours reports (a stack raise, a module's load), on this context, and
+    /// read what they took: the device's free memory before and after,
+    /// serialized with every other such call, and with every allocation and
+    /// free of ours, on the device in the process ([`Self::changing_memory`]):
+    /// no change of ours but `work` lies in the window.
+    ///
+    /// The device's free memory is device-wide, so other programs' moves in
+    /// the window are not excluded, and the reading is a bound on what
+    /// `work` took, not the exact figure: another program's allocation in
+    /// the window reads as taken by `work`, at most what it allocated, and
+    /// another's free reads as less taken, at least nothing (the work only
+    /// takes).
+    fn taken_by<T>(&self, work: impl FnOnce() -> Result<T, DriverError>) -> Result<(T, u64), DriverError> {
+        let _measuring = self.changing_memory();
+        let _current = self.enter()?;
+        let driver = &self.driver;
         let free = || {
             let (mut free, mut total) = (0usize, 0usize);
             unsafe {
@@ -408,32 +446,40 @@ impl Context {
             }
         };
         let before = free()?;
-        #[cfg(test)]
-        self.limit_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            driver.check(
-                (driver.context_set_limit)(CU_LIMIT_STACK_SIZE, bytes),
-                "stack limit raise",
-            )?;
-        }
-        self.stack_limit.fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
-        Ok(before.saturating_sub(free()?))
+        let done = work()?;
+        Ok((done, before.saturating_sub(free()?)))
     }
 
-    /// Charge the stack the driver holds beyond `RESERVED_STACK_BYTES` on
-    /// this context's device to `account`, its device account: what the
-    /// process's earlier contexts grew it to now, and each later growth as a
-    /// function loaded here takes it. Called once, at the device's opening.
-    pub(crate) fn charge_stack_to(&self, account: Arc<dyn seismic_compiler::executable::MemoryAccount>) {
+    /// Held across every driver call of ours that takes or frees memory on
+    /// this context's device (`cuMemAlloc` and `cuMemFree`, pinned and
+    /// registered host memory, a module's load and unload, a graph's
+    /// instantiation and destruction, a stack raise): one at a time on the
+    /// device in the process, so none of ours runs inside another's
+    /// measurement ([`Self::taken_by`]).
+    pub(crate) fn changing_memory(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stack.measuring.lock().expect("a device's driver memory lock is never poisoned")
+    }
+
+    /// Charge the driver memory of this context's device that no
+    /// allocation reports to `entry`, its device store's own entry: the
+    /// stack the driver holds beyond `RESERVED_STACK_BYTES`, what the
+    /// process's earlier contexts grew it to now and each later growth as a
+    /// function loaded here takes it, and each module loaded here from now
+    /// while it is loaded ([`load_module`]). Called once, at the device's
+    /// opening.
+    pub(crate) fn charge_own_to(&self, entry: Arc<dyn Entry>) {
+        // Memory the process's earlier contexts took, recorded now: a change
+        // of its own, with no effect of this call beside it.
+        let change = entry.change();
         let mut charges = self.stack_charges();
-        charges.push(account.record(self.stack.bytes()));
+        charges.push(Charge::took(&change, &entry, self.stack.bytes(), Wiring::Pageable));
         assert!(
-            self.stack_account.set(account).is_ok(),
-            "a context's stack is charged to one account, at its device's opening"
+            self.own_entry.set(entry).is_ok(),
+            "a context's driver memory is charged to one entry, at its device's opening"
         );
     }
 
-    fn stack_charges(&self) -> std::sync::MutexGuard<'_, Vec<Box<dyn seismic_compiler::executable::MemoryHold>>> {
+    fn stack_charges(&self) -> std::sync::MutexGuard<'_, Vec<Charge>> {
         self.stack_charges
             .lock()
             .expect("the stack charge lock is never poisoned")
@@ -442,8 +488,9 @@ impl Context {
     /// Reserves the stack `function` needs before it first runs. What a
     /// reservation beyond `RESERVED_STACK_BYTES` takes is device memory no
     /// allocation charges: the driver keeps it for the life of the process
-    /// (`stack_growth`), and this context charges it to its device account
-    /// and, where the device's memory is the host's, to the driver memory.
+    /// (`stack_growth`), and this context charges it to its device store's
+    /// own entry and, where the device's memory is the host's, to the driver
+    /// memory.
     pub(crate) fn reserve_function_stack(&self, function: Handle) -> Result<(), DriverError> {
         let mut local = 0;
         {
@@ -455,12 +502,14 @@ impl Context {
                 )?;
             }
         }
+        // The raise and the record of what it took are one change.
+        let change = self.own_entry.get().map(|entry| (entry, entry.change()));
         let taken = self.raise_stack(usize::try_from(local).unwrap_or(0))?;
         if taken > 0 {
             self.stack.grew(taken);
             self.driver_allocated(taken);
-            if let Some(account) = self.stack_account.get() {
-                self.stack_charges().push(account.record(taken));
+            if let Some((entry, change)) = &change {
+                self.stack_charges().push(Charge::took(change, entry, taken, Wiring::Pageable));
             }
         }
         Ok(())
@@ -505,7 +554,12 @@ impl Context {
 }
 
 impl Drop for Context {
+    /// The context's release, which returns the stack it holds, and the
+    /// free of the bytes charged for that stack are one change.
     fn drop(&mut self) {
+        if let Some(entry) = self.own_entry.get() {
+            self.scope.begin(entry);
+        }
         if !self.transfer.is_null() {
             if let Ok(_current) = self.enter() {
                 unsafe {
@@ -537,8 +591,11 @@ pub(crate) const RESERVED_STACK_BYTES: usize = 2048;
 #[derive(Default)]
 pub(crate) struct StackGrowth {
     bytes: std::sync::atomic::AtomicU64,
-    /// Held by a raise of the device's limit, which alone calls the driver.
-    raising: std::sync::Mutex<()>,
+    /// Held across every driver call of the process that takes or frees
+    /// memory on the device, and across a measurement of one from the
+    /// device's free memory (`Context::changing_memory`,
+    /// `Context::taken_by`): one at a time on the device in the process.
+    measuring: std::sync::Mutex<()>,
 }
 
 impl StackGrowth {
@@ -794,6 +851,7 @@ impl Allocation {
         let _current = context.enter()?;
         let mut pointer = 0;
         unsafe {
+            let _changing = context.changing_memory();
             context.driver.check(
                 (context.driver.allocate)(&mut pointer, bytes.max(1)),
                 "allocation",
@@ -840,97 +898,23 @@ impl MemoryLocation {
         }
     }
 
-    /// Host NUMA node `node`.
     fn host_numa(node: c_int) -> Self {
         // CU_MEM_LOCATION_TYPE_HOST_NUMA
         Self { kind: 3, id: node }
     }
 
-    /// Where created `memory` of device `ordinal` lies: the device, or the
-    /// host NUMA node closest to it (`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`),
-    /// node 0 where the host has no NUMA, as `cuMemCreate` requires there.
-    fn of(memory: CreatedMemory, driver: &Driver, ordinal: c_int) -> Result<Self, DriverError> {
+    fn host_for_device(driver: &Driver, ordinal: c_int) -> Result<Self, DriverError> {
         // CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID
         const HOST_NUMA_ID: c_int = 134;
-        Ok(match memory {
-            CreatedMemory::Device => Self::device(ordinal),
-            CreatedMemory::Host => Self::host_numa(driver.attribute(HOST_NUMA_ID, ordinal)?.max(0)),
-        })
+        Ok(Self::host_numa(driver.attribute(HOST_NUMA_ID, ordinal)?.max(0)))
     }
 }
 
-/// Memory a reservation's granules are created as (`cuMemCreate`): the
-/// device's own, or pinned memory of its host node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CreatedMemory {
-    Device,
-    Host,
-}
-
-impl CreatedMemory {
-    /// Who may read and write its granules: the device, and for host memory
-    /// the host (`CU_MEM_LOCATION_TYPE_HOST_NUMA` access, whose id the
-    /// driver ignores).
-    fn access(self, ordinal: c_int) -> Vec<AccessDescription> {
-        // CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        let readwrite = |location| AccessDescription { location, flags: 3 };
-        let device = readwrite(MemoryLocation::device(ordinal));
-        match self {
-            Self::Device => vec![device],
-            Self::Host => vec![device, readwrite(MemoryLocation::host_numa(0))],
-        }
-    }
-}
-
-/// What memory a reservation's granules are ([`ReservedMemory::new`]): the
-/// mechanism of each kind that reserves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RangeMemory {
-    /// The device's own memory, mapped for the device.
-    Device,
-    /// Pinned memory of the host node closest to a device whose memory is
-    /// the host's (GB10), created for it (`Granules::Created`) and mapped
-    /// for the device and the host at the same addresses, which it reads
-    /// as its own.
-    HostNode,
-    /// Host pages a discrete device reads in place over its link, each
-    /// granule registered for it at its host address
-    /// (`Granules::Registered`). Its pages lie where the
-    /// host's first touch places them: the process may not set their node
-    /// in a container (`mbind` was refused on two RTX 3090 hosts), and the
-    /// node made no difference to the link (a 2990WX's tier on node 2 of a
-    /// device on node 0, and an EPYC 7313's over nodes 0-3 of one on node 1,
-    /// read as fast as host-NUMA allocations of the device's node).
-    Registered,
-}
-
-impl RangeMemory {
-    /// The memory of `kind` (`crate::topology`); none for one that reserves
-    /// nothing.
-    pub const fn of(kind: u32) -> Option<Self> {
-        match kind {
-            crate::topology::DEVICE_KIND => Some(Self::Device),
-            crate::topology::HOST_NODE_KIND => Some(Self::HostNode),
-            crate::topology::REGISTERED_KIND => Some(Self::Registered),
-            _ => None,
-        }
-    }
-
-    /// Whether the host addresses the backed bytes in place: a device
-    /// reservation the host reaches only by driver copies
-    /// (`Buffer::host_address`), a host one in place.
-    pub const fn host_addressed(self) -> bool {
-        matches!(self, Self::HostNode | Self::Registered)
-    }
-
-    /// What its granules are created as; none for registered host pages.
-    const fn created(self) -> Option<CreatedMemory> {
-        match self {
-            Self::Device => Some(CreatedMemory::Device),
-            Self::HostNode => Some(CreatedMemory::Host),
-            Self::Registered => None,
-        }
-    }
+/// `CUmemAccessDesc`.
+#[repr(C)]
+pub(crate) struct AccessDescription {
+    location: MemoryLocation,
+    flags: c_uint,
 }
 
 /// `CUmemAllocationProp`.
@@ -963,18 +947,11 @@ impl AllocationProperties {
     }
 }
 
-/// `CUmemAccessDesc`.
-#[repr(C)]
-pub(crate) struct AccessDescription {
-    location: MemoryLocation,
-    flags: c_uint,
-}
-
 fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError> {
     symbol.ok_or(DriverError {
-        operation: "virtual memory management",
+        operation: "allocation granularity",
         code: 0,
-        description: "the CUDA driver predates driver API 10.2 virtual memory management".into(),
+        description: "the CUDA driver predates driver API 10.2".into(),
     })
 }
 
@@ -982,7 +959,189 @@ fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError
 /// (`cuMemGetAllocationGranularity`, recommended): what one allocation's
 /// size is rounded up to.
 pub(crate) fn allocation_granularity(context: &Context) -> Result<u64, DriverError> {
-    granularity(&context.driver, MemoryLocation::device(context.ordinal()))
+    device_granularity(&context.driver, context.ordinal())
+}
+
+/// [`allocation_granularity`] of device `ordinal`, without a context: what
+/// discovery reports (`DeviceDescriptor::allocation_granularity`).
+pub(crate) fn device_granularity(driver: &Driver, ordinal: c_int) -> Result<u64, DriverError> {
+    granularity(driver, MemoryLocation::device(ordinal))
+}
+
+/// The first driver API that places virtual-memory allocations on a host NUMA
+/// node (`CU_MEM_LOCATION_TYPE_HOST_NUMA`, CUDA 12.2).
+const HOST_NUMA_DRIVER: c_int = 12020;
+
+/// Whether `context`'s device supports `cuMemCreate` physical allocations on
+/// its host NUMA node (`HostNodeBlock`), which a unified-memory CUDA host
+/// (Grace Blackwell GB10) reads at full device bandwidth (`242 GB/s` vs
+/// `160 GB/s` for `cuMemHostRegister`).
+pub(crate) fn can_create_host_node(context: &Context) -> Result<bool, DriverError> {
+    // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
+    const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
+    let driver = &context.driver;
+    if driver.address_reserve.is_none()
+        || driver.address_free.is_none()
+        || driver.physical_create.is_none()
+        || driver.physical_release.is_none()
+        || driver.map.is_none()
+        || driver.unmap.is_none()
+        || driver.set_access.is_none()
+        || driver.attribute(VIRTUAL_MEMORY_MANAGEMENT, context.ordinal())? == 0
+    {
+        return Ok(false);
+    }
+    Ok(driver.version()? >= HOST_NUMA_DRIVER)
+}
+
+/// One host-NUMA physical allocation (`cuMemCreate` at
+/// `CU_MEM_LOCATION_TYPE_HOST_NUMA`) mapped for both the device and the host
+/// at one virtual address: zero when made, charged to its entry while it lives,
+/// and unmapped and released in one change when dropped.
+pub(crate) struct HostNodeBlock(Backed<HostNode>);
+
+impl std::ops::Deref for HostNodeBlock {
+    type Target = HostNode;
+
+    fn deref(&self) -> &HostNode {
+        &self.0
+    }
+}
+
+pub(crate) struct HostNode {
+    base: u64,
+    bytes: usize,
+    handle: u64,
+    context: Arc<Context>,
+}
+
+unsafe impl Send for HostNode {}
+unsafe impl Sync for HostNode {}
+
+impl HostNodeBlock {
+    pub fn new(
+        context: &Arc<Context>,
+        entry: &Arc<dyn Entry>,
+        bytes: u64,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
+        use seismic_compiler::errors::{ExecutionError, RefusalReading};
+        let failed = |error: DriverError| crate::executor::allocation_error(bytes, || RefusalReading::Host)(error);
+        let location = MemoryLocation::host_for_device(&context.driver, context.ordinal()).map_err(failed)?;
+        let granule = granularity(&context.driver, location).map_err(failed)?;
+        let whole = bytes
+            .max(1)
+            .checked_next_multiple_of(granule)
+            .ok_or_else(|| ExecutionError::AllocationFailed("CUDA host-node block size overflows".into()))?;
+        let whole_usize = usize::try_from(whole).map_err(|_| {
+            ExecutionError::AllocationFailed("CUDA host-node block exceeds host address space".into())
+        })?;
+        let gran_usize = usize::try_from(granule).map_err(|_| {
+            ExecutionError::AllocationFailed("CUDA host-node granularity exceeds host address space".into())
+        })?;
+        Backed::take(entry, whole, Wiring::Pageable, |_| {
+            let driver = &context.driver;
+            let reserve = memory_management_symbol(driver.address_reserve).map_err(failed)?;
+            let free = memory_management_symbol(driver.address_free).map_err(failed)?;
+            let create = memory_management_symbol(driver.physical_create).map_err(failed)?;
+            let release = memory_management_symbol(driver.physical_release).map_err(failed)?;
+            let map = memory_management_symbol(driver.map).map_err(failed)?;
+            let unmap = memory_management_symbol(driver.unmap).map_err(failed)?;
+            let set_access = memory_management_symbol(driver.set_access).map_err(failed)?;
+            let node = {
+                let _current = context.enter().map_err(failed)?;
+                let _changing = context.changing_memory();
+                let mut base = 0u64;
+                unsafe {
+                    driver.check(reserve(&mut base, whole_usize, gran_usize, 0, 0), "address reservation")
+                }
+                .map_err(failed)?;
+                let properties = AllocationProperties::at(location);
+                let mut handle = 0u64;
+                if let Err(error) = unsafe {
+                    driver.check(create(&mut handle, whole_usize, &properties, 0), "physical allocation")
+                } {
+                    unsafe {
+                        free(base, whole_usize);
+                    }
+                    return Err(failed(error));
+                }
+                if let Err(error) = unsafe { driver.check(map(base, whole_usize, 0, handle, 0), "map") } {
+                    unsafe {
+                        release(handle);
+                        free(base, whole_usize);
+                    }
+                    return Err(failed(error));
+                }
+                // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3 for the device and the host.
+                let access = [
+                    AccessDescription { location: MemoryLocation::device(context.ordinal()), flags: 3 },
+                    AccessDescription { location: MemoryLocation::host_numa(0), flags: 3 },
+                ];
+                if let Err(error) = unsafe {
+                    driver.check(set_access(base, whole_usize, access.as_ptr(), access.len()), "set access")
+                } {
+                    unsafe {
+                        unmap(base, whole_usize);
+                        release(handle);
+                        free(base, whole_usize);
+                    }
+                    return Err(failed(error));
+                }
+                context.driver_allocated(whole);
+                HostNode {
+                    base,
+                    bytes: whole_usize,
+                    handle,
+                    context: context.clone(),
+                }
+            };
+            zero(context, node.base, node.bytes).map_err(failed)?;
+            Ok::<_, ExecutionError>(node)
+        })
+        .map(Self)
+    }
+}
+
+impl HostNode {
+    pub fn device(&self) -> u64 {
+        self.base
+    }
+
+    pub fn host(&self) -> std::ptr::NonNull<u8> {
+        std::ptr::NonNull::new(self.base as *mut u8).expect("mapped host-node address is non-null")
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for HostNode {
+    fn drop(&mut self) {
+        let driver = &self.context.driver;
+        let (Some(unmap), Some(release), Some(free)) =
+            (driver.unmap, driver.physical_release, driver.address_free)
+        else {
+            return;
+        };
+        let _current = self
+            .context
+            .enter()
+            .unwrap_or_else(|error| panic!("a host-node block's context enters: {error}"));
+        let _changing = self.context.changing_memory();
+        unsafe {
+            driver
+                .check(unmap(self.base, self.bytes), "unmap")
+                .unwrap_or_else(|error| panic!("a host-node block no work uses unmaps: {error}"));
+            driver
+                .check(release(self.handle), "physical release")
+                .unwrap_or_else(|error| panic!("a host-node block no work uses releases: {error}"));
+            driver
+                .check(free(self.base, self.bytes), "address free")
+                .unwrap_or_else(|error| panic!("a host-node block's address range frees: {error}"));
+        }
+        self.context.driver_freed(self.bytes as u64);
+    }
 }
 
 /// `cuMemGetAllocationGranularity` (recommended) for pinned memory at
@@ -1004,353 +1163,6 @@ fn granularity(driver: &Driver, location: MemoryLocation) -> Result<u64, DriverE
     Ok(granularity as u64)
 }
 
-/// What device work reaches a reservation's backed bytes through chunks
-/// of: none, the granules are mapped into one device virtual range.
-pub const RESERVATION_CHUNKS: Option<u64> = None;
-
-/// The first driver API that places virtual-memory allocations on a host
-/// NUMA node (`CU_MEM_LOCATION_TYPE_HOST_NUMA`, CUDA 12.2), which created
-/// host memory is, as `cuDriverGetVersion` reports it.
-const HOST_NUMA_DRIVER: c_int = 12020;
-
-/// The granule in which device `ordinal` backs a reserved tensor's
-/// committed bytes of `memory`; `None` where it reserves no address ranges
-/// of it. Created memory: the driver's allocation granularity, none
-/// without virtual memory management or for host memory before
-/// [`HOST_NUMA_DRIVER`]. Registered host pages: the host's registration
-/// granule (`seismic_reservation::registration_granule`, a large page where it has
-/// them), none where the device reads registered memory at no host address
-/// (`CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM`), which their reservation's
-/// one base needs. Discovery reads it without a context: what it
-/// advertises is what [`ReservedMemory::new`] backs.
-pub fn reservation_granule(ordinal: u32, memory: RangeMemory) -> Result<Option<u64>, String> {
-    let driver = Driver::load()?;
-    let ordinal = c_int::try_from(ordinal).map_err(|_| "a device ordinal exceeds the driver ABI")?;
-    reserving_granularity(&driver, ordinal, memory).map_err(|error| error.to_string())
-}
-
-/// A reserving device's granule of `memory` ([`granularity`]).
-fn reserving_granularity(
-    driver: &Driver,
-    ordinal: c_int,
-    memory: RangeMemory,
-) -> Result<Option<u64>, DriverError> {
-    let Some(memory) = memory.created() else {
-        // CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
-        const HOST_POINTER: c_int = 91;
-        if driver.attribute(HOST_POINTER, ordinal)? == 0 {
-            return Ok(None);
-        }
-        return seismic_reservation::registration_granule().map(Some).map_err(host_pages);
-    };
-    // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
-    const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
-    if driver.address_reserve.is_none() || driver.attribute(VIRTUAL_MEMORY_MANAGEMENT, ordinal)? == 0
-    {
-        return Ok(None);
-    }
-    if memory == CreatedMemory::Host {
-        if driver.version()? < HOST_NUMA_DRIVER {
-            return Ok(None);
-        }
-    }
-    let location = MemoryLocation::of(memory, driver, ordinal)?;
-    granularity(driver, location).map(Some)
-}
-
-/// An address range reserved once, with memory of one kind
-/// ([`RangeMemory`]) backed over a leading prefix of it in granules. The
-/// base address never changes while the backed prefix grows and shrinks, so
-/// work bound to it (and graphs keyed by its address) stays valid, and host
-/// memory's host address with it.
-pub struct ReservedMemory {
-    pub(crate) base: u64,
-    /// Bytes of address space, a whole number of granules.
-    pub(crate) reserved: usize,
-    pub(crate) granularity: usize,
-    /// What the granules are.
-    pub(crate) memory: RangeMemory,
-    /// The account they are charged to.
-    account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
-    granules: Granules,
-    charges: std::sync::Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
-    /// The stream its zero fills run on, its own: what it zeroes no queued
-    /// device work reaches, so it waits on none of the device's.
-    pub(crate) stream: Arc<Stream>,
-    context: Arc<Context>,
-}
-
-/// What backs a reservation's granules, and how many are backed.
-enum Granules {
-    /// Physical allocations created at `location` (CUDA virtual memory
-    /// management), mapped in order from the base of a reserved device
-    /// address range: device memory, and host memory where the device's
-    /// memory is the host's. There it reads them faster than registered
-    /// host pages: on GB10 1 GiB read at 239 GB/s against 164 GB/s
-    /// (`where_memory_is_the_hosts_a_host_reservation_reads_as_a_device_one`).
-    Created {
-        memory: CreatedMemory,
-        location: MemoryLocation,
-        handles: std::sync::Mutex<Vec<u64>>,
-    },
-    /// Host memory a device reads over its link ([`Registered`]: granules
-    /// registered at their host addresses, unregistered by a shrink's
-    /// release or the reservation's end), no driver copy or fill crossing a granule
-    /// ([`ReservedMemory::copy_span`]). Physical allocations `cuMemCreate`
-    /// places on a host node are small pages, which an IOMMU translating
-    /// the device's reads (DMA mode) maps one by one: on an RTX 3090 their
-    /// zero-copy reads fall to half the link and below, and their copies
-    /// run at 10.7 of its 12.4 GB/s ([`HostRange`]).
-    Registered(Arc<Registered>),
-}
-
-unsafe impl Send for ReservedMemory {}
-unsafe impl Sync for ReservedMemory {}
-
-impl ReservedMemory {
-    /// Reserve address space for `bytes` with nothing backed, to be backed
-    /// with `memory` in `granularity`-byte granules (`reservation_granule`),
-    /// charged to `account`.
-    pub(crate) fn new(
-        context: &Arc<Context>,
-        bytes: usize,
-        granularity: usize,
-        memory: RangeMemory,
-        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
-    ) -> Result<Self, DriverError> {
-        let driver = &context.driver;
-        let stream = Stream::new(context)?;
-        let reserved = bytes.max(1).div_ceil(granularity) * granularity;
-        let (base, granules) = match memory.created() {
-            Some(created) => {
-                let reserve = memory_management_symbol(driver.address_reserve)?;
-                let location = MemoryLocation::of(created, driver, context.ordinal())?;
-                let _current = context.enter()?;
-                let mut base = 0u64;
-                unsafe {
-                    driver.check(
-                        reserve(&mut base, reserved, granularity, 0, 0),
-                        "address reservation",
-                    )?;
-                }
-                let handles = std::sync::Mutex::new(Vec::new());
-                (base, Granules::Created { memory: created, location, handles })
-            }
-            None => {
-                let range = HostRange::reserve(reserved as u64, granularity as u64, seismic_reservation::PageSize::Large)
-                    .map_err(host_pages)?;
-                let base = range.base().as_ptr() as u64;
-                (base, Granules::Registered(Registered::new(context, range)))
-            }
-        };
-        Ok(Self {
-            base,
-            charges: std::sync::Mutex::new(Vec::new()),
-            reserved,
-            granularity,
-            memory,
-            account,
-            granules,
-            stream,
-            context: context.clone(),
-        })
-    }
-
-    pub(crate) fn context(&self) -> &Arc<Context> {
-        &self.context
-    }
-
-    /// Registered granules, committed or kept by a growth's retraction.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn registered_granules(&self) -> Option<usize> {
-        self.registered().map(|registered| registered.registered())
-    }
-
-    /// Its registered granules, where it has them.
-    pub(crate) fn registered(&self) -> Option<&Arc<Registered>> {
-        match &self.granules {
-            Granules::Registered(registered) => Some(registered),
-            Granules::Created { .. } => None,
-        }
-    }
-
-    /// The bytes no driver copy of this reservation's crosses: registered
-    /// granules are each their own registration.
-    pub(crate) fn copy_span(&self) -> Option<u64> {
-        matches!(self.granules, Granules::Registered(_)).then_some(self.granularity as u64)
-    }
-
-    /// Back exactly the granules covering the leading `bytes`: map new ones
-    /// read-write for this device, or unmap and release the tail. Precondition
-    /// for a shrink: no device work still touches the released range.
-    /// Each granule backed is charged to the reservation's account before
-    /// it is mapped, and
-    /// released with its granule. Where its bytes read zero from: registered
-    /// host pages newly backed are the host's, zeroed; created granules are
-    /// the driver's, whose contents it leaves undefined, so none of `bytes`.
-    pub(crate) fn commit(&self, bytes: usize) -> Result<usize, seismic_compiler::errors::ExecutionError> {
-        let wanted = bytes.div_ceil(self.granularity);
-        let charge = || self.account.reserve(self.granularity as u64);
-        assert!(
-            bytes <= self.reserved,
-            "ReservedMemory::commit precondition: {bytes} bytes exceed the {}-byte reservation",
-            self.reserved
-        );
-        match &self.granules {
-            Granules::Created { memory, location, handles } => {
-                let mut charges = self
-                    .charges
-                    .lock()
-                    .expect("native reservation charge lock poisoned");
-                let mut extra = Vec::new();
-                for _ in charges.len()..wanted {
-                    extra.push(charge()?);
-                }
-                self.commit_created(*memory, *location, handles, wanted)
-                    .map_err(crate::executor::allocation_error(bytes as u64, || crate::executor::device_free(&self.context)))?;
-                charges.truncate(wanted);
-                charges.extend(extra);
-                Ok(bytes)
-            }
-            // Its granules carry their own charges, which fall when they
-            // are unregistered ([`Registered::commit`]).
-            Granules::Registered(registered) => registered.commit(wanted, charge).map(|fresh| fresh * self.granularity),
-        }
-    }
-
-    fn commit_created(
-        &self,
-        memory: CreatedMemory,
-        location: MemoryLocation,
-        handles: &std::sync::Mutex<Vec<u64>>,
-        wanted: usize,
-    ) -> Result<(), DriverError> {
-        let driver = &self.context.driver;
-        let create = memory_management_symbol(driver.physical_create)?;
-        let release = memory_management_symbol(driver.physical_release)?;
-        let map = memory_management_symbol(driver.map)?;
-        let unmap = memory_management_symbol(driver.unmap)?;
-        let set_access = memory_management_symbol(driver.set_access)?;
-        let _current = self.context.enter()?;
-        let mut granules = handles
-            .lock()
-            .expect("reservation granule lock is never poisoned");
-        let address = |index: usize| self.base + (index * self.granularity) as u64;
-        let previous = granules.len();
-        while granules.len() > wanted {
-            let index = granules.len() - 1;
-            unsafe {
-                if let Err(error) = driver.check(unmap(address(index), self.granularity), "unmap") {
-                    if granules.len() == previous {
-                        return Err(error);
-                    }
-                    panic!("CUDA reservation unmap failed after partial shrink: {error}");
-                }
-                // Once unmapped, the physical handle is no longer usable by
-                // the old view. Releasing it must succeed for the shrink to
-                // return as an ordinary recoverable result.
-                driver
-                    .check(release(granules[index]), "physical release")
-                    .unwrap_or_else(|error| {
-                        panic!("CUDA reservation release failed after unmap: {error}")
-                    });
-            }
-            granules.pop();
-            self.context.driver_freed(self.granularity as u64);
-        }
-        if wanted < previous {
-            return Ok(());
-        }
-        let first_new = granules.len();
-        if wanted == first_new {
-            return Ok(());
-        }
-        let properties = AllocationProperties::at(location);
-        let mapped = (|| {
-            while granules.len() < wanted {
-                let mut handle = 0u64;
-                unsafe {
-                    driver.check(
-                        create(&mut handle, self.granularity, &properties, 0),
-                        "physical allocation",
-                    )?;
-                    if let Err(error) = driver.check(
-                        map(address(granules.len()), self.granularity, 0, handle, 0),
-                        "map",
-                    ) {
-                        release(handle);
-                        return Err(error);
-                    }
-                }
-                granules.push(handle);
-                self.context.driver_allocated(self.granularity as u64);
-            }
-            let access = memory.access(self.context.ordinal());
-            unsafe {
-                driver.check(
-                    set_access(
-                        address(first_new),
-                        (wanted - first_new) * self.granularity,
-                        access.as_ptr(),
-                        access.len(),
-                    ),
-                    "set access",
-                )
-            }
-        })();
-        if mapped.is_err() {
-            // Leave the backing as it was: release what this call mapped.
-            while granules.len() > first_new {
-                let index = granules.len() - 1;
-                unsafe {
-                    unmap(address(index), self.granularity);
-                    release(granules[index]);
-                }
-                granules.pop();
-                self.context.driver_freed(self.granularity as u64);
-            }
-        }
-        mapped
-    }
-}
-
-impl Drop for ReservedMemory {
-    fn drop(&mut self) {
-        let driver = &self.context.driver;
-        let Ok(_current) = self.context.enter() else {
-            return;
-        };
-        match &mut self.granules {
-            Granules::Created { handles, .. } => {
-                let (Some(unmap), Some(release), Some(free)) =
-                    (driver.unmap, driver.physical_release, driver.address_free)
-                else {
-                    return;
-                };
-                let granules = handles
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for (index, handle) in granules.iter().enumerate() {
-                    unsafe {
-                        unmap(
-                            self.base + (index * self.granularity) as u64,
-                            self.granularity,
-                        );
-                        release(*handle);
-                    }
-                }
-                self.context
-                    .driver_freed((granules.len() * self.granularity) as u64);
-                unsafe {
-                    free(self.base, self.reserved);
-                }
-            }
-            // Unregistered now, after the holder's last work that uses them.
-            Granules::Registered(registered) => registered.drop_reservation(),
-        }
-    }
-}
-
 /// Synchronous host copy into device memory at `pointer`, on the context's
 /// non-blocking transfer stream: it waits for nothing but itself (callers
 /// hold the destination's access fence, so no queued launch still reads or
@@ -1367,6 +1179,22 @@ pub(crate) fn upload(context: &Context, pointer: u64, bytes: &[u8]) -> Result<()
         )?;
     }
     context.synchronize(context.transfer, "upload synchronization")
+}
+
+/// Synchronous zero fill of `bytes` of device memory at `pointer`, on the
+/// context's non-blocking transfer stream: memory no queued work reaches
+/// (a block just allocated), so it waits for nothing but itself.
+pub(crate) fn zero(context: &Context, pointer: u64, bytes: usize) -> Result<(), DriverError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let _current = context.enter()?;
+    unsafe {
+        context
+            .driver
+            .check(context.enqueue().memset_d8_async(pointer, 0, bytes, context.transfer), "zero fill")?;
+    }
+    context.synchronize(context.transfer, "zero fill synchronization")
 }
 
 /// Synchronous device-to-host copy from `pointer`, on the context's
@@ -1673,6 +1501,7 @@ impl Graph {
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
         unsafe {
+            let _changing = self.context.changing_memory();
             self.context.driver.check(
                 instantiate(&mut raw, self.raw, 0),
                 "kernel graph instantiation",
@@ -1799,6 +1628,7 @@ impl Drop for GraphExec {
         if let (Some(destroy), Ok(_current)) =
             (self.context.driver.graph_exec_destroy, self.context.enter())
         {
+            let _changing = self.context.changing_memory();
             unsafe {
                 destroy(self.raw);
             }
@@ -1806,36 +1636,58 @@ impl Drop for GraphExec {
     }
 }
 
+/// Pinned host memory mapped into the device address space, with its bytes
+/// charged: allocated and freed inside the change that records them
+/// ([`Backed`]).
+pub(crate) struct HostMapped(Backed<Mapped>);
+
+impl std::ops::Deref for HostMapped {
+    type Target = Mapped;
+
+    fn deref(&self) -> &Mapped {
+        &self.0
+    }
+}
+
+impl HostMapped {
+    /// Mapped host memory of `bytes`, its whole host pages charged to
+    /// `entry`.
+    pub fn new(
+        context: &Arc<Context>,
+        entry: &Arc<dyn Entry>,
+        bytes: usize,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
+        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Mapped::allocate(context, bytes)).map(Self)
+    }
+}
+
 /// Pinned host memory mapped into the device address space. The host writes
 /// and reads it directly; kernels address it through `device`. A host write
 /// made before a launch is visible to that launch, so filling it needs no
 /// driver call and never waits for the device stream.
-pub(crate) struct HostMapped {
+pub(crate) struct Mapped {
     host: *mut u8,
     pub device: u64,
     pub bytes: usize,
     context: Arc<Context>,
-    _charge: Box<dyn seismic_compiler::executable::MemoryHold>,
 }
 
 // The CUDA driver owns the pinned allocation; host access is plain memory
 // access, and the owner serializes host access against device use.
-unsafe impl Send for HostMapped {}
-unsafe impl Sync for HostMapped {}
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
 
-impl HostMapped {
-    /// Mapped host memory of `bytes`, charged to `account`.
-    pub fn new(
+impl Mapped {
+    fn allocate(
         context: &Arc<Context>,
-        account: &Arc<dyn seismic_compiler::executable::MemoryAccount>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
         // CU_MEMHOSTALLOC_DEVICEMAP
         const DEVICE_MAP: c_uint = 2;
         let failed = || crate::executor::allocation_error(bytes as u64, || seismic_compiler::errors::RefusalReading::Host);
-        let charge = account.reserve(bytes.max(1) as u64)?;
         let _current = context.enter().map_err(failed())?;
         let mut host = std::ptr::null_mut();
+        let changing = context.changing_memory();
         unsafe {
             context
                 .driver
@@ -1850,8 +1702,8 @@ impl HostMapped {
                 device: 0,
                 bytes,
                 context: context.clone(),
-                _charge: charge,
             };
+            drop(changing);
             context
                 .driver
                 .check(
@@ -1869,7 +1721,7 @@ impl HostMapped {
             offset
                 .checked_add(bytes.len())
                 .is_some_and(|end| end <= self.bytes),
-            "HostMapped::write_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            "Mapped::write_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
             bytes.len(),
             self.bytes
         );
@@ -1889,7 +1741,7 @@ impl HostMapped {
             offset
                 .checked_add(bytes.len())
                 .is_some_and(|end| end <= self.bytes),
-            "HostMapped::read_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
+            "Mapped::read_at precondition: [{offset}, {offset}+{}) exceeds {} bytes",
             bytes.len(),
             self.bytes
         );
@@ -1899,9 +1751,10 @@ impl HostMapped {
     }
 }
 
-impl Drop for HostMapped {
+impl Drop for Mapped {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
+            let _changing = self.context.changing_memory();
             unsafe {
                 (self.context.driver.free_host)(self.host.cast());
             }
@@ -1909,31 +1762,68 @@ impl Drop for HostMapped {
     }
 }
 
+/// The bytes a pinned host allocation of `bytes` takes: whole host pages,
+/// which the driver pins.
+fn host_pages_of(bytes: usize) -> Result<u64, seismic_compiler::errors::ExecutionError> {
+    let page = seismic_memory::host_page()
+        .map_err(|error| seismic_compiler::errors::ExecutionError::AllocationFailed(format!("the host page: {error}")))?;
+    (bytes.max(1) as u64)
+        .checked_next_multiple_of(page)
+        .ok_or_else(|| seismic_compiler::errors::ExecutionError::AllocationFailed("a pinned host allocation overflows".into()))
+}
+
 /// Pinned host staging retained until every asynchronous upload that reads
-/// it has completed on the submission stream.
-pub(crate) struct PinnedUpload {
+/// it has completed on the submission stream, with its bytes charged:
+/// allocated and freed inside the change that records them ([`Backed`]).
+pub(crate) struct PinnedUpload(Backed<Pinned>);
+
+impl std::ops::Deref for PinnedUpload {
+    type Target = Pinned;
+
+    fn deref(&self) -> &Pinned {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PinnedUpload {
+    fn deref_mut(&mut self) -> &mut Pinned {
+        &mut self.0
+    }
+}
+
+impl PinnedUpload {
+    /// Pinned host staging of `bytes`, its whole host pages charged to
+    /// `entry`.
+    pub fn new(
+        context: &Arc<Context>,
+        entry: &Arc<dyn Entry>,
+        bytes: usize,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
+        Backed::take(entry, host_pages_of(bytes)?, Wiring::Pageable, |_| Pinned::allocate(context, bytes)).map(Self)
+    }
+}
+
+/// The pinned allocation of a [`PinnedUpload`].
+pub(crate) struct Pinned {
     pointer: *mut u8,
     bytes: usize,
     context: Arc<Context>,
-    _charge: Box<dyn seismic_compiler::executable::MemoryHold>,
 }
 
 // The CUDA driver owns the pinned allocation and accepts it from any host
 // thread while its primary context is current there.
-unsafe impl Send for PinnedUpload {}
+unsafe impl Send for Pinned {}
 
-impl PinnedUpload {
-    /// Pinned host staging of `bytes`, charged to `account`.
-    pub fn new(
+impl Pinned {
+    fn allocate(
         context: &Arc<Context>,
-        account: &Arc<dyn seismic_compiler::executable::MemoryAccount>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
         let failed = || crate::executor::allocation_error(bytes as u64, || seismic_compiler::errors::RefusalReading::Host);
-        let charge = account.reserve(bytes.max(1) as u64)?;
         let _current = context.enter().map_err(failed())?;
         let mut pointer = std::ptr::null_mut();
         unsafe {
+            let _changing = context.changing_memory();
             context
                 .driver
                 .check(
@@ -1946,7 +1836,6 @@ impl PinnedUpload {
             pointer: pointer.cast(),
             bytes,
             context: context.clone(),
-            _charge: charge,
         })
     }
 
@@ -1984,12 +1873,13 @@ impl PinnedUpload {
     }
 }
 
-impl Drop for PinnedUpload {
+impl Drop for Pinned {
     fn drop(&mut self) {
         // The executor synchronizes the stream before releasing an in-flight
         // staging allocation. Driver teardown/device loss is the only path
         // where entering the context may fail; free is then best-effort.
         if let Ok(_current) = self.context.enter() {
+            let _changing = self.context.changing_memory();
             unsafe {
                 (self.context.driver.free_host)(self.pointer.cast());
             }
@@ -2001,6 +1891,7 @@ impl Drop for Allocation {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.enter() {
             unsafe {
+                let _changing = self.context.changing_memory();
                 (self.context.driver.free)(self.pointer);
             }
             self.context.driver_freed(self.bytes.max(1) as u64);
@@ -2008,21 +1899,35 @@ impl Drop for Allocation {
     }
 }
 
-/// One loaded module; unloaded with its context.
+/// One loaded module; unloaded with its context. The device memory its
+/// load took is charged to the device's own entry while it is loaded, where
+/// the device was opened with one (`Context::charge_own_to`).
 pub(crate) struct Module {
     pub raw: Handle,
     pub context: Arc<Context>,
+    /// What its load took, as the device's free memory read it.
+    taken: u64,
+    /// Those bytes on the device's own entry; freed after the unload.
+    _charge: Option<Charge>,
+    /// The change its drop runs in ([`DropScope`]): last.
+    scope: DropScope,
 }
 
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Drop for Module {
+    /// The unload and the free of its bytes are one change.
     fn drop(&mut self) {
+        if let Some(charge) = &self._charge {
+            self.scope.begin(charge.entry());
+        }
         if let Ok(_current) = self.context.enter() {
             unsafe {
+                let _changing = self.context.changing_memory();
                 (self.context.driver.module_unload)(self.raw);
             }
+            self.context.driver_freed(self.taken);
         }
     }
 }
@@ -2148,32 +2053,40 @@ pub(crate) fn load_module(
     image: &[u8],
     entry: &str,
 ) -> Result<(Module, Handle), JitError> {
-    let _current = context.enter().map_err(JitError::Driver)?;
     let driver = &context.driver;
     let mut raw = std::ptr::null_mut();
     let mut log = vec![0u8; 16384];
     // ERROR_LOG_BUFFER(5)/SIZE(6)
     let mut options = [5, 6];
     let mut values = [log.as_mut_ptr().cast::<c_void>(), log.len() as *mut c_void];
-    let status = unsafe {
-        (driver.module_load)(
-            &mut raw,
-            image.as_ptr().cast(),
-            options.len() as u32,
-            options.as_mut_ptr(),
-            values.as_mut_ptr(),
-        )
-    };
-    driver
-        .check(status, "native image loading")
-        .map_err(|error| JitError::Toolchain {
-            error,
-            log: log_text(&log),
-        })?;
+    // The load and the record of what it took are one change.
+    let change = context.own_entry.get().map(|entry| (entry, entry.change()));
+    let loaded = context.taken_by(|| {
+        let status = unsafe {
+            (driver.module_load)(
+                &mut raw,
+                image.as_ptr().cast(),
+                options.len() as u32,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+            )
+        };
+        Ok(driver.check(status, "native image loading"))
+    });
+    let (loaded, taken) = loaded.map_err(JitError::Driver)?;
+    loaded.map_err(|error| JitError::Toolchain {
+        error,
+        log: log_text(&log),
+    })?;
+    context.driver_allocated(taken);
     let module = Module {
         raw,
         context: context.clone(),
+        taken,
+        _charge: change.as_ref().map(|(entry, change)| Charge::took(change, entry, taken, Wiring::Pageable)),
+        scope: DropScope::default(),
     };
+    let _current = context.enter().map_err(JitError::Driver)?;
     // Entry names are `seismic_kernel_<n>`: ASCII without NUL.
     let name = std::ffi::CString::new(entry)
         .expect("PTX emitter precondition: entry names contain no NUL byte");
@@ -2366,16 +2279,14 @@ mod tests {
     /// run nothing.
     #[test]
     fn a_function_beyond_the_reserved_stack_raises_it_at_load_and_holds_the_growth() {
-        let Ok(driver) = Driver::load() else { return };
-        let mut devices = 0;
-        if unsafe { (driver.device_count)(&mut devices) } != 0 || devices == 0 {
-            return;
-        }
-        let context = Context::retain(driver.clone(), 0).unwrap();
+        let Some((_exclusive, opened)) = crate::test_device() else { return };
+        let context = opened.service.context().clone();
+        let driver = context.driver.clone();
+        let ordinal = context.ordinal();
         let reserved = stack_limit(&context);
         assert!(reserved >= RESERVED_STACK_BYTES);
         let architecture =
-            driver.attribute(75, 0).unwrap() as u32 * 10 + driver.attribute(76, 0).unwrap() as u32;
+            driver.attribute(75, ordinal).unwrap() as u32 * 10 + driver.attribute(76, ordinal).unwrap() as u32;
         let words = RESERVED_STACK_BYTES / 2;
         let source = format!(
             "extern \"C\" __global__ void deep(int* out, int seed) {{ volatile int frame[{words}]; \
@@ -2385,18 +2296,22 @@ mod tests {
         let Ok(cubin) = crate::nvrtc::compile_cubin_named(&source, "deep.cu", architecture, &[]) else {
             return;
         };
-        let held = stack_growth(0).bytes();
+        let held = stack_growth(ordinal).bytes();
         let (_module, function) = load_module(&context, &cubin.image, "deep").unwrap();
         let local = function_attribute(&context, function, LOCAL_SIZE_BYTES).unwrap() as usize;
         assert!(local > reserved, "the fixture's frame ({local} B) exceeds the reservation");
         assert!(stack_limit(&context) >= local);
-        let threads = driver.attribute(16, 0).unwrap() as u64 * driver.attribute(39, 0).unwrap() as u64;
-        let expected = (local - reserved) as u64 * threads;
-        let grown = stack_growth(0).bytes() - held;
-        eprintln!("reserved {reserved} B, frame {local} B, raise took {grown} bytes for {expected} expected");
+        let sms = driver.attribute(16, ordinal).unwrap() as u64;
+        let max_threads_per_sm = driver.attribute(39, ordinal).unwrap() as u64;
+        let expected_max = (local - reserved) as u64 * sms * max_threads_per_sm;
+        let expected_min = (local - reserved) as u64 * sms * max_threads_per_sm.min(1024);
+        let grown = stack_growth(ordinal).bytes() - held;
+        eprintln!(
+            "reserved {reserved} B, frame {local} B, raise took {grown} bytes for {expected_min}..={expected_max} expected"
+        );
         assert!(
-            grown + (8 << 20) >= expected && grown <= expected + (64 << 20),
-            "the raise took {grown} bytes; the reservation grew by {expected}"
+            grown + (8 << 20) >= expected_min && grown <= expected_max + (64 << 20),
+            "the raise took {grown} bytes; the reservation grew by {expected_min}..={expected_max}"
         );
     }
 }

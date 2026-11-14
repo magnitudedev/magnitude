@@ -59,6 +59,8 @@ fn every_participant_runs_the_kernel_last_compiled_at_a_reused_code_address() {
     let target = &opened.device;
     let mut workers = Workers::host(std::thread::available_parallelism().unwrap()).unwrap();
     let workgroups = workers.count() as u64 * 64;
+    let scratch: std::sync::Arc<dyn seismic_memory::entry::Entry> =
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
     for round in 0..256u32 {
         // Each round's kernel differs from the last only in its constant,
         // so it is the same size and is usually placed where the last one,
@@ -82,7 +84,7 @@ fn every_participant_runs_the_kernel_last_compiled_at_a_reused_code_address() {
             results: std::ptr::null_mut(),
         };
         workers
-            .run(native.kernel.entry, &frame, workgroups, 1, 0, 0, 0)
+            .run(&scratch, native.kernel.entry, &frame, workgroups, 1, 0, 0, 0)
             .unwrap();
         let stale = output.iter().filter(|written| **written != value).count();
         assert_eq!(

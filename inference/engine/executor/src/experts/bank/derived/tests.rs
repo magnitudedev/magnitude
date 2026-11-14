@@ -1,19 +1,12 @@
-//! The bank's target as the catalog's failures met it, on a ledger with its
-//! readings handed in: no OS, no device.
+//! The bank's sizes from a store's room: the slots a room holds, how a
+//! store's holdings share it, and the one resize toward a target. The room
+//! itself is the ledger's estimate (`Estimate::target`), tested with it.
 
 use super::*;
-use crate::memory::ledger::{Available, Blind, Claim, Ledger, Ledgers, LoadShape, Need};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-const GB: u64 = 1_000_000_000;
 
 /// Flash Next q4's slot on the laptop's 64 GB M4 Max: 148,111,360 bytes
 /// over every layer (its 131→132 growth).
 const SLOT: u64 = 148_111_360;
-
-/// The laptop's unified memory.
-const TOTAL: u64 = 64 << 30;
 
 /// Flash Next's bank on the laptop: a floor, the 226 slots its counts were
 /// derived up to as its saturation, and a block of one slot (the
@@ -27,163 +20,52 @@ fn charge(slots: u64) -> u64 {
     slots * SLOT
 }
 
-/// A ledger of host RAM in a scope of its own, and its readings' clock.
-struct Store {
-    _scope: Ledgers,
-    ledger: Ledger,
-    start: Instant,
-    readings: u32,
-}
-
-impl Store {
-    fn new() -> Self {
-        let scope = Ledgers::new();
-        let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
-        Self { _scope: scope, ledger, start: Instant::now(), readings: 0 }
-    }
-
-    /// A reading with other programs holding `others`: the OS shows free
-    /// what neither they nor the process's allocations hold.
-    fn read(&mut self, others: u64) {
-        self.readings += 1;
-        let at = self.start + Duration::from_millis(100) * self.readings;
-        let allocated = self.ledger.snapshot().allocated();
-        let available = TOTAL.checked_sub(others + allocated).expect("others and the process fit the store");
-        self.ledger.read(self.ledger.sampled(at), Ok(Available::new(TOTAL, available, None).expect("a reading")));
-    }
-
-    /// A committed claim of exactly `bytes`, allocated.
-    fn commit(&self, bytes: u64) -> Claim {
-        let mut claim = self.ledger.claim(Need::Measurement { bytes }).expect("the claim fits");
-        self.ledger.change(|changing| claim.allocated(bytes, changing));
-        claim
-    }
-
-    fn target(&self, in_process: u64) -> u64 {
-        target_slots(bank_room(&self.ledger.snapshot(), in_process), &shape(), &charge)
-    }
-}
-
-/// What other programs hold where the laptop's bank derives `slots`
-/// beside `committed`, with half a slot to spare.
-fn others_at(slots: u64, committed: u64) -> u64 {
-    TOTAL - committed - (slots - shape().floor_slots()) * SLOT - SLOT / 2
-}
-
-/// Item 9: the laptop's sequence (Flash Next q4, 64 GB M4 Max, main
-/// b4c36dba9). A bank of 132 slots, a brief rise of others' memory and its
-/// fall a reading later, then a 103-token prompt's state claimed and its
-/// decode: the bank's target is 132 again at the reading after the rise
-/// falls, and stays 132 through the prompt and its decode. On main a
-/// settle reserved 104 places for that prompt and released the bank to 54
-/// slots, and nothing grew it back.
+/// Cache claims of the process took is the ledger's fact, not the room's
+/// movement: a bank owing a claim a third of a slot (blocks of one slot)
+/// sheds a whole slot though its room moved by less than a block, sheds two
+/// for a slot and a third, and grows by none while it owes; owing nothing,
+/// the same room keeps its slots.
 #[test]
-fn the_laptops_bank_holds_132_slots_through_a_prompt_and_its_decode() {
-    let mut store = Store::new();
-    let committed = 10 * GB + shape().floor_slots() * SLOT;
-    let base = others_at(132, committed);
-    store.read(base);
-    let _weights = store.commit(committed);
-    let _bank = store.ledger.cached(CacheKind::Bank, (132 - shape().floor_slots()) * SLOT).expect("the bank's room");
-    store.read(base);
-    assert_eq!(store.target(0), 132, "the bank as it stood");
-    // Others take a third of a slot for a reading (the laptop's brief
-    // Reclaim), and give it back.
-    store.read(base + SLOT / 3);
-    assert!(store.target(0) < 132, "the rise is room the bank gives up");
-    store.read(base);
-    assert_eq!(store.target(0), 132, "the next reading derives the bank afresh");
-    // The prompt's state: 103 rows, a few MB, claimed as the prompt runs.
-    let chunk = 8 << 20;
-    let _state = store.commit(chunk);
-    store.read(base);
-    assert_eq!(store.target(chunk), 132, "the prompt's state takes no slot");
-    // Its decode: 108 tokens, readings a tenth of a second apart.
-    for _ in 0..10 {
-        store.read(base);
-        assert_eq!(store.target(0), 132, "the decode runs on 132 slots");
-    }
-}
-
-/// Items 4, 5, 12, 13, 15, 44: growth is never dropped, nor its room read
-/// once. As another program gives its memory back over readings, each
-/// reading's target follows it up, by every slot the freed room holds, to
-/// the saturation.
-#[test]
-fn the_target_follows_freed_memory_up_at_every_reading() {
-    let mut store = Store::new();
-    let committed = 10 * GB + shape().floor_slots() * SLOT;
-    store.read(TOTAL - committed - SLOT);
-    let _weights = store.commit(committed);
-    let mut before = shape().floor_slots();
-    for slots in (20..=300).step_by(20) {
-        let others = TOTAL.saturating_sub(committed + (slots - shape().floor_slots()) * SLOT + SLOT / 2);
-        store.read(others);
-        // A fall is no rise: the guarantee's outside term is zero.
-        let target = store.target(0);
-        assert_eq!(target, slots.min(shape().saturation_slots()), "{slots} slots of room");
-        assert!(target >= before, "the target never stays behind freed memory");
-        before = target;
-    }
-}
-
-/// Items 3, 42: one formula on one reading. A committed claim lowers the
-/// target by the slots its bytes cover, at the reading that pairs it with
-/// the OS's figure, and its release raises it back.
-#[test]
-fn a_committed_claim_moves_the_target_by_its_bytes() {
-    let mut store = Store::new();
-    let committed = 10 * GB + shape().floor_slots() * SLOT;
-    let base = others_at(150, committed);
-    store.read(base);
-    let _weights = store.commit(committed);
-    store.read(base);
-    assert_eq!(store.target(0), 150);
-    let job = store.commit(20 * SLOT);
-    store.read(base);
-    assert_eq!(store.target(0), 130, "a measurement job's room");
-    drop(job);
-    store.read(base);
-    assert_eq!(store.target(0), 150, "given back");
-}
-
-/// The speed guarantee is subtracted, nothing else: one prompt chunk's
-/// mandatory growth lowers the target by the slots it covers.
-#[test]
-fn the_guarantee_is_the_only_margin() {
-    let mut store = Store::new();
-    let committed = 10 * GB + shape().floor_slots() * SLOT;
-    let base = others_at(150, committed);
-    store.read(base);
-    let _weights = store.commit(committed);
-    store.read(base);
-    assert_eq!(store.target(0), 150);
-    assert_eq!(store.target(3 * SLOT), 147);
-}
-
-/// A blind store, or committed memory filling the budget, holds the floor.
-#[test]
-fn a_blind_or_overcommitted_store_holds_the_floor() {
-    let mut store = Store::new();
-    store.read(TOTAL / 2);
-    store.ledger.read(store.ledger.sampled(Instant::now()), Err(Blind("no reading".into())));
-    assert_eq!(store.target(0), shape().floor_slots(), "blind");
-    let mut store = Store::new();
-    store.read(0);
-    let _weights = store.commit(TOTAL / 2);
-    store.read(TOTAL / 2);
-    assert_eq!(store.target(0), shape().floor_slots(), "committed fills the budget");
-}
-
-/// A shrink whenever the target falls below the bank; a growth only once
-/// it is a block above.
-#[test]
-fn the_bank_grows_by_blocks_and_shrinks_at_once() {
+fn a_bank_sheds_what_claims_took_in_whole_blocks() {
+    let room = (132 - 8) * SLOT;
+    assert_eq!(held_target(room - SLOT / 3, 132, SLOT / 3, &shape(), &charge), 131, "a third of a slot owed");
+    assert_eq!(held_target(room - SLOT / 3, 132, 0, &shape(), &charge), 132, "the same room, nothing owed: a shortage's yield");
+    assert_eq!(held_target(room, 132, SLOT + SLOT / 3, &shape(), &charge), 130, "a slot and a third");
+    assert_eq!(held_target(room + 10 * SLOT, 132, 1, &shape(), &charge), 131, "no growth while it owes a byte");
     let block = BankShape::new(4 * SLOT, 8, 226, 226);
-    assert_eq!(bank_move(131, 132, &block, &charge), Some(BankMove::Shrink { to: 131 }));
-    assert_eq!(bank_move(132, 132, &block, &charge), None);
-    assert_eq!(bank_move(135, 132, &block, &charge), None, "short of a block");
-    assert_eq!(bank_move(136, 132, &block, &charge), Some(BankMove::Grow { to: 136 }));
+    assert_eq!(held_target(room, 132, 1, &block, &charge), 128, "a block of four slots for a byte");
+    assert_eq!(held_target(0, 9, SLOT, &shape(), &charge), 8, "never below the floor");
+}
+
+/// The block is the one threshold both ways: a bank of 132 slots in blocks
+/// of four grows once its room holds a block more, and shrinks once it holds
+/// a block more than its room, to what the room fits.
+#[test]
+fn the_bank_moves_by_a_block_either_way() {
+    let block = BankShape::new(4 * SLOT, 8, 226, 226);
+    let room = |slots: u64| (slots - 8) * SLOT;
+    let held = |room| held_target(room, 132, 0, &block, &charge);
+    assert_eq!(held(room(132)), 132);
+    assert_eq!(held(room(135) + SLOT / 2), 132, "short of a block above");
+    assert_eq!(held(room(136)), 136, "a block above");
+    assert_eq!(held(room(129) + 1), 132, "short of a block below");
+    assert_eq!(held(room(128)), 128, "a block below: to what the room fits");
+    assert_eq!(held(room(120) + SLOT / 3), 120);
+    assert_eq!(bank_move(132, 132), None);
+    assert_eq!(bank_move(128, 132), Some(BankMove::Shrink { to: 128 }));
+    assert_eq!(bank_move(136, 132), Some(BankMove::Grow { to: 136 }));
+}
+
+/// The laptop's bank in blocks of one slot: others' jitter of a third of a
+/// slot for a reading lowers the room by less than a block, so the bank
+/// holds; its next reading holds too.
+#[test]
+fn a_room_moving_within_a_block_resizes_nothing() {
+    let room = (132 - 8) * SLOT;
+    for jitter in [SLOT / 3, SLOT - 1, 0] {
+        assert_eq!(bank_move(held_target(room - jitter, 132, 0, &shape(), &charge), 132), None, "{jitter} bytes of others' rise");
+    }
+    assert_eq!(held_target(room - SLOT, 132, 0, &shape(), &charge), 131, "a whole block's");
 }
 
 /// A charge in steps (slots crossing their storage's granule, two slots a
@@ -210,6 +92,20 @@ fn the_bank_holds_at_most_its_ceiling_or_saturation() {
     // bank of every expert, whatever host RAM holds.
     assert_eq!(BankShape::host(SLOT, 256, 256, true).saturation_slots(), 0, "a whole device bank");
     assert_eq!(BankShape::host(SLOT, 256, 256, false).saturation_slots(), 256, "a device short of experts");
+}
+
+/// A miss curve bounds a growth, never what the bank holds: its deepest
+/// reuse only deepens as the decode counts steps, so a bank of 126 slots
+/// whose curve has found reuse 78 deep keeps its slots where the room holds
+/// them, grows no further, and still shrinks to a room short of them.
+#[test]
+fn a_shallow_curve_bounds_growth_and_shrinks_nothing() {
+    let room = |slots: u64| (slots - 8) * SLOT;
+    let shape = |at| BankShape::curved(SLOT, 8, 226, Some(78), at);
+    assert_eq!(held_target(room(200), 126, 0, &shape(126), &charge), 126, "held past the curve");
+    assert_eq!(held_target(room(200), 60, 0, &shape(60), &charge), 78, "grown to the curve");
+    assert_eq!(held_target(room(100), 126, 0, &shape(126), &charge), 100, "shrunk to the room");
+    assert_eq!(BankShape::curved(SLOT, 8, 226, None, 126).saturation_slots(), 226, "no curve: the ceiling");
 }
 
 /// Today's floor of a bank whose layers fall in `groups` record forms: each
@@ -249,34 +145,54 @@ fn the_scratch_is_never_below_the_decode_set() {
     assert_eq!(WorkingSet::new(6, 384, 430, 1).floor_records(), 442, "today's whole-layer scratch");
 }
 
-/// One store's holdings share its room in their order: the first takes
-/// what its slots fit, the next what is left, each at least its floor.
+/// One store's holdings, each at its floor, share its room in their order:
+/// the first takes what its slots fit, the next what is left, each at least
+/// its floor.
 #[test]
 fn a_stores_holdings_share_its_room_in_order() {
     let table = |records: u64| records * (SLOT / 4);
-    let holdings: [(BankShape, &dyn Fn(u64) -> u64); 2] = [(shape(), &charge), (BankShape::new(SLOT / 4, 2, 40, 40), &table)];
+    let holdings: [(BankShape, u64, u64, &dyn Fn(u64) -> u64); 2] = [(shape(), 8, 0, &charge), (BankShape::new(SLOT / 4, 2, 40, 40), 2, 0, &table)];
     assert_eq!(shared_targets(0, &holdings), vec![8, 2], "floors");
     assert_eq!(shared_targets(10 * SLOT + SLOT / 2, &holdings), vec![18, 4], "the bank's ten slots, then the table's two records");
     assert_eq!(shared_targets(u64::MAX / 2, &holdings), vec![226, 40], "both saturated");
 }
 
-/// A load imports what its first reading keeps: on the laptop with others
-/// holding 40 GB, an import whose weights, floor and later allocations
-/// place 7 GB in the store holds the experts' target beside them and a
-/// guarantee of half a GB; once the load holds them (the slots past its
-/// floor as the bank's cache), the first reading derives that same target.
+/// A load imports what its first reading keeps: on the laptop's 64 GB with
+/// others holding 40 GB and the load's in-process figure of half a GB held,
+/// an import whose weights, floor and later allocations place 7 GB in the
+/// store imports the experts' target beside them ([`import_target`]); once
+/// the load holds them (the slots past its floor as the bank's cache), the
+/// first reading derives that same target, so the load resizes nothing.
+/// The load is idle, so its in-process figure counts in neither: nothing
+/// grows in process until a sequence is admitted.
 #[test]
 fn a_load_imports_what_its_first_reading_keeps() {
-    let mut store = Store::new();
-    let others = 40 * GB;
-    let in_process = GB / 2;
-    let floor = shape().floor_slots();
-    store.read(others);
-    let beside = 7 * GB;
-    let imported = import_target(&store.ledger.snapshot(), in_process, beside, &shape(), &charge);
-    assert!(floor < imported && imported < shape().saturation_slots(), "{imported} slots");
-    let _held = store.commit(beside);
-    let _cache = store.ledger.cached(CacheKind::Bank, charge(imported) - charge(floor)).expect("the import's room holds its cache");
-    store.read(others);
-    assert_eq!(store.target(in_process), imported);
+    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape, Need};
+    use crate::memory::supply::Reading;
+    use std::time::{Duration, Instant};
+    const GB: u64 = 1_000_000_000;
+    const TOTAL: u64 = 64 << 30;
+    let now = seismic::Lag { release: Duration::ZERO, growth: Duration::ZERO };
+    let scope = Ledgers::new();
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, std::sync::Arc::new(LoadShape { stores: Vec::new() }));
+    let _pool = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(SLOT).unwrap()).blocks;
+    let (start, others, beside) = (Instant::now(), 40 * GB, 7 * GB);
+    // The OS shows free what neither other programs nor the load's
+    // allocations hold.
+    let read = |reading: u32, allocated: u64| {
+        let at = ledger.sampled(start + Duration::from_millis(100) * reading);
+        ledger.read(at, Reading::device(TOTAL, TOTAL - others - allocated, now));
+    };
+    read(1, 0);
+    let _launch = ledger.in_process(GB / 2);
+    let imported = import_target(&ledger.estimate(), beside, &shape(), &charge);
+    assert!(shape().floor_slots() < imported && imported < shape().saturation_slots(), "{imported} slots");
+    let held = ledger.claim(Need::Measurement { bytes: beside }).expect("the import's claims fit");
+    ledger.change(|_| { let entry = held.entry(); entry.take(&entry.change(), beside, seismic::memory::Wiring::Pageable) }).expect("the import's own bytes");
+    let cache = charge(imported) - charge(shape().floor_slots());
+    let _cache = ledger.cached(CacheKind::Bank, cache).expect("the import's room holds its cache");
+    read(2, beside + cache);
+    let room = ledger.estimate().target();
+    assert_eq!(target_slots(room, &shape(), &charge), imported, "the first reading keeps the import");
+    assert_eq!(bank_move(held_target(room, imported, 0, &shape(), &charge), imported), None, "and resizes nothing");
 }

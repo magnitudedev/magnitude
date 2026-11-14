@@ -307,11 +307,10 @@ impl TransferInner {
     }
 
     /// A run copies between live views of this device's tensors, each
-    /// within the bytes its view reaches (on chunked storage its records as
-    /// packed, which run past its canonical bytes).
+    /// within its view's bytes.
     fn check(&self, run: &TransferRun<'_>) -> Result<(), TransferError> {
         let within =
-            |tensor: &TensorInner, offset: u64| offset.checked_add(run.bytes).is_some_and(|end| end <= tensor.reached_bytes());
+            |tensor: &TensorInner, offset: u64| offset.checked_add(run.bytes).is_some_and(|end| end <= tensor.byte_len());
         if !within(run.source, run.source_offset) || !within(run.destination, run.destination_offset) {
             return Err(TransferError::Run("a run lies outside its tensors".into()));
         }
@@ -323,7 +322,7 @@ impl TransferInner {
 
     /// A signal's word is an aligned i32 of a live view of this device's.
     fn check_signal(&self, word: &TensorInner, offset: u64) -> Result<(), TransferError> {
-        if offset.checked_add(4).is_none_or(|end| end > word.reached_bytes()) {
+        if offset.checked_add(4).is_none_or(|end| end > word.byte_len()) {
             return Err(TransferError::Run("a signal's word lies outside its tensor".into()));
         }
         if (word.byte_offset() + offset) % 4 != 0 {

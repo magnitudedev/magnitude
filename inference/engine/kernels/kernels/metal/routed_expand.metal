@@ -4,8 +4,13 @@
 // `up_scale` where those ports are present (static GS, US).
 // Threadgroup row y < M * K is choice (m, k): a K1 paired GEMV over the
 // feature tile `x` of expert routes[m, k]'s gate and up rows. Row y = M * K
-// is the shared expert, whose weights feed all M activation rows.
+// is the shared expert, whose weights feed all M activation rows. The expert
+// stacks are record ports, bound as their records' address tables, as every
+// routed launch's are: the expand form decodes a held layer's stacks and a
+// whole bank's home records alike, the expert itself its record. Nothing
+// lands in either while it runs, so plain loads read them.
 
+#define PACKETS_PLAIN_RECORDS
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -26,8 +31,8 @@ template <uint ROWS, uint LANES>
 kernel void routed_expand(
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device const uchar *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
-    device const uchar *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
+    device const ulong *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
+    device const ulong *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
     device const uchar *shared_gate [[buffer(SEISMIC_BUFFER_SHARED_GATE)]],
     device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],
@@ -56,10 +61,10 @@ kernel void routed_expand(
         const int expert = routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
         const auto in = routed::activation(normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * A::bytes,
             SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H));
-        const auto gate = routed::stack_weights<packets::W0>(expert_gate, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), expert,
-            SEISMIC_DIM_F, SEISMIC_DIM_H);
-        const auto up = routed::stack_weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), expert,
-            SEISMIC_DIM_F, SEISMIC_DIM_H);
+        const auto gate = routed::record_weights<packets::W0>(expert_gate, expert, KERNEL_W0_LAYOUT(SEISMIC_DIM_H),
+            SEISMIC_DIM_H);
+        const auto up = routed::record_weights<packets::W1>(expert_up, expert, KERNEL_W1_LAYOUT(SEISMIC_DIM_H),
+            SEISMIC_DIM_H);
         const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
             projection::SiluMul<A>{
                 expert_product.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1), 0,

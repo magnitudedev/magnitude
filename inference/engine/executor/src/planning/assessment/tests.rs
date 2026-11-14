@@ -212,6 +212,7 @@ fn checked_decoder_family_bounds_every_prepared_class_axis() {
         crate::ResourceCapacity {
             domain_bytes: 512 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -266,7 +267,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
     use magnitude_family_contracts::{
         ActivationFunction, ExitNorm, ExpertSelection, FeedForwardUp, HeadChain, HeadInput,
-        InputNorm, Operator, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+        Operator, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
         SharedExpert, SharedExpertGate, WeightDescriptor,
     };
 
@@ -315,6 +316,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         crate::ResourceCapacity {
             domain_bytes: 512 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -649,6 +651,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         crate::ResourceCapacity {
             domain_bytes: 512 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -718,7 +721,7 @@ fn assert_undrafted_is_the_target_alone(
         PlannedMethod::Plain,
         KvCodec::Dense,
         limits,
-        crate::ResourceCapacity { domain_bytes: 512 << 20, tensor_operations: crate::TensorOperations::Absent },
+        crate::ResourceCapacity { domain_bytes: 512 << 20, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
     )
     .unwrap();
     let alone =
@@ -891,6 +894,7 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
         crate::ResourceCapacity {
             domain_bytes: 512 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -1070,6 +1074,7 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             crate::ResourceCapacity {
                 domain_bytes: 512 << 20,
                 tensor_operations: crate::TensorOperations::Absent,
+                allocations: seismic::NativeAllocations::EXACT,
             },
         )
         .unwrap();
@@ -1705,6 +1710,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
         crate::ResourceCapacity {
             domain_bytes: 512 * 1024 * 1024,
             tensor_operations: crate::TensorOperations::Absent,
+            allocations: seismic::NativeAllocations::EXACT,
         },
     )
     .unwrap();
@@ -1750,7 +1756,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     let history_slabs = terms.fit_depth.div_ceil(u64::from(history.slab_rows));
     assert_eq!(
         state_bytes,
-        history_layout.address_table_bytes + history_slabs * history_layout.slab_bytes
+        history_layout.address_table_bytes + history_slabs * state.target_state().granule
     );
     assert!(state_bytes > terms.history_at_fit_depth().unwrap());
     let startup_state = state.startup_state_bytes().unwrap();
@@ -1900,20 +1906,13 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
 
 const GIB: u64 = 1 << 30;
 
-/// Status of an unopened machine whose host RAM `by` reports, sampled
-/// for every executor of `topology`: assessment plans on stable fit,
-/// which no headroom changes.
-fn unopened(topology: &DeviceTopology, by: seismic::ReportedBy) -> Status {
+/// Status of an unopened machine, sampled for every executor of
+/// `topology`: assessment plans on stable fit, which no headroom changes.
+fn unopened(topology: &DeviceTopology) -> Status {
     Status {
         sample: seismic::Sample {
             taken: std::time::SystemTime::now(),
-            host_ram: Ok(seismic::HostStatus {
-                allocatable: seismic::Reported::new(16 * GIB, by),
-                reclaimable: 0,
-                limits: Vec::new(),
-                limit_visibility: seismic::LimitVisibility::Complete,
-                held: None,
-            }),
+            host: crate::memory::ledger::tests::host_sample(u64::MAX, 16 * GIB),
             volumes: Vec::new(),
             executors: topology
                 .executors()
@@ -1953,31 +1952,30 @@ fn domain(fit: &AssessmentFit, store: StoreId) -> DomainFit {
 }
 
 /// Each store a load charges is fitted on its own against its capacity
-/// less its planning reserve, and the store with the largest deficit
+/// and the store with the largest deficit
 /// limits the load. On the M4 Pro's CPU the load, its host tables and
 /// its sealed graph plans are one domain, host RAM; the RTX 3090's CUDA
 /// charges its allocation to the 3090's memory and its staged upload,
 /// host tables and sealed graph plans to host RAM.
 #[test]
-fn fit_is_decided_per_domain_against_capacity_less_reserve() {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
+fn fit_is_decided_per_domain_against_capacity() {
     let m4_pro = recorded::m4_pro();
-    let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
+    let status = unopened(&m4_pro);
     let cpu = executor(&m4_pro, BackendName::Cpu);
     let host_ram = m4_pro.host_ram().id();
-    let host = Fit::new(&m4_pro, &status, &reserves, HostRoom::Allocatable)
+    let host = Fit::new(&m4_pro, &status)
         .store(host_ram)
         .unwrap();
     let mut unified = AssessmentMemoryCharge {
         host_table_bytes: 30,
-        ..fixture_charge(host.stable_bytes - 50, 0)
+        ..fixture_charge(host.capacity_bytes - 50, 0)
     };
     unified.bounds.sealed_graph_host_bytes = SealedGraphHostBytes {
         at_most: 20,
         at_least: 15,
     };
     let fits = unified
-        .assess_fit(&m4_pro, cpu, &status, &reserves)
+        .assess_fit(&m4_pro, cpu, &status)
         .unwrap();
     assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
     assert_eq!(
@@ -1986,8 +1984,7 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
             role: DomainRole::Allocation,
             domain: host_ram,
             capacity_bytes: host.capacity_bytes,
-            required_bytes: host.stable_bytes,
-            reserve_bytes: host.thresholds.planning_bytes,
+            required_bytes: host.capacity_bytes,
             remaining_bytes: 0,
         }]
     );
@@ -1995,7 +1992,7 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
         host_table_bytes: 31,
         ..unified
     }
-    .assess_fit(&m4_pro, cpu, &status, &reserves)
+    .assess_fit(&m4_pro, cpu, &status)
     .unwrap();
     assert_eq!(
         short.verdict,
@@ -2007,41 +2004,40 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
     assert_eq!(short.domains[0].remaining_bytes, -1);
 
     let rtx3090 = recorded::rtx3090();
-    let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
+    let status = unopened(&rtx3090);
     let cuda = executor(&rtx3090, BackendName::Cuda);
     let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
-    let fit = Fit::new(&rtx3090, &status, &reserves, HostRoom::Allocatable);
+    let fit = Fit::new(&rtx3090, &status);
     let (own, host) = (fit.store(gpu).unwrap(), fit.store(host_ram).unwrap());
-    // CUDA's room is its usable memory less the store's planning
-    // reserve, below the store's own fit.
+    // CUDA's room is the placement's grant within the store's fit, below
+    // the store's own capacity.
     let room = fit.placement(cuda, seismic::Contract::DeviceOnly).unwrap().stable_bytes;
-    assert!(room < own.stable_bytes);
+    assert!(room < own.capacity_bytes);
     let dedicated = |allocation, staging| {
         AssessmentMemoryCharge {
             host_table_bytes: 30,
             ..fixture_charge(allocation, staging)
         }
-        .assess_fit(&rtx3090, cuda, &status, &reserves)
+        .assess_fit(&rtx3090, cuda, &status)
         .unwrap()
     };
-    let both = dedicated(room, host.stable_bytes - 30);
+    let both = dedicated(room, host.capacity_bytes - 30);
     assert_eq!(both.verdict, AssessmentFitVerdict::Fits);
     assert_eq!(
         domain(&both, gpu),
         DomainFit {
             role: DomainRole::Allocation,
             domain: gpu,
-            capacity_bytes: room + own.thresholds.planning_bytes,
+            capacity_bytes: room,
             required_bytes: room,
-            reserve_bytes: own.thresholds.planning_bytes,
             remaining_bytes: 0,
         }
     );
     assert_eq!(domain(&both, host_ram).role, DomainRole::Staging);
-    assert_eq!(domain(&both, host_ram).required_bytes, host.stable_bytes);
+    assert_eq!(domain(&both, host_ram).required_bytes, host.capacity_bytes);
     assert_eq!(domain(&both, host_ram).remaining_bytes, 0);
     // Staging 50 bytes beyond host RAM's fit: host RAM limits the load.
-    let staging = dedicated(room, host.stable_bytes - 30 + 50);
+    let staging = dedicated(room, host.capacity_bytes - 30 + 50);
     assert_eq!(
         staging.verdict,
         AssessmentFitVerdict::DoesNotFit {
@@ -2052,7 +2048,7 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
     assert_eq!(domain(&staging, gpu).remaining_bytes, 0);
     assert_eq!(domain(&staging, host_ram).remaining_bytes, -50);
     // The largest deficit limits the load.
-    let worst = dedicated(room + 100, host.stable_bytes - 30 + 50);
+    let worst = dedicated(room + 100, host.capacity_bytes - 30 + 50);
     assert_eq!(
         worst.verdict,
         AssessmentFitVerdict::DoesNotFit {
@@ -2068,7 +2064,6 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
 /// staged upload, and the device's own memory holds none of them.
 #[test]
 fn worker_host_bytes_are_charged_to_host_ram() {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let mut worker = AssessmentMemoryCharge {
         host_table_bytes: 50,
         ..fixture_charge(800, 300)
@@ -2092,11 +2087,11 @@ fn worker_host_bytes_are_charged_to_host_ram() {
     );
 
     let rtx3090 = recorded::rtx3090();
-    let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
+    let status = unopened(&rtx3090);
     let cuda = executor(&rtx3090, BackendName::Cuda);
     let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
     let fit = worker
-        .assess_fit(&rtx3090, cuda, &status, &reserves)
+        .assess_fit(&rtx3090, cuda, &status)
         .unwrap();
     assert_eq!(domain(&fit, gpu).required_bytes, 800);
     assert_eq!(
@@ -2243,32 +2238,22 @@ fn worker_host_bytes_price_the_plans_vocabulary_and_kernels() {
 /// the allocation in its own memory.
 #[test]
 fn staging_is_charged_to_host_ram_once() {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let (allocation, staged, tables) = (8 * GIB, 2 * GIB, 30);
     let assess = |topology: &DeviceTopology, executor: &Executor, status: &Status, staging| {
         AssessmentMemoryCharge {
             host_table_bytes: tables,
             ..fixture_charge(allocation, staging)
         }
-        .assess_fit(topology, executor, status, &reserves)
+        .assess_fit(topology, executor, status)
         .unwrap()
     };
-    use seismic::ReportedBy::{LinuxMemAvailable, MachMovablePages, WindowsPhysicalAndCommit};
-    for (topology, backend, by) in [
-        (recorded::m4_pro(), BackendName::Metal, MachMovablePages),
-        (recorded::gb10(), BackendName::Cuda, LinuxMemAvailable),
-        (
-            recorded::strix_halo_linux(),
-            BackendName::Vulkan,
-            LinuxMemAvailable,
-        ),
-        (
-            recorded::lunar_lake(),
-            BackendName::Vulkan,
-            WindowsPhysicalAndCommit,
-        ),
+    for (topology, backend) in [
+        (recorded::m4_pro(), BackendName::Metal),
+        (recorded::gb10(), BackendName::Cuda),
+        (recorded::strix_halo_linux(), BackendName::Vulkan),
+        (recorded::lunar_lake(), BackendName::Vulkan),
     ] {
-        let status = unopened(&topology, by);
+        let status = unopened(&topology);
         let executor = executor(&topology, backend);
         let host_ram = topology.host_ram().id();
         let staging = assess(&topology, executor, &status, staged);
@@ -2283,7 +2268,7 @@ fn staging_is_charged_to_host_ram_once() {
     }
 
     let rtx3090 = recorded::rtx3090();
-    let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
+    let status = unopened(&rtx3090);
     let cuda = executor(&rtx3090, BackendName::Cuda);
     let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
     let staging = assess(&rtx3090, cuda, &status, staged);
@@ -2297,21 +2282,20 @@ fn staging_is_charged_to_host_ram_once() {
 /// working set's room.
 #[test]
 fn host_demand_sits_beside_the_metal_working_set() {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let m4_pro = recorded::m4_pro();
-    let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
+    let status = unopened(&m4_pro);
     let metal = executor(&m4_pro, BackendName::Metal);
     let host_ram = m4_pro.host_ram().id();
-    let fit = Fit::new(&m4_pro, &status, &reserves, HostRoom::Allocatable);
+    let fit = Fit::new(&m4_pro, &status);
     let room = fit.placement(metal, seismic::Contract::DeviceOnly).unwrap().stable_bytes;
     let host = fit.store(host_ram).unwrap();
-    assert!(room + GIB < host.stable_bytes);
+    assert!(room + GIB < host.capacity_bytes);
     let assess = |device| {
         AssessmentMemoryCharge {
             host_table_bytes: GIB,
             ..fixture_charge(device, 0)
         }
-        .assess_fit(&m4_pro, metal, &status, &reserves)
+        .assess_fit(&m4_pro, metal, &status)
         .unwrap()
     };
     let full = assess(room);
@@ -2321,9 +2305,8 @@ fn host_demand_sits_beside_the_metal_working_set() {
         DomainFit {
             role: DomainRole::Allocation,
             domain: host_ram,
-            capacity_bytes: room + GIB + host.thresholds.planning_bytes,
+            capacity_bytes: room + GIB,
             required_bytes: room + GIB,
-            reserve_bytes: host.thresholds.planning_bytes,
             remaining_bytes: 0,
         }
     );
@@ -2343,39 +2326,38 @@ fn host_demand_sits_beside_the_metal_working_set() {
 /// memory (ReBAR), where the same load fits.
 #[test]
 fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let topology = recorded::rtx3090();
-    let status = unopened(&topology, seismic::ReportedBy::LinuxMemAvailable);
+    let status = unopened(&topology);
     let (gpu, host_ram) = (device_memory(&topology), topology.host_ram().id());
-    let fit = Fit::new(&topology, &status, &reserves, HostRoom::Allocatable);
+    let fit = Fit::new(&topology, &status);
     let (own, host) = (fit.store(gpu).unwrap(), fit.store(host_ram).unwrap());
     let cuda = executor(&topology, BackendName::Cuda);
     let vulkan = executor(&topology, BackendName::Vulkan);
     let charge = |staging, executor| {
         AssessmentMemoryCharge {
             weight_demand: ClaimDemand { upload: GIB, ..ClaimDemand::default() },
-            ..fixture_charge(own.stable_bytes, staging)
+            ..fixture_charge(own.capacity_bytes, staging)
         }
-        .assess_fit(&topology, executor, &status, &reserves)
+        .assess_fit(&topology, executor, &status)
         .unwrap()
     };
     let pinned = charge(0, cuda);
     assert_eq!(pinned.verdict, AssessmentFitVerdict::Fits);
-    assert_eq!(domain(&pinned, gpu).required_bytes, own.stable_bytes - GIB);
-    // What remains of CUDA's room there: its usable memory less the
-    // reserve, below the store's own fit.
+    assert_eq!(domain(&pinned, gpu).required_bytes, own.capacity_bytes - GIB);
+    // What remains of CUDA's room there: the placement's grant within the
+    // store's fit, below the store's own capacity.
     let room = fit.placement(cuda, seismic::Contract::DeviceOnly).unwrap().stable_bytes;
     assert_eq!(
         domain(&pinned, gpu).remaining_bytes,
-        i64::try_from(room - (own.stable_bytes - GIB)).unwrap()
+        i64::try_from(room - (own.capacity_bytes - GIB)).unwrap()
     );
     assert_eq!(domain(&pinned, host_ram).required_bytes, GIB);
     let local = charge(0, vulkan);
     assert_eq!(local.verdict, AssessmentFitVerdict::Fits);
-    assert_eq!(domain(&local, gpu).required_bytes, own.stable_bytes);
+    assert_eq!(domain(&local, gpu).required_bytes, own.capacity_bytes);
     assert_eq!(domain(&local, host_ram).required_bytes, 0);
     // Staging takes host RAM's fit.
-    let crowded = charge(host.stable_bytes, cuda);
+    let crowded = charge(host.capacity_bytes, cuda);
     assert_eq!(
         crowded.verdict,
         AssessmentFitVerdict::DoesNotFit {
@@ -2388,7 +2370,7 @@ fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
         domain(&pinned, gpu).remaining_bytes
     );
     assert_eq!(
-        charge(host.stable_bytes, vulkan).verdict,
+        charge(host.capacity_bytes, vulkan).verdict,
         AssessmentFitVerdict::Fits
     );
 }
@@ -2396,14 +2378,13 @@ fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
 #[test]
 fn reserved_host_weights_stay_in_host_ram_beside_rebar_upload() {
     let topology = recorded::rtx3090();
-    let status = unopened(&topology, seismic::ReportedBy::LinuxMemAvailable);
-    let reserves = crate::platform::MemoryReserves::of_machine(None);
+    let status = unopened(&topology);
     let vulkan = executor(&topology, BackendName::Vulkan);
     let charge = AssessmentMemoryCharge {
-        weight_demand: ClaimDemand { upload: GIB, host: 2 * GIB, reserved: GIB,
+        weight_demand: ClaimDemand { device: GIB, upload: GIB, host: 2 * GIB,
             ..ClaimDemand::default() },
         ..fixture_charge(4 * GIB, 0)
-    }.assess_fit(&topology, vulkan, &status, &reserves).unwrap();
+    }.assess_fit(&topology, vulkan, &status).unwrap();
     assert_eq!(charge.verdict, AssessmentFitVerdict::Fits);
     assert_eq!(domain(&charge, device_memory(&topology)).required_bytes, 2 * GIB);
     assert_eq!(domain(&charge, topology.host_ram().id()).required_bytes, 2 * GIB);
@@ -2433,7 +2414,7 @@ fn a_drafted_loads_state_claims_include_its_heads_rows() {
         method,
         KvCodec::Dense,
         crate::planning::fixtures::LIMITS,
-        crate::ResourceCapacity { domain_bytes: 512 * 1024 * 1024, tensor_operations: crate::TensorOperations::Absent },
+        crate::ResourceCapacity { domain_bytes: 512 * 1024 * 1024, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
     )
     .unwrap();
     let (target, head) = (state.target_state(), state.head_state().expect("an MTP head keeps its own history"));
@@ -2483,7 +2464,7 @@ fn glm_mtp_heads_general_routed_graphs_certify_on_every_backend() {
             method,
             KvCodec::Dense,
             limits,
-            crate::ResourceCapacity { domain_bytes: 512 * 1024 * 1024, tensor_operations: crate::TensorOperations::Absent },
+            crate::ResourceCapacity { domain_bytes: 512 * 1024 * 1024, tensor_operations: crate::TensorOperations::Absent, allocations: seismic::NativeAllocations::EXACT },
         )
         .unwrap();
         let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -2530,7 +2511,7 @@ fn glm_mtp_head_qualifies_on_the_selected_device() {
         &catalog,
         crate::ExecutionPath::Native,
         crate::platform::DeviceRequest::Automatic,
-        &crate::platform::MemoryReserves::of_machine(None),
+        &crate::platform::ReleaseRate::of_machine(None),
     )
     .unwrap();
     let device = catalog.open(catalog.resolve(chosen.info.selector()).unwrap()).unwrap();

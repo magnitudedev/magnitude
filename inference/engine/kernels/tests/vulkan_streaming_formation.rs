@@ -26,7 +26,6 @@ fn vulkan_streaming_forms() {
     let (hd, f) = (2048, 768);
     let mut requests = vec![
         request("repack_weight", &[("E", g), ("U", w)], &[]),
-        request("routed_move", &[("U", w)], &[]),
         request("routed_copy", &[("U", w)], &[]),
         request("routed_copy", &[("U", b)], &[]),
         request("routed_list_grid", &[], &[]),

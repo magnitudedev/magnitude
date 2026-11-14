@@ -7,16 +7,15 @@ license.workspace = true
 [lib]
 path = "src/compiler.rs"
 
-[features]
-# What backends' own tests open devices with (`executable::Unbounded`).
-fixtures = []
-
 [dependencies]
 seismic-ir.workspace = true
 seismic-estimator.workspace = true
 seismic-lang.workspace = true
 seismic-native-target.workspace = true
+seismic-memory.workspace = true
 magnitude-solver = { path = "../../solver" }
 serde.workspace = true
 sha2 = "=0.11.0"
 
+[dev-dependencies]
+seismic-topology.workspace = true

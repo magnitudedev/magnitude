@@ -87,21 +87,21 @@ pub(super) struct Lending {
 }
 
 /// A pool's conveyor in the lent records: each lent record of its routed
-/// tensor `record` bytes, the conveyor's records at `offset` bytes of them,
-/// where `conveyor` places them.
+/// tensor `record` bytes, the conveyor's records of `conveyor` bytes each at
+/// `offset` bytes of them, one after another.
 pub(super) struct LentPool {
     pub record: u64,
     pub offset: u64,
-    pub conveyor: seismic::RecordPlacement,
+    pub conveyor: u64,
 }
 
 impl Lending {
     /// The lent records conveyor record `record` of pool `pool` lies across.
     pub fn records(&self, pool: usize, record: u32) -> std::ops::RangeInclusive<usize> {
         let LentPool { record: bytes, offset, conveyor } = &self.pools[pool];
-        let start = offset + conveyor.offset(u64::from(record));
+        let start = offset + conveyor * u64::from(record);
         let lent = |byte: u64| usize::try_from(byte / bytes).expect("a lent record");
-        lent(start)..=lent(start + conveyor.record() - 1)
+        lent(start)..=lent(start + conveyor - 1)
     }
 }
 

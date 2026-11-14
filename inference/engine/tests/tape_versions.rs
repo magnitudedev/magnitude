@@ -14,7 +14,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     ReservedResources, RowResult, StateBindings, TokenId, WorkKind,
 };
@@ -57,7 +57,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -207,7 +207,7 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(bindings, request, None).unwrap();
+        domain.open_state(bindings, request, None, 0).unwrap();
         Sequence {
             request,
             position: 0,

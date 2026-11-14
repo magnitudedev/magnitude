@@ -53,8 +53,8 @@
 
 use seismic_lang::checked::SourceError;
 use seismic_lang::checked::{
-    EntryInfo, NativeImplementation, ParameterSummary, ParameterSummaryKind, ResultSummaryKind,
-    SourceSet, TensorAccess,
+    EntryInfo, NativeImplementation, ParameterSummary, ParameterSummaryKind,
+    ResultSummaryKind, SourceSet, TensorAccess,
 };
 pub use seismic_lang::registry::BackendName;
 use seismic_lang::types::DType;
@@ -2122,40 +2122,74 @@ mod internals {
             ));
             word += 1;
         }
+        // A record port's accessor gives its records (`Records`), each the
+        // port's view without its leading axis at its record's address; the
+        // launches of a CPU form share one context, so they bind the same.
+        let records = &definition.records;
+        if (0..definition.launches.len()).any(|launch| definition.launch_records(launch) != records.as_slice()) {
+            return Err(BuildError::CpuNative {
+                path: cpu.path.clone(),
+                reason: format!("the launches of `{}` share one context, so they list the same record ports", entry.name),
+            });
+        }
         let mut buffer = 0usize;
         let tensor = |out: &mut String,
                       name: &str,
                       view: CpuView,
                       buffer: usize,
                       word: usize,
-                      rank: usize| {
-            let extents = (0..rank)
-                .map(|axis| format!("self.invocation.word({})", word + axis))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let strides = (0..rank)
-                .map(|axis| format!("self.invocation.word({})", word + rank + axis))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let safety =
-                "// SAFETY: the runtime binds every view inside its allocation for the call.";
-            match view {
-                CpuView::Dense(element) => out.push_str(&format!(
-                    "      pub fn {name}(&self) -> seismic::cpu::Tensor<'a, {element}, {rank}> {{ {safety}\n        unsafe {{ seismic::cpu::Tensor::from_raw(self.invocation.buffer({buffer}), [{extents}], [{strides}]) }} }}\n"
-                )),
-                CpuView::Scalars(scalar) => out.push_str(&format!(
-                    "      pub fn {name}(&self) -> seismic::cpu::Scalars<'a, {scalar}, {rank}> {{ {safety}\n        unsafe {{ seismic::cpu::Scalars::from_raw(self.invocation.buffer({buffer}), [{extents}], [{strides}]) }} }}\n"
-                )),
-                CpuView::Weights => out.push_str(&format!(
-                    "      pub fn {name}(&self) -> seismic::cpu::Weights<'a> {{ {safety}\n        unsafe {{ seismic::cpu::Weights::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.weights({buffer})) }} }}\n"
-                )),
-                CpuView::External => out.push_str(&format!(
-                    "      pub fn {name}(&self) -> seismic::cpu::External<'a> {{ {safety}\n        unsafe {{ seismic::cpu::External::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.representation({buffer})) }} }}\n"
-                )),
-                CpuView::Packed => out.push_str(&format!(
-                    "      pub fn {name}(&self) -> seismic::cpu::Packed<'a> {{ {safety}\n        unsafe {{ seismic::cpu::Packed::from_tensor(self.invocation.buffer({buffer}), &[{extents}], &[{strides}], self.invocation.representation({buffer})) }} }}\n"
-                )),
-            }
+                      rank: usize,
+                      record: bool|
+         -> Result<(), BuildError> {
+            let axes = |from: usize, first: usize| {
+                (first..rank)
+                    .map(|axis| format!("self.invocation.word({})", from + axis))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let first = usize::from(record);
+            let (extents, strides) = (axes(word, first), axes(word + rank, first));
+            let (base, constant) = match record {
+                true => ("std::ptr::null_mut()".to_owned(), "std::ptr::null()".to_owned()),
+                false => (format!("self.invocation.buffer({buffer})"), format!("self.invocation.buffer({buffer})")),
+            };
+            let view_rank = rank - first;
+            let (ty, view) = match view {
+                CpuView::Dense(element) => (
+                    format!("seismic::cpu::Tensor<'a, {element}, {view_rank}>"),
+                    format!("seismic::cpu::Tensor::from_raw({base}, [{extents}], [{strides}])"),
+                ),
+                CpuView::Scalars(scalar) => (
+                    format!("seismic::cpu::Scalars<'a, {scalar}, {view_rank}>"),
+                    format!("seismic::cpu::Scalars::from_raw({base}, [{extents}], [{strides}])"),
+                ),
+                CpuView::Weights => (
+                    "seismic::cpu::Weights<'a>".to_owned(),
+                    format!("seismic::cpu::Weights::from_tensor({constant}, &[{extents}], &[{strides}], self.invocation.weights({buffer}))"),
+                ),
+                CpuView::External | CpuView::Packed if record => {
+                    return Err(BuildError::CpuNative {
+                        path: cpu.path.clone(),
+                        reason: format!("record port `{name}` of `{}`: a CPU record is a dense, scalar or weight view", entry.name),
+                    });
+                }
+                CpuView::External => (
+                    "seismic::cpu::External<'a>".to_owned(),
+                    format!("seismic::cpu::External::from_tensor({constant}, &[{extents}], &[{strides}], self.invocation.representation({buffer}))"),
+                ),
+                CpuView::Packed => (
+                    "seismic::cpu::Packed<'a>".to_owned(),
+                    format!("seismic::cpu::Packed::from_tensor({base}, &[{extents}], &[{strides}], self.invocation.representation({buffer}))"),
+                ),
+            };
+            let safety = "// SAFETY: the runtime binds every view inside its allocation for the call, and a record port as its records' table.";
+            out.push_str(&match record {
+                true => format!(
+                    "      pub fn {name}(&self) -> seismic::cpu::slab::Records<{ty}> {{ {safety}\n        unsafe {{ seismic::cpu::slab::Records::from_table(self.invocation.buffer({buffer}), self.invocation.word({word}), {view}) }} }}\n"
+                ),
+                false => format!("      pub fn {name}(&self) -> {ty} {{ {safety}\n        unsafe {{ {view} }} }}\n"),
+            });
+            Ok(())
         };
         for (ordinal, parameter) in entry.parameters.iter().enumerate() {
             let unique = entry
@@ -2181,7 +2215,8 @@ mod internals {
                 }
                 ParameterSummaryKind::Tensor { rank, element, .. } => {
                     let rank = *rank as usize;
-                    tensor(out, &name, cpu_view(element, &elements), buffer, word, rank);
+                    let record = records.contains(&RecordPort::Parameter(parameter.name.clone()));
+                    tensor(out, &name, cpu_view(element, &elements), buffer, word, rank, record)?;
                     buffer += 1;
                     word += rank * 2;
                 }
@@ -2229,7 +2264,8 @@ mod internals {
                             ),
                         });
                     }
-                    tensor(out, &format!("result_{ordinal}"), view, buffer, word, rank);
+                    let record = records.contains(&RecordPort::Result(ordinal as u32));
+                    tensor(out, &format!("result_{ordinal}"), view, buffer, word, rank, record)?;
                     buffer += 1;
                     word += rank * 2;
                 }

@@ -8,8 +8,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
     MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLEvent,
     MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
@@ -483,7 +482,7 @@ fn ended(command: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
 fn command_buffer(
     device: &MetalDevice,
 ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, ExecutionError> {
-    crate::pooled(|| device.queue().commandBuffer()).ok_or_else(|| {
+    device.command_buffer().ok_or_else(|| {
         ExecutionError::SubmissionFailed("Metal could not create a native command buffer".into())
     })
 }
@@ -797,7 +796,7 @@ impl DirectBatch {
                     ordered(device, &encoder);
                     encode_launch(&encoder, launch);
                     encoder.endEncoding();
-                    Ok(())
+                    Ok::<_, ExecutionError>(())
                 })?;
                 lease.samples += 2;
                 launches.push(Some(*encoded));

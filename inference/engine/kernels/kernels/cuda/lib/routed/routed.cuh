@@ -1,8 +1,12 @@
 // Shared pieces of the routed (mixture-of-experts) CUDA entries built on the
-// projection family (`routed_expand`, `_output`, `_experts`): the grouped
-// blocks' row source. An expert's weights are matrix `expert` of its
-// expert-stacked [E, N, K] tensor (`KERNEL_Wn_MATRIX`, dense or packed).
+// projection family (`routed_expand`, `_output`, `_experts`): the record an
+// expert's weights are read from and the grouped blocks' row source. The
+// counterpart of `metal/lib/routed/routed.h`. An expert-stacked weight is a
+// record port, bound as its records' address table, and an expert's weights
+// are rows 0.. of its record's base (`slab::region(table, record)`,
+// `ROUTED_RECORD`), wherever that record lies.
 
+#include <seismic/slab.cuh>
 #include "../projection/projection.cuh"
 
 namespace routed {
@@ -138,19 +142,15 @@ __device__ __forceinline__ int decode_source(const u8 *sources, u64 rows, u64 ro
     return rows == 0 ? expert : reinterpret_cast<const int *>(sources)[m * row_stride + k * choice_stride];
 }
 
-// Where a decode choice's weights are read, of a stack's `bank` and `tier`
-// records: the bank record its source names, or the tier record read in
-// place over the link; no stack
-// (`stack` null) for a choice with no record.
-struct Place {
-    const u8 *stack;
-    u64 record;
-    __device__ __forceinline__ static Place of(const u8 *bank, const u8 *tier, int source) {
-        if (source == -1)
-            return Place{nullptr, 0};
-        return source >= 0 ? Place{bank, (u64)source} : Place{tier, (u64)(-2 - source)};
-    }
-};
+// The base of the record a decode choice's weights are read from, of the
+// record tables `bank` and `tier`: the bank record its source names (>= 0),
+// or tier record t (-2 - t) read in place over the link; null for a choice
+// with no record (-1).
+__device__ __forceinline__ const u8 *source_record(const u8 *bank, const u8 *tier, int source) {
+    if (source == -1)
+        return nullptr;
+    return source >= 0 ? slab::region(bank, (u64)source) : slab::region(tier, (u64)(-2 - source));
+}
 
 // A choice with no record's (`decode_source` -1) share of a decode GEMV's
 // `rows` output rows: this block's (`Shape::GROUPS` tile groups of TPW
@@ -162,10 +162,17 @@ template <class Shape, class Zero> __device__ __forceinline__ void zero_block_ro
         zero(n);
 }
 
-// Expert `expert`'s matrix of weight slot W: record `slot` of `records`, or
-// matrix `expert` of `experts` (`ROUTED_EXPERT_SLOT`).
-#define ROUTED_EXPERT_MATRIX(W, records, experts, slot, expert) \
-    ((slot) >= 0 ? W##_MATRIX(records, slot) : W##_MATRIX(experts, expert))
+// The weights of slot W in the record at `base`: its rows 0.. from there.
+#define ROUTED_RECORD(W, base) W##_MATRIX(base, 0)
+
+// Expert `expert`'s weights of slot W: record `slot` of the record table
+// `records`, or record `expert` of the record table `experts`
+// (`ROUTED_EXPERT_SLOT`). Paste `W` directly before macro expansion so
+// `KERNEL_Wn` resolves to `KERNEL_Wn_MATRIX`, never `SEISMIC_EXPERT_*_MATRIX`.
+#define ROUTED_EXPERT_RECORD(W, records, experts, slot, expert)                                             \
+    W##_MATRIX((slot) >= 0 ? slab::region((records), (routed::u64)(slot))                                   \
+                           : slab::region((experts), (routed::u64)(expert)),                                \
+               0)
 
 __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
     int *words = reinterpret_cast<int *>(grid);

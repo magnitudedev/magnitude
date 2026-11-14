@@ -58,10 +58,9 @@ fn routed_down_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
         // projection.
         match record(slot) {
             Some(place) => {
-                let (down, record) = place.of(&down, &tier);
-                let first = routed::expert_row(record, h) + columns.start;
+                let down = place.of(&down, &tier);
                 let q8 = quantized.map(|q8| &q8[choice * blocks..(choice + 1) * blocks]);
-                projection::project_arithmetic(down, first, &staged[choice * f..(choice + 1) * f], q8, projected);
+                projection::project_arithmetic(&down, columns.start, &staged[choice * f..(choice + 1) * f], q8, projected);
             }
             None => projected.fill(0.0),
         }

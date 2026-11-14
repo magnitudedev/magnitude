@@ -16,8 +16,9 @@
 use super::super::*;
 use super::target::{ExpertReads, qualify_general_routed, qualify_routed};
 use super::*;
+use crate::experts::{PooledRecords, pooled_records};
 use crate::planning::{
-    BankAllocation, BankBinding, BankedFeedForward, RecordTensor, RecordTensors,
+    BankBinding, BankedFeedForward, RecordTensor, RecordTensors,
 };
 use magnitude_kernels::constants::{
     FILE_CHOICE, FILE_COUNT, FILE_RECORD, LANDING_DONE, LANDING_ENTRIES, LANDING_FROM, LANDING_HEAD, LANDING_TO, LIST_COUNT,
@@ -26,7 +27,7 @@ use magnitude_kernels::constants::{
     SLOT_ANSWER, SLOT_REQUEST, SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_WORDS,
 };
 use magnitude_kernels::{
-    SlotTable, landing_extent, list_extent, routed_copy, routed_land, routed_list_grid, routed_move, routed_pass_map,
+    SlotTable, landing_extent, list_extent, routed_copy, routed_land, routed_list_grid, routed_pass_map,
     routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit,
     routed_select_streamed, routed_step,
 };
@@ -34,8 +35,8 @@ use magnitude_kernels::{
 /// The fixture step's sequence.
 const SEQUENCE: i32 = 1;
 
-/// The fixture bank's records: the one a shrink's move lands in (0), and the
-/// one a prompt group's seed lands in (1).
+/// The fixture bank's records: one no entry writes (0), and the one a prompt
+/// group's seed lands in (1).
 const RECORDS: u64 = 2;
 
 /// Qualify `binding`'s bank entries `kernels` of the streamed feed-forward
@@ -45,9 +46,8 @@ const RECORDS: u64 = 2;
 /// bank places, landed in tier record 0 where the tier does), a
 /// scratch-served step's request, its round 0's landing launch and grids,
 /// the
-/// seed of expert 0 into record 1 and its commit, which the host then maps,
-/// and a shrink's
-/// move of record 1 into record 0; then the shared routed entries over the
+/// seed of expert 0 into record 1 and its commit, which the host then maps;
+/// then the shared routed entries over the
 /// map the seed left (expert 0 held in record 1 for the step), the decode
 /// entries' sources naming it.
 ///
@@ -78,7 +78,6 @@ pub(super) fn qualify_bank(
         scratch_grids,
         pass_map,
         placement,
-        moves,
         site,
     } = kernels;
     let served = Served::of(banked, route, feed_forward, label)?;
@@ -148,7 +147,7 @@ pub(super) fn qualify_bank(
         crate::planning::Placer::Bank => Ok(tensor.clone()),
     };
     let staging = records.as_ref().try_map(|_, fixture| views(&fixture.conveyor))?;
-    let mut bank = records.as_ref().try_map(|_, fixture| views(&fixture.records))?;
+    let mut bank = records.as_ref().try_map(|_, fixture| views(&fixture.records.records))?;
     let staging_gate = staging.gate.clone().map_or_else(|| none(&staging.up), Ok)?;
     let mut gate = bank.gate.take().map_or_else(|| none(&bank.up), Ok)?;
     land.call_answered(routed_land::Args {
@@ -169,7 +168,7 @@ pub(super) fn qualify_bank(
     if appended > 0 {
         require_words(&landing, &[(LANDING_ENTRIES + LANDING_DONE, SEQUENCE)], entry, label)?;
         for fixture in records.as_ref() {
-            require_bytes(&fixture.records, &[&fixture.converted[..], &fixture.marker[..]].concat(), entry, label)?;
+            fixture.require(&[&fixture.converted, &fixture.marker], entry, label)?;
         }
     }
 
@@ -244,8 +243,7 @@ pub(super) fn qualify_bank(
         .map_err(|error| qualification_dynamic(entry, label, error))?;
 
     // Expert 0 into record 1: the prompt group's seed and its commit,
-    // whoever places. Then a shrink's move of record 1 into record 0 over
-    // bytes no entry wrote, and the host maps it, held from the step on.
+    // whoever places, and the host maps it, held from the step on.
     {
         let crate::native::DevicePlacement { seed, seed_commit, list_grid } = placement;
         {
@@ -268,20 +266,17 @@ pub(super) fn qualify_bank(
             let entry = "routed_copy";
             let (seed_grid, staged) = grid_of(&seeds, entry)?;
             for (kernel, fixture) in seed.as_ref().zip(records.as_mut()) {
-                fixture
-                    .records
-                    .write_from_host(&fixture.marker.repeat(2))
-                    .map_err(|error| qualification_dynamic(entry, label, error))?;
+                fixture.mark().map_err(|error| qualification_dynamic(entry, label, error))?;
                 kernel
                     .call(routed_copy::Args {
                         source: &fixture.scratch,
                         list: &staged,
                         step: &step,
-                        destination: &mut fixture.records,
+                        destination: &mut fixture.records.records,
                         grid: &seed_grid,
                     })
                     .map_err(|error| qualification_dynamic(entry, label, error))?;
-                require_bytes(&fixture.records, &[&fixture.marker[..], &fixture.converted[..]].concat(), entry, label)?;
+                fixture.require(&[&fixture.marker, &fixture.converted], entry, label)?;
             }
             // Its commit of record 1.
             let entry = "routed_seed_commit";
@@ -291,22 +286,6 @@ pub(super) fn qualify_bank(
                 .map_err(|error| qualification_dynamic(entry, label, error))?;
             require_words(&commits, &[(0, 0), (1, SEQUENCE)], entry, label)?;
         }
-    }
-    // A shrink's move of record 1 into record 0, over bytes no entry wrote.
-    let entry = "routed_move";
-    let move_list = words(&[list_extent(1)], &list(1, 0), entry)?;
-    for (kernel, fixture) in moves.records.as_ref().zip(records.as_mut()) {
-        fixture
-            .records
-            .write_from_host(&[&fixture.marker[..], &fixture.converted[..]].concat())
-            .map_err(|error| qualification_dynamic(entry, label, error))?;
-        kernel
-            .call(routed_move::Args {
-                records: &mut fixture.records,
-                list: &move_list,
-            })
-            .map_err(|error| qualification_dynamic(entry, label, error))?;
-        require_bytes(&fixture.records, &fixture.converted.repeat(2), entry, label)?;
     }
     set_words(&map, &held(0, 1), "host placement", label)?;
 
@@ -334,16 +313,14 @@ pub(super) fn qualify_bank(
     require_words(&resolved, &wanted, entry, label)?;
 
     // The shared entries read the bank's record 1; beside a host tier they
-    // take its records as their entries are prepared for (`TR`), reserved
-    // as the tier's, none of which a source names.
+    // take its records as their entries are prepared for (`TR`), pooled as
+    // the tier's, none of which a source names.
     let tier = (binding.tier > 0)
         .then(|| {
-            // A tier is reserved `Shared`, on a link or in unified memory.
+            // A tier is pooled `Shared`, on a link or in unified memory.
             let kind = crate::planning::BankTier::Host.contract_on(device);
             binding.record.try_map(|_, tensor| {
-                let [n, k] = tensor.matrix;
-                BankAllocation::reserve(device, kind, tensor.resident, &[binding.tier, n, k], 1, None)
-                    .map(|(tier, _)| tier)
+                pooled_records(device, kind, tensor.resident, &tensor.matrix, binding.tier, 1)
                     .map_err(|error| qualification_dynamic("routed_bank", label, error))
             })
         })
@@ -352,9 +329,9 @@ pub(super) fn qualify_bank(
         map,
         step: step.clone(),
         decode_record: Some(1),
-        records: records.as_ref().map(|_, fixture| fixture.records.clone()),
-        stacks: records.as_ref().map(|_, fixture| fixture.stacks.clone()),
-        tier,
+        records: records.as_ref().map(|_, fixture| fixture.records.records.clone()),
+        stacks: records.as_ref().map(|_, fixture| fixture.stacks.records.clone()),
+        tier: tier.as_ref().map(|tier| tier.as_ref().map(|_, tier| tier.records.clone())),
     };
     match &served {
         Served::Fused { binding, kernels, .. } => qualify_routed(device, *binding, kernels, rows, &reads)?,
@@ -611,8 +588,9 @@ struct RecordFixture {
     marker: Vec<u8>,
     conveyor: Tensor,
     scratch: Tensor,
-    stacks: Tensor,
-    records: Tensor,
+    stacks: PooledRecords,
+    /// `RECORDS` records, each held.
+    records: PooledRecords,
 }
 
 impl RecordFixture {
@@ -631,21 +609,30 @@ impl RecordFixture {
         let shared = |extents: &[u64]| Tensor::shared(device, tensor.source, extents).map_err(|error| failed(&error));
         let mut scratch = Tensor::zeros(device, tensor.resident, &record).map_err(|error| failed(&error))?;
         scratch.write_from_host(&marker).map_err(|error| failed(&error))?;
-        let reserve = |kind, extents: &[u64], committed| {
-            BankAllocation::reserve(device, kind, tensor.resident, extents, committed, None).map_err(|error| failed(&error))
-        };
         let bank = crate::planning::BankTier::Bank.contract_on(device);
-        let (stacks, _) = reserve(bank, &[experts, n, k], 1)?;
-        let (mut records, _) = reserve(bank, &[RECORDS, n, k], RECORDS)?;
-        records.write_from_host(&marker.repeat(2)).map_err(|error| failed(&error))?;
-        Ok(Self {
+        let pooled = |records, held| pooled_records(device, bank, tensor.resident, &tensor.matrix, records, held).map_err(|error| failed(&error));
+        let stacks = pooled(experts, 1)?;
+        let records = pooled(RECORDS, RECORDS)?;
+        let mut fixture = Self {
             conveyor: shared(&record)?,
             converted,
             marker,
             scratch,
             stacks,
             records,
-        })
+        };
+        fixture.mark().map_err(|error| failed(&error))?;
+        Ok(fixture)
+    }
+
+    /// Write the marker into every record, through its view.
+    fn mark(&mut self) -> Result<(), seismic::TensorError> {
+        self.records.views.iter_mut().try_for_each(|view| view.write_from_host(&self.marker))
+    }
+
+    /// Require each record to hold `wanted`'s bytes, in order.
+    fn require(&self, wanted: &[&[u8]], entry: &'static str, label: &str) -> Result<(), CatalogFailure> {
+        self.records.views.iter().zip(wanted).try_for_each(|(view, wanted)| require_bytes(view, wanted, entry, label))
     }
 }
 
@@ -835,7 +822,6 @@ mod tests {
             round_records: 2,
             widest: EXPERTS,
             conveyor: EXPERTS,
-            moves: 2,
             tier: 0,
             placer: crate::planning::Placer::Tier,
             words: RegionWords {
@@ -942,16 +928,6 @@ mod tests {
                 .unwrap(),
                 list_grid: routed_list_grid::native_for_device(device, &specialization::<routed_list_grid::Entry>(device, &[]))
                     .unwrap(),
-            },
-            moves: BankMoves {
-                records: bank.record.map(|_, tensor| {
-                    routed_move::native_for_device_with(
-                        device,
-                        routed_move::Elements { U: tensor.resident },
-                        &specialization::<routed_move::Entry>(device, &record_statics(tensor, bank.moves)),
-                    )
-                    .unwrap()
-                }),
             },
             site: None,
         }

@@ -117,6 +117,13 @@ pub struct Weights<'a> {
 unsafe impl Send for Weights<'_> {}
 unsafe impl Sync for Weights<'_> {}
 
+impl slab::RecordView for Weights<'_> {
+    #[inline(always)]
+    unsafe fn at(self, base: *const u8) -> Self {
+        Self { base, geometry: self.geometry.with_base(base, self.geometry.matrix_rows), ..self }
+    }
+}
+
 impl<'a> Weights<'a> {
     /// A weight operand of `rows` rows of `k` values at `base`;
     /// `dense_stride` is the tensor's row stride in bytes (dense rows only).

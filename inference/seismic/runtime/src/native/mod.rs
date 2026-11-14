@@ -39,8 +39,10 @@ mod cuda;
 pub mod dimension;
 pub mod graph;
 mod graph_replays;
+pub(crate) mod moves;
 // The order a submission's launches need: Metal encodes them concurrently
 // by level.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) mod hazard;
 #[cfg(test)]
 mod handoff_tests;
@@ -62,6 +64,7 @@ pub(crate) mod vulkan;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
+#[cfg(any(test, target_os = "macos"))]
 use crate::api::tensor::Records;
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, OutputError};
@@ -196,55 +199,27 @@ pub(crate) struct NativeState {
     graph_budget: Mutex<GraphBudget>,
 }
 
-/// The device's graph budget: the sum of every live [`GraphHold`]'s census,
-/// how many are live, and the ledger's charge of what that census costs on
-/// the device (`DeviceInner::graph_cost`), in device and upload storage:
-/// one charge each, resized as holds come and go, so it is always the cost
-/// of the whole census, which a sum of the holds' own costs would not be (a
-/// driver's pool grows in granules, argument blocks fill chunks).
+/// The device's graph budget: the sum of every live [`GraphHold`]'s census
+/// and how many are live. What the census holds on the device is charged by
+/// its backend as the driver takes it, never predicted here.
 #[derive(Default)]
 struct GraphBudget {
     census: GraphCensus,
     holds: usize,
-    device: Option<crate::memory::MemoryCharge>,
-    upload: Option<crate::memory::MemoryCharge>,
 }
 
 impl GraphBudget {
-    /// Charge what `census` costs on `device`, the budget's census becoming
-    /// it: the growth reserved whole, or refused with nothing changed. The
-    /// bytes the device is no longer charged, none for a growth.
+    /// The budget's census becoming `census`: the bytes of what the device's
+    /// graphs cost (`DeviceInner::graph_cost`) the change gives up, none for
+    /// a growth.
     fn charge(&mut self, device: &DeviceInner, census: GraphCensus) -> Result<u64, ExecutionError> {
-        let charged = |budget: &Self| {
-            [&budget.device, &budget.upload].into_iter().flatten().map(crate::memory::MemoryCharge::bytes).sum::<u64>()
+        let cost = |census| {
+            let bytes = device.graph_cost.bytes(census).expect("a device's graph budget's memory fits u64");
+            bytes.device + bytes.upload
         };
-        let before = charged(self);
-        let bytes = device.graph_cost.bytes(census).expect("a device's graph budget's memory fits u64");
-        let memory = &device.memory;
-        let growth = |charge: &Option<crate::memory::MemoryCharge>, bytes: u64| {
-            bytes.saturating_sub(charge.as_ref().map_or(0, crate::memory::MemoryCharge::bytes))
-        };
-        let reserve = |placement: &Arc<crate::memory::Placement>, bytes: u64| {
-            (bytes != 0).then(|| crate::driver::reserve(placement, bytes)).transpose()
-        };
-        let device_growth = reserve(memory.device(), growth(&self.device, bytes.device))?;
-        let upload_growth = reserve(memory.upload(), growth(&self.upload, bytes.upload))?;
-        for (charge, growth, bytes) in [
-            (&mut self.device, device_growth, bytes.device),
-            (&mut self.upload, upload_growth, bytes.upload),
-        ] {
-            match (charge.as_mut(), growth) {
-                (Some(held), Some(mut growth)) => {
-                    let extra = growth.remaining();
-                    growth.extend(held, extra);
-                }
-                (None, Some(mut growth)) => *charge = Some(growth.take(bytes)),
-                (Some(held), None) => held.shrink(bytes),
-                (None, None) => {}
-            }
-        }
+        let before = cost(self.census);
         self.census = census;
-        Ok(before.saturating_sub(charged(self)))
+        Ok(before.saturating_sub(cost(census)))
     }
 }
 
@@ -2348,6 +2323,21 @@ impl NativePrepared {
     /// # Panics
     /// Where launches active together list different record ports: the
     /// native's declaration is wrong.
+    /// Whether result `ordinal` is bound as a record port (`records (result ordinal)`).
+    pub(crate) fn records_result(&self, ordinal: usize) -> bool {
+        let parameter_buffers = self
+            .schema()
+            .parameters()
+            .iter()
+            .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+            .count();
+        self.records
+            .first()
+            .and_then(|records| records.get(parameter_buffers + ordinal))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub(crate) fn records(&self, launches: &CallLaunches) -> &[bool] {
         let mut active = launches
             .geometry
@@ -2707,6 +2697,11 @@ impl NativePrepared {
         self.call_with(args, None, Parking::Unanswered, commit)
     }
 
+    pub(crate) fn standalone_scratch_bytes(&self, args: EncodedArgs) -> Result<u64, CallError> {
+        let shape = self.shape(&args.values())?;
+        Ok(if shape.scratch.is_empty() { 0 } else { place_scratch(&shape.scratch).1 })
+    }
+
     /// Validate a standalone call, place its results and its scratch (in
     /// `arena`, which the calls placed together share), and fix its
     /// executable form.
@@ -2776,7 +2771,9 @@ impl NativePrepared {
 
         let schema = self.schema();
         let mut buffers = Vec::new();
+        #[cfg(any(test, target_os = "macos"))]
         let mut slabs = Vec::new();
+        #[cfg(any(test, target_os = "macos"))]
         let mut records = Vec::new();
         let mut representations = Vec::new();
         let mut access = collect_native_access(schema, &args);
@@ -2802,12 +2799,23 @@ impl NativePrepared {
             if port.is_ok_and(|ordinal| self.reads_grid(ordinal)) && tensor.is_slab_view() {
                 return Err(CallError::Invocation(InvocationError::SlabGrid { parameter: name() }));
             }
-            if port.is_ok_and(|ordinal| self.addresses_slab(ordinal)) && !tensor.binds_slab_port() {
+            let addresses_slab = port.is_ok_and(|ordinal| self.addresses_slab(ordinal));
+            if addresses_slab && !tensor.binds_slab_port() {
                 return Err(CallError::Workflow(crate::api::WorkflowError::PlainSlabBinding {
                     parameter: name(),
                 }));
             }
             let buffer = buffers.len();
+            if !record_ports[buffer]
+                && !addresses_slab
+                && self.bound[buffer]
+                && tensor.is_slab_view()
+                && tensor.byte_len() > 0
+            {
+                return Err(CallError::Workflow(crate::api::WorkflowError::SlabPlainBinding {
+                    parameter: name(),
+                }));
+            }
             if record_ports[buffer] {
                 let bound = tensor.records().map_err(tensor_error)?;
                 buffers.push((
@@ -2815,22 +2823,27 @@ impl NativePrepared {
                     bound.table_offset,
                     seismic_lang::registry::record_table_entry(bound.count),
                 ));
-                records.push((buffer, bound));
-            } else if tensor.chunked() && self.bound[buffer] {
-                // Chunked storage has no one buffer: device work binds it
-                // only through a record port. A host port, never bound,
-                // takes it, ordered by its packed span.
-                return Err(CallError::Workflow(crate::api::WorkflowError::ChunkedBinding {
-                    parameter: name(),
-                }));
-            } else {
-                if let Some(slab) = tensor.slab_reach() {
-                    slabs.push((buffer, slab));
+                #[cfg(any(test, target_os = "macos"))]
+                {
+                    if let Some(slab) = tensor.slab_reach() {
+                        slabs.push((buffer, slab));
+                    }
+                    records.push((buffer, bound));
                 }
+            } else if let Some(slab) = tensor.slab_reach() {
+                let table_bytes = slab.table_bytes;
+                #[cfg(any(test, target_os = "macos"))]
+                slabs.push((buffer, slab));
                 buffers.push((
                     tensor.allocation().clone(),
                     tensor.byte_offset(),
-                    tensor.reached_bytes(),
+                    table_bytes,
+                ));
+            } else {
+                buffers.push((
+                    tensor.allocation().clone(),
+                    tensor.byte_offset(),
+                    tensor.byte_len(),
                 ));
             }
             representations.push(representation_name(tensor.representation()));
@@ -2842,7 +2855,7 @@ impl NativePrepared {
             return Err(CallError::Workflow(crate::api::WorkflowError::UnaddressedCondition { parameter }));
         }
         for tensor in &results {
-            access.push((tensor.allocation().clone(), true));
+            access.extend(tensor.bound_allocations().map(|allocation| (allocation, true)));
         }
         if let Some(arena) = arena {
             for (offset, need) in scratch.into_iter().zip(&shape.scratch) {
@@ -2855,21 +2868,25 @@ impl NativePrepared {
         // The kernel's arguments: its bound buffers'.
         let mut bound = Vec::with_capacity(representations.len());
         self.bind(representations, &mut bound);
+        let binding_leases = args
+            .tensors()
+            .flatten()
+            .chain(results.iter())
+            .filter(|tensor| tensor.holds_binding_lease())
+            .cloned()
+            .collect();
         Ok(NativeBoundCall {
             results,
             buffers,
+            #[cfg(any(test, target_os = "macos"))]
             slabs,
+            #[cfg(any(test, target_os = "macos"))]
             records,
             representations: bound,
             words: shape.words,
             launches: shape.launches,
             access,
-            binding_leases: args
-                .tensors()
-                .flatten()
-                .filter(|tensor| tensor.holds_binding_lease())
-                .cloned()
-                .collect(),
+            binding_leases,
         })
     }
 
@@ -2907,7 +2924,7 @@ impl NativePrepared {
     fn reset_scalar_results(&self) -> Result<(), CallError> {
         if let Some(scalars) = &self.scalars {
             let _host = scalars.slots.acquire(true).map_err(CallError::Execution)?;
-            write_zeros(scalars.slots.storage(), scalars.bytes()).map_err(CallError::Execution)?;
+            write_zeros(scalars.slots.storage(), 0, scalars.bytes()).map_err(CallError::Execution)?;
         }
         Ok(())
     }
@@ -3038,9 +3055,11 @@ struct NativeBoundCall {
     buffers: Vec<(Arc<Allocation>, u64, u64)>,
     /// Each buffer bound to a slab view, by ABI ordinal, with what it
     /// reaches (the encodings order by it).
-    slabs: Vec<(usize, hazard::SlabReach)>,
+    #[cfg(any(test, target_os = "macos"))]
+    slabs: Vec<(usize, Arc<crate::api::tensor::SlabReach>)>,
     /// Each buffer bound to a record port, by ABI ordinal, with the records
     /// its table reaches.
+    #[cfg(any(test, target_os = "macos"))]
     records: Vec<(usize, Arc<Records>)>,
     /// The bound buffers' representations, in argument order.
     representations: Vec<&'static str>,
@@ -3079,11 +3098,15 @@ impl NativeBoundCall {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl NativeBoundCall {
     /// What the call's launches reach, into `reaches`.
-    fn reaches<'s>(&'s self, reaches: &mut Vec<hazard::Reach<'s>>) {
+    fn reaches(&self, reaches: &mut Vec<hazard::Reach>) {
         for (buffer, (allocation, offset, bytes)) in self.buffers.iter().enumerate() {
-            if let Some((_, records)) = self.records.iter().find(|(bound, _)| *bound == buffer) {
+            // A slab view's, record port or not, reaches its slabs wherever
+            // they lie now.
+            let stored = self.records.iter().find(|(bound, records)| *bound == buffer && records.storage.is_some());
+            if let Some((_, records)) = stored {
                 records.extend(buffer, 0, records.count, reaches);
                 continue;
             }
@@ -3091,7 +3114,7 @@ impl NativeBoundCall {
                 Some((_, slab)) => slab.extend(buffer, allocation, *offset, reaches),
                 None => reaches.push(hazard::Reach {
                     buffer,
-                    allocation,
+                    allocation: allocation.identity(),
                     offset: *offset,
                     bytes: *bytes,
                     through: hazard::Through::Binding,
@@ -3144,7 +3167,8 @@ impl DispatchList for StandaloneCalls<'_> {
         }
     }
 
-    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>) {
+    #[cfg(any(test, target_os = "macos"))]
+    fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>) {
         self.calls[index].reaches(reaches);
     }
 
@@ -3201,7 +3225,8 @@ pub(crate) trait DispatchList {
     /// What call `index`'s launches reach through all its buffers, host
     /// ports included (each by its ABI ordinal), appended to `reaches`.
     /// Metal's concurrent encoding orders by them ([`hazard`]).
-    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>);
+    #[cfg(any(test, target_os = "macos"))]
+    fn reaches(&self, index: usize, reaches: &mut Vec<hazard::Reach>);
     /// The sealed plans' runs that make up the list, in order, each with
     /// its calls: a run's segments between timeline boundaries are replayed
     /// as graphs of their shape ([`ReplayKeys`]). `None` for lists launched

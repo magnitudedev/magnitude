@@ -9,7 +9,7 @@ mod common;
 mod declared;
 
 use magnitude_kernels::attention_prefill;
-use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, Tensor};
 
 include!("attention_common/fixtures.rs");
 
@@ -139,14 +139,12 @@ fn native(
     let kernel = entry.prepare(device, &specialization).unwrap();
     let (selected_rows, selected) = no_picks(device, m, kv, w);
     let plane = |values: &[f32]| {
-        let mut slabs = SlabTensor::new(
+        let slabs = crate::common::slab_tensor(
             device,
             t as u64,
             t as u64,
-            vec![SlabRegion { element: Element::bf16(), row_shape: vec![kv as u64, w as u64] }],
-        )
-        .unwrap();
-        slabs.add_slab().unwrap();
+            &vec![SlabRegion { element: Element::bf16(), row_shape: vec![kv as u64, w as u64] }]);
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         slabs
             .region_rows(0, 0, t as u64)
             .unwrap()

@@ -1530,6 +1530,7 @@ pub(crate) mod tests {
                     ResourceCapacity {
                         domain_bytes: 16 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -1685,6 +1686,7 @@ pub(crate) mod tests {
                     ResourceCapacity {
                         domain_bytes: 16 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -1758,6 +1760,7 @@ pub(crate) mod tests {
                     ResourceCapacity {
                         domain_bytes: 16 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -2069,6 +2072,7 @@ pub(crate) mod tests {
                     ResourceCapacity {
                         domain_bytes: 16 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -2163,6 +2167,7 @@ pub(crate) mod tests {
                     ResourceCapacity {
                         domain_bytes: 16 * 1024 * 1024 * 1024,
                         tensor_operations: crate::TensorOperations::Absent,
+                        allocations: seismic::NativeAllocations::EXACT,
                     },
                 )
                 .unwrap();
@@ -2191,7 +2196,7 @@ pub(crate) mod tests {
                 &catalog,
                 ExecutionPath::Native,
                 crate::platform::DeviceRequest::Automatic,
-                &crate::platform::MemoryReserves::of_machine(None),
+                &crate::platform::ReleaseRate::of_machine(None),
             )
             .unwrap();
             let device = catalog
@@ -2223,10 +2228,11 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: chosen.assessment_capacity_bytes.min(1 << 30),
+                    domain_bytes: crate::StableRoom::of_selected(&chosen).capacity().unwrap().min(1 << 30),
                     tensor_operations: crate::TensorOperations::of(
                         chosen.info.forms_tensor_operations(),
                     ),
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -2252,6 +2258,7 @@ pub(crate) mod tests {
                     &state,
                     draft.programs().target(),
                     limits,
+                    draft.load().pass(limits),
                     &seismic::Workers::new(1),
                 )
                 .unwrap();
@@ -2268,7 +2275,7 @@ pub(crate) mod tests {
                 &catalog,
                 ExecutionPath::Native,
                 crate::platform::DeviceRequest::Automatic,
-                &crate::platform::MemoryReserves::of_machine(None),
+                &crate::platform::ReleaseRate::of_machine(None),
             )
             .unwrap();
             let device = catalog
@@ -2300,10 +2307,11 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: chosen.assessment_capacity_bytes.min(1 << 30),
+                    domain_bytes: crate::StableRoom::of_selected(&chosen).capacity().unwrap().min(1 << 30),
                     tensor_operations: crate::TensorOperations::of(
                         chosen.info.forms_tensor_operations(),
                     ),
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -2329,6 +2337,7 @@ pub(crate) mod tests {
                     &state,
                     draft.programs().target(),
                     limits,
+                    draft.load().pass(limits),
                     &seismic::Workers::new(1),
                 )
                 .unwrap();
@@ -2407,6 +2416,7 @@ pub(crate) mod tests {
                         ResourceCapacity {
                             domain_bytes: 16 * 1024 * 1024 * 1024,
                             tensor_operations: crate::TensorOperations::Absent,
+                            allocations: seismic::NativeAllocations::EXACT,
                         },
                     )
                     .unwrap();

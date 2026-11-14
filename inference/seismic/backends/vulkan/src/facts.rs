@@ -9,7 +9,6 @@ use crate::device::DeviceHandle;
 use crate::instance::Instance;
 use ash::vk;
 use std::ffi::CStr;
-use seismic_topology::Unreservable;
 use std::sync::Arc;
 
 pub use seismic_lang::device::vulkan::{Probed, Properties};
@@ -339,14 +338,6 @@ pub struct Facts {
     /// compute; else `queue_family`, where it has a second queue, whose
     /// copies take turns with compute on one engine.
     pub side_family: Option<u32>,
-    /// `minImportedHostPointerAlignment`, where the device imports host
-    /// memory (`VK_EXT_external_memory_host`).
-    pub host_import_alignment: Option<u64>,
-    /// `minPlacedMemoryMapAlignment`, where the device maps memory at a
-    /// host address it is given and unmaps it back to a reservation
-    /// (`VK_EXT_map_memory_placed`'s `memoryMapPlaced` and
-    /// `memoryUnmapReserve`, over `VK_KHR_map_memory2`).
-    pub placed_map_alignment: Option<u64>,
     /// `VK_KHR_pipeline_executable_properties` with `pipelineExecutableInfo`:
     /// a formed pipeline reports its executables' statistics (registers,
     /// spills, memory and others, as the driver names them).
@@ -419,7 +410,7 @@ pub struct Allocation {
     /// its first device-local type's, or every heap with a type on a device
     /// whose memory is the host's, the device-local ones first.
     pub device_heaps: Vec<u32>,
-    /// The types host pages are imported as, and staging's: every mappable
+    /// Host RAM's types, which staging is of: every mappable
     /// type that is not device-local (any mappable type, on a device whose
     /// memory is the host's), host-cached ones first, so the host's reads
     /// are cached and its stores are ordinary write-back stores.
@@ -502,40 +493,6 @@ impl Facts {
         target
     }
 
-    /// What backs a reservation in `kind` ([`ChunkBacking`]): imported host
-    /// pages where the device has no placed mapping for its host-addressed
-    /// ranges or its memory is its own; a device-local type's chunks on a
-    /// device whose memory is its own; a mappable type's, mapped in place,
-    /// on one whose memory is the host's and that maps at a placed address;
-    /// else none.
-    pub(crate) fn chunk_backing(&self, kind: u32) -> Option<ChunkBacking> {
-        chunk_backing(&self.memory, self.device_type.memory_is_host(), self.placed_map_alignment.is_some(), kind)
-    }
-
-    /// How the backend reserves address ranges in `kind`: in chunks, each
-    /// its own memory object and buffer, which device work reaches through
-    /// record tables (`crate::reservation`), backed as
-    /// [`Self::chunk_backing`] says; and why not where this device cannot
-    /// ([`reservation_unit`]). Chunks the host addresses lie in one reserved
-    /// host range, so the host addresses the reservation in place at one
-    /// base, as CUDA's host-addressed storage is.
-    pub fn reservation(&self, kind: u32) -> Result<Option<ReservationForm>, Unreservable> {
-        let Some(backing) = self.chunk_backing(kind) else {
-            return Ok(None);
-        };
-        reservation_form(
-            backing,
-            Reserving {
-                queues: 1 + u32::from(self.side_family.is_some()),
-                host_import_alignment: self.host_import_alignment,
-                placed_map_alignment: self.placed_map_alignment,
-                heap_bytes: self.memory.heaps.iter().map(|heap| heap.bytes).sum::<u64>(),
-                max_allocations: self.limits.max_memory_allocations,
-            },
-        )
-        .map(Some)
-    }
-
     /// Tuning identity: vendor and device, name, driver ID and
     /// version, so a driver update changes the key.
     pub fn tuning_identity(&self) -> String {
@@ -549,141 +506,6 @@ impl Facts {
             self.driver_info
         )
     }
-}
-
-/// [`Facts::chunk_backing`] of a device of memory layout `layout`, whose
-/// memory is the host's or its own, that maps at a `placed` address or not.
-pub(crate) fn chunk_backing(layout: &MemoryLayout, memory_is_host: bool, placed: bool, kind: u32) -> Option<ChunkBacking> {
-    if kind == crate::topology::IMPORTED_KIND {
-        return (!memory_is_host || !placed).then_some(ChunkBacking::HostPages);
-    }
-    let memory = layout.types[kind as usize];
-    match memory_is_host {
-        true => (placed && memory.mappable()).then_some(ChunkBacking::Placed),
-        false => memory.device_local.then_some(ChunkBacking::Device),
-    }
-}
-
-/// The facts of a device that decide how it reserves address ranges
-/// ([`reservation_form`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reserving {
-    /// Queues of its work queue family.
-    pub queues: u32,
-    /// `minImportedHostPointerAlignment`, where it imports host memory.
-    pub host_import_alignment: Option<u64>,
-    /// `minPlacedMemoryMapAlignment`, where it maps memory at a placed host
-    /// address ([`Facts::placed_map_alignment`]).
-    pub placed_map_alignment: Option<u64>,
-    /// Bytes of every memory heap.
-    pub heap_bytes: u64,
-    /// `maxMemoryAllocationCount`.
-    pub max_allocations: u64,
-}
-
-/// How a device of `reserving` reserves address ranges backed as `backing`;
-/// why not where it cannot.
-fn reservation_form(backing: ChunkBacking, reserving: Reserving) -> Result<ReservationForm, Unreservable> {
-    let unit = reservation_unit(backing, reserving, seismic_reservation::host_page)?;
-    Ok(ReservationForm {
-        granule: reservation_granule(unit, reserving.heap_bytes, reserving.max_allocations),
-        chunk_unit: unit,
-        host_addressed: backing != ChunkBacking::Device,
-    })
-}
-
-/// How the backend reserves one kind's address ranges
-/// ([`Facts::reservation`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReservationForm {
-    /// The least chunk, in which committed bytes are backed and charged.
-    pub granule: u64,
-    /// The bytes every chunk is a whole number of: `vkCmdFillBuffer`'s
-    /// 4-byte unit for device memory chunks, which are zeroed with it; for
-    /// chunks the host addresses the host page (a power of two, of the
-    /// import or placed mapping alignment's multiples), where each starts
-    /// and ends.
-    pub chunk_unit: u64,
-    /// Whether the host addresses the backed bytes in place, at one base:
-    /// whether its chunks lie in one reserved host range ([`ChunkBacking`]).
-    pub host_addressed: bool,
-}
-
-/// What backs a reservation's chunks ([`chunk_backing`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChunkBacking {
-    /// Device memory of its kind, which the host does not address.
-    Device,
-    /// Host pages of one reserved host range, imported
-    /// (`VK_EXT_external_memory_host`): host RAM, which the host addresses
-    /// at the range's base.
-    HostPages,
-    /// Device memory of its kind, each chunk mapped at its place in one
-    /// reserved host range (`VK_EXT_map_memory_placed`), so the host
-    /// addresses it at the range's base while device work reads it as the
-    /// device's own (GB10: scattered reads at 238 GB/s against 19.5 for
-    /// imported host pages).
-    Placed,
-}
-
-/// The bytes every chunk of a reservation backed as `backing` is a whole
-/// number of ([`Facts::reservation`]), on a device of `reserving`; `page`
-/// reads the host page; why not where the device cannot reserve so. Device
-/// memory chunks need a second queue in the work queue family, on which a
-/// growth's chunks are zeroed beside work parked on the first; chunks in a
-/// host range start on host pages, imported at a host page, or mapped in
-/// place at an alignment no coarser than the least chunk (the host zeroes
-/// them through its range).
-fn reservation_unit<E: std::fmt::Display>(
-    backing: ChunkBacking,
-    reserving: Reserving,
-    page: impl FnOnce() -> Result<u64, E>,
-) -> Result<u64, Unreservable> {
-    let host_page = || page().map_err(|error| Unreservable::Unread(format!("the host page size: {error}")));
-    match backing {
-        ChunkBacking::Device => match reserving.queues {
-            0 | 1 => Err(Unreservable::OneQueue { queues: reserving.queues }),
-            _ => Ok(FILL_UNIT),
-        },
-        ChunkBacking::HostPages => {
-            let alignment = reserving.host_import_alignment.ok_or(Unreservable::NoHostImport)?;
-            let page = host_page()?;
-            match alignment <= page {
-                true => Ok(page),
-                false => Err(Unreservable::HostImportAlignment { alignment, page }),
-            }
-        }
-        ChunkBacking::Placed => {
-            let alignment = reserving.placed_map_alignment.ok_or(Unreservable::NoPlacedMapping)?;
-            match alignment <= RESERVATION_CHUNK_BYTES {
-                true => host_page(),
-                false => Err(Unreservable::PlacedMappingAlignment { alignment, least: RESERVATION_CHUNK_BYTES }),
-            }
-        }
-    }
-}
-
-/// The unit `vkCmdFillBuffer` writes: its offset and size are whole words.
-pub(crate) const FILL_UNIT: u64 = 4;
-
-/// The least chunk a reservation backs: 2 MiB, the large page of the GPUs
-/// the backend runs (CUDA's reservation granule on the same devices,
-/// `cuMemGetAllocationGranularity`), so a chunk is no smaller than the
-/// pages its memory is mapped in.
-const RESERVATION_CHUNK_BYTES: u64 = 2 << 20;
-
-/// The granule of chunks of `unit` bytes on a device of `total` bytes of
-/// heaps that admits `allocations` memory objects at once: the least power
-/// of two of at least [`RESERVATION_CHUNK_BYTES`] and `unit` (a power of
-/// two) whose chunks over every heap take at most half of them, leaving the
-/// rest to the block allocator and the driver (Windows NVIDIA drivers admit
-/// 4096; a 24 GiB device in 2 MiB chunks would need 12288).
-fn reservation_granule(unit: u64, total: u64, allocations: u64) -> u64 {
-    let mut granule = RESERVATION_CHUNK_BYTES.max(unit);
-    while total.div_ceil(granule) > allocations / 2 && granule < total {
-        granule *= 2;
-    }
-    granule
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -817,15 +639,10 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
     let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
     let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
-    let mut host_import = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-    let imports_host = has(ash::ext::external_memory_host::NAME);
     let mut properties = vk::PhysicalDeviceProperties2::default()
         .push_next(&mut v11)
         .push_next(&mut v12)
         .push_next(&mut v13);
-    if imports_host {
-        properties = properties.push_next(&mut host_import);
-    }
     unsafe { raw.get_physical_device_properties2(physical, &mut properties) };
     let base = properties.properties;
 
@@ -858,21 +675,6 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     }
     unsafe { raw.get_physical_device_features2(physical, &mut features) };
     let core = features.features;
-    // Placed mapping, where the device maps memory at a given host address
-    // and unmaps it back to a reservation: its alignment.
-    let placed_map_alignment = (has(ash::ext::map_memory_placed::NAME) && has(ash::khr::map_memory2::NAME))
-        .then(|| {
-            let mut placed = vk::PhysicalDeviceMapMemoryPlacedFeaturesEXT::default();
-            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut placed);
-            unsafe { raw.get_physical_device_features2(physical, &mut features) };
-            let mut alignment = vk::PhysicalDeviceMapMemoryPlacedPropertiesEXT::default();
-            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut alignment);
-            unsafe { raw.get_physical_device_properties2(physical, &mut properties) };
-            (placed.memory_map_placed == vk::TRUE && placed.memory_unmap_reserve == vk::TRUE)
-                .then_some(alignment.min_placed_memory_map_alignment)
-        })
-        .flatten();
-
     let families = unsafe { raw.get_physical_device_queue_family_properties(physical) };
     let compute_only = families.iter().position(|family| {
         family.queue_flags.contains(vk::QueueFlags::COMPUTE)
@@ -962,8 +764,6 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         dedicated_compute_queue: compute_only.is_some(),
         queue_count: queue_family.map_or(0, |family| families[family].queue_count),
         side_family,
-        host_import_alignment: imports_host.then_some(host_import.min_imported_host_pointer_alignment),
-        placed_map_alignment,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
         matrix_path: matrix_path(v12.driver_id, base.vendor_id, mixed_dot),
         calibration,
@@ -1125,7 +925,7 @@ mod tests {
         }
     }
 
-    /// Imported pages and staging lie in host RAM, host-cached types first;
+    /// Staging lies in host RAM, host-cached types first;
     /// the device's budget reads its first device-local type's heap.
     #[test]
     fn the_backends_own_storage_is_host_ram_cached_first() {
@@ -1137,90 +937,5 @@ mod tests {
         assert_eq!(allocation.host, vec![3, 1]);
         assert_eq!(allocation.staging, Some(3));
         assert_eq!(allocation.device_heaps, vec![0]);
-    }
-
-    /// Device memory chunks need a second queue, which zeroes a growth, and
-    /// say why not on one; imported host pages say why not where host memory
-    /// imports at no host page or not at all; chunks mapped in place need a
-    /// placed alignment no coarser than the least chunk (no second queue: the
-    /// host zeroes them).
-    #[test]
-    fn a_reservation_needs_its_backing_own_requirement() {
-        let page = || Ok::<_, String>(16384);
-        let reserving = |queues, import, placed| Reserving {
-            queues,
-            host_import_alignment: import,
-            placed_map_alignment: placed,
-            heap_bytes: 1 << 30,
-            max_allocations: u64::from(u32::MAX),
-        };
-        let unit = |backing, queues, import, placed| reservation_unit(backing, reserving(queues, import, placed), page);
-        assert_eq!(unit(ChunkBacking::Device, 2, None, None), Ok(FILL_UNIT));
-        assert_eq!(unit(ChunkBacking::Device, 1, Some(4096), None), Err(Unreservable::OneQueue { queues: 1 }));
-        assert_eq!(unit(ChunkBacking::HostPages, 1, Some(4096), None), Ok(16384));
-        assert_eq!(unit(ChunkBacking::Placed, 1, None, Some(65536)), Ok(16384), "mapped in place, the host page");
-        assert_eq!(
-            unit(ChunkBacking::Placed, 2, None, Some(4 << 20)),
-            Err(Unreservable::PlacedMappingAlignment { alignment: 4 << 20, least: RESERVATION_CHUNK_BYTES })
-        );
-        assert_eq!(unit(ChunkBacking::HostPages, 2, None, None), Err(Unreservable::NoHostImport));
-        assert_eq!(
-            unit(ChunkBacking::HostPages, 2, Some(65536), None),
-            Err(Unreservable::HostImportAlignment { alignment: 65536, page: 16384 })
-        );
-        let unread = reservation_unit(ChunkBacking::HostPages, reserving(2, Some(4096), None), || Err("no sysconf")).unwrap_err();
-        assert!(matches!(&unread, Unreservable::Unread(why) if why.contains("no sysconf")), "{unread}");
-    }
-
-    /// A reservation's chunks are 2 MiB where the device admits the memory
-    /// objects to chunk every heap twice over, and double until they fit
-    /// half its memory objects; a unit above 2 MiB is the least chunk.
-    #[test]
-    fn reservation_chunks_fit_half_the_memory_objects() {
-        const GIB: u64 = 1 << 30;
-        // A Linux NVIDIA driver admits u32::MAX objects; a 24 GiB device
-        // with 64 GiB of host heap is chunked at 2 MiB.
-        assert_eq!(reservation_granule(4, 88 * GIB, u64::from(u32::MAX)), 2 << 20);
-        // A Windows NVIDIA driver admits 4096: 88 GiB in at most 2048
-        // chunks is 44 MiB, so 64 MiB.
-        assert_eq!(reservation_granule(4, 88 * GIB, 4096), 64 << 20);
-        assert!(88 * GIB / (64 << 20) <= 2048 && 88 * GIB / (32 << 20) > 2048);
-        assert_eq!(reservation_granule(4 << 20, 8 * GIB, u64::from(u32::MAX)), 4 << 20);
-    }
-
-    /// The RTX 3090 as one reports it (vulkaninfo, 2026-11-02: the
-    /// compute-only family's 8 queues, host import at 4 KiB on its 4 KiB
-    /// host page, maxMemoryAllocationCount 2^32 − 1, the fixture's heaps)
-    /// reserves as its fixture records: device storage in fill-unit chunks,
-    /// host storage in host pages, both at the 2 MiB least chunk.
-    #[test]
-    fn the_recorded_rtx3090_reserves_as_its_fixture_records() {
-        use seismic_topology::fixtures::{rtx3090_uuid, rtx3090_vulkan};
-        let report = rtx3090_vulkan(rtx3090_uuid());
-        let heap_bytes = report.memory.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
-        let reserving = Reserving {
-            queues: 8,
-            host_import_alignment: Some(4096),
-            placed_map_alignment: None,
-            heap_bytes,
-            max_allocations: 4_294_967_295,
-        };
-        let form = |backing, kind| {
-            let unit = reservation_unit(backing, reserving, || Ok::<_, String>(4096)).unwrap();
-            let granule = reservation_granule(unit, heap_bytes, 4_294_967_295);
-            let recorded = report.kinds.iter().find(|each| each.id == kind).unwrap();
-            let recorded = recorded.reservation.clone().unwrap().unwrap();
-            assert_eq!(
-                recorded,
-                seismic_topology::Reservation {
-                    granule,
-                    host_addressed: backing != ChunkBacking::Device,
-                    chunks: Some(seismic_topology::ReservationChunks { unit, table: seismic_topology::Contract::Upload }),
-                }
-            );
-            (granule, unit)
-        };
-        assert_eq!(form(ChunkBacking::Device, 0), (2 << 20, FILL_UNIT));
-        assert_eq!(form(ChunkBacking::HostPages, crate::topology::IMPORTED_KIND), (2 << 20, 4096));
     }
 }

@@ -248,32 +248,6 @@ impl FeatureRef {
         }
     }
 
-    pub(crate) fn reclaimable_bytes(features: &[&Self]) -> Result<u64, ResourceError> {
-        let mut allocations = Vec::<&Rc<FeatureAllocation>>::new();
-        for feature in features {
-            if allocations
-                .iter()
-                .any(|other| Rc::ptr_eq(other, &feature.allocation))
-            {
-                continue;
-            }
-            let selected = features
-                .iter()
-                .filter(|other| feature.same_allocation(other))
-                .count();
-            if Rc::strong_count(&feature.allocation) == selected {
-                allocations.push(&feature.allocation);
-            }
-        }
-        let tensors = allocations
-            .iter()
-            .filter_map(|allocation| match &allocation.tensor {
-                Some(backing @ TensorBacking::Owned(_)) => Some(backing.tensor()),
-                _ => None,
-            });
-        Tensor::reclaimable_bytes(tensors).map_err(|error| ResourceError::Tensor(error.to_string()))
-    }
-
     /// Tensor-free RAII lease for contract tests and non-device executors.
     pub fn logical(
         domain: ResourceDomainId,
@@ -540,14 +514,6 @@ impl ResourceDomain {
         })
     }
 
-    /// Visit the storage of every feature tensor the domain owns.
-    pub(crate) fn visit_owned_feature_storage(
-        &self,
-        visit: &mut dyn FnMut(&seismic::TensorStorageObserver),
-    ) {
-        self.owned_features.borrow().iter().for_each(visit);
-    }
-
     /// Publish `tensor` as features the domain owns, kept with `claims`,
     /// those its allocation was made under, until its last view drops.
     pub fn publish_features(&self, tensor: Tensor, claims: Vec<crate::memory::ledger::Claim>) -> Result<FeatureRef, ResourceError> {
@@ -733,11 +699,6 @@ mod tests {
         let bytes = feature.allocation().tensor().unwrap().storage_bytes();
         let weak = feature.downgrade();
         let fork = feature.clone();
-        assert_eq!(FeatureRef::reclaimable_bytes(&[&feature]).unwrap(), 0);
-        assert_eq!(
-            FeatureRef::reclaimable_bytes(&[&feature, &fork]).unwrap(),
-            bytes
-        );
         assert_eq!(domain.owned_feature_bytes().unwrap(), bytes);
         drop(feature);
         assert_eq!(domain.clone().owned_feature_bytes().unwrap(), bytes);

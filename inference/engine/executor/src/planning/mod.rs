@@ -13,7 +13,7 @@ pub(crate) use imports::ImportPlan;
 mod programs;
 mod prices;
 pub use prices::{PlanPrices, PlanSteps};
-pub(crate) use prices::{BankPrices, Prior};
+pub(crate) use prices::Prior;
 mod prompt_room;
 pub(crate) use prompt_room::{pass_ladder, routed_prompt_seconds};
 mod resources;
@@ -31,7 +31,7 @@ pub use bank::{
     Lender,
     HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredPart, StoredStack,
-    growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer,
+    growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer, PoolSlab,
 };
 pub(crate) use bank::{layer_homes, releasing};
 #[cfg(test)]
@@ -59,7 +59,7 @@ pub use resources::{
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
 };
-pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions};
+pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions, state_granule, state_pool_granule};
 pub(crate) use weights::{AttentionForm, AttentionWidths, GateForm, RoundingArguments, RoundingWords, SeparateGate, axis};
 pub use weights::{
     AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
@@ -245,7 +245,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::of_machine(None),
+            &crate::platform::ReleaseRate::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
@@ -345,7 +345,7 @@ pub(crate) mod tests {
         impl crate::TuningRoom for Total {
             fn now(&self, device: &seismic::Device) -> crate::RoomNow {
                 crate::RoomNow {
-                    device_bytes: self.0.saturating_sub(device.device_ledger().charged),
+                    device_bytes: self.0.saturating_sub(device.allocated()),
                     host_bytes: u64::MAX,
                     host_shared: true,
                 }
@@ -359,7 +359,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::of_machine(None),
+            &crate::platform::ReleaseRate::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
@@ -451,11 +451,17 @@ pub(crate) mod tests {
             }
         }
         /// All the room the platform has until the mandatory work is done,
-        /// and none after: a neighbour took it.
-        struct Taken<'a>(&'a Search);
+        /// and none after: a neighbour took it, bounding the device's store
+        /// at what the mandatory work allocated.
+        struct Taken<'a>(&'a Search, &'a seismic::memory::Tally, std::cell::OnceCell<()>);
         impl crate::TuningRoom for Taken<'_> {
             fn now(&self, device: &seismic::Device) -> crate::RoomNow {
-                let left = if self.0.mandatory.get() { 0 } else { 1 << 40 };
+                let left = if self.0.mandatory.get() {
+                    self.2.get_or_init(|| self.1.bound(device.allocated()));
+                    0
+                } else {
+                    1 << 40
+                };
                 crate::RoomNow { device_bytes: left, host_bytes: left, host_shared: crate::memory::ledger::shares_host(device) }
             }
             fn release(&self) -> crate::platform::ReleaseRate {
@@ -467,12 +473,25 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::of_machine(None),
+            &crate::platform::ReleaseRate::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
-        let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
+        let (device, tally) = crate::test_support::open_tallied(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
-        let definition = fixture_definition();
+        let mut definition = crate::planning::fixtures::fixture_definition_of(1024);
+        if let magnitude_family_contracts::Operator::DenseFfn(dense) =
+            &mut definition.decoder.blocks[0].sublayers[1].op
+        {
+            const WIDE: u64 = 16_448;
+            dense.intermediate = WIDE;
+            dense.up = magnitude_family_contracts::FeedForwardUp::Gated {
+                activation: magnitude_family_contracts::ActivationFunction::Silu,
+                limit: None,
+                gate: crate::planning::fixtures::descriptor("gate", &[WIDE, 1024]),
+                up: crate::planning::fixtures::descriptor("up", &[WIDE, 1024]),
+            };
+            dense.down = crate::planning::fixtures::descriptor("down", &[1024, WIDE]);
+        }
         let manifest = fixture_manifest(&definition);
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -497,7 +516,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let search = Search::default();
-        let room = Taken(&search);
+        let room = Taken(&search, &tally, std::cell::OnceCell::new());
         crate::AttestedPrograms::search_draft(
             &draft,
             &device,
@@ -507,7 +526,7 @@ pub(crate) mod tests {
                 observer: &search,
                 cache: None,
                 numerical_profile: crate::ResolvedNumericalProfile::standard(),
-                settings: crate::TuningSettings { budget: std::time::Duration::from_secs(30), fresh: true },
+                settings: crate::TuningSettings { budget: std::time::Duration::from_secs(600), fresh: true },
             },
             Some(&room),
         )
@@ -529,7 +548,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::of_machine(None),
+            &crate::platform::ReleaseRate::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
@@ -549,8 +568,9 @@ pub(crate) mod tests {
             conversations: std::num::NonZeroUsize::MIN,
         };
         let capacity_bytes = ResourceCapacity {
-            domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
+            domain_bytes: StableRoom::of_selected(&selected).capacity().unwrap().min(512 * 1024 * 1024),
             tensor_operations: TensorOperations::of(selected.info.forms_tensor_operations()),
+            allocations: selected.info.limits().allocations(),
         };
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -597,6 +617,7 @@ pub(crate) mod tests {
                 &state,
                 draft.programs().target(),
                 limits,
+                draft.load().pass(limits),
                 &seismic::Workers::new(1),
             )
             .unwrap();
@@ -856,7 +877,7 @@ pub(crate) mod tests {
                 catalog,
                 crate::ExecutionPath::Native,
                 crate::platform::DeviceRequest::Backend(backend),
-                &crate::platform::MemoryReserves::of_machine(None),
+                &crate::platform::ReleaseRate::of_machine(None),
             )
             .unwrap_or_else(|error| panic!("an available {backend:?} device is selected: {error}"));
             let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
@@ -882,10 +903,11 @@ pub(crate) mod tests {
                 KvCodec::Dense,
                 limits,
                 ResourceCapacity {
-                    domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
+                    domain_bytes: StableRoom::of_selected(&selected).capacity().unwrap().min(512 * 1024 * 1024),
                     tensor_operations: TensorOperations::of(
                         selected.info.forms_tensor_operations(),
                     ),
+                    allocations: selected.info.limits().allocations(),
                 },
             )
             .unwrap();
@@ -911,6 +933,7 @@ pub(crate) mod tests {
                     &state,
                     draft.programs().target(),
                     limits,
+                    draft.load().pass(limits),
                     &seismic::Workers::new(1),
                 )
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));

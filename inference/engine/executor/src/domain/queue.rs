@@ -480,7 +480,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let drained = drain_steps(steps, self.measures.as_ref().and_then(|measures| measures.experts.as_ref()));
         self.target.insert(holder, joined.abort());
-        let released = self.release_state(&[holder]).map(|_bytes| ()).map_err(DomainError::invariant);
+        let released = self.release_state(&[holder]).map_err(DomainError::invariant);
         // The first failure of all: the drained steps' fault, else the
         // release's, else the group's close.
         drained.and(released).and_then(|()| self.close_group())

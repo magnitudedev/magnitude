@@ -144,11 +144,12 @@ impl<'a> QualificationView<'a> {
             let following_bank = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
             let decays = value_heads * binding.decay_width;
             // One tape row, the least a bank holds.
-            let mut banks = seismic::SlabTensor::new(
+            let banks = crate::experts::pooled_slabs(
                 device,
+                seismic::Contract::DeviceOnly,
                 2,
                 2,
-                vec![
+                &[
                     seismic::SlabRegion {
                         element: binding.activation,
                         row_shape: vec![taps, channels],
@@ -162,10 +163,11 @@ impl<'a> QualificationView<'a> {
                         row_shape: vec![1, (value_heads + key_heads) * w + decays],
                     },
                 ],
+                1,
             )
             .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
             banks
-                .add_slab()
+                .add_slab(seismic::SlabFill::Zeroed)
                 .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
             let mut window = banks
                 .logical_region(0)
@@ -1501,18 +1503,20 @@ fn qualify_short_conv(
     let previous_tape = semantic_i32(device, &[1], &[0], entry, &label)?;
     let following_bank = semantic_i32(device, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
-    let mut banks = seismic::SlabTensor::new(
+    let banks = crate::experts::pooled_slabs(
         device,
+        seismic::Contract::DeviceOnly,
         2,
         2,
-        vec![seismic::SlabRegion {
+        &[seismic::SlabRegion {
             element: Element::f32(),
             row_shape: vec![shape.convolution_width, shape.channels],
         }],
+        1,
     )
     .map_err(|error| qualification_dynamic(entry, &label, error))?;
     banks
-        .add_slab()
+        .add_slab(seismic::SlabFill::Zeroed)
         .map_err(|error| qualification_dynamic(entry, &label, error))?;
     let mut window = banks
         .logical_region(0)
@@ -1616,11 +1620,12 @@ fn qualify_state_space(
     let previous_tape = semantic_i32(device, &[1], &[0], entry, &label)?;
     let following_bank = semantic_i32(device, &[1], &[1], entry, &label)?;
     // One tape row, the least a bank holds.
-    let mut banks = seismic::SlabTensor::new(
+    let banks = crate::experts::pooled_slabs(
         device,
+        seismic::Contract::DeviceOnly,
         2,
         2,
-        vec![
+        &[
             seismic::SlabRegion {
                 element: binding.activation,
                 row_shape: vec![shape.convolution_width, shape.channels()],
@@ -1634,10 +1639,11 @@ fn qualify_state_space(
                 row_shape: vec![1, shape.tape_width()],
             },
         ],
+        1,
     )
     .map_err(|error| qualification_dynamic(entry, &label, error))?;
     banks
-        .add_slab()
+        .add_slab(seismic::SlabFill::Zeroed)
         .map_err(|error| qualification_dynamic(entry, &label, error))?;
     let region = |index| {
         banks

@@ -616,7 +616,7 @@ fn mentions(types: &[syn::Type], scope: &Rc<Scope>, from: &str, parameters: &Rc<
 /// is resolved or fetched).
 fn sources() -> Vec<(String, PathBuf)> {
     let package = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo runs the test from its package");
-    let cargo = std::env::var_os("CARGO").expect("cargo names itself to the test");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = std::process::Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--no-deps", "--offline"])
         .current_dir(&package)

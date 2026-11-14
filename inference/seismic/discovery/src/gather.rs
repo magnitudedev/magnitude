@@ -16,6 +16,8 @@ pub enum DiscoveryError {
     HostMemory(String),
     /// The OS build, the CPU's and Metal's driver, could not be read.
     OsBuild(String),
+    /// The host's page, which its allocations round to, could not be read.
+    HostPage(String),
     /// The CPU as the OS reports it could not be read.
     CpuIdentity(String),
     /// A cache the OS reports for the CPU, part of its identity, could not
@@ -30,6 +32,7 @@ impl fmt::Display for DiscoveryError {
         match self {
             Self::HostMemory(message) => write!(f, "host memory discovery failed: {message}"),
             Self::OsBuild(message) => write!(f, "the OS build could not be read: {message}"),
+            Self::HostPage(message) => write!(f, "the host's page could not be read: {message}"),
             Self::CpuIdentity(message) => {
                 write!(f, "the CPU identity could not be read: {message}")
             }
@@ -72,6 +75,7 @@ pub(crate) struct Natives {
 pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gathered, DiscoveryError> {
     let host = host::capacity().map_err(DiscoveryError::HostMemory)?;
     let os_build = host::os_build().map_err(DiscoveryError::OsBuild)?;
+    let page = seismic_memory::host_page().map_err(|error| DiscoveryError::HostPage(error.to_string()))?;
     let mut diagnostics = Vec::new();
 
     let cache = host::last_level_cache().map_err(DiscoveryError::CpuCache)?;
@@ -82,8 +86,7 @@ pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gat
         cache,
         availability: cpu_availability(seismic_native_cpu::Tier::detected()),
         max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
-        kind: seismic_cpu::topology::kind()
-            .map_err(|error| DiscoveryError::CpuIdentity(format!("the host page: {error}")))?,
+        kind: seismic_cpu::topology::kind(),
     };
 
     #[cfg(target_os = "macos")]
@@ -156,6 +159,7 @@ pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gat
         reports: Reports {
             host,
             os_build,
+            page,
             cpu,
             metal,
             cuda,

@@ -13,4 +13,6 @@ serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The controlled execution domain (`fixtures`), for the owner's tests.
+magnitude-executor = { path = "../executor", features = ["fixtures"] }
 serde_json.workspace = true

@@ -16,7 +16,7 @@ use magnitude_executor::UnpreparedUnits;
 use magnitude_artifacts::PackageIdentity;
 use magnitude_executor::{
     image_cell_limit, max_image_cells,
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath,
 };
 use magnitude_scheduler::ServiceLimits;
@@ -44,9 +44,9 @@ pub struct EngineConfiguration {
     /// nothing: no tuning record reaches a load, which forms every entry
     /// at its canonical default.
     pub kernel_cache: Option<PathBuf>,
-    /// The host's threshold policy (`MemoryReserves::of_machine(None)` for the
+    /// The machine's page-release rate (`ReleaseRate::of_machine(None)` for the
     /// service and CLI). The engine never defaults it.
-    pub reserves: MemoryReserves,
+    pub release: ReleaseRate,
 }
 
 /// The two authorities produced by host resolution: host artifacts (chat
@@ -85,7 +85,7 @@ impl EngineConfiguration {
             self.device,
             self.kernel_cache,
             Some(host.package().store().to_path_buf()),
-            self.reserves,
+            self.release,
         )
         .map_err(invalid)?;
         Ok(ResolvedEngineConfiguration { host, manifest })

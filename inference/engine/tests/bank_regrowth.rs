@@ -65,7 +65,8 @@ fn the_owner_regrows_the_bank_once_the_room_that_shrank_it_is_free() {
     for backend in bank_backends() {
         let (domain, bindings) = banked(backend, 4, 4);
         let other = press(&domain);
-        let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes));
+        let clock = magnitude_executor::fixtures::clock(&domain);
+        let mut host = Host::new(|wakes| Owner::new(domain, bindings, limits(), wakes)).reading_memory_at(clock);
         host.run();
         assert_eq!(slots(&host), 4, "{backend:?}: the bank at its full target");
         other.take(room(&mut host));

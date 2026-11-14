@@ -26,7 +26,7 @@ using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 // Where choice (m, k) of `expert` reads its up weights: a bank record, or
 // its tier record in place. In the kernel's own scope, where its ports are.
 #define UP_WEIGHTS(m, k, expert)                                                                           \
-    routed::Place::of(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP),          \
+    routed::source_record(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP),      \
                       routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,           \
                                             SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m), (k),  \
                                             (expert)))
@@ -45,11 +45,11 @@ __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up(SEISMIC_KERN
         Pro{Raw{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}},
         reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_H, nullptr);
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
-    const routed::Place weights = UP_WEIGHTS(m, k, (int)expert);
+    const projection::u8 *weights = UP_WEIGHTS(m, k, (int)expert);
     const element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> product =
         SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);
     // A choice with no record has a zero product.
-    if (weights.stack == nullptr) {
+    if (weights == nullptr) {
         routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
             product.put(n, 0.0f);
         });
@@ -61,7 +61,7 @@ __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up(SEISMIC_KERN
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
                                  SEISMIC_UP_SCALE_STRIDE_0, expert), 1.0f);
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    KERNEL_W0_MATRIX(weights.stack, weights.record), projection::NoWeight{}, epi);
+                                    ROUTED_RECORD(KERNEL_W0, weights), projection::NoWeight{}, epi);
 }
 #endif
 
@@ -118,10 +118,10 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
     __syncthreads();
     const projection::u64 expert =
         (projection::u64)routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice);
-    const routed::Place weights = UP_WEIGHTS(choice / slots, choice % slots, (int)expert);
+    const projection::u8 *weights = UP_WEIGHTS(choice / slots, choice % slots, (int)expert);
     // An expert with no record (every choice of an expert has its one
     // source) has a zero product for each of its choices.
-    if (weights.stack == nullptr) {
+    if (weights == nullptr) {
         for (unsigned r = 0; r < count; ++r)
             routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
                 SEISMIC_RESULT_0_OUT.put(products_at[r] + n, 0.0f);
@@ -136,6 +136,6 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
         1.0f);
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, rows_at}, count, SEISMIC_DIM_H / 64,
                                     group, SEISMIC_DIM_F,
-                                    KERNEL_W0_MATRIX(weights.stack, weights.record), projection::NoWeight{}, epi);
+                                    ROUTED_RECORD(KERNEL_W0, weights), projection::NoWeight{}, epi);
 }
 #endif

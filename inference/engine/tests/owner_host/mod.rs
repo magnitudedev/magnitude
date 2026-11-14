@@ -38,6 +38,11 @@ impl Wakes for RecordedWakes {
     fn publication(&self, request: RequestId, wake: PublicationWake) {
         self.0.lock().unwrap().push((request, wake));
     }
+
+    /// A test's host raises no OS pressure events: each run reads memory.
+    fn pressure(&self) -> Box<dyn Fn() + Send + Sync> {
+        Box::new(|| {})
+    }
 }
 
 /// One admitted request's host side: its stream and what arrived on it.
@@ -91,7 +96,6 @@ pub struct Host<F: ProgramFamily = NativeFamily> {
     owner: Option<Owner<F>>,
     wakes: Arc<RecordedWakes>,
     now: u64,
-    due: u64,
     /// When the last run left a flight on the device: the device runs it in
     /// real time, so the host's clock follows real time until it completes.
     in_flight: Option<Instant>,
@@ -109,7 +113,6 @@ impl<F: ProgramFamily> Host<F> {
             owner: Some(owner),
             wakes,
             now: 0,
-            due: 0,
             in_flight: None,
             memory_clock: None,
         }
@@ -178,7 +181,6 @@ impl<F: ProgramFamily> Host<F> {
             .run(now)
             .unwrap_or_else(|error| panic!("execution stopped: {error}"));
         self.owner = Some(owner);
-        self.due = ran.due;
         ran
     }
 
@@ -197,12 +199,6 @@ impl<F: ProgramFamily> Host<F> {
             self.in_flight = Some(Instant::now());
         }
         ran
-    }
-
-    /// Run no earlier than the owner's next memory observation, as the
-    /// worker does when it wakes for one.
-    pub fn observe(&mut self) -> Ran {
-        self.run_at((self.now + TICK_NS).max(self.due))
     }
 
     /// Drain `streams`, run once, drain again, and pause briefly while a

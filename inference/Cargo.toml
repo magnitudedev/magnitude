@@ -55,7 +55,7 @@ members = [
   "seismic/backends/vulkan",
   "seismic/cli",
   "seismic/compiler",
-  "seismic/reservation",
+  "seismic/memory",
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
@@ -93,7 +93,7 @@ default-members = [
   "seismic/backends/cuda",
   "seismic/cli",
   "seismic/compiler",
-  "seismic/reservation",
+  "seismic/memory",
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
@@ -131,7 +131,7 @@ seismic-cpu = { path = "seismic/backends/cpu" }
 seismic-cuda = { path = "seismic/backends/cuda" }
 seismic-vulkan = { path = "seismic/backends/vulkan" }
 seismic-compiler = { path = "seismic/compiler" }
-seismic-reservation = { path = "seismic/reservation" }
+seismic-memory = { path = "seismic/memory" }
 seismic-runtime = { path = "seismic/runtime" }
 seismic = { path = "seismic/api" }
 seismic-build = { path = "seismic/build" }

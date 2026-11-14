@@ -54,7 +54,8 @@ impl PromptScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::ledger::{Available, CacheKind, Ledgers, LoadShape, Need};
+    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape, Need};
+    use crate::memory::supply::Reading;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -64,7 +65,7 @@ mod tests {
     fn ledger(total: u64) -> (Ledgers, Ledger) {
         let scope = Ledgers::new();
         let ledger = scope.ledger(seismic::StoreIdentity::HostRam, Arc::new(LoadShape { stores: Vec::new() }));
-        ledger.read(ledger.sampled(Instant::now()), Ok(Available::new(total, total, None).expect("a reading")));
+        ledger.read(ledger.sampled(Instant::now()), Reading::device(total, total, seismic::Lag { release: std::time::Duration::ZERO, growth: std::time::Duration::ZERO }));
         (scope, ledger)
     }
 
@@ -80,7 +81,7 @@ mod tests {
         let scratch = PromptScratch::open(&ledger, shape(16, 40));
         assert_eq!((scratch.records(), scratch.bytes()), (40, 24 * RECORD));
         drop(scratch);
-        assert_eq!(ledger.snapshot().committed(), 0, "the group's close frees its scratch");
+        assert_eq!(ledger.estimate().committed(), 0, "the group's close frees its scratch");
     }
 
     /// Short of room, the scratch is the decode set and the whole records
@@ -90,6 +91,8 @@ mod tests {
     fn a_group_takes_only_what_yields_at_once() {
         let (_scope, ledger) = ledger(64 * RECORD);
         let committed = ledger.claim(Need::Measurement { bytes: 50 * RECORD }).expect("room");
+        // The bank's slots are granules of the store's pool.
+        let _pool = ledger.pool_block(crate::memory::ledger::PoolClass::Records, NonZeroU64::new(RECORD).unwrap()).blocks;
         let bank = ledger.cached(CacheKind::Bank, 10 * RECORD + RECORD / 2).expect("room");
         // Free: 3.5 records; the bank's cache: 10.5. Whole records: 14.
         let scratch = PromptScratch::open(&ledger, shape(16, 40));

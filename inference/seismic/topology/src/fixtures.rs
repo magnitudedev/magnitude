@@ -10,10 +10,10 @@
 //! heap (a report gives no global order), from which the placement rule
 //! decides.
 
-use crate::kind::{HostReads, KindMemory, KindReport, Obtained, Reach, Reserving};
+use crate::kind::{HostReads, KindMemory, KindReport, Reach};
 use crate::model::{
     Availability, DeviceTopology, Executor, ExecutorKind, PhysicalDeviceId, PhysicalIdentity,
-    Reported, ReportedBy, Reservation, Revision, StoreId, StoreKind, VolumeId,
+    Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
 };
 use crate::reports::{
     build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
@@ -23,151 +23,59 @@ use seismic_lang::registry::BackendName;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-/// The kind identifier a recorded Vulkan report gives imported host pages,
-/// as the Vulkan backend reports them (its tests hold its kinds to these
-/// recordings); every memory type's is its index.
-pub const VULKAN_IMPORTED_KIND: u32 = u32::MAX;
-
 pub const GB: u64 = 1_000_000_000;
-
-/// The CPU backend's reservation in `granule`s, as it declares it
-/// (`seismic_cpu::topology`'s `RESERVATIONS_HOST_ADDRESSED` and `RESERVATION_CHUNKS`):
-/// host-addressed, in no chunks.
-fn cpu_reservation(granule: u64) -> Reservation {
-    Reservation {
-        granule,
-        host_addressed: true,
-        chunks: None,
-    }
-}
 
 /// The CPU backend's largest allocation on a 64-bit host
 /// (`seismic_cpu::MAX_ALLOCATION_BYTES`): `isize::MAX` down to its 4 KiB
 /// scratch alignment.
 const CPU_MAX_ALLOCATION: u64 = 0x7fff_ffff_ffff_f000;
 
-/// CUDA's reservation in `granule`s, as it declares it: in no chunks,
-/// host-addressed unless it is a discrete device's own memory, which only
-/// the device addresses (`seismic_cuda::topology`).
-fn cuda_reservation(granule: u64, host_addressed: bool) -> Reservation {
-    Reservation {
-        granule,
-        host_addressed,
-        chunks: None,
-    }
-}
-
-/// A Vulkan reservation as the backend reports it
-/// (`seismic_vulkan::ReservationForm`): chunks of `unit`, addressed through
-/// a record table in upload storage.
-fn vulkan_reservation(granule: u64, unit: u64, host_addressed: bool) -> Reservation {
-    Reservation {
-        granule,
-        host_addressed,
-        chunks: Some(crate::ReservationChunks {
-            unit,
-            table: crate::Contract::Upload,
-        }),
-    }
-}
-
 /// The host memory the CPU backend allocates, its one kind
 /// (`seismic_cpu::kind`).
-fn cpu_kind(granule: u64) -> KindReport {
+fn cpu_kind() -> KindReport {
     KindReport {
         id: 0,
         name: "host memory".into(),
         reach: Reach::Mapped {
             reads: HostReads::Cached,
         },
-        obtained: Obtained::Allocated,
         memory: KindMemory::HostRam,
-        reservation: Ok(Some(cpu_reservation(granule))),
     }
 }
 
-/// Metal's shared storage mode, its one kind (`seismic_metal::kind`),
-/// reserved as `reservation`.
-fn metal_kind(reservation: Reservation) -> KindReport {
+/// Metal's shared storage mode, its one kind (`seismic_metal::kind`).
+fn metal_kind() -> KindReport {
     KindReport {
         id: 0,
         name: "shared storage".into(),
         reach: Reach::Mapped {
             reads: HostReads::Cached,
         },
-        obtained: Obtained::Allocated,
         memory: KindMemory::HostRam,
-        reservation: Ok(Some(reservation)),
     }
 }
 
-/// CUDA's kinds, as it declares them (`seismic_cuda::topology::kinds`) for
-/// a device whose memory is the host's (`in_host`) or its own: device memory
-/// and pinned host memory always; host-node memory on a device whose memory
-/// is the host's, and registered host pages on one whose memory is its own,
-/// where each is read to reserve. `created` is how memory CUDA creates
-/// reserves, `registered` how registered host pages do.
-fn cuda_kinds(in_host: bool, created: Reserving, registered: Reserving) -> Vec<KindReport> {
+/// CUDA's kinds, as it declares them (`seismic_cuda::topology::kinds`):
+/// device memory, which the host cannot map, and pinned host memory.
+fn cuda_kinds() -> Vec<KindReport> {
     let mapped = Reach::Mapped {
         reads: HostReads::Cached,
     };
-    let kind = |id, name: &str, reach, obtained, memory, reservation| KindReport {
+    let kind = |id, name: &str, reach, memory| KindReport {
         id,
         name: name.into(),
         reach,
-        obtained,
         memory,
-        reservation,
     };
-    let own = if in_host { Ok(None) } else { created.clone() };
-    let mut kinds = vec![
-        kind(
-            0,
-            "device memory",
-            Reach::Device,
-            Obtained::Allocated,
-            KindMemory::DeviceMemory,
-            own,
-        ),
-        kind(
-            1,
-            "pinned host memory",
-            mapped,
-            Obtained::Allocated,
-            KindMemory::HostRam,
-            Ok(None),
-        ),
-    ];
-    if in_host && created != Ok(None) {
-        kinds.push(kind(
-            2,
-            "host-node memory",
-            mapped,
-            Obtained::Allocated,
-            KindMemory::HostRam,
-            created,
-        ));
-    }
-    if !in_host && registered != Ok(None) {
-        kinds.push(kind(
-            3,
-            "registered host pages",
-            mapped,
-            Obtained::ImportedHostPages,
-            KindMemory::HostRam,
-            registered,
-        ));
-    }
-    kinds
+    vec![
+        kind(0, "device memory", Reach::Device, KindMemory::DeviceMemory),
+        kind(1, "pinned host memory", mapped, KindMemory::HostRam),
+    ]
 }
 
 /// `report` with the kinds CUDA declares for it ([`cuda_kinds`]).
-fn cuda(mut report: CudaReport, created: Reserving, registered: Reserving) -> CudaReport {
-    report.kinds = cuda_kinds(
-        matches!(report.memory, CudaMemory::Host),
-        created,
-        registered,
-    );
+fn cuda(mut report: CudaReport) -> CudaReport {
+    report.kinds = cuda_kinds();
     report
 }
 
@@ -175,30 +83,15 @@ fn cuda(mut report: CudaReport, created: Reserving, registered: Reserving) -> Cu
 /// `HV`, `HC`, `C`), heap by heap.
 pub type Layout<'a> = &'a [&'a [&'a str]];
 
-/// How a recorded Vulkan device reserves: the memory types that reserve
-/// (a device whose memory is its own, its device-local types' chunks; one
-/// whose memory is the host's, its mappable types' placed mappings), and
-/// imported host pages, reported only where they reserve or why not.
-pub struct VulkanReserving {
-    pub types: Reserving,
-    pub imported: Reserving,
-}
-
-/// The Vulkan kinds of `layout` on `heaps`, reserving as `reserving`
-/// records, as the backend reports them (`seismic_vulkan`'s topology holds
-/// itself to these): each memory type a kind on its heap, the host mapping
-/// a mappable type, through its caches where it is host-cached; and
-/// imported host pages, where they reserve or say why not.
-fn recorded_vulkan_kinds(
-    layout: Layout<'_>,
-    heaps: &[(u64, bool)],
-    memory_is_host: bool,
-    reserving: VulkanReserving,
-) -> Vec<KindReport> {
+/// The Vulkan kinds of `layout` on `heaps`, as the backend reports them
+/// (`seismic_vulkan`'s topology holds itself to these): each memory type a
+/// kind on its heap, the host mapping a mappable type, through its caches
+/// where it is host-cached.
+fn recorded_vulkan_kinds(layout: Layout<'_>, heaps: &[(u64, bool)]) -> Vec<KindReport> {
     let has = |flags: &str, flag: &str| flags.split('|').any(|each| each == flag);
     let mappable = |flags: &str| has(flags, "HV") && has(flags, "HC");
     let types = layout.iter().enumerate().flat_map(|(heap, types)| types.iter().map(move |flags| (heap, *flags)));
-    let mut kinds = (0..)
+    (0..)
         .zip(types)
         .map(|(id, (heap, flags))| {
             let (bytes, device_local) = heaps[heap];
@@ -210,43 +103,11 @@ fn recorded_vulkan_kinds(
                     (true, false) => Reach::Mapped { reads: HostReads::Uncached },
                     (false, _) => Reach::Device,
                 },
-                obtained: Obtained::Allocated,
                 memory: KindMemory::Heap { index: heap, device_local, bytes },
-                reservation: match if memory_is_host { mappable(flags) } else { has(flags, "DL") } {
-                    true => reserving.types.clone(),
-                    false => Ok(None),
-                },
             }
         })
-        .collect::<Vec<_>>();
-    if reserving.imported != Ok(None) {
-        kinds.push(KindReport {
-            id: VULKAN_IMPORTED_KIND,
-            name: "imported host pages".into(),
-            reach: Reach::Mapped { reads: HostReads::Cached },
-            obtained: Obtained::ImportedHostPages,
-            memory: KindMemory::HostRam,
-            reservation: reserving.imported,
-        });
-    }
-    kinds
+        .collect()
 }
-
-/// How a recorded Vulkan device whose report records no queue count or
-/// host import reserves: by neither, which decide it.
-pub fn unrecorded_reserving() -> VulkanReserving {
-    let unrecorded = || Err(crate::Unreservable::Unrecorded);
-    VulkanReserving {
-        types: unrecorded(),
-        imported: unrecorded(),
-    }
-}
-
-/// The registration granule of an x86-64 Linux host's 4 KiB pages
-/// (`seismic_reservation::registration_granule`): its 2 MiB large page, or with
-/// none, the span of one last-level page table (4096 · 4096 / 8 bytes),
-/// the same 2 MiB.
-const X86_REGISTRATION_GRANULE: u64 = X86_PAGE * (X86_PAGE / 8);
 
 /// The topology of each recorded machine, each built at a revision of its
 /// own.
@@ -323,6 +184,11 @@ pub const RTX3090_VULKAN_HEAP: u64 = 25_769_803_776;
 /// 2^40 alike in reports 52089 (RTX 3090) and 51857 (RTX 4070), of driver
 /// 615.71.09, and 52552 (GB10).
 pub const NVIDIA_VULKAN_MAX_ALLOCATION: u64 = 1_099_511_627_776;
+/// `cuMemGetAllocationGranularity` (recommended) of device memory on every
+/// recorded CUDA device: 2 MiB.
+pub const CUDA_DEVICE_GRANULARITY: u64 = 2 << 20;
+/// `maxMemoryAllocationCount` of every recorded Vulkan device: 4096.
+pub const VULKAN_MEMORY_OBJECTS: u64 = 4096;
 
 /// The CPU executor of a host, as discovery reads it there.
 fn cpu() -> CpuReport {
@@ -332,31 +198,15 @@ fn cpu() -> CpuReport {
         cache: None,
         availability: Availability::Available,
         max_allocation: CPU_MAX_ALLOCATION,
-        kind: cpu_kind(X86_PAGE),
+        kind: cpu_kind(),
     }
 }
 
-/// The host page of the recorded x86-64 hosts and of GB10's kernel (not a
-/// 64K-page build), and of macOS on Apple silicon: what the CPU backend
-/// backs a reservation in.
-const X86_PAGE: u64 = 4096;
-const GB10_PAGE: u64 = 4096;
-const APPLE_SILICON_PAGE: u64 = 16_384;
-/// The 2 MiB granule Metal (`seismic_metal::device::RESERVATION_GRANULE`)
-/// and the recorded CUDA drivers (`cuMemGetAllocationGranularity`, the
-/// reserved-tensor charge tests on a GB10) back a reservation in.
-const DEVICE_GRANULE: u64 = 2 << 20;
-
-/// The granule CUDA reserves host-NUMA memory in on GB10, where discovery
-/// reserves device storage (its memory is the host's), as its driver
-/// reports it (`cuMemGetAllocationGranularity`; held to the hardware by
-/// `the_gb10_fixtures_host_granule_is_the_drivers`).
-pub const GB10_HOST_GRANULE: u64 = 2 << 20;
-
-fn reports(host: Reported<u64>, os_build: &str, cpu: CpuReport) -> Reports {
+fn reports(host: Reported<u64>, os_build: &str, page: u64, cpu: CpuReport) -> Reports {
     Reports {
         host,
         os_build: os_build.into(),
+        page,
         cpu,
         metal: Vec::new(),
         cuda: Vec::new(),
@@ -372,6 +222,7 @@ pub fn rtx3090_host() -> Reports {
     reports(
         Reported::new(RTX3090_HOST, ReportedBy::LinuxMemTotal),
         RTX3090_OS,
+        4096,
         cpu(),
     )
 }
@@ -405,7 +256,6 @@ pub fn vulkan(
     layout: Layout<'_>,
     max_allocation: u64,
     luid: Option<[u8; 8]>,
-    reserving: VulkanReserving,
 ) -> VulkanReport {
     VulkanReport {
         uuid,
@@ -419,6 +269,7 @@ pub fn vulkan(
         floor: Ok(()),
         driver: driver.into(),
         max_allocation,
+        least_object: Ok(heaps.iter().map(|&(bytes, _)| bytes).sum::<u64>().div_ceil(VULKAN_MEMORY_OBJECTS)),
         memory: VulkanMemory {
             luid,
             heaps: heaps
@@ -429,7 +280,7 @@ pub fn vulkan(
                 })
                 .collect(),
         },
-        kinds: recorded_vulkan_kinds(layout, heaps, memory_is_host, reserving),
+        kinds: recorded_vulkan_kinds(layout, heaps),
     }
 }
 
@@ -477,15 +328,6 @@ fn rtx3090_vulkan_of(uuid: [u8; 16], heap: u64) -> VulkanReport {
         RTX3090_LAYOUT,
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
-        // vulkaninfo on an RTX 3090, 2026-11-02: the compute-only family's
-        // 8 queues (device storage in fill-unit chunks), host import at
-        // 4 KiB within the host's 4 KiB page (host storage in host pages),
-        // and maxMemoryAllocationCount 2^32 − 1, which leaves both at the
-        // 2 MiB least chunk.
-        VulkanReserving {
-            types: Ok(Some(vulkan_reservation(DEVICE_GRANULE, 4, false))),
-            imported: Ok(Some(vulkan_reservation(DEVICE_GRANULE, X86_PAGE, true))),
-        },
     )
 }
 
@@ -505,6 +347,7 @@ fn rtx3090_cuda_of(uuid: [u8; 16], peers: Vec<[u8; 16]>, usable: u64) -> CudaRep
             admission: Ok(()),
             total: RTX3090_CUDA_TOTAL,
             max_allocation: RTX3090_CUDA_TOTAL,
+            allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: false,
             l2: Some(RTX3090_CUDA_L2),
             memory: CudaMemory::Own {
@@ -513,10 +356,6 @@ fn rtx3090_cuda_of(uuid: [u8; 16], peers: Vec<[u8; 16]>, usable: u64) -> CudaRep
             peers,
             kinds: Vec::new(),
         },
-        Ok(Some(cuda_reservation(DEVICE_GRANULE, false))),
-        // Registered host pages (CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
-        // on the RTX 3090), in the x86-64 host's registration granule.
-        Ok(Some(cuda_reservation(X86_REGISTRATION_GRANULE, true))),
     )
 }
 
@@ -580,6 +419,7 @@ pub fn m4_pro() -> Reports {
     let mut reports = reports(
         Reported::new(M4_PRO_HOST, ReportedBy::MacOsMemsize),
         M4_PRO_OS,
+        16384,
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "Apple M4 Pro".into(),
@@ -589,7 +429,7 @@ pub fn m4_pro() -> Reports {
             )),
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
-            kind: cpu_kind(APPLE_SILICON_PAGE),
+            kind: cpu_kind(),
         },
     );
     reports.metal.push(MetalReport {
@@ -602,16 +442,7 @@ pub fn m4_pro() -> Reports {
         tensor_operations: false,
         working_set: M4_PRO_WORKING_SET,
         max_allocation: M4_PRO_MAX_BUFFER,
-        // Recorded: `seismic_metal::device::RESERVATIONS_HOST_ADDRESSED` and
-        // `RESERVATION_CHUNKS`, which exist only where Metal does.
-        kind: metal_kind(Reservation {
-            granule: DEVICE_GRANULE,
-            host_addressed: true,
-            chunks: Some(crate::ReservationChunks {
-                unit: APPLE_SILICON_PAGE,
-                table: crate::Contract::DeviceOnly,
-            }),
-        }),
+        kind: metal_kind(),
     });
     reports
 }
@@ -644,13 +475,14 @@ pub fn gb10() -> Reports {
     let mut reports = reports(
         Reported::new(GB10_HOST, ReportedBy::LinuxMemTotal),
         GB10_OS,
+        4096,
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "NVIDIA GB10".into(),
             cache: Some(Reported::new(GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)),
             availability: Availability::Available,
             max_allocation: CPU_MAX_ALLOCATION,
-            kind: cpu_kind(GB10_PAGE),
+            kind: cpu_kind(),
         },
     );
     reports.cuda.push(cuda(
@@ -662,15 +494,13 @@ pub fn gb10() -> Reports {
             admission: Ok(()),
             total: GB10_CUDA_TOTAL,
             max_allocation: GB10_CUDA_TOTAL,
+            allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: true,
             l2: Some(GB10_CUDA_L2),
             memory: CudaMemory::Host,
             peers: Vec::new(),
             kinds: Vec::new(),
         },
-        // Reserved in host-node memory, which the host addresses.
-        Ok(Some(cuda_reservation(GB10_HOST_GRANULE, true))),
-        Ok(None),
     ));
     reports.vulkan.push(vulkan(
         GB10_UUID,
@@ -681,7 +511,6 @@ pub fn gb10() -> Reports {
         GB10_LAYOUT,
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     ));
     reports
 }
@@ -708,7 +537,6 @@ pub fn strix_halo_linux_vulkan() -> VulkanReport {
         RADV_LAYOUT,
         RADV_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     )
 }
 
@@ -740,6 +568,7 @@ pub fn windows_host(bytes: u64, os_build: &str) -> Reports {
     reports(
         Reported::new(bytes, ReportedBy::WindowsTotalPhys),
         os_build,
+        4096,
         cpu(),
     )
 }
@@ -760,7 +589,6 @@ pub fn strix_halo_windows() -> Reports {
         STRIX_HALO_WINDOWS_LAYOUT,
         STRIX_HALO_WINDOWS_MAX_ALLOCATION,
         Some(STRIX_HALO_WINDOWS_LUID),
-        unrecorded_reserving(),
     ));
     reports
 }
@@ -786,7 +614,6 @@ pub fn lunar_lake() -> Reports {
         LUNAR_LAKE_LAYOUT,
         LUNAR_LAKE_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     ));
     reports
 }
@@ -813,7 +640,6 @@ pub fn ryzen_igpu_and_rtx4070() -> Reports {
         RADV_LAYOUT,
         RADV_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     ));
     reports.vulkan.push(vulkan(
         uuid(RTX4070_UUID),
@@ -824,7 +650,6 @@ pub fn ryzen_igpu_and_rtx4070() -> Reports {
         RTX4070_LAYOUT,
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     ));
     reports
 }
@@ -853,6 +678,7 @@ pub fn a10_8q() -> Reports {
             admission: Ok(()),
             total: A10_8Q_CUDA_TOTAL,
             max_allocation: A10_8Q_CUDA_TOTAL,
+            allocation_granularity: CUDA_DEVICE_GRANULARITY,
             integrated: false,
             l2: None,
             memory: CudaMemory::Own {
@@ -861,9 +687,6 @@ pub fn a10_8q() -> Reports {
             peers: Vec::new(),
             kinds: Vec::new(),
         },
-        Ok(Some(cuda_reservation(DEVICE_GRANULE, false))),
-        // Registered pages' granule is not recorded.
-        Ok(None),
     ));
     reports.vulkan.push(vulkan(
         slice,
@@ -874,7 +697,6 @@ pub fn a10_8q() -> Reports {
         A10_8Q_LAYOUT,
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
-        unrecorded_reserving(),
     ));
     reports
 }
@@ -909,7 +731,7 @@ pub fn placement(
     contract: crate::Contract,
 ) -> Vec<(StoreKind, Option<Reported<u64>>)> {
     executor
-        .paths(crate::Placing::Fixed(contract))
+        .paths(contract)
         .iter()
         .map(|&id| {
             let path = topology.access_path(id).unwrap();
@@ -967,7 +789,7 @@ pub fn describe(topology: &DeviceTopology) -> String {
         }
         for contract in crate::Contract::ALL {
             let places = executor
-                .paths(crate::Placing::Fixed(contract))
+                .paths(contract)
                 .iter()
                 .map(|&id| {
                     let path = topology.access_path(id).unwrap();
@@ -1027,8 +849,8 @@ pub fn assert_consistent(topology: &DeviceTopology) {
         assert!(topology.executor(path.by()).is_some());
     }
     for executor in topology.executors() {
-        for placing in crate::Placing::ALL {
-            for &id in executor.paths(placing) {
+        for contract in crate::Contract::ALL {
+            for &id in executor.paths(contract) {
                 assert_eq!(topology.access_path(id).unwrap().executor(), executor.id());
             }
         }

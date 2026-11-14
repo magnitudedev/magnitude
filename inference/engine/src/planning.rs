@@ -15,7 +15,7 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits, SettleRoom, StableRoom,
     assessment::{decode_step, ExecutorCosts, Priced},
 };
 use magnitude_scheduler::ServiceLimits;
@@ -58,7 +58,7 @@ pub(crate) fn select_load_device(
     catalog: &Devices,
     manifest: &ExecutionManifest,
 ) -> Result<SelectedDevice, PlatformError> {
-    platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.reserves, manifest.kernel_cache.as_deref())
+    platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.release, manifest.kernel_cache.as_deref())
 }
 
 /// Plan the manifest's model on the selected device: component selection,
@@ -66,14 +66,18 @@ pub(crate) fn select_load_device(
 /// then `ExecutionPlanner::prepare`, then its expert bank under the model
 /// policy's weight cap, if any, beside its arena, a streamed bank at the
 /// pass the machine's prices settle ([`plan_banked`]).
-/// Opens no device and reads no payload. The draft comes with the memory
-/// charge its planning confirmed, each way of holding its experts charged
-/// as a `C` (`HeldCharge`).
+/// Opens no device and reads no payload: its room is the stable fit's
+/// ([`StableRoom`]), an assessment's and a preview's, where a load's is the
+/// reading it holds ([`magnitude_executor::PlanningRoom`]). The draft comes
+/// with the memory charge its planning confirmed, each way of holding its
+/// experts charged as a `C` (`HeldCharge`).
 pub fn plan_execution<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
-    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, selected, resident, Holding::Placed))
+    plan_resident(manifest, selected).and_then(|resident| {
+        plan_banked(manifest, selected, resident, Holding::Placed, &StableRoom::of_selected(selected))
+    })
 }
 
 /// How a plan holds its experts ([`plan_banked`]).
@@ -109,8 +113,8 @@ pub fn plan_resident(
 
 /// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
 /// experts placed whole under the model policy's weight cap, if any, from
-/// memory alone (`ExecutionPlanDraft::placed`); else streamed through the
-/// expert bank the room holds beside its arena, at the pass the machine's
+/// memory alone, in `room` (`ExecutionPlanDraft::placed`); else streamed
+/// through the expert bank `room` holds beside its arena, at the pass the machine's
 /// prices settle ([`plan_prices`], `Unplaced::streamed`).
 ///
 /// Every load, whole or streamed, is priced on its executor's costs as it
@@ -126,6 +130,7 @@ pub fn plan_banked<C: HeldCharge>(
     selected: &SelectedDevice,
     resident: ExecutionPlanDraft,
     holding: Holding,
+    room: &impl SettleRoom,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     let measurements = match manifest.kernel_cache.as_deref() {
         None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
@@ -143,16 +148,16 @@ pub fn plan_banked<C: HeldCharge>(
         }));
     }
     let short = match holding {
-        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound).map_err(ExecutionPlanningError::Plan)? {
+        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound, room).map_err(ExecutionPlanningError::Plan)? {
             Placed::Whole(whole) => return Ok(whole),
             Placed::Short(short) => short,
         },
         Holding::Streamed => resident
-            .streaming(&manifest.definition, manifest.model.weight_bound)
+            .streaming(&manifest.definition, manifest.model.weight_bound, room)
             .map_err(ExecutionPlanningError::Plan)?,
     };
     let prices = plan_prices(&measurements, short.draft());
-    short.streamed(&manifest.definition, &prices).map_err(ExecutionPlanningError::Plan)
+    short.streamed(&manifest.definition, &prices, room).map_err(ExecutionPlanningError::Plan)
 }
 
 /// The prices a plan of `definition` as `plan` (its plan before any bank)

@@ -104,8 +104,15 @@ impl Drop for Answer<'_> {
     }
 }
 
+/// Both tests open the same physical GPU's primary context, and the first
+/// deliberately saturates the driver's launch lock with 16,384 queued graphs
+/// behind a parked kernel; serialize them so that flood cannot starve the
+/// second test's transfer-latency check.
+static SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the_driver() {
+    let _turn = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let n = 1024u64;
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
         let backend = device.backend();
@@ -241,6 +248,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
 /// before.
 #[test]
 fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
+    let _turn = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     const RECORDS: u64 = 20;
     const RECORD: u64 = 1_900_544;
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -273,7 +281,7 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
             skipped.write_shared(0, &[0; 4]).unwrap();
         }
         let shape = [RECORDS, RECORD];
-        let (mut tier, _resizer) = Tensor::reserved_in(seismic::ReservedContract::Shared, &device, Element::bool(), &shape, RECORDS, None).unwrap();
+        let mut tier = Tensor::shared(&device, Element::bool(), &shape).unwrap();
         tier.write_from_host(&vec![7u8; (RECORDS * RECORD) as usize]).unwrap();
         let into = Tensor::zeros(&device, Element::bool(), &shape).unwrap();
         let transfer = seismic::Transfer::new(&device).unwrap();

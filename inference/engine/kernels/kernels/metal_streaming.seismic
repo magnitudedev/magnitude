@@ -216,15 +216,6 @@ native routed_copy for metal from "metal/routed_copy.metal":
         grid (grid)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
-# Metal: `routed_copy`'s geometry on every entry (a shrink lists its
-# moves), LIST_ROWS rows of entries, LIST_GROUPS threadgroups striding over
-# each matrix.
-native routed_move for metal from "metal/routed_move.metal":
-    records (records)
-    launch routed_move:
-        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
-        threads_per_threadgroup (LIST_THREADS, 1, 1)
-
 # Metal: one threadgroup reads the list's count, then commits each listed
 # record after a system-scope fence (`streaming/seed.hpp`).
 native routed_seed_commit for metal from "metal/routed_seed_commit.metal":

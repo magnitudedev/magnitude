@@ -1038,7 +1038,7 @@ impl Case {
             });
         }
         let slab_banks = 2u64;
-        let mut slabs = SlabTensor::new(device, slab_banks, g.banks as u64, regions).unwrap();
+        let slabs = crate::common::slab_tensor(device, slab_banks, g.banks as u64, &regions);
         let mut contents = vec![
             activation_bytes(&self.window),
             self.delta
@@ -1056,12 +1056,12 @@ impl Case {
         }
         let count = (g.banks as u64).div_ceil(slab_banks);
         for slab in 0..count {
-            assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), slab as usize);
         }
         if reuse {
             assert!(count >= 3);
             slabs.free_slab(1).unwrap();
-            assert_eq!(slabs.add_slab().unwrap(), 1);
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
         }
         for slab in 0..count {
             let start = slab * slab_banks;

@@ -83,7 +83,7 @@ fn dispatch(device: &Device, module: &DirectModule, buffers: &[(&Buffer, u64)], 
 
 /// A storage buffer holding `bytes`, then `extra` zero bytes.
 fn upload(device: &Device, bytes: &[u8], extra: usize) -> Result<Buffer, String> {
-    let buffer = device.allocate((bytes.len() + extra) as u64, 256, None).map_err(|error| error.to_string())?;
+    let buffer = device.allocate((bytes.len() + extra) as u64, 256, &device.own()).map_err(|error| error.to_string())?;
     let mut contents = bytes.to_vec();
     contents.resize(bytes.len() + extra, 0);
     device.write(&buffer, 0, &contents).map_err(|error| error.to_string())?;
@@ -351,5 +351,5 @@ pub fn open(device: &str) -> Result<Device, String> {
         .into_iter()
         .find(|description| description.facts.uuid == uuid)
         .ok_or_else(|| format!("no Vulkan device has UUID {device}"))?;
-    Device::open(uuid, crate::unbounded_accounts(&description.facts), &Default::default()).map_err(|error| error.to_string())
+    Device::open(uuid, crate::unbounded_stores(&description.facts), &Default::default()).map_err(|error| error.to_string())
 }

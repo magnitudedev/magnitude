@@ -1010,6 +1010,73 @@ impl<T: Timing> DirectBatch<T> {
         Ok(())
     }
 
+    /// Copy each of `copies` (`bytes` bytes of a source end into a
+    /// destination end, `vkCmdCopyBuffer`) and then set each of `words` (the
+    /// 8-byte word at an end, its value carried in the command buffer,
+    /// `vkCmdUpdateBuffer`), in queue order: after every earlier
+    /// submission's work (the batch's leading barrier) and this batch's
+    /// launches, before every later use, the host's included once the
+    /// submission completes. Nothing is written through a mapping, which
+    /// work in flight may still read. A copy or word outside its buffer, or
+    /// a word not 8-byte aligned, is refused before anything is recorded.
+    pub fn transfer(
+        &mut self,
+        copies: &[(crate::transfer::TransferEnd<'_>, crate::transfer::TransferEnd<'_>, u64)],
+        words: &[(crate::transfer::TransferEnd<'_>, u64)],
+    ) -> Result<(), ExecutionError> {
+        let copies = copies
+            .iter()
+            .filter(|(_, _, bytes)| *bytes > 0)
+            .map(|(source, destination, bytes)| {
+                let ((source, source_offset), (destination, destination_offset)) = (source.span(*bytes)?, destination.span(*bytes)?);
+                Ok((source, destination, vk::BufferCopy { src_offset: source_offset, dst_offset: destination_offset, size: *bytes }))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let words = words
+            .iter()
+            .map(|(end, value)| {
+                let (buffer, offset) = end.span(8)?;
+                if offset % 8 != 0 {
+                    return Err(ExecutionError::SubmissionFailed("a transferred word is not 8-byte aligned".into()));
+                }
+                Ok((buffer, offset, value.to_le_bytes()))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let _recording = self.device.locked();
+        let raw = &self.device.inner.device;
+        unsafe {
+            if self.launched {
+                barrier(
+                    raw,
+                    self.command,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::MEMORY_WRITE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
+                );
+            }
+            for (source, destination, region) in &copies {
+                raw.cmd_copy_buffer(self.command, *source, *destination, std::slice::from_ref(region));
+            }
+            for (buffer, offset, bytes) in &words {
+                raw.cmd_update_buffer(self.command, *buffer, *offset, bytes);
+            }
+            // The copies' and words' writes to what follows: this batch's
+            // launches, and the host once the submission completes (a later
+            // submission's own leading barrier orders its reads).
+            barrier(
+                raw,
+                self.command,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER | vk::PipelineStageFlags2::HOST,
+                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::HOST_READ,
+            );
+        }
+        self.launched = true;
+        Ok(())
+    }
+
     /// Execute every launch of `graph` in its order.
     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
         self.execute(graph, &graph.inner.commands)
@@ -1394,11 +1461,11 @@ mod park_tests {
         if device.has_side_queue() {
             let (queue, source, destination) = (
                 TransferQueue::new(device).unwrap(),
-                device.allocate_upload(4096, 256, None).unwrap(),
-                device.allocate_upload(4096, 256, None).unwrap(),
+                device.allocate_upload(4096, 256, &device.own()).unwrap(),
+                device.allocate_upload(4096, 256, &device.own()).unwrap(),
             );
             assert!(returns("a copy on the second queue while parked", move || {
-                let run = TransferRun { source: TransferEnd::Buffer(&source, 0), destination: TransferEnd::Buffer(&destination, 0), bytes: 4096 };
+                let run = TransferRun { source: TransferEnd(&source, 0), destination: TransferEnd(&destination, 0), bytes: 4096 };
                 queue.copy(&[TransferItem::Run(run)], 1).unwrap();
                 queue.wait(1, BOUND).unwrap()
             }));
@@ -1449,7 +1516,7 @@ mod park_tests {
             text.split_whitespace().next().unwrap().parse::<f64>().unwrap() / 1e9
         };
         for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
-            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             for work in [Duration::from_micros(50), Duration::from_micros(300), Duration::from_millis(2)] {
                 let gate = Arc::new(HostTimeline::new(&device).unwrap());
                 let reached = Arc::new(HostTimeline::new(&device).unwrap());
@@ -1510,7 +1577,7 @@ mod park_tests {
             return;
         };
         for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
-            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             let run = |parked: bool| {
                 let (reached, gate) = (Arc::new(HostTimeline::new(&device).unwrap()), Arc::new(HostTimeline::new(&device).unwrap()));
                 let answerer = parked.then(|| {
@@ -1565,7 +1632,7 @@ mod park_tests {
     fn a_park_holds_what_follows_it_on_the_host() {
         for description in crate::test_devices() {
             eprintln!("{}:", description.facts.name);
-            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             case(&device, false);
             case(&device, true);
         }

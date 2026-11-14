@@ -34,7 +34,10 @@ const BOUND: Duration = Duration::from_millis(50);
 
 /// One run of a batch (`seismic::TransferRun`): `bytes` from `source` at
 /// `source_offset` to `destination` at `destination_offset`, held by the
-/// queue until its batch is issued.
+/// queue until its batch completes. A transfer is ordered against no
+/// device work, so the views it reads and writes stay held while it runs:
+/// a pool moves no slab a view holds (`seismic::Pool::return_freed`), and
+/// none it writes moves under it.
 pub(in crate::experts) struct Run {
     pub source: Tensor,
     pub source_offset: u64,
@@ -70,9 +73,9 @@ struct State {
     issuing: Option<(u64, std::time::Instant)>,
     /// Every ticket through this one is issued.
     issued: u64,
-    /// The batches issued and not yet complete: each ticket and the value
-    /// its batch completes at, in order.
-    running: VecDeque<(u64, u64)>,
+    /// The batches issued and not yet complete: each ticket, the value its
+    /// batch completes at, and its runs, held until then, in order.
+    running: VecDeque<(u64, u64, Vec<Run>)>,
     /// The batches the queue refused as issued, and why.
     refused: BTreeMap<u64, String>,
     /// Why the queue faulted, once it has: no batch completes from then.
@@ -143,7 +146,7 @@ impl Copies {
         if let Some(reason) = state.refused.get(&ticket) {
             return Err(reason.clone());
         }
-        if ticket > state.issued || state.running.iter().any(|&(running, _)| running == ticket) {
+        if ticket > state.issued || state.running.iter().any(|&(running, _, _)| running == ticket) {
             return match &state.fault {
                 Some(fault) => Err(fault.clone()),
                 None => Ok(false),
@@ -163,7 +166,7 @@ impl Copies {
             state.waiting.len(),
             state.issuing.map(|(ticket, since)| (ticket, since.elapsed())),
             state.issued,
-            state.running,
+            state.running.iter().map(|&(ticket, value, _)| (ticket, value)).collect::<Vec<_>>(),
             state.refused,
             state.fault,
         )
@@ -235,12 +238,13 @@ impl Copies {
                 })
                 .collect::<Vec<_>>();
             let issued = self.inner.transfer.copy(&items);
+            drop(items);
             {
                 let mut state = self.state();
                 state.issuing = None;
                 state.issued = ticket;
                 match issued {
-                    Ok(value) => state.running.push_back((ticket, value)),
+                    Ok(value) => state.running.push_back((ticket, value, runs)),
                     Err(error) => drop(state.refused.insert(ticket, error.to_string())),
                 }
             }
@@ -258,7 +262,7 @@ impl Copies {
             }
             let earliest = {
                 let state = self.state();
-                state.fault.is_none().then(|| state.running.front().map(|&(_, value)| value)).flatten()
+                state.fault.is_none().then(|| state.running.front().map(|&(_, value, _)| value)).flatten()
             };
             let Some(value) = earliest else {
                 events.wait(seen);

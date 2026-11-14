@@ -11,7 +11,7 @@ use magnitude_engine::load_native_domain;
 use magnitude_engine::options::{
     ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
 };
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
 use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, NumericalProfile, Operation, Outcome,
     PhysicalDecision, ProgramFamily, RequestId, ReservedResources, ResumeState, Sampling, SelectSpec,
@@ -98,7 +98,7 @@ pub fn configuration(
         Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
         None => None,
     };
-    let reserves = MemoryReserves::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
+    let release = ReleaseRate::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: artifacts.target.clone(),
@@ -126,7 +126,7 @@ pub fn configuration(
         path: ExecutionPath::Native,
         device: options.device,
         kernel_cache: options.cache_dir.clone(),
-        reserves,
+        release,
     }
     .resolve()
     .map_err(|error| error.to_string())?;
@@ -170,7 +170,7 @@ fn selected_machine(
     let manifest = &resolved.manifest;
     let paths = served_paths(artifacts)?;
     let catalog = seismic::Devices::discover(&paths).map_err(|error| error.to_string())?;
-    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.reserves, Some(root))
+    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.release, Some(root))
         .map_err(|error| error.to_string())?;
     Ok((paths, catalog, selected))
 }
@@ -233,6 +233,7 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     };
     magnitude_engine::composition::settle_prices(manifest).map_err(|error| error.to_string())?;
     let (paths, catalog, _) = selected_machine(artifacts, resolved, root)?;
+    let catalog = std::rc::Rc::new(catalog);
     magnitude_engine::request_load_points(&catalog, manifest, resolved.host.package()).map_err(|error| error.to_string())?;
     let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)?.expect("a load with a kernel cache has jobs");
     let mut left = jobs.outstanding()?;
@@ -305,6 +306,22 @@ impl<F: ProgramFamily> MemoryHost for Unrequested<'_, F> {
     fn advance_epoch(&mut self) {}
 
     fn unload(&mut self) {}
+
+    fn evict_owed_prefixes(&mut self) -> bool {
+        false
+    }
+
+    fn prefix_value(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// A shortage the harness would answer by preempting ends the run, as
+    /// an unload does: its sequences are the run's own.
+    fn preempt(&mut self, _: &[RequestId]) -> Result<(), magnitude_scheduler::publication::RequestError> {
+        Err(magnitude_scheduler::publication::RequestError::ModelUnloaded {
+            cause: magnitude_scheduler::publication::ModelUnloadCause::MemoryPressure,
+        })
+    }
 }
 
 /// The boundary after a step, as the scheduler's owner runs it after
@@ -318,7 +335,7 @@ fn between_steps<F: ProgramFamily>(
     now: u64,
 ) -> Result<(), String> {
     let mut host = Unrequested { domain, memory, now };
-    match between_flights(&mut host, Some(bindings), 0).map_err(|error| error.to_string())? {
+    match between_flights(&mut host, Some(bindings)).map_err(|error| error.to_string())? {
         true => Err("the memory guarantee could not be kept: the model would unload".into()),
         false => Ok(()),
     }
@@ -440,7 +457,7 @@ impl Engine {
             .bindings
             .as_mut()
             .expect("no flight holds the state bindings");
-        self.domain.open_state(bindings, request, from).map_err(text)?;
+        self.domain.open_state(bindings, request, from, 0).map_err(text)?;
         Ok(request)
     }
 

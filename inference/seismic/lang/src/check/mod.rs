@@ -1182,12 +1182,11 @@ pub(crate) fn check_closed<E>(
 }
 
 /// The record ports `declared` lists (`records`), each a device tensor
-/// parameter or tensor result with a leading record axis, listed once, on a
-/// backend that binds record tables; what is wrong with any is in `errors`.
+/// parameter or tensor result with a leading record axis, listed once; what
+/// is wrong with any is in `errors`.
 fn native_records(
     declared: &[crate::syntax::ast::NativeRecordDecl],
     contract: &ir::Definition,
-    backend: crate::registry::BackendName,
     errors: &mut Vec<(Span, String)>,
 ) -> Vec<crate::checked::RecordPort> {
     let mut records = Vec::new();
@@ -1225,10 +1224,6 @@ fn native_records(
             ),
         };
         match port {
-            _ if !backend.binds_record_tables() => errors.push((
-                span,
-                format!("`records`: {} binds no record tables", backend.as_str()),
-            )),
             Ok(port) if records.contains(&port) => errors.push((
                 span,
                 match record {
@@ -1508,7 +1503,7 @@ fn check_native(
         })
         .collect::<Vec<_>>();
 
-    let records = native_records(&native.records, contract, backend, &mut errors);
+    let records = native_records(&native.records, contract, &mut errors);
 
     let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
     for coverage in &native.elements {
@@ -1983,7 +1978,7 @@ fn check_native(
             }
         }
         if let Some(own) = &launch.records {
-            launch_records.push((launches.len(), native_records(own, contract, backend, &mut errors)));
+            launch_records.push((launches.len(), native_records(own, contract, &mut errors)));
         }
         // A resident launch's grid is the backend's: as many threadgroups as
         // it holds co-resident for the formed pipeline, at most the first

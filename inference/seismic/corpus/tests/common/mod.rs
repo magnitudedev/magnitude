@@ -47,11 +47,17 @@ pub fn corpus_path(relative: &str) -> PathBuf {
 }
 
 /// The backend's device; a missing device is a test failure, never a skip.
-/// `backend`'s device, its ledgers its own: no other test's open shares a
-/// limit or a charge with it.
+/// `backend`'s device over tallies of its own: no other test's open shares
+/// a limit or a charge with it.
 pub fn device(backend: BackendName) -> Device {
+    tallied_device(backend).0
+}
+
+/// [`device`], and its device store's tally, which the test reads and
+/// bounds.
+pub fn tallied_device(backend: BackendName) -> (Device, seismic::memory::Tally) {
     let devices = Devices::discover(&[]).expect("device discovery");
-    seismic::testing::open_backend_own_ledgers(&devices, backend, Default::default())
+    seismic::testing::open_backend_tallied(&devices, backend, Default::default())
         .unwrap_or_else(|e| panic!("{} device required: {e}", backend.as_str()))
 }
 

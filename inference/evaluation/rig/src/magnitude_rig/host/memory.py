@@ -18,9 +18,10 @@ assessment prices:
 - context: what the device lost when the engine opened it (the `device
   opened` moment) before any allocation;
 - programs: what it lost by `programs prepared` beyond the context and what
-  the engine holds there (`device_held_bytes`), per native kernel of the
-  load's kernel inventory (`magnitude-assess --breakdown`, `kernels`);
-- residual: what it lost at load end beyond context, programs and held.
+  the engine's ledger counts allocated there (`device_allocated_bytes`), per
+  native kernel of the load's kernel inventory (`magnitude-assess --breakdown`,
+  `kernels`);
+- residual: what it lost at load end beyond context, programs and allocated.
 
 The GPU must be otherwise idle: device-wide memory is sampled (`mrig memory`
 holds the device for it). Run it from any directory; it writes only under
@@ -41,17 +42,16 @@ term by term: the plan's storage terms beside Seismic's charge at load end in
 each (the engine's `MemoryChargeReconciliation`), with what no term holds.
 With `--residency` the load also reads how many pages of its expert stacks
 the file cache holds once loaded and once it has decoded a fixture (it must hold none);
-with `--pressure BYTES` too, another process presses the load BYTES below its
-planning line over the middle half of that decode, and the owner's releases are reported in order
-with the decode's tokens against the same decode on a resident load.
-With `--recommit GB[,GB...]` nothing loads: it times an in-place recommit of
-a reserved tensor (an elastic expert bank's resize) at each commitment.
+with `--pressure-store STORE` too, another process takes what that store gives past the
+guarantee the load's ledger keeps free there over the middle half of that decode, and the
+owner's resizes and releases are reported in order with the decode's tokens against the same
+decode on a resident load: none in the steady decode before the press, each matched to the
+reading and term that caused it, and each shrink returning memory to the OS.
 
   python3 memory.py --bin DIR --backend cuda|vulkan|metal|cpu --memory dedicated|unified \\
       --scratch DIR [--weight-cap BYTES] [--context TOKENS] \\
-      [--residency HARNESS FIXTURES TOKENS [--pressure BYTES]] \\
+      [--residency HARNESS FIXTURES TOKENS [--pressure-store host|device]] \\
       [--artifacts ACQUISITION.json] [TARGET.gguf[,PROJECTOR.gguf[,DRAFT.gguf]] ...]
-  python3 memory.py --bin DIR --backend BACKEND --memory unified --scratch DIR --recommit GB[,GB...]
 
 DIR holds magnitude-engine and magnitude-assess (an unpacked engine
 installation or a release build) for dedicated memory, magnitude-harness
@@ -95,11 +95,7 @@ BACKENDS = ("cuda", "vulkan", "metal", "cpu")
 # By the device's memory, as the engine's topology states it (`mrig device`): its own, sampled
 # device-wide, or the host's, read as the worker's footprint.
 RESULTS = {"dedicated": "device-costs.json", "unified": "host-costs.json"}
-RECOMMIT = "recommit.json"  # `--recommit`'s results
-PRESSURE = "pressure.json"  # `--pressure`'s releases, pressure and tokens
-# The plan's storage term that bounds what the backend holds beside its allocations (its blocks' free
-# space, its recorded graphs), where every other term is exact.
-BOUND = "beyond_allocations"
+PRESSURE = "pressure.json"  # `--pressure-store`'s resizes, releases, pressure and tokens
 
 
 def exe(directory, name):
@@ -228,46 +224,126 @@ def _moment(line):
         return json.loads(event["record"]) if event["message"] == MOMENT else None
     _, found, record = line.partition(f"{MOMENT} record=")
     return json.loads(record) if found else None
-SHRINK_STEPS = ("queued", "planned", "moves")  # a shrink's steps on the submitting thread
+SHRINK_STEPS = ("queued", "planned")  # a shrink's steps on the submitting thread; nothing moves
+YIELD = "memory released: the cache the ledger took"
+SHORTAGE = "a real memory shortage"
+READ = "memory read"
+# What a resize record names its cause by: the store it resized in, the reading whose derived target
+# it followed (`Ledger::generation` there, which that reading's record carries) and the term of
+# that reading's record whose move since `before_generation` set the target: the reading the store's
+# previous resize followed, which the engine judges the move against. A store's first resize
+# follows no earlier one: its term is `load`, whatever reading it names as before.
+CAUSE = ("store", "reading", "term")
+BEFORE = "before_generation"
+LOAD = "load"
+# What a shortage's response took beyond the cache: new work waiting, sequences preempted, the
+# model unloaded (spec §4.5, steps 2-4), each only once the bank sits at its floor.
+COSTLIER = ("admission_waits", "preempt", "unload")
 
 
 def releases(lines):
-    """The owner's releases (`memory released`), the bank's growth steps (`memory grown`, rung
-    `Growth`) and memory conditions (`memory condition changed`), each with its time in Unix seconds,
-    in order: the scheduler's events the worker prints, one JSON object each, an unread value
-    absent."""
+    """The owner's memory events, each with its time in Unix seconds, in order: the bank's resizes
+    (`memory released`, a shrink, and `memory grown`, `resize` naming which) with their cause
+    (`CAUSE`) and, for a shrink, the bytes it returned to the OS (`returned`), the cache the ledger
+    took released at a boundary (`yield`) and each real shortage (`shortage`, its cause, and its
+    response's `COSTLIER` steps): the scheduler's events the worker prints, one JSON object each, an
+    unread value absent."""
     found = []
     for line in lines:
         if not line.startswith(EVENT):
             continue
         event = json.loads(line[len(EVENT):])
         if event["message"] in ("memory released", "memory grown"):
-            rung = event["rung"] if event["message"] == "memory released" else "Growth"
-            found.append({"at": event["at"], "rung": rung, "ms": event["micros"] / 1e3,
-                          "bytes": event.get("grown" if rung == "Growth" else "released"),
-                          **{key: event.get(key) for key in ("bank_slots", "charged_before", "charged_after",
-                                                              "claimed_before", "claimed_after",
-                                                              "footprint_before", "footprint_after", "holding", "from", "to", "cause",
-                                                              "reclaim_device_deficit_bytes", "reclaim_host_deficit_bytes")}})
-            if rung == "Bank":
-                # A shrink's steps on the submitting thread (ms); a growth takes none of them.
+            resize = "Shrink" if event["message"] == "memory released" else "Growth"
+            found.append({"at": event["at"], "resize": resize, "ms": event["micros"] / 1e3,
+                          "bytes": event.get("released" if resize == "Shrink" else "grown"),
+                          **{key: event.get(key) for key in ("bank_slots", "held_before", "held_after", "holding",
+                                                              "from", "to", *CAUSE, BEFORE)}})
+            if resize == "Shrink":
+                # A shrink's steps on the submitting thread (ms), and what it returned to the OS;
+                # a growth takes none of them.
                 found[-1].update({key: event[f"{key}_micros"] / 1e3 for key in SHRINK_STEPS})
-            if rung in ("Bank", "Growth"):
-                # When a resize's other steps happened.
-                found[-1].update({key: event["at"] - event[f"{key}_before"] / 1e6
-                                  for key in ("decided", "prepared", "installed", "released")})
-        elif event["message"] == "the expert bank's storage refused a resize":
-            # This event's `at` is a holding size, not the event timestamp.
-            # Retain the source reason; a partial refusal makes backing proof
-            # incomplete even when logical slots later reach their floor.
-            found.append({"refusal": event})
-        elif event["message"] == "memory condition changed":
-            found.append({"at": event["at"], "condition": event["to"]})
-        elif event["message"] == "expert bank growth decision":
-            # What a growth with room enough reaches: where the load's priced decode says the
-            # holding's misses stop falling, at most its ceiling.
-            found.append({"at": event["at"], "decision": event["holding"], "justified": event["justified"]})
+                found[-1]["returned"] = event.get("returned")
+            # When a resize's other steps happened.
+            found[-1].update({key: event["at"] - event[f"{key}_before"] / 1e6
+                              for key in ("decided", "prepared", "installed", "released")})
+        elif event["message"] == YIELD:
+            found.append({"at": event["at"], "yield": event["micros"] / 1e3,
+                          "held_before": event["held_before"], "held_after": event["held_after"]})
+        elif event["message"] == SHORTAGE:
+            found.append({"at": event["at"], "shortage": event["cause"], "store": event["store"],
+                          **{key: event.get(key) for key in COSTLIER}})
     return found
+
+
+def readings(lines):
+    """The owner's memory readings (`memory read`, the ledger's estimate of one store at a reading),
+    by store, each store's in the order they were read: the records as printed."""
+    found = {}
+    for line in lines:
+        if line.startswith(EVENT):
+            event = json.loads(line[len(EVENT):])
+            if event["message"] == READ:
+                found.setdefault(event["store"], []).append(event)
+    return found
+
+
+def untraced(resizes, read):
+    """Each resize matched to its cause: the reading its record names (`reading`, among `read`, the
+    store's readings) and the term there that moved from the reading its record names as before
+    (`before_generation`, the reading the store's previous resize followed). A resize follows a
+    target the ledger derives afresh at each reading, and a target moves only where a term of the
+    estimate does: one with no reading, no term, or a term that did not move is untraced, and
+    steady decode moves no term. A store's first resize is the load's own sizing (`load`), and
+    only that one. The failures, one a resize."""
+    failures = []
+    resized = set()
+    for event in resizes:
+        what = f"{event['resize']} of {event.get('holding')} {event.get('from')}→{event.get('to')} at {event['at']}"
+        if any(event.get(key) is None for key in CAUSE):
+            failures.append(f"{what} is untraced: its record names no " + ", ".join(
+                key for key in CAUSE if event.get(key) is None))
+            continue
+        first = event["store"] not in resized
+        resized.add(event["store"])
+        store = {record.get("generation"): record for record in read.get(event["store"], [])}
+        term, before = event["term"], event.get(BEFORE)
+        if first:
+            if term != LOAD:
+                failures.append(f"{what} is the first resize of {event['store']} but names {term}, not {LOAD}")
+            continue
+        if term == LOAD or before is None:
+            failures.append(f"{what} names {term} with before reading {before}, "
+                            f"though an earlier resize of {event['store']} came before it")
+            continue
+        missing = [generation for generation in (event["reading"], before) if generation not in store]
+        if missing:
+            failures.append(f"{what} follows reading {event['reading']} from {before} of {event['store']}, "
+                            f"and no record holds " + ", ".join(map(str, missing)))
+        elif term not in store[event["reading"]] or term not in store[before]:
+            failures.append(f"{what} names {term}, which the readings of {event['store']} do not carry")
+        elif store[event["reading"]][term] == store[before][term]:
+            failures.append(f"{what} names {term}, which held at {store[before][term]} "
+                            f"from reading {before} to {event['reading']}")
+    return failures
+
+
+def steady_resizes(pressure, resizes):
+    """The resizes decided while the decode ran steady: from its first token to the press's start,
+    with the occupier's approach already held (it leaves the load the guarantee its ledger keeps
+    free, so no term of the estimate moves). Steady decode makes none; each one there is a
+    failure."""
+    # The outputs' times; the admission's (token 0) is where a press from the prompt starts.
+    outputs = [at for count, at in pressure.get("steps") or [] if count > 0]
+    started = pressure.get("started", {}).get("at")
+    if not outputs or started is None:
+        return ["no steady decode: the decode or the press never began"]
+    first = outputs[0]
+    steady = [event for event in resizes if first <= event["decided"] < started]
+    print(f"steady decode: {started - first:.2f} s before the press, {len(steady)} resizes in it")
+    return [f"{len(steady)} resizes in steady decode, before the press: "
+            + ", ".join(f"{event['resize']} of {event.get('holding')} at {event['decided']}" for event in steady)
+            ] if steady else []
 
 
 STEP_READS = ("misses", "missed_bytes", "read_micros", "parked_micros")
@@ -289,7 +365,7 @@ def report_stalls(pressure, released, start, served):
     """What each resize in the pressure's window costs the decode, apart from steps that are slow on
     their own. The window is the decode's span under the held pressure (the harness's `window`
     tokens); a resize outside it is listed, not judged. A resize costs the decode what it holds
-    the submitting thread (its decision, plan and moves: `ms`); its release, from install to released,
+    the submitting thread (its decision and plan: `ms`); its release, from install to released,
     slowed device work beside it by about a tenth on a GB10, so a release spanning many steps
     explains little of any one slow step among them and none is credited. Each step's excess
     is its wait less the step there, the median of the window's other waits (`step_at` says why
@@ -300,7 +376,7 @@ def report_stalls(pressure, released, start, served):
     of its own, reported as one with what the streamed steps that completed in it read (`served`,
     the worker's `expert step completed` events). Returns the gate's failures: a window that tested nothing, and
     each resize in it not within one step."""
-    resizes = [event for event in released if event["rung"] in ("Bank", "Growth")]
+    resizes = [event for event in released if "resize" in event]
     steps = pressure.get("steps", [])
     window = pressure.get("window") or {}
     at_token = dict((count, at) for count, at in steps)
@@ -333,9 +409,9 @@ def report_stalls(pressure, released, start, served):
         return statistics.median(wait for other, (wait, _, _) in enumerate(waits) if other != index)
 
     ms = lambda seconds: f"{seconds * 1e3:.1f}"
-    print("| s | resize | slots | thread ms | moves ms | release ms | step ms | excess at decision "
+    print("| s | resize | slots | thread ms | release ms | step ms | excess at decision "
           "| worst excess during release | within one step |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|")
     excess = lambda index: waits[index][0] - step_at(index)
     overlap = lambda index, since, until: max(0.0, min(waits[index][2], until) - max(waits[index][1], since))
     # What resizes cost each step: the thread time of those decided in it.
@@ -355,9 +431,8 @@ def report_stalls(pressure, released, start, served):
         release = max((excess(index) for index in during), default=None)
         fits = step is not None and thread <= step
         within += fits
-        moves = f"{event['moves']:.1f}" if event["rung"] == "Bank" else "-"
-        print(f"| {event['decided'] - start:.2f} | {event['rung']} | {event['bank_slots']} | {event['ms']:.1f} "
-              f"| {moves} | {ms(event['released'] - event['installed'])} | {ms(step) if step else '-'} "
+        print(f"| {event['decided'] - start:.2f} | {event['resize']} | {event['bank_slots']} | {event['ms']:.1f} "
+              f"| {ms(event['released'] - event['installed'])} | {ms(step) if step else '-'} "
               f"| {ms(at_decision) if at_decision is not None else '-'} | {ms(release) if release is not None else '-'} "
               f"| {'yes' if fits else 'NO'} |")
     print(f"resizes in the window within one step, by thread time: {within} of {len(inside)}")
@@ -379,23 +454,35 @@ def report_stalls(pressure, released, start, served):
 
 
 def memory_samples(lines, name):
-    """Each of the owner's memory readings of the store named `name`: its time, what the load charges
-    it, and the ceiling everything else on the host leaves that charge above the planning line."""
-    events = (json.loads(line[len(EVENT):]) for line in lines if line.startswith(EVENT))
-    return [{"at": event["at"], "charge": event["charged"],
-             "ceiling": event["charged"] + event["headroom"] - event["planning"]}
-            for event in events if event["message"] == "memory read" and event["store"] == name]
+    """Each of the owner's memory readings of the store named `name` (the ledger's estimate): its
+    time, what the load holds there (committed and cache), the ceiling its budget leaves that beside
+    the guarantee the ledger keeps free (`Estimate::guarantee`), and the bank's derived targets, in
+    slots, of its expert and host holdings there."""
+    return [{"at": event["at"], "charge": event["committed"] + event["cache"],
+             "ceiling": event["budget"] - event["guarantee"],
+             # The machine's wired ceiling and wire count (`wired_limit`, `wire_count`; zero where
+             # no wired ceiling bounds the store): none off Metal.
+             **({"wired": (event["wired_limit"], event["wire_count"])} if event["wired_limit"] else {}),
+             "targets": {"Experts": event["bank_target"], "Host": event["host_target"]}}
+            for event in readings(lines).get(name, [])]
 
 
 def within_ceiling(samples, growths, held_from, freeing):
-    """The load under what the occupier leaves: a reading over the ceiling is the host's move, which
-    the load must answer before the pressure ends, and never one of its own growth steps. The failures,
-    and how many readings under the held pressure were over."""
+    """The load under the ceilings it answers to. The machine's: the wire count of any reading
+    (`wired`, the OS's bytes wired machine-wide, ours included) over the wired limit the runtime
+    reads (`min(iogpu.wired_limit_mb, recommendedMaxWorkingSetSize)`) is a failure, held pressure
+    or not. The occupier's: a reading over what it leaves is the host's move, which the load must
+    answer before the pressure ends, and never one of its own growth steps. The failures, and how
+    many readings under the held pressure were over the occupier's."""
+    wired = [sample for sample in samples if sample.get("wired") and sample["wired"][1] > sample["wired"][0]]
+    failures = ([f"the machine wires {worst['wired'][1]} bytes over its {worst['wired'][0]} wired ceiling at "
+                 f"{len(wired)} of {len(samples)} readings, first at {wired[0]['at']}"
+                 for worst in [max(wired, key=lambda sample: sample["wired"][1] - sample["wired"][0])]]
+                if wired else [])
     held = [sample for sample in samples if held_from <= sample["at"] <= freeing]
     if not held:
-        return ["unexercised pressure: no reading of the load's charge under the held pressure"], 0
+        return [*failures, "unexercised pressure: no reading of the load's charge under the held pressure"], 0
     over = lambda sample: sample["charge"] > sample["ceiling"]
-    failures = []
     if over(held[-1]):
         failures.append(f"the load charges {held[-1]['charge']} over the {held[-1]['ceiling']} the occupier leaves "
                         "as the pressure ends")
@@ -405,9 +492,99 @@ def within_ceiling(samples, growths, held_from, freeing):
     return failures, sum(map(over, held))
 
 
+# The ledger's counts of readings whose accounting failed, cumulative per store: an error in a
+# store with an exact OS count of what is out of RAM (macOS), where unobserved bytes are the
+# ledger's own charge (`accounting_violations`); on a store under a wired ceiling (Metal) the
+# readings left unobserved or short of the process's wired bytes (`unobserved_readings`,
+# `unwired_readings`), none in a correct run.
+COUNTERS = {"accounting_violations": False, "unobserved_readings": True, "unwired_readings": True}
+
+
+def uncounted(records):
+    """A counter of the ledger's accounting that is nonzero at a store's last reading has counted
+    during the run (`COUNTERS`, cumulative from its first reading); the one-per-store failures name
+    it. `records`: each store's readings, as `readings` gives them; a counter that applies only
+    under a wired ceiling (`COUNTERS`, true) is judged on stores that read one."""
+    failures = []
+    for store, store_records in records.items():
+        wired = any(record["wired_limit"] for record in store_records)
+        for name, needs_ceiling in COUNTERS.items():
+            first, last = store_records[0][name], store_records[-1][name]
+            if last and (wired or not needs_ceiling):
+                failures.append(f"{store}: {name} counted {last} by reading {store_records[-1].get('generation')} "
+                                f"({first} at its first of {len(store_records)})")
+    return failures
+
+
+def others_after_shrinks(resizes, records, held_from, freeing):
+    """A shrink frees the process's memory and moves no other program's, so the reading's `others`
+    (what the store uses beyond its supply and the process's own bytes in use) must not rise across
+    one by more than the bytes the shrink freed, the most a store's reclaim lag can show as others':
+    the ledger counts the bytes freed at once, the device shows them later. Judged from the reading
+    the shrink followed (its `reading`, the last before it was decided, where the occupier's press
+    was already shown) to the readings until its release and the first after it, and only for a
+    shrink wholly inside the held pressure (`held_from` to `freeing`), where no occupier is still
+    taking memory. The log carries no reclaim lag figure of the store's, so the freed bytes are
+    its bound. The failures."""
+    failures = []
+    for event in resizes:
+        if event["resize"] != "Shrink" or not (held_from <= event["decided"] and event["released"] <= freeing):
+            continue
+        if not event.get("bytes") or event.get("store") is None or event.get("reading") is None:
+            continue  # nothing freed, or untraced (`untraced` fails it)
+        store = records.get(event["store"], [])
+        base = next((record for record in store if record.get("generation") == event["reading"]), None)
+        later = [record for record in store if event["decided"] < record["at"] <= event["released"]]
+        later += [record for record in store if record["at"] > event["released"]][:1]
+        what = f"the shrink of {event['holding']} {event['from']}→{event['to']} at {event['decided']}"
+        if base is None or not later:
+            failures.append(f"{what}: others unverified, no reading " + ("it followed" if base is None else "after it"))
+            continue
+        rise = max(record["others"] for record in later) - base["others"]
+        if rise > event["bytes"]:
+            failures.append(f"{what}: others rose {rise} bytes over reading {event['reading']}, "
+                            f"more than the {event['bytes']} it freed")
+    return failures
+
+
+def costlier(events, samples, selected, name):
+    """A real shortage of the pressed store (named `name`) is answered in order (spec §4.5): the
+    cache yields first, and new work waits, sequences are preempted or the model unloads
+    (`COSTLIER`) only once the bank sits at its floor. So a costlier response is judged by the
+    reading that answered it (the store's first at or after it, `samples`): each of the `selected`
+    holdings' derived targets there at its floor. A shortage of another store is that store's,
+    and one whose record lacks its response leaves the order unverified. The failures."""
+    failures = []
+    for event in events:
+        if "shortage" not in event or event["store"] != name:
+            continue
+        if any(event.get(key) is None for key in COSTLIER):
+            failures.append(f"release ordering unverified: the shortage at {event['at']} records no "
+                            + ", ".join(key for key in COSTLIER if event.get(key) is None))
+            continue
+        taken = [key for key in COSTLIER if event[key]]
+        if not taken:
+            continue
+        reading = min((sample for sample in samples if sample["at"] >= event["at"]),
+                      key=lambda sample: sample["at"], default=None)
+        if reading is None:
+            failures.append(f"release ordering unverified: no reading of {name} answered the shortage at {event['at']}")
+            continue
+        # A holding with no derived target (a table) holds its floor always.
+        above = [f"{holding} at {reading['targets'][holding]} slots over its floor of {value['floor']}"
+                 for holding, value in selected.items()
+                 if reading["targets"].get(holding, value["floor"]) > value["floor"]]
+        if above:
+            failures.append(f"costlier response ({', '.join(taken)}) at {event['at']} before the pressed store's "
+                            "holdings reached their floor: " + "; ".join(above))
+    return failures
+
+
 def pressure_transitions(charge, events, samples):
     """A physical cell exercises one holding's shrink under the ceiling the occupier leaves
-    (`within_ceiling`), then regrows every shrunk holding to all it held."""
+    (`within_ceiling`), answers the press costlier than the cache only at its floor (`costlier`),
+    then regrows every shrunk holding to all it held, or to the bank's derived target once the press
+    is back where that is less."""
     pressure = charge["pressure"]
     required = ("started", "approached", "occupied", "freeing", "released", "freed", "window")
     missing = [name for name in required if name not in pressure]
@@ -431,12 +608,6 @@ def pressure_transitions(charge, events, samples):
     selected = {name: value for name, value in holdings.items() if value["stores"] == [store]}
     if not selected:
         return ["unexercised pressure: no holding exclusively occupies the selected store"]
-    # A growth the store refuses leaves the holding as it was, and memory freeing piecemeal
-    # refuses one; a refused shrink is what leaves its backing unknown.
-    refused = [event["refusal"] for event in events
-               if event.get("refusal", {}).get("holding") in selected and event["refusal"].get("cause") != "Growth"]
-    if refused:
-        return [f"physical backing unverified after resize refusal: {event}" for event in refused]
     # The child records physical release; the parent's `freed` is when it joined the child.
     start = max(pressure["started"]["at"], pressure["approached"]["at"])
     freed = pressure["released"]["at"]
@@ -444,73 +615,69 @@ def pressure_transitions(charge, events, samples):
     if any(not all(isinstance(event.get(key), (int, float))
                    for key in ("decided", "installed", "released")) for event in resizes):
         return ["physical transitions unverified: missing resize lifecycle timestamps"]
-    shrunk = {event["holding"] for event in events if event.get("rung") == "Bank"
-              and event.get("holding") in selected and start <= event["released"] <= freed
-              and event["to"] < event["from"] and event.get("bytes", 0) > 0}
+    shrunk = {event["holding"] for event in resizes if event["resize"] == "Shrink"
+              and start <= event["released"] <= freed and event["to"] < event["from"] and event.get("bytes", 0) > 0}
     failures = []
     if not shrunk:
         failures.append("unexercised pressure: selected store's holdings never shrank")
-    growths = [event for event in resizes if event.get("rung") == "Growth"]
+    growths = [event for event in resizes if event["resize"] == "Growth"]
     held, over = within_ceiling(samples, growths, pressure["occupied"]["at"], pressure["freeing"]["at"])
     failures += held
     print(f"readings over the ceiling under the held pressure, each answered by a release: {over}")
+    failures += costlier(events, samples, selected, observed[0]["name"])
     current = {name: value["initial"] for name, value in selected.items()}
     # Replay backing changes at their lifecycle boundary, not delayed log delivery.
-    ordered = sorted((event for event in events if "refusal" not in event), key=lambda event: event["released"] if event.get("rung") == "Bank"
-                     else event["installed"] if event.get("rung") == "Growth" else event["at"])
-    for event in ordered:
-        if event.get("holding") in selected:
-            current[event["holding"]] = event["to"]
-        if event.get("rung") in ("Prefix", "Optional", "Preemption") and start <= event["at"] <= freed:
-            deficits = {"Device": event.get("reclaim_device_deficit_bytes"),
-                        "Host": event.get("reclaim_host_deficit_bytes")}
-            if event.get("cause") != "Reclaim" or any(
-                    not isinstance(deficits.get(value["storage_kind"]), int) for value in selected.values()):
-                failures.append("release ordering unverified: costlier release has live-claim or missing reclaim attribution")
-            elif any(deficits[value["storage_kind"]] > 0 and current[name] > value["physical_floor"]
-                     for name, value in selected.items()):
-                failures.append("costlier resource released before pressured-store holdings exhausted reclaimable backing")
-    # All it held, or less where the latest growth decision's priced decode says more saves nothing.
-    justified = {event["decision"]: event["justified"] for event in events if "decision" in event}
-    wanted = {name: min(selected[name]["initial"], justified.get(name, selected[name]["initial"])) for name in shrunk}
-    failures += [f"{name} did not regrow after the pressure: {current[name]} of the {wanted[name]} its record justifies"
+    for event in sorted(resizes, key=lambda event: event["released"] if event["resize"] == "Shrink"
+                        else event["installed"]):
+        current[event["holding"]] = event["to"]
+    # All it held, or less where the bank's derived target once the press is back (the ledger's
+    # room, up to where the holding's misses stop falling) says so: the target while the decode
+    # follows it, from the press's release to the occupier's exit (`freed`), which comes after the
+    # decode, when no step is left to grow in.
+    exited = pressure["freed"]["at"]
+    back = [sample for sample in samples if freed <= sample["at"] < exited]
+    targets = back[-1]["targets"] if back else {}
+    wanted = {name: min(selected[name]["initial"], targets.get(name, selected[name]["initial"])) for name in shrunk}
+    failures += [f"{name} did not regrow after the pressure: {current[name]} of the {wanted[name]} its target holds"
                  for name in shrunk if current[name] < wanted[name]]
     return failures
 
 
 def report_pressure(charge, lines, resident_tokens, scratch):
-    """The forced-pressure gate: the pressed store's holdings shrink before any costlier release, the
-    load keeps under what the occupier leaves, and regrows once the memory is free
-    (`pressure_transitions`), no bank step needs new memory (its charge and footprint fall), and the
-    decode's tokens equal the resident decode's. Returns the gate's failures, empty when it passes,
-    with the window's (`report_stalls`)."""
+    """The forced-pressure gate: the pressed store's holdings shrink, the load keeps under what the
+    occupier leaves, and regrows once the memory is free (`pressure_transitions`); steady decode
+    makes no resize (`steady_resizes`) and every resize traces to its cause (`untraced`); every
+    shrink returns memory to the OS and needs none (what the process holds never rises across
+    one); and the decode's tokens equal the resident decode's. Returns the gate's failures, empty
+    when it passes, with the window's (`report_stalls`)."""
     events = releases(lines)
     pressure = charge["pressure"]
     tokens = charge["decoded_tokens"]
     samples = memory_samples(lines, pressure.get("approached", {}).get("before", {}).get("name"))
     failures = pressure_transitions(charge, events, samples)
-    # A shrink needs no new memory: charge and footprint fall at every step. The charge read is
-    # the device's, so a discrete bank's host tier leaves it where it was. The footprint is what
-    # the holding's store holds of the process: its host memory for a holding in host RAM, and for
-    # a discrete device's holding what the device store reports it holds (its claim), as the
-    # process's host footprint moves with its other allocations beside the step.
-    stores = {name: value["stores"] for name, value in charge["bank"]["holdings"].items()}
-    footprint = lambda event: (("footprint_before", "footprint_after") if "HostRam" in stores[event["holding"]]
-                               else ("claimed_before", "claimed_after"))
-    bank = [event for event in events if event.get("rung") == "Bank"]
-    grew = [event for event in bank
-            if (event["charged_after"] > event["charged_before"] if event["holding"] == "Host"
-                else event["charged_after"] >= event["charged_before"])
-            or (event[footprint(event)[0]] is not None and event[footprint(event)[1]] > event[footprint(event)[0]])]
+    resizes = [event for event in events if "resize" in event]
+    failures += steady_resizes(pressure, resizes)
+    records = readings(lines)
+    failures += untraced(resizes, records)
+    failures += uncounted(records)
+    held = (pressure.get("occupied", {}).get("at"), pressure.get("freeing", {}).get("at"))
+    if None not in held:  # a pressure without them fails in `pressure_transitions`
+        failures += others_after_shrinks(resizes, records, *held)
+    # A shrink frees memory to others: its empty blocks return to the OS (`returned`), and what the
+    # process holds never rises across it. One that returns nothing freed no one anything.
+    bank = [event for event in resizes if event["resize"] == "Shrink"]
+    kept = [event for event in bank if not event.get("returned")]
+    if kept:
+        failures.append(f"{len(kept)} of {len(bank)} bank shrinks returned nothing to the OS")
+    grew = [event for event in bank if event["held_after"] > event["held_before"]]
     if grew:
-        failures.append(f"{len(grew)} of {len(bank)} bank steps grew their charge or footprint")
+        failures.append(f"{len(grew)} of {len(bank)} bank shrinks grew what the process holds")
     if tokens is None or resident_tokens is None:
         failures.append("no exact-output comparison: pressured or reference decode did not complete")
     elif tokens != resident_tokens:
         failures.append("pressured decode differs from unpressured reference")
     if not failures:
-        failures += report_stalls(pressure, [event for event in events if "rung" in event],
-                                  pressure["started"]["at"], served_steps(lines))
+        failures += report_stalls(pressure, resizes, pressure["started"]["at"], served_steps(lines))
     report = {"pressure": pressure, "bank": charge.get("bank"), "events": events, "samples": samples, "failures": failures,
               "tokens": tokens, "reference_tokens": resident_tokens}
     (scratch / PRESSURE).write_text(json.dumps(report, indent=1))
@@ -520,12 +687,12 @@ def report_pressure(charge, lines, resident_tokens, scratch):
                           ("held", pressure.get("occupied", {}).get("observation")),
                           ("released", pressure.get("released", {}).get("observation"))):
         if value:
-            print(f"{moment}: store={value['store']}, headroom={value['headroom_bytes']}, "
-                  f"claimable={value['ceiling_bytes']}")
+            print(f"{moment}: store={value['store']}, headroom={value['headroom_bytes']}")
     for event in events:
         if event.get("holding"):
-            print(f"{event['rung']}: {event['holding']} {event['from']}→{event['to']}, "
-                  f"backing bytes={event['bytes']}")
+            print(f"{event['resize']}: {event['holding']} {event['from']}→{event['to']}, "
+                  f"backing bytes={event['bytes']}, returned={event.get('returned', '-')}, "
+                  f"cause {event.get('term')} at reading {event.get('reading')}")
     for failure in failures:
         print(f"FAILED: {failure}")
     print(f"results in {scratch / PRESSURE}")
@@ -545,28 +712,25 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=18977)
     parser.add_argument("--artifacts", help="a catalog acquisition object (JSON) to measure")
     parser.add_argument("--weight-cap", type=int, metavar="BYTES",
-                        help="load under this weight cap; dedicated memory requires --pressure")
+                        help="load under this weight cap; dedicated memory requires --pressure-store")
     parser.add_argument("--kernels", metavar="DIR",
                         help="the kernel cache every load prepares from, as a served load's (its executor's "
                              "costs price the bank's growth)")
     parser.add_argument("--context", type=int, metavar="TOKENS",
-                        help="load at this context; dedicated memory requires --pressure")
+                        help="load at this context; dedicated memory requires --pressure-store")
     parser.add_argument("--residency", nargs=3, metavar=("HARNESS", "FIXTURES", "TOKENS"),
                         help="under --weight-cap: read the expert pages and drive the requested decode; "
                              "stacks the file cache holds once loaded and once the load has decoded "
                              "TOKENS tokens of the first of FIXTURES (rendered by the harness "
                              "executable HARNESS)")
-    parser.add_argument("--recommit", metavar="GB[,GB...]",
-                        help="unified memory, loading nothing: what an in-place recommit of a reserved tensor (an "
-                             "elastic expert bank's resize) costs at each commitment")
-    parser.add_argument("--pressure", type=int, metavar="BYTES",
-                        help="under --residency: another process presses the load BYTES below its planning line "
-                             "from a quarter of the decode to three quarters of it; report the owner's releases (the bank's slots, each "
-                             "release's time, charge and footprint) and the decode's tokens against a resident "
-                             "load's (the forced-pressure gate)")
-    parser.add_argument("--pressure-store", choices=("host", "device"))
+    parser.add_argument("--pressure-store", choices=("host", "device"),
+                        help="under --residency: another process takes what this physical store gives past the "
+                             "guarantee the load's ledger keeps free there, from a quarter of the decode to three "
+                             "quarters of it; report the owner's resizes and releases (the bank's slots, each "
+                             "step's time, what the process held on each side) and the decode's tokens against a "
+                             "resident load's (the forced-pressure gate)")
     parser.add_argument("--pressure-prompt", action="store_true",
-                        help="under --pressure: the pressure starts once the request is admitted, so its "
+                        help="under --pressure-store: the pressure starts once the request is admitted, so its "
                              "prompt's groups run under it")
     parser.add_argument("models", nargs="*")
     return parser
@@ -575,24 +739,15 @@ def parser() -> argparse.ArgumentParser:
 def refusal(options) -> str | None:
     """Why these options (`parser`'s) do not name one measurement, or None: the one judge of
     them, which `mrig memory` also applies to the command it plans."""
-    if options.pressure is not None and options.pressure <= 0:
-        return "--pressure requires a positive byte deficit"
-    if bool(options.pressure) != bool(options.pressure_store):
-        return "--pressure and --pressure-store are required together"
-    if options.pressure and not options.residency:
-        return "--pressure applies while a streamed load decodes: it takes --residency"
-    if options.pressure_prompt and not options.pressure:
-        return "--pressure-prompt says when --pressure starts: it takes --pressure"
+    if options.pressure_store and not options.residency:
+        return "--pressure-store applies while a streamed load decodes: it takes --residency"
+    if options.pressure_prompt and not options.pressure_store:
+        return "--pressure-prompt says when the pressure starts: it takes --pressure-store"
     if options.fit:
         return None
     if not (options.bin and options.backend and options.memory and options.scratch):
         return "a measurement takes --bin, --backend, --memory and --scratch"
-    if options.recommit:
-        if options.memory == "dedicated" or options.models or options.artifacts or options.weight_cap \
-                or options.context or options.residency:
-            return "--recommit takes a unified-memory device and loads nothing"
-        return None
-    if (options.weight_cap or options.context) and options.memory == "dedicated" and not options.pressure:
+    if (options.weight_cap or options.context) and options.memory == "dedicated" and not options.pressure_store:
         return "--weight-cap and --context measure a unified-memory load"
     if options.residency and not (options.weight_cap and options.context and options.artifacts):
         return "--residency reads a streamed load's experts: it takes --weight-cap, --context and --artifacts"
@@ -609,11 +764,6 @@ def main():
     if options.fit:
         fit_loads([load for path in options.fit for load in json.loads(Path(path).read_text())])
         return
-    if options.recommit:
-        scratch = Path(options.scratch)
-        scratch.mkdir(parents=True, exist_ok=True)
-        recommit_costs(options, scratch)
-        return
     models = list(options.models)
     if options.artifacts:
         acquired = json.loads(Path(options.artifacts).read_text())
@@ -621,38 +771,14 @@ def main():
                                 (acquired.get("drafter") or {}).get("path", "")]).rstrip(","))
     scratch = Path(options.scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    (device_costs if options.memory == "dedicated" and not options.pressure else host_costs)(options, models, scratch)
-
-
-def recommit_costs(options, scratch):
-    """What an in-place recommit costs at each commitment (`magnitude-harness recommit`): the
-    median and range of a one-row shrink and regrow, and the median per committed GB."""
-    run = subprocess.run([exe(options.bin, "magnitude-harness"), "recommit", "--device", options.backend,
-                          "--gigabytes", options.recommit],
-                         capture_output=True, text=True, check=False)  # a failure is reported below
-    (scratch / "recommit.log").write_text(run.stderr)
-    if run.returncode != 0:
-        print(f"recommit timing failed (exit {run.returncode}); see {scratch / 'recommit.log'}", file=sys.stderr)
-        return
-    results = [json.loads(line) for line in run.stdout.splitlines()]
-    (scratch / RECOMMIT).write_text(json.dumps(results, indent=1))
-    span = lambda times: f"{statistics.median(times):7.1f} ({min(times):.1f}–{max(times):.1f})"
-    print("| committed GB | reserve ms | shrink one row ms | regrow one row ms | resize ms per GB |")
-    print("|---|---|---|---|---|")
-    for r in results:
-        gigabytes = r["committed_bytes"] / 1e9
-        per = statistics.median(r["shrink_ms"] + r["grow_ms"]) / gigabytes
-        print(f"| {gigabytes:.2f} | {r['reserve_ms']:.1f} | {span(r['shrink_ms'])} | {span(r['grow_ms'])} "
-              f"| {per:.1f} |")
-    print(f"\n{options.backend}, rows of {results[0]['row_bytes'] / 1024:g} KiB (the device's granule); median (min–max) of "
-          f"{len(results[0]['shrink_ms'])} resizes each way")
+    (device_costs if options.memory == "dedicated" and not options.pressure_store else host_costs)(options, models, scratch)
 
 
 def host_costs(options, models, scratch):
     """Each model's target loaded plain: its own memory at load end against its charge. A load, a
     rendering or a resident decode that failed fails the measurement once every model is reported:
-    what it would have tested is untested. So does every check that failed: storage beyond its
-    bound, expert pages in the file cache, and the forced-pressure gate (`report_pressure`)."""
+    what it would have tested is untested. So does every check that failed: expert pages in the
+    file cache, and the forced-pressure gate (`report_pressure`)."""
     results, failed, failures = [], [], []
     for index, paths in enumerate(models):
         target = paths.split(",")[0]
@@ -678,11 +804,11 @@ def host_costs(options, models, scratch):
         # site's admitted arithmetic differs from the device's within the precision system, and a
         # shrink moves misses to it. The site's arithmetic is judged by its own instrument (kl).
         unsited = scratch / "unsited.json"
-        if options.pressure:
+        if options.pressure_store:
             unsited.write_text(json.dumps({"cpu_sites": False}))
-        pressure = (("--pressure", str(options.pressure), "--pressure-store", options.pressure_store,
+        pressure = (("--pressure-store", options.pressure_store,
                      *(("--pressure-prompt",) if options.pressure_prompt else ()), "--numerical-profile", str(unsited))
-                    if options.pressure else ())
+                    if options.pressure_store else ())
         kernels = ("--cache-dir", options.kernels) if options.kernels else ()
         load = subprocess.run([exe(options.bin, "magnitude-harness"), "memory", "--device", options.backend,
                                *cap, *context, *decode, *pressure, *kernels, target],
@@ -699,11 +825,10 @@ def host_costs(options, models, scratch):
         loaded = found["loaded"][1]
         if options.memory == "unified":
             footprint = loaded["footprint_bytes"]
-            storage = loaded["device_held_bytes"]
-            # What the load holds at load end of what its plan prices: its storage (every charge the device
-            # makes in unified memory, device and upload)
-            # as held, which is the plan's exactly but for the bytes beyond allocations the plan bounds,
-            # and its exact host terms.
+            storage = loaded["device_allocated_bytes"]
+            # What the load holds at load end of what its plan prices: its storage (every byte the ledger
+            # counts the device allocating in unified memory, device and upload, block slack and driver
+            # objects among them), and its exact host terms.
             own = footprint - storage - charge["plan_host_bytes"]
             charged = charge["charged_runtime_bytes"] + charge["charged_vocabulary_bytes"] + charge["charged_program_bytes"]
             results.append({**charge, "host": platform.node(), "os": platform.system(),
@@ -715,10 +840,10 @@ def host_costs(options, models, scratch):
                             "loaded_storage_terms": loaded["charge"],
                             "own_bytes": own, "charged_bytes": charged, "overcharge_bytes": charged - own})
             (scratch / RESULTS["unified"]).write_text(json.dumps(results, indent=1))
-        if options.pressure and charge["decoded_tokens"] is None:
-            # The decode ended under pressure (the ladder past its last rung): its releases are reported.
+        if options.pressure_store and charge["decoded_tokens"] is None:
+            # The decode ended under pressure (the model unloaded): its resizes and releases are reported.
             failures += [f"{name}: {failure}" for failure in report_pressure(charge, load.stderr.splitlines(), None, scratch)]
-        elif options.pressure:
+        elif options.pressure_store:
             # The same decode resident, after the streamed load, so its cached reads never serve the
             # streamed one: from the prompt the pressured decode was sized to, as many tokens as it
             # decoded, the tokens it must equal.
@@ -755,26 +880,19 @@ def host_costs(options, models, scratch):
               "charged: its host process costs; a negative overcharge is memory the plan does not charge")
     for r in results:
         planned, held = r["plan_storage_terms"], r["loaded_storage_terms"]
-        terms = [*planned, *(term for term in held if term not in planned and term != "charged")]
+        terms = [*planned, *(term for term in held if term not in planned and term != "allocated")]
         print(f"\n{Path(r['model']).name}, weight cap {r['weight_cap'] or '-'}, context {r['context']}: "
-              f"storage by term at load end ({BOUND}: what the backend holds beside its allocations, which "
-              "the plan bounds over the load's life)")
+              "storage by term at load end (the recorded graphs and the device process's bytes are charged "
+              "to the entries whose allocations made them, so they read in the total alone)")
         print("| term | planned MB | charged MB | charged − planned (bytes) |")
         print("|---|---|---|---|")
         for term in terms:
             plan, charge = planned.get(term), held.get(term)
             shown = lambda recorded: "unrecorded" if recorded is None else mb(recorded)
             difference = "-" if plan is None or charge is None else charge - plan
-            if term == BOUND and difference != "-":
-                difference = f"{difference} ({'within' if charge <= plan else 'EXCEEDS'} its bound)"
-                if charge > plan:
-                    failures.append(f"{Path(r['model']).name}: storage beyond allocations exceeds its bound by "
-                                    f"{charge - plan} bytes")
             print(f"| {term} | {shown(plan)} | {shown(charge)} | {difference} |")
-        # Every allocation's term is planned exactly; the bound is compared on its own row.
-        allocations = r["plan_storage_bytes"] - planned[BOUND]
-        print(f"| total charged | {mb(allocations)} | {mb(held['charged'])} "
-              f"| {held['charged'] - allocations} |")
+        print(f"| total charged | {mb(r['plan_storage_bytes'])} | {mb(held['allocated'])} "
+              f"| {held['allocated'] - r['plan_storage_bytes']} |")
         residency = r["expert_residency"]
         if residency:
             print(f"expert stacks' pages in the file cache, of {residency['pages']}: "
@@ -878,13 +996,13 @@ def device_costs(options, models, scratch):
         def lost(moment, sampler=sampler, found=found, baseline=baseline):
             return sampler.at(found[moment][0]) - baseline
 
-        def held(moment, found=found):
-            return found[moment][1].get("device_held_bytes") or found[moment][1]["device_charged_bytes"]
+        def allocated(moment, found=found):
+            return found[moment][1]["device_allocated_bytes"]
 
         context = lost("device opened")
-        programs = lost("programs prepared") - context - held("programs prepared")
+        programs = lost("programs prepared") - context - allocated("programs prepared")
         loaded = lost("loaded")
-        residual = loaded - context - programs - held("loaded")
+        residual = loaded - context - programs - allocated("loaded")
         peak = max(value for _, value in sampler.samples) - baseline
         kernels = breakdown["kernels"]
         planned = breakdown["serving_bytes"] - breakdown["state_bytes"] + breakdown["startup_state_bytes"]
@@ -894,8 +1012,7 @@ def device_costs(options, models, scratch):
             "context_bytes": context, "program_bytes": programs,
             "program_bytes_per_kernel": programs // max(kernels, 1),
             "loaded_lost_bytes": loaded, "peak_lost_bytes": peak,
-            "held_bytes": held("loaded"), "charged_bytes": found["loaded"][1]["device_charged_bytes"],
-            "unallocated_bytes": found["loaded"][1].get("device_unallocated_bytes"),
+            "allocated_bytes": allocated("loaded"),
             "residual_bytes": residual, "planned_at_load_bytes": planned,
             "required_bytes": [domain["requiredBytes"] for domain in verdict.get("memory", [])],
             "breakdown": breakdown,
@@ -903,11 +1020,11 @@ def device_costs(options, models, scratch):
         results.append(result)
         (scratch / RESULTS["dedicated"]).write_text(json.dumps(results, indent=1))
     gb = lambda value: f"{value / 1e9:7.3f}" if value is not None else "      -"
-    print("| model | kernels | context | programs | per kernel | held | residual | lost at load | peak | planned at load |")
+    print("| model | kernels | context | programs | per kernel | allocated | residual | lost at load | peak | planned at load |")
     print("|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         print(f"| {Path(r['model'].split(',')[0]).name} | {r['kernels']} | {gb(r['context_bytes'])} | {gb(r['program_bytes'])} "
-              f"| {r['program_bytes_per_kernel'] / 1e6:.1f} MB | {gb(r['held_bytes'])} | {gb(r['residual_bytes'])} "
+              f"| {r['program_bytes_per_kernel'] / 1e6:.1f} MB | {gb(r['allocated_bytes'])} | {gb(r['residual_bytes'])} "
               f"| {gb(r['loaded_lost_bytes'])} | {gb(r['peak_lost_bytes'])} | {gb(r['planned_at_load_bytes'])} |")
     if results:
         print(f"\nper-kernel cost bound: {max(r['program_bytes_per_kernel'] for r in results) / 1e6:.1f} MB; "

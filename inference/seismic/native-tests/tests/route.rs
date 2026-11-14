@@ -7,8 +7,7 @@ use seismic::measure::{measure, Measure, Stop};
 use seismic::{
     AllocationLimit, BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
     InvocationError, NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome,
-    RegionError, Placing, ReservationCharges, ReservedContract, Resizer, SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor,
-    TensorError,
+    SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor,
     TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
 };
 use seismic_native_tests::{
@@ -50,34 +49,6 @@ fn search_hinted(hints: &[(&str, u64)]) -> Strategy {
         .map(|(name, value)| [((*name).to_owned(), *value)].into_iter().collect())
         .collect();
     Strategy::Search(plan)
-}
-
-/// What `device` charges on each store it reaches: its own ledgers.
-fn storage_charged(device: &Device) -> std::collections::BTreeMap<seismic::StoreId, u64> {
-    device.ledgers().own.iter().map(|(store, view)| (*store, view.charged)).collect()
-}
-
-/// The store a buffer placed as `placing` is placed on first.
-fn store_of(device: &Device, placing: Placing) -> seismic::StoreId {
-    let path = device.info().paths(placing)[0];
-    device.topology().access_path(path).expect("a placement's path belongs to its topology").store()
-}
-
-/// Each store has been charged, since `before`, exactly what `charges`
-/// places there: the backing in its reserved kind's storage's store, a
-/// record table in its placement's.
-fn assert_charged_where_placed(
-    device: &Device,
-    before: &std::collections::BTreeMap<seismic::StoreId, u64>,
-    charges: ReservationCharges,
-) {
-    let mut expected = before.clone();
-    *expected.entry(store_of(device, Placing::Reserved(charges.contract))).or_default() += charges.backing;
-    if let Some(table) = charges.table {
-        *expected.entry(store_of(device, Placing::Fixed(table.placement()))).or_default() += table.bytes();
-    }
-    let backend = device.backend();
-    assert_eq!(storage_charged(device), expected, "{backend:?}: each store charges only the owners placed there");
 }
 
 fn f32_tensor(device: &Device, extents: &[u64], values: &[f32]) -> Tensor {
@@ -231,17 +202,17 @@ fn metal_launch_grid_binds_no_slab_view() {
     };
     let kernel = marked_groups::native_for_device(&device, &NativeSpecialization::new())
         .expect("Metal has the grid fixture");
-    let mut slabs = seismic::SlabTensor::new(
-        &device,
+    let slabs = seismic::SlabTensor::in_pool(
+        &seismic_native_tests::pool(&device),
         3,
         3,
-        vec![seismic::SlabRegion {
+        &[seismic::SlabRegion {
             element: Element::i32(),
             row_shape: vec![],
         }],
     )
     .unwrap();
-    slabs.add_slab().unwrap();
+    slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
     let grid = slabs.logical_region(0).unwrap();
     let mut marks = Tensor::from_host(&device, Element::i32(), &[8], &[0; 32]).unwrap();
     match kernel.call(marked_groups::Args {
@@ -431,7 +402,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     let mut discovered = None;
     while let Some(work) = unit.next() {
         if work.stage == Stage::Measure && discovered.is_none() {
-            discovered = Some(device.device_ledger().charged);
+            discovered = Some(device.allocated());
         }
         let ended = if let Some(forming) = unit.forming() {
             assert_eq!(work.stage, Stage::Measure);
@@ -456,7 +427,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
         };
         // What a piece holds is the device's charges and the process's
         // host bytes: no less than the charges.
-        let charged = device.device_ledger().charged;
+        let charged = device.allocated();
         assert!(ended >= charged);
         if work.stage == Stage::Measure {
             held.push((unit.standing().measured, charged));
@@ -488,7 +459,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     unit.release(&mut source);
     assert!(!unit.holds_inputs());
     assert!(
-        device.device_ledger().charged < discovered,
+        device.allocated() < discovered,
         "{held:?}"
     );
     let result = unit.terminal().unwrap();
@@ -2009,16 +1980,36 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
 /// charge, not from the least bound the call runs under: a backend that
 /// carves allocations from blocks it already holds (CUDA) admits a call
 /// inside that slack under any bound, as it takes no device memory more.
-fn standalone_scratch_bytes(
+fn assert_standalone_scratch_released(
     device: &Device,
+    placed: u64,
     call: impl Fn() -> Result<Tensor, CallError>,
 ) -> u64 {
-    let before = device.device_ledger().charged;
-    device.restart_high_water();
-    let results = call().unwrap().storage_bytes();
-    let charged = device.device_ledger();
-    assert_eq!(charged.charged, before);
-    charged.high_water - before - results
+    let before = device.allocated();
+    let tally = seismic::memory::Tally::unbounded(
+        device.topology().store_identity(device.device_store()).unwrap(),
+    );
+    let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(tally.clone());
+    let result = seismic::memory::charging(&[entry], call).unwrap();
+    let charged = result.charged_bytes();
+    let results = result.storage_bytes();
+    if device.backend() != seismic::BackendName::Cpu {
+        assert_eq!(tally.held(), charged, "{:?}: standalone scratch freed on return", device.backend());
+    }
+    drop(result);
+    assert_eq!(tally.held(), 0, "{:?}: call result freed on drop", device.backend());
+    assert_eq!(device.allocated(), before, "{:?}: device store back at before", device.backend());
+    let high_water = seismic::memory::Store::high_water(&tally);
+    assert!(
+        high_water >= (results + placed).max(charged),
+        "{:?}: high-water {} covers results {} (charged {}) + placed {}",
+        device.backend(),
+        high_water,
+        results,
+        charged,
+        placed
+    );
+    placed
 }
 
 /// S8: a standalone call's scratch is its own, released when the call ends;
@@ -2033,6 +2024,7 @@ fn standalone_scratch_is_the_calls_own() {
         .unwrap();
         let before = kernel.scalar_result_bytes();
         let x = f32_tensor(&device, &[64], &exact_values(64));
+        let placed = kernel.standalone_scratch_bytes(split_sum::Args { x: &x }).unwrap();
         let call = || {
             kernel
                 .call(split_sum::Args { x: &x })
@@ -2044,7 +2036,7 @@ fn standalone_scratch_is_the_calls_own() {
         );
         // The reserved sync range, then four f32 partials.
         assert_eq!(
-            standalone_scratch_bytes(&device, call),
+            assert_standalone_scratch_released(&device, placed, call),
             SYNC_RESERVE + 16,
             "{:?}",
             device.backend()
@@ -2526,6 +2518,7 @@ fn inactive_scratch_is_charged_the_minimum() {
         let scratch = |n: u64| {
             let values = exact_values(n as usize);
             let x = f32_tensor(&device, &[n], &values);
+            let placed = kernel.standalone_scratch_bytes(gated_sum::Args { x: &x }).unwrap();
             let call = || kernel.call(gated_sum::Args { x: &x }).map(|results| results.value);
             assert_eq!(
                 read_f32(&call().unwrap()),
@@ -2533,7 +2526,7 @@ fn inactive_scratch_is_charged_the_minimum() {
                 "{:?} N {n}",
                 device.backend()
             );
-            standalone_scratch_bytes(&device, call)
+            assert_standalone_scratch_released(&device, placed, call)
         };
         assert_eq!(scratch(10), SYNC_RESERVE + 1, "{:?}", device.backend());
         assert_eq!(scratch(200), SYNC_RESERVE + 800, "{:?}", device.backend());
@@ -2562,690 +2555,77 @@ fn inactive_scratch_is_charged_the_minimum() {
     }
 }
 
-/// Every opened backend whose topology reports device reservations. Refusal
-/// is checked against that capability, independently of the backend name.
-fn reserving_devices() -> Vec<Device> {
-    seismic_native_tests::every_device().into_iter().filter(|device| {
-        let reserving = device.info().reserving(ReservedContract::DeviceOnly).map(|reservation| reservation.is_some()).map_err(Clone::clone);
-        let probe = Tensor::reserved(device, Element::f32(), &[2, 4], 1);
-        let supported = reserving == Ok(true);
-        if supported {
-            drop(probe.expect("advertised device reservation must work"));
-        } else {
-            match reserving {
-                Ok(_) => assert!(matches!(probe, Err(TensorError::Unreservable { why: None, .. })), "unadvertised reservation must be refused"),
-                Err(why) => assert!(
-                    matches!(&probe, Err(TensorError::Unreservable { why: Some(refused), .. }) if *refused == why),
-                    "a refused reservation must be refused with its reason"
-                ),
-            }
-            eprintln!("{:?}: device reservations unsupported", device.backend());
-            assert!(std::env::var_os("SEISMIC_TEST_BACKEND").is_none(), "selected backend cannot execute reservation checks");
+/// A record port binds a store of one record a slab (a bank's records),
+/// each record a granule of the device's pool, through the store's address
+/// table: a graph bound once reads each record wherever its slab lies, and
+/// reads the slabs added and freed after it was bound with no rebind. On
+/// the backends whose `scale_records` declares its record port (Metal,
+/// Vulkan).
+#[test]
+fn a_record_port_reads_pooled_records_through_their_table() {
+    let (records, n) = (4u64, 256u64);
+    let values = |record: u64| (0..n).map(|index| (record * n + index) as f32 + 1.0).collect::<Vec<_>>();
+    let record_ports = seismic_native_tests::every_device()
+        .into_iter()
+        .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Vulkan));
+    for device in record_ports {
+        let backend = device.backend();
+        let store = seismic::SlabTensor::in_pool(
+            &seismic_native_tests::pool(&device),
+            1,
+            records,
+            &[seismic::SlabRegion { element: Element::f32(), row_shape: vec![n] }],
+        )
+        .unwrap();
+        let write = |record: u64| {
+            store
+                .region_rows(0, record, 1)
+                .unwrap()
+                .write_from_host(&f32_bytes(&values(record)))
+                .unwrap()
+        };
+        for record in 0..2 {
+            assert_eq!(store.add_slab(seismic::SlabFill::Unwritten).unwrap(), record as usize);
+            write(record);
         }
-        supported
-    }).collect()
-}
-
-/// A resize to `rows` that must be refused: why, and the resizer back.
-fn refused(resizer: Resizer, rows: u64) -> (TensorError, Resizer) {
-    match resizer.recommit(rows) {
-        Ok(_) => panic!("a resize to {rows} rows was not refused"),
-        Err(refusal) => (refusal.error, refusal.resizer),
+        let view = store.logical_region(0).unwrap();
+        let scale = scale_records::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
+        let mut graph = device.native_graph();
+        let x = graph.port(Element::f32(), view.extents()).unwrap();
+        let tripled = graph
+            .enqueue(&scale, scale_records::WorkflowArgs { x: x.tensor().into(), factor: seismic::Argument::from(3.0) })
+            .unwrap()
+            .value;
+        graph.export(&tripled).unwrap();
+        let plan = graph.seal().unwrap();
+        let bound = plan.bind_static(&[(&x, &view)]).unwrap();
+        let mut slot = plan.new_slot().unwrap();
+        let mut run = |backed: &[u64], step: &str| {
+            let (outputs, completion) = slot.attach(bound.bindings(), plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+            completion.wait().unwrap();
+            let read = read_f32(&outputs.exported(&tripled).unwrap());
+            for &record in backed {
+                let at = (record * n) as usize..((record + 1) * n) as usize;
+                let expected = values(record).iter().map(|value| value * 3.0).collect::<Vec<_>>();
+                assert_eq!(read[at], expected[..], "{backend:?}: record {record} after {step}");
+            }
+        };
+        run(&[0, 1], "binding");
+        for record in 2..records {
+            assert_eq!(store.add_slab(seismic::SlabFill::Unwritten).unwrap(), record as usize);
+            write(record);
+        }
+        run(&[0, 1, 2, 3], "adding slabs");
+        assert!(store.free_slab(1).unwrap());
+        run(&[0, 2, 3], "freeing a slab");
+        assert_eq!(store.add_slab(seismic::SlabFill::Unwritten).unwrap(), 1);
+        write(1);
+        run(&[0, 1, 2, 3], "backing the freed slot again");
     }
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-/// A sealed graph statically bound to a view of a reserved tensor's rows,
-/// tripling them: the binding the recommit tests run unchanged across
-/// recommits. It reaches them a row at a time, as chunked storage binds
-/// (`scale_records`' record port on chunked backends).
-fn tripling_graph(
-    device: &Device,
-    view: &Tensor,
-) -> (
-    seismic::NativeGraphPlan,
-    seismic::BoundNativeGraphPlan,
-    seismic::WorkflowTensor,
-) {
-    let scale = scale_records::native_for_device(
-        device,
-        &NativeSpecialization::new().with_param("ROWS", 1),
-    )
-    .unwrap();
-    let mut graph = device.native_graph();
-    let x = graph.port(Element::f32(), view.extents()).unwrap();
-    let tripled = graph
-        .enqueue(
-            &scale,
-            scale_records::WorkflowArgs {
-                x: x.tensor().into(),
-                factor: seismic::Argument::from(3.0),
-            },
-        )
-        .unwrap()
-        .value;
-    graph.export(&tripled).unwrap();
-    let plan = graph.seal().unwrap();
-    let bound = plan.bind_static(&[(&x, view)]).unwrap();
-    (plan, bound, tripled)
-}
-
-/// A reserved tensor recommits in place beneath a graph bound to it: the
-/// tensor, its views and the bound graph stay valid with no rebind, and the
-/// graph reads the rows' current contents after a grow and a shrink. Kept
-/// rows keep their contents; rows backed again read zero, including those a
-/// shrink left inside a kept granule. Host access past the committed rows is
-/// refused.
-#[test]
-fn a_reserved_tensor_recommits_in_place_beneath_a_bound_graph() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        // 1 KiB rows: 2 MiB granules (Metal, CUDA) are mapped, released and
-        // mapped again.
-        let (rows, n, bound) = (8192u64, 256u64, 8u64);
-        let (grow, shrink, regrow) = (6000u64, 16u64, 5000u64);
-        let row_values = |count: u64, salt: u64| {
-            (0..count * n)
-                .map(|index| ((index + salt) % 97) as f32 * 0.5 + 1.0)
-                .collect::<Vec<_>>()
-        };
-        let with_zeros = |values: &[f32], count: u64| {
-            let mut all = values.to_vec();
-            all.resize((count * n) as usize, 0.0);
-            all
-        };
-        let tripled = |values: &[f32]| values.iter().map(|value| value * 3.0).collect::<Vec<_>>();
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], bound).unwrap();
-        assert_eq!(reserved.committed_rows(), bound, "{backend:?}");
-        assert!(
-            reserved.read_to_host().is_err(),
-            "{backend:?}: host access past the committed rows"
-        );
-        let mut view = reserved.slice_leading(0, bound).unwrap();
-        let first = row_values(bound, 0);
-        view.write_from_host(&f32_bytes(&first)).unwrap();
-        let (plan, graph, output) = tripling_graph(&device, &view);
-        let mut slot = plan.new_slot().unwrap();
-        let mut run = |expected: &[f32], step: &str| {
-            let (outputs, completion) = slot
-                .attach(graph.bindings(), plan.new_outputs().unwrap())
-                .unwrap()
-                .submit()
-                .unwrap();
-            completion.wait().unwrap();
-            assert_eq!(
-                read_f32(&outputs.exported(&output).unwrap()),
-                tripled(expected),
-                "{backend:?}: the bound graph after {step}"
-            );
-        };
-        run(&first, "binding");
-
-        let resizer = resizer.recommit(grow).unwrap();
-        assert_eq!(reserved.committed_rows(), grow, "{backend:?}");
-        assert_eq!(view.committed_rows(), bound, "{backend:?}");
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, grow).unwrap()),
-            with_zeros(&first, grow),
-            "{backend:?}: grown rows read zero"
-        );
-        let second = row_values(grow, 1);
-        reserved
-            .slice_leading(0, grow)
-            .unwrap()
-            .write_from_host(&f32_bytes(&second))
-            .unwrap();
-        run(&second[..(bound * n) as usize], "a grow");
-
-        let resizer = resizer.recommit(shrink).unwrap();
-        assert_eq!(reserved.committed_rows(), shrink, "{backend:?}");
-        assert!(
-            reserved.slice_leading(0, shrink + 1).unwrap().read_to_host().is_err(),
-            "{backend:?}: host access past the committed rows after a shrink"
-        );
-        run(&second[..(bound * n) as usize], "a shrink");
-
-        let resizer = resizer.recommit(regrow).unwrap();
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, regrow).unwrap()),
-            with_zeros(&second[..(shrink * n) as usize], regrow),
-            "{backend:?}: rows released and backed again read zero"
-        );
-        run(&second[..(bound * n) as usize], "a regrow");
-        // A whole commitment is host-accessible as one tensor.
-        resizer.recommit(rows).unwrap();
-        assert_eq!(read_f32(&reserved).len(), (rows * n) as usize, "{backend:?}");
-    }
-}
-
-/// A reserved tensor is charged for the granules that back its committed
-/// rows, and on chunked storage for its record table too (one 8-byte device
-/// address a row, formed with the tensor), and the charge follows each
-/// recommit: each storage placement carries its declared owners, a
-/// granule-aligned commitment is charged exactly, and any other is rounded
-/// up to less than one granule more.
-#[test]
-fn a_reserved_tensor_is_charged_for_its_backed_granules() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        // 1 KiB rows: 2048 rows fill a 2 MiB granule.
-        let (rows, n, row) = (16384u64, 256u64, 1024u64);
-        let reservation = device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves");
-        let record = std::num::NonZeroU64::new(row).unwrap();
-        let granule = reservation.of_records(seismic::ReservedRecords::of(record)).granule;
-        let table = reservation.table_bytes(rows).unwrap();
-        let before = storage_charged(&device);
-        let (reserved, mut resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], 8).unwrap();
-        let storage = reserved.observe_storage();
-        for committed in [8, 2048, 6000, 4096, 1, 16384] {
-            resizer = resizer.recommit(committed).unwrap();
-            let charged = storage.charged_bytes().unwrap();
-            let backed = charged - table;
-            let bytes = committed * row;
-            assert_eq!(reserved.storage_bytes(), bytes, "{backend:?}");
-            assert_charged_where_placed(&device, &before, reservation.charges(ReservedContract::DeviceOnly, seismic::ReservedRecords::of(record), rows, bytes).unwrap());
-            assert!(
-                backed >= bytes && backed - bytes < granule,
-                "{backend:?}: {committed} rows backed by {backed} charged bytes"
-            );
-            if bytes % granule == 0 {
-                assert_eq!(backed, bytes, "{backend:?}");
-            }
-            assert_eq!(charged, reservation.charge(seismic::ReservedRecords::of(record), rows, bytes).unwrap(), "{backend:?}: topology charge");
-        }
-        drop((reserved, resizer));
-        assert_eq!(storage.charged_bytes(), None);
-        assert_eq!(storage_charged(&device), before, "{backend:?}: every store releases its charge");
-    }
-}
-
-/// A recommit waits for submitted device work that uses the tensor: once it
-/// returns, every run queued before it has completed.
-#[test]
-fn a_recommit_waits_for_device_work_in_flight() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let (rows, n, bound) = (8192u64, 256u64, 4096u64);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], bound).unwrap();
-        let view = reserved.slice_leading(0, bound).unwrap();
-        let (plan, graph, _) = tripling_graph(&device, &view);
-        let completions = (0..32)
-            .map(|_| {
-                plan.new_slot()
-                    .unwrap()
-                    .attach(graph.bindings(), plan.new_outputs().unwrap())
-                    .unwrap()
-                    .submit()
-                    .unwrap()
-                    .1
-            })
-            .collect::<Vec<_>>();
-        resizer.recommit(bound + 1).unwrap();
-        assert!(
-            completions.iter().all(|completion| completion.is_complete()),
-            "{backend:?}: a recommit returned before the work using the tensor completed"
-        );
-        for completion in completions {
-            completion.wait().unwrap();
-        }
-    }
-}
-
-/// A growth the device's limit refuses leaves the tensor as it was: its
-/// commitment, contents and charge. A shrink needs no grant, so it succeeds
-/// at the limit.
-#[test]
-fn a_refused_growth_leaves_the_reserved_tensor_unchanged() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let (rows, n) = (16384u64, 256u64);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], 64).unwrap();
-        let contents = (0..64 * n).map(|value| value as f32).collect::<Vec<_>>();
-        reserved
-            .slice_leading(0, 64)
-            .unwrap()
-            .write_from_host(&f32_bytes(&contents))
-            .unwrap();
-        let storage = reserved.observe_storage();
-        let charge = storage.charged_bytes().unwrap();
-        let limit = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(limit)).unwrap();
-        let (error, resizer) = refused(resizer, rows);
-        assert!(
-            matches!(
-                error,
-                TensorError::Execution(ExecutionError::AllocationCapacity { .. })
-            ),
-            "{backend:?}"
-        );
-        assert_eq!(reserved.committed_rows(), 64, "{backend:?}");
-        assert_eq!(storage.charged_bytes(), Some(charge), "{backend:?}");
-        assert_eq!(device.device_ledger().charged, limit);
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, 64).unwrap()),
-            contents,
-            "{backend:?}"
-        );
-        let resizer = resizer.recommit(16).unwrap();
-        assert_eq!(reserved.committed_rows(), 16, "{backend:?}");
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-        resizer.recommit(rows).unwrap();
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, 16).unwrap()),
-            contents[..(16 * n) as usize],
-            "{backend:?}"
-        );
-    }
-}
-
-/// Chunked reserved storage, which is no one buffer, is refused where
-/// device work would bind it directly: at a native port not marked
-/// `records` (`scale_rows`), on every backend whose reservations are chunks
-/// (Metal's, Vulkan's). Its record port (`scale_records`) binds it.
-#[test]
-fn a_chunked_reserved_tensor_binds_only_through_a_record_port() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let reservation = device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves");
-        if !reservation.chunked() {
-            continue;
-        }
-        let (rows, n) = (8u64, 64u64);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows).unwrap();
-        let view = reserved.slice_leading(0, rows).unwrap();
-        let direct = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
-        let mut graph = device.native_graph();
-        let x = graph.port(Element::f32(), view.extents()).unwrap();
-        let scaled = graph
-            .enqueue(&direct, scale_rows::WorkflowArgs { x: x.tensor().into(), factor: seismic::Argument::from(3.0) })
-            .unwrap()
-            .value;
-        graph.export(&scaled).unwrap();
-        let plan = graph.seal().unwrap();
-        assert!(
-            matches!(plan.bind_static(&[(&x, &view)]), Err(CallError::Workflow(seismic::WorkflowError::ChunkedBinding { .. }))),
-            "{backend:?}: a direct port refuses chunked storage"
-        );
-        drop(tripling_graph(&device, &view));
-        drop((view, reserved, resizer));
-    }
-}
-
-/// A shrink of a reserved tensor returns its pages to the host by the time
-/// its recommit returns, and a regrow takes fresh ones, as the host's one
-/// available reading (`seismic::host_available`) sees them: the memory
-/// ledger counts a release free at the first reading after it. On Metal a reservation bound as
-/// one buffer over its range kept its pages past every release until it was
-/// unmapped (M4 Pro, macOS 15.7.9, 2026-11-12: 2 GiB released of 4 GiB of
-/// written rows raised host free memory by nothing within 1 s), while its
-/// chunks return theirs within 50 ms. A measurement of the host's memory,
-/// which other processes move: run it alone, on a host with 4 GiB to spare.
-#[test]
-#[ignore = "a measurement of host memory: run alone with --ignored"]
-fn a_reserved_tensors_shrink_returns_its_pages_to_the_host() {
-    const MIB: u64 = 1 << 20;
-    // 1 MiB rows; host_available reads the kernel's live counts.
-    let (rows, n) = (4096u64, MIB / 4);
-    let available = || seismic::host_available().expect("host memory reads").available as i64;
-    let settled = || {
-        std::thread::sleep(Duration::from_millis(100));
-        available()
-    };
-    // Random bytes, so the compressor takes nothing back from them.
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let chunk: Vec<u8> = (0..64 * MIB / 8)
-        .flat_map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()
-        })
-        .collect();
-    let write = |tensor: &Tensor, from: u64, to: u64| {
-        for start in (from..to).step_by(64) {
-            let end = (start + 64).min(to);
-            let mut part = tensor.slice_leading(start, end).unwrap();
-            part.write_from_host(&chunk[..((end - start) * MIB) as usize]).unwrap();
-        }
-    };
-    let gib = |bytes: i64| bytes as f64 / (1u64 << 30) as f64;
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows).unwrap();
-        write(&reserved, 0, rows);
-        let held = settled();
-        let resizer = resizer.recommit(rows / 2).unwrap();
-        let at_return = available();
-        // How long the host took to show 90% of the shrink, if not at once.
-        let returned = Instant::now();
-        let half = (rows / 2 * MIB) as i64;
-        while available() - held < half * 9 / 10 && returned.elapsed() < Duration::from_secs(1) {}
-        let shown = returned.elapsed();
-        let released = settled();
-        eprintln!(
-            "{backend:?}: a shrink of {:.2} GiB raised host available memory {:.2} GiB as its recommit returned, 90% of it {:.1} ms later, {:.2} GiB by 100 ms",
-            gib(half),
-            gib(at_return - held),
-            shown.as_secs_f64() * 1e3,
-            gib(released - held)
-        );
-        assert!(
-            at_return - held >= half * 9 / 10,
-            "{backend:?}: the shrink returned {:.2} GiB of {:.2} as its recommit returned",
-            gib(at_return - held),
-            gib(half)
-        );
-        let resizer = resizer.recommit(rows).unwrap();
-        write(&reserved, rows / 2, rows);
-        let regrown = settled();
-        eprintln!("{backend:?}: the regrow took {:.2} GiB", gib(released - regrown));
-        assert!(released - regrown >= half * 9 / 10, "{backend:?}: the regrow took {:.2} GiB of {:.2}", gib(released - regrown), gib(half));
-        drop((reserved, resizer));
-    }
-}
-
-/// The device's single-allocation limit bounds each native allocation
-/// backing a reserved tensor, never its address range: a reservation past
-/// the limit with a small commitment is made. Where one allocation backs the
-/// committed bytes, a growth past the limit is refused, leaving the tensor
-/// as it was; where each chunk is its own allocation (chunked storage), the
-/// limit bounds a chunk, so a reservation of records whose chunk passes it
-/// is refused. A limit that is the host's address space (the CPU backend's)
-/// bounds no device allocation, so there is none to exercise.
-#[test]
-fn the_allocation_limit_bounds_each_allocation_backing_a_reservation() {
-    let capacity = |error: TensorError, limit: u64| {
-        matches!(
-            error,
-            TensorError::Execution(ExecutionError::AllocationCapacity { available, .. })
-                if available == limit
-        )
-    };
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let limit = match device.info().limits().max_allocation {
-            AllocationLimit::Device { bytes, .. } => bytes,
-            AllocationLimit::AddressSpace(bytes) => {
-                eprintln!("{backend:?}: no device allocation bound to exercise, the host's address space ({bytes} bytes)");
-                continue;
-            }
-        };
-        // 1 MiB rows, two more than the limit holds.
-        let n = 1u64 << 18;
-        let rows = limit / (4 * n) + 2;
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], 1).unwrap();
-        assert_eq!(reserved.committed_rows(), 1, "{backend:?}");
-        if device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves").chunked() {
-            // One record more than the limit.
-            match Tensor::reserved(&device, Element::f32(), &[2, limit / 4 + 1], 1) {
-                Ok(_) => panic!("{backend:?}: a chunk past the limit was reserved"),
-                Err(error) => assert!(capacity(error, limit), "{backend:?}"),
-            }
-            continue;
-        }
-        let (error, resizer) = refused(resizer, rows);
-        assert!(capacity(error, limit), "{backend:?}");
-        assert_eq!(reserved.committed_rows(), 1, "{backend:?}");
-        resizer.recommit(2).unwrap();
-        assert_eq!(reserved.committed_rows(), 2, "{backend:?}");
-    }
-}
-
-/// A region of a reserved tensor lies within its committed rows and pins
-/// them: a recommit beneath any live view of the region is refused, and once
-/// the last one drops, the rows can be released.
-#[test]
-fn a_region_pins_a_reserved_tensors_committed_rows() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let (rows, n) = (8192u64, 256u64);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], 4096).unwrap();
-        assert!(
-            matches!(
-                reserved.region(Element::f32(), &[4097, n], 0),
-                Err(TensorError::Region(RegionError::Unbacked { .. }))
-            ),
-            "{backend:?}: a region past the committed rows"
-        );
-        let region = reserved.region(Element::f32(), &[1024, n], 1024 * n * 4).unwrap();
-        let view = region.slice_leading(0, 16).unwrap();
-        drop(region);
-        let (error, resizer) = refused(resizer, 2047);
-        assert!(
-            matches!(error, TensorError::Region(RegionError::Pinned { .. })),
-            "{backend:?}: a shrink beneath a live view of a region"
-        );
-        assert_eq!(reserved.committed_rows(), 4096, "{backend:?}");
-        let resizer = resizer.recommit(2048).unwrap();
-        let resizer = resizer.recommit(rows).unwrap();
-        drop(view);
-        resizer.recommit(16).unwrap();
-        assert_eq!(reserved.committed_rows(), 16, "{backend:?}");
-    }
-}
-
-/// A resize is prepared beside device work and installed between
-/// submissions. While a growth is prepared on another thread, runs bound to
-/// the tensor read its rows unchanged, and until it is installed nothing the
-/// tensor shows changes: its rows, its charge, host access past them. A
-/// prepare abandoned leaves the tensor as it was. An install charges its
-/// growth at once; a shrink's charge leaves when it is released, on any
-/// thread, once the device work submitted before its install completes,
-/// which hands the resizer back. A region pinned after a shrink's
-/// prepare refuses its install, handing the resizer back.
-#[test]
-fn a_recommit_is_prepared_beside_device_work_and_installed_between_submissions() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let (rows, n, bound, grow, shrink) = (8192u64, 256u64, 1024u64, 6000u64, 16u64);
-        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], bound).unwrap();
-        let first = (0..bound * n).map(|value| (value % 89) as f32).collect::<Vec<_>>();
-        let mut view = reserved.slice_leading(0, bound).unwrap();
-        view.write_from_host(&f32_bytes(&first)).unwrap();
-        let storage = reserved.observe_storage();
-        let charged = storage.charged_bytes().unwrap();
-        let (plan, graph, output) = tripling_graph(&device, &view);
-        let tripled = first.iter().map(|value| value * 3.0).collect::<Vec<_>>();
-        let run = || {
-            let (outputs, completion) = plan
-                .new_slot()
-                .unwrap()
-                .attach(graph.bindings(), plan.new_outputs().unwrap())
-                .unwrap()
-                .submit()
-                .unwrap();
-            completion.wait().unwrap();
-            read_f32(&outputs.exported(&output).unwrap())
-        };
-
-        let prepared = std::thread::scope(|scope| {
-            let preparing = scope.spawn(move || resizer.prepare(grow).unwrap());
-            loop {
-                assert_eq!(run(), tripled, "{backend:?}: a run while a growth is prepared");
-                if preparing.is_finished() {
-                    break preparing.join().unwrap();
-                }
-            }
-        });
-        assert_eq!(reserved.committed_rows(), bound, "{backend:?}");
-        assert_eq!(
-            storage.charged_bytes(),
-            Some(charged),
-            "{backend:?}: a prepared growth is charged once installed"
-        );
-        assert!(
-            reserved.slice_leading(0, bound + 1).unwrap().read_to_host().is_err(),
-            "{backend:?}: host access past the rows before the install"
-        );
-        assert_eq!(run(), tripled, "{backend:?}");
-        let release = prepared.install().unwrap();
-        assert_eq!(reserved.committed_rows(), grow, "{backend:?}");
-        let grown = storage.charged_bytes().unwrap();
-        assert!(grown >= grow * n * 4, "{backend:?}: an installed growth is charged");
-        let resizer = release.release();
-        let mut with_zeros = first.clone();
-        with_zeros.resize((grow * n) as usize, 0.0);
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, grow).unwrap()),
-            with_zeros,
-            "{backend:?}: grown rows read zero"
-        );
-        assert_eq!(run(), tripled, "{backend:?}: a run after the growth");
-
-        let resizer = resizer.prepare(shrink).unwrap().abandon();
-        assert_eq!(reserved.committed_rows(), grow, "{backend:?}");
-        assert_eq!(storage.charged_bytes(), Some(grown), "{backend:?}");
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, grow).unwrap()),
-            with_zeros,
-            "{backend:?}: an abandoned shrink changes nothing"
-        );
-
-        let prepared = resizer.prepare(shrink).unwrap();
-        let region = reserved.region(Element::f32(), &[bound, n], 0).unwrap();
-        let resizer = match prepared.install() {
-            Err(refusal) => {
-                assert!(
-                    matches!(refusal.error, TensorError::Region(RegionError::Pinned { .. })),
-                    "{backend:?}: {:?}",
-                    refusal.error
-                );
-                refusal.resizer
-            }
-            Ok(_) => panic!("{backend:?}: a shrink beneath a region pinned since its prepare"),
-        };
-        drop(region);
-        assert_eq!(reserved.committed_rows(), grow, "{backend:?}");
-
-        // A run submitted before the install reads rows the shrink releases.
-        let (_outputs, in_flight) = plan
-            .new_slot()
-            .unwrap()
-            .attach(graph.bindings(), plan.new_outputs().unwrap())
-            .unwrap()
-            .submit()
-            .unwrap();
-        let release = resizer.prepare(shrink).unwrap().install().unwrap();
-        assert_eq!(reserved.committed_rows(), shrink, "{backend:?}");
-        assert_eq!(
-            storage.charged_bytes(),
-            Some(grown),
-            "{backend:?}: a shrink's charge leaves when it is released"
-        );
-        let resizer = std::thread::spawn(move || release.release()).join().unwrap();
-        assert!(
-            in_flight.is_complete(),
-            "{backend:?}: a release frees rows only once the work submitted before its install completes"
-        );
-        assert!(
-            storage.charged_bytes().unwrap() < grown,
-            "{backend:?}: a release frees the shrink's charge"
-        );
-        assert_eq!(
-            read_f32(&reserved.slice_leading(0, shrink).unwrap()),
-            first[..(shrink * n) as usize],
-            "{backend:?}: kept rows survive"
-        );
-        resizer.recommit(rows).unwrap();
-        assert_eq!(reserved.committed_rows(), rows, "{backend:?}");
-    }
-}
-
-/// A region of a reserved tensor is host-addressed exactly where its backend
-/// declares its reservations host-addressed (`RESERVATIONS_HOST_ADDRESSED`,
-/// which discovery reports: Metal, the CPU), and bytes the
-/// host writes there are the tensor's; the tensor itself, whose rows a
-/// recommit may release, is not host-addressed.
-#[test]
-fn a_reserved_region_is_host_addressed_where_reservations_are_host_memory() {
-    for device in reserving_devices() {
-        let backend = device.backend();
-        let host = device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves").host_addressed;
-        let (reserved, _resizer) = Tensor::reserved(&device, Element::f32(), &[8, 1024], 4).unwrap();
-        assert_eq!(reserved.shared_address(), None, "{backend:?}");
-        let region = reserved.region(Element::f32(), &[2, 1024], 2 * 1024 * 4).unwrap();
-        assert_eq!(region.shared_address().is_some(), host, "{backend:?}");
-        if host {
-            let bytes = (0..2 * 1024 * 4).map(|index| index as u8).collect::<Vec<_>>();
-            unsafe { region.write_shared(0, &bytes) }.unwrap();
-            assert_eq!(region.read_to_host().unwrap(), bytes, "{backend:?}");
-        }
-    }
-}
-
-/// A reserved host tensor (host RAM the device reads in place) exists
-/// exactly where its backend reports a host reservation, which is
-/// host-addressed: it grows, the host writes a region of its rows in place,
-/// a graph bound to that region reads them on the device, and it shrinks,
-/// its charge following each resize: its backing on host storage, and a
-/// record table (where its backend binds one) on the storage it is placed
-/// in, which is never host storage.
-#[test]
-fn a_reserved_host_tensor_is_written_in_place_and_read_on_the_device() {
-    for device in seismic_native_tests::every_device() {
-        let backend = device.backend();
-        let reservation = device.info().reserving(ReservedContract::Shared).expect("the device says how it reserves");
-        let (rows, n) = (8192u64, 256u64);
-        // The charges before the tensor is reserved.
-        let before = storage_charged(&device);
-        let reserved = Tensor::reserved_in(ReservedContract::Shared, &device, Element::f32(), &[rows, n], 8, None);
-        let Some(reservation) = reservation else {
-            assert!(
-                matches!(reserved, Err(TensorError::Unreservable { .. })),
-                "{backend:?}: no host reservation, none reserved"
-            );
-            eprintln!("{backend:?}: host reservations unsupported");
-            assert!(std::env::var_os("SEISMIC_TEST_BACKEND").is_none(), "selected backend cannot execute host reservation check");
-            continue;
-        };
-        assert!(reservation.host_addressed, "{backend:?}: a host reservation is host-addressed");
-        let (reserved, resizer) = reserved.unwrap();
-        let record = std::num::NonZeroU64::new(n * 4).unwrap();
-        // The tensor holds its backed granules and its record table, each
-        // charged to the storage it is placed in.
-        let charged = |committed: u64, resize: &str| {
-            let bytes = committed * n * 4;
-            assert_eq!(reserved.charged_bytes(), reservation.charge(seismic::ReservedRecords::of(record), rows, bytes).unwrap(), "{backend:?}: {resize}");
-            assert_charged_where_placed(&device, &before, reservation.charges(ReservedContract::Shared, seismic::ReservedRecords::of(record), rows, bytes).unwrap());
-        };
-        charged(8, "its backed granules");
-        // 1 KiB rows: 2 MiB granules are mapped, then released.
-        let grown = 6000u64;
-        let resizer = resizer.recommit(grown).unwrap();
-        charged(grown, "a growth's granules");
-        // A region far into the growth, written through its host address.
-        let (first, count) = (5000u64, 16u64);
-        let region = reserved.region(Element::f32(), &[count, n], first * n * 4).unwrap();
-        let address = region.shared_address().expect("a pinned region of host memory");
-        let values = (0..count * n).map(|index| (index % 89) as f32 + 0.25).collect::<Vec<_>>();
-        let bytes = f32_bytes(&values);
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.as_ptr(), bytes.len()) };
-        let (plan, graph, output) = tripling_graph(&device, &region);
-        let (outputs, completion) = plan
-            .new_slot()
-            .unwrap()
-            .attach(graph.bindings(), plan.new_outputs().unwrap())
-            .unwrap()
-            .submit()
-            .unwrap();
-        completion.wait().unwrap();
-        let tripled = values.iter().map(|value| value * 3.0).collect::<Vec<_>>();
-        assert_eq!(
-            read_f32(&outputs.exported(&output).unwrap()),
-            tripled,
-            "{backend:?}: the device reads what the host wrote in place"
-        );
-        drop((outputs, graph, plan, region));
-        let _resizer = resizer.recommit(16).unwrap();
-        assert_eq!(reserved.committed_rows(), 16, "{backend:?}");
-        charged(16, "a shrink releases its granules");
-    }
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
 }
 
 /// What a search's record holds of `record`, a candidate whose numerics
@@ -3871,7 +3251,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     }
 
     // Its own ledgers: the test bounds them alone.
-    let device = seismic::testing::open_backend_own_ledgers(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
+    let (device, tally) = seismic::testing::open_backend_tallied(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
         .unwrap();
     let n = 64;
     let large = 8u64 << 20;
@@ -3895,8 +3275,8 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
     unit.perform(&mut source, None).unwrap();
     // The second point's state is refused by the device's limit.
-    let charged = device.device_ledger().charged;
-    device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged + large / 2)).unwrap();
+    let charged = tally.held();
+    tally.bound(charged + large / 2);
     let work = unit.next().unwrap();
     assert_eq!(work.stage, Stage::Discovery);
     assert_eq!(work.footprint.unpriced, 1, "an unbuilt point has no price");
@@ -3918,7 +3298,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         work.footprint.priced
     );
     // With room for it, the same point is discovered.
-    device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+    tally.bound(u64::MAX);
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }
@@ -3936,13 +3316,14 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     /// that only the measurement's own allocations are refused.
     struct Clamping<'d> {
         device: &'d Device,
+        tally: &'d seismic::memory::Tally,
         n: u64,
         clamp: Option<usize>,
-        kept: [Option<Tensor>; 2],
+        kept: [Vec<Tensor>; 2],
     }
     impl PointSource<'static, split_sum::Entry> for Clamping<'_> {
         fn release(&mut self, point: usize) {
-            self.kept[point] = None;
+            self.kept[point].clear();
         }
         fn points(&self) -> Vec<PointSpec> {
             (0..2)
@@ -3957,10 +3338,13 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
         }
         fn build(&mut self, point: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
             let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
-            self.kept[point] = Some(x.clone());
+            self.kept[point] = vec![x.clone()];
             if self.clamp == Some(point) {
-                self.device.bounds().bound(seismic::Ledger::Own(self.device.device_store()), Some(self.device.device_ledger().charged),
-                ).unwrap();
+                // Fill the entry's active 1 MiB (`CARVED_LIMIT`) `Carver` block
+                // whole so the defaults measurement cannot carve from block slack.
+                let pad = Tensor::zeros(self.device, Element::f32(), &[(1 << 20) / 4])?;
+                self.kept[point].push(pad);
+                self.tally.bound(self.tally.held());
             }
             Ok(seismic::point_inputs::<split_sum::Entry>(
                 vec![split_sum::Args { x: &x }],
@@ -3972,14 +3356,15 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     }
 
     // Its own ledgers: the test bounds them alone.
-    let device = seismic::testing::open_backend_own_ledgers(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
+    let (device, tally) = seismic::testing::open_backend_tallied(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
         .unwrap();
     let n = 64;
     let mut source = Clamping {
         device: &device,
+        tally: &tally,
         n,
         clamp: None,
-        kept: [None, None],
+        kept: [Vec::new(), Vec::new()],
     };
     let mut unit =
         split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
@@ -4011,7 +3396,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     assert!(work.footprint.priced > 0);
     // With room for it, the same point is discovered.
     source.clamp = None;
-    device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+    tally.bound(u64::MAX);
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }

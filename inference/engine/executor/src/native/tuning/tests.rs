@@ -2891,7 +2891,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let placement =
         history_placement(&inputs, magnitude_state::KvCodec::AffineK8V4, None, &point).unwrap();
     assert_eq!(placement.sequences.len(), 2);
-    assert_eq!(placement.sequences[0], [[0, 600]]);
+    assert_eq!(placement.sequences[0], [[0, 512], [512, 600]]);
     let second = &placement.sequences[1];
     assert!(second[0][0] > 600 + 256, "{second:?}");
     assert_eq!(
@@ -2903,7 +2903,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
         .unwrap();
     assert_eq!(placed.class.segments(), second.len().next_power_of_two());
     let history = &placed.histories[0];
-    assert_eq!(history.visible[0][0], [0, 600]);
+    assert_eq!(&history.visible[0][..2], [[0, 512], [512, 600]]);
     assert_eq!(history.visible[1][0], second[0]);
     assert_eq!(
         history.destinations[..2],
@@ -3727,12 +3727,12 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     // beside a gated shared expert in the fused form, by a sigmoid score
     // and no shared expert in the general form. Every lead is a unit.
     let routed = |experts: u64, score, shared: bool| {
-        use crate::planning::fixtures::{descriptor, fixture_definition};
+        use crate::planning::fixtures::{descriptor, fixture_definition_of};
         use magnitude_family_contracts::{
             ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn, Router,
             RouterInput, SharedExpert, SharedExpertGate,
         };
-        let (features, hidden) = (128, 128);
+        let (features, hidden) = (512, 512);
         let silu = |gate: &str, up: &str, extents: &[u64]| FeedForwardUp::Gated {
             activation: ActivationFunction::Silu,
             limit: None,
@@ -3766,7 +3766,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
                 }),
             }))
         };
-        let mut definition = fixture_definition();
+        let mut definition = fixture_definition_of(hidden);
         let blocks = &mut definition.decoder.blocks;
         blocks.extend([blocks[0].clone(), blocks[0].clone()]);
         for (block, layer) in blocks.iter_mut().enumerate() {
@@ -3777,7 +3777,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     // Metal's fused route routes over a multiple of 32 experts.
     let forms = [
         ("routed_route_streamed", routed(256, ScoreFunction::Softmax, true)),
-        ("routed_select_streamed", routed(64, ScoreFunction::Sigmoid, false)),
+        ("routed_select_streamed", routed(256, ScoreFunction::Sigmoid, false)),
     ];
     for (streamed, definition) in forms {
         // The second layer's down as Q4_0 blocks: a binding of its own.
@@ -3788,7 +3788,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             18,
         );
         let plan = |bound: Option<crate::WeightBound>| {
-            crate::ExecutionPlanner::prepare(
+            let prepared = crate::ExecutionPlanner::prepare(
                 &selected,
                 &manifest,
                 &definition,
@@ -3809,18 +3809,28 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
                     conversations: std::num::NonZeroUsize::MIN,
                 },
             )
-            .unwrap()
-            .streaming::<crate::AssessmentMemoryCharge>(&definition, bound)
-            .unwrap()
-            .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
-            .unwrap()
-            .into_draft()
+            .unwrap();
+            let device = prepared.device().clone();
+            let room = crate::StableRoom::of(&device);
+            prepared
+                .streaming::<crate::AssessmentMemoryCharge>(&definition, bound, &room)
+                .unwrap()
+                .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()), &room)
+                .unwrap()
+                .into_draft()
         };
         // The experts stream only where the weights do not all fit: capped at
         // the load's weights less half its experts, so the bank holds half.
         let whole = plan(None);
         let experts = whole.load().expert_bank().expect("a routed load banks its experts");
-        let cap = whole.load().weight_bytes().unwrap() - experts.slot_bytes().unwrap() * (experts.widest().get() / 2);
+        let target_slots = (experts.floor() + experts.widest().get()) / 2;
+        let cap = whole
+            .load()
+            .clone()
+            .with_bank_slots(target_slots, experts.ceiling)
+            .unwrap()
+            .weight_bytes()
+            .unwrap();
         let draft = plan(Some(crate::WeightBound::Cap(cap)));
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
         // A decode launch of a banked layer reads its stack as the bank's
@@ -4022,7 +4032,7 @@ fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
     assert!(before >= 64, "6 GB affords many 64 MB compiles: {before}");
     // Four compiles ran at once; this process's footprint did not move, but
     // the host's room fell 8 GB below its reading as the wave began.
-    let held = compile_wave_price(Some(20 * GB), Some(12 * GB), 4).expect("the room fell");
+    let held = compile_wave_price(20 * GB, Some(12 * GB), 4).expect("the room fell");
     assert_eq!(held, 2 * GB);
     memory.price_compiles(held);
     assert_eq!(memory.compile_host_bytes, 2 * GB);
@@ -4030,9 +4040,8 @@ fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
     let after = memory.compile_threads(&device, room).expect("a host room bounds compiles");
     assert!(after <= 3 && after < before, "the next wave narrows to what 6 GB affords at 2 GB a compile: {after}");
     // A room that did not fall, or a missing reading, prices nothing.
-    assert_eq!(compile_wave_price(Some(20 * GB), Some(20 * GB), 4), None);
-    assert_eq!(compile_wave_price(None, Some(12 * GB), 4), None);
-    assert_eq!(compile_wave_price(Some(20 * GB), None, 4), None);
+    assert_eq!(compile_wave_price(20 * GB, Some(20 * GB), 4), None);
+    assert_eq!(compile_wave_price(20 * GB, None, 4), None);
 }
 
 /// A DeepSeek V4.1 load on Metal refused routed_experts' second discovery

@@ -2,7 +2,7 @@
 use crate::test_support::metal_device;
 use crate::{compile, profile, Metal};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
 };
 use seismic_compiler::executable::DeviceService;
 use seismic_ir::construction::{AllocationPlan, Construction};
@@ -20,7 +20,7 @@ use seismic_lang::types::DType;
 #[test]
 fn matrix_operand_preserves_pre_and_post_plane_views() {
     let device = metal_device();
-    let target = profile::open_device(&device, crate::test_support::store()).unwrap();
+    let target = profile::open_device(&device, crate::test_support::probes()).unwrap();
     let programs = crate::test_support::programs(&device, &target);
     let representation = registry::representation("q8g32s").unwrap();
     let RepresentationKind::Packed(layout) = &registry::representation_info(representation).kind
@@ -208,17 +208,17 @@ fn matrix_operand_preserves_pre_and_post_plane_views() {
             arena.eval_nat_u64(*expression, &values).unwrap();
     }
     words[emission.words.workgroup_first as usize] = 32;
-    let input_buffer = device.allocate(input.len() as u64, 16).unwrap();
+    let input_buffer = device.allocate(crate::topology::SHARED_KIND, input.len() as u64, 16, &crate::test_support::entry()).unwrap();
     device.write(&input_buffer, 0, &input).unwrap();
-    let output_buffer = device.allocate(256, 16).unwrap();
+    let output_buffer = device.allocate(crate::topology::SHARED_KIND, 256, 16, &crate::test_support::entry()).unwrap();
     let word_bytes = words
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
-    let word_buffer = device.allocate(word_bytes.len() as u64, 8).unwrap();
+    let word_buffer = device.allocate(crate::topology::SHARED_KIND, word_bytes.len() as u64, 8, &crate::test_support::entry()).unwrap();
     device.write(&word_buffer, 0, &word_bytes).unwrap();
-    let unused = device.allocate(16, 16).unwrap();
-    let command = device.queue().commandBuffer().unwrap();
+    let unused = device.allocate(crate::topology::SHARED_KIND, 16, 16, &crate::test_support::entry()).unwrap();
+    let command = device.command_buffer().unwrap();
     let encoder = command.computeCommandEncoder().unwrap();
     encoder.setComputePipelineState(&native.pipeline().state);
     for (slot, buffer) in [

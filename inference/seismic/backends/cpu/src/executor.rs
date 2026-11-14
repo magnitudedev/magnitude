@@ -1,7 +1,6 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
 use crate::buffer::{Buffer, WritableBuffer};
-use seismic_reservation::{AllocationFailure, Pages, Resizer};
 use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
@@ -12,31 +11,32 @@ use seismic_compiler::executable::{
 use seismic_ir::schedule::FillValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
+use seismic_memory::entry::Entry;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Device;
 
 impl Device {
-    /// Zeroed memory over a host address reservation of `reserved` bytes in
-    /// `granule`-byte granules with the leading `committed` bytes backed,
-    /// and its resizer; see [`WritableBuffer::reserved`].
-    pub fn allocate_reserved(
-        &self,
-        committed: u64,
-        reserved: u64,
-        granule: u64,
-    ) -> Result<(WritableBuffer, Resizer<Pages>), ExecutionError> {
-        WritableBuffer::reserved(committed, reserved, granule).map_err(allocation_error)
+    /// One granule pool block of `bytes` in `kind`, the backend's one kind:
+    /// host pages of its own at the page, whatever its size, backed and
+    /// zero, charged exactly to `entry` ([`WritableBuffer::pages`]): the
+    /// pool lays granules from the block's base at its granule alignment.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableBuffer, ExecutionError> {
+        assert_eq!(kind, crate::topology::kind().id, "invariant violated: a CPU block of kind {kind}");
+        WritableBuffer::pages(bytes, entry)
     }
+
 }
 
 impl DeviceService<Cpu> for Device {
     type Buffer = Buffer;
     type Writable = WritableBuffer;
 
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<WritableBuffer, ExecutionError> {
-        WritableBuffer::new(bytes, alignment).map_err(allocation_error)
+    /// Host memory, the backend's one kind.
+    fn allocate(&self, kind: u32, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<WritableBuffer, ExecutionError> {
+        assert_eq!(kind, crate::topology::kind().id, "invariant violated: a CPU allocation of kind {kind}");
+        WritableBuffer::new(bytes, alignment, entry)
     }
 
     fn write(&self, buffer: &WritableBuffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
@@ -61,6 +61,9 @@ impl DeviceService<Cpu> for Device {
 pub struct Executor {
     /// Shared by every CPU device of the process (`open_host`).
     workers: Arc<Mutex<Workers>>,
+    /// The device's own entry of the host store, which the pool's scratch
+    /// this device's launches grow is charged to.
+    own: Arc<dyn Entry>,
     /// The device's properties (`seismic_lang::device::cpu`): its units are
     /// the pool's participants, the submitting thread included.
     properties: seismic_lang::device::cpu::Properties,
@@ -86,7 +89,7 @@ impl Executor {
         seismic_compiler::errors::TargetError,
     > {
         let mut workers = self.workers.lock().expect("CPU worker pool lock poisoned");
-        crate::profile::profile_for_workers(&mut workers, device)
+        crate::profile::profile_for_workers(&mut workers, &self.own, device)
     }
 
     /// The device's properties.
@@ -111,17 +114,18 @@ impl Executor {
     ) -> (Result<(), ExecutionError>, (f64, f64)) {
         let mut workers = self.workers.lock().expect("CPU worker-pool lock poisoned");
         let started = clock();
-        let outcome = workers.run_native(steps).map_err(launch_error);
+        let outcome = workers.run_native(&self.own, steps).map_err(launch_error);
         (outcome, (started, clock()))
     }
 
-    pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>) -> Self {
+    pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>, own: Arc<dyn Entry>) -> Self {
         let participants = workers
             .lock()
             .expect("CPU worker-pool lock poisoned")
             .count();
         Self {
             workers,
+            own,
             properties: seismic_lang::device::cpu::describe(&Pool { participants }, &Default::default())
                 .expect("a worker pool answers its participants"),
         }
@@ -136,12 +140,15 @@ impl NativeExecutor<Cpu> for Executor {
     fn begin_submission(&self) -> Result<Self::Submission, ExecutionError> {
         Ok(Submission {
             workers: self.workers.clone(),
+            own: self.own.clone(),
         })
     }
 }
 
 pub struct Submission {
     workers: Arc<Mutex<Workers>>,
+    /// The [`Executor`]'s own entry, which its scratch is charged to.
+    own: Arc<dyn Entry>,
 }
 
 pub struct Completed;
@@ -370,6 +377,7 @@ impl Submission {
             .lock()
             .expect("CPU worker-pool lock poisoned")
             .run(
+                &self.own,
                 kernel.entry,
                 &frame,
                 workgroups,
@@ -446,12 +454,8 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
     })
 }
 
-fn allocation_error(error: AllocationFailure) -> ExecutionError {
-    ExecutionError::AllocationFailed(error.to_string())
-}
-
 fn launch_error(error: LaunchFailure) -> ExecutionError {
     match error {
-        LaunchFailure::Scratch(error) => allocation_error(error),
+        LaunchFailure::Scratch(error) => error,
     }
 }

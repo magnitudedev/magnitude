@@ -11,6 +11,7 @@
 //! and the tensors bound to external ports; attaching checks those bindings
 //! alone, so per-run host work does not revalidate nodes.
 
+#[cfg(any(test, target_os = "macos"))]
 use super::hazard::{Reach, Through};
 use super::point::{GraphPoint, GraphTiming};
 use super::spans::{NativeSpans, Stamp};
@@ -28,7 +29,6 @@ use crate::api::kernel::{
     EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny, PendingWorkflowResults,
     ViewOperation, WorkflowResultRef, WorkflowTensorArgument,
 };
-use crate::api::tensor::RecordPlacement;
 use crate::api::tensor::{Records, TensorInner};
 use crate::api::{CallError, GraphBuffer, LayoutMismatch, TensorError, WorkflowError};
 use crate::driver::Allocation;
@@ -2041,6 +2041,9 @@ struct PortUse {
     /// A node binds it to a slab port (`&slab`), so it binds a slab view
     /// or no elements.
     slab: bool,
+    /// A node binds it as plain elements (neither `&slab` nor `records`,
+    /// and not a host port), so it binds no non-empty slab view.
+    plain: bool,
     /// A node binds it other than as a record port (a host port, never
     /// bound, does not), so it binds no chunked storage.
     direct: bool,
@@ -2212,7 +2215,8 @@ impl Executable {
             };
             let (extents, strides) = (&descriptor.extents, &descriptor.strides);
             let (record, bound) = (record_ports[sites.len()], kernel.bound[sites.len()]);
-            if !self.use_site(&mut site, record, bound, descriptor.representation, extents, strides, ports) {
+            let slab = kernel.addresses_slab(ordinal);
+            if !self.use_site(&mut site, record, slab, bound, descriptor.representation, extents, strides, ports) {
                 return Err(WorkflowError::RecordPortBinding {
                     parameter: parameter.name.clone(),
                 });
@@ -2253,7 +2257,7 @@ impl Executable {
                 records: SiteRecords::None,
             };
             let record = record_ports[sites.len()];
-            if !self.use_site(&mut site, record, true, spec.representation, &spec.extents, &spec.strides, ports) {
+            if !self.use_site(&mut site, record, false, true, spec.representation, &spec.extents, &spec.strides, ports) {
                 return Err(WorkflowError::RecordPortBinding {
                     parameter: format!("result {ordinal}"),
                 });
@@ -2338,6 +2342,7 @@ impl Executable {
         &mut self,
         site: &mut Site,
         record: bool,
+        slab: bool,
         bound: bool,
         representation: RepresentationId,
         extents: &[u64],
@@ -2379,6 +2384,7 @@ impl Executable {
             // A host port is ordered by, never bound: it binds any storage.
             (Region::External(port), false) => {
                 self.port_uses[port as usize].direct |= bound;
+                self.port_uses[port as usize].plain |= bound && !slab;
                 true
             }
             (_, record) => !record,
@@ -3113,7 +3119,7 @@ impl NativeGraphPlan {
                 let tensor = bindings.inputs[range.port]
                     .as_ref()
                     .expect("every port of a checked pair is bound");
-                let start = tensor.byte_offset() + range.offset;
+                let start = tensor.descriptor().byte_offset + range.offset;
                 (tensor.alias_identity(), start, start + range.bytes)
             };
             let (first_allocation, first_start, first_end) = range(first);
@@ -4509,8 +4515,8 @@ impl NativeGraphBindings {
                 parameter: format!("port {ordinal}"),
             });
         }
-        if self.uses[ordinal].direct && tensor.chunked() {
-            return Err(WorkflowError::ChunkedBinding {
+        if self.uses[ordinal].plain && tensor.is_slab_view() && tensor.byte_len() > 0 {
+            return Err(WorkflowError::SlabPlainBinding {
                 parameter: format!("port {ordinal}"),
             });
         }
@@ -4606,7 +4612,6 @@ impl ReadyNativeGraphRun<'_> {
                         Ok::<_, TensorError>(External {
                             allocation: tensor.allocation().clone(),
                             offset: tensor.byte_offset(),
-                            placement: tensor.record_placement(),
                             records: uses.records.then(|| tensor.records()).transpose()?,
                         })
                     })
@@ -4662,6 +4667,7 @@ impl ReadyNativeGraphRun<'_> {
                 .filter(|tensor| tensor.holds_binding_lease())
                 .cloned(),
         );
+        #[cfg(any(test, target_os = "macos"))]
         let slabs = self
             .externals
             .iter()
@@ -4681,6 +4687,7 @@ impl ReadyNativeGraphRun<'_> {
         let mut run = QueuedRun {
             plan,
             externals,
+            #[cfg(any(test, target_os = "macos"))]
             slabs,
             workspace: self.slot.workspace.clone(),
             workspace_records: self.slot.workspace_records.clone(),
@@ -4858,7 +4865,8 @@ struct QueuedRun {
     externals: Vec<Option<External>>,
     /// Each port bound to a slab view, with what it reaches (the
     /// encodings order by it).
-    slabs: Vec<(usize, super::hazard::SlabReach)>,
+    #[cfg(any(test, target_os = "macos"))]
+    slabs: Vec<(usize, Arc<crate::api::tensor::SlabReach>)>,
     workspace: Option<Arc<Allocation>>,
     /// The slot's workspace record table (`NativeGraphSlot::workspace_records`).
     workspace_records: Option<Arc<Allocation>>,
@@ -4883,10 +4891,6 @@ struct External {
     allocation: Arc<Allocation>,
     /// The view's first byte.
     offset: u64,
-    /// Where the view's records lie, where it has records: packed in its
-    /// chunks on chunked storage (a host port's view; Metal's encoding
-    /// orders by them).
-    placement: Option<RecordPlacement>,
     /// Where a record port binds the port, the view's records.
     records: Option<Arc<Records>>,
 }
@@ -4897,6 +4901,16 @@ impl QueuedRun {
         self.externals[port as usize]
             .as_ref()
             .expect("attach bound every external port")
+    }
+
+    /// What device work reaches through the slab view bound to `port`,
+    /// where a slab view is bound there.
+    #[cfg(any(test, target_os = "macos"))]
+    fn slab(&self, port: u32) -> Option<&crate::api::tensor::SlabReach> {
+        self.slabs
+            .iter()
+            .find(|(slabbed, _)| *slabbed == port as usize)
+            .map(|(_, slab)| &**slab)
     }
 
     /// The records of the tensor bound to `port`, which a record port binds.
@@ -4920,7 +4934,7 @@ impl QueuedRun {
         node.kernel.bind(node.sites.iter().map(|site| match (site.region, site.records) {
             (Region::External(port), SiteRecords::Port(_)) => {
                 let records = run.records(port);
-                let entry = site.offset / records.placement.record();
+                let entry = site.offset / records.record;
                 (
                     &*records.table,
                     records.table_offset + seismic_lang::registry::record_table_entry(entry),
@@ -5058,7 +5072,8 @@ impl DispatchList for PlaceholderRun<'_> {
     }
 
     /// None: a graph's launches keep stream order, whatever they reach.
-    fn reaches<'s>(&'s self, _index: usize, _reaches: &mut Vec<Reach<'s>>) {}
+    #[cfg(any(test, target_os = "macos"))]
+    fn reaches(&self, _index: usize, _reaches: &mut Vec<Reach>) {}
 
     fn runs(&self) -> Option<Vec<super::PlanRun>> {
         Some(vec![super::PlanRun {
@@ -5093,20 +5108,26 @@ impl DispatchList for SequenceList<'_> {
         self.runs[run].encodes(node, ordinal)
     }
 
-    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<Reach<'s>>) {
+    #[cfg(any(test, target_os = "macos"))]
+    fn reaches(&self, index: usize, reaches: &mut Vec<Reach>) {
         let (run, node) = self.nodes[index];
         let run = &self.runs[run];
-        let region = |region: &'s Option<Arc<Allocation>>| {
-            &**region
+        let region = |region: &Option<Arc<Allocation>>| {
+            region
                 .as_ref()
                 .expect("a planned graph storage region is present")
+                .identity()
         };
         for (buffer, site) in run.plan.executable.nodes[node].sites.iter().enumerate() {
             let (allocation, offset, bytes) = match (site.region, site.records) {
                 (Region::External(port), SiteRecords::Port(count)) => {
                     let records = run.records(port);
-                    let first = site.offset / records.placement.record();
-                    records.extend(buffer, first, count, reaches);
+                    match run.slab(port) {
+                        // A slab view's records, one a slab: wherever its
+                        // slabs lie now.
+                        Some(slab) => slab.extend(buffer, &records.table, records.table_offset, reaches),
+                        None => records.extend(buffer, site.offset / records.record, count, reaches),
+                    }
                     continue;
                 }
                 // A workspace record site's records, which its table
@@ -5122,20 +5143,12 @@ impl DispatchList for SequenceList<'_> {
                     continue;
                 }
                 (Region::External(port), SiteRecords::None) => {
-                    let External { allocation, offset: start, placement, .. } = run.external(port);
-                    if let Some((_, slab)) =
-                        run.slabs.iter().find(|(slabbed, _)| *slabbed == port as usize)
-                    {
+                    let External { allocation, offset: start, .. } = run.external(port);
+                    if let Some(slab) = run.slab(port) {
                         slab.extend(buffer, allocation, start + site.offset, reaches);
                         continue;
                     }
-                    // A host port's view of chunked storage reaches its
-                    // records as packed.
-                    let (offset, bytes) = match placement {
-                        Some(placement) => placement.reach(site.offset, site.bytes),
-                        None => (start + site.offset, site.bytes),
-                    };
-                    (&**allocation, offset, bytes)
+                    (allocation.identity(), start + site.offset, site.bytes)
                 }
                 (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset, site.bytes),
                 (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset, site.bytes),

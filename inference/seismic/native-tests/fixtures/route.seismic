@@ -136,8 +136,8 @@ native scale_rows for cpu from "cpu/scale_rows.rs":
         threads_per_threadgroup (min(N, 64), 1, 1)
 
 # `scale_rows` reaching `x` a row at a time where a backend binds record
-# tables: a reserved tensor's rows on chunked storage bind only to
-# a record port. Backends that bind none share `scale_rows`'s source.
+# tables: a store of one record a slab binds through its address table.
+# Backends that bind none share `scale_rows`'s source.
 fn scale_records[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:
     let mut result = zeros_like(x)
     parallel for row in 0..M:

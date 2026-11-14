@@ -13,7 +13,6 @@ mod graph_cost;
 mod instance;
 mod memory;
 pub mod probe;
-pub mod reservation;
 pub mod seal;
 pub mod toolchain;
 pub mod topology;
@@ -22,7 +21,7 @@ pub mod transfer;
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
     Allocation, Calibration, Description, DeviceType, Facts, FormationTarget, Limits, MemoryHeap,
-    MemoryLayout, MemoryType, Probed, Properties, ReservationForm, Reserving, SUBGROUP_WIDTH,
+    MemoryLayout, MemoryType, Probed, Properties, SUBGROUP_WIDTH,
 };
 pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 
@@ -30,9 +29,8 @@ pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 /// backend's code forms a program (the runtime's program former, over the
 /// process's program store).
 pub type VulkanPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::VulkanToolchain>>;
-pub use reservation::{ReservedBuffer, VulkanResizer};
 pub use instance::LoaderError;
-pub use memory::{AllocationAccount, Buffer, MemoryAccounts};
+pub use memory::{Buffer, MemoryStores};
 
 /// Enumerate the physical devices against the floor, from their reported
 /// properties alone: discovery opens no logical device. GPUs come first, so
@@ -48,18 +46,14 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
     Ok(descriptions)
 }
 
-/// Accounts that bound and charge nothing for every kind of a device of
-/// `facts`: a test's, and the probe process's, which allocates only its
-/// probes' few buffers.
-pub(crate) fn unbounded_accounts(facts: &Facts) -> MemoryAccounts {
-    let unbounded = || -> std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount> {
-        std::sync::Arc::new(seismic_compiler::executable::Unbounded)
-    };
-    let kinds = (0..facts.memory.types.len() as u32)
-        .chain([topology::IMPORTED_KIND])
-        .map(|kind| AllocationAccount { kind, account: unbounded() })
-        .collect();
-    MemoryAccounts { host: unbounded(), kinds, driver: unbounded() }
+/// One tally, bounding nothing, as every store of a device of `facts`: a
+/// test's, and the probe process's, which allocates only its probes' few
+/// buffers and keeps no count of its stores apart.
+pub(crate) fn unbounded_stores(facts: &Facts) -> MemoryStores {
+    let tally: std::sync::Arc<dyn seismic_memory::entry::Store> =
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
+    let kinds = (0..facts.memory.types.len() as u32).map(|kind| (kind, tally.clone())).collect();
+    MemoryStores { kinds, host: tally }
 }
 
 /// The devices meeting the floor a test exercises; none without a loader,
@@ -116,7 +110,7 @@ mod tests {
                 facts::hex(&description.facts.uuid)
             );
             if let Err(reason) = &description.floor {
-                let error = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default())
+                let error = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default())
                     .err()
                     .expect("a device discovery reports unavailable does not open");
                 eprintln!("  {error}");
@@ -125,10 +119,10 @@ mod tests {
                 }
                 continue;
             }
-            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).unwrap_or_else(|error| {
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).unwrap_or_else(|error| {
                 panic!("a device discovery reports available opens: {error}")
             });
-            let buffer = device.allocate(1 << 20, 256, None).expect("allocation");
+            let buffer = device.allocate(1 << 20, 256, &device.own()).expect("allocation");
             let bytes = (0..1u32 << 18)
                 .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<_>>();

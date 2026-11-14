@@ -730,6 +730,9 @@ fn history_geometry(
 ) -> Result<magnitude_state::HistoryGeometry, String> {
     let layout =
         magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
+    let context = usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?;
+    let max_advance = usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?;
+    let granule = crate::planning::state_granule(&layout, context, max_advance)?;
     layout
         .target_history
         .iter()
@@ -741,11 +744,7 @@ fn history_geometry(
             _ => false,
         })
         .ok_or("the layers' history domain is not the target's")?
-        .geometry(
-            &layout.target_history,
-            usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?,
-            usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?,
-        )
+        .geometry(&layout.target_history, context, max_advance, granule)
         .map_err(|error| error.to_string())
 }
 
@@ -1345,15 +1344,15 @@ pub struct RoomNow {
     pub host_shared: bool,
 }
 
-/// The room a search is held to, read live while it runs: the load's
-/// ledgers' ([`crate::LoadRoom`]), read afresh at every decision, so a neighbour
-/// that grows while the search runs takes its room from the search's next
-/// admission. A reading that fails reads no room: missing observations never
-/// authorize allocation.
+/// The room a search is held to, asked at every decision: the load's
+/// ledgers' at the reading the load holds ([`crate::LoadRoom`]), every
+/// holding since counted, so what the search and its neighbours in the
+/// process hold takes its room from the search's next admission, and the
+/// search's room is the room the load was planned against.
 pub trait TuningRoom {
     fn now(&self, device: &Device) -> RoomNow;
     /// The rate the machine frees memory at, a generic figure of it
-    /// (`platform::MemoryReserves::release_rate`): what giving a unit's
+    /// (`platform::ReleaseRate`): what giving a unit's
     /// inputs up is priced by before a give-up is observed.
     fn release(&self) -> crate::platform::ReleaseRate;
 }
@@ -1575,14 +1574,25 @@ fn device_separate(device: &Device) -> bool {
     !device.allocations_in_process_footprint()
 }
 
+/// What the ledger counts the device store holding, the driver's memory
+/// brought up to date first.
+fn allocated(device: &Device) -> u64 {
+    device.reconcile_driver_memory();
+    device.allocated()
+}
+
+/// The most [`allocated`] has been since the device's high water was last
+/// restarted, the driver's memory brought up to date first.
+fn high_water(device: &Device) -> u64 {
+    device.reconcile_driver_memory();
+    device.high_water()
+}
+
 impl TuningMemory {
     /// What tuning holds now, as admission counts it: Seismic's charges on
     /// the device since tuning began.
     fn held(&self, device: &Device) -> u64 {
-        device
-            .device_ledger()
-            .charged
-            .saturating_sub(self.began_bytes)
+        allocated(device).saturating_sub(self.began_bytes)
     }
 
     /// What tuning holds now in all: what the process's footprint has
@@ -1737,9 +1747,7 @@ impl TuningMemory {
         }
         self.process_peak_footprint_bytes = self.process_peak_footprint_bytes.max(footprint);
         self.peak_bytes = self.peak_bytes.max(
-            device
-                .device_ledger()
-                .high_water,
+            high_water(device),
         );
         self.held_peak_bytes = self
             .held_peak_bytes
@@ -2540,16 +2548,19 @@ impl TuningInputs<'_, '_> {
         if rows == 0 || extents.first().is_none_or(|&held| rows > held) {
             return Err("a tuning slab has invalid row bounds".into());
         }
-        let mut slab = seismic::SlabTensor::new(
+        let slab = crate::experts::pooled_slabs(
             self.device,
+            seismic::Contract::DeviceOnly,
             rows,
             rows,
-            vec![seismic::SlabRegion {
+            &[seismic::SlabRegion {
                 element: source.element(),
                 row_shape: extents[1..].to_vec(),
             }],
+            1,
         )?;
-        slab.add_slab()?;
+        // Every row is written before the entry reads any.
+        slab.add_slab(seismic::SlabFill::Unwritten)?;
         let bytes = source.slice_leading(0, rows)?.read_to_host()?;
         slab.region_rows(0, 0, rows)?.write_from_host(&bytes)?;
         Ok(slab)
@@ -2933,8 +2944,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
             .expect("a unit performs the work it named")
             .stage;
         let device = tuner.device;
-        let usage = || device.device_ledger();
-        let charged_before = usage().charged;
+        let charged_before = allocated(device);
         let resident = <Self as allocation::Unit>::holding(self) > 0;
         let host_before = seismic::ProcessMemory::footprint_now();
         let peak_before = seismic::ProcessMemory::footprint_peak();
@@ -2967,8 +2977,8 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         }
         tuner
             .memory
-            .piece(unit, stage, charged_before, usage().charged);
-        let within = usage().high_water;
+            .piece(unit, stage, charged_before, allocated(device));
+        let within = high_water(device);
         let room = tuner.room_now();
         tuner.memory.observe(device, within, room);
         tuner.report_progress();
@@ -4021,10 +4031,7 @@ impl<'a> Tuner<'a> {
         else {
             unreachable!("a census follows the count");
         };
-        self.memory.began_bytes = self
-            .device
-            .device_ledger()
-            .charged;
+        self.memory.began_bytes = allocated(self.device);
         self.memory.device_separate = device_separate(self.device);
         // The search holds no more than the platform lets the engine claim
         // ([`TuningRoom`]). Where the device's memory is the host's, its
@@ -4106,9 +4113,7 @@ impl<'a> Tuner<'a> {
             let lowest = std::sync::atomic::AtomicU64::new(u64::MAX);
             let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
                 let formed = ground(compile);
-                if let Some(room) = host_room() {
-                    lowest.fetch_min(room, std::sync::atomic::Ordering::Relaxed);
-                }
+                lowest.fetch_min(host_room(), std::sync::atomic::Ordering::Relaxed);
                 formed
             };
             grounded.extend(workers.each(&groundings[observed..observed + threads], ground));
@@ -4175,10 +4180,7 @@ impl<'a> Tuner<'a> {
                 (key, count)
             })
             .collect::<HashMap<_, _>>();
-        self.memory.mandatory_bytes = self
-            .device
-            .device_ledger()
-            .charged;
+        self.memory.mandatory_bytes = allocated(self.device);
         self.memory.peak_bytes = self.memory.mandatory_bytes;
         let searches = !launches.is_empty();
         self.first_load_search = searches;
@@ -4280,10 +4282,7 @@ impl<'a> Tuner<'a> {
                     }),
             );
         drop(threads);
-        self.memory.ended_bytes = self
-            .device
-            .device_ledger()
-            .charged;
+        self.memory.ended_bytes = allocated(self.device);
         let ended = self.memory.ended_bytes;
         let room = self.room_now();
         self.memory.observe(self.device, ended, room);
@@ -5237,12 +5236,10 @@ fn tuned_entry(
     }
 }
 
-/// Host RAM this process may take now without displacing anyone
-/// ([`seismic::host_room`] of [`seismic::Reclaim::Nothing`]): a compile burst
-/// or a probe is a one-off taker that must not press the host. None where
-/// the host cannot be read.
-pub(super) fn host_room() -> Option<u64> {
-    seismic::host_room(seismic::Reclaim::Nothing).ok()
+/// Host RAM the OS can give a taker now ([`seismic::Supply::total`] of a
+/// [`seismic::host_sample`]): a compile burst's price is how far it falls.
+pub(super) fn host_room() -> u64 {
+    seismic::host_sample().supply.total()
 }
 
 /// What one thread of a wave of `threads` compiles held: how far the host's
@@ -5250,9 +5247,10 @@ pub(super) fn host_room() -> Option<u64> {
 /// least as any of the wave's compiles ended, for each thread. The fall
 /// counts the compiles' memory in any process, a toolchain's compiler
 /// service as well as this one, which the process's footprint does not.
-/// None where either reading is missing or the room did not fall.
-pub(super) fn compile_wave_price(before: Option<u64>, lowest: Option<u64>, threads: usize) -> Option<u64> {
-    let fell = before?.checked_sub(lowest?).filter(|fell| *fell > 0)?;
+/// None where no compile ended (`lowest` is missing) or the room did not
+/// fall.
+pub(super) fn compile_wave_price(before: u64, lowest: Option<u64>, threads: usize) -> Option<u64> {
+    let fell = before.checked_sub(lowest?).filter(|fell| *fell > 0)?;
     Some(fell / threads.max(1) as u64)
 }
 

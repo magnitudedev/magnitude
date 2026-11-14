@@ -6,7 +6,6 @@ mod bank;
 mod codec;
 mod domain;
 mod layout;
-pub mod placement;
 
 pub use advance::{
     CodecConversionStep, OwnedAdvanceBindings, OwnedAdvanceResolution, OwnedChainAdvance,
@@ -16,7 +15,7 @@ pub use advance::{
 pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryReads,
-    HistorySource, batch_state_bytes, produced_domain,
+    HistorySource, StateUnit, produced_domain, slab_regions, state_bytes,
 };
 
 pub use codec::{
@@ -25,12 +24,11 @@ pub use codec::{
     VectorKind,
 };
 pub use layout::{
-    HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
-    banks_per_slab, history_codec, history_geometry, kv_codec_policy, window_pages,
+    HistoryGeometry, HistoryPages, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_ROW_TILE, bank_regions, bank_slab_bytes, banks_per_slab, history_codec,
+    history_geometry, history_pages, kv_codec_policy, smallest_slabs, window_pages,
 };
 
-use placement::{Generation, LogicalId, Placement, PlacementError};
-use seismic::{DType, Device, Element, SlabRegion, SlabTensor, Tensor, TensorStorageObserver};
+use seismic::{DType, Device, Pool, SlabFill, SlabTensor, Tensor};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -53,7 +51,6 @@ pub enum Error {
     /// A step's rows need a slab its provisioning did not back: the step
     /// fits once it provisions.
     Unbacked,
-    Placement(PlacementError),
     UnsupportedBankComponent(BankComponent),
     /// A caller whose launch format carries one history domain met a store
     /// with another number of them.
@@ -79,7 +76,6 @@ impl std::fmt::Display for Error {
                 write!(f, "all {capacity} recurrent banks have live claims")
             }
             Self::Unbacked => f.write_str("a step's rows need a slab its provisioning did not back"),
-            Self::Placement(error) => write!(f, "recurrent bank placement: {error:?}"),
             Self::UnsupportedBankComponent(component) => {
                 write!(f, "recurrent bank component {component:?} is not supported")
             }
@@ -125,12 +121,6 @@ impl From<seismic::TensorError> for Error {
 impl From<LayoutError> for Error {
     fn from(error: LayoutError) -> Self {
         Self::Layout(error)
-    }
-}
-
-impl From<PlacementError> for Error {
-    fn from(error: PlacementError) -> Self {
-        Self::Placement(error)
     }
 }
 
@@ -202,9 +192,8 @@ pub struct PlaneBuffer {
 /// A row is referenced once by every history ([`Claims`]) covering it, so a
 /// prefix is shared by any number of sequences and checkpoints at row
 /// granularity, and a row returns to the free holes only when its last
-/// history drops it. Every history is registered, so compaction can move
-/// referenced rows and rewrite every affected history.
-#[derive(Clone)]
+/// history drops it. Every history is registered, so placement sees every
+/// live history's end ([`Arena::tail_blocked`]).
 struct Arena {
     slab_rows: usize,
     page_rows: usize,
@@ -292,7 +281,10 @@ impl Arena {
         self.free
             .iter()
             .find(|(start, _)| *start == end)
-            .map_or(0, |&(start, count)| count.min(self.page_end(start) - start))
+            .map_or(0, |&(start, count)| {
+                let rest = self.page_end(start) - start;
+                if count >= rest { rest } else { 0 }
+            })
     }
 
     /// Whether a history ending at `end` has a partial last page whose next
@@ -354,152 +346,6 @@ impl Arena {
         } else {
             pages[first + (count - 1) / 2]
         }
-    }
-
-    /// Plan every row move for one shrink against the published placement.
-    /// Destinations are free in that placement, even when several slabs are
-    /// emptied together, so all copies may finish before anything publishes.
-    fn compact_into_slabs(
-        &self,
-        rows: usize,
-        keep: &BTreeSet<usize>,
-    ) -> (Self, Vec<(usize, usize, usize)>) {
-        let mut planned = self.clone();
-        // Whole occupied pages move to free pages of kept slabs at the same
-        // offsets, so every history keeps its page structure (and its span
-        // limit), including the free rows after a history's end.
-        let mut destinations = self
-            .free_pages()
-            .into_iter()
-            .filter(|page| keep.contains(&(page / self.slab_rows)));
-        let mut moved_pages = BTreeMap::new();
-        let mut placed = BTreeMap::new();
-        for (&start, run) in &self.runs {
-            if keep.contains(&(start / self.slab_rows)) {
-                continue;
-            }
-            let (mut row, end) = (start, start + run.count);
-            while row < end {
-                let page = row / self.page_rows * self.page_rows;
-                let to = *moved_pages.entry(page).or_insert_with(|| {
-                    destinations
-                        .next()
-                        .expect("kept slabs have a free page for every moved page")
-                });
-                let piece = end.min(self.page_end(row)) - row;
-                placed.insert(row, (piece, to + row - page));
-                row += piece;
-            }
-        }
-        let moves = if placed.is_empty() {
-            Vec::new()
-        } else {
-            planned.remap(rows, placed)
-        };
-        for slab in self.backed.difference(keep) {
-            planned.unback_empty_slab(*slab);
-        }
-        (planned, moves)
-    }
-
-    /// Rewrite every history through `placed` (old start -> (count, new
-    /// start)); rows outside it keep their address. Rebuilds the runs from
-    /// the rewritten histories and the free holes within `rows` committed
-    /// rows, and returns the placed moves joined where adjacent.
-    fn remap(
-        &mut self,
-        rows: usize,
-        placed: BTreeMap<usize, (usize, usize)>,
-    ) -> Vec<(usize, usize, usize)> {
-        let slab_rows = self.slab_rows;
-        let translate = |start: usize, count: usize| {
-            let mut out = Vec::new();
-            let (mut row, end) = (start, start + count);
-            while row < end {
-                match placed.range(..=row).next_back() {
-                    Some((&from, &(moved, to))) if from + moved > row => {
-                        let taken = (from + moved).min(end) - row;
-                        append_ranges(&mut out, [(to + row - from, taken)], slab_rows);
-                        row += taken;
-                    }
-                    _ => {
-                        let stop = placed.range(row..end).next().map_or(end, |(&from, _)| from);
-                        append_ranges(&mut out, [(row, stop - row)], slab_rows);
-                        row = stop;
-                    }
-                }
-            }
-            out
-        };
-        for entry in self.entries.values_mut() {
-            let mut ranges = Vec::with_capacity(entry.ranges.len());
-            for &(start, count) in &entry.ranges {
-                append_ranges(&mut ranges, translate(start, count), slab_rows);
-            }
-            entry.ranges = ranges;
-        }
-        // Reference counts follow the histories covering each row.
-        let mut events = self
-            .entries
-            .values()
-            .flat_map(|entry| entry.ranges.iter())
-            .flat_map(|&(start, count)| [(start, 1isize), (start + count, -1)])
-            .collect::<Vec<_>>();
-        events.sort_unstable();
-        self.runs.clear();
-        let (mut depth, mut from) = (0isize, 0);
-        let mut last: Option<usize> = None;
-        for (row, delta) in events {
-            if depth > 0 && row > from {
-                let references = depth as usize;
-                let extended = last.and_then(|start| {
-                    let run = self.runs.get_mut(&start)?;
-                    (start + run.count == from
-                        && start / slab_rows == from / slab_rows
-                        && run.references == references)
-                        .then(|| run.count += row - from)
-                });
-                if extended.is_none() {
-                    self.runs.insert(
-                        from,
-                        Run {
-                            count: row - from,
-                            references,
-                        },
-                    );
-                    last = Some(from);
-                }
-            }
-            depth += delta;
-            from = row;
-        }
-        debug_assert_eq!(
-            self.runs.values().map(|run| run.count).sum::<usize>(),
-            self.referenced
-        );
-        self.free.clear();
-        for &slab in self.backed.difference(&self.reserve) {
-            let start = slab * slab_rows;
-            let end = ((slab + 1) * slab_rows).min(rows);
-            let mut cursor = start;
-            for (&run_start, run) in self.runs.range(start..end) {
-                if run_start > cursor {
-                    append_ranges(&mut self.free, [(cursor, run_start - cursor)], slab_rows);
-                }
-                cursor = run_start + run.count;
-            }
-            if end > cursor {
-                append_ranges(&mut self.free, [(cursor, end - cursor)], slab_rows);
-            }
-        }
-        let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(placed.len());
-        for (from, (count, to)) in placed {
-            match moves.last_mut() {
-                Some((f, t, n)) if *f + *n == from && *t + *n == to => *n += count,
-                _ => moves.push((from, to, count)),
-            }
-        }
-        moves
     }
 
     /// Claim `count` rows, in logical order, for a history whose end is row
@@ -750,7 +596,7 @@ impl Arena {
 /// One registered history: address ranges in logical order (physically
 /// adjacent ranges joined). `live` marks the history of a sequence, which can
 /// still grow; checkpoints and tentative rows are frozen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Entry {
     ranges: Vec<(usize, usize)>,
     live: bool,
@@ -835,7 +681,7 @@ impl Tail {
 }
 
 /// A history's claims: one reference on each row of its ranges, registered in
-/// the arena, so the arena knows every history and can relocate them all.
+/// the arena, so the arena knows every history's ranges and end.
 /// Cloning adds a reference to every row, dropping removes one; appending and
 /// splitting move references without touching the arena's counts.
 struct Claims {
@@ -1060,29 +906,29 @@ pub struct HistoryDomainTrace {
 /// The permanently pristine bank every new sequence starts from. It is never
 /// on the free list, so no advance can name it as its successor.
 pub const ZERO_SEED_BANK: usize = 0;
-/// The zero seed's permanent logical claim. Compaction never moves it, since
-/// it occupies the lowest slot.
-const ZERO_SEED_CLAIM: LogicalId = LogicalId(0);
 
 struct BankPoolInner {
+    /// The writable banks the store holds at most.
     capacity: usize,
-    placement: RefCell<Placement>,
+    /// One past the highest committed slot.
+    committed: Cell<usize>,
+    /// The claimed slots, the zero seed's among them for the store's life.
+    claimed: RefCell<BTreeSet<usize>>,
+    /// Committed slots whose slab is released.
     unavailable: RefCell<BTreeSet<usize>>,
-    next_logical: Cell<u64>,
 }
 
-/// A stable logical claim on one row of every recurrent component. The
-/// published placement alone decides which physical row holds it.
+/// A claim on one row of every recurrent component: its slot, fixed for the
+/// claim's life, since no bank moves.
 struct BankClaim {
     pool: Rc<BankPoolInner>,
-    id: LogicalId,
+    slot: usize,
 }
 
 impl Drop for BankClaim {
     fn drop(&mut self) {
-        if self.id != ZERO_SEED_CLAIM {
-            self.pool.placement.borrow_mut().release(self.id)
-                .expect("bank release preserves placement generation");
+        if self.slot != ZERO_SEED_BANK {
+            assert!(self.pool.claimed.borrow_mut().remove(&self.slot), "a live bank's slot is claimed");
         }
     }
 }
@@ -1091,105 +937,85 @@ impl Drop for BankClaim {
 struct BankHandle(Rc<BankClaim>);
 
 impl BankHandle {
-    fn id(&self) -> LogicalId {
-        self.0.id
-    }
-
     fn index(&self) -> usize {
-        self.0
-            .pool
-            .placement
-            .borrow()
-            .resolve(self.0.id)
-            .expect("live bank has a physical placement")
+        self.0.slot
     }
 }
 
-/// Logical bank ownership and its published physical placement. The zero
-/// seed is permanently claimed; writable rows are acquired lowest first.
+/// The store's bank slots and their claims. The zero seed is permanently
+/// claimed; writable slots are acquired lowest first.
 struct BankPool {
     inner: Rc<BankPoolInner>,
 }
 
 impl BankPool {
     fn new(capacity: BankCapacity, committed: usize) -> Result<(Self, BankHandle), Error> {
-        let placement = Placement::new(
-            Generation(0),
-            committed,
-            BTreeMap::from([(ZERO_SEED_CLAIM, ZERO_SEED_BANK)]),
-        )?;
+        assert!(committed > ZERO_SEED_BANK, "a store commits its zero seed's slot");
         let inner = Rc::new(BankPoolInner {
             capacity: capacity.total()?,
-            placement: RefCell::new(placement),
+            committed: Cell::new(committed),
+            claimed: RefCell::new(BTreeSet::from([ZERO_SEED_BANK])),
             unavailable: RefCell::new(BTreeSet::new()),
-            next_logical: Cell::new(1),
         });
         let seed = BankHandle(Rc::new(BankClaim {
             pool: inner.clone(),
-            id: ZERO_SEED_CLAIM,
+            slot: ZERO_SEED_BANK,
         }));
         Ok((Self { inner }, seed))
     }
 
     fn acquire(&self) -> Result<BankHandle, Error> {
-        let published = self.inner.placement.borrow().clone();
-        let occupied = published
-            .resources()
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let unavailable = self.inner.unavailable.borrow();
-        let index = (1..self.committed())
-            .find(|index| !occupied.contains(index) && !unavailable.contains(index))
-            .ok_or(Error::BanksExhausted {
-                capacity: self.inner.capacity,
-            })?;
-        let id = LogicalId(self.inner.next_logical.get());
-        let mut resources = published.resources().clone();
-        resources.insert(id, index);
-        *self.inner.placement.borrow_mut() = published.with_resources(resources)?;
-        self.inner
-            .next_logical
-            .set(id.0.checked_add(1).expect("bank logical id exhausted"));
+        let slot = {
+            let claimed = self.inner.claimed.borrow();
+            let unavailable = self.inner.unavailable.borrow();
+            (1..self.committed())
+                .find(|slot| !claimed.contains(slot) && !unavailable.contains(slot))
+                .ok_or(Error::BanksExhausted {
+                    capacity: self.inner.capacity,
+                })?
+        };
+        self.inner.claimed.borrow_mut().insert(slot);
         Ok(BankHandle(Rc::new(BankClaim {
             pool: self.inner.clone(),
-            id,
+            slot,
         })))
     }
 
     fn committed(&self) -> usize {
-        self.inner.placement.borrow().capacity()
+        self.inner.committed.get()
+    }
+
+    /// The claimed slots, the zero seed's among them.
+    fn claimed(&self) -> BTreeSet<usize> {
+        self.inner.claimed.borrow().clone()
     }
 
     fn available(&self) -> usize {
-        self.committed()
-            - self.inner.placement.borrow().resources().len()
-            - self.inner.unavailable.borrow().len()
+        self.committed() - self.inner.claimed.borrow().len() - self.inner.unavailable.borrow().len()
     }
 
     fn resize(&self, from: usize, to: usize) {
         assert_eq!(self.committed(), from);
-        let published = self.inner.placement.borrow().clone();
-        *self.inner.placement.borrow_mut() = published
-            .with_capacity(to)
-            .expect("bank resize preserves every live placement");
+        assert!(
+            self.inner.claimed.borrow().iter().all(|&slot| slot < to),
+            "a resize keeps every claimed slot"
+        );
+        self.inner.committed.set(to);
         self.inner
             .unavailable
             .borrow_mut()
-            .retain(|&index| index < to);
+            .retain(|&slot| slot < to);
     }
 
     fn mark_slab_unavailable(&self, start: usize, end: usize) {
-        let placement = self.inner.placement.borrow().clone();
         assert!(
-            placement
-                .resources()
-                .values()
-                .all(|&slot| slot < start || slot >= end)
+            self.inner
+                .claimed
+                .borrow()
+                .iter()
+                .all(|&slot| slot < start || slot >= end),
+            "a released bank slab holds no claimed bank"
         );
-        *self.inner.placement.borrow_mut() = placement
-            .with_resources(placement.resources().clone())
-            .expect("bank slab release advances placement generation");
         self.inner.unavailable.borrow_mut().extend(start..end);
     }
 
@@ -1198,15 +1024,6 @@ impl BankPool {
         for slot in start..end {
             unavailable.remove(&slot);
         }
-        drop(unavailable);
-        let placement = self.inner.placement.borrow().clone();
-        *self.inner.placement.borrow_mut() = placement
-            .with_resources(placement.resources().clone())
-            .expect("bank slab addition advances placement generation");
-    }
-
-    fn generation(&self) -> Generation {
-        self.inner.placement.borrow().generation()
     }
 }
 
@@ -1236,7 +1053,7 @@ type HistoryKey = (usize, u64);
 #[derive(Default)]
 struct TransactionClaims {
     histories: BTreeMap<HistoryKey, usize>,
-    banks: BTreeMap<LogicalId, usize>,
+    banks: BTreeMap<usize, usize>,
 }
 
 #[derive(Clone)]
@@ -1245,7 +1062,7 @@ struct Transactions(Rc<RefCell<TransactionClaims>>);
 struct Transaction {
     claims: Rc<RefCell<TransactionClaims>>,
     histories: Vec<HistoryKey>,
-    banks: Vec<LogicalId>,
+    banks: Vec<usize>,
 }
 
 impl Transactions {
@@ -1272,8 +1089,8 @@ impl Transaction {
         *self.claims.borrow_mut().histories.entry(key).or_default() += 1;
     }
     fn track_bank(&mut self, bank: &BankHandle) {
-        self.banks.push(bank.id());
-        *self.claims.borrow_mut().banks.entry(bank.id()).or_default() += 1;
+        self.banks.push(bank.index());
+        *self.claims.borrow_mut().banks.entry(bank.index()).or_default() += 1;
     }
 }
 
@@ -1362,8 +1179,9 @@ impl HistoryDomain {
     /// One past the highest row of the backed slabs.
     fn backed_extent(&self, slabs: &SlabTensor) -> usize {
         slabs
-            .slabs()
-            .map(|(index, _)| ((index + 1) * self.slab_rows).min(self.capacity))
+            .backed()
+            .into_iter()
+            .map(|index| ((index + 1) * self.slab_rows).min(self.capacity))
             .max()
             .unwrap_or(0)
     }
@@ -1378,78 +1196,32 @@ impl HistoryDomain {
         }
     }
 
-    /// Plan one shrink of this domain against its published arena: the
-    /// slabs kept (idle: every occupied slab and one spare; reclaim: the
-    /// most occupied slabs whose free whole pages hold every occupied page
-    /// of the others), the page moves out of the others, and the arena to
-    /// publish once they are copied.
-    /// Reclaim keeps `reserve` free pages beyond the compacted rows: one for
-    /// each of the live sequences' next steps (`StateStore::next_steps`).
-    /// A shrink runs with no step queued (its caller orphans the queue
-    /// first), so no reserved slab waits for a step's admission: each
-    /// returns to placement, its pages free, and is kept or released as
-    /// any other slab.
-    fn shrink_plan(&self, policy: ShrinkPolicy, rows: usize, reserve: usize) -> ShrinkPlan {
-        let mut arena = self.arena.borrow().clone();
+    /// The slabs a shrink keeping room for `rows` rows keeps, every
+    /// reserved slab first admitted (a shrink runs with no step queued, its
+    /// caller orphaning the queue, so none waits for a step's admission):
+    /// each slab with a referenced row and, while the free pages of those
+    /// fall short of the rows' pages, the lowest empty slabs, as
+    /// [`Self::admission`] would back them again.
+    fn retained_slabs(&self, rows: usize) -> BTreeSet<usize> {
+        let mut arena = self.arena.borrow_mut();
         for slab in arena.reserve.clone() {
             arena.admit_slab(slab, self.capacity);
         }
-        let occupied_pages = arena
-            .runs
-            .iter()
-            .flat_map(|(&start, run)| {
-                (start / self.page_rows..=(start + run.count - 1) / self.page_rows)
-                    .map(|page| page * self.page_rows)
-            })
-            .collect::<BTreeSet<_>>();
         let free_pages = arena.free_pages();
-        // (slab, occupied pages, free whole pages)
-        let mut slabs = arena
-            .backed
-            .iter()
-            .map(|&index| {
-                let in_slab = |page: &&usize| **page / self.slab_rows == index;
-                let free = free_pages.iter().filter(in_slab).count();
-                (index, occupied_pages.iter().filter(in_slab).count(), free)
-            })
-            .collect::<Vec<_>>();
-        slabs.sort_unstable_by_key(|&(index, occupied, _)| (std::cmp::Reverse(occupied), index));
-        let mut keep = BTreeSet::new();
-        match policy {
-            ShrinkPolicy::Idle => {
-                keep.extend(
-                    slabs
-                        .iter()
-                        .filter(|(_, occupied, _)| *occupied > 0)
-                        .map(|(index, _, _)| *index),
-                );
-                if let Some(&(index, _, _)) = slabs.iter().find(|(_, occupied, _)| *occupied == 0) {
-                    keep.insert(index);
-                }
+        let pages_in = |slab: usize| free_pages.iter().filter(|page| **page / self.slab_rows == slab).count();
+        let mut keep = arena.backed.iter().copied().filter(|&slab| !arena.empty_slab(slab)).collect::<BTreeSet<_>>();
+        let mut room = keep.iter().map(|&slab| pages_in(slab)).sum::<usize>();
+        let pages = rows.div_ceil(self.page_rows);
+        for &slab in &arena.backed {
+            if room >= pages {
+                break;
             }
-            ShrinkPolicy::Reclaim => {
-                let mut moved = occupied_pages.len();
-                let mut room = 0;
-                for &(index, occupied, free) in &slabs {
-                    if room >= moved + reserve {
-                        break;
-                    }
-                    keep.insert(index);
-                    moved -= occupied;
-                    room += free;
-                }
+            if keep.insert(slab) {
+                room += pages_in(slab);
             }
         }
-        let (arena, moves) = arena.compact_into_slabs(rows, &keep);
-        ShrinkPlan { arena, moves, keep }
+        keep
     }
-}
-
-/// One domain's planned shrink (see [`HistoryDomain::shrink_plan`]).
-struct ShrinkPlan {
-    arena: Arena,
-    moves: Vec<(usize, usize, usize)>,
-    keep: BTreeSet<usize>,
 }
 
 /// Each stored history domain's rows are a shared arena; recurrent
@@ -1462,6 +1234,9 @@ struct ShrinkPlan {
 /// when empty, only through the store's [`StoreBindings`].
 pub struct StateStore {
     device: Rc<Device>,
+    /// The granule pool of the store the slabs lie in, shared with every
+    /// other slab store there: each backed slab is one of its granules.
+    pool: Pool,
     context_capacity: usize,
     domains: Vec<HistoryDomain>,
     /// Layers of Shared domains and the stored layers they read.
@@ -1475,7 +1250,6 @@ pub struct StateStore {
     backing: RefCell<StoreSlabs>,
     history_views: RefCell<Option<Vec<PlaneBuffer>>>,
     recurrent_views: RefCell<Option<Rc<[Tensor]>>>,
-    retired_storage: RefCell<Vec<TensorStorageObserver>>,
     banks: BankPool,
     zero_seed: BankHandle,
     /// Live sequences and checkpoints: the store is idle only without both.
@@ -1484,26 +1258,6 @@ pub struct StateStore {
     /// checkpoint is frozen until a fork of it becomes a sequence.
     sequences: Cell<usize>,
     transactions: Transactions,
-    compactions: Cell<Compactions>,
-}
-
-/// How [`StoreBindings::shrink_with`] releases slab backing. Idle releases empty
-/// slabs beyond one spare per store. Reclaim also compacts occupied slabs and
-/// releases every slab it can empty, but for room for the live sequences'
-/// next steps, which is not surplus.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShrinkPolicy {
-    Idle,
-    Reclaim,
-}
-
-/// Shrink compactions a store performed: relocations of referenced history
-/// rows and claimed recurrent banks into free slots of retained slabs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Compactions {
-    pub count: usize,
-    pub history_rows: usize,
-    pub banks: usize,
 }
 
 /// One store's demand for `rows` free rows in one stored history domain.
@@ -1516,7 +1270,7 @@ pub struct RowDemand {
 }
 
 /// What the admitted requests' next steps claim of a store
-/// ([`StoreBindings::shrink_keeping`]): each domain's page-rounded rows
+/// ([`StoreBindings::shrink`]): each domain's page-rounded rows
 /// (`SequenceState::demands`) and successor banks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NextSteps {
@@ -1524,10 +1278,10 @@ pub struct NextSteps {
     pub banks: usize,
 }
 
-/// The one right to change a store's slab bindings: adding slabs, moving
-/// rows and banks, and releasing slabs. [`StateStore::new`] hands out exactly
-/// one; it is never cloned. Row and bank claims (advances, relocations,
-/// checkpoints) need no binding right.
+/// The one right to change a store's slab bindings: adding and releasing
+/// slabs. [`StateStore::new`] hands out exactly one; it is never cloned.
+/// Row and bank claims (advances, relocations, checkpoints) need no binding
+/// right.
 pub struct StoreBindings {
     store: Rc<StateStore>,
 }
@@ -1564,45 +1318,18 @@ impl StoreBindings {
             .provision_with_growth(demands, queued, banks, choice)
     }
 
-    /// Release empty history and bank slabs, retaining one spare of each at
-    /// idle. Reclaim first moves referenced rows and claimed banks from
-    /// sparse slabs into free slots of the retained ones through `copy`.
-    /// Returns the physical bytes released, measured by the device ledger.
-    pub fn shrink_with<E, F>(&mut self, policy: ShrinkPolicy, copy: F) -> Result<u64, E>
-    where
-        E: From<Error>,
-        F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
-    {
-        self.shrink_keeping(policy, &NextSteps::default(), copy)
-    }
-
-    /// [`Self::shrink_with`], Reclaim keeping room for `next`: what the
-    /// admitted requests' next steps claim is not surplus.
-    pub fn shrink_keeping<E, F>(&mut self, policy: ShrinkPolicy, next: &NextSteps, copy: F) -> Result<u64, E>
-    where
-        E: From<Error>,
-        F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
-    {
-        self.store.shrink_with(policy, next, copy)
-    }
-
-    /// Drop every slab once no sequence or checkpoint owns the store.
-    pub fn release_idle(&mut self) -> Result<usize, Error> {
-        self.store.release_idle()
-    }
-
-    #[cfg(test)]
-    fn shrink(&mut self, policy: ShrinkPolicy) -> Result<u64, Error> {
-        self.store.shrink_on_host(policy, &NextSteps::default())
-    }
-
-    #[cfg(test)]
-    fn shrink_for(&mut self, next: &NextSteps) -> Result<u64, Error> {
-        self.store.shrink_on_host(ShrinkPolicy::Reclaim, next)
+    /// Release every slab beyond the room `next` claims: what the admitted
+    /// requests' next steps claim is not surplus, and nothing else is kept.
+    /// Moves no row or bank ([`StateStore::shrink`]). Returns the bytes of
+    /// the granules freed, which the caller returns to the OS through
+    /// [`Pool::return_freed`], the one mechanism that empties sparse blocks.
+    pub fn shrink(&mut self, next: &NextSteps) -> Result<u64, Error> {
+        self.store.shrink(next)
     }
 }
 
-/// Additional Seismic charge for fixed slab additions during state growth.
+/// The bytes of the slabs a state growth adds: each slab's bytes, which a
+/// granule of the store's pool holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateGrowthClaim {
     pub minimum_bytes: u64,
@@ -1631,6 +1358,46 @@ impl StateHoldingCensus {
     }
 }
 
+impl Drop for StateStore {
+    /// The store's slabs leave its pool with it, and the bytes their
+    /// granules held return through the pool's one return path
+    /// ([`Pool::return_freed`]): dropping a store returns its memory as
+    /// releasing its slabs does, granules a flight still reads returning
+    /// as it completes. A view of a slab's rows still holds its granule.
+    ///
+    /// # Panics
+    /// Where the pool cannot return them: a device fault, which no caller
+    /// of a drop can take. Dropped while its thread already panics, the
+    /// fault is logged instead, the bytes stay owed to the OS in the pool,
+    /// and the panic under way is the report: a second would abort the
+    /// process before it reports.
+    fn drop(&mut self) {
+        // The cached logical views hold the slab stores' slots.
+        self.history_views.get_mut().take();
+        self.recurrent_views.get_mut().take();
+        let backing = self.backing.get_mut();
+        let slabs = backing.history.iter().map(|history| &history.slabs).chain(&backing.recurrent);
+        let freed = slabs.map(owned_slabs).sum::<u64>() * self.pool.granule();
+        backing.history.clear();
+        backing.recurrent = None;
+        if let Err(error) = self.pool.return_freed(freed) {
+            if std::thread::panicking() {
+                tracing::error!(freed, %error, "a state store dropped while panicking could not return its bytes to the OS: they stay owed");
+                return;
+            }
+            panic!("a dropped state store's {freed} bytes could not return to the OS: {error}");
+        }
+    }
+}
+
+/// The slabs of `slabs` that are granules of its pool: every backed slot
+/// past the lent ones, which view their owner's storage
+/// ([`SlabTensor::lent`]).
+fn owned_slabs(slabs: &SlabTensor) -> u64 {
+    let lent = slabs.lent();
+    slabs.backed().into_iter().filter(|slot| *slot >= lent).count() as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrowthChoice {
     Minimum,
@@ -1641,10 +1408,15 @@ impl StateStore {
     /// A store of the given history domains and recurrent bank components.
     /// Every domain's reserved rows cover its row limit: the context for
     /// Token, `n` plus one advance of at most `max_advance` rows for
-    /// Window(n). Each stored domain starts with one backed slab. The store's
-    /// one [`StoreBindings`] comes with it.
+    /// Window(n). Each stored domain starts with one backed slab. Every slab
+    /// is a granule of `pool`, the pool of the store on `device` the state
+    /// lies in, and holds as many whole pages or banks as fit one
+    /// ([`HistoryDomainLayout::geometry`], [`banks_per_slab`]): a granule
+    /// below a page or a bank is refused. The store's one [`StoreBindings`]
+    /// comes with it.
     pub fn new(
         device: Rc<Device>,
+        pool: Pool,
         context_capacity: usize,
         max_advance: usize,
         domains: Vec<HistoryDomainPlan>,
@@ -1659,10 +1431,11 @@ impl StateStore {
         let (stored, shared) = domain::validate_domains(domains, context_capacity, max_advance)?;
         let reads = HistoryReads::new(&stored, &shared);
         let recurrent_bank_bytes = recurrent_bank_bytes(&component_specs)?;
+        let regions = bank_regions(&component_specs);
         let bank_slab_banks = if component_specs.is_empty() {
             0
         } else {
-            banks_per_slab(recurrent_bank_bytes).map_err(Error::Request)?
+            banks_per_slab(&regions, pool.granule()).map_err(Error::Request)?
         };
         let reserved_banks = bank_capacity.storage_total()?;
         // Banks of a store without recurrent components have no storage.
@@ -1673,46 +1446,34 @@ impl StateStore {
             ((slabs * bank_slab_banks).min(reserved_banks), slabs)
         };
         let (banks, zero_seed) = BankPool::new(bank_capacity, committed_banks)?;
-        let mut recurrent = if component_specs.is_empty() {
+        let recurrent = if component_specs.is_empty() {
             None
         } else {
-            Some(SlabTensor::new(
-                &device,
+            Some(SlabTensor::in_pool(
+                &pool,
                 bank_slab_banks as u64,
                 reserved_banks as u64,
-                component_specs
-                    .iter()
-                    .map(|spec| SlabRegion {
-                        element: Element::dense(spec.dtype),
-                        row_shape: spec.shape.iter().map(|&size| size as u64).collect(),
-                    })
-                    .collect(),
+                &regions,
             )?)
         };
-        if let Some(recurrent) = &mut recurrent {
+        if let Some(recurrent) = &recurrent {
+            // Kernels read a bank (the zero seed above all) before any
+            // writes it.
             for _ in 0..startup_slabs {
-                recurrent.add_slab()?;
+                recurrent.add_slab(SlabFill::Zeroed)?;
             }
         }
         let mut history = Vec::with_capacity(stored.len());
         let mut domains = Vec::with_capacity(stored.len());
         for domain in stored {
-            let geometry = domain.geometry;
-            let mut slabs = SlabTensor::new(
-                &device,
+            let geometry = domain.pages.in_granule(domain.row_bytes, pool.granule()).map_err(Error::Request)?;
+            let slabs = SlabTensor::in_pool(
+                &pool,
                 geometry.slab_rows as u64,
                 domain.logical_rows as u64,
-                domain
-                    .components
-                    .iter()
-                    .flat_map(ComponentDescriptor::planes)
-                    .map(|plane| SlabRegion {
-                        element: Element::dense(plane.dtype),
-                        row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
-                    })
-                    .collect(),
+                &slab_regions(&domain.components),
             )?;
-            slabs.add_slab()?;
+            slabs.add_slab(SlabFill::Zeroed)?;
             let rows = geometry.slab_rows.min(domain.logical_rows);
             history.push(HistorySlabs { slabs, rows });
             domains.push(HistoryDomain {
@@ -1732,6 +1493,7 @@ impl StateStore {
         }
         let store = Rc::new(Self {
             device,
+            pool,
             context_capacity,
             domains,
             shared,
@@ -1747,13 +1509,11 @@ impl StateStore {
             }),
             history_views: RefCell::new(None),
             recurrent_views: RefCell::new(None),
-            retired_storage: RefCell::new(Vec::new()),
             banks,
             zero_seed,
             owners: Cell::new(0),
             sequences: Cell::new(0),
             transactions: Transactions(Rc::new(RefCell::new(TransactionClaims::default()))),
-            compactions: Cell::new(Compactions::default()),
         });
         Ok((store.clone(), StoreBindings { store }))
     }
@@ -1799,98 +1559,39 @@ impl StateStore {
     pub fn committed_banks(&self) -> usize {
         self.backing.borrow().banks
     }
-    /// Physical bytes of the committed backing.
+    /// The granule pool its slabs are drawn from: its store's one pool,
+    /// which others draw from too, so its holder counts it once.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Physical bytes of the committed backing: each slab store's address
+    /// table and its backed slabs' bytes. The slabs are granules of the
+    /// store's pool, which is charged for whole blocks of them.
     pub fn committed_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
         backing
             .history
             .iter()
-            .map(|history| history.slabs.storage_bytes())
-            .sum::<u64>()
-            + backing
-                .recurrent
-                .as_ref()
-                .map_or(0, SlabTensor::storage_bytes)
+            .map(|history| &history.slabs)
+            .chain(&backing.recurrent)
+            .map(|slabs| slabs.address_table_bytes() + slabs.backed().len() as u64 * slabs.pool().granule())
+            .sum()
     }
 
-    /// Whether a released slab might still be charged through an outside view.
-    pub fn has_retired_storage(&self) -> bool {
-        !self.retired_storage.borrow().is_empty()
-    }
-
-    /// Every allocation kept by this store or a view of a retired slab.
-    /// The caller deduplicates allocation identities across owners.
-    pub fn visit_storage(&self, visit: &mut dyn FnMut(&TensorStorageObserver)) {
-        let backing = self.backing.borrow();
-        let history = backing
-            .history
+    /// The state its holders reference: every row some history claims and
+    /// every recurrent bank some holder claims (the model's seed bank
+    /// apart), at their bytes.
+    pub fn referenced_bytes(&self) -> u64 {
+        let history = self
+            .domains
             .iter()
-            .flat_map(|history| history.slabs.slab_storage_observers());
-        let recurrent = backing
-            .recurrent
-            .iter()
-            .flat_map(SlabTensor::slab_storage_observers);
-        for storage in history.chain(recurrent) {
-            visit(&storage);
-        }
-        self.retired_storage.borrow().iter().for_each(visit);
+            .map(|domain| domain.arena.borrow().referenced as u64 * domain.row_bytes)
+            .sum::<u64>();
+        let banks = self.banks.claimed().len() as u64 - 1;
+        history + banks * self.recurrent_bank_bytes
     }
 
-    /// The permanent seed's physical byte ranges; the rest of its slab
-    /// remains context capacity. This never assigns a slab by proportion.
-    pub fn seed_store_charges(&self) -> Result<Vec<(seismic::StoreId, u64)>, Error> {
-        let backing = self.backing.borrow();
-        let Some(slabs) = &backing.recurrent else {
-            return Ok(Vec::new());
-        };
-        let mut charges = Vec::new();
-        for region in 0..self.component_specs.len() {
-            let view = slabs.region_rows(region, 0, 1)?;
-            charges.extend(view.view_store_charges()?);
-        }
-        Ok(charges)
-    }
-
-    /// Released slabs still charged because a caller holds a tensor view.
-    /// The weak observers neither pin the allocations nor invent a charge:
-    /// each live byte count comes from Seismic's physical allocation.
-    pub fn external_pinned_bytes(&self) -> Result<u64, Error> {
-        if !self.has_retired_storage() {
-            return Ok(0);
-        }
-        let backing = self.backing.borrow();
-        let current = backing
-            .history
-            .iter()
-            .flat_map(|history| history.slabs.slab_storage_observers())
-            .chain(
-                backing
-                    .recurrent
-                    .iter()
-                    .flat_map(SlabTensor::slab_storage_observers),
-            )
-            .map(|storage| storage.identity())
-            .collect::<BTreeSet<_>>();
-        let mut seen = BTreeSet::new();
-        let mut retired = self.retired_storage.borrow_mut();
-        retired.retain(|storage| storage.charged_bytes().is_some());
-        retired
-            .iter()
-            .filter(|storage| !current.contains(&storage.identity()))
-            .filter(|storage| seen.insert(storage.identity()))
-            .filter_map(TensorStorageObserver::charged_bytes)
-            .try_fold(0u64, |total, bytes| {
-                total
-                    .checked_add(bytes)
-                    .ok_or_else(|| Error::Request("external state pin charge overflows".into()))
-            })
-    }
-
-    fn record_retired_storage(&self, storage: TensorStorageObserver) {
-        let mut retired = self.retired_storage.borrow_mut();
-        retired.push(storage);
-        retired.retain(|allocation| allocation.charged_bytes().is_some());
-    }
     /// Classify committed state backing from its actual row and bank claims.
     /// Every registered holder must be supplied or owned by an outstanding
     /// transaction. An untracked omission is an error rather than surplus.
@@ -1928,7 +1629,7 @@ impl StateStore {
                     ));
                 }
             }
-            banks.insert(holder.bank().id());
+            banks.insert(holder.bank().index());
         }
         let tracked = self.transactions.0.borrow();
         if live
@@ -1941,7 +1642,6 @@ impl StateStore {
                 "state census marks a submitted history as live or retained".into(),
             ));
         }
-        let mut occupied_history = 0u64;
         for (index, domain) in self.domains.iter().enumerate() {
             let arena = domain.arena.borrow();
             if arena.entries.keys().any(|&id| {
@@ -1956,39 +1656,25 @@ impl StateStore {
                     "state census does not reconcile to committed backing".into(),
                 ));
             }
-            occupied_history = u64::try_from(arena.referenced)
-                .ok()
-                .and_then(|rows| rows.checked_mul(domain.row_bytes))
-                .and_then(|bytes| occupied_history.checked_add(bytes))
-                .ok_or_else(|| Error::Request("state census byte count overflow".into()))?;
         }
-        let placement = self.banks.inner.placement.borrow();
-        let claimed_banks = placement
-            .resources()
-            .keys()
-            .filter(|&&id| id != ZERO_SEED_CLAIM)
-            .collect::<Vec<_>>();
-        if claimed_banks
-            .iter()
-            .any(|id| !banks.contains(id) && !tracked.banks.contains_key(id))
+        if self
+            .banks
+            .claimed()
+            .into_iter()
+            .filter(|&slot| slot != ZERO_SEED_BANK)
+            .any(|slot| !banks.contains(&slot) && !tracked.banks.contains_key(&slot))
         {
             return Err(Error::Request(
                 "state census omits a recurrent bank claim".into(),
             ));
         }
-        let used_banks = u64::try_from(claimed_banks.len())
-            .map_err(|_| Error::Request("occupied bank count exceeds u64".into()))?;
-        let occupied = used_banks
-            .checked_mul(self.recurrent_bank_bytes)
-            .and_then(|bank| occupied_history.checked_add(bank))
-            .ok_or_else(|| Error::Request("state census byte count overflow".into()))?;
+        let occupied = self.referenced_bytes();
         let model_seed = self.recurrent_bank_bytes;
         let committed = self.committed_bytes();
         let surplus = committed
             .checked_sub(occupied)
             .and_then(|bytes| bytes.checked_sub(model_seed))
-            .ok_or_else(|| Error::Request("state census exceeds Seismic charged backing".into()))?;
-        drop(placement);
+            .ok_or_else(|| Error::Request("state census exceeds committed backing".into()))?;
         drop(tracked);
         let retained_only = self.exclusive_bytes(retained)?;
         let non_flight = live.iter().chain(retained).copied().collect::<Vec<_>>();
@@ -2187,7 +1873,8 @@ impl StateStore {
             .try_fold(0u64, |total, (&slabs, history)| {
                 history
                     .slabs
-                    .slab_charge()
+                    .pool()
+                    .granule()
                     .checked_mul(slabs as u64)
                     .and_then(|bytes| total.checked_add(bytes))
             })
@@ -2195,7 +1882,7 @@ impl StateStore {
         let bank_bytes = backing
             .recurrent
             .as_ref()
-            .map_or(0, SlabTensor::slab_charge)
+            .map_or(0, |slabs| slabs.pool().granule())
             .checked_mul(bank_slabs as u64)
             .ok_or_else(|| Error::Request("bank slab claim overflows".into()))?;
         history_bytes
@@ -2239,6 +1926,7 @@ impl StateStore {
     /// of one aggregate growth fails. No advance has claimed the newly added
     /// rows.
     fn rollback_history_growth(&self, before: &[BTreeSet<usize>]) -> Result<(), Error> {
+        let mut freed = 0u64;
         for (index, (domain, before)) in self.domains.iter().zip(before).enumerate() {
             let added = domain
                 .arena
@@ -2253,12 +1941,14 @@ impl StateStore {
             self.history_views.borrow_mut().take();
             let mut backing = self.backing.borrow_mut();
             let history = &mut backing.history[index];
-            for slab in added {
-                history.slabs.free_slab(slab)?;
-                domain.arena.borrow_mut().unback_empty_slab(slab);
+            for slab in &added {
+                history.slabs.free_slab(*slab)?;
+                domain.arena.borrow_mut().unback_empty_slab(*slab);
             }
             history.rows = domain.backed_extent(&history.slabs);
+            freed += added.len() as u64;
         }
+        self.pool.return_freed(freed * self.pool.granule())?;
         Ok(())
     }
 
@@ -2273,10 +1963,7 @@ impl StateStore {
             .recurrent
             .as_ref()
             .expect("recurrent layout has slabs");
-        let backed = slabs
-            .slabs()
-            .map(|(index, _)| index)
-            .collect::<BTreeSet<_>>();
+        let backed = slabs.backed().into_iter().collect::<BTreeSet<_>>();
         let mut additional = 0;
         let mut added_banks = 0;
         for index in 0..reserved.div_ceil(self.bank_slab_banks) {
@@ -2368,254 +2055,83 @@ impl StateStore {
         }
     }
 
-    /// Release empty history and bank slabs, retaining one spare of each at
-    /// idle. Reclaim also moves referenced rows and claimed banks from sparse
-    /// slabs into free slots of the retained slabs before releasing them.
-    /// Returns the physical bytes released, measured by the device ledger:
-    /// an earlier backing a caller still views stays charged.
-    fn shrink_with<E, F>(self: &Rc<Self>, policy: ShrinkPolicy, next: &NextSteps, mut copy: F) -> Result<u64, E>
-    where
-        E: From<Error>,
-        F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
-    {
-        let before = self.device.device_ledger().charged;
-        let backing = self.backing.borrow();
-        // Each stored domain plans against its own published arena.
-        let history_plans = self
-            .domains
-            .iter()
-            .zip(&backing.history)
-            .enumerate()
-            .map(|(index, (domain, history))| {
-                let id = HistoryDomainId(index);
-                let rows = next.rows.iter().filter(|demand| demand.domain == id).map(|demand| demand.rows).sum::<usize>();
-                domain.shrink_plan(policy, history.rows, rows.div_ceil(domain.page_rows))
-            })
-            .collect::<Vec<_>>();
-
-        let published_banks = self.banks.inner.placement.borrow().clone();
-        let reserved = self.bank_capacity.storage_total().map_err(E::from)?;
-        let mut bank_slabs = backing
-            .recurrent
-            .as_ref()
-            .map(|slabs| {
-                slabs
-                    .slabs()
-                    .map(|(index, _)| {
-                        let start = index * self.bank_slab_banks;
-                        let end = (start + self.bank_slab_banks).min(reserved);
-                        let occupied = published_banks
-                            .resources()
-                            .values()
-                            .filter(|&&slot| (start..end).contains(&slot))
-                            .count();
-                        (index, end - start, occupied)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        bank_slabs
-            .sort_unstable_by_key(|&(index, _, occupied)| (std::cmp::Reverse(occupied), index));
-        let mut bank_keep = BTreeSet::new();
-        match policy {
-            ShrinkPolicy::Idle => {
-                bank_keep.extend(
-                    bank_slabs
-                        .iter()
-                        .filter(|(_, _, occupied)| *occupied > 0)
-                        .map(|(index, _, _)| *index),
-                );
-                if let Some(&(index, _, _)) =
-                    bank_slabs.iter().find(|(_, _, occupied)| *occupied == 0)
-                {
-                    bank_keep.insert(index);
-                }
-            }
-            ShrinkPolicy::Reclaim => {
-                let mut capacity = 0;
-                if !bank_slabs.is_empty() {
-                    bank_keep.insert(0);
-                    capacity = self.bank_slab_banks.min(reserved);
-                }
-                for &(index, banks, _) in &bank_slabs {
-                    if capacity >= published_banks.resources().len() + next.banks {
-                        break;
-                    }
-                    if bank_keep.insert(index) {
-                        capacity += banks;
-                    }
-                }
-            }
-        }
-        let occupied = published_banks
-            .resources()
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut free_banks = bank_keep
-            .iter()
-            .flat_map(|&slab| {
-                let start = slab * self.bank_slab_banks;
-                start..(start + self.bank_slab_banks).min(reserved)
-            })
-            .filter(|index| !occupied.contains(index))
-            .collect::<Vec<_>>()
-            .into_iter();
-        let mut planned_resources = published_banks.resources().clone();
-        let mut bank_moves = Vec::new();
-        for (&resource, &from) in published_banks.resources() {
-            if bank_slabs.is_empty() {
-                break;
-            }
-            if !bank_keep.contains(&(from / self.bank_slab_banks)) {
-                let to = free_banks
-                    .next()
-                    .expect("kept bank slabs hold every claimed bank");
-                planned_resources.insert(resource, to);
-                bank_moves.push((from, to));
-            }
-        }
-        let planned_banks = if bank_moves.is_empty() {
-            published_banks.clone()
-        } else {
-            published_banks
-                .with_resources(planned_resources)
-                .map_err(Error::from)
-                .map_err(E::from)?
-        };
-
-        // Every plan reads the same published generation. Every destination
-        // is free there, so even a later failed copy leaves every domain and
-        // the banks readable and no physical slab has been released.
-        for (plan, history) in history_plans.iter().zip(&backing.history) {
-            if !plan.moves.is_empty() {
-                copy(
-                    &history.slabs,
-                    self.history_copy_plan(&history.slabs, &plan.moves)
-                        .map_err(E::from)?,
-                )?;
-            }
-        }
-        if !bank_moves.is_empty() {
-            let slabs = backing
-                .recurrent
-                .as_ref()
-                .expect("recurrent layout has slabs");
-            copy(
-                slabs,
-                self.bank_copy_plan(slabs, &bank_moves).map_err(E::from)?,
-            )?;
-        }
-        drop(backing);
-
-        let history_rows = history_plans
-            .iter()
-            .flat_map(|plan| plan.moves.iter())
-            .map(|(_, _, count)| count)
-            .sum::<usize>();
-        *self.banks.inner.placement.borrow_mut() = planned_banks;
+    /// Release every slab beyond the room `next` claims, moving no row or
+    /// bank: each domain keeps its slabs with a referenced row and, while
+    /// their free pages fall short of its rows in `next`, its lowest empty
+    /// slabs ([`HistoryDomain::retained_slabs`]); the banks keep their slabs
+    /// with a claimed bank (the zero seed's among them) and, while their
+    /// free banks fall short of `next.banks`, the lowest empty ones. Returns
+    /// the bytes of the granules the released slabs held, freed in the pool
+    /// for outside demand: the pool returns them ([`Pool::return_freed`]).
+    /// A released slab a caller still views keeps its granule until the view
+    /// drops.
+    fn shrink(&self, next: &NextSteps) -> Result<u64, Error> {
+        let mut released = 0u64;
         let mut backing = self.backing.borrow_mut();
-        for ((domain, plan), history) in self
-            .domains
-            .iter()
-            .zip(history_plans)
-            .zip(&mut backing.history)
-        {
-            *domain.arena.borrow_mut() = plan.arena;
+        let backing = &mut *backing;
+        for (index, (domain, history)) in self.domains.iter().zip(&mut backing.history).enumerate() {
+            let id = HistoryDomainId(index);
+            let rows = next.rows.iter().filter(|demand| demand.domain == id).map(|demand| demand.rows).sum::<usize>();
+            let keep = domain.retained_slabs(rows);
+            let victims = history.slabs.backed().into_iter().filter(|slab| !keep.contains(slab)).collect::<Vec<_>>();
+            if victims.is_empty() {
+                continue;
+            }
             self.history_views.borrow_mut().take();
-            let victims = history
-                .slabs
-                .slabs()
-                .map(|(index, _)| index)
-                .filter(|index| !plan.keep.contains(index))
-                .collect::<Vec<_>>();
-            for index in victims {
-                if let Some(observer) = history
-                    .slabs
-                    .free_slab(index)
-                    .map_err(Error::from)
-                    .map_err(E::from)?
-                {
-                    self.record_retired_storage(observer);
-                }
+            for slab in victims {
+                assert!(history.slabs.free_slab(slab)?, "a backed history slab frees");
+                domain.arena.borrow_mut().unback_empty_slab(slab);
+                released += 1;
             }
             history.rows = domain.backed_extent(&history.slabs);
         }
         if let Some(slabs) = backing.recurrent.as_mut() {
-            self.recurrent_views.borrow_mut().take();
-            let victims = slabs
-                .slabs()
-                .map(|(index, _)| index)
-                .filter(|index| !bank_keep.contains(index))
-                .collect::<Vec<_>>();
-            for index in victims {
-                if let Some(observer) = slabs
-                    .free_slab(index)
-                    .map_err(Error::from)
-                    .map_err(E::from)?
-                {
-                    let start = index * self.bank_slab_banks;
-                    let end = (start + self.bank_slab_banks).min(reserved);
-                    self.banks.mark_slab_unavailable(start, end);
-                    self.record_retired_storage(observer);
+            let reserved = self.bank_capacity.storage_total()?;
+            let span = |slab: usize| {
+                let start = slab * self.bank_slab_banks;
+                start..(start + self.bank_slab_banks).min(reserved)
+            };
+            let occupied = self.banks.claimed();
+            let backed = slabs.backed().into_iter().collect::<BTreeSet<_>>();
+            let mut keep = backed
+                .iter()
+                .copied()
+                .filter(|&slab| span(slab).any(|bank| occupied.contains(&bank)))
+                .collect::<BTreeSet<_>>();
+            let mut room = keep
+                .iter()
+                .map(|&slab| span(slab).filter(|bank| !occupied.contains(bank)).count())
+                .sum::<usize>();
+            for &slab in &backed {
+                if room >= next.banks {
+                    break;
+                }
+                if keep.insert(slab) {
+                    room += span(slab).len();
                 }
             }
-            let extent = slabs
-                .slabs()
-                .map(|(index, _)| ((index + 1) * self.bank_slab_banks).min(reserved))
-                .max()
-                .expect("zero seed slab stays backed");
-            if extent < backing.banks {
-                self.banks.resize(backing.banks, extent);
-                backing.banks = extent;
-            }
-        }
-        drop(backing);
-        if history_rows != 0 || !bank_moves.is_empty() {
-            let stats = self.compactions.get();
-            self.compactions.set(Compactions {
-                count: stats.count + 1,
-                history_rows: stats.history_rows + history_rows,
-                banks: stats.banks + bank_moves.len(),
-            });
-        }
-        let charged = self.device.device_ledger().charged;
-        Ok(before.saturating_sub(charged))
-    }
-
-    #[cfg(test)]
-    fn shrink_on_host(self: &Rc<Self>, policy: ShrinkPolicy, next: &NextSteps) -> Result<u64, Error> {
-        self.shrink_with(policy, next, |slabs, plan| {
-            for copy in plan.copies() {
-                for (&from, &to) in copy.from.iter().zip(&copy.to) {
-                    let source = slabs.region_rows(copy.plane_index, from as u64, 1)?;
-                    let mut destination = slabs.region_rows(copy.plane_index, to as u64, 1)?;
-                    let bytes = source
-                        .read_to_host()
-                        .map_err(|error| Error::Request(error.to_string()))?;
-                    destination
-                        .write_from_host(&bytes)
-                        .map_err(|error| Error::Request(error.to_string()))?;
+            let victims = backed.difference(&keep).copied().collect::<Vec<_>>();
+            if !victims.is_empty() {
+                self.recurrent_views.borrow_mut().take();
+                for slab in victims {
+                    assert!(slabs.free_slab(slab)?, "a backed bank slab frees");
+                    released += 1;
+                    let banks = span(slab);
+                    self.banks.mark_slab_unavailable(banks.start, banks.end);
+                }
+                let extent = slabs
+                    .backed()
+                    .into_iter()
+                    .map(|slab| span(slab).end)
+                    .max()
+                    .expect("zero seed slab stays backed");
+                if extent < backing.banks {
+                    self.banks.resize(backing.banks, extent);
+                    backing.banks = extent;
                 }
             }
-            Ok(())
-        })
-    }
-
-    fn history_copy_plan(
-        self: &Rc<Self>,
-        slabs: &SlabTensor,
-        moves: &[(usize, usize, usize)],
-    ) -> Result<StoreCopy, Error> {
-        let from = moves
-            .iter()
-            .flat_map(|&(start, _, count)| start..start + count)
-            .collect();
-        let to = moves
-            .iter()
-            .flat_map(|&(_, start, count)| start..start + count)
-            .collect();
-        StoreCopy::new(self.clone(), slabs, from, to)
+        }
+        Ok(released * self.pool.granule())
     }
 
     /// A copy of rows `from` to rows `to` in one history domain's slabs.
@@ -2627,26 +2143,6 @@ impl StateStore {
     ) -> Result<StoreCopy, Error> {
         let backing = self.backing.borrow();
         StoreCopy::new(self.clone(), &backing.history[domain.0].slabs, from, to)
-    }
-
-    fn bank_copy_plan(
-        self: &Rc<Self>,
-        slabs: &SlabTensor,
-        moves: &[(usize, usize)],
-    ) -> Result<StoreCopy, Error> {
-        let from = moves.iter().map(|&(from, _)| from).collect();
-        let to = moves.iter().map(|&(_, to)| to).collect();
-        StoreCopy::new(self.clone(), slabs, from, to)
-    }
-
-    pub fn compactions(&self) -> Compactions {
-        self.compactions.get()
-    }
-
-    /// The published recurrent bank placement generation. It advances with
-    /// every acquisition, release, relocation and resize of the bank arena.
-    pub fn bank_placement_generation(&self) -> Generation {
-        self.banks.generation()
     }
 
     /// Add whole history slabs to a domain, into its lowest unbacked slots,
@@ -2661,12 +2157,13 @@ impl StateStore {
         self.history_views.borrow_mut().take();
         let mut added = Vec::new();
         for _ in 0..count {
-            match slab.add_slab() {
+            match slab.add_slab(SlabFill::Zeroed) {
                 Ok(index) => added.push(index),
                 Err(error) => {
-                    for index in added {
-                        slab.free_slab(index)?;
+                    for index in &added {
+                        slab.free_slab(*index)?;
                     }
+                    self.pool.return_freed(added.len() as u64 * self.pool.granule())?;
                     return Err(error.into());
                 }
             }
@@ -2695,12 +2192,13 @@ impl StateStore {
         self.recurrent_views.borrow_mut().take();
         let mut added = Vec::new();
         for _ in 0..count {
-            match slab.add_slab() {
+            match slab.add_slab(SlabFill::Zeroed) {
                 Ok(index) => added.push(index),
                 Err(error) => {
-                    for index in added {
-                        slab.free_slab(index)?;
+                    for index in &added {
+                        slab.free_slab(*index)?;
                     }
+                    self.pool.return_freed(added.len() as u64 * self.pool.granule())?;
                     return Err(error.into());
                 }
             }
@@ -2825,35 +2323,6 @@ impl StateStore {
     /// [`SequenceState::demands`]).
     pub fn free_rows(&self, domain: HistoryDomainId) -> usize {
         self.domains[domain.0].arena.borrow().available()
-    }
-    /// Drop the store's arena allocations when no sequence/checkpoint owns them.
-    /// External completion/buffer pins may still retain physical storage.
-    fn release_idle(&self) -> Result<usize, Error> {
-        if !self.idle() {
-            return Ok(0);
-        }
-        let before = self.device.device_ledger().charged;
-        let mut backing = self.backing.borrow_mut();
-        for (domain, history) in self.domains.iter().zip(&mut backing.history) {
-            self.history_views.borrow_mut().take();
-            let held = history
-                .slabs
-                .slabs()
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            for index in held {
-                if let Some(observer) = history.slabs.free_slab(index)? {
-                    domain.arena.borrow_mut().unback_empty_slab(index);
-                    self.record_retired_storage(observer);
-                }
-                history.rows = domain.backed_extent(&history.slabs);
-            }
-            *domain.arena.borrow_mut() = Arena::new(0, domain.slab_rows, domain.page_rows);
-        }
-        drop(backing);
-        let charged = self.device.device_ledger().charged;
-        usize::try_from(before.saturating_sub(charged))
-            .map_err(|_| Error::Request("reclaimable history bytes exceed host range".into()))
     }
     pub fn create(self: &Rc<Self>) -> Result<SequenceState, Error> {
         let bank = self.zero_seed.clone();
@@ -3201,8 +2670,9 @@ pub struct PlaneCopy {
     pub to: Vec<usize>,
 }
 
-/// Pinned slab views and row maps for one unpublished store compaction.
-/// The caller must finish every physical copy before returning success.
+/// Pinned slab views and row maps for one unpublished copy of a history's
+/// rows ([`OwnedTailRelocation::copy`]). The caller finishes every physical
+/// copy before it commits.
 pub struct StoreCopy {
     store: Rc<StateStore>,
     planes: Vec<Tensor>,
@@ -3377,6 +2847,149 @@ fn install_commit(
 #[cfg(test)]
 mod domain_tests;
 
+/// The granule the tests' own pools open at, and the one their geometries
+/// are figured in: 64 MiB, which every slab of their banks and history
+/// pages fits, the widest a page of 256 rows of 256 KiB. No load's granule
+/// follows from it: a load's is its state's smallest slab
+/// (`planning::state_pool_granule`).
+#[cfg(test)]
+pub(crate) const TEST_GRANULE: u64 = 64 << 20;
+
+/// A test's own device, the tally of its device store, and that store's
+/// granule pool charged to the tally, as a load opens one: tests beside each
+/// other in one process read and bound only their own.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OwnDevice {
+    pub(crate) device: Rc<Device>,
+    pub(crate) tally: seismic::memory::Tally,
+    pub(crate) pool: Pool,
+}
+
+#[cfg(test)]
+impl OwnDevice {
+    /// `backend`'s device of `catalog`, its pool of `granule`-byte granules,
+    /// one a block: each slab a test backs is a block of its own, charged to
+    /// the tally from when it is added until it is freed and the pool returns
+    /// its empty blocks.
+    pub(crate) fn open(
+        catalog: &seismic::Devices,
+        backend: seismic::BackendName,
+        granule: u64,
+    ) -> Result<Self, seismic::OpenError> {
+        Self::open_in_blocks(catalog, backend, granule, 1)
+    }
+
+    /// [`Self::open`], each of the pool's blocks `granules` granules: a
+    /// block can keep a live slab beside a free granule, which the pool
+    /// empties into another block's ([`Pool::return_freed`]).
+    pub(crate) fn open_in_blocks(
+        catalog: &seismic::Devices,
+        backend: seismic::BackendName,
+        granule: u64,
+        granules: u64,
+    ) -> Result<Self, seismic::OpenError> {
+        let (device, tally) =
+            seismic::testing::open_backend_tallied(catalog, backend, Default::default())?;
+        let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(tally.clone());
+        let pool = device
+            .pool(seismic::Contract::DeviceOnly, granule, granules * granule, seismic::PoolEntries::one(entry))
+            .expect("a test's own device opens its pool");
+        Ok(Self {
+            device: Rc::new(device),
+            tally,
+            pool,
+        })
+    }
+
+    /// The CPU's, of `granule`-byte granules.
+    pub(crate) fn cpu_of(granule: u64) -> Self {
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        Self::open(&catalog, seismic::BackendName::Cpu, granule).expect("the CPU backend opens")
+    }
+
+    /// The CPU's, of [`TEST_GRANULE`]-byte granules.
+    pub(crate) fn cpu() -> Self {
+        Self::cpu_of(TEST_GRANULE)
+    }
+
+    /// What the device store holds with `store` the one slab store in the
+    /// pool, of a granule a block ([`Self::open`]): the pool a block for each
+    /// backed slab and its absent granule, each at what the backend charges
+    /// a block; beside the pool, the store's address tables, at what the
+    /// backend charges them. Both charges are measured, never derived: the
+    /// same allocations made again through the same path, in the same order,
+    /// charged to a scratch tally of the same store and dropped.
+    pub(crate) fn assert_holds(&self, store: &StateStore) {
+        assert_eq!(self.pool.block_bytes(), self.pool.granule(), "a fixture's pool of a granule a block");
+        let identity = seismic::memory::Store::identity(&self.tally).clone();
+        let scratch = || {
+            let tally = seismic::memory::Tally::unbounded(identity.clone());
+            let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(tally.clone());
+            (tally, entry)
+        };
+        // A block's charge: a pool opening holds its absent granule alone,
+        // one granule, a block's bytes.
+        let (tally, entry) = scratch();
+        let block = {
+            let opened = self
+                .device
+                .pool(seismic::Contract::DeviceOnly, self.pool.granule(), self.pool.block_bytes(), seismic::PoolEntries::one(entry))
+                .expect("a scratch pool opens beside the fixture's");
+            let block = opened.held_bytes();
+            assert_eq!(tally.held(), block);
+            block
+        };
+        let backing = store.backing.borrow();
+        // In the order the store made them: its recurrent slabs, then each
+        // history domain's.
+        let stores = backing.recurrent.iter().chain(backing.history.iter().map(|history| &history.slabs)).collect::<Vec<_>>();
+        let slabs = stores.iter().map(|slabs| slabs.backed().len() as u64).sum::<u64>();
+        // The tables' charge: slab stores of the same slots and regions, in
+        // the same pool, so tables of the same bytes, whatever the regions'
+        // rows.
+        let (tally, entry) = scratch();
+        let tables = seismic::memory::charging(&[entry], || {
+            let made = stores
+                .iter()
+                .map(|slabs| {
+                    let region = seismic::SlabRegion { element: seismic::Element::dense(DType::F32), row_shape: vec![1] };
+                    SlabTensor::in_pool(&self.pool, slabs.rows_per_slab(), slabs.logical_rows(), &vec![region; slabs.region_count()])
+                        .expect("a scratch slab store opens in the fixture's pool")
+                })
+                .collect::<Vec<_>>();
+            assert!(made.iter().zip(&stores).all(|(made, slabs)| made.capacity() == slabs.capacity()));
+            let tables = tally.held();
+            drop(made);
+            tables
+        });
+        assert_eq!(tally.held(), 0, "the scratch tables return their charge as they drop");
+        let pooled = self.pool.held_bytes();
+        assert_eq!(pooled, (slabs + 1) * block, "a block for each of {slabs} backed slabs and the absent granule");
+        assert_eq!(self.tally.held() - pooled, tables, "the store's tables beside the pool");
+    }
+
+    /// A store of `domains` and `specs` on this device, in its pool.
+    pub(crate) fn store(
+        &self,
+        context_capacity: usize,
+        max_advance: usize,
+        domains: Vec<HistoryDomainPlan>,
+        specs: Vec<ComponentSpec>,
+        banks: BankCapacity,
+    ) -> Result<(Rc<StateStore>, StoreBindings), Error> {
+        StateStore::new(
+            self.device.clone(),
+            self.pool.clone(),
+            context_capacity,
+            max_advance,
+            domains,
+            specs,
+            banks,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3389,7 +3002,7 @@ mod tests {
     /// A store of one Token domain (none without components), as Qwen's
     /// target and head stores are.
     fn token_store(
-        device: Rc<Device>,
+        device: OwnDevice,
         context: usize,
         rows: usize,
         components: Vec<ComponentDescriptor>,
@@ -3404,7 +3017,8 @@ mod tests {
                 logical_rows: rows,
             }]
         };
-        StateStore::new(device, context, context, domains, specs, banks)
+        device
+            .store(context, context, domains, specs, banks)
             .map(|(_, bindings)| bindings)
     }
 
@@ -3443,15 +3057,9 @@ mod tests {
         )
     }
 
-    /// `backend`'s device of `catalog`, its ledgers its own: a test bounds
-    /// them alone beside the process's other tests.
-    fn own_device(catalog: &seismic::Devices, backend: BackendName) -> Result<Device, seismic::OpenError> {
-        seismic::testing::open_backend_own_ledgers(catalog, backend, Default::default())
-    }
 
-    fn cpu_device() -> Rc<Device> {
-        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-        Rc::new(own_device(&catalog, BackendName::Cpu).expect("the CPU backend opens"))
+    fn cpu_device() -> OwnDevice {
+        OwnDevice::cpu()
     }
 
     fn bank_view(store: &StateStore, bank: usize) -> Tensor {
@@ -3482,42 +3090,48 @@ mod tests {
     /// sequence's first step writes, so that step grows nothing.
     #[test]
     fn a_first_step_grows_no_bank_slab() {
-        let (store, _bindings) = StateStore::new(
-            cpu_device(),
-            64,
-            64,
-            vec![],
-            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
-            BankCapacity { active: 2, in_flight: 1, retained: 0 },
-        )
-        .unwrap();
+        let (store, _bindings) = OwnDevice::cpu_of(WIDE_BANK_BYTES)
+            .store(
+                64,
+                64,
+                vec![],
+                vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+                BankCapacity { active: 2, in_flight: 1, retained: 0 },
+            )
+            .unwrap();
         assert_eq!(store.bank_slab_banks(), 1);
         assert_eq!(store.available_banks(), BankCapacity { active: 2, in_flight: 1, retained: 0 }.startup_banks().unwrap() - 1);
         assert_eq!(store.growth_claim(&[], &[], 1).unwrap().minimum_bytes, 0);
     }
 
-    /// A growth claims what a slab's allocation is charged, the figure the
-    /// device's bound is derived from, never a sum of its own: a record table
-    /// the allocation holds is part of it, so the claim and the allocation
-    /// cannot differ.
+    /// The bytes of a bank of 20 Mi F32 words, more than a slab's target:
+    /// one bank a slab, and a granule.
+    const WIDE_BANK_BYTES: u64 = 20 * 1024 * 1024 * 4;
+
+    /// A growth claims the bytes of each slab it adds, the slab layout's
+    /// own figure, never a sum of its own: a slab holds them of the one
+    /// granule of the store's pool it takes, and a pool with no free
+    /// granule grows by a block for it.
     #[test]
-    fn a_slab_growth_claims_the_charge_of_a_slab_allocation() {
-        let (store, _bindings) = StateStore::new(
-            cpu_device(),
-            64,
-            64,
-            vec![],
-            vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
-            BankCapacity { active: 2, in_flight: 1, retained: 0 },
-        )
-        .unwrap();
-        let backing = store.backing.borrow();
-        let slabs = backing.recurrent.as_ref().expect("a store of components holds bank slabs");
-        let charged = slabs.slab_storage_observers().filter_map(|observer| observer.charged_bytes()).max().expect("a backed slab");
-        assert_eq!(slabs.slab_charge(), charged.max(slabs.slab_bytes()));
-        drop(backing);
-        // Two banks are wanted, one is committed past the seed: one slab.
-        assert_eq!(store.growth_claim(&[], &[], 2).unwrap().minimum_bytes, store.backing.borrow().recurrent.as_ref().unwrap().slab_charge());
+    fn a_slab_growth_claims_the_granules_of_its_slabs() {
+        let device = OwnDevice::cpu_of(WIDE_BANK_BYTES);
+        let (store, mut bindings) = device
+            .store(
+                64,
+                64,
+                vec![],
+                vec![ComponentSpec { shape: vec![20 * 1024 * 1024], dtype: DType::F32 }],
+                BankCapacity { active: 2, in_flight: 1, retained: 0 },
+            )
+            .unwrap();
+        let slab_bytes = store.backing.borrow().recurrent.as_ref().expect("a store of components holds bank slabs").slab_bytes();
+        assert!(slab_bytes <= device.pool.granule());
+        // Two banks are wanted, one is committed past the seed: one slab,
+        // which holds a whole granule.
+        assert_eq!(store.growth_claim(&[], &[], 2).unwrap().minimum_bytes, device.pool.granule());
+        let held = device.tally.held();
+        bindings.provision(&[], 2).unwrap();
+        assert_eq!(device.tally.held(), held + device.pool.block_bytes());
     }
 
     #[test]
@@ -3620,8 +3234,11 @@ mod tests {
         assert_eq!(history, vec![(0, 8), (8, 8), (16, 8), (24, 6)]);
     }
 
+    /// A shrink keeping no room releases no slab that holds a referenced row
+    /// or a claimed bank, however sparse: no row or bank moves, and nothing
+    /// is freed.
     #[test]
-    fn idle_shrink_does_not_compact_occupied_history_or_bank_slabs() {
+    fn a_shrink_releases_no_occupied_history_or_bank_slab() {
         let device = cpu_device();
         let mut store = token_store(
             device.clone(),
@@ -3651,36 +3268,28 @@ mod tests {
         drop(claims[1].take());
         let bank = claims[3].as_ref().unwrap();
         let before = (
-            device.device_ledger().charged,
+            device.tally.held(),
             committed_extent(&store),
             high.ranges(),
             bank.index(),
-            store.bank_placement_generation(),
-            store.compactions(),
         );
-        assert_eq!(
-            store
-                .shrink_with(ShrinkPolicy::Idle, |_, _| -> Result<(), Error> {
-                    panic!("idle shrink must not copy occupied slabs")
-                })
-                .unwrap(),
-            0
-        );
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), 0);
         assert_eq!(
             (
-                device.device_ledger().charged,
+                device.tally.held(),
                 committed_extent(&store),
                 high.ranges(),
                 bank.index(),
-                store.bank_placement_generation(),
-                store.compactions(),
             ),
             before
         );
     }
 
+    /// A shrink keeps the room the next steps claim and no spare beyond it:
+    /// the lowest empty slab while a next step's page needs it, none once
+    /// no step does.
     #[test]
-    fn idle_shrink_keeps_one_empty_history_slab() {
+    fn a_shrink_keeps_only_the_next_steps_room() {
         let device = cpu_device();
         let mut store = token_store(
             device.clone(),
@@ -3696,52 +3305,48 @@ mod tests {
         )
         .unwrap();
         store.add_admitted_history_slabs(2).unwrap();
+        let granule = device.pool.granule();
         let occupied = claim_rows(&store.arena(), 0, 1);
-        let before = device.device_ledger().charged;
-        assert!(
-            store
-                .shrink_with(ShrinkPolicy::Idle, |_, _| -> Result<(), Error> {
-                    panic!("idle shrink must not copy")
-                })
-                .unwrap()
-                > 0
-        );
-        assert_eq!(
-            store
-                .history_slabs()
-                .slabs()
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(device.device_ledger().charged < before);
+        let before = device.tally.held();
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), 2 * granule);
+        assert_eq!(store.history_slabs().backed(), vec![0]);
+        assert_eq!(device.pool.return_freed(2 * granule).unwrap(), 2 * device.pool.block_bytes());
+        assert!(device.tally.held() < before);
         drop(occupied);
-        store.shrink(ShrinkPolicy::Idle).unwrap();
-        assert_eq!(
-            store
-                .history_slabs()
-                .slabs()
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>(),
-            vec![0]
-        );
-        assert_eq!(store.compactions(), Compactions::default());
+        let next = NextSteps {
+            rows: vec![RowDemand { domain: TOKEN, rows: 1 }],
+            banks: 0,
+        };
+        assert_eq!(store.shrink(&next).unwrap(), 0, "the next step's page is not surplus");
+        assert_eq!(store.history_slabs().backed(), vec![0]);
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), granule);
+        assert!(store.history_slabs().backed().is_empty());
     }
 
     #[test]
-    fn cpu_reclaim_compacts_partial_final_history_and_bank_slabs() {
-        let device = cpu_device();
-        reclaim_compacts_partial_final_history_and_bank_slabs_on(device);
+    fn cpu_sparse_final_history_and_bank_slabs_stay_and_their_block_returns() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = OwnDevice::open_in_blocks(&catalog, BackendName::Cpu, TEST_GRANULE, 2).unwrap();
+        sparse_final_history_and_bank_slabs_stay_and_their_block_returns_on(device);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_reclaim_compacts_partial_final_history_and_bank_slabs() {
-        let device = Rc::new(own_device(&seismic::Devices::discover(&[]).unwrap(), BackendName::Metal).unwrap());
-        reclaim_compacts_partial_final_history_and_bank_slabs_on(device);
+    fn metal_sparse_final_history_and_bank_slabs_stay_and_their_block_returns() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = OwnDevice::open_in_blocks(&catalog, BackendName::Metal, TEST_GRANULE, 2).unwrap();
+        sparse_final_history_and_bank_slabs_stay_and_their_block_returns_on(device);
     }
 
-    fn reclaim_compacts_partial_final_history_and_bank_slabs_on(device: Rc<Device>) {
+    /// A partial final history slab and a final bank slab, each holding
+    /// one referenced row or claimed bank, stay where they are: the shrink
+    /// releases only the empty slab between, moving nothing. The pool then
+    /// returns what it freed, a whole block, emptying the emptiest block
+    /// into free granules it already holds where no block is empty
+    /// (`Pool::return_freed`): with no new charge, every row and bank at
+    /// its address, and its bytes intact. Five slabs fill three blocks of
+    /// two granules; four live slabs leave one block to return.
+    fn sparse_final_history_and_bank_slabs_stay_and_their_block_returns_on(device: OwnDevice) {
         let mut store = token_store(
             device.clone(),
             5000,
@@ -3758,17 +3363,17 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_admitted_history_slabs(1).unwrap();
+        store.add_admitted_history_slabs(2).unwrap();
         store.add_bank_slabs(1).unwrap();
         let rows = store.history_slab_rows(TOKEN);
-        assert!(rows < 5000);
+        assert!(2 * rows < 5000 && 3 * rows > 5000, "slab 2 is partial and final");
         assert_eq!(store.bank_slab_banks(), 4);
         let _low = claim_rows(&store.arena(), 0, 2);
-        let high = claim_rows(&store.arena(), rows, 1);
+        let high = claim_rows(&store.arena(), 2 * rows, 1);
         let history_value = vec![29u8; 4096 * 4];
         store
             .history_slabs()
-            .region_rows(0, rows as u64, 1)
+            .region_rows(0, (2 * rows) as u64, 1)
             .unwrap()
             .write_from_host(&history_value)
             .unwrap();
@@ -3778,53 +3383,40 @@ mod tests {
         drop(claims[0].take());
         drop(claims[1].take());
         let bank = claims[3].as_ref().unwrap();
+        assert_eq!(bank.index(), 4, "the final bank slab's");
         let bank_value = vec![31u8; 16 * 1024 * 1024];
         write_bank(&store, bank.index(), &bank_value);
-        let before = device.device_ledger().charged;
-        assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
-        assert_eq!(committed_extent(&store), (rows, 4));
-        assert!(high.ranges()[0].0 < rows);
-        assert!(bank.index() < 4);
+        let (extent, ranges, slot) = (committed_extent(&store), high.ranges(), bank.index());
+        let charged = device.tally.held();
+        device.tally.bound(charged);
+        let freed = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(freed, device.pool.granule(), "the empty middle history slab");
+        assert_eq!(store.history_slabs().backed(), vec![0, 2]);
+        let returned = device.pool.return_freed(freed).unwrap();
+        device.tally.bound(u64::MAX);
+        assert_eq!(returned, device.pool.block_bytes());
+        assert_eq!(device.tally.held(), charged - returned);
+        assert_eq!((committed_extent(&store), high.ranges(), bank.index()), (extent, ranges, slot));
         assert_eq!(
             store
                 .history_slabs()
-                .region_rows(0, high.ranges()[0].0 as u64, 1)
+                .region_rows(0, (2 * rows) as u64, 1)
                 .unwrap()
                 .read_to_host()
                 .unwrap(),
             history_value
         );
         assert_eq!(bank_bytes(&store, bank.index()), bank_value);
-        assert_eq!(store.compactions().history_rows, 1);
-        assert_eq!(store.compactions().banks, 1);
-        assert!(device.device_ledger().charged < before);
     }
 
-    /// Reclaim moves whole occupied pages to free pages of kept slabs at the
-    /// same offsets, so a history keeps its page structure.
+    /// A sparse history slab between full ones stays, its row at its
+    /// address; the empty slab the shrink releases frees a granule, and the
+    /// pool returns a whole block of what it holds without a new charge,
+    /// copying the sparse slab's granule where its block has no empty one.
     #[test]
-    fn reclaim_moves_whole_pages_at_their_offsets() {
-        let arena = Rc::new(RefCell::new(Arena::new(0, 4, 2)));
-        for index in 0..3 {
-            arena.borrow_mut().back_admitted(index, 12);
-        }
-        let _full = claim_rows(&arena, 0, 4);
-        // Row 5: the second row of page [4, 6).
-        let sparse = claim_rows(&arena, 5, 1);
-        let _high = claim_rows(&arena, 8, 2);
-        let (planned, moves) = arena
-            .borrow()
-            .compact_into_slabs(12, &BTreeSet::from([0, 2]));
-        // Page [4, 6) moves to the free page [10, 12) at the same offset.
-        assert_eq!(moves, vec![(5, 11, 1)]);
-        assert_eq!(planned.referenced, 7);
-        assert!(!planned.backed.contains(&1));
-        assert_eq!(planned.entries[&sparse.id].ranges, vec![(11, 1)]);
-    }
-
-    #[test]
-    fn reclaim_frees_the_sparsest_history_slab_without_new_charge() {
-        let device = cpu_device();
+    fn a_sparse_history_slab_returns_its_block_through_the_pool_without_new_charge() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = OwnDevice::open_in_blocks(&catalog, BackendName::Cpu, TEST_GRANULE, 2).unwrap();
         let mut store = token_store(
             device.clone(),
             8192,
@@ -3838,33 +3430,33 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_admitted_history_slabs(2).unwrap();
+        store.add_admitted_history_slabs(3).unwrap();
         let rows = store.history_slab_rows(TOKEN);
-        let page = store.history_page_rows(TOKEN);
+        assert!(4 * rows <= 8192);
         let _low = claim_rows(&store.arena(), 0, rows);
-        let sparse = claim_rows(&store.arena(), rows, 1);
-        // The high slab's last page is free: the sparse page moves there.
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
-        let moved = 3 * rows - page;
+        let sparse = claim_rows(&store.arena(), 2 * rows + 1, 1);
         let value = vec![43u8; 4096 * 4];
         store
             .history_slabs()
-            .region_rows(0, rows as u64, 1)
+            .region_rows(0, (2 * rows + 1) as u64, 1)
             .unwrap()
             .write_from_host(&value)
             .unwrap();
-        let slab_bytes = store.history_slabs().slab_bytes();
-        let charged = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-        assert_eq!(store.compactions().history_rows, 1);
-        assert_eq!(sparse.ranges(), vec![(moved, 1)]);
-        assert!(store.history_slabs().slab(1).is_none());
+        let charged = device.tally.held();
+        device.tally.bound(charged);
+        // Two empty slabs free two granules: one block's worth.
+        let freed = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(freed, 2 * device.pool.granule());
+        assert_eq!(store.history_slabs().backed(), vec![0, 2]);
+        let returned = device.pool.return_freed(freed).unwrap();
+        device.tally.bound(u64::MAX);
+        assert_eq!(returned, device.pool.block_bytes());
+        assert_eq!(device.tally.held(), charged - returned);
+        assert_eq!(sparse.ranges(), vec![(2 * rows + 1, 1)]);
         assert_eq!(
             store
                 .history_slabs()
-                .region_rows(0, moved as u64, 1)
+                .region_rows(0, (2 * rows + 1) as u64, 1)
                 .unwrap()
                 .read_to_host()
                 .unwrap(),
@@ -3872,14 +3464,18 @@ mod tests {
         );
     }
 
+    /// A pool whose granule is no whole number of host pages holds each
+    /// block, and its absent granule, at the backend's rounding of it: the
+    /// store's charge is its blocks at what each is charged, and its tables
+    /// beside them.
     #[test]
-    fn failed_store_copy_preserves_published_history_and_charge() {
-        let device = cpu_device();
-        let mut store = token_store(
+    fn a_store_in_blocks_the_backend_rounds_holds_them_at_their_charge() {
+        let device = OwnDevice::cpu_of(TEST_GRANULE + 256);
+        let store = token_store(
             device.clone(),
-            8192,
-            8192,
-            vec![dense_component(4096)],
+            4096,
+            4096,
+            vec![dense_component(4)],
             vec![],
             BankCapacity {
                 active: 1,
@@ -3888,31 +3484,16 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_admitted_history_slabs(2).unwrap();
-        let rows = store.history_slab_rows(TOKEN);
-        let page = store.history_page_rows(TOKEN);
-        let _low = claim_rows(&store.arena(), 0, rows);
-        let sparse = claim_rows(&store.arena(), rows, 1);
-        // One whole page of the high slab stays free for the sparse page.
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
-        let before_charge = device.device_ledger().charged;
-        let before_ranges = sparse.ranges();
-        let before_stats = store.compactions();
-        let failure = store.shrink_with(ShrinkPolicy::Reclaim, |_, plan| {
-            assert_eq!(plan.rows(), 1);
-            Err(Error::Request("injected copy failure".into()))
-        });
-        assert!(
-            matches!(failure, Err(Error::Request(message)) if message == "injected copy failure")
-        );
-        assert_eq!(sparse.ranges(), before_ranges);
-        assert_eq!(store.compactions(), before_stats);
-        assert_eq!(device.device_ledger().charged, before_charge);
-        assert!(store.history_slabs().slab(1).is_some());
+        assert!(device.pool.held_bytes() > 2 * device.pool.block_bytes(), "the backend rounds the blocks up");
+        device.assert_holds(&store);
     }
 
+    /// A launch's binding of a history plane reads through its slab store's
+    /// address table, which stays valid as slabs are released: it holds no
+    /// slab. A view of a slab's rows holds the slab's granule, and so its
+    /// block, until the view drops; the pool returns the block then.
     #[test]
-    fn released_history_slab_stays_charged_while_a_view_pins_it() {
+    fn released_history_slab_stays_charged_while_a_view_of_its_rows_holds_it() {
         let device = cpu_device();
         let mut store = token_store(
             device.clone(),
@@ -3927,33 +3508,27 @@ mod tests {
             },
         )
         .unwrap();
-        let slab_bytes = store.history_slabs().slab_bytes();
+        let block = device.pool.block_bytes();
         let binding = store.history_planes().unwrap()[0].buffer.clone();
-        let charged = device.device_ledger().charged;
-        assert!(store.shrink(ShrinkPolicy::Reclaim).is_err());
-        assert!(store.history_slabs().slab(0).is_some());
-        assert_eq!(device.device_ledger().charged, charged);
-        drop(binding);
         let pinned = store.history_slabs().region_rows(0, 0, 1).unwrap();
-        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
+        device.assert_holds(&store);
+        let charged = device.tally.held();
+        // The slab is released, its granule freed once the view drops.
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), device.pool.granule());
+        assert_eq!(device.pool.return_freed(device.pool.granule()).unwrap(), 0);
         assert_eq!(committed_extent(&store).0, 0);
-        assert_eq!(device.device_ledger().charged, charged);
-        assert_eq!(store.external_pinned_bytes().unwrap(), slab_bytes);
-        assert_eq!(
-            store.holding_census(&[], &[], &[]).unwrap().total()
-                + store.external_pinned_bytes().unwrap(),
-            device.device_ledger().charged
-        );
+        assert!(store.history_slabs().backed().is_empty());
+        assert_eq!(device.tally.held(), charged);
+        // The census counts the store's committed backing, its tables alone;
+        // the pool holds the viewed slab's block beside its absent granule.
+        assert_eq!(store.holding_census(&[], &[], &[]).unwrap().total(), store.committed_bytes());
+        assert_eq!(device.pool.held_bytes(), 2 * block);
+        drop(binding);
+        assert_eq!(device.pool.return_freed(0).unwrap(), 0);
         drop(pinned);
-        assert_eq!(store.external_pinned_bytes().unwrap(), 0);
-        assert_eq!(
-            device.device_ledger().charged,
-            charged - slab_bytes
-        );
-        assert_eq!(
-            store.holding_census(&[], &[], &[]).unwrap().total(),
-            device.device_ledger().charged
-        );
+        assert_eq!(device.pool.return_freed(0).unwrap(), block, "the granule owed behind the view returns once it drops");
+        assert_eq!(device.tally.held(), charged - block);
+        device.assert_holds(&store);
     }
 
     #[test]
@@ -4409,7 +3984,7 @@ mod tests {
         assert_eq!(census.retained, bank);
         assert_eq!(census.live, (page as u64 + 8 + 6 + 3) * row + 3 * bank);
         assert_eq!(census.total(), store.committed_bytes());
-        assert_eq!(census.total(), device.device_ledger().charged);
+        device.assert_holds(&store);
         let submitted = store
             .holding_census(
                 &[Holder::State(&b), Holder::State(&c)],
@@ -4704,7 +4279,7 @@ mod tests {
 
     /// A store of 1,024 rows (four 256-row pages) of one dense row for a
     /// 1,024-row context, every page backed.
-    fn paged_store(device: Rc<Device>) -> Rc<StateStore> {
+    fn paged_store(device: OwnDevice) -> Rc<StateStore> {
         let mut store = token_store(
             device,
             1024,
@@ -4996,7 +4571,7 @@ mod tests {
     /// spans before) stay within the limit too.
     #[test]
     fn long_prompts_stay_within_the_span_limit_at_the_incident_geometry() {
-        let geometry = history_geometry(28_672, 65_792, 0).unwrap();
+        let geometry = history_geometry(28_672, 65_792, 0, TEST_GRANULE).unwrap();
         assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
         for concurrent in [1usize, 2, 4, 8] {
             let capacity = (65_792 * concurrent).next_multiple_of(geometry.page_rows);
@@ -5049,9 +4624,8 @@ mod tests {
     /// chunks of up to a sixteenth of the row limit, advance speculatively
     /// and roll back a random suffix, fork from checkpoints with both
     /// branches continuing (relocating a blocked last page), release a
-    /// window's front rows, finish, and are reclaimed (the sparsest slab
-    /// emptied into free pages of the others). After every operation every
-    /// history presents at most `ceil(rows / page) + 1` spans, within its
+    /// window's front rows, finish, and release their empty slabs. After
+    /// every operation every history presents at most `ceil(rows / page) + 1` spans, within its
     /// domain's span limit; and whenever the free pages hold a growth's page
     /// demand (the admission check), the claim succeeds without growth.
     #[test]
@@ -5071,7 +4645,11 @@ mod tests {
                 (262_144, 0),
                 (1_048_576, 1_024),
             ] {
-                let geometry = history_geometry(row_bytes, row_limit, appended).unwrap();
+                // The granule a store of this domain alone takes: its
+                // smallest slab, one page.
+                let pages = history_pages(row_limit, appended);
+                let granule = pages.page_bytes(row_bytes).unwrap();
+                let geometry = pages.in_granule(row_bytes, granule).unwrap();
                 assert!(geometry.span_limit <= MAX_HISTORY_SPANS);
                 let page = geometry.page_rows;
                 let slab = geometry.slab_rows;
@@ -5112,45 +4690,18 @@ mod tests {
                                 history.drop_front(random(rows));
                             }
                         }
-                        // Reclaim: empty the sparsest backed slab into free
-                        // pages of the others when they hold its pages.
+                        // Shrink: release every empty backed slab, as a
+                        // shrink keeping no room does; no row moves.
                         6 => {
-                            let planned = {
-                                let inner = arena.borrow();
-                                let occupied = |index: usize| {
-                                    inner
-                                        .runs
-                                        .iter()
-                                        .flat_map(|(&start, run)| {
-                                            start / page..=(start + run.count - 1) / page
-                                        })
-                                        .filter(|&page_index| page_index * page / slab == index)
-                                        .collect::<BTreeSet<_>>()
-                                        .len()
-                                };
-                                inner
-                                    .backed
-                                    .iter()
-                                    .copied()
-                                    .min_by_key(|&index| (occupied(index), index))
-                                    .and_then(|victim| {
-                                        let keep = inner
-                                            .backed
-                                            .iter()
-                                            .copied()
-                                            .filter(|&index| index != victim)
-                                            .collect::<BTreeSet<_>>();
-                                        let room = inner
-                                            .free_pages()
-                                            .into_iter()
-                                            .filter(|free| keep.contains(&(free / slab)))
-                                            .count();
-                                        (room >= occupied(victim))
-                                            .then(|| inner.compact_into_slabs(capacity, &keep).0)
-                                    })
-                            };
-                            if let Some(planned) = planned {
-                                *arena.borrow_mut() = planned;
+                            let mut inner = arena.borrow_mut();
+                            let empty = inner
+                                .backed
+                                .iter()
+                                .copied()
+                                .filter(|&index| inner.empty_slab(index))
+                                .collect::<Vec<_>>();
+                            for index in empty {
+                                inner.unback_empty_slab(index);
                             }
                         }
                         // Grow, possibly speculatively with a rolled-back
@@ -5384,7 +4935,7 @@ mod tests {
                 }
             }
             // Worst case for thrash: the engine idles between every batch.
-            bindings.shrink(ShrinkPolicy::Idle).unwrap();
+            bindings.shrink(&NextSteps::default()).unwrap();
             let mut ranges = slots
                 .iter()
                 .flatten()
@@ -5408,7 +4959,7 @@ mod tests {
             verify(request);
         }
         drop(slots);
-        bindings.shrink(ShrinkPolicy::Idle).unwrap();
+        bindings.shrink(&NextSteps::default()).unwrap();
         Interleaved {
             segments: max_segments,
             span_limit: store.span_limit(TOKEN),
@@ -5421,8 +4972,10 @@ mod tests {
     }
 
     /// The backing commits rows and banks with demand, keeps every row's
-    /// contents across growth, and returns bytes to the device ledger when
-    /// a slab is unreferenced; a launch's captured binding pins placement.
+    /// contents across growth, and returns its blocks to the device when a
+    /// slab is unreferenced. A launch's captured binding reads through the
+    /// slab store's address table, which stays valid as slabs are added and
+    /// released: it pins no placement.
     #[test]
     fn backing_grows_and_shrinks_and_returns_device_memory() {
         let device = cpu_device();
@@ -5442,7 +4995,7 @@ mod tests {
             },
         )
         .unwrap();
-        let charged = || device.device_ledger().charged;
+        let charged = || device.tally.held();
         let base = charged();
         assert_eq!(
             committed_extent(&store),
@@ -5457,19 +5010,6 @@ mod tests {
             .unwrap();
         let rows = committed_extent(&store).0;
         assert_eq!(rows, store.history_slab_rows(TOKEN));
-        // A launch's captured binding pins slab placement: growth fails
-        // rather than doing nothing, and the backing is unchanged.
-        assert!(matches!(
-            store.provision(
-                &[RowDemand {
-                    domain: TOKEN,
-                    rows: 5000,
-                }],
-                8,
-            ),
-            Err(Error::Tensor(seismic::TensorError::SlabLayout(_)))
-        ));
-        assert_eq!(committed_extent(&store).0, rows);
         let written = (0..1000u32)
             .flat_map(|row| (row as f32).to_le_bytes().repeat(4096))
             .collect::<Vec<_>>();
@@ -5490,9 +5030,7 @@ mod tests {
         let claim = store.growth_claim(&demand, &[], 8).unwrap();
         assert!(claim.preferred_bytes >= claim.minimum_bytes);
         assert!(claim.minimum_bytes > 0);
-        let previous_limit = device.device_ledger().bound;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged() + claim.minimum_bytes - 1),
-        ).unwrap();
+        device.tally.bound(charged() + claim.minimum_bytes - 1);
         assert!(matches!(
             store.provision_with_growth(&demand, &[], 8, GrowthChoice::Minimum),
             Err(Error::Tensor(seismic::TensorError::Execution(
@@ -5501,7 +5039,7 @@ mod tests {
         ));
         assert_eq!(committed_extent(&store).0, rows);
         assert_eq!(state.history_ranges(TOKEN), [(0, 1000)]);
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), previous_limit).unwrap();
+        device.tally.bound(u64::MAX);
         store.provision(&demand, 8).unwrap();
         let (rows, banks) = committed_extent(&store);
         assert!(rows >= 11000 && rows <= 16384, "committed {rows} rows");
@@ -5517,19 +5055,23 @@ mod tests {
             written
         );
         assert_eq!(state.history_ranges(TOKEN), [(0, 1000)]);
-        // A launch binding must be released before placement changes.
         drop(plane);
         let before = charged();
-        let released = store.shrink(ShrinkPolicy::Reclaim).unwrap();
-        assert_eq!(released, before.saturating_sub(charged()));
+        let released = store.shrink(&NextSteps::default()).unwrap();
+        assert!(released > 0);
+        // Each released slab's granule was its block's one: every block
+        // returns whole.
+        assert_eq!(device.pool.return_freed(released).unwrap(), released);
+        assert_eq!(released, before - charged());
         assert!(committed_extent(&store).0 < rows);
         assert!(committed_extent(&store).0 >= 1000);
-        assert_eq!(store.external_pinned_bytes().unwrap(), 0);
+        assert_eq!(device.pool.return_freed(0).unwrap(), 0);
         drop(state);
-        // Idle hysteresis keeps a small backing; reclaim releases it all.
-        store.shrink(ShrinkPolicy::Reclaim).unwrap();
+        // With no sequence left, no slab is kept.
+        let released = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(device.pool.return_freed(released).unwrap(), released);
         assert_eq!(committed_extent(&store).0, 0);
-        store.release_idle().unwrap();
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), 0, "an idle store holds nothing more to release");
         assert!(charged() < base);
     }
 
@@ -5559,17 +5101,17 @@ mod tests {
             .unwrap()
             .write_from_host(&encoded)
             .unwrap();
-        let baseline = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(baseline)).unwrap();
+        let baseline = device.tally.held();
+        device.tally.bound(baseline);
         assert!(matches!(
             store.add_history_slabs(TOKEN, 1),
             Err(Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.tally.bound(u64::MAX);
         assert_eq!(committed_extent(&store).0, store.history_slab_rows(TOKEN));
-        assert_eq!(device.device_ledger().charged, baseline);
+        assert_eq!(device.tally.held(), baseline);
         assert_eq!(
             store
                 .history_slabs()
@@ -5604,7 +5146,7 @@ mod tests {
             domain: TOKEN,
             rows: store.history_slab_rows(TOKEN) + 1,
         }];
-        let baseline = device.device_ledger().charged;
+        let baseline = device.tally.held();
         let committed = committed_extent(&store);
         let history_bytes = store.history_slabs().slab_bytes();
         let bank_bytes = store
@@ -5618,17 +5160,19 @@ mod tests {
             store.growth_claim(&demand, &[], 4).unwrap().minimum_bytes,
             history_bytes + bank_bytes
         );
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(baseline + history_bytes + bank_bytes - 1),
-        ).unwrap();
+        // Each slab grows the pool by a block: the history slab's is
+        // admitted, the bank slab's refused.
+        let block = device.pool.block_bytes();
+        device.tally.bound(baseline + 2 * block - 1);
         assert!(matches!(
             store.provision_with_growth(&demand, &[], 4, GrowthChoice::Minimum),
             Err(Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationCapacity { .. }
             )))
         ));
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        device.tally.bound(u64::MAX);
         assert_eq!(committed_extent(&store), committed);
-        assert_eq!(device.device_ledger().charged, baseline);
+        assert_eq!(device.tally.held(), baseline);
         assert_eq!(store.arena().borrow().backed, BTreeSet::from([0]));
 
         store
@@ -5639,17 +5183,16 @@ mod tests {
             committed_extent(&store).1,
             committed.1 + store.bank_slab_banks()
         );
-        assert_eq!(
-            device.device_ledger().charged,
-            baseline + history_bytes + bank_bytes
-        );
+        assert_eq!(device.tally.held(), baseline + 2 * block);
     }
 
     /// Regression (chost 15:36): shrinking after every step released the
     /// successor banks the next step regrew, reallocating and copying the
-    /// bank arenas every other decode step. With hysteresis a request that
+    /// bank arenas every other decode step. A shrink keeps the room the
+    /// next step claims, its row and successor bank, so a request that
     /// decodes 300 steps beside a retained prompt checkpoint changes the
-    /// backing only while it grows, even when the store idles between steps.
+    /// backing only while it grows, even when the store shrinks between
+    /// steps.
     #[test]
     fn decode_never_alternates_growing_and_shrinking_the_backing() {
         let device = cpu_device();
@@ -5677,7 +5220,11 @@ mod tests {
             else {
                 panic!("full prefix must commit");
             };
-            bindings.shrink(ShrinkPolicy::Idle).unwrap();
+            let next = NextSteps {
+                rows: state.demands(1),
+                banks: 1,
+            };
+            bindings.shrink(&next).unwrap();
             state
         };
         let mut state = step(store.create().unwrap(), 500);
@@ -5694,10 +5241,10 @@ mod tests {
         }
     }
 
-    /// Reclaim releases surplus but not a live sequence's next step: one
+    /// A shrink releases surplus but not a live sequence's next step: one
     /// whose last page is full still advances a row without growing.
     #[test]
-    fn reclaim_keeps_room_for_a_live_sequences_next_step() {
+    fn a_shrink_keeps_room_for_a_live_sequences_next_step() {
         let device = cpu_device();
         let mut bindings = token_store(
             device,
@@ -5729,9 +5276,9 @@ mod tests {
             rows: live.demands(2),
             banks: 0,
         };
-        assert!(bindings.shrink_for(&next).unwrap() > 0, "the freed rows are surplus");
+        assert!(bindings.shrink(&next).unwrap() > 0, "the freed rows are surplus");
         let claim = bindings.growth_claim(&live.demands(2), &[], 0).unwrap();
-        assert_eq!(claim.minimum_bytes, 0, "the next steps' rows open pages Reclaim kept");
+        assert_eq!(claim.minimum_bytes, 0, "the next steps' rows open pages the shrink kept");
     }
 
     /// One step's chunks chained behind two slots are admitted together, as
@@ -5783,10 +5330,10 @@ mod tests {
     }
 
     /// A slab left in reserve when its queue was orphaned returns to
-    /// placement at a shrink, its pages the room Reclaim keeps: no further
-    /// slab stays charged beside it.
+    /// placement at a shrink, its pages the room the shrink keeps: no
+    /// further slab stays charged beside it.
     #[test]
-    fn reclaim_counts_a_reserved_slab_as_the_room_it_returns() {
+    fn a_shrink_counts_a_reserved_slab_as_the_room_it_returns() {
         let device = cpu_device();
         let mut bindings = token_store(
             device,
@@ -5817,16 +5364,16 @@ mod tests {
             rows: live.demands(1),
             banks: 0,
         };
-        bindings.shrink_for(&next).unwrap();
+        bindings.shrink(&next).unwrap();
         let arena = store.arena().borrow();
         assert_eq!(arena.backed, BTreeSet::from([0, 1]));
         assert!(arena.reserve.is_empty());
     }
 
-    /// Reclaim frees an empty interior history slab without moving a shared
+    /// A shrink frees an empty interior history slab without moving a shared
     /// prefix, and growth reuses the lowest vacant slab index.
     #[test]
-    fn reclaim_frees_empty_interior_slab_and_reuses_lowest_index() {
+    fn a_shrink_frees_an_empty_interior_slab_and_growth_reuses_the_lowest_index() {
         let device = cpu_device();
         let mut bindings = token_store(
             device.clone(),
@@ -5891,22 +5438,19 @@ mod tests {
         drop(large);
         let before = (
             committed_extent(&store).0,
-            device.device_ledger().charged,
+            device.tally.held(),
         );
         let occupied = store.occupied_rows(TOKEN);
         assert_eq!(occupied, 256 + 50 + 20);
-        // Reclaim copies only into space held by the store and succeeds when
-        // the device refuses all new allocations.
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(before.1)).unwrap();
-        let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        // The shrink and the pool's return allocate nothing: they succeed
+        // when the device refuses every new allocation.
+        device.tally.bound(before.1);
+        let released = bindings.shrink(&NextSteps::default()).unwrap();
         assert!(released > 0);
+        assert_eq!(device.pool.return_freed(released).unwrap(), released);
+        device.tally.bound(u64::MAX);
         assert!(committed_extent(&store).0 <= before.0);
-        assert!(device.device_ledger().charged < before.1);
-        assert_eq!(store.compactions(), Compactions::default());
-        assert_eq!(read(long.history_ranges(TOKEN)), expected(306));
-        assert_eq!(store.compactions().count, 0);
-        assert!(device.device_ledger().charged < before.1);
+        assert_eq!(device.tally.held(), before.1 - released);
         assert_eq!(store.occupied_rows(TOKEN), occupied);
         assert_eq!(long.history_ranges(TOKEN), long_ranges);
         assert_eq!(system.history_ranges(TOKEN), system_ranges);
@@ -5923,11 +5467,16 @@ mod tests {
         assert_eq!(claim.minimum_bytes, slab_bytes);
         assert_eq!(claim.preferred_bytes, slab_bytes);
         bindings.provision(&demand, 0).unwrap();
-        assert!(store.history_slabs().slab(0).is_some());
+        assert!(store.history_slabs().backed().contains(&0));
     }
 
+    /// On every backend, a shrink of a sparse history store releases its
+    /// empty slab and moves no row; the pool returns a whole block of its
+    /// two-granule blocks, emptying the emptiest into a free granule it
+    /// holds where none is empty, without a new charge, the sparse row
+    /// readable at its address.
     #[test]
-    fn reclaim_compacts_across_a_sparse_history_store() {
+    fn a_sparse_history_store_returns_a_block_without_moving_a_row_on_every_backend() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         for backend in [
             BackendName::Cpu,
@@ -5935,10 +5484,9 @@ mod tests {
             BackendName::Cuda,
             BackendName::Vulkan,
         ] {
-            let Ok(device) = own_device(&catalog, backend) else {
+            let Ok(device) = OwnDevice::open_in_blocks(&catalog, backend, TEST_GRANULE, 2) else {
                 continue;
             };
-            let device = Rc::new(device);
             let mut store = token_store(
                 device.clone(),
                 8192,
@@ -5963,19 +5511,21 @@ mod tests {
                 .unwrap()
                 .write_from_host(&value)
                 .unwrap();
-            let slab_bytes = store.history_slabs().slab_bytes();
-            let charged = device.device_ledger().charged;
-            device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-            assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
-            device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-            assert_eq!(committed_extent(&store).0, slab_rows);
-            assert_eq!(store.compactions().history_rows, 1);
-            let moved = high.ranges()[0].0;
-            assert!(moved < slab_rows);
+            let extent = committed_extent(&store);
+            let charged = device.tally.held();
+            device.tally.bound(charged);
+            let freed = store.shrink(&NextSteps::default()).unwrap();
+            assert_eq!(freed, device.pool.granule());
+            let returned = device.pool.return_freed(freed).unwrap();
+            device.tally.bound(u64::MAX);
+            assert_eq!(returned, device.pool.block_bytes());
+            assert_eq!(device.tally.held(), charged - returned);
+            assert_eq!(committed_extent(&store), extent);
+            assert_eq!(high.ranges(), vec![(2 * slab_rows + 1, 1)]);
             assert_eq!(
                 store
                     .history_slabs()
-                    .region_rows(0, moved as u64, 1)
+                    .region_rows(0, (2 * slab_rows + 1) as u64, 1)
                     .unwrap()
                     .read_to_host()
                     .unwrap(),
@@ -5984,8 +5534,12 @@ mod tests {
         }
     }
 
+    /// On every backend, claimed banks keep their slots while a shrink
+    /// releases the empty bank slab between them; the pool returns a whole
+    /// block of its two-granule blocks without a new charge, and every
+    /// claimed bank reads back its bytes.
     #[test]
-    fn reclaim_compacts_claimed_banks_before_releasing_slabs() {
+    fn claimed_banks_keep_their_slots_while_their_empty_slab_returns_on_every_backend() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         for backend in [
             BackendName::Cpu,
@@ -5993,10 +5547,9 @@ mod tests {
             BackendName::Cuda,
             BackendName::Vulkan,
         ] {
-            let Ok(device) = own_device(&catalog, backend) else {
+            let Ok(device) = OwnDevice::open_in_blocks(&catalog, backend, TEST_GRANULE, 2) else {
                 continue;
             };
-            let device = Rc::new(device);
             let mut bindings = token_store(
                 device.clone(),
                 64,
@@ -6020,11 +5573,14 @@ mod tests {
             )
             .unwrap();
             let store = Rc::clone(&bindings);
+            assert_eq!(store.bank_slab_banks(), 4);
             store.add_bank_slabs(2).unwrap();
             let mut claims = (0..9)
                 .map(|_| Some(store.banks.acquire().unwrap()))
                 .collect::<Vec<_>>();
-            let kept = [2usize, 5, 9];
+            // Bank 2 in the first slab, bank 9 in the last; the middle slab
+            // empties.
+            let kept = [2usize, 9];
             for &index in &kept {
                 for (plane_index, plane) in store.recurrent_arenas().iter().enumerate() {
                     let bytes = vec![
@@ -6047,42 +5603,43 @@ mod tests {
                 }
             }
             let placed = || kept.map(|index| claims[index - 1].as_ref().unwrap().index());
-            let holds = |slots: [usize; 3]| {
-                for (old, slot) in kept.into_iter().zip(slots) {
+            let holds = || {
+                for index in kept {
                     for (plane_index, plane) in store.recurrent_arenas().iter().enumerate() {
                         let bytes = plane
-                            .slice_leading(slot as u64, slot as u64 + 1)
+                            .slice_leading(index as u64, index as u64 + 1)
                             .unwrap()
                             .read_to_host()
                             .unwrap();
-                        assert_eq!(bytes, vec![old as u8 + plane_index as u8; bytes.len()]);
+                        assert_eq!(bytes, vec![index as u8 + plane_index as u8; bytes.len()]);
                     }
                 }
             };
-            let charged = device.device_ledger().charged;
-            // Bank 9 lies beyond the four kept banks; lower banks are free.
-            let generation = store.bank_placement_generation();
-            // Compaction and release use only already held storage.
-            device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-            let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
-            device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-            assert!(released > 0);
-            assert_eq!(committed_extent(&store).1, 4);
-            let after = placed();
-            assert!(after.iter().all(|&slot| slot < 4));
-            assert!(store.bank_placement_generation() > generation);
-            assert_eq!(store.compactions().banks, 2);
-            holds(after);
-            assert_eq!(bindings.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
-            assert_eq!(store.compactions().count, 1);
-            assert_eq!(placed(), after);
-            holds(after);
-            assert!(device.device_ledger().charged < charged);
+            assert_eq!(placed(), kept);
+            let extent = committed_extent(&store);
+            let charged = device.tally.held();
+            let available = store.available_banks();
+            device.tally.bound(charged);
+            let freed = bindings.shrink(&NextSteps::default()).unwrap();
+            assert_eq!(freed, device.pool.granule());
+            let returned = device.pool.return_freed(freed).unwrap();
+            device.tally.bound(u64::MAX);
+            assert_eq!(returned, device.pool.block_bytes());
+            assert_eq!(device.tally.held(), charged - returned);
+            assert_eq!(committed_extent(&store), extent);
+            assert_eq!(store.available_banks(), available - 4, "the released slab's banks left the free slots");
+            assert_eq!(placed(), kept);
+            holds();
+            assert_eq!(bindings.shrink(&NextSteps::default()).unwrap(), 0);
+            assert_eq!(placed(), kept);
+            holds();
         }
     }
 
+    /// A shrink frees an empty interior bank slab, moving no bank, and
+    /// growth reuses its index.
     #[test]
-    fn reclaim_frees_empty_interior_bank_slab_and_reuses_its_index() {
+    fn a_shrink_frees_an_empty_interior_bank_slab_and_growth_reuses_its_index() {
         let device = cpu_device();
         let mut store = token_store(
             device.clone(),
@@ -6122,10 +5679,12 @@ mod tests {
             .as_ref()
             .unwrap()
             .slab_bytes();
-        let charged = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
+        let charged = device.tally.held();
+        device.tally.bound(charged);
+        let freed = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(freed, device.pool.granule());
+        assert_eq!(device.pool.return_freed(freed).unwrap(), device.pool.block_bytes());
+        device.tally.bound(u64::MAX);
         assert_eq!(high.index(), 8);
         assert_eq!(store.available_banks(), 3);
         assert_eq!(
@@ -6146,14 +5705,17 @@ mod tests {
                 .recurrent
                 .as_ref()
                 .unwrap()
-                .slab(1)
-                .is_some()
+                .backed()
+                .contains(&1)
         );
         assert_eq!(store.available_banks(), 7);
     }
 
+    /// A bank past an unbacked interior slab keeps its slot and bytes, and
+    /// the committed banks reach it; once it is released, the next shrink
+    /// releases its slab and the committed banks end at the seed's slab.
     #[test]
-    fn reclaim_compacts_banks_past_an_unbacked_interior_slab() {
+    fn a_bank_past_an_unbacked_interior_slab_stays_until_released() {
         let device = cpu_device();
         let mut store = token_store(
             device.clone(),
@@ -6171,6 +5733,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(store.bank_slab_banks(), 4);
         store.add_bank_slabs(2).unwrap();
         let mut claims = (0..8)
             .map(|_| Some(store.banks.acquire().unwrap()))
@@ -6179,26 +5742,22 @@ mod tests {
         for claim in claims {
             drop(claim);
         }
+        assert_eq!(high.index(), 8);
         let value = vec![37u8; 16 * 1024 * 1024];
         store.recurrent_arenas()[0]
             .slice_leading(high.index() as u64, high.index() as u64 + 1)
             .unwrap()
             .write_from_host(&value)
             .unwrap();
-        let slab_bytes = store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slab_bytes();
-        let charged = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-        assert_eq!(high.index(), 1);
-        assert_eq!(committed_extent(&store).1, 4);
-        assert_eq!(store.compactions().banks, 1);
+        let extent = committed_extent(&store).1;
+        let charged = device.tally.held();
+        device.tally.bound(charged);
+        let freed = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(freed, device.pool.granule(), "the interior slab");
+        assert_eq!(device.pool.return_freed(freed).unwrap(), device.pool.block_bytes());
+        device.tally.bound(u64::MAX);
+        assert_eq!(high.index(), 8);
+        assert_eq!(committed_extent(&store).1, extent);
         assert_eq!(
             store.recurrent_arenas()[0]
                 .slice_leading(high.index() as u64, high.index() as u64 + 1)
@@ -6207,11 +5766,19 @@ mod tests {
                 .unwrap(),
             value
         );
+        drop(high);
+        assert_eq!(store.shrink(&NextSteps::default()).unwrap(), device.pool.granule());
+        assert_eq!(committed_extent(&store).1, 4);
     }
 
+    /// A sparse bank slab stays, its bank at its slot; the empty slabs the
+    /// shrink releases free two granules, and the pool returns a whole block
+    /// of its two-granule blocks without a new charge, copying the sparse
+    /// slab's granule where its block has no empty one.
     #[test]
-    fn reclaim_frees_the_sparsest_bank_slab_without_new_charge() {
-        let device = cpu_device();
+    fn a_sparse_bank_slab_returns_its_block_through_the_pool_without_new_charge() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = OwnDevice::open_in_blocks(&catalog, BackendName::Cpu, TEST_GRANULE, 2).unwrap();
         let mut store = token_store(
             device.clone(),
             64,
@@ -6228,213 +5795,33 @@ mod tests {
             },
         )
         .unwrap();
-        store.add_bank_slabs(2).unwrap();
+        assert_eq!(store.bank_slab_banks(), 4);
+        // Slabs of banks 0..4, 4..8, 8..12 and 12..13.
+        store.add_bank_slabs(3).unwrap();
         let mut claims = (0..10)
             .map(|_| Some(store.banks.acquire().unwrap()))
             .collect::<Vec<_>>();
-        for index in 5..=7 {
+        for index in 5..=10 {
             drop(claims[index - 1].take());
         }
         let sparse = claims[3].as_ref().unwrap();
+        assert_eq!(sparse.index(), 4);
         let value = vec![47u8; 16 * 1024 * 1024];
-        store.recurrent_arenas()[0]
-            .slice_leading(sparse.index() as u64, sparse.index() as u64 + 1)
-            .unwrap()
-            .write_from_host(&value)
-            .unwrap();
-        let slab_bytes = store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slab_bytes();
-        let charged = device.device_ledger().charged;
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), Some(charged)).unwrap();
-        assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
-        device.bounds().bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-        assert_eq!(sparse.index(), 11);
-        assert_eq!(store.compactions().banks, 1);
-        assert!(
-            store
-                .backing
-                .borrow()
-                .recurrent
-                .as_ref()
-                .unwrap()
-                .slab(1)
-                .is_none()
-        );
+        write_bank(&store, sparse.index(), &value);
+        let charged = device.tally.held();
+        device.tally.bound(charged);
+        let freed = store.shrink(&NextSteps::default()).unwrap();
+        assert_eq!(freed, 2 * device.pool.granule());
+        let returned = device.pool.return_freed(freed).unwrap();
+        device.tally.bound(u64::MAX);
+        assert_eq!(returned, device.pool.block_bytes());
+        assert_eq!(device.tally.held(), charged - returned);
+        assert_eq!(sparse.index(), 4);
         assert_eq!(
-            store.recurrent_arenas()[0]
-                .slice_leading(sparse.index() as u64, sparse.index() as u64 + 1)
-                .unwrap()
-                .read_to_host()
-                .unwrap(),
-            value
+            store.backing.borrow().recurrent.as_ref().unwrap().backed(),
+            vec![0, 1]
         );
-    }
-
-    #[test]
-    fn failed_store_copy_preserves_published_bank_and_charge() {
-        let device = cpu_device();
-        let mut store = token_store(
-            device.clone(),
-            64,
-            64,
-            vec![],
-            vec![ComponentSpec {
-                shape: vec![4 * 1024 * 1024],
-                dtype: DType::F32,
-            }],
-            BankCapacity {
-                active: 11,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        store.add_bank_slabs(2).unwrap();
-        let mut claims = (0..10)
-            .map(|_| Some(store.banks.acquire().unwrap()))
-            .collect::<Vec<_>>();
-        for index in 5..=7 {
-            drop(claims[index - 1].take());
-        }
-        let sparse = claims[3].as_ref().unwrap();
-        let before_slot = sparse.index();
-        let before_generation = store.bank_placement_generation();
-        let before_charge = device.device_ledger().charged;
-        let before_stats = store.compactions();
-        let failure = store.shrink_with(ShrinkPolicy::Reclaim, |_, plan| {
-            assert_eq!(plan.rows(), 1);
-            Err(Error::Request("injected bank copy failure".into()))
-        });
-        assert!(
-            matches!(failure, Err(Error::Request(message)) if message == "injected bank copy failure")
-        );
-        assert_eq!(sparse.index(), before_slot);
-        assert_eq!(store.bank_placement_generation(), before_generation);
-        assert_eq!(store.compactions(), before_stats);
-        assert_eq!(device.device_ledger().charged, before_charge);
-        assert!(
-            store
-                .backing
-                .borrow()
-                .recurrent
-                .as_ref()
-                .unwrap()
-                .slab(1)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn later_copy_failure_preserves_both_placements_values_and_charge() {
-        let device = cpu_device();
-        let mut store = token_store(
-            device.clone(),
-            8192,
-            8192,
-            vec![dense_component(4096)],
-            vec![ComponentSpec {
-                shape: vec![4 * 1024 * 1024],
-                dtype: DType::F32,
-            }],
-            BankCapacity {
-                active: 11,
-                in_flight: 1,
-                retained: 0,
-            },
-        )
-        .unwrap();
-        store.add_admitted_history_slabs(2).unwrap();
-        store.add_bank_slabs(2).unwrap();
-        let rows = store.history_slab_rows(TOKEN);
-        let page = store.history_page_rows(TOKEN);
-        let _low = claim_rows(&store.arena(), 0, rows);
-        let sparse = claim_rows(&store.arena(), rows, 1);
-        let _high = claim_rows(&store.arena(), 2 * rows, rows - page);
-        let history_value = vec![41u8; 4096 * 4];
-        store
-            .history_slabs()
-            .region_rows(0, rows as u64, 1)
-            .unwrap()
-            .write_from_host(&history_value)
-            .unwrap();
-        let mut claims = (0..10)
-            .map(|_| Some(store.banks.acquire().unwrap()))
-            .collect::<Vec<_>>();
-        for index in 5..=7 {
-            drop(claims[index - 1].take());
-        }
-        let bank = claims[3].as_ref().unwrap();
-        let bank_value = vec![47u8; 16 * 1024 * 1024];
-        write_bank(&store, bank.index(), &bank_value);
-        let before_charge = device.device_ledger().charged;
-        let before_ranges = sparse.ranges();
-        let before_slot = bank.index();
-        let before_generation = store.bank_placement_generation();
-        let before_stats = store.compactions();
-        let before_history_slabs = store.history_slabs().slabs().count();
-        let before_bank_slabs = store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slabs()
-            .count();
-        let mut copies = 0;
-        let failure = store.shrink_with(ShrinkPolicy::Reclaim, |slabs, plan| {
-            copies += 1;
-            if copies == 2 {
-                return Err(Error::Request("injected later copy failure".into()));
-            }
-            for part in plan.copies() {
-                for (&from, &to) in part.from.iter().zip(&part.to) {
-                    let source = slabs.region_rows(part.plane_index, from as u64, 1)?;
-                    let mut destination = slabs.region_rows(part.plane_index, to as u64, 1)?;
-                    destination.write_from_host(
-                        &source
-                            .read_to_host()
-                            .map_err(|error| Error::Request(error.to_string()))?,
-                    )?;
-                }
-            }
-            Ok(())
-        });
-        assert!(
-            matches!(failure, Err(Error::Request(message)) if message == "injected later copy failure")
-        );
-        assert_eq!(copies, 2);
-        assert_eq!(sparse.ranges(), before_ranges);
-        assert_eq!(bank.index(), before_slot);
-        assert_eq!(store.bank_placement_generation(), before_generation);
-        assert_eq!(store.compactions(), before_stats);
-        assert_eq!(store.history_slabs().slabs().count(), before_history_slabs);
-        assert_eq!(
-            store
-                .backing
-                .borrow()
-                .recurrent
-                .as_ref()
-                .unwrap()
-                .slabs()
-                .count(),
-            before_bank_slabs
-        );
-        assert_eq!(device.device_ledger().charged, before_charge);
-        assert_eq!(
-            store
-                .history_slabs()
-                .region_rows(0, rows as u64, 1)
-                .unwrap()
-                .read_to_host()
-                .unwrap(),
-            history_value
-        );
-        assert_eq!(bank_bytes(&store, before_slot), bank_value);
+        assert_eq!(bank_bytes(&store, sparse.index()), value);
     }
 
     struct Interleaved {

@@ -8,8 +8,8 @@ use seismic_native_target::{
 };
 use std::sync::{Arc, Once};
 
-/// The process's test store: each device's probes run once a test process.
-pub(crate) fn store() -> &'static MemoryStore {
+/// The process's probe-answer store: each device's probes run once a test process.
+pub(crate) fn probes() -> &'static MemoryStore {
     static STORE: std::sync::OnceLock<MemoryStore> = std::sync::OnceLock::new();
     STORE.get_or_init(MemoryStore::default)
 }
@@ -22,7 +22,19 @@ static VALIDATION: Once = Once::new();
 /// an encoding the API forbids then aborts the test process.
 pub(crate) fn metal_device() -> MetalDevice {
     VALIDATION.call_once(|| std::env::set_var("MTL_DEBUG_LAYER", "1"));
-    MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap()
+    MetalDevice::open(DeviceHandle::system_default().unwrap(), store()).unwrap()
+}
+
+/// The store a backend test's device opens with: a tally of host RAM, the
+/// store Metal's shared storage lies in, admitting everything.
+pub(crate) fn store() -> std::sync::Arc<dyn seismic_memory::entry::Store> {
+    std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam))
+}
+
+/// The ledger entry a backend test's allocations are charged to: a tally
+/// of its own, as [`store`]'s.
+pub(crate) fn entry() -> std::sync::Arc<dyn seismic_memory::entry::Entry> {
+    std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam))
 }
 
 /// The programs of `device` in this crate's tests, which sit below the

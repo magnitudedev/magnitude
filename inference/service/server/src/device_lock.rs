@@ -69,9 +69,6 @@ struct Sharing {
     idleness: u64,
     /// A job holds the device.
     job: bool,
-    /// Memory is recovering ([`DeviceLock::hold_off_jobs`]): no job starts, and a running one
-    /// is preempted.
-    held_off: bool,
 }
 
 impl Default for DeviceLock {
@@ -321,22 +318,6 @@ impl DeviceLock {
         let _ = self.sharing.subscribe().wait_for(|sharing| !sharing.job).await;
     }
 
-    /// Hold jobs off while memory recovers (`held`), or no longer: the memory supervisor's alone
-    /// to say. Held off, no job starts, and one running is preempted at once. Only the hold's
-    /// start preempts, so a job still ending from it is not preempted again.
-    pub fn hold_off_jobs(&self, held: bool) {
-        let mut preempted = false;
-        self.sharing.send_if_modified(|sharing| {
-            let changed = sharing.held_off != held;
-            preempted = changed && held && sharing.job;
-            sharing.held_off = held;
-            changed
-        });
-        if preempted {
-            self.wanted.send_modify(|wanted| *wanted += 1);
-        }
-    }
-
     /// The device's changes from now on ([`DeviceChanges`]).
     pub fn changes(&self) -> DeviceChanges {
         let sharing = self.sharing.subscribe();
@@ -363,10 +344,6 @@ impl DeviceLock {
     /// Take the device for a job, without waiting: `None` while residency shares it or another
     /// job holds it. Only shares wanted from here on preempt the job.
     pub fn try_job(&self) -> Option<DeviceJob> {
-        // Held off, the write guard is not even tried, so no share is refused for it.
-        if self.sharing.borrow().held_off {
-            return None;
-        }
         let preemption = Preemption {
             wanted: self.wanted.subscribe(),
             idle: None,
@@ -376,7 +353,7 @@ impl DeviceLock {
         // ends; no share starts while the write guard is held, so none starts beside it.
         let mut taken = false;
         self.sharing.send_if_modified(|sharing| {
-            taken = !sharing.job && !sharing.held_off;
+            taken = !sharing.job;
             if taken {
                 sharing.job = true;
             }
@@ -397,7 +374,7 @@ impl DeviceLock {
         let wanted = self.wanted.subscribe();
         let mut taken = None;
         self.sharing.send_if_modified(|sharing| {
-            if let (Some(idle), 1, false, false) = (&sharing.idle, sharing.shares, sharing.job, sharing.held_off) {
+            if let (Some(idle), 1, false) = (&sharing.idle, sharing.shares, sharing.job) {
                 taken = Some((Arc::clone(&idle.room), sharing.idleness));
                 sharing.job = true;
             }

@@ -243,7 +243,9 @@ impl NativeSubmission<Metal> for AuditSubmission {
 #[test]
 #[ignore = "requires Metal device"]
 fn authored_failure_before_subgroup_preserves_prefix_and_reconverges_after_if() {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let tally = seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let charge: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(tally.clone());
+    let device = MetalDevice::open(DeviceHandle::system_default().unwrap(), std::sync::Arc::new(tally)).unwrap();
     let store = crate::artifacts::ProgramStore::user();
     let target = seismic_metal::profile::open_device(&device, &*store).unwrap();
     let programs: seismic_metal::MetalPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
@@ -341,7 +343,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
                     .unwrap()
                     .try_into()
                     .expect("fixture allocation must fit the device byte address domain");
-                let buffer = device.allocate(bytes.max(1), allocation.alignment).unwrap();
+                let buffer = device.allocate(seismic_metal::topology::SHARED_KIND, bytes.max(1), allocation.alignment, &charge).unwrap();
                 device
                     .write(
                         &buffer,
@@ -481,7 +483,9 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
 
 #[test]
 fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
-    let opened = seismic_cpu::open_host(crate::backends::host_cores().unwrap()).unwrap();
+    let tally = seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let charge: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(tally.clone());
+    let opened = seismic_cpu::open_host(crate::backends::host_cores().unwrap(), std::sync::Arc::new(tally)).unwrap();
     let programs: seismic_cpu::CpuPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
         seismic_cpu::toolchain::CpuToolchain::new(&opened.device),
         crate::artifacts::ProgramStore::user(),
@@ -537,7 +541,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
                 .expect("fixture allocation must fit the device byte address domain");
             let buffer = opened
                 .service
-                .allocate(bytes.max(1), allocation.alignment)
+                .allocate(seismic_cpu::topology::kind().id, bytes.max(1), allocation.alignment, &charge)
                 .unwrap();
             opened
                 .service

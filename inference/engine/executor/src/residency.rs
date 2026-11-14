@@ -463,19 +463,6 @@ pub struct ResidentWeight {
 }
 
 impl ResidentWeight {
-    /// Visit every tensor the weight holds: its own, its scale and bound,
-    /// and its table's beside them.
-    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        visit(&self.tensor);
-        if let Some(tensor) = &self.scale {
-            visit(tensor);
-        }
-        if let Some(tensor) = &self.bound {
-            visit(tensor);
-        }
-        self.table.visit_extra_storage(visit);
-    }
-
     /// The weight as its row-gathering readers find it.
     pub fn table(&self) -> &ResidentTable {
         &self.table
@@ -539,9 +526,12 @@ impl ResidentWeight {
 
     /// [`Self::storage_bytes`], its table's stagings counted as `stagings`
     /// bytes: every other allocation as charged now, a stored table's slots
-    /// at the records the bank resized them to.
+    /// at the records the bank resized them to (`StoredTable::charged_bytes`;
+    /// its tensor, the slots' logical view, is its slab store's address
+    /// table).
     fn storage_bytes_staging(&self, stagings: u64) -> u64 {
         self.tensor.charged_bytes()
+            + self.table.stored().map_or(0, |table| table.charged_bytes())
             + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
             + self.bound.as_ref().map_or(0, Tensor::storage_bytes)
             + self.table.held_bytes()
@@ -785,12 +775,6 @@ impl Imports {
         self.0.borrow().len()
     }
 
-    /// Visit every tensor of the cached imports.
-    fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        for imported in self.0.borrow().values() {
-            imported.weight.visit_storage(visit);
-        }
-    }
 }
 
 /// Sole cache and importer for one planned device. Resident components are
@@ -810,8 +794,6 @@ pub struct ResidencyStore {
     kept_table_rows: Option<std::path::PathBuf>,
     /// What the job stored of the bank's CPU sites.
     cpu_site: crate::assessment::StoredCpuSite,
-    /// The load's release thread, which the expert bank releases on.
-    releases: crate::Releases,
     /// The changes of the load's ledgers' scope, which the expert bank
     /// holds each memory change of with its record from its open
     /// (`memory::ledger::Changing`).
@@ -821,23 +803,39 @@ pub struct ResidencyStore {
     /// bank has host slots ([`crate::memory::ledger::DeviceLedgers::host_backing`]),
     /// split from the target import's claim as the store is made for it.
     host_backing: Option<crate::memory::ledger::Claim>,
+    /// The target import's transient upload window entries, when claimed apart
+    /// from `weights`: temporary import workspaces charge here so their drops
+    /// never resize `weights`.
+    upload: Vec<std::sync::Arc<dyn seismic::memory::Entry>>,
+    /// The load's granule pools (`experts::LoadPools`): the state's, which
+    /// its whole stored tables lie in, the bank's records pool, which its
+    /// records and banked tables claim from, and a linked host tier's.
+    pools: crate::experts::LoadPools,
 }
 
 impl ResidencyStore {
     /// The store of a load's target import: `weights` is the import's claim
     /// on `ledgers`, which the tier of the plan's bank takes its backing
-    /// from, so a bank opened by this store has its host tier's claim.
+    /// from and its pooled record holdings split from, so non-pooled imports
+    /// never consume the bank's record reserve.
     pub fn for_target(
         device: Rc<Device>,
         programs: Rc<crate::native::AttestedPrograms>,
         execution: ExecutionPlan,
         domain: ResourceDomainId,
-        releases: crate::Releases,
         ledgers: &crate::memory::ledger::DeviceLedgers,
         weights: &mut crate::memory::ledger::Held,
+        pools: crate::experts::LoadPools,
     ) -> Result<Self, WeightImportError> {
         let backing = ledgers.host_backing(weights, execution.load()).map_err(invalid)?;
-        Self::make(device, programs, execution, domain, releases, ledgers.changes().clone(), backing)
+        ledgers.split_records(weights, execution.load()).map_err(invalid)?;
+        Self::make(device, programs, execution, domain, ledgers.changes().clone(), backing, pools)
+    }
+
+    /// Charge temporary import workspaces to `upload` while importing the
+    /// target's weights.
+    pub fn with_upload(&mut self, upload: &crate::memory::ledger::Held) {
+        self.upload = upload.charging_entries();
     }
 
     /// The store of a component that opens no expert bank (the vision
@@ -848,10 +846,10 @@ impl ResidencyStore {
         programs: Rc<crate::native::AttestedPrograms>,
         execution: ExecutionPlan,
         domain: ResourceDomainId,
-        releases: crate::Releases,
         changes: std::sync::Arc<crate::memory::ledger::Changes>,
+        pools: crate::experts::LoadPools,
     ) -> Result<Self, WeightImportError> {
-        Self::make(device, programs, execution.without_expert_bank(), domain, releases, changes, None)
+        Self::make(device, programs, execution.without_expert_bank(), domain, changes, None, pools)
     }
 
     fn make(
@@ -859,9 +857,9 @@ impl ResidencyStore {
         programs: Rc<crate::native::AttestedPrograms>,
         execution: ExecutionPlan,
         domain: ResourceDomainId,
-        releases: crate::Releases,
         changes: std::sync::Arc<crate::memory::ledger::Changes>,
         host_backing: Option<crate::memory::ledger::Claim>,
+        pools: crate::experts::LoadPools,
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
             || execution.device().backend() != device.backend()
@@ -882,9 +880,10 @@ impl ResidencyStore {
             import_progress: None,
             kept_table_rows: None,
             cpu_site: Default::default(),
-            releases,
             changes,
             host_backing,
+            upload: Vec::new(),
+            pools,
         })
     }
 
@@ -924,11 +923,6 @@ impl ResidencyStore {
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Visit every tensor of the completed resident imports.
-    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        self.resident.visit_storage(visit);
     }
 
     /// The cache this store imports into.
@@ -1105,8 +1099,11 @@ impl ResidencyStore {
             .expert_bank()
             .is_some_and(|bank| bank.tables.iter().any(|table| table.role == plan.role));
         let slots = match banked {
-            true => crate::stored_table::StoredSlots::Reserved { records, record_rows },
-            false => crate::stored_table::StoredSlots::Whole { records, record_rows },
+            true => {
+                let pool = self.pools.records.clone().expect("invariant violated: a banked table's load opens its records pool");
+                crate::stored_table::StoredSlots::Banked { pool, records, record_rows }
+            }
+            false => crate::stored_table::StoredSlots::Whole { pool: self.pools.state.clone(), records, record_rows },
         };
         // A step waits on the rows its lookups name: one head's rows of a
         // step, each its ranges in their files, are the table's urgent
@@ -1165,16 +1162,27 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`HostLines::of_bank`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone(), (self.changes.clone(), self.host_backing.take()))?;
+        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
         if plan.whole() {
-            bank.import_whole(&mut |weight, records| {
+            bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
                 let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
                 let source = crate::resources::filled_import(weight, &stored, &self.device)?;
-                crate::programs::native_import::import_into(&entry, &source, records, None)
+                if entry.writes_records() {
+                    crate::programs::native_import::import_into(&entry, &source, records, None)
+                        .map_err(|error| error.to_string())
+                } else {
+                    crate::programs::native_import::import_records(
+                        &entry,
+                        &self.device,
+                        &source,
+                        records.extents(),
+                        record_at,
+                    )
                     .map_err(|error| error.to_string())
+                }
             })
             .map_err(invalid)?;
         }
@@ -1400,12 +1408,19 @@ impl ResidencyStore {
         .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))?;
         let destination = ResidentWeightSlot::new(&planned, &self.device, tensor)
             .map_err(WeightImportError::Invariant)?;
-        let workspace = ResourceAllocator::import_workspace(
-            &self.execution,
-            &planned,
-            &self.device,
-            self.domain.clone(),
-        )
+        let allocate_workspace = || {
+            ResourceAllocator::import_workspace(
+                &self.execution,
+                &planned,
+                &self.device,
+                self.domain.clone(),
+            )
+        };
+        let workspace = if self.upload.is_empty() {
+            allocate_workspace()
+        } else {
+            seismic::memory::charging(&self.upload, allocate_workspace)
+        }
         .map_err(|error| WeightImportError::of_allocation(seismic::Contract::DeviceOnly, error))?;
         let launch = ValidatedImportLaunch::new(
             ImportLaunchInputs::new(planned.clone(), source, workspace, destination),
@@ -1578,12 +1593,28 @@ impl ResidencyStore {
         Ok(())
     }
 
+    /// The plan of the host table `descriptor` names, which the load streams.
+    ///
+    /// # Panics
+    /// Where the load plans no such table: a model's host tables are its
+    /// plan's.
+    pub(crate) fn host_table(&self, descriptor: &magnitude_family_contracts::WeightDescriptor) -> &crate::HostTablePlan {
+        self.execution
+            .load()
+            .host_tables()
+            .iter()
+            .find(|table| table.descriptor == *descriptor)
+            .unwrap_or_else(|| panic!("invariant violated: the load plans no host table {:?}", descriptor.name))
+    }
+
     /// Import the target, reporting its resident bytes to `observer` from
-    /// none to all of them.
+    /// none to all of them; its host tables' row caches charged to
+    /// `host_tables`, the load's claim of them.
     pub fn load_target(
         &mut self,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
+        host_tables: &crate::memory::ledger::Held,
         mut observer: ImportObserver,
     ) -> Result<crate::ResidentTarget, crate::ResidencyError> {
         crate::resident_weights::validate_definition_package(definition, package)?;
@@ -1614,7 +1645,7 @@ impl ResidencyStore {
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )
             .map_err(crate::ResidencyError::from)
-            .and_then(|()| crate::resident_weights::import_target(definition, package, self));
+            .and_then(|()| crate::resident_weights::import_target(definition, package, self, host_tables));
         let mut progress = self
             .import_progress
             .take()
@@ -1749,6 +1780,23 @@ type ComponentImport<T> = fn(
     &magnitude_artifacts::Package,
 ) -> Result<Option<T>, crate::ResidencyError>;
 
+/// `make`, an allocation, its every byte charged to the claim of its store
+/// among `claims` (`seismic::memory::charging`), within one change of the
+/// ledgers' scope `changes`. Never a pooled holding's: the pool's entry
+/// allocates its granules.
+pub(crate) fn charged<R>(
+    changes: &std::sync::Arc<crate::memory::ledger::Changes>,
+    claims: &[crate::memory::ledger::Claim],
+    make: impl FnOnce() -> R,
+) -> R {
+    let entries: Vec<_> = claims
+        .iter()
+        .filter(|claim| !claim.pooled())
+        .map(crate::memory::ledger::Claim::entry)
+        .collect();
+    changes.change(|_| seismic::memory::charging(&entries, make))
+}
+
 /// A one-shot optional component authority. Numerical stages receive this
 /// typed loader, never direct mutable access to the weight cache. Success or
 /// failure is retained so concurrent request paths cannot trigger a second
@@ -1765,11 +1813,6 @@ pub struct ComponentLoader<T: Clone> {
 }
 
 impl<T: Clone> ComponentLoader<T> {
-    /// Visit every tensor the component's resident imports hold.
-    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        self.store.borrow().visit_storage(visit);
-    }
-
     /// The bytes of the imports the component brought into its cache, as
     /// imported: none of another component's it found there.
     pub fn own_bytes(&self) -> Result<u64, &'static str> {
@@ -1809,6 +1852,23 @@ impl<T: Clone> ComponentLoader<T> {
         }
     }
 
+    /// The claims of its imports, taken while the component idles as cache
+    /// (`ExecutorDomain::release_yielded`): none are left with it.
+    pub(crate) fn take_claims(&self) -> Vec<crate::memory::ledger::Claim> {
+        std::mem::take(&mut *self.claims.borrow_mut())
+    }
+
+    /// The claims of its imports, committed again as it is used
+    /// (`ExecutorDomain::activate_components`).
+    ///
+    /// # Panics
+    /// Where it holds claims already.
+    pub(crate) fn restore_claims(&self, claims: Vec<crate::memory::ledger::Claim>) {
+        let mut held = self.claims.borrow_mut();
+        assert!(held.is_empty(), "invariant violated: a component's claims restored beside others");
+        *held = claims;
+    }
+
     /// Whether the component is imported ([`Self::import`]).
     pub fn imported(&self) -> bool {
         matches!(&*self.cached.borrow(), Some(Ok(_)))
@@ -1817,11 +1877,15 @@ impl<T: Clone> ComponentLoader<T> {
     /// Import the component under `held`, the claims of the bytes its
     /// import brings into its cache, kept until [`Self::unload`]. An attempt
     /// made before is returned as it ended, `held` released.
-    pub fn import(&self, mut held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
+    pub fn import(&self, held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
         assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
-        let imported = held.allocate(|| self.load());
+        let claims = held.into_claims();
+        let changes = self.store.borrow().changes.clone();
+        // The import's allocations charge its claims as Seismic makes them,
+        // one change with the import.
+        let imported = charged(&changes, &claims, || self.load());
         if imported.is_ok() {
-            *self.claims.borrow_mut() = held.into_claims();
+            *self.claims.borrow_mut() = claims;
         }
         imported
     }
@@ -2057,9 +2121,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// A reserved stored table the bank shrinks after its import is read
-    /// at what its slots are charged then: the importer's bytes fall with
-    /// the slots' charge, never above it.
+    /// A banked stored table the bank shrinks after its import is read at
+    /// what its slots are charged then: the importer's bytes fall with the
+    /// slots' charge, never above it.
     #[test]
     fn an_imported_table_is_counted_at_its_resized_charge() {
         const ROWS: u64 = 4096;
@@ -2067,6 +2131,12 @@ mod tests {
         std::fs::write(&path, vec![0u8; 100 + ROWS as usize * 90]).unwrap();
         let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
+        // A granule a record of 256 slots, as the bank's pool sizes one.
+        let regions = [seismic::SlabRegion { element: Element::named("iq4g32s@rows16").unwrap(), row_shape: vec![256, 160] }];
+        let slab = seismic::SlabLayout::for_regions(1, 1, &regions).unwrap();
+        let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
+        let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
+        let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap();
         let table = Arc::new(
             StoredTable::new(
                 &device,
@@ -2075,7 +2145,7 @@ mod tests {
                 Element::named("iq4g32s@rows16").unwrap(),
                 ROWS,
                 160,
-                crate::stored_table::StoredSlots::Reserved { records: 4, record_rows: 256 },
+                crate::stored_table::StoredSlots::Banked { pool, records: 4, record_rows: 256 },
                 crate::planning::DirectoryForm::Hashed,
                 vec![crate::stored_table::RowRange {
                     source: seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),
@@ -2177,16 +2247,19 @@ mod tests {
 
     /// An allocation its store has no room for is refused for room, in the
     /// storage it was made in, never a device failure: a CPU device whose
-    /// store Seismic bounds to what it claims refuses a 1 MiB weight.
+    /// allocation is charged to a ledger that reads its store full refuses a
+    /// 1 MiB weight.
     #[test]
     fn an_allocation_without_room_is_refused_for_room() {
+        use crate::memory::ledger::{DeviceLedgers, Ledgers, LoadShape};
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).unwrap();
-        let bounds = device.bounds();
-        for view in device.ledgers().stores {
-            bounds.bound(seismic::Ledger::Store(view.store), Some(view.claim)).unwrap();
-        }
-        let error = Tensor::zeros(&device, Element::bool(), &[1 << 20]).expect_err("a store with no room refuses");
+        let full = crate::memory::supply::Reading::device(1 << 30, 0, crate::domain::fixtures::NO_LAG);
+        let (ledgers, _) = DeviceLedgers::open_in(&Ledgers::new(), &device, std::sync::Arc::new(LoadShape { stores: Vec::new() })).read_scripted(full);
+        let ledger = ledgers.of_contract(&device, seismic::Contract::DeviceOnly);
+        let entry = seismic::memory::Store::own(ledger);
+        let error = seismic::memory::charging(&[entry], || Tensor::zeros(&device, Element::bool(), &[1 << 20]))
+            .expect_err("a store with no room refuses");
         assert!(
             matches!(
                 WeightImportError::allocating(seismic::Contract::DeviceOnly, &error),

@@ -58,20 +58,22 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
-pub use experts::derived::{import_slots, in_process_growth};
+pub use experts::derived::{import_slots, in_process_bytes};
 pub use stored_table::{Prefetched, TableWaits};
 pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, TableResidency, DeviceReader, LoadRoom, MachineReading, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, DecodeStep,
-    ExpertTargets, HeadFlight, LaunchDuration, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
+    ExpertTargets, HeadFlight, LaunchDuration, MemoryChargeReconciliation, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
-    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight,
+    ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, StoreAllocation, SubmitFailure,
+    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, SizingFigures, SizingTerm, SizingTerms,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use domain::{SlotRelease, StateShrink, StateYield};
 pub use error::{
     CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
     UnstreamedExperts, WeightReadError,
@@ -154,6 +156,7 @@ pub fn head_admitted(definition: &magnitude_family_contracts::ModelDefinition) -
 pub use residency::{
     ComponentLoader, ImportArtifactTensor, ResidentWeight, Stored, StoredTensor, WeightImportError,
 };
+pub use experts::LoadPools;
 pub use residency::{ImportReport, ResidencyStore};
 pub use storage_thread::Releases;
 pub use resident_weights::{

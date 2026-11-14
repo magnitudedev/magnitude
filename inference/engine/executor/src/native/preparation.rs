@@ -2886,7 +2886,7 @@ impl<'a> Preparation<'a> {
         layers: &[WeightScope],
     ) -> Result<Option<super::ExpertBankKernels>, CatalogFailure> {
         use magnitude_kernels::{
-            routed_copy, routed_land, routed_list_grid, routed_move, routed_pass_map, routed_round, routed_scratch_grids,
+            routed_copy, routed_land, routed_list_grid, routed_pass_map, routed_round, routed_scratch_grids,
             routed_scratch_request, routed_seed_commit, routed_step,
         };
         let bindings = format!("{slot:?} {bank:?}");
@@ -2951,16 +2951,6 @@ impl<'a> Preparation<'a> {
             routed_seed_commit::native_entry(),
         )?;
         let list_grid = spec.fixed(&bindings, &[], routed_list_grid::native_entry())?;
-        // Each routed tensor's records, whoever places: a shrink's moves run
-        // on the device in queue order.
-        let moves = bank.record.try_map(|_, tensor| {
-            let [n, k] = tensor.matrix;
-            spec.fixed(
-                &bindings,
-                &[("D", bank.records), ("L", bank.moves), ("N", n), ("K", k)],
-                routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
-            )
-        })?;
         let site = self.bank_site(slot, bank, layers, &bindings)?;
         /// Every tensor's kernel, or none where one is a count or a listing.
         fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
@@ -2981,7 +2971,7 @@ impl<'a> Preparation<'a> {
         else {
             return Ok(None);
         };
-        let (Some(moves), Some(seed)) = (formed(moves), formed(seed)) else {
+        let Some(seed) = formed(seed) else {
             return Ok(None);
         };
         let placement = super::DevicePlacement { seed, seed_commit, list_grid };
@@ -2998,7 +2988,6 @@ impl<'a> Preparation<'a> {
             scratch_grids,
             pass_map,
             placement,
-            moves: super::BankMoves { records: moves },
             site,
         }))
     }

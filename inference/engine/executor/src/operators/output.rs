@@ -262,6 +262,7 @@ mod tests {
                 ResourceCapacity {
                     domain_bytes: 1024 * 1024 * 1024,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();

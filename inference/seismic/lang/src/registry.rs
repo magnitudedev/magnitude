@@ -219,17 +219,6 @@ impl BackendName {
             BackendName::Cpu | BackendName::Metal | BackendName::Vulkan => false,
         }
     }
-
-    /// Whether a native implementation reaches tensors a record at a time
-    /// through a table of record addresses (`records`): its runtime binds
-    /// such a parameter as that table, which reserved storage held as
-    /// chunks requires.
-    pub const fn binds_record_tables(self) -> bool {
-        match self {
-            BackendName::Metal | BackendName::Vulkan => true,
-            BackendName::Cpu | BackendName::Cuda => false,
-        }
-    }
 }
 
 /// The bytes of a resident launch's barrier, at the start of its `sync`
@@ -242,7 +231,13 @@ pub const RESIDENT_BARRIER_BYTES: u64 = 16;
 pub const RESIDENT_GIVE_UP_BYTE: u64 = 8;
 
 /// The bytes of one entry of a record table: the 8-byte device address of
-/// its record.
+/// its record. A native implementation reaches a record port's tensor
+/// (`records`) a record at a time through such a table, on every backend:
+/// its runtime binds the port as the table, entry `i` the little-endian
+/// address of record `i`'s first byte (the slab table's format, a U32
+/// `[records, 2]` of address pairs, low word first), and the record's
+/// values are rows 0.. from there. No kernel reads a record port's records
+/// as one contiguous range, so each record may lie anywhere.
 pub const RECORD_TABLE_ENTRY_BYTES: u64 = 8;
 
 /// The bytes of a record table of `records` entries, one device address a

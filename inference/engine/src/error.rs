@@ -18,7 +18,7 @@ use std::fmt;
 /// Why a loaded model stopped serving.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnloadCause {
-    /// Headroom stayed at or below the planning reserve after every release
+    /// Headroom ran out after every release
     /// (engine memory policy): the engine unloaded itself.
     MemoryPressure,
     /// The host asked the worker to shut down.
@@ -456,9 +456,6 @@ impl From<magnitude_scheduler::owner::AdmissionError> for RequestError {
     fn from(error: magnitude_scheduler::owner::AdmissionError) -> Self {
         use magnitude_scheduler::{owner::AdmissionError, publication::ModelUnloadCause};
         match error {
-            AdmissionError::MemoryObservationUnavailable(reason) => {
-                Self::MemoryObservationUnavailable { reason }
-            }
             AdmissionError::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {

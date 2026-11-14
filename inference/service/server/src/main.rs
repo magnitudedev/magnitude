@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::ReleaseRate;
 use magnitude_service_api::{AppState, ServerIdentity, app};
-use magnitude_service_contracts::bootstrap_protocol::{IcnStartupRecord, IcnStartupRecordType};
+use magnitude_service_contracts::bootstrap_protocol::{
+    API_VERSION, IcnStartupRecord, IcnStartupRecordType,
+};
 use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_models::{
     HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ModelDomainResolver,
@@ -29,7 +31,6 @@ use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{
     MODEL_IDLE_TIMEOUT, ModelInstances, ResidencyEnvironment,
 };
-use magnitude_service_server::residency::supervisor::SeismicHostMemory;
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
@@ -189,8 +190,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
             } = open_served_store(inventory_config).await?;
             let kernels = inventory.derived_cache().kernel_directory();
             let storage = inventory.root().to_owned();
-            // The machine's motion, its page-fill rate kept with its figures in the kernel cache.
-            let reserves = MemoryReserves::of_machine(Some((kernels.as_path(), &*catalog.topology())));
+            // The machine's page-release rate, kept with its figures in the kernel cache.
+            let release = ReleaseRate::of_machine(Some((kernels.as_path(), &*catalog.topology())));
             // The serving device is decided once over the discovered topology. Every model is
             // assessed on it, from that topology and a status sample, under what the
             // measurement job has stored of this machine; every load and the hardware report
@@ -250,13 +251,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 configurations: Arc::new(ResolvedConfigurations::new(
                     inventory.clone(),
                     kernels,
-                    reserves,
+                    release,
                     serving,
                     bounds,
                 )),
-                host_memory: Arc::new(SeismicHostMemory::new(catalog.clone(), reserves)),
                 catalog: catalog.clone(),
-                reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,
                 device,
@@ -311,7 +310,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .with_model_candidates(candidates)
                 .with_identity(ServerIdentity {
                     instance_id: instance_id.clone(),
-                    api_version: 1,
+                    api_version: API_VERSION,
                     native_build: native_build.clone(),
                 })
                 .with_model_domains(
@@ -322,7 +321,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .with_model_assessments(assessments)
                 .with_hardware(Arc::new(HardwareInventory::new(
                     Arc::clone(catalog.inventory()),
-                    reserves,
                     volumes,
                     serving,
                     Arc::new(instances.clone()),
@@ -344,7 +342,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 origin: format!("http://{address}"),
                 instance_id: instance_id.clone(),
                 pid: std::process::id(),
-                api_version: 1,
+                api_version: API_VERSION,
                 native_build,
             };
             println!("MAGNITUDE_ICN_READY {}", serde_json::to_string(&startup)?);

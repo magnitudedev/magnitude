@@ -216,12 +216,13 @@ impl ResidentPlanes {
     }
 }
 
-/// The per-layer entry's device weights and its host-resident table.
+/// The per-layer entry's device weights and its host-resident table,
+/// streamed through its row cache.
 #[derive(Clone)]
 pub struct ResidentPerLayer {
     pub projection: ResidentWeight,
     pub norm: ResidentWeight,
-    pub table: crate::host_tables::HostTable,
+    pub table: std::rc::Rc<crate::streamed_table::StreamedTable>,
 }
 
 /// The draft's fusion projection of the concatenated taps, and the norm the
@@ -263,15 +264,6 @@ impl ResidentTarget {
         bank.checked_add(imported).ok_or("resident target charge overflows")
     }
 
-    /// Visit every allocation the target holds: its weights' and its
-    /// expert bank's.
-    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
-        self.visit_weights(|weight| weight.visit_storage(visit));
-        if let Some(bank) = &self.bank {
-            bank.visit_storage(visit);
-        }
-    }
-
     /// The tensor a graph's bank port binds (`BankPort`): the bank's.
     pub(crate) fn bank_part(
         &self,
@@ -301,10 +293,13 @@ impl ResidentTarget {
     }
 }
 
+/// The target `definition` names, imported through `residency`; its host
+/// tables' row caches charged to `host_tables`, the load's claim of them.
 pub(crate) fn import_target(
     definition: &ModelDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    host_tables: &crate::memory::ledger::Held,
 ) -> Result<ResidentTarget, ResidencyError> {
     validate_definition_package(definition, package)?;
     let decoder = &definition.decoder;
@@ -377,8 +372,7 @@ pub(crate) fn import_target(
                     &entry.projection_norm.weight,
                     operators::resident_dtype(WeightKind::PerLayerProjectionNorm, activation),
                 )?,
-                table: crate::host_tables::HostTable::open(&stored)
-                    .map_err(|error| invalid(error.to_string()))?,
+                table: std::rc::Rc::new(row_cached(&stored, residency.host_table(&entry.table), host_tables)?),
             })
         })
         .transpose()?;
@@ -393,6 +387,39 @@ pub(crate) fn import_target(
         bank: residency.open_expert_bank(target)?,
         imports: residency.imports(),
     })
+}
+
+/// The host table `stored`, which `plan` plans, streamed through a row
+/// cache charged to the load's host-tables claim, which claims it in the
+/// one store host memory lies in.
+///
+/// # Panics
+/// Where `host_tables` claims other than one store: a plan with a host
+/// table claims its row cache.
+fn row_cached(
+    stored: &crate::residency::Stored,
+    plan: &crate::HostTablePlan,
+    host_tables: &crate::memory::ledger::Held,
+) -> Result<crate::streamed_table::StreamedTable, ResidencyError> {
+    let step_rows = usize::try_from(plan.step_rows).map_err(|_| invalid("a step's host table rows exceed the host range"))?;
+    let [claim] = host_tables.claims() else {
+        panic!(
+            "invariant violated: a host table's row cache is claimed in {} stores, not one",
+            host_tables.claims().len()
+        );
+    };
+    use crate::host_tables::{HostTable, HostTableError};
+    HostTable::open(stored)
+        .and_then(|table| crate::streamed_table::StreamedTable::new(table, step_rows, &claim.entry()))
+        .map_err(|error| match error {
+            // The ledger's refusal of the cache is a refusal of memory in the
+            // store a host-tables claim lies in: the shared contract's
+            // (`DeviceLedgers::claim`).
+            HostTableError::Refused(seismic::memory::Refused { required, available }) => {
+                ResidencyError::Import(WeightImportError::Refused { contract: seismic::Contract::Shared, required, available })
+            }
+            error => invalid(error.to_string()),
+        })
 }
 
 /// Import `scope`'s projection in the one form the finalized plan stores it

@@ -191,7 +191,7 @@ mod tests {
     fn a_program_loads_from_its_artifact_or_misses() {
         for description in crate::test_devices() {
             let open = || {
-                Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default())
+                Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default())
                     .expect("a device meeting the floor opens")
             };
             let source = ProgramSource {

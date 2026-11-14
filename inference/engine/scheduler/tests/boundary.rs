@@ -9,7 +9,7 @@ fn manifest_dir() -> PathBuf {
 /// name, as Cargo resolves its manifest: whatever key or rename declares
 /// them.
 fn dependencies() -> Vec<String> {
-    let output = std::process::Command::new(std::env::var_os("CARGO").expect("cargo sets CARGO"))
+    let output = std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args(["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path"])
         .arg(manifest_dir().join("Cargo.toml"))
         .output()

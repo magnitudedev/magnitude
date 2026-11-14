@@ -17,7 +17,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLSize,
 };
 use seismic_estimator::{AnalyticalService, CoreService};
@@ -298,7 +298,9 @@ pub(crate) fn acquire(
     let composition_pipeline = pipeline(&composition_entry);
     let probe_build_ns = build_started.elapsed().as_nanos() as u64;
     let execution_started = Instant::now();
-    let buffer = device.allocate_bytes(4 * 1024 * 1024).map_err(|error| {
+    // The probe's buffer is the device's own, charged to its store's own
+    // entry while the profile is measured.
+    let buffer = device.allocate_bytes(4 * 1024 * 1024, &device.store().own()).map_err(|error| {
         seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
     })?;
     buffer.write_bytes(0, &vec![0u8; 4 * 1024 * 1024]);
@@ -766,7 +768,7 @@ fn gpu_elapsed_pipeline_batch(
 ) -> Result<Vec<u64>, seismic_compiler::errors::TargetError> {
     let mut commands = Vec::with_capacity(requests.len());
     for &(pipeline, iterations, threads) in requests {
-        let command = device.queue().commandBuffer().ok_or_else(|| {
+        let command = device.command_buffer().ok_or_else(|| {
             seismic_compiler::errors::TargetError::DeviceUnavailable(
                 "Metal could not create a service-probe command buffer".into(),
             )
@@ -1465,7 +1467,7 @@ fn core_service(
             "metal.command-submit",
             ServiceAccuracyClass::MemoryOrTransfer,
             || {
-                let command = device.queue().commandBuffer().ok_or_else(|| {
+                let command = device.command_buffer().ok_or_else(|| {
                     seismic_compiler::errors::TargetError::DeviceUnavailable(
                         "opened Metal queue stopped creating command buffers".into(),
                     )
@@ -1500,23 +1502,29 @@ fn core_service(
         }),
         // A reached instance's backing, as the executor acquires one: the
         // device service's allocation of a shared buffer, released after.
-        CoreService::AllocationInstance => host_definition(
-            class,
-            "metal.allocation-instance",
-            ServiceAccuracyClass::MemoryOrTransfer,
-            || {
-                let instance = <crate::device::MetalDevice as seismic_compiler::executable::DeviceService<crate::Metal>>::allocate(
-                    device,
-                    seismic_estimator::ALLOCATION_INSTANCE_BYTES,
-                    1,
-                )
-                .map_err(|error| {
-                    seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
-                })?;
-                drop(std::hint::black_box(instance));
-                Ok(())
-            },
-        ),
+        // Charged, like the probe's buffer, to the device's store's own entry.
+        CoreService::AllocationInstance => {
+            let entry = device.store().own();
+            host_definition(
+                class,
+                "metal.allocation-instance",
+                ServiceAccuracyClass::MemoryOrTransfer,
+                || {
+                    let instance = <crate::device::MetalDevice as seismic_compiler::executable::DeviceService<crate::Metal>>::allocate(
+                        device,
+                        crate::topology::SHARED_KIND,
+                        seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                        1,
+                        &entry,
+                    )
+                    .map_err(|error| {
+                        seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
+                    })?;
+                    drop(std::hint::black_box(instance));
+                    Ok(())
+                },
+            )
+        }
         // A publication as the schedule's execution records it.
         CoreService::TensorPublication => {
             let mut probe = seismic_compiler::executable::TensorPublicationProbe::new();

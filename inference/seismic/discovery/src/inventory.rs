@@ -2,7 +2,6 @@
 //! on request, and its status samples.
 
 use crate::gather::{self, DiscoveryError, Gathered, Natives};
-use crate::host::{self, HostStatus, ObservationError};
 use crate::status::{self, Sample};
 use seismic_native_target::ArtifactStore;
 use seismic_topology::{DeviceTopology, ExecutorId, Identity, Revision};
@@ -80,19 +79,10 @@ impl Inventory {
         state.topology.clone()
     }
 
-    /// One reading of host RAM alone, taken now: the OS's availability
-    /// within this process's limits. A [`Sample`] reads host RAM the same
-    /// way, so its headroom ([`crate::Status::headroom`]) and this agree.
-    pub fn host_status(&self) -> Result<HostStatus, ObservationError> {
-        host::status()
-    }
-
-    /// One reading of the status of `topology`'s stores and of the grants
-    /// of `executors`, host RAM read now: what a claim and every
-    /// observation between claims is judged against.
+    /// One reading of host RAM ([`crate::HostSample`]), of `topology`'s
+    /// volumes and of the grants of `executors`, taken now.
     pub fn sample(&self, topology: &DeviceTopology, executors: &[ExecutorId]) -> Sample {
-        let host_ram = self.host_status();
-        status::sample(topology, executors, &self.state().natives, host_ram)
+        status::sample(topology, executors, &self.state().natives)
     }
 
     /// The persistent identity of an executor of the current revision, what

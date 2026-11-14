@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn native_tensor_operations_use_the_probed_language() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::store()).unwrap();
+        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap();
         if !facts.facts().properties().tensor_ops.holds() {
             return;
         }
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn a_stored_archive_serves_its_pipelines_without_compiling() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::store()).unwrap().facts().clone();
+        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().facts().clone();
         let source = ProgramSource {
             text: "#include <metal_stdlib>\nusing namespace metal;\n\
                    template <uint TILE> kernel void probe(device float* x [[buffer(0)]], \
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn what_an_archive_does_not_serve_is_a_miss() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::store()).unwrap().facts().clone();
+        let facts = crate::profile::open_device(&device, crate::test_support::probes()).unwrap().facts().clone();
         let toolchain = MetalToolchain::new(device, &facts);
         let source = ProgramSource {
             text: "kernel void probe(device float* x [[buffer(0)]]) { x[0] = 1; }\n".into(),
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn an_entry_group_size_bounds_its_pipeline() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::store())
+        let facts = crate::profile::open_device(&device, crate::test_support::probes())
             .unwrap()
             .facts()
             .clone();
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn every_requested_instance_forms_a_pipeline() {
         let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device, crate::test_support::store())
+        let facts = crate::profile::open_device(&device, crate::test_support::probes())
             .unwrap()
             .facts()
             .clone();

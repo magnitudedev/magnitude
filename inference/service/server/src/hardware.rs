@@ -1,8 +1,7 @@
 //! `GET /api/v1/hardware` (integration spec §5.4, §9.4; memory-reserves spec §5.5): the service
 //! process's own Seismic topology (its physical devices with their executors and the serving
 //! device, the stores, and the access and transfer paths with their grants)
-//! and its status under the service's reserve
-//! policy, as the engine's fit reads them, merged with the resident worker's readings. The
+//! and its status as the engine's fit reads them, merged with the resident worker's readings. The
 //! service opens no executor, so only a loaded worker reads a device store's live free bytes.
 //! No capacity, placement or backend rule is recreated here.
 
@@ -11,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
+use magnitude_executor::platform::Fit;
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
@@ -21,7 +20,7 @@ use magnitude_service_contracts::{
 };
 use seismic::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
-    Contract, Placing, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
+    Contract, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -81,7 +80,6 @@ impl ResidentMemory for ModelInstances {
 /// The hardware endpoint's provider.
 pub struct HardwareInventory {
     inventory: Arc<Inventory>,
-    reserves: MemoryReserves,
     volumes: Arc<ServedVolumes>,
     serving: ServingDevice,
     machine: Arc<MachineDescription>,
@@ -94,14 +92,12 @@ impl HardwareInventory {
     /// as the device the service serves on.
     pub fn new(
         inventory: Arc<Inventory>,
-        reserves: MemoryReserves,
         volumes: ServedVolumes,
         serving: ServingDevice,
         resident: Arc<dyn ResidentMemory>,
     ) -> Self {
         Self {
             inventory,
-            reserves,
             volumes: Arc::new(volumes),
             serving,
             machine: Arc::new(MachineDescription::discover()),
@@ -114,7 +110,6 @@ impl HardwareInventory {
     /// readings.
     fn snapshot_with(
         inventory: &Inventory,
-        reserves: &MemoryReserves,
         volumes: &ServedVolumes,
         serving: ServingDevice,
         machine: &MachineDescription,
@@ -130,7 +125,7 @@ impl HardwareInventory {
             sample: inventory.sample(&topology, &every),
             runtime: RuntimeStatus::default(),
         };
-        let mut snapshot = snapshot(&topology, &status, reserves, volumes, serving, machine)?;
+        let mut snapshot = snapshot(&topology, &status, volumes, serving, machine)?;
         if let Some(resident) = resident {
             merge_resident(&mut snapshot.device_memory, resident);
         }
@@ -191,7 +186,6 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
 impl HardwareProvider for HardwareInventory {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
         let inventory = Arc::clone(&self.inventory);
-        let reserves = self.reserves;
         let volumes = Arc::clone(&self.volumes);
         let serving = self.serving;
         let machine = Arc::clone(&self.machine);
@@ -200,7 +194,6 @@ impl HardwareProvider for HardwareInventory {
             magnitude_service_utils::blocking::run(move || {
                 Self::snapshot_with(
                     &inventory,
-                    &reserves,
                     &volumes,
                     serving,
                     &machine,
@@ -223,12 +216,11 @@ fn observation_error(error: impl std::fmt::Display) -> InventoryError {
 fn snapshot(
     topology: &DeviceTopology,
     status: &Status,
-    reserves: &MemoryReserves,
     served: &ServedVolumes,
     serving: ServingDevice,
     machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
-    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable).with_volumes(&served.reserves);
+    let fit = Fit::new(topology, status).with_volumes(&served.reserves);
     let path_index = |id| {
         let index = topology
             .access_paths()
@@ -245,7 +237,7 @@ fn snapshot(
     };
     let placement = |executor: &seismic::Executor, kind| -> Vec<u32> {
         executor
-            .paths(Placing::Fixed(kind))
+            .paths(kind)
             .iter()
             .copied()
             .map(path_index)
@@ -307,20 +299,13 @@ fn snapshot(
             id: store_domain_id(topology, store.id()),
             total_capacity_bytes: store.capacity().value,
             capacity_basis: reported_by(store.capacity().by),
-            stable_capacity_bytes: reading.stable_bytes,
             allocation_capacity_bytes: reading.capacity_bytes,
-            planning_reserve_bytes: reading.thresholds.planning_bytes,
         };
         Ok((hardware, reading.headroom_bytes))
     };
     let host_ram = {
         let (store, current_free_bytes) = store(topology.host_ram())?;
-        let host = status.sample.host_ram.as_ref().map_err(observation_error)?;
-        HardwareHostRam {
-            store,
-            available_bytes: host.allocatable.value,
-            current_free_bytes,
-        }
+        HardwareHostRam { store, current_free_bytes }
     };
     let mut device_memory = Vec::new();
     let mut volumes = Vec::new();
@@ -558,9 +543,7 @@ mod tests {
                 id: store_identity_id(identity),
                 total_capacity_bytes: 1024,
                 capacity_basis: HardwareReportedBy::CudaTotalMemory,
-                stable_capacity_bytes: 768,
                 allocation_capacity_bytes: 1024,
-                planning_reserve_bytes: 256,
             },
             current_free_bytes: None,
         };
@@ -602,7 +585,6 @@ mod tests {
         served.tag(&directory, HardwareVolumeRole::ModelStore).unwrap();
         let observed = HardwareInventory::snapshot_with(
             &inventory,
-            &MemoryReserves::of_machine(None),
             &served,
             ServingDevice::of(seismic::ExecutorSelector::HostCpu),
             &MachineDescription::discover(),
@@ -624,7 +606,6 @@ mod tests {
         let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let observed = HardwareInventory::snapshot_with(
             &inventory,
-            &MemoryReserves::of_machine(None),
             &ServedVolumes::new(Arc::new(VolumeReserves::new(None))),
             serving,
             &MachineDescription::discover(),
@@ -639,7 +620,6 @@ mod tests {
             observed.device_memory.len() + observed.volumes.len() + 1,
             topology.stores().len()
         );
-        assert!(observed.host_ram.current_free_bytes <= observed.host_ram.available_bytes);
         let stores = std::iter::once(&observed.host_ram.store)
             .chain(observed.device_memory.iter().map(|memory| &memory.store))
             .chain(observed.volumes.iter().map(|volume| &volume.store))

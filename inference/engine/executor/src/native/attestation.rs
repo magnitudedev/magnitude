@@ -326,6 +326,17 @@ pub(crate) enum AttestedImport {
     },
 }
 
+impl AttestedImport {
+    /// Whether this import writes its resident destination through a record
+    /// table (`records (result 0)`).
+    pub(crate) fn writes_records(&self) -> bool {
+        match self {
+            Self::Dense(handle) => handle.records_result(0),
+            Self::Repack { repack, .. } => repack.records_result(0),
+        }
+    }
+}
+
 fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogFailure {
     CatalogFailure::Qualification {
         entry,
@@ -609,25 +620,6 @@ impl AttestedPrograms {
         self.target_graphs.as_deref()
     }
 
-    /// Each bank group's record moves (`ExpertBankKernels::moves`), its
-    /// first layer's bank entries': every layer of a group shares its
-    /// binding.
-    pub(crate) fn expert_bank_moves(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<super::BankMoves>, String> {
-        plan.groups()
-            .iter()
-            .map(|group| {
-                let layer = &plan.layers()[group.layers[0]];
-                let (scope, index) = (layer.scope, layer.sublayer());
-                self.target
-                    .blocks
-                    .get(index.block as usize)
-                    .and_then(|block| block.bank.as_ref())
-                    .map(|bank| bank.moves.clone())
-                    .ok_or_else(|| format!("{scope:?} has no bank entries"))
-            })
-            .collect()
-    }
-
     /// Each streamed layer's CPU site as its qualification left it
     /// ([`Self::expert_bank_sites`], and the refusals it kept): the layers
     /// the plan charges a site's words and buffers for, and those whose
@@ -657,7 +649,11 @@ impl AttestedPrograms {
     pub(crate) fn expert_bank_sites(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<Option<super::BankSite>>, String> {
         plan.layers()
             .iter()
-            .map(|layer| {
+            .enumerate()
+            .map(|(layer_index, layer)| {
+                if !plan.sited(layer_index) {
+                    return Ok(None);
+                }
                 let (scope, index) = (layer.scope, layer.sublayer());
                 self.target
                     .blocks
@@ -669,6 +665,8 @@ impl AttestedPrograms {
             .collect()
     }
 
+    /// The target's graphs, prepared for `pass`: the pass the load's plan
+    /// holds, which its in-process figure is priced at.
     pub fn prepare_target_graphs(
         &self,
         device: &Device,
@@ -677,6 +675,7 @@ impl AttestedPrograms {
         state: &crate::StateResourcePlan,
         plan: &crate::TargetProgramPlan,
         limits: crate::ResourceLimits,
+        pass: crate::PassLaunches,
         workers: &seismic::Workers,
     ) -> Result<crate::PreparedTargetGraphs, String> {
         let landing = self.landing(load, TARGET_TABLE)?;
@@ -690,7 +689,7 @@ impl AttestedPrograms {
             state,
             plan,
             limits,
-            load.pass(limits),
+            pass,
             workers,
         )
     }

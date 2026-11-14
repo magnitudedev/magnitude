@@ -766,16 +766,6 @@ __device__ __forceinline__ void convert_tile(const A &source, u8 *destination,
         planes_tile<B, A, O, LANES>(source, destination, seismic_words_value, b, tile_x, tile_y, lane, mask, shared);
 }
 
-// A bound destination tensor of dense representation kind KIND
-// (`ELEMENT_KIND`) as a kernel writes it: a dense float tensor only through
-// its owner's handle (`element::Out`), any other by its stored bytes.
-template <int KIND> struct DestinationOf {
-    typedef element::Out<typename element::Of<KIND>::type> type;
-};
-template <> struct DestinationOf<-1> {
-    typedef u8 *type;
-};
-
 } // namespace repack
 
 // ---- bindings ----------------------------------------------------------------
@@ -836,8 +826,6 @@ template <> struct DestinationOf<-1> {
         }                                                                                                   \
         __host__ __device__ static constexpr int source_kind() { return ELEMENT_KIND(S); }  \
         __host__ __device__ static constexpr int destination_kind() { return ELEMENT_KIND(D); } \
-        /* The destination tensor as the kernel holds it (`repack::DestinationOf`). */                     \
-        typedef typename repack::DestinationOf<ELEMENT_KIND(D)>::type Destination;                          \
         __host__ __device__ static constexpr bool external() { return ELEMENT_HAS(S, _KIND_EXTERNAL); } \
         __host__ __device__ static constexpr bool packed() { return ELEMENT_HAS(D, _KIND_PACKED); } \
         __host__ __device__ static constexpr bool packet() { return ELEMENT_HAS(D, _LAYOUT_PACKET); } \

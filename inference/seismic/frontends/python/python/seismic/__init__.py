@@ -149,10 +149,8 @@ class Device:
         return tuple(self._inner.capabilities)
 
     def device_ledger(self):
-        charged, claim, bound, high_water = _invoke(self._inner.device_ledger)
-        return MappingProxyType(
-            {"charged": charged, "claim": claim, "bound": bound, "high_water": high_water}
-        )
+        charged, high_water = _invoke(self._inner.device_ledger)
+        return MappingProxyType({"charged": charged, "high_water": high_water})
 
     def set_device_bound(self, value):
         if value is not None:

@@ -153,14 +153,6 @@ native routed_pass_map for vulkan from "vulkan/routed_pass_map.comp":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (LIST_THREADS, 1, 1)
 
-# The same geometry visits every entry of a bank shrink's move list.
-native routed_move for vulkan from "vulkan/routed_move.comp":
-    records (records)
-    launch routed_move:
-        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
-        threads_per_threadgroup (LIST_THREADS, 1, 1)
-        shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
-
 # One workgroup counts every choice in its group memory, a
 # word an expert; a resident group's step requests nothing.
 native routed_scratch_request for vulkan from "vulkan/routed_scratch_request.comp":

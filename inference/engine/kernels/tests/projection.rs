@@ -6445,7 +6445,7 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
 #[test]
 fn metal_convolved_matrix_columns_match_host() {
     use magnitude_kernels::gated_delta_project_convolved;
-    use seismic::{SlabRegion, SlabTensor};
+    use seismic::SlabRegion;
     let Some(device) = devices()
         .into_iter()
         .find(|d| d.backend() == BackendName::Metal)
@@ -6517,18 +6517,16 @@ fn metal_convolved_matrix_columns_match_host() {
             let previous_tape = i32_tensor(&device, &[2], &[2, 1]);
             let following = i32_tensor(&device, &[2], &[3, 4]);
             for parts in [1u64, 2, 4] {
-                let mut slabs = SlabTensor::new(
+                let slabs = crate::common::slab_tensor(
                     &device,
                     2,
                     banks as u64,
-                    vec![SlabRegion {
+                    &vec![SlabRegion {
                         element: act.element(),
                         row_shape: vec![window_rows as u64, channels as u64],
-                    }],
-                )
-                .unwrap();
+                    }]);
                 for slab in 0..banks.div_ceil(2) {
-                    slabs.add_slab().unwrap();
+                    slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
                     let start = slab * 2;
                     let count = 2.min(banks - start);
                     slabs

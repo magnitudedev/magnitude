@@ -18,7 +18,7 @@
 //! where it is made.
 
 use super::catalog::served_targets;
-use crate::platform::{DomainRole, GraphPricing, MemoryReserves};
+use crate::platform::{DomainRole, GraphPricing, ReleaseRate};
 use crate::{
     AssessmentFit, AssessmentFitVerdict, AssessmentMemoryCharge, AttestedPrograms, ComponentSelection, ExecutionPath,
     ExecutionPlanDraft, ExecutionPlanner, Placed, PlannedMethod, ResourceLimits, StableRoom,
@@ -126,17 +126,10 @@ fn pricing(machine: &str, backend: BackendName) -> Option<GraphPricing> {
 /// A recorded machine's reading before any load: stable fit reads no
 /// headroom (the engine's recorded setups, `tests/recorded`).
 fn unopened(topology: &DeviceTopology) -> Status {
-    let none = seismic::Reported::new(0, seismic::ReportedBy::MacOsFreePages);
     Status {
         sample: seismic::Sample {
             taken: std::time::SystemTime::now(),
-            host_ram: Ok(seismic::HostStatus {
-                allocatable: none,
-                reclaimable: 0,
-                limits: Vec::new(),
-                limit_visibility: seismic::LimitVisibility::Complete,
-                held: None,
-            }),
+            host: crate::memory::ledger::tests::host_sample(topology.host_ram().capacity().value, 0),
             volumes: Vec::new(),
             executors: topology.executors().iter().map(|executor| executor.id()).collect(),
             grants: Vec::new(),
@@ -171,11 +164,7 @@ fn unopened(topology: &DeviceTopology) -> Status {
 /// bytes, the import peaks and every host term (`main:906`).
 fn main_charge(base: &AssessmentMemoryCharge, backend: BackendName) -> AssessmentMemoryCharge {
     let demand = base.weight_demand;
-    assert_eq!(
-        (demand.host, demand.reserved),
-        (0, 0),
-        "a resident load holds weights in host or reserved storage: {demand:?}"
-    );
+    assert_eq!(demand.host, 0, "a resident load holds weights in host storage: {demand:?}");
     let weights = demand.checked_bytes().unwrap();
     let recorded_graph_bytes = match backend {
         BackendName::Cuda | BackendName::Vulkan => 192 << 20,
@@ -207,7 +196,7 @@ fn need(fit: &AssessmentFit) -> (u64, u64, bool) {
         .find(|domain| domain.role == DomainRole::Allocation)
         .expect("a fit reaches its allocation domain");
     (
-        allocation.capacity_bytes - allocation.reserve_bytes,
+        allocation.capacity_bytes,
         allocation.required_bytes,
         matches!(fit.verdict, AssessmentFitVerdict::Fits),
     )
@@ -272,7 +261,7 @@ fn row(
     workload: Workload,
 ) -> Row {
     let began = std::time::Instant::now();
-    let reserves = MemoryReserves::of_machine(None);
+    let release = ReleaseRate::of_machine(None);
     let backend = executor.backend();
     let head = format!("{name} | {machine}:{} | {}@{}", backend.as_str(), workload.label, workload.context);
     let failed = |stage: &str, error: String| Row { line: format!("{head} | {stage} fails: {error}"), regression: false, diverged: false, panicked: false };
@@ -281,11 +270,8 @@ fn row(
     let Some(pricing) = pricing(machine, backend) else {
         return failed("pricing", "this host knows no Vulkan graph bound".to_owned());
     };
-    let device = match crate::platform::selected(topology, status, &reserves, executor.clone(), pricing) {
-        Ok(device) => device,
-        Err(error) => return failed("selection", error.to_string()),
-    };
-    let room = StableRoom { topology, executor, status, reserves: &reserves };
+    let device = crate::platform::selected(topology, status, &release, executor.clone(), pricing);
+    let room = StableRoom { topology, executor, status };
     // Both planners are compared at one load: this workload at one
     // conversation (`main` charged one, whatever the harness decoded).
     let limits = ResourceLimits { conversations: NonZeroUsize::MIN, ..workload.limits };
@@ -297,7 +283,7 @@ fn row(
         Ok(base) => main_charge(&base, backend),
         Err(error) => return failed("charging", format!("{error:?}")),
     };
-    let (main_room, main_need, main_fits) = match main.assess_fit(topology, executor, status, &reserves) {
+    let (main_room, main_need, main_fits) = match main.assess_fit(topology, executor, status) {
         Ok(fit) => need(&fit),
         Err(error) => return failed("main's fit", error),
     };
@@ -321,12 +307,12 @@ fn row(
     // The assessment's closed form over the same plan: whole where it fits
     // a whole form at its floor of places.
     let assessing = std::time::Instant::now();
-    let assessed = match assessed(&definition, &draft, pricing, topology, status, &reserves) {
+    let assessed = match assessed(&definition, &draft, pricing, topology, status) {
         Ok(assessed) => assessed,
         Err(error) => return failed("assessment", error),
     };
     let assessment_ms = assessing.elapsed().as_secs_f64() * 1e3;
-    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None) {
+    let verdict = match draft.placed::<AssessmentMemoryCharge>(&definition, None, &room) {
         Ok(Placed::Whole(placed)) => {
             let fits = match room.fit(placed.charge()) {
                 Ok(fit) => need(&fit).2,
@@ -364,7 +350,6 @@ fn assessed(
     pricing: GraphPricing,
     topology: &DeviceTopology,
     status: &Status,
-    reserves: &MemoryReserves,
 ) -> Result<(String, bool), String> {
     let forms = draft
         .floor_forms(definition, None, |draft| {
@@ -372,7 +357,7 @@ fn assessed(
         })
         .map_err(|error| error.to_string())?;
     let prepared = super::prepare_execution_assessment(definition, forms).map_err(|error| format!("{error:?}"))?;
-    Ok(match super::assess_execution_fit(definition, &prepared, pricing, topology, status, reserves).map_err(|error| format!("{error:?}"))? {
+    Ok(match super::assess_execution_fit(definition, &prepared, pricing, topology, status).map_err(|error| format!("{error:?}"))? {
         super::ExecutionAssessment::Fits(fit) => match fit.bank.as_ref().is_none_or(|bank| bank.whole()) {
             true => ("whole, fits".to_owned(), true),
             false => (format!("streams {} slots", fit.bank.as_ref().map_or(0, |bank| bank.slots)), false),
@@ -387,11 +372,11 @@ fn assessed(
 fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageManifest), machine: &str, topology: &DeviceTopology, backend: BackendName, context: u64) -> Option<usize> {
     let executor = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
     let status = unopened(topology);
-    let reserves = MemoryReserves::of_machine(None);
-    let device = crate::platform::selected(topology, &status, &reserves, executor.clone(), pricing(machine, backend).unwrap()).unwrap();
+    let release = ReleaseRate::of_machine(None);
+    let device = crate::platform::selected(topology, &status, &release, executor.clone(), pricing(machine, backend).unwrap());
     let mut definition = target.1.clone();
     definition.decoder.context_limit = context;
-    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None).unwrap() {
+    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None, &StableRoom::of_selected(&device)).unwrap() {
         Placed::Whole(placed) => Some(placed.draft().policy().limits().chain_capacity.get()),
         Placed::Short(_) => None,
     }
@@ -567,8 +552,8 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
     for (machine, topology, backend) in [("m4_pro", recorded::m4_pro(), BackendName::Metal), ("rtx3090", recorded::rtx3090(), BackendName::Cuda)] {
         let status = unopened(&topology);
         let executor = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
-        let reserves = MemoryReserves::of_machine(None);
-        let device = crate::platform::selected(&topology, &status, &reserves, executor.clone(), pricing(machine, backend).unwrap()).unwrap();
+        let release = ReleaseRate::of_machine(None);
+        let device = crate::platform::selected(&topology, &status, &release, executor.clone(), pricing(machine, backend).unwrap());
         let draft = ExecutionPlanner::prepare(
             &device,
             &manifest,
@@ -580,7 +565,8 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
             service(backend, &definition),
         )
         .unwrap_or_else(|error| panic!("{machine}: {error}"));
-        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None) {
+        let planned = draft.device().clone();
+        if let Err(error) = draft.placed::<crate::AssessmentMemoryCharge>(&definition, None, &StableRoom::of(&planned)) {
             panic!("{machine}: {error}");
         }
     }

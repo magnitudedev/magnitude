@@ -23,7 +23,7 @@ use magnitude_engine::{
     },
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     AssessmentGraphResourceBounds, AssessmentMemoryTerms, Demand, DraftForm, ExecutionPath,
     ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, Operation, Outcome, PhysicalDecision,
     RequestId, ReservedResources, ResourceCapacity, ResourcePlanner, ResumeState, Sampling,
@@ -85,7 +85,7 @@ fn resolved() -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::of_machine(None),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -179,7 +179,7 @@ fn open(
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(bindings, request, from).unwrap();
+    domain.open_state(bindings, request, from, 0).unwrap();
 }
 
 /// One draft transaction at draft position `position` entering `tokens`
@@ -327,7 +327,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     // Evicting the source and resuming it from that state drafts them too.
     domain.release_state(&[source]).unwrap();
     domain
-        .open_state(&mut bindings, source, Some(&before_draft))
+        .open_state(&mut bindings, source, Some(&before_draft), 0)
         .unwrap();
     let (resumed, mut bindings) =
         draft(&mut domain, bindings, source, &tokens, &conditioning, width);
@@ -358,8 +358,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     domain.close(source).unwrap();
     drop(before_inject);
     drop(before_draft);
-    let charge = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(charge.unattributed, 0, "{charge:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
 }
 
 #[test]
@@ -370,7 +369,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &catalog,
         DeviceRequest::Automatic,
         None,
-        MemoryReserves::of_machine(None),
+        ReleaseRate::of_machine(None),
         policy(),
         standard_service_limits(),
     )
@@ -409,10 +408,11 @@ fn header_only_assessment_charges_what_a_load_commits() {
         policy.codec(),
         policy.limits(),
         ResourceCapacity {
-            domain_bytes: plan.device().assessment_capacity_bytes(),
+            domain_bytes: magnitude_executor::StableRoom::of(plan.device()).capacity().unwrap(),
             tensor_operations: magnitude_executor::TensorOperations::of(
                 plan.device().tensor_operations(),
             ),
+            allocations: plan.device().allocations(),
         },
     )
     .unwrap();
@@ -447,7 +447,6 @@ fn header_only_assessment_charges_what_a_load_commits() {
     domain.close(request).unwrap();
     let charge = domain.reconcile_memory_charge(&[&held]).unwrap();
     eprintln!("assessed {terms:?} graphs {graphs:?}\nloaded {charge:?}");
-    assert_eq!(charge.unattributed, 0);
     assert_eq!(
         charge.target_weights, terms.target_weights,
         "target weights"

@@ -24,21 +24,13 @@ struct LandWords {
 
 typedef Shared<LandWords, GateBinding, UpBinding, DownBinding> LandShared;
 
-// The routed tensors' destinations, each as its binding holds it
-// (`REPACK_BINDING`'s `Destination`: a dense float tensor's owner handle).
-struct LandDestinations {
-    GateBinding::Destination gate;
-    UpBinding::Destination up;
-    DownBinding::Destination down;
-};
-
 // A landing launch's conversion context: each routed tensor's source and
-// destination (gate, up, down), whether the record has a gate, the entry's
+// destination record tables (gate, up, down), whether the record has a gate, the entry's
 // words, the block's shared memory, and the window the thread holds: its
 // span and its rows' pitch in the block's window.
 struct Lander {
     const u8 *source[3];
-    LandDestinations destination;
+    const u8 *destination[3];
     bool gated;
     const seismic_words_t &words;
     LandShared &shared;
@@ -50,27 +42,13 @@ struct Lander {
     ScaleSpan scale_span;
 };
 
-// The destination of the routed tensor converted through binding `B`.
-__device__ __forceinline__ GateBinding::Destination destination_of(const Lander &land, const GateBinding *) {
-    return land.destination.gate;
-}
-__device__ __forceinline__ UpBinding::Destination destination_of(const Lander &land, const UpBinding *) {
-    return land.destination.up;
-}
-__device__ __forceinline__ DownBinding::Destination destination_of(const Lander &land, const DownBinding *) {
-    return land.destination.down;
-}
-template <class B> __device__ __forceinline__ typename B::Destination destination_of(const Lander &land) {
-    return destination_of(land, static_cast<const B *>(nullptr));
-}
-
 // Load window `window_index` of row tile `row_tile` of entry (from, to)'s
 // record of `tensor` through binding `B` into the thread's registers.
 template <class B>
 __device__ __forceinline__ void land_load(Lander &land, u32 tensor, int from, int to, u64 row_tile, u64 window_index) {
     const Window<B> window(land.words);
     const Placed<B> placed =
-        place_of<B>(window, land.source[tensor], destination_of<B>(land), land.words, from, to, row_tile, window_index);
+        place_of<B>(window, land.source[tensor], land.destination[tensor], land.words, from, to, row_tile, window_index);
     land.span = span_of(window, placed);
     land.pitch = window.pitch;
     land.held.load(land.span);
@@ -96,7 +74,7 @@ template <class B>
 __device__ __forceinline__ Span dense_span_of(Lander &land, u32 tensor, int from, u32 item) {
     const DenseItem span = dense_item_of<B>(land.words, item);
     const u32 bytes = span.count * dense_element<B>();
-    const u8 *at = listed_source<B>(land.source[tensor], destination_of<B>(land), land.words, from) +
+    const u8 *at = listed_source(land.source[tensor], land.destination[tensor], from) +
                    (u64)span.first * dense_element<B>();
     return Span{at, 0, 1, bytes, load_unit(u32(reinterpret_cast<u64>(at)) | bytes)};
 }
@@ -121,7 +99,7 @@ template <class B> __device__ __forceinline__ void land_stage(Lander &land, u32 
         for (u32 at = 0; at + 1 < window.windows; ++at) {
             land_store(land);
             land_load<B>(land, tensor, from, to, item, at + 1);
-            convert_window<B>(window, land.source[tensor], destination_of<B>(land), land.words, from, to, item, at,
+            convert_window<B>(window, land.source[tensor], land.destination[tensor], land.words, from, to, item, at,
                               land.shared);
         }
         land_store(land);
@@ -131,10 +109,10 @@ template <class B> __device__ __forceinline__ void land_stage(Lander &land, u32 
 template <class B> __device__ __forceinline__ void land_place(Lander &land, u32 tensor, int from, int to, u32 item) {
     __syncthreads();
     if constexpr (B::dense()) {
-        convert_span<B>(land.shared.window, destination_of<B>(land), land.words, (u64)to, item);
+        convert_span<B>(land.shared.window, land.destination[tensor], land.words, (u64)to, item);
     } else {
         const Window<B> window(land.words);
-        convert_window<B>(window, land.source[tensor], destination_of<B>(land), land.words, from, to, item,
+        convert_window<B>(window, land.source[tensor], land.destination[tensor], land.words, from, to, item,
                           window.windows - 1, land.shared);
     }
     __syncthreads();

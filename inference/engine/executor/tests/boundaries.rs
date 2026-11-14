@@ -4,7 +4,7 @@ use std::process::Command;
 fn manifest_keeps_the_executor_below_model_and_product_layers() {
     // Cargo resolves dependency tables, target conditions and renamed packages for us.
     // Model families used only by numerical fixtures do not create a production edge.
-    let cargo = std::env::var_os("CARGO").expect("cargo sets CARGO when it runs tests");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo sets CARGO_MANIFEST_DIR when it runs tests");
     let output = Command::new(cargo)

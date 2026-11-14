@@ -513,7 +513,7 @@ fn a_last_step_expiring_before_its_request_is_taken_seeds_nothing_there() {
 /// bank and unmapped from the group's first step; no seed takes one (the
 /// bank otherwise holds only shares, so the group seeds nothing); once the
 /// device is past the group they return free, so a shrink after the group
-/// keeps them and the next group claims them again.
+/// evicts past them and the next group claims them again.
 #[test]
 fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     let harness = lending_bank("bank-lent", EXPERTS, 4, 1, STAGING, WHOLE, TIER, Placer::Tier, true, 2, false);
@@ -537,8 +537,8 @@ fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     eventually("the lent records never returned free", || !lent(0) && !lent(1));
     let shared = harness.watcher.shared();
     eventually("the group's reads were never ranked", || shared.telemetry.fed_all());
-    let plan = shared.plan_shrink(3, vec![3]).unwrap();
-    shared.commit_shrink(plan).unwrap();
+    let evicted = shared.shrink(super::super::resize::Evicting::Bank, Candidates::one(3, vec![3]), None).unwrap().expect("the shrink evicts beside no step");
+    assert!(evicted.records[0].iter().all(|&record| record >= 2), "a shrink never evicts a lent record");
     assert_eq!(shared.costs().records, [3]);
     let step = harness.prompt_step();
     harness.scratch(&step, 0, &[6]);

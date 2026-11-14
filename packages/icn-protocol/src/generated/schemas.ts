@@ -1637,7 +1637,6 @@ export type HardwareGrant = S.Schema.Type<typeof HardwareGrant>
 export type HardwareGrantEncoded = S.Schema.Encoded<typeof HardwareGrant>
 
 export const HardwareHostRam = S.Struct({
-  available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
 })
@@ -1729,8 +1728,6 @@ export const HardwareStore = S.Struct({
   allocation_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   capacity_basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
   id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
-  planning_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   total_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type HardwareStore = S.Schema.Type<typeof HardwareStore>
@@ -2193,7 +2190,6 @@ export type MeasurementStateEncoded = S.Schema.Encoded<typeof MeasurementState>
 
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   remainingBytes: S.Number.pipe(S.int()),
   requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

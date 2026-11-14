@@ -1,16 +1,14 @@
 //! History domains in one store: window trimming and sharing, per-domain
-//! placement, compaction and accounting, and the single Token domain's
+//! placement, release and accounting, and the single Token domain's
 //! identity with the one-domain store.
 
 use super::*;
-use seismic::BackendName;
 
 const TOKEN: HistoryDomainId = HistoryDomainId(0);
 const WINDOW: HistoryDomainId = HistoryDomainId(1);
 
-fn cpu_device() -> Rc<Device> {
-    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    Rc::new(catalog.open_backend(BackendName::Cpu).expect("the CPU backend opens"))
+fn cpu_device() -> OwnDevice {
+    OwnDevice::cpu()
 }
 
 fn component(layer: u32, width: usize) -> ComponentDescriptor {
@@ -33,15 +31,14 @@ fn banks() -> BankCapacity {
 /// A Token domain (layer 0) and a Window(`window`) domain (layer 1) of
 /// `width`-wide dense F32 rows.
 fn windowed_store(
-    device: Rc<Device>,
+    device: OwnDevice,
     context: usize,
     window: usize,
     max_advance: usize,
     window_rows: usize,
     width: usize,
 ) -> StoreBindings {
-    StateStore::new(
-        device,
+    device.store(
         context,
         max_advance,
         vec![
@@ -351,20 +348,26 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
         state = step(&mut bindings, state, 1);
         check(&state);
         crossed |= state.history_ranges(WINDOW).len() > 1;
-        // Idle release keeps one spare slab and never copies.
-        bindings
-            .shrink_with(ShrinkPolicy::Idle, |_, _| -> Result<(), Error> {
-                panic!("idle release never copies")
-            })
-            .unwrap();
+        // A shrink between steps keeps the next step's room and moves no
+        // row: `check` reads every row at its address.
+        // What it frees returns at once, as a yield returns it, so the pool
+        // holds no empty block from one step into the next.
+        let next = NextSteps {
+            rows: state.demands(1),
+            banks: 0,
+        };
+        let released = bindings.shrink(&next).unwrap();
+        assert_eq!(device.pool.return_freed(released).unwrap(), released);
     }
     assert!(crossed, "the window spanned a slab edge");
     assert_eq!(store.occupied_rows(WINDOW), WINDOW_ROWS);
 
-    // Reclaim frees whichever slab the window does not occupy; the next
-    // growth adds the lowest unbacked index again.
-    let before = device.device_ledger().charged;
-    let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
+    // A shrink keeping no room frees whatever slab the window does not
+    // occupy (none where the last step's shrink freed it), and the pool
+    // returns it; the next growth adds the lowest unbacked index again.
+    let before = device.tally.held();
+    let released = bindings.shrink(&NextSteps::default()).unwrap();
+    assert_eq!(device.pool.return_freed(released).unwrap(), released);
     let occupied_slabs = state
         .history_ranges(WINDOW)
         .iter()
@@ -373,9 +376,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     let backed = store.domains[WINDOW.0].arena.borrow().backed.clone();
     assert!(backed.len() <= 2);
     assert!(occupied_slabs.is_subset(&backed));
-    if released > 0 {
-        assert!(device.device_ledger().charged < before);
-    }
+    assert_eq!(device.tally.held(), before - released);
     check(&state);
     for _ in 0..600 {
         state = step(&mut bindings, state, 3);
@@ -409,11 +410,12 @@ fn freed_window_slab_index_is_reused_by_growth() {
     // Trimming released every row of slab 0, so it holds no referenced row
     // and the release rule frees it.
     assert_eq!(store.occupied_rows(WINDOW), 8);
-    let charged = device.device_ledger().charged;
-    assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
-    assert!(device.device_ledger().charged < charged);
+    let charged = device.tally.held();
+    let released = store.shrink(&NextSteps::default()).unwrap();
+    assert!(released > 0);
+    assert_eq!(device.pool.return_freed(released).unwrap(), released);
+    assert_eq!(device.tally.held(), charged - released);
     assert_eq!(arena.borrow().backed, BTreeSet::from([1]));
-    assert_eq!(store.compactions(), Compactions::default());
     // Growth backs the lowest unbacked index, the freed slab 0, again.
     store
         .provision(
@@ -545,17 +547,20 @@ fn shrink_and_census_cover_every_domain() {
         .holding_census(&[Holder::State(&state)], &[], &[])
         .unwrap();
     assert_eq!(census.total(), store.committed_bytes());
-    assert_eq!(census.total(), device.device_ledger().charged);
+    device.assert_holds(&store);
     assert_eq!(
         census.live,
         40 * store.history_row_bytes(TOKEN) + 16 * store.history_row_bytes(WINDOW)
     );
-    let charged = device.device_ledger().charged;
-    // Idle keeps each domain's occupied slabs and one spare.
-    assert_eq!(store.shrink(ShrinkPolicy::Idle).unwrap(), slab_bytes);
-    assert!(device.device_ledger().charged < charged);
+    let charged = device.tally.held();
+    // A shrink keeping no room keeps each domain's occupied slabs alone:
+    // the window's two added slabs are freed, and the pool returns them.
+    let released = store.shrink(&NextSteps::default()).unwrap();
+    assert_eq!(released, 2 * device.pool.granule());
+    assert_eq!(device.pool.return_freed(released).unwrap(), released);
+    assert_eq!(device.tally.held(), charged - released);
     assert_eq!(store.domains[TOKEN.0].arena.borrow().backed.len(), 1);
-    assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 2);
+    assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 1);
     assert_eq!(
         store
             .holding_census(&[Holder::State(&state)], &[], &[])
@@ -584,18 +589,20 @@ fn span_limits_follow_each_domain_row_limit() {
             },
         ]
     };
+    // Each domain's geometry in the test device's granules.
+    let geometry = |domain: &domain::StoredDomain| domain.pages.in_granule(domain.row_bytes, TEST_GRANULE).unwrap();
     let (stored, shared) = domain::validate_domains(plans(), 262_144, 64).unwrap();
     assert!(shared.is_empty());
     // 8 KiB rows: the smallest page keeping 262,144 rows within 63 spans is
     // 4,352 rows (17 tiles: 61 pages plus a partial first), and a 64 MiB
     // slab holds one such page.
-    assert_eq!(stored[0].geometry.page_rows, 4352);
-    assert_eq!(stored[0].geometry.slab_rows, 4352);
-    assert_eq!(stored[0].geometry.span_limit, 62);
+    assert_eq!(geometry(&stored[0]).page_rows, 4352);
+    assert_eq!(geometry(&stored[0]).slab_rows, 4352);
+    assert_eq!(geometry(&stored[0]).span_limit, 62);
     // A window history holds n plus one advance: 576 rows in 256-row pages.
-    assert_eq!(stored[1].geometry.page_rows, 256);
-    assert_eq!(stored[1].geometry.slab_rows, 8192);
-    assert_eq!(stored[1].geometry.span_limit, 4);
+    assert_eq!(geometry(&stored[1]).page_rows, 256);
+    assert_eq!(geometry(&stored[1]).slab_rows, 8192);
+    assert_eq!(geometry(&stored[1]).span_limit, 4);
     // A Shared reader of the Token domain also sees an advance's appended
     // rows, so its page grows to keep the reader within the limit.
     let mut with_reader = plans();
@@ -609,12 +616,12 @@ fn span_limits_follow_each_domain_row_limit() {
     let (stored, shared) = domain::validate_domains(with_reader, 262_144, 64).unwrap();
     assert_eq!(shared.len(), 1);
     assert_eq!(
-        stored[0].geometry,
-        history_geometry(8192, 262_144, 64).unwrap()
+        geometry(&stored[0]),
+        history_geometry(8192, 262_144, 64, TEST_GRANULE).unwrap()
     );
-    assert_eq!(stored[0].geometry.page_rows, 4608);
-    assert!(stored[0].geometry.span_limit <= MAX_HISTORY_SPANS);
-    assert_eq!(stored[1].geometry.span_limit, 4);
+    assert_eq!(geometry(&stored[0]).page_rows, 4608);
+    assert!(geometry(&stored[0]).span_limit <= MAX_HISTORY_SPANS);
+    assert_eq!(geometry(&stored[1]).span_limit, 4);
     assert_eq!(
         HistoryDomainKind::Window { rows: 512 }.row_limit(262_144, 64).unwrap(),
         576
@@ -632,8 +639,7 @@ fn span_limits_follow_each_domain_row_limit() {
 #[test]
 fn shared_layers_bind_their_source_regions() {
     let device = cpu_device();
-    let store = StateStore::new(
-        device,
+    let store = device.store(
         16,
         4,
         vec![
@@ -684,8 +690,7 @@ fn a_single_token_domain_is_the_one_domain_store() {
     let device = cpu_device();
     let components = vec![component(0, 4096), component(3, 4096)];
     let row_bytes = 2 * 2 * 4096 * 4;
-    let store = StateStore::new(
-        device.clone(),
+    let store = device.store(
         20_000,
         16,
         vec![HistoryDomainPlan {
@@ -699,7 +704,8 @@ fn a_single_token_domain_is_the_one_domain_store() {
     )
     .unwrap()
     .0;
-    let geometry = history_geometry(row_bytes, 20_000, 0).unwrap();
+    let geometry = history_geometry(row_bytes, 20_000, 0, device.pool.granule()).unwrap();
+    let reserved = history_pages(20_000, 0).reserved_rows(40_000).unwrap();
     let slab_rows = geometry.slab_rows;
     assert_eq!(store.history_row_bytes(TOKEN), row_bytes);
     assert_eq!(store.history_slab_rows(TOKEN), slab_rows);
@@ -711,9 +717,9 @@ fn a_single_token_domain_is_the_one_domain_store() {
         trace.history,
         [HistoryDomainTrace {
             kind: HistoryDomainKind::Token,
-            capacity: geometry.reserved_rows(40_000).unwrap(),
+            capacity: reserved,
             row_bytes,
-            bytes: row_bytes * geometry.reserved_rows(40_000).unwrap() as u64,
+            bytes: row_bytes * reserved as u64,
             slab_rows,
             page_rows: geometry.page_rows,
             span_limit: geometry.span_limit,
@@ -743,7 +749,7 @@ fn a_single_token_domain_is_the_one_domain_store() {
     let first = commit(first, 3);
     assert_eq!(first.history_ranges(TOKEN), [(0, 13)]);
     assert_eq!(first.history_start(TOKEN), 0);
-    assert_eq!(store.committed_bytes(), device.device_ledger().charged);
+    device.assert_holds(&store);
 }
 
 /// A Token domain and one selected-attention indexer of blocks of four: its
@@ -752,12 +758,11 @@ const RAW: HistoryDomainId = HistoryDomainId(1);
 const BLOCKS: HistoryDomainId = HistoryDomainId(2);
 const INDEX_KEYS: LayerRef = LayerRef::IndexKeys { block: 0, part: 0 };
 
-fn indexed_store(device: Rc<Device>, context: usize, max_advance: usize) -> StoreBindings {
+fn indexed_store(device: OwnDevice, context: usize, max_advance: usize) -> StoreBindings {
     let keys = |coordinates| {
         ComponentDescriptor::produced(INDEX_KEYS, DType::F32, 4, coordinates).unwrap()
     };
-    StateStore::new(
-        device,
+    device.store(
         context,
         max_advance,
         vec![
@@ -898,11 +903,10 @@ fn checkpoints_and_successors_share_the_block_rows() {
 const PENDING: HistoryDomainId = HistoryDomainId(1);
 const POOLED: HistoryDomainId = HistoryDomainId(2);
 
-fn pooled_store(device: Rc<Device>, context: usize, max_advance: usize) -> StoreBindings {
+fn pooled_store(device: OwnDevice, context: usize, max_advance: usize) -> StoreBindings {
     let source = LayerRef::Pooled { block: 0, part: 1 };
     let keys = LayerRef::IndexKeys { block: 0, part: 1 };
-    StateStore::new(
-        device,
+    device.store(
         context,
         max_advance,
         vec![
@@ -1001,7 +1005,7 @@ fn produced_domains_follow_the_per_token_ones() {
     };
     let token = |components| plan(HistoryDomainLayout::Token { components });
     let block = |components| plan(HistoryDomainLayout::Block { rate: 4, components });
-    let store = |plans| StateStore::new(device.clone(), 64, 16, plans, vec![], banks());
+    let store = |plans| device.store(64, 16, plans, vec![], banks());
     // A produced domain before a per-token one.
     assert!(store(vec![block(vec![keys()]), token(vec![component(0, 1)])]).is_err());
     // A per-token domain holding produced rows, or a Block holding
@@ -1044,7 +1048,7 @@ fn a_batchs_most_rows_are_its_worst_positions() {
 
 /// The backing a submission batch newly takes in each domain, at its worst
 /// page offset (a history whose last page holds none of it), is its
-/// `batch_state_bytes`: a fresh history for the Token and Window domains, and
+/// `state_bytes`: a fresh history for the Token and Window domains, and
 /// for the Block(4) domain one at position 3, whose batch completes its
 /// first block.
 #[test]
@@ -1056,10 +1060,11 @@ fn a_batch_takes_its_state_bytes_of_pages() {
         HistoryDomainLayout::Block { rate: 4, components: vec![keys(false)] },
     ];
     let (context, max_advance) = (64, 16);
+    let device = cpu_device();
     for rows in 1..=4 {
         for (index, (layout, at)) in layouts.iter().zip([0, 0, 3]).enumerate() {
             let domain = HistoryDomainId(index);
-            let store = indexed_store(cpu_device(), context, max_advance);
+            let store = indexed_store(device.clone(), context, max_advance);
             let state = match at {
                 0 => store.create().unwrap(),
                 at => commit(store.create().unwrap(), at),
@@ -1070,7 +1075,7 @@ fn a_batch_takes_its_state_bytes_of_pages() {
             let single = std::slice::from_ref(layout);
             assert_eq!(
                 taken,
-                batch_state_bytes(single, context, max_advance, rows as u64).unwrap(),
+                state_bytes(single, context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap(),
                 "{:?} at {rows} rows",
                 layout.kind()
             );
@@ -1079,14 +1084,30 @@ fn a_batch_takes_its_state_bytes_of_pages() {
         // The store's every domain at once.
         let each = layouts
             .iter()
-            .map(|layout| batch_state_bytes(std::slice::from_ref(layout), context, max_advance, rows as u64).unwrap())
+            .map(|layout| state_bytes(std::slice::from_ref(layout), context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap())
             .sum::<u64>();
-        assert_eq!(batch_state_bytes(&layouts, context, max_advance, rows as u64).unwrap(), each);
+        assert_eq!(state_bytes(&layouts, context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap(), each);
+        // Three sequences' slabs: each domain's pages of all three in whole
+        // slabs of its own, a granule each, as the store commits them, never
+        // one rounding of the sum.
+        let granule = device.pool.granule();
+        let slabs = layouts
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| {
+                let domain = HistoryDomainId(index);
+                let store = indexed_store(device.clone(), context, max_advance);
+                let pages = state_bytes(std::slice::from_ref(layout), context, max_advance, StateUnit::Pages, 3, rows as u64).unwrap();
+                let slab_rows = store.history_slab_rows(domain) as u64;
+                (pages / store.history_row_bytes(domain)).div_ceil(slab_rows) * granule
+            })
+            .sum::<u64>();
+        assert_eq!(state_bytes(&layouts, context, max_advance, StateUnit::Slabs { granule }, 3, rows as u64).unwrap(), slabs);
     }
 }
 
 /// A window history occupies at most its row limit's pages and the partial
-/// page at its front however long it grows, so `batch_state_bytes` of its
+/// page at its front however long it grows, so `state_bytes` of its
 /// rows from a page boundary caps there: as a sequence advances far past
 /// its window, the pages the store holds for it never exceed that figure,
 /// and reach it once the window straddles a page boundary in flight.
@@ -1107,7 +1128,7 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
         let advance = OwnedStateAdvance::begin(state, max_advance).ok().unwrap();
         let through = advance.position() + max_advance;
         let held = free - store.free_rows(WINDOW);
-        let bytes = batch_state_bytes(&single, context, max_advance, through as u64).unwrap();
+        let bytes = state_bytes(&single, context, max_advance, StateUnit::Pages, 1, through as u64).unwrap();
         assert!(held as u64 * row_bytes <= bytes, "{held} rows held through {through}");
         most = most.max(held);
         let OwnedAdvanceResolution::Committed(next) = advance.commit_all().ok().unwrap() else {
@@ -1116,5 +1137,5 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
         state = next;
     }
     assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
-    assert_eq!(batch_state_bytes(&single, context, max_advance, context as u64).unwrap(), cap as u64 * row_bytes);
+    assert_eq!(state_bytes(&single, context, max_advance, StateUnit::Pages, 1, context as u64).unwrap(), cap as u64 * row_bytes);
 }

@@ -37,18 +37,18 @@ using Epi = projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 // record, or its tier records in place. In the kernel's own scope, where
 // its ports are.
 struct Weights {
-    routed::Place gate, up;
-    __device__ __forceinline__ bool none() const { return gate.stack == nullptr; }
+    const projection::u8 *gate, *up;
+    __device__ __forceinline__ bool none() const { return gate == nullptr; }
 };
 #define CHOICE_WEIGHTS(m, k, expert)                                                                       \
     [&] {                                                                                                  \
         const int source = routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,      \
                                                  SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m),  \
                                                  (k), (expert));                                           \
-        return Weights{routed::Place::of(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE),                          \
-                                         SEISMIC_PTR(SEISMIC_BUFFER_TIER_GATE), source),                   \
-                       routed::Place::of(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),                            \
-                                         SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP), source)};                    \
+        return Weights{routed::source_record(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE),                      \
+                                             SEISMIC_PTR(SEISMIC_BUFFER_TIER_GATE), source),               \
+                       routed::source_record(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),                        \
+                                             SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP), source)};                \
     }()
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP
@@ -83,8 +83,8 @@ __global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
                                  SEISMIC_UP_SCALE_STRIDE_0, expert));
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    KERNEL_W0_MATRIX(weights.gate.stack, weights.gate.record),
-                                    KERNEL_W1_MATRIX(weights.up.stack, weights.up.record), epi);
+                                    ROUTED_RECORD(KERNEL_W0, weights.gate),
+                                    ROUTED_RECORD(KERNEL_W1, weights.up), epi);
 }
 #endif
 
@@ -159,7 +159,7 @@ __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
                                  expert));
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, rows_at}, count, SEISMIC_DIM_H / 64,
-                                    group, SEISMIC_DIM_F, KERNEL_W0_MATRIX(weights.gate.stack, weights.gate.record),
-                                    KERNEL_W1_MATRIX(weights.up.stack, weights.up.record), epi);
+                                    group, SEISMIC_DIM_F, ROUTED_RECORD(KERNEL_W0, weights.gate),
+                                    ROUTED_RECORD(KERNEL_W1, weights.up), epi);
 }
 #endif
