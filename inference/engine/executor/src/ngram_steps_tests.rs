@@ -239,6 +239,157 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// A verification row computes, bit for bit, the logits and the selection
+/// plain decode computes at the same history: drafting never changes what a
+/// target emits. One prompt, then its continuation decoded a token a step;
+/// then, from the same prompt, each verification width up to the decode row
+/// bound feeds that continuation as one forward, and each of its rows'
+/// logits are the decode step's at its position. The prompt (37 tokens) puts
+/// the rows' histories across attention's 32-key tiles and partitions, so
+/// every width splits a row's keys between history and the pass's fresh rows
+/// at another place. Dense and K8/V4 history, on every backend present, of a
+/// plain load, an MTP load and a load streaming its routed experts over a
+/// bank of about half the slots: the rows a drafted round verifies, so the
+/// tokens it emits are plain decode's. A DFlash load needs a package of two
+/// components, which this harness's one-file package cannot hold; the
+/// serving pair compares it end to end.
+#[test]
+fn a_verification_row_scores_as_plain_decode_at_its_history() {
+    const PROMPT: usize = 37;
+    const ROWS: usize = magnitude_kernels::constants::VERIFY_ROWS as usize;
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
+    let proposals = (ROWS - 1) as u8;
+    let loads = [
+        ("plain", fixture("verify-rows"), PlannedMethod::Plain, Banked::Resident),
+        (
+            "mtp",
+            fixture_with("verify-rows-mtp", mtp, crate::planning::fixtures::fixture_manifest),
+            PlannedMethod::Mtp {
+                greedy_proposals: proposals,
+                sampled_proposals: proposals,
+                widths: crate::DraftWidths::Adaptive,
+            },
+            Banked::Resident,
+        ),
+        // Routed layers over a bank of about half the slots where the backend
+        // streams (resident on the CPU): ten layers of 256 experts span more
+        // than one CUDA pool block, so the half-slot cap forms a partial bank.
+        (
+            "streamed",
+            fixture_with("verify-rows-streamed", qwen4exp_fixture_definition_of(9, 256), streamed_experts_manifest),
+            PlannedMethod::Plain,
+            Banked::Half,
+        ),
+    ];
+    let token = |position: usize| (position * 37 + 11) as u32 % 256;
+    // Every row selects greedily, as a served round does, and exports its
+    // logits: each row's logits bits and its selection.
+    let scoring = |request: RequestId, kind: WorkKind, tokens: &[u32], position: usize| {
+        let Operation::Forward { request, kind, tokens, position, conditioning, committed, prime, .. } =
+            forward(request, kind, tokens, position, false)
+        else {
+            unreachable!("a forward")
+        };
+        Operation::Forward {
+            select: (0..tokens.len())
+                .map(|row| SelectSpec {
+                    sampling: Sampling::Greedy,
+                    seed: 0,
+                    position: position + row,
+                    domain: 0,
+                    mask: None,
+                    shaping: Shaping::default(),
+                    history: None,
+                })
+                .collect(),
+            demand: crate::batching::Demand::SELECT | crate::batching::Demand::LOGITS,
+            request,
+            kind,
+            tokens,
+            position,
+            conditioning,
+            committed,
+            prime,
+        }
+    };
+    let scores = |outcome: &Outcome| -> Vec<(Vec<u32>, Option<(u32, u8)>)> {
+        step_bits(outcome)
+            .into_iter()
+            .map(|(_, logits, selected)| (logits.expect("every row exports its logits"), selected))
+            .collect()
+    };
+    let backends = [
+        seismic::BackendName::Cpu,
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Vulkan,
+    ];
+    let mut failures = Vec::new();
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        for (name, (_, definition, package), method, banked) in &loads {
+            let banked = if STREAMING_BACKENDS.contains(&backend) { *banked } else { Banked::Resident };
+            for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
+                let (mut domain, mut bindings, _, _) = load_coded(
+                    &catalog,
+                    definition,
+                    package,
+                    backend,
+                    ResourceLimits { max_selected_rows: ROWS, ..limits(ROWS, false, 1, ROWS) },
+                    banked,
+                    *method,
+                    codec,
+                );
+                // `request`'s prompt, in launches of up to ROWS rows.
+                let prompted = |domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId| {
+                    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+                    domain.open_state(&mut bindings, request, None, 0).unwrap();
+                    for start in (0..PROMPT).step_by(ROWS) {
+                        let tokens = (start..PROMPT.min(start + ROWS)).map(token).collect::<Vec<_>>();
+                        let (_, returned) = run(domain, bindings, forward(request, WorkKind::Prefill, &tokens, start, false), false, backend);
+                        bindings = returned;
+                    }
+                    bindings
+                };
+                let plain = RequestId(1);
+                bindings = prompted(&mut domain, bindings, plain);
+                let mut decoded = Vec::new();
+                for position in PROMPT..PROMPT + ROWS {
+                    let (outcome, returned) =
+                        run(&mut domain, bindings, scoring(plain, WorkKind::Decode, &[token(position)], position), false, backend);
+                    bindings = returned;
+                    decoded.extend(scores(&outcome));
+                }
+                domain.close(plain).unwrap_or_else(|error| panic!("{error}"));
+                for width in 2..=ROWS {
+                    let request = RequestId(1 + width as u64);
+                    bindings = prompted(&mut domain, bindings, request);
+                    let tokens = (PROMPT..PROMPT + width).map(token).collect::<Vec<_>>();
+                    let (outcome, returned) =
+                        run(&mut domain, bindings, scoring(request, WorkKind::Verify, &tokens, PROMPT), false, backend);
+                    bindings = returned;
+                    for (row, (logits, selected)) in scores(&outcome).iter().enumerate() {
+                        let (plain_logits, plain_selected) = &decoded[row];
+                        if logits != plain_logits || selected != plain_selected {
+                            let differing = logits.iter().zip(plain_logits).filter(|(a, b)| a != b).count();
+                            failures.push(format!(
+                                "{backend:?} {name} {codec:?}: width {width} row {row}: {differing} of {} logits differ from plain decode's; selected {selected:?}, plain {plain_selected:?}",
+                                logits.len()
+                            ));
+                        }
+                    }
+                    domain.close(request).unwrap_or_else(|error| panic!("{error}"));
+                }
+            }
+        }
+    }
+    for (_, (directory, _, _), _, _) in &loads {
+        std::fs::remove_dir_all(directory).ok();
+    }
+    assert!(failures.is_empty(), "verification rows that are not plain decode's:\n{}", failures.join("\n"));
+}
+
 /// On Metal and on the CPU, a load streaming its experts through a bank
 /// (some layers' experts partly held, some held whole as the bank fills):
 /// a prompt chunk, then two decode steps of the device's selected tokens,
@@ -2196,6 +2347,21 @@ fn load_with(
     banked: Banked,
     method: PlannedMethod,
 ) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
+    load_coded(catalog, definition, package, backend, limits, banked, method, KvCodec::Dense)
+}
+
+/// [`load_with`] keeping its history in `codec`.
+#[allow(clippy::too_many_arguments)]
+fn load_coded(
+    catalog: &seismic::Devices,
+    definition: &Rc<ModelDefinition>,
+    package: &Arc<Package>,
+    backend: seismic::BackendName,
+    limits: ResourceLimits,
+    banked: Banked,
+    method: PlannedMethod,
+    codec: KvCodec,
+) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
     crate::diagnostics::install();
@@ -2226,7 +2392,7 @@ fn load_with(
         },
         ExecutionPath::Native,
         method,
-        KvCodec::Dense,
+        codec,
         limits,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
@@ -2252,7 +2418,7 @@ fn load_with(
         definition,
         draft.load(),
         draft.policy().method(),
-        KvCodec::Dense,
+        codec,
         limits,
         capacity,
     )
