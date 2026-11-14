@@ -56,6 +56,7 @@ ARCHIVE = ("-a",)
 RSYNC_DESCRIPTORS = 64
 STAGE = "stage-"  # a run directory's `stage-<label>`, one per side
 RUN_KERNELS = "kernels"  # a run directory's own kernel cache, fresh per run
+RUN_CACHES = "caches"  # a run directory's own user cache (program store, probe answers, CUDA JIT), fresh per run
 RUN_CLONES = "clones"  # a run directory's clones of its model's files, per fresh job (`host/fresh.py`)
 RUN_INPUTS = "inputs"  # a run directory's copy of the request's files, staged from its results
 
@@ -112,12 +113,13 @@ def push(remote: Remote, paths: list[str], tree: Path, destination: str, *, alik
 
 
 # The stages are the caller's copies of what the run installs, already in its checkouts. The
-# run's kernel cache is compiled for the host's device, and what of it a run's answer shows is
-# in its jobs' logs. Clones are the model's files, which a killed job leaves behind: kept with
+# run's kernel cache and user cache are compiled for the host's device, and what of them a run's
+# answer shows is in its jobs' logs. Clones are the model's files, which a killed job leaves behind: kept with
 # the run's directory, so its removal or eviction takes them. Raw logits stay on the host: they are gigabytes at a long context, and
 # everything that reads them (the references' `kl`, the logits digests) runs there. The run's
 # locks are its host processes' own (`host/agent.py`).
-HOST_ONLY = ("--exclude", f"/{STAGE}*", "--exclude", f"/{RUN_KERNELS}/", "--exclude", f"/{RUN_CLONES}/",
+HOST_ONLY = ("--exclude", f"/{STAGE}*", "--exclude", f"/{RUN_KERNELS}/", "--exclude", f"/{RUN_CACHES}/",
+             "--exclude", f"/{RUN_CLONES}/",
              "--exclude", "logits*.f32",
              *(argument for lock in RUN_LOCKS for argument in ("--exclude", f"/{lock}")))
 # Never fetched: what stays on the host, and the request's files, which the caller staged from

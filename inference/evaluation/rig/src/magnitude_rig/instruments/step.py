@@ -3,7 +3,7 @@ decode step's time go?
 
 The harness `time` at one context and `--sequences` decoded together (one by default), without
 drafting (the drafter is `draft`'s), on the host's kernel cache (so stored tuning is
-reused, never searched afresh between runs): the median
+reused, never searched afresh between runs), or, under `--cold`, caches of the run's own: the median
 step with its 95% interval from the measured steps, the launches per step, and the device
 time per entry from `--attribution` further steps, each launch timed alone; and the prefill of
 the context, the median of `--prefill-samples` warm samples (after a cold one) with its
@@ -58,7 +58,7 @@ import json
 import shutil
 from pathlib import Path
 
-from .. import store
+from .. import store, sync
 from ..engine import Refused, Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
 from .assess import preceded, priced
@@ -98,6 +98,11 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fresh-tuning", action="store_true",
                         help="the resident load searches afresh, ignoring stored tuning results: "
                              "its trace is then the whole search, for a curve of tuning over time")
+    parser.add_argument("--cold", action="store_true",
+                        help="time two loads in a row on caches of the run's own, empty when it starts: its "
+                             "kernel cache, its user cache (the program store and probe answers) and CUDA's "
+                             "driver JIT cache; the first load is cold, the second warm, and each one's wall "
+                             "time is reported. The OS Metal shader cache is the user's, which this does not reach")
     parser.add_argument("--tuning-budget", type=float, metavar="SECONDS",
                         help="seconds each load's first tuning may spend (default the engine's served budget); "
                              "each cell reports whether its tuning completed within it")
@@ -112,12 +117,27 @@ def configure(parser: argparse.ArgumentParser) -> None:
                           "its default and is reported")
 
 
+def kernels(arguments) -> str:
+    """The kernel cache the run's loads use: its own under `--cold`, else the one every checkout shares."""
+    return f"{{runs}}/{sync.RUN_KERNELS}" if arguments.cold else "{engine_cache}/kernels"
+
+
+def caches(arguments) -> tuple[tuple[str, str], ...]:
+    """The environment of the run's loads: under `--cold`, the user cache the program store and
+    probe answers are kept in, and CUDA's driver JIT cache, are the run's own too, so its first
+    load forms everything and its second nothing it formed."""
+    if not arguments.cold:
+        return ()
+    own = f"{{runs}}/{sync.RUN_CACHES}"
+    return (("XDG_CACHE_HOME", f"{own}/user"), ("CUDA_CACHE_PATH", f"{own}/nv"))
+
+
 def time(arguments, family: str, *extra: str) -> tuple[str, ...]:
     return (
         harness.EXECUTABLE, "time",
         "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{family}.jsonl",
         "--output", "{run_dir}", "--build-identity", "{build_file}",
-        "--cache-dir", "{engine_cache}/kernels", "--device", arguments.backend,
+        "--cache-dir", kernels(arguments), "--device", arguments.backend,
         "--contexts", str(arguments.context), "--concurrency", str(arguments.sequences),
         "--warm", str(arguments.warm), "--steps", str(arguments.steps),
         "--attribution-steps", str(arguments.attribution),
@@ -150,7 +170,8 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
         resident, against = (), ()
     elif arguments.resident is None:
         fresh = ("--fresh-tuning",) if arguments.fresh_tuning else ()
-        resident = (("step", Step("time", time(arguments, family, *pinning, *fresh))),)
+        load = Step("time", time(arguments, family, *pinning, *fresh), env=caches(arguments))
+        resident = (("step", load), *((("warm", load),) if arguments.cold else ()))
         against = ("--resident-decode", f"{{runs}}/{prefix}step/result.json")
     else:
         resident, against = (), ("--resident-decode", f"{{inputs}}/{_recorded(arguments).name}")
@@ -159,7 +180,7 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
     caps = tuple(
         (harness.streamed(cap), Step("time", time(
             arguments, family, *pinning, "--weight-cap", str(cap), *against,
-        ), fresh=True))
+        ), env=caches(arguments), fresh=True))
         for cap in arguments.weight_cap
     )  # fmt: skip
     return (*resident, *caps)
@@ -174,6 +195,8 @@ def plan(arguments, source, host) -> Plan:
         if not arguments.weight_cap:
             raise SystemExit("step: --resident serves streamed cells; give --weight-cap")
         _accept_resident(arguments, _wanted(arguments, source, host))
+    if arguments.cold and (arguments.weight_cap or arguments.resident is not None or arguments.streamed_only):
+        raise SystemExit("step: --cold times a resident load cold and then warm; it takes no streamed cell")
     if arguments.tuning_record and arguments.tuning_record.exists():
         raise SystemExit(f"step: {arguments.tuning_record} is recorded already; a reference is recorded once")
     if arguments.tuning_replay and not arguments.tuning_replay.is_file():
@@ -863,8 +886,20 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         lines += streamed_lines
         measures.update(streamed_measures)
         ok = ok and valid
+    if arguments.cold:
+        warm = results["warm"]
+        if warm.code != 0:
+            return Answer(tuple(_failed("warm ", warm)), False)
+        loads = {phase: _load_ms(result) for phase, result in (("cold", result), ("warm", warm))}
+        lines.insert(0, f"load cold {loads['cold'] / 1000:.2f} s · warm {loads['warm'] / 1000:.2f} s")
+        measures.update({f"{phase}_load_ms": Measure(ms, "ms", None, True) for phase, ms in loads.items()})
     lines.append(tuning)
     return Answer(tuple(lines), ok, measures)
+
+
+def _load_ms(result: JobResult) -> float:
+    """The wall time of a step job's load, as its record holds it."""
+    return json.loads((result.directory / "result.json").read_text())["measurements"]["load"]["wall_ms"]
 
 
 INSTRUMENT = Instrument(
