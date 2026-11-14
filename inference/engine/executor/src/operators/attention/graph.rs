@@ -132,9 +132,6 @@ pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
         codec: CodecSpec,
         append: G::Binding<'a, attention_append_k8v4::Entry>,
         decode: G::Binding<'a, attention_decode_k8v4::Entry>,
-        verify: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
-        verify_four: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
-        verify_eight: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
         prefill: G::Binding<'a, attention_prefill_k8v4::Entry>,
         /// The prefill of a class that lists its launch's history row tiles
         /// (`StateResourcePlan::lists_history_tiles`).
@@ -151,10 +148,7 @@ impl<'a, G: GraphDraft + 'a> Clone for AttentionHistoryEntries<'a, G> {
 
 /// What attends a dense history's decode row classes ([`dense_decodes`]).
 pub(crate) enum DenseDecodeEntries<'a, G: GraphDraft + 'a> {
-    Decode {
-        single: G::Binding<'a, attention_decode::Entry>,
-        verify: Option<G::Binding<'a, attention_decode::Entry>>,
-    },
+    Decode(G::Binding<'a, attention_decode::Entry>),
     Prefill(G::Binding<'a, attention_prefill::Entry>),
 }
 
@@ -211,10 +205,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 codec: kernels.codec,
                 append,
                 decode: match decode {
-                    DenseDecodeKernels::Decode { single, verify } => DenseDecodeEntries::Decode {
-                        single,
-                        verify: verify.as_ref(),
-                    },
+                    DenseDecodeKernels::Decode(kernel) => DenseDecodeEntries::Decode(kernel),
                     DenseDecodeKernels::Prefill(kernel) => DenseDecodeEntries::Prefill(kernel),
                 },
                 prefill,
@@ -222,18 +213,12 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
             AttentionHistoryKernels::AffineK8V4 {
                 append,
                 decode,
-                verify,
-                verify_four,
-                verify_eight,
                 prefill,
                 prefill_listed,
             } => AttentionHistoryEntries::AffineK8V4 {
                 codec: kernels.codec,
                 append,
                 decode,
-                verify: verify.as_ref(),
-                verify_four: verify_four.as_ref(),
-                verify_eight: verify_eight.as_ref(),
                 prefill,
                 prefill_listed: prefill_listed.as_ref(),
             },
@@ -549,10 +534,7 @@ impl CheckedAttentionEntries {
                 codec: self.history,
                 append: &self.mix[..],
                 decode: if self.decodes {
-                    DenseDecodeEntries::Decode {
-                        single: &self.mix[..],
-                        verify: None,
-                    }
+                    DenseDecodeEntries::Decode(&self.mix[..])
                 } else {
                     DenseDecodeEntries::Prefill(&self.mix[..])
                 },
@@ -562,9 +544,6 @@ impl CheckedAttentionEntries {
                 codec: self.history,
                 append: &self.mix[..],
                 decode: &self.mix[..],
-                verify: None,
-                verify_four: None,
-                verify_eight: None,
                 prefill: &self.mix[..],
                 prefill_listed: self.lists.then_some(&self.mix[..]),
             },
@@ -652,13 +631,11 @@ pub(crate) fn affine_dimensions(codec: CodecSpec) -> Result<Vec<(&'static str, u
     ])
 }
 
-/// Row classes up to this size attend with the decode entry; larger classes
-/// use the prefill entry.
-pub(crate) const DECODE_ROWS: u64 = 8;
-
-/// Whether a `rows`-row class attends with the decode entry.
+/// Whether a `rows`-row class attends with the decode entry: row classes up
+/// to a draft verification's (`VERIFY_ROWS`); larger classes use the prefill
+/// entry.
 pub(crate) fn decodes(rows: impl Into<Dim>) -> bool {
-    rows.into().at_most(DECODE_ROWS)
+    rows.into().at_most(magnitude_kernels::constants::VERIFY_ROWS)
 }
 
 /// The block's weight tensors, as ports of the graph being built. The
@@ -2012,9 +1989,9 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     };
     let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense {
-            decode: DenseDecodeEntries::Decode { single, .. },
+            decode: DenseDecodeEntries::Decode(kernel),
             ..
-        } => graph.control_for(topology.controls, *single, name, &dimensions),
+        } => graph.control_for(topology.controls, *kernel, name, &dimensions),
         AttentionHistoryEntries::Dense {
             decode: DenseDecodeEntries::Prefill(kernel),
             ..
@@ -2465,17 +2442,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         .reshape(&[Dim::from(0), block_keys.clone()]);
     let attended = match &history {
         AttentionHistoryEntries::Dense {
-            decode:
-                DenseDecodeEntries::Decode {
-                    verify: Some(kernel),
-                    ..
-                },
-            ..
-        } if decode && rows.greater_than(1) => {
-            dense_mix!(kernel, attention_decode, &attend_dimensions)
-        }
-        AttentionHistoryEntries::Dense {
-            decode: DenseDecodeEntries::Decode { single: kernel, .. },
+            decode: DenseDecodeEntries::Decode(kernel),
             ..
         } if decode => {
             dense_mix!(kernel, attention_decode, &attend_dimensions)
@@ -2497,39 +2464,6 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 selection: (&bitmap).into(),
                 block_slots: (&block_slots).into())
         }
-        AttentionHistoryEntries::AffineK8V4 {
-            verify_four: Some(kernel),
-            ..
-        } if decode && rows.equals(4) => mix!(
-            kernel,
-            attention_decode_k8v4,
-            history_key_codes,
-            history_key_coefficients,
-            history_value_codes,
-            history_value_coefficients
-        ),
-        AttentionHistoryEntries::AffineK8V4 {
-            verify_eight: Some(kernel),
-            ..
-        } if decode && rows.greater_than(4) => mix!(
-            kernel,
-            attention_decode_k8v4,
-            history_key_codes,
-            history_key_coefficients,
-            history_value_codes,
-            history_value_coefficients
-        ),
-        AttentionHistoryEntries::AffineK8V4 {
-            verify: Some(kernel),
-            ..
-        } if decode && rows.greater_than(1) => mix!(
-            kernel,
-            attention_decode_k8v4,
-            history_key_codes,
-            history_key_coefficients,
-            history_value_codes,
-            history_value_coefficients
-        ),
         AttentionHistoryEntries::AffineK8V4 { decode: kernel, .. } if decode => mix!(
             kernel,
             attention_decode_k8v4,

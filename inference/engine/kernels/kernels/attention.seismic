@@ -891,10 +891,28 @@ fn block_read[B](bitmap: &tensor[B] u32, ordinal: i32, block_rows: i32) -> bool:
             read = ((bitmap[block / 32] >> u32(block % 32)) & u32(1)) != u32(0)
     return read
 
-# Decode rows (M <= 8). L1: one threadgroup per (kv head, partition, row). A
-# row's visible keys (spans in order, then its fresh span) split into
-# consecutive partitions (with a SPAN minimum on Metal and Vulkan, so a short
-# row still spreads over several partitions and a long one over all PARTS).
+# Decode rows (a draft verification's, M <= VERIFY_ROWS). L1: one threadgroup per (kv head, partition, row).
+#
+# The decode key rule, which every decode form on every backend follows (the
+# decode entries' and the prefill entries' decode row classes): a row's key
+# sequence is its visible spans in order, its fresh span, then its picks
+# (KS). A form reads it in units at fixed positions of that sequence (keys,
+# or tiles of KEYS keys: unit u is positions [u KEYS, (u + 1) KEYS)). Of a
+# row's N units, partition p takes the contiguous run [p run, min((p + 1)
+# run, N)), run = max(floor, ceil(N / parts)), the floor a form's declared
+# fewest units (SPAN keys, or SPAN / KEYS tiles; the CUDA prefill entry's 16
+# tiles), so a short row still spreads over several partitions and a long
+# one over all of them. The first ceil(N / run) partitions hold keys, and the
+# merge folds them in partition order (a form that also publishes the others
+# publishes them empty, adding nothing). A partition absorbs its keys in
+# position order, in batches at fixed positions, fresh keys read as history
+# will hold them. Rows of a launch share a unit only where it is the same
+# positions of both sequences (one a prefix of the other) and their runs are
+# equal. So a row's partitions, batches and reduction order are its own:
+# under one specialization its result is bit for bit the same whatever rows
+# of its request share its launch, and whichever of its keys are still
+# fresh.
+#
 # The query group splits into SLICES slices; each simdgroup scans a
 # contiguous sub-range of the partition for its slice's heads, so each K/V
 # row is read once per slice. Partition 0 also appends the row's K/V. L2: per
@@ -915,7 +933,7 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32, selected_slab_rows: u32,
     key_block: i32, key_element: i32, key_scale: i32, key_amax_floor: f32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK <= 1 and (VK == 0 or NV == 0) and KR >= 0 and KR <= 1 and (KR == 0 or VK == 1) and KS >= 0 and TS >= 0 and AB >= 0 and AB <= 1:
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK <= 1 and (VK == 0 or NV == 0) and KR >= 0 and KR <= 1 and (KR == 0 or VK == 1) and KS >= 0 and TS >= 0 and AB >= 0 and AB <= 1 and M <= VERIFY_ROWS:
     let every = tensor[M, 0] u32
     let axes = tensor[0, RA, RT, RO, VK, KR, AB] i32
     return attention_rows(query, gate, key, value, query_norm, key_norm, value_norm, sinks,
@@ -1668,7 +1686,7 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, KC, KP, VC, V
     history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0 and M <= VERIFY_ROWS:
     let every = tensor[M, 0] u32
     let layout = tensor[0, RA, RT, RO] i32
     return attention_rows_k8v4(query, gate, key, value, query_norm, key_norm, value_norm, sinks,

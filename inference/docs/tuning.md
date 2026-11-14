@@ -19,10 +19,15 @@ implementations; compiler candidate evaluation and numerical applicability remai
 | Evaluation | Independent correctness, whole-model quality, tuning effectiveness and performance against controls |
 
 A unit identifies an entry with its bound representations, static geometry and served workload
-class. The same entry can have distinct units for disjoint graph classes. Repeated logical calls
-contribute their actual invocation demand; sharing weights does not remove calls or manufacture
-independent memory streams. A selected configuration is a whole artifact, including all launches
-and coupled parameter values. The serving graph binds that exact choice to its class.
+class. The same entry can have distinct units for disjoint graph classes, but decode row classes
+are never split between units: a decode entry's parameters set each row's reduction order, so its
+decode attention is one tuning unit over every decode row and its arithmetic has one owner. A row
+computed in a verification or beside other requests' rows then runs the arithmetic it runs alone.
+The unit ranks its configurations over the weighted demand of all of its rows, and one without
+demand settles its canonical default for all of them. Repeated logical calls contribute their
+actual invocation demand; sharing weights does not remove calls or manufacture independent memory
+streams. A selected configuration is a whole artifact, including all launches and coupled
+parameter values. The serving graph binds that exact choice to its class.
 
 Two descriptions of a unit must remain distinct:
 

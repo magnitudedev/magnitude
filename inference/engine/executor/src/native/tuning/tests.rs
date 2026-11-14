@@ -3143,7 +3143,6 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         },
         scopes: Vec::new(),
         epsilon: 1.0e-5,
-        decode_rows: None,
         window: None,
         selection: None,
         picked: None,

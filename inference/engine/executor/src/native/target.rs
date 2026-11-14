@@ -607,10 +607,8 @@ pub enum AttentionHistoryKernels {
     },
     AffineK8V4 {
         append: NativeKernel<attention_append_k8v4::Entry>,
+        /// Every decode row's attention, one row or several.
         decode: NativeKernel<attention_decode_k8v4::Entry>,
-        verify: Option<NativeKernel<attention_decode_k8v4::Entry>>,
-        verify_four: Option<NativeKernel<attention_decode_k8v4::Entry>>,
-        verify_eight: Option<NativeKernel<attention_decode_k8v4::Entry>>,
         /// The prefill of a launch that lists no history row tiles: it reads
         /// the history in place.
         prefill: NativeKernel<attention_prefill_k8v4::Entry>,
@@ -625,13 +623,8 @@ pub enum AttentionHistoryKernels {
 /// (`graph::dense_decodes`).
 #[derive(Clone, Debug)]
 pub enum DenseDecodeKernels {
-    Decode {
-        single: NativeKernel<attention_decode::Entry>,
-        /// The multi-row decode (draft blocks, verification), tuned on its
-        /// own row classes so it can read each history tile once for all
-        /// rows.
-        verify: Option<NativeKernel<attention_decode::Entry>>,
-    },
+    /// The decode entry, over every decode row, one or several.
+    Decode(NativeKernel<attention_decode::Entry>),
     /// The prefill entry tuned on the decode row classes, where the decode
     /// entry holds no form of the shape.
     Prefill(NativeKernel<attention_prefill::Entry>),

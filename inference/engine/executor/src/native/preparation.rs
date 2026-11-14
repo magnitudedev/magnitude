@@ -5,7 +5,7 @@ use super::tuning::{
     ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights, decode_experts,
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
-        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning, PrefillRows,
         LowRankQueryProjectTuning, PooledProjectInput,
         PooledProjectTuning, PrefillListing, history_window, picked_rows,
     },
@@ -68,21 +68,6 @@ use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 /// Each recipe's formed levels, by the programs they are.
 type ReadoutRecipeStates = Rc<RefCell<HashMap<String, RecipePreparation>>>;
-
-/// The affine Metal matrix form can share one decoded tile across four
-/// rows for these head geometries. Give that row band its own objective,
-/// independently of the model or the configuration that tuning selects.
-pub(super) fn separates_packed_attention_rows(
-    backend: seismic::BackendName,
-    group: u64,
-    width: u64,
-    max_rows: u64,
-) -> bool {
-    backend == seismic::BackendName::Metal
-        && (1..=8).contains(&group)
-        && matches!(width, 128 | 256)
-        && max_rows >= 4
-}
 
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
@@ -1403,7 +1388,6 @@ impl<'a> Preparation<'a> {
             shape,
             scopes: scopes.clone(),
             epsilon: self.epsilon,
-            decode_rows: None,
             listing: PrefillListing::Every,
             window,
             selection: binding.selection,
@@ -1424,49 +1408,26 @@ impl<'a> Preparation<'a> {
                 })?;
         let history = match binding.history.encoding() {
             magnitude_state::HistoryEncoding::Dense => {
-                // As for K8/V4, multi-row launches (draft blocks,
-                // verification) get their own tuning identity, so their
-                // grouped form is not displaced by the single-row one. CUDA
-                // also changes history-tile row capacity with its warp count.
-                let split_decode = matches!(
-                    self.spec.backend(),
-                    seismic::BackendName::Metal
-                        | seismic::BackendName::Vulkan
-                        | seismic::BackendName::Cuda
-                ) && self.limits.max_rows >= 2;
+                // One decode kernel serves every decode row: its tuned
+                // parameters set each row's reduction order, so no row class
+                // is tuned apart.
                 let decode = if crate::operators::attention::graph::dense_decodes(
                     self.spec.backend(),
                     binding,
                 )? {
-                    let mut single = mix();
-                    if split_decode {
-                        single.decode_rows = Some(1..2);
-                    }
-                    let single = self
-                        .spec
-                        .tuned(&mut self.tuning, &AttentionDecodeTuning(single))?;
-                    let verify = if split_decode {
-                        let mut selected = mix();
-                        selected.decode_rows =
-                            Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
-                        self.spec
-                            .tuned(&mut self.tuning, &AttentionDecodeTuning(selected))?
-                    } else {
-                        None
-                    };
-                    single.map(|single| DenseDecodeKernels::Decode { single, verify })
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionDecodeTuning(mix()))?
+                        .map(DenseDecodeKernels::Decode)
                 } else {
                     // The prefill entry attends the decode row classes, tuned
                     // on them alone.
-                    let mut rows = visible();
-                    rows.decode_rows = Some(1..crate::operators::attention::graph::DECODE_ROWS + 1);
                     self.spec
-                        .tuned(&mut self.tuning, &AttentionPrefillTuning(rows))?
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(visible(), PrefillRows::Decode))?
                         .map(DenseDecodeKernels::Prefill)
                 };
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionPrefillTuning(visible()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillTuning(visible(), PrefillRows::Prefill))?;
                 let append = fixed!(
                     self.spec,
                     attention_append_dense,
@@ -1488,63 +1449,11 @@ impl<'a> Preparation<'a> {
                     )
             }
             magnitude_state::HistoryEncoding::Affine => {
-                let split_decode = matches!(
-                    self.spec.backend(),
-                    seismic::BackendName::Metal
-                        | seismic::BackendName::Vulkan
-                        | seismic::BackendName::Cuda
-                ) && self.limits.max_rows >= 2;
-                let mut single = mix();
-                // The base kernel serves only single-row decode when the
-                // graph binds separate verification kernels. Pricing their
-                // rows here as well would duplicate the same served work.
-                if split_decode {
-                    single.decode_rows = Some(1..2);
-                }
+                // One decode kernel serves every decode row, as the dense
+                // history's.
                 let decode = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(single))?;
-                let packed_four_rows = split_decode
-                    && separates_packed_attention_rows(
-                        self.spec.backend(),
-                        shape.widths.group,
-                        shape.widths.width,
-                        self.limits.max_rows,
-                    );
-                let verify = if split_decode {
-                    let mut selected = mix();
-                    selected.decode_rows = Some(
-                        2..if packed_four_rows {
-                            4
-                        } else {
-                            crate::operators::attention::graph::DECODE_ROWS + 1
-                        },
-                    );
-                    self.spec
-                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
-                } else {
-                    None
-                };
-                // The packed form reuses each K/V tile across four Verify
-                // rows. Give that workload its own tuning identity so
-                // shorter and wider rows cannot displace its form.
-                let verify_four = if packed_four_rows {
-                    let mut selected = mix();
-                    selected.decode_rows = Some(4..5);
-                    self.spec
-                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
-                } else {
-                    None
-                };
-                let verify_eight = if packed_four_rows && self.limits.max_rows >= 5 {
-                    let mut selected = mix();
-                    selected.decode_rows =
-                        Some(5..crate::operators::attention::graph::DECODE_ROWS + 1);
-                    self.spec
-                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
-                } else {
-                    None
-                };
+                    .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(mix()))?;
                 // Where the entry's forms differ by it, a launch that lists
                 // the history row tiles its rows see and one that does not
                 // are two kernels with their own admissible forms.
@@ -1600,9 +1509,6 @@ impl<'a> Preparation<'a> {
                         |((decode, prefill), append)| AttentionHistoryKernels::AffineK8V4 {
                             append,
                             decode,
-                            verify,
-                            verify_four,
-                            verify_eight,
                             prefill,
                             prefill_listed,
                         },
@@ -1624,7 +1530,7 @@ impl<'a> Preparation<'a> {
                         .map(SelectedPrefillKernel::AffineK8V4),
                     _ => self
                         .spec
-                        .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(mix(), PrefillRows::Prefill))?
                         .map(SelectedPrefillKernel::Dense),
                 };
                 // Every entry is prepared whatever another yields: a demand

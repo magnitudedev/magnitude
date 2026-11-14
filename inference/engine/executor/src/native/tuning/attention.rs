@@ -1,6 +1,6 @@
 //! Tuning cases of the attention block: the normed segmented projection, the
 //! fused attention entries of each history codec (`attention_decode` and
-//! `attention_decode_k8v4` up to [`DECODE_ROWS`] rows, `attention_prefill` and
+//! `attention_decode_k8v4` up to [`VERIFY_ROWS`] rows, `attention_prefill` and
 //! `attention_prefill_k8v4` beyond) and the output projection, in the form
 //! of the layers a case binds.
 //!
@@ -21,10 +21,11 @@ use super::{
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    DECODE_ROWS, query_projection_dimensions,
+    query_projection_dimensions,
     rotary_amplitudes, rotary_components, rotary_frequencies, selected_segments,
 };
 use crate::programs::invocation_demand::Launch;
+use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::operators::attention::{FreshRows, PickedSource, fresh_rows, picked_source, shared_rows};
 use crate::{AttentionBinding, AttentionShape, LowRankQueryBinding, SelectionBinding};
 use magnitude_family_contracts::{
@@ -38,25 +39,49 @@ use seismic::{BuildError, Device, Element, Tensor};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-/// Start CUDA verification with a query tile sized for its served rows;
-/// start the Vulkan key-parallel and Metal matrix forms at a bounded
-/// encoded-history slice of the longest history the case's layers keep
-/// (a window layer never holds the whole context), and every other Metal
-/// matrix form at the partitions that fill the device for its kv heads
-/// (one kv head of a long history needs many). Metal verification also
-/// starts from the first legal scalar query-group split. Starts expose useful
-/// candidates early; every admissible configuration remains searchable and
-/// is judged on the case's served points.
-/// Threadgroups a Metal decode-attention grid needs to keep an Apple GPU
-/// busy over a long history (`decode_starts`).
-const DECODE_GRID: u64 = 128;
-
+/// A decode unit, over every decode row class, starts from the seeds of a
+/// single row and, where the row bound admits more, those of several rows
+/// (draft blocks, verification, requests decoding together). The search
+/// judges every start on the unit's weighted points over all of its rows.
+/// Starts expose useful candidates early; every admissible configuration
+/// remains searchable.
 fn decode_starts(
     mix: &AttentionMix,
     backend: seismic::BackendName,
     implementation: &seismic::OnDevice,
     statics: &seismic::NativeSpecialization,
     limits: TuningLimits,
+) -> Vec<seismic::ParameterValues> {
+    let mut starts = row_starts(mix, backend, implementation, statics, limits, false);
+    if limits.max_rows >= 2 {
+        for start in row_starts(mix, backend, implementation, statics, limits, true) {
+            if !starts.contains(&start) {
+                starts.push(start);
+            }
+        }
+    }
+    starts
+}
+
+/// Threadgroups a Metal decode-attention grid needs to keep an Apple GPU
+/// busy over a long history (`decode_starts`).
+const DECODE_GRID: u64 = 128;
+
+/// The seeds for single-row (`multirow` false) or multi-row decode. Start
+/// CUDA's multi-row form with a query tile sized for the decode rows; start
+/// the Vulkan key-parallel and Metal matrix forms at a bounded
+/// encoded-history slice of the longest history the case's layers keep
+/// (a window layer never holds the whole context), and every other Metal
+/// matrix form at the partitions that fill the device for its kv heads
+/// (one kv head of a long history needs many). Metal's multi-row form also
+/// starts from the first legal scalar query-group split.
+fn row_starts(
+    mix: &AttentionMix,
+    backend: seismic::BackendName,
+    implementation: &seismic::OnDevice,
+    statics: &seismic::NativeSpecialization,
+    limits: TuningLimits,
+    multirow: bool,
 ) -> Vec<seismic::ParameterValues> {
     let Some(defaults) = implementation.default_specialization(statics).ok() else {
         return Vec::new();
@@ -70,24 +95,18 @@ fn decode_starts(
             .expect("validated history descriptor") as u64,
     );
     // Wide heads run the keywise walk in one subgroup. Across multiple
-    // verification rows, extra partitions multiply its merge and dispatch
-    // work; start at the default partition count and let the search compare
-    // wider choices on the rows this variant actually serves.
-    let wide_verification =
-        mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2) && mix.shape.widths.width >= 512;
-    let desired_parts = if wide_verification {
+    // rows, extra partitions multiply its merge and dispatch work; start at
+    // the default partition count and let the search compare wider choices
+    // on the rows the unit serves.
+    let wide_multirow = multirow && mix.shape.widths.width >= 512;
+    let desired_parts = if wide_multirow {
         default_parts
     } else {
         bytes_per_head.div_ceil(256 * 1024)
     };
     let mut starts = match backend {
-        seismic::BackendName::Cuda
-            if mix.shape.widths.width <= 256
-                && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2)
-                && limits.max_rows >= 2 =>
-        {
-            let rows = mix.decode_rows.as_ref().unwrap();
-            let widest = (rows.end - 1).min(DECODE_ROWS).min(limits.max_rows);
+        seismic::BackendName::Cuda if mix.shape.widths.width <= 256 && multirow => {
+            let widest = VERIFY_ROWS.min(limits.max_rows);
             nearest(
                 implementation,
                 statics,
@@ -110,7 +129,7 @@ fn decode_starts(
                 },
             )
         }
-        seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
+        seismic::BackendName::Vulkan if desired_parts > default_parts || wide_multirow => {
             nearest(
                 implementation,
                 statics,
@@ -133,8 +152,7 @@ fn decode_starts(
         }
         seismic::BackendName::Metal
             if mix.shape.widths.width <= 256
-                && ((mix.shape.widths.group <= 4
-                    && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2))
+                && ((mix.shape.widths.group <= 4 && multirow)
                     || mix.shape.widths.group == 8) =>
         {
             nearest(
@@ -151,7 +169,7 @@ fn decode_starts(
                     let packed_g8 = wide_group
                         && mix.shape.widths.width == 256
                         && history >= 16_384
-                        && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2);
+                        && multirow;
                     let history_parts = history
                         .min(65_536)
                         .saturating_mul(mix.shape.widths.width)
@@ -212,14 +230,12 @@ fn decode_starts(
         }
         _ => Vec::new(),
     };
-    // Verification can exhaust its short search after the default and matrix
+    // Several rows can exhaust a short search after the default and matrix
     // starts. Also measure the first legal scalar query-group split: fewer
     // heads per subgroup reduce its live accumulators without changing forms.
     // The domain supplies the split and all other default parameters stay put;
     // this is a measured candidate, never an unconditional mapping choice.
-    if backend == seismic::BackendName::Metal
-        && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2)
-    {
+    if backend == seismic::BackendName::Metal && multirow {
         if let Some(slices) = implementation
             .params
             .iter()
@@ -959,11 +975,6 @@ pub(crate) struct AttentionMix {
     pub shape: AttentionShape,
     pub scopes: Vec<WeightScope>,
     pub epsilon: f32,
-    /// The decode row classes this variant serves, of a decode entry or of
-    /// the prefill entry where it attends them (`graph::dense_decodes`);
-    /// none for every class its entry serves by default. Distinct ranges
-    /// have distinct tuning identities and are validated on their own rows.
-    pub decode_rows: Option<Range<u64>>,
     /// For the affine prefill: which of the layers' prefill launches the
     /// kernel serves, and whether it lists the history row tiles their rows
     /// see (the entry's `L`).
@@ -1161,19 +1172,29 @@ pub(crate) fn picked_rows(
     }))
 }
 
-/// `attention_decode`, for row classes up to [`DECODE_ROWS`].
+/// `attention_decode`, for row classes up to [`VERIFY_ROWS`].
 #[derive(Clone)]
 pub(crate) struct AttentionDecodeTuning(pub AttentionMix);
 
-/// `attention_prefill`, for row classes beyond [`DECODE_ROWS`].
+/// `attention_prefill`, for the row classes `.1` names.
 #[derive(Clone)]
-pub(crate) struct AttentionPrefillTuning(pub AttentionMix);
+pub(crate) struct AttentionPrefillTuning(pub AttentionMix, pub PrefillRows);
 
-/// `attention_decode_k8v4`, for row classes up to [`DECODE_ROWS`].
+/// The row classes a dense prefill unit serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillRows {
+    /// The classes past the decode rows.
+    Prefill,
+    /// Every decode row class, where the decode entry holds no form of the
+    /// shape (`graph::dense_decodes`).
+    Decode,
+}
+
+/// `attention_decode_k8v4`, for row classes up to [`VERIFY_ROWS`].
 #[derive(Clone)]
 pub(crate) struct AttentionDecodeK8V4Tuning(pub AttentionMix);
 
-/// `attention_prefill_k8v4`, for row classes beyond [`DECODE_ROWS`].
+/// `attention_prefill_k8v4`, for row classes beyond [`VERIFY_ROWS`].
 #[derive(Clone)]
 pub(crate) struct AttentionPrefillK8V4Tuning(pub AttentionMix);
 
@@ -1517,7 +1538,7 @@ impl AttentionMix {
             .into_iter()
             .flat_map(|(segments, selected)| {
                 shapes.iter().filter_map(move |point| {
-                    if selected && point.rows > DECODE_ROWS {
+                    if selected && point.rows > VERIFY_ROWS {
                         return None;
                     }
                     let context = point.context?;
@@ -1558,15 +1579,9 @@ impl AttentionMix {
     }
 
     fn bindings(&self) -> String {
-        match &self.decode_rows {
-            Some(rows) => format!(
-                "A={},M={}..{}",
-                self.activation.name(),
-                rows.start,
-                rows.end
-            ),
-            None if self.listing.lists() => format!("A={},L=1", self.activation.name()),
-            None if self.selection.is_some() => {
+        match () {
+            _ if self.listing.lists() => format!("A={},L=1", self.activation.name()),
+            _ if self.selection.is_some() => {
                 format!(
                     "A={},B={},BR={}",
                     self.activation.name(),
@@ -1574,7 +1589,7 @@ impl AttentionMix {
                     self.block_keys()
                 )
             }
-            None => format!("A={}", self.activation.name()),
+            _ => format!("A={}", self.activation.name()),
         }
     }
 
@@ -1790,26 +1805,20 @@ impl AttentionMix {
 /// The fused entries differ in the rows they serve and in their history
 /// planes; they share every other argument.
 macro_rules! mix_entry {
-    ($tuning:ident, $module:ident, $history:ty, $serves:expr, statics |$mix:ident| $statics:expr,
+    ($tuning:ident, $module:ident, $history:ty, $serves:expr, rows |$this:ident| $rows:expr,
+     statics |$mix:ident| $statics:expr,
      |$case:ident| { $($plane:ident: $state:expr),* $(,)? }
      $(, search_starts $starts:path)?) => {
         impl $tuning {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
-                let rows = served_row_points(limits, |rows| {
-                    ($serves)(&self.0, rows)
-                        && self
-                            .0
-                            .decode_rows
-                            .as_ref()
-                            .is_none_or(|range| range.contains(&rows))
-                });
+                let rows = served_row_points(limits, |rows| ($serves)(self, rows));
                 // Decode rows are one sequence's (a drafter's verification)
                 // or several sequences' (requests decoding together), each
                 // of which reads a history of its own: a point for every
                 // slot class the rows can span, beside the one sequence's.
                 let across = rows
                     .iter()
-                    .filter(|point| point.rows <= DECODE_ROWS)
+                    .filter(|point| point.rows <= VERIFY_ROWS)
                     .flat_map(|point| {
                         std::iter::successors(Some(2u64), |sequences| sequences.checked_mul(2))
                             .take_while(|sequences| *sequences <= point.rows)
@@ -1833,7 +1842,8 @@ macro_rules! mix_entry {
             }
 
             fn bindings(&self) -> String {
-                format!("{};codec={:?}", self.0.bindings(), self.0.codec)
+                let $this = self;
+                format!("{}{};codec={:?}", self.0.bindings(), $rows, self.0.codec)
             }
 
             fn statics(
@@ -1851,18 +1861,14 @@ macro_rules! mix_entry {
 
             fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
                 let rows = launch.rows;
-                if rows == 0 || !($serves)(&self.0, rows)
-                    || self.0.decode_rows.as_ref().is_some_and(|range| !range.contains(&rows))
-                    || !self.0.listing.serves(launch)
-                {
+                if rows == 0 || !($serves)(self, rows) || !self.0.listing.serves(launch) {
                     return None;
                 }
-                if rows <= DECODE_ROWS {
-                    // A dedicated upper decode band can begin below its
-                    // first representative (5..9 is represented by 8).
-                    // Keep those owned calls rather than dropping their
-                    // demand; the support/range guard above prevents a
-                    // call from crossing into another entry's row band.
+                if rows <= VERIFY_ROWS {
+                    // Priced at the nearest representative at or below its
+                    // rows, a decode launch past the largest within the row
+                    // bound (6 rows under a bound of 6, represented at 1, 2
+                    // and 4) keeps its demand.
                     representatives.iter().copied().filter(|at| *at <= rows).max()
                         .or_else(|| representatives.iter().copied().min())
                 } else {
@@ -1940,13 +1946,22 @@ macro_rules! mix_entry {
     };
 }
 
+/// The rows a decode entry serves: every decode row class, as one unit. Each
+/// of its parameters sets a row's reduction order, and a row computes alike
+/// whatever rows share its launch, so one unit owns that arithmetic for every
+/// decode row and a verified row runs the arithmetic it runs alone.
+fn decode_serves(rows: u64) -> bool {
+    rows <= VERIFY_ROWS
+}
+
 // The prefills tune the form their binding reads: Visible (`B = 0`) or
 // WorkList (`B` words).
 mix_entry!(
     AttentionDecodeTuning,
     attention_decode,
     DenseMixHistory,
-    |_: &AttentionMix, rows| rows <= DECODE_ROWS,
+    |_: &AttentionDecodeTuning, rows| decode_serves(rows),
+    rows |_this| "",
     statics |_mix| [],
     |case| {
         selected_rows: &case.selected_rows,
@@ -1965,7 +1980,14 @@ mix_entry!(
     AttentionPrefillTuning,
     attention_prefill,
     DenseMixHistory,
-    |mix: &AttentionMix, rows| rows > DECODE_ROWS || mix.decode_rows.is_some(),
+    |this: &AttentionPrefillTuning, rows| match this.1 {
+        PrefillRows::Prefill => rows > VERIFY_ROWS,
+        PrefillRows::Decode => rows <= VERIFY_ROWS,
+    },
+    rows |this| match this.1 {
+        PrefillRows::Prefill => String::new(),
+        PrefillRows::Decode => format!(",M=1..{}", VERIFY_ROWS + 1),
+    },
     statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
         selection: &case.selection,
@@ -1985,7 +2007,8 @@ mix_entry!(
     AttentionDecodeK8V4Tuning,
     attention_decode_k8v4,
     AffineMixHistory,
-    |_: &AttentionMix, rows| rows <= DECODE_ROWS,
+    |_: &AttentionDecodeK8V4Tuning, rows| decode_serves(rows),
+    rows |_this| "",
     statics |_mix| [],
     |case| {
         history_key_codes: case.history.key_codes.tensor_mut(),
@@ -1999,7 +2022,8 @@ mix_entry!(
     AttentionPrefillK8V4Tuning,
     attention_prefill_k8v4,
     AffineMixHistory,
-    |mix: &AttentionMix, rows| rows > DECODE_ROWS || mix.decode_rows.is_some(),
+    |_: &AttentionPrefillK8V4Tuning, rows| rows > VERIFY_ROWS,
+    rows |_this| "",
     statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
         selection: &case.selection,
@@ -2047,8 +2071,11 @@ mod tests {
         assert!(unlisted.serves(&launch(16, 16, 8192)));
     }
 
+    /// A decode unit that serves several rows starts, beside its single-row
+    /// seeds, from the first legal scalar query-group split; one bounded to
+    /// a single row does not.
     #[test]
-    fn metal_verification_exposes_legal_scalar_group_split() {
+    fn metal_multirow_decode_exposes_legal_scalar_group_split() {
         // Each entry's own history codec: the dense entry's dense, the
         // affine entry's K8/V4.
         for (implementation, codec) in [
@@ -2073,7 +2100,7 @@ mod tests {
         .zip([magnitude_state::KvCodec::Dense, magnitude_state::KvCodec::AffineK8V4])
         {
             for group in [1, 2, 3, 4, 8] {
-                let mut mix = AttentionMix {
+                let mix = AttentionMix {
                     codec: codec.spec(seismic::DType::BF16, 256, 256),
                     listing: PrefillListing::Every,
                     activation: Element::bf16(),
@@ -2103,7 +2130,6 @@ mod tests {
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
-                    decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
                     selection: None,
                     picked: None,
@@ -2147,14 +2173,17 @@ mod tests {
                         .validate(&defaults.clone().with_param("SLICES", split))
                         .unwrap();
                 }
-                mix.decode_rows = Some(1..2);
+                let single = TuningLimits {
+                    max_rows: 1,
+                    ..limits
+                };
                 assert!(
                     decode_starts(
                         &mix,
                         seismic::BackendName::Metal,
                         &implementation,
                         &statics,
-                        limits
+                        single
                     )
                     .iter()
                     .all(|choice| choice.get("MATRIX") != Some(&0))
@@ -2175,12 +2204,11 @@ mod tests {
             .owned();
         // Gemma 4 E2B and 12B full layers (one kv head, 512 columns), Gemma
         // 4 31B full layers (four), Qwen 3.8 27B (four kv heads of six).
-        for (kv_heads, group, width, rows, expected) in [
-            (1, 8, 512, 1..2, 128),
-            (1, 8, 512, 2..DECODE_ROWS + 1, 128),
-            (1, 16, 512, 2..DECODE_ROWS + 1, 128),
-            (4, 8, 512, 2..DECODE_ROWS + 1, 32),
-            (4, 6, 256, 2..DECODE_ROWS + 1, 32),
+        for (kv_heads, group, width, expected) in [
+            (1, 8, 512, 128),
+            (1, 16, 512, 128),
+            (4, 8, 512, 32),
+            (4, 6, 256, 32),
         ] {
             let mix = AttentionMix {
                 codec: magnitude_state::KvCodec::AffineK8V4.spec(
@@ -2216,7 +2244,6 @@ mod tests {
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
-                decode_rows: Some(rows),
                 window: None,
                 selection: None,
                 picked: None,
@@ -2255,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_verification_start_follows_served_rows_and_declared_domain() {
+    fn cuda_multirow_start_follows_served_rows_and_declared_domain() {
         use seismic::{BackendName, NativeSpecialization};
         let implementations = [
             seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
@@ -2318,7 +2345,6 @@ mod tests {
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
-                    decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
                     selection: None,
                     picked: None,
@@ -2356,17 +2382,15 @@ mod tests {
                 assert_eq!(default.param("MATRIX"), Some(0));
                 assert_eq!(default.param("SLICES"), Some(if affine { affine_slices } else { 1 }));
 
-                mix.decode_rows = Some(1..2);
+                // A unit bounded to one row has no multi-row seed.
+                let single = TuningLimits {
+                    max_rows: 1,
+                    ..limits
+                };
                 assert!(
-                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits)
+                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, single)
                         .is_empty()
                 );
-                mix.decode_rows = None;
-                assert!(
-                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits)
-                        .is_empty()
-                );
-                mix.decode_rows = Some(2..DECODE_ROWS + 1);
                 mix.shape.widths.width = 512;
                 mix.codec.key_width = 512;
                 if let magnitude_state::HistoryValue::Own { width, .. } = &mut mix.codec.value {
@@ -2387,34 +2411,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_decode_has_distinct_tuning_identity_and_served_rows() {
-        use crate::native::preparation::separates_packed_attention_rows;
-        for group in 1..=8 {
-            for width in [128, 256] {
-                assert!(separates_packed_attention_rows(
-                    seismic::BackendName::Metal,
-                    group,
-                    width,
-                    8,
-                ));
-                // TOKENS=SIMDS=4, KEYS=16 is a legal shared tile throughout
-                // this capability. The planner does not select that tuple.
-                let shared_bytes = (4 * 8 * width * 2).max(16 * width * 4) + 64;
-                assert!(shared_bytes <= 32768);
-            }
-        }
-        for (backend, group, width, rows) in [
-            (seismic::BackendName::Cuda, 8, 256, 8),
-            (seismic::BackendName::Metal, 16, 256, 8),
-            (seismic::BackendName::Metal, 8, 512, 8),
-            (seismic::BackendName::Metal, 8, 256, 3),
-        ] {
-            assert!(!separates_packed_attention_rows(
-                backend, group, width, rows
-            ));
-        }
-        let mix = AttentionMix {
+    /// A G4/W256 K8/V4 mix of the decode entries.
+    fn decode_mix() -> AttentionMix {
+        AttentionMix {
             codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 256, 256),
             listing: PrefillListing::Every,
             activation: Element::bf16(),
@@ -2444,103 +2443,149 @@ mod tests {
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
-            decode_rows: Some(1..2),
             window: None,
             selection: None,
             picked: None,
-        };
-        let single = AttentionDecodeK8V4Tuning(mix);
-        let limits = TuningLimits {
-            max_rows: 8,
-            max_projected_rows: 8,
-            context_tokens: 256,
-        };
-        // Each served row is measured at several contexts.
-        assert_eq!(
-            single
-                .points(limits)
-                .iter()
-                .map(|point| point.rows)
-                .collect::<std::collections::BTreeSet<_>>(),
-            [1].into()
-        );
-        assert_eq!(
-            single.bindings(),
-            format!("A=bf16,M=1..2;codec={:?}", single.0.codec)
-        );
-        let mut mix = single.0;
-        mix.decode_rows = Some(2..DECODE_ROWS + 1);
-        let verify = AttentionDecodeK8V4Tuning(mix);
-        assert_eq!(
-            verify
-                .points(limits)
-                .iter()
-                .map(|point| point.rows)
-                .collect::<std::collections::BTreeSet<_>>(),
-            [2, 4, 8].into()
-        );
-        assert_eq!(
-            verify.bindings(),
-            format!("A=bf16,M=2..9;codec={:?}", verify.0.codec)
-        );
-
-        // Dense and compressed history use disjoint decode/verification
-        // row domains on every backend with split graph dispatch. A
-        // multirow cache identity cannot reuse the old combined
-        // result, and neither class can train on the other's row counts.
-        let dense_verify = AttentionDecodeTuning(verify.0.clone());
-        let mut dense_single_mix = verify.0.clone();
-        dense_single_mix.decode_rows = Some(1..2);
-        let dense_single = AttentionDecodeTuning(dense_single_mix);
-        assert_eq!(
-            dense_single.bindings(),
-            format!("A=bf16,M=1..2;codec={:?}", dense_single.0.codec)
-        );
-        assert_eq!(dense_verify.bindings(), verify.bindings());
-        assert!(
-            dense_single
-                .points(limits)
-                .iter()
-                .all(|point| point.rows == 1)
-        );
-        assert_eq!(dense_verify.points(limits), verify.points(limits));
-
-        let mut classes = Vec::new();
-        for range in [2..4, 4..5, 5..DECODE_ROWS + 1] {
-            let mut mix = verify.0.clone();
-            mix.decode_rows = Some(range.clone());
-            let tuned = AttentionDecodeK8V4Tuning(mix);
-            let rows = tuned
-                .points(limits)
-                .iter()
-                .map(|point| point.rows)
-                .collect::<Vec<_>>();
-            assert!(rows.iter().all(|row| range.contains(row)));
-            let representatives = rows
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            for logical in 1..=DECODE_ROWS {
-                let launch = Launch {
-                    term: 0,
-                    rows: logical,
-                    sequences: 1,
-                    history: 0,
-                };
-                let represented = tuned.invocation_rows(&launch, &representatives);
-                assert_eq!(represented.is_some(), range.contains(&logical));
-                assert!(represented.is_none_or(|row| range.contains(&row)));
-            }
-            classes.extend(range);
         }
-        assert_eq!(classes, (2..DECODE_ROWS + 1).collect::<Vec<_>>());
-        // The base decode plus the dedicated verification domains own
-        // every physical decode row exactly once. This also excludes
-        // duplicate workload pricing by a combined base domain.
-        let owned = std::iter::once(1).chain(classes).collect::<Vec<_>>();
-        assert_eq!(owned, (1..DECODE_ROWS + 1).collect::<Vec<_>>());
+    }
+
+    const DECODE_LIMITS: TuningLimits = TuningLimits {
+        max_rows: 8,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+
+    /// The rows each logical launch of `rows` rows is priced at in `tuning`
+    /// (none where its kernel does not serve it).
+    fn represented<T: EntryTuning>(tuning: &T, rows: u64) -> Option<u64> {
+        let representatives = tuning
+            .points(DECODE_LIMITS)
+            .iter()
+            .map(|point| point.rows)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        tuning.invocation_rows(
+            &Launch {
+                term: 0,
+                rows,
+                sequences: 1,
+                history: 0,
+            },
+            &representatives,
+        )
+    }
+
+    /// Each decode entry is one tuning unit per shape over every decode row
+    /// class: its points span them all, its identity names no row band, and
+    /// every decode launch, of one row or of a draft block, is demand of
+    /// that unit. The prefill unit over the decode rows (where the decode
+    /// entry holds no form) is likewise one unit over all of them.
+    #[test]
+    fn a_decode_entry_is_one_unit_over_every_decode_row() {
+        let rows = |points: Vec<PointShape>| {
+            points
+                .iter()
+                .map(|point| point.rows)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let affine = AttentionDecodeK8V4Tuning(decode_mix());
+        let dense = AttentionDecodeTuning(decode_mix());
+        assert_eq!(rows(affine.points(DECODE_LIMITS)), [1, 2, 4, 8].into());
+        assert_eq!(rows(dense.points(DECODE_LIMITS)), [1, 2, 4, 8].into());
+        assert_eq!(affine.bindings(), format!("A=bf16;codec={:?}", affine.0.codec));
+        assert_eq!(dense.bindings(), affine.bindings());
+        let prefill = AttentionPrefillTuning(decode_mix(), PrefillRows::Decode);
+        assert_eq!(rows(prefill.points(DECODE_LIMITS)), [1, 2, 4, 8].into());
+        assert_eq!(prefill.bindings(), format!("A=bf16,M=1..9;codec={:?}", prefill.0.codec));
+        let visible = AttentionPrefillTuning(decode_mix(), PrefillRows::Prefill);
+        for logical in 1..=VERIFY_ROWS {
+            for unit in [
+                represented(&affine, logical),
+                represented(&dense, logical),
+                represented(&prefill, logical),
+            ] {
+                let at = unit.unwrap_or_else(|| panic!("{logical} rows have no unit"));
+                assert!(at <= logical, "{logical} rows priced at {at}");
+            }
+            assert_eq!(represented(&visible, logical), None);
+        }
+        assert_eq!(represented(&affine, VERIFY_ROWS + 1), None);
+        assert_eq!(represented(&prefill, VERIFY_ROWS + 1), None);
+    }
+
+    /// A drafting load's demand weighs every verify width beside the one-row
+    /// step, so timings that pull one row and several to different
+    /// partition counts (PARTS 32 faster at one row, PARTS 16 at two to
+    /// eight) settle on one: the unit's points carry the load's weights
+    /// (`apply_invocation_counts`, from the graph's drafted rounds), and one
+    /// cost over all of them ranks each configuration. Weighing the one-row
+    /// point alone would pick the other.
+    #[test]
+    fn a_drafting_loads_weights_settle_one_choice_over_every_decode_row() {
+        let unit = AttentionDecodeK8V4Tuning(decode_mix());
+        let method = crate::PlannedMethod::Mtp {
+            greedy_proposals: (VERIFY_ROWS - 1) as u8,
+            sampled_proposals: (VERIFY_ROWS - 1) as u8,
+            widths: crate::DraftWidths::Adaptive,
+        };
+        let terms = super::super::workload::terms(DECODE_LIMITS, &method.draft_widths());
+        let graph = crate::programs::invocation_demand::GraphInvocationDemand::new(
+            method,
+            terms.clone(),
+            None,
+            DECODE_LIMITS.max_rows,
+        );
+        let mut points = unit.points(DECODE_LIMITS);
+        let mut representatives = points.iter().map(|point| point.rows).collect::<Vec<_>>();
+        representatives.sort_unstable();
+        representatives.dedup();
+        let calls = graph
+            .target
+            .represented(|launch| unit.invocation_rows(launch, &representatives));
+        let mut objective = super::super::Objective::new(terms);
+        objective.measured = vec![1.; objective.terms.len()];
+        super::super::apply_invocation_counts(&mut points, &calls, &objective);
+        let weight_at = |rows: u64| {
+            points
+                .iter()
+                .filter(|point| point.rows == rows)
+                .map(|point| point.weight)
+                .sum::<f64>()
+        };
+        for rows in [1, 2, 4, 8] {
+            assert!(weight_at(rows) > 0., "no demand at {rows} rows");
+        }
+        let seconds = |parts: u64, rows: u64| match (parts, rows) {
+            (32, 1) => 1.0,
+            (32, _) => 3.0,
+            _ => 2.0,
+        };
+        let cost = |parts: u64, demand: &[f64]| {
+            let key = |parts: u64| seismic::LaunchKey {
+                launches: vec![0],
+                values: [("PARTS".to_owned(), parts)].into(),
+            };
+            let measured = |of: u64| {
+                points
+                    .iter()
+                    .map(|point| seconds(of, point.rows))
+                    .collect::<Vec<_>>()
+            };
+            seismic::Cost::relative(
+                points.iter().map(|_| key(parts)).collect(),
+                demand,
+                &measured(parts),
+                &measured(16),
+            )
+        };
+        let all = points.iter().map(|point| point.weight).collect::<Vec<_>>();
+        let one_row = points
+            .iter()
+            .map(|point| if point.rows == 1 { point.weight } else { 0. })
+            .collect::<Vec<_>>();
+        assert!(cost(32, &one_row).improves_on(&cost(16, &one_row)));
+        assert!(!cost(32, &all).improves_on(&cost(16, &all)));
     }
 
     /// A case's picks name rows its index-list source holds at the position
@@ -2584,7 +2629,6 @@ mod tests {
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
-            decode_rows: None,
             window: Some(128),
             selection: None,
             picked: Some(picked),
@@ -2684,7 +2728,6 @@ mod tests {
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
-            decode_rows: None,
             window: None,
             selection: None,
             picked: None,

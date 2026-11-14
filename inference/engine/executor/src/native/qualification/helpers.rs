@@ -411,7 +411,7 @@ pub(super) fn qualify_attention(
             decode, prefill, ..
         } => [
             match decode {
-                DenseDecodeKernels::Decode { single, .. } => (
+                DenseDecodeKernels::Decode(single) => (
                     "attention_decode",
                     mix!(@call single, attention_decode, {
                         form: &dense_form, selected_rows: &selected_rows, selected: &selected,
