@@ -1582,6 +1582,21 @@ fn check_native(
         });
     }
 
+    // A CPU form binds every element parameter by how the entry uses it.
+    if backend == crate::registry::BackendName::Cpu {
+        for parameter in entry.element_domain.parameters() {
+            if entry.element_domain.cpu_binding(&parameter.name).is_none() {
+                errors.push((
+                    native.function.span,
+                    format!(
+                        "`{}` has no CPU binding in `{}`: the entry neither reads, stores nor converts it",
+                        parameter.name, entry.name
+                    ),
+                ));
+            }
+        }
+    }
+
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
         native_nat_expr(expr, &entry.dimensions, &parameter_names, element_reads)
             .map_err(|message| errors.push((expr.span, message)))

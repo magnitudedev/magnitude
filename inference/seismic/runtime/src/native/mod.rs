@@ -1267,7 +1267,7 @@ fn cpu_route(
     // Every weight is bound in a form the tier's components read where it
     // lies (a CPU row layout, or a device's).
     for (element, representation) in bindings.iter() {
-        if !domain.read_as_weight(element) {
+        if domain.cpu_binding(element) != Some(seismic_lang::checked::CpuBinding::Weights) {
             continue;
         }
         if seismic_native_cpu::WeightOperand::of(tier, representation).is_none() {

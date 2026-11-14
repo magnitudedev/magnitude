@@ -602,6 +602,21 @@ pub struct ElementDomain {
     predicates: Vec<ElementPredicate>,
 }
 
+/// How a CPU form binds an element parameter, decided by the entry's uses of
+/// it ([`ElementDomain::cpu_binding`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuBinding {
+    /// A typed buffer of one dense element type: the entry stores it or
+    /// copies part of its packing axis.
+    Dense,
+    /// A weight operand: read through its decoded rows or components.
+    Weights,
+    /// An external source an entry only converts.
+    External,
+    /// A packed result a conversion writes.
+    Packed,
+}
+
 /// One element parameter and every use the entry makes of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElementParameter {
@@ -823,23 +838,37 @@ impl ElementDomain {
         &self.predicates
     }
 
-    /// Whether element parameter `name` is a weight the entry only reads:
-    /// neither stored nor copied, not a conversion's target, and not only a
-    /// conversion's source (a CPU form's weight operand).
-    pub fn read_as_weight(&self, name: &str) -> bool {
-        let converted = self
+    /// How a CPU form binds element parameter `name`, derived from how the
+    /// entry uses it; `None` when it uses it in no way a binding serves
+    /// (never reads, stores or converts it), which the CPU native
+    /// declaration rejects.
+    ///
+    /// Weights is the binding of every read: it decodes any readable
+    /// representation, dense included, so a read needs no other. Dense is
+    /// the binding of a store or a copy of part of the packing axis, which
+    /// only a typed buffer of a dense element type accepts.
+    pub fn cpu_binding(&self, name: &str) -> Option<CpuBinding> {
+        if self
             .conversions
             .iter()
-            .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()));
-        self.parameters
+            .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()))
+        {
+            return Some(CpuBinding::Packed);
+        }
+        let uses = self
+            .parameters
             .iter()
-            .find(|parameter| parameter.name == name)
-            .is_some_and(|parameter| {
-                let uses = parameter.uses;
-                !converted
-                    && !(uses.stored || uses.partial_copy)
-                    && !(uses.conversion_source && !uses.decoded_read)
-            })
+            .find(|parameter| parameter.name == name)?
+            .uses;
+        if uses.stored || uses.partial_copy {
+            Some(CpuBinding::Dense)
+        } else if uses.decoded_read || uses.component_read {
+            Some(CpuBinding::Weights)
+        } else if uses.conversion_source {
+            Some(CpuBinding::External)
+        } else {
+            None
+        }
     }
 
     /// Whether parameter names are unique and every conversion and predicate
@@ -5183,7 +5212,7 @@ mod native_tests {
             sources.push(SourceFile {
                 path: "ops.seismic".to_owned(),
                 text: format!(
-                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    dst[0:N] = src[0:N]\n\nfn widen[N](w: &tensor[N] W) -> tensor[N] U:\n    return repack[U = U](w)\n\n{native}"
+                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    let weight = f32(w[0])\n    dst[0:N] = src[0:N]\n\nfn widen[N](w: &tensor[N] W) -> tensor[N] U:\n    return repack[U = U](w)\n\n{native}"
                 ),
             });
             check_source(sources)
@@ -5251,6 +5280,61 @@ mod native_tests {
             let error = check(&native).expect_err(message).to_string();
             assert!(error.contains(message), "{message}: {error}");
         }
+    }
+
+    /// A CPU form binds each element parameter by how the entry uses it: a
+    /// store is dense, a read is a weight, a conversion's source is external
+    /// and its target packed; a parameter the entry never uses has none, and
+    /// its CPU native declaration is rejected.
+    #[test]
+    fn cpu_element_binding_follows_the_entry_uses() {
+        use super::CpuBinding;
+        let check = |entry: &str, native: &str| {
+            let mut sources = SourceSet::default();
+            sources.push(SourceFile {
+                path: "ops.seismic".to_owned(),
+                text: format!("{entry}\n\n{native}"),
+            });
+            check_source(sources)
+        };
+        let launch = "    launch run:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let binding = |entry: &str, name: &str| {
+            let module = check(
+                entry,
+                &format!("native run for cpu from \"run.rs\":\n{launch}"),
+            )
+            .expect("every element parameter has a CPU binding");
+            module
+                .entries()
+                .iter()
+                .find(|entry| entry.name == "run")
+                .expect("the entry")
+                .element_domain
+                .cpu_binding(name)
+        };
+        let stored_and_read = "fn run[N](src: &tensor[N] W, dst: &mut tensor[N] A):\n    dst[0] = f32(src[0])";
+        assert_eq!(binding(stored_and_read, "A"), Some(CpuBinding::Dense));
+        assert_eq!(binding(stored_and_read, "W"), Some(CpuBinding::Weights));
+        let converted = "fn run[N](w: &tensor[N] W) -> tensor[N] U:\n    return repack[U = U](w)";
+        assert_eq!(binding(converted, "W"), Some(CpuBinding::External));
+        assert_eq!(binding(converted, "U"), Some(CpuBinding::Packed));
+        // A weight also read as a plain value keeps the binding every read
+        // has: a weight view decodes any readable representation.
+        let mixed = "fn run[N](w: &tensor[N] W, out: &mut tensor[N] f32):\n    let mut sum = f32(0.0)\n    for i in 0..N:\n        sum = sum + f32(w[i])\n    out[0] = sum + f32(w[0])";
+        assert_eq!(binding(mixed, "W"), Some(CpuBinding::Weights));
+        let unused = "fn run[N](a: &tensor[N] A, w: &tensor[N] W, out: &mut tensor[N] f32):\n    out[0] = f32(a[0])";
+        let error = check(
+            unused,
+            &format!("native run for cpu from \"run.rs\":\n{launch}"),
+        )
+        .expect_err("an unused element parameter has no CPU binding")
+        .to_string();
+        assert!(error.contains("`W` has no CPU binding in `run`"), "{error}");
+        check(
+            unused,
+            &format!("native run for metal from \"run.metal\":\n{launch}"),
+        )
+        .expect("other backends bind each representation when prepared");
     }
 
     #[test]
