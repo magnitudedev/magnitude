@@ -224,18 +224,24 @@ attention_cursor attention_cursor_at(uint64_t visible, uint64_t fresh, uint64_t 
     return c;
 }
 
-// Moves the cursor to key `position` (at or past its own) and returns the
-// key's index in its span: a history or fresh row, or the ordinal of a
-// pick. On a history row (span < spans) the cursor holds the row's slab of
-// `slab_rows` rows; `moved` is whether that changed it.
-uint64_t attention_cursor_seek(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
-    uint64_t spans, uint picks, uint64_t slab_rows, uint position, out bool moved) {
+// Moves the cursor to the span holding key `position` (at or past its own)
+// and returns the key's index in that span: a history or fresh row, or the
+// ordinal of a pick.
+uint64_t attention_cursor_to(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
+    uint64_t spans, uint picks, uint position) {
     while (position >= c.offset + c.count) {
         c.offset += c.count;
         ++c.span;
         attention_cursor_span(c, visible, fresh, row, spans, picks);
     }
-    const uint64_t index = uint64_t(c.lo) + uint64_t(position - c.offset);
+    return uint64_t(c.lo) + uint64_t(position - c.offset);
+}
+
+// [`attention_cursor_to`], holding on a history row (span < spans) the
+// row's slab of `slab_rows` rows; `moved` is whether that changed it.
+uint64_t attention_cursor_seek(inout attention_cursor c, uint64_t visible, uint64_t fresh, uint64_t row,
+    uint64_t spans, uint picks, uint64_t slab_rows, uint position, out bool moved) {
+    const uint64_t index = attention_cursor_to(c, visible, fresh, row, spans, picks, position);
     moved = c.span < spans && (index < c.slab_lo || index >= c.slab_hi);
     if (moved) {
         c.slab = index / slab_rows;

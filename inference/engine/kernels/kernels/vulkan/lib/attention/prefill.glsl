@@ -39,14 +39,12 @@
 // queries exceed the shared bytes), it prepares its own query tile into
 // shared memory after the subgroup scratch ([ROWS][W + 8] f16) and its fresh
 // K/V tiles (prepared and held as L1 holds them), partition 0 appending the
-// tile's rows. A tile of one row (QT = 1) cuts its key tiles at fixed
-// positions of the row's key sequence, history and fresh keys alike, so over
-// dense history the row's result does not depend on which rows share its
-// launch; a tile of several rows tiles each span's union interval. The key
-// tiles, then with an index-list source (PREFILL_PICKS) each row's pick
-// tiles in row order, split into equal runs over
-// PREFILL_PARTS partitions, and every partition, an empty one too
-// (denominator 0), stores its partial in the decode layout
+// tile's rows. Every row's keys are cut into tiles at fixed positions of its
+// own key sequence, history and fresh keys alike, then the row's picks with
+// an index-list source (PREFILL_PICKS), which partition p takes as a
+// contiguous run (`attention_partition_span`), so a row's result does not depend on
+// which rows share its tile or launch (`prefill_attend`). Every partition, an
+// empty one too (denominator 0), stores its partial in the decode layout
 // ((row * KV * G + head) * PARTS + part) for the decode merge.
 #include "history.glsl"
 
@@ -134,11 +132,8 @@ struct prefill_picked {
     uint64_t statistics;
 };
 #define PREFILL_QT (PREFILL_ROWS / ATTENTION_G)
-#ifdef PREFILL_DECODE
-#define PREFILL_MIN_TILES 1u
-#else
+// A prefill partition's fewest key tiles.
 #define PREFILL_MIN_TILES 16u
-#endif
 // Output columns per pass over the keys: the whole head up to FLASH_MAX_W, so
 // every key tile's scores and history decode happen once, where the device
 // compiles wide accumulator arrays (`flash.glsl`).
@@ -281,6 +276,44 @@ void prefill_stage_picks(uint64_t row, uint pick0, uint kv_head, uint column, co
         }
         seismic_shared_uvec4[(k * flash_pitch(w) + c) / 8u] = bits;
     }
+}
+
+// The key tiles of a sequence of `total` keys.
+uint prefill_tiles(uint total) { return (total + PREFILL_KEYS - 1u) / PREFILL_KEYS; }
+
+#ifdef PREFILL_DECODE
+// A decode row's tiles per partition for its `tiles` key and pick tiles: the
+// decode key rule (`attention_partition_span`) in tiles, its floor SPAN keys.
+#if PREFILL_SPAN % 32 != 0
+#error "the matrix decode's floor is whole key tiles (FLASH_KEYS, 32)"
+#endif
+uint prefill_run(uint tiles) {
+    return attention_partition_span(tiles, uint(PREFILL_SPAN) / PREFILL_KEYS, PREFILL_PARTS);
+}
+#endif
+
+// Whether row `row`'s key sequence is a prefix of row `lead`'s: their spans
+// agree before the row's last non-empty one, which starts where the lead's
+// does and ends no later. Counted by the calling invocation alone.
+bool prefill_prefix(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t lead, uint64_t spans) {
+    uint64_t last = 0ul;
+    bool any = false;
+    for (uint64_t index = 0ul; index <= spans; ++index) {
+        if (attention_span_length(visible, fresh, row, spans, index) > 0u) {
+            last = index;
+            any = true;
+        }
+    }
+    bool prefix = true;
+    for (uint64_t index = 0ul; any && index <= last; ++index) {
+        int lo, hi, lead_lo, lead_hi;
+        attention_span(visible, fresh, row, spans, index, lo, hi);
+        attention_span(visible, fresh, lead, spans, index, lead_lo, lead_hi);
+        const bool empty = hi <= lo, lead_empty = lead_hi <= lead_lo;
+        prefix = prefix && (index < last ? (empty && lead_empty) || (lo == lead_lo && hi == lead_hi)
+                                         : lo == lead_lo && hi <= lead_hi);
+    }
+    return prefix;
 }
 
 // Stages columns [column, column + w) of keys [first, first + 32) of row
@@ -630,7 +663,6 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint kv_head = gl_WorkGroupID.x;
     const uint part = gl_WorkGroupID.y;
     const uint tile = gl_WorkGroupID.z;
-    const uint parts = PREFILL_PARTS;
 #else
     // Query tiles dispatch last-first: in a causal chunk the last tiles see
     // the most keys, and starting them first shortens the grid's tail.
@@ -690,37 +722,37 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #endif
 
 #ifdef PREFILL_DECODE
-    // A row of its own (QT = 1) takes its keys in tiles at fixed positions of
-    // its key sequence, history and fresh keys alike
-    // (`prefill_stage_positions`), and its partitions split those tiles:
-    // over dense history, where a fresh key stages as history stores it, its
-    // result is bit for bit the same whatever rows share its launch and
-    // whichever of its keys are still fresh. Row tiles of several rows share
-    // their key tiles across rows, span by span, and do not hold this.
-    const bool positions = PREFILL_QT == 1u;
-#else
-    const bool positions = false;
-#endif
-    const uint sequence = positions ? attention_visible_total(visible, fresh, tile_first, spans) : 0u;
-    uint total_tiles = positions ? (sequence + PREFILL_KEYS - 1u) / PREFILL_KEYS
-                                 : prefill_total_tiles(visible, fresh, tile_first, rows, spans);
-    // The tiles of the spans or positions; a decode row's pick tiles follow
-    // them.
-    const uint visible_tiles = total_tiles;
-#ifdef PREFILL_DECODE
-    // Each row of the tile has its own picks, in tiles of PREFILL_KEYS.
-    const uint pick_tiles = (PREFILL_PICK_COUNT + PREFILL_KEYS - 1u) / PREFILL_KEYS;
-    if (PREFILL_PICKS)
-        total_tiles += PREFILL_QT * pick_tiles;
-#else
-    // A WorkList's key tiles are its query tile's listed ones.
-    if (PREFILL_SELECTED)
-        total_tiles = element_u32_at(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul);
-#endif
-    const uint per = max(PREFILL_MIN_TILES, (total_tiles + parts - 1u) / parts);
-    const uint used = max(1u, (total_tiles + per - 1u) / per);
-    if (part >= used) {
-#ifdef PREFILL_DECODE
+    // Decode rows take their keys on a grid of positions in each row's own
+    // key sequence (its visible spans, then its fresh keys): key tile t holds
+    // positions [t KEYS, (t + 1) KEYS) (`prefill_stage_positions`), followed
+    // by its pick tiles. Of a row's N tiles, partition p takes the
+    // contiguous run [p run, (p + 1) run), run = `attention_partition_span`
+    // (N, SPAN / KEYS, PARTS): the decode key rule, the vector forms' in
+    // tiles. Each row masks positions at or past its total. Where every row's
+    // sequence is a prefix of the longest's (`prefill_prefix`, a
+    // verification's rows) and their runs are equal, the rows share the
+    // longest's tiles; otherwise the tile walks each row's in turn, masked
+    // for the others. A tile a row does not reach is all masked and leaves
+    // its state as it was, so the row's partitions, tiles and reduction
+    // order are its own: its result is bit for bit the same whatever rows of
+    // its request share its tile and launch, and whichever of its keys are
+    // still fresh.
+    const uint pick_tiles = PREFILL_PICKS ? (PREFILL_PICK_COUNT + PREFILL_KEYS - 1u) / PREFILL_KEYS : 0u;
+    // Each valid row's key count, counted once (`attention_visible_total`;
+    // every subgroup calls it).
+    uint totals[PREFILL_QT];
+    uint lead = 0u;
+    uint least = 0xffffffffu;
+    uint reached = 0u;
+    for (uint i = 0u; i < PREFILL_QT && tile_first + i < rows; ++i) {
+        totals[i] = attention_visible_total(visible, fresh, tile_first + i, spans);
+        if (totals[i] > totals[lead])
+            lead = i;
+        least = min(least, totals[i]);
+        const uint tiles = prefill_tiles(totals[i]) + pick_tiles;
+        reached = max(reached, (tiles + prefill_run(tiles) - 1u) / prefill_run(tiles));
+    }
+    if (part >= reached) {
         // An empty partition's (maximum, denominator 0) per row.
         for (uint i = gl_LocalInvocationIndex; i < PREFILL_QT * G; i += gl_WorkGroupSize.x) {
             const uint64_t token = tile_first + i / G;
@@ -730,20 +762,33 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS) + slot * 8ul, -ATTENTION_INF);
             element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS) + slot * 8ul + 4ul, 0.0);
         }
-#endif
         return;
     }
-#ifndef PREFILL_DECODE
+    bool prefixed = true;
+    const uint lead_run = prefill_run(prefill_tiles(totals[lead]) + pick_tiles);
+    for (uint i = 0u; i < PREFILL_QT && tile_first + i < rows && prefixed; ++i)
+        if (i != lead)
+            prefixed = prefill_run(prefill_tiles(totals[i]) + pick_tiles) == lead_run
+                && prefill_prefix(visible, fresh, tile_first + i, tile_first + lead, spans);
+#else
+    uint total_tiles = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
+    // A WorkList's key tiles are its query tile's listed ones.
+    if (PREFILL_SELECTED)
+        total_tiles = element_u32_at(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul);
+    const uint per = max(PREFILL_MIN_TILES, (total_tiles + parts - 1u) / parts);
+    const uint used = max(1u, (total_tiles + per - 1u) / per);
+    if (part >= used)
+        return;
     if (part == 0u && kv_head == 0u && gl_LocalInvocationIndex == 0u)
         element_u32_put(scratch_planes.counts + uint64_t(tile) * 4ul, used);
-#endif
     const uint tiles_lo = part * per;
     const uint tiles_hi = min(tiles_lo + per, total_tiles);
     // The partition's walk over the spans starts on the span holding its
     // first tile and ends past its last.
-    const uvec2 located = PREFILL_SELECTED_PASS || positions
+    const uvec2 located = PREFILL_SELECTED_PASS
         ? uvec2(0u)
         : prefill_locate_tile(visible, fresh, tile_first, rows, spans, tiles_lo);
+#endif
 
     // The subgroup's block: matrix rows 16 sg .. of the tile's QT x G rows;
     // the lane's softmax row is lane % 16. When G does not divide ROWS, the
@@ -827,15 +872,38 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 flash_accumulate(p_half, 0u, width, width, 0u, o);
         }
 #endif
-        for (uint t = tiles_lo; positions && t < min(tiles_hi, visible_tiles); ++t) {
-            const int first = int(t * PREFILL_KEYS);
-            prefill_absorb(h, scratch_planes, PREFILL_FROM_POSITIONS, first, int(sequence),
-                first + int(PREFILL_KEYS) <= int(sequence), 0, int(sequence), tile_first, token, kv_head, chunk,
-                column0, width, computes, block_queries, shared_queries, scratch, row_scale, softmax, o);
+#ifdef PREFILL_DECODE
+        // The lane's row's keys end at its total, where the walk is its own;
+        // a shared tile below every row's total is unmasked (`inside`).
+        const uint own_total = valid ? totals[uint(token - tile_first)] : 0u;
+        for (uint walk = 0u; walk < (prefixed ? 1u : PREFILL_QT); ++walk) {
+            const uint walked_index = prefixed ? lead : walk;
+            const uint64_t walked = tile_first + walked_index;
+            if (walked >= rows)
+                break;
+            const uint walked_total = totals[walked_index];
+            const int row_hi = prefixed || token == walked ? int(own_total) : 0;
+            const uint run = prefill_run(prefill_tiles(walked_total) + pick_tiles);
+            for (uint t = part * run; t < min(part * run + run, prefill_tiles(walked_total)); ++t)
+                prefill_absorb(h, scratch_planes, PREFILL_FROM_POSITIONS, int(t * PREFILL_KEYS), int(walked_total),
+                    prefixed && (t + 1u) * PREFILL_KEYS <= least, 0, row_hi, walked, token, kv_head, chunk, column0,
+                    width, computes, block_queries, shared_queries, scratch, row_scale, softmax, o);
         }
+        // Each row's pick tiles follow its visible ones on its grid, each
+        // attended by its own row alone.
+        for (uint i = 0u; PREFILL_PICKS && i < PREFILL_QT && tile_first + i < rows; ++i) {
+            const uint64_t pick_row = tile_first + i;
+            const uint own = prefill_tiles(totals[i]);
+            const uint run = prefill_run(own + pick_tiles);
+            for (uint k = max(part * run, own) - own; k < pick_tiles && own + k < part * run + run; ++k)
+                prefill_absorb(h, scratch_planes, PREFILL_FROM_PICKS, int(k * PREFILL_KEYS), 0, true, 0, 0, pick_row,
+                    token, kv_head, chunk, column0, width, computes, block_queries, shared_queries, scratch, row_scale,
+                    softmax, o);
+        }
+#else
         uint tiles_before = located.y;
         for (uint64_t index = located.x;
-             index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS && !positions; ++index) {
+             index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS; ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
             const uint span_tiles = prefill_span_tiles(interval);
             const uint span_first = tiles_before;
@@ -855,18 +923,6 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                     interval.y, inside, row_lo, row_hi, 0ul, token, kv_head, chunk, column0, width, computes,
                     block_queries, shared_queries, scratch, row_scale, softmax, o);
             }
-        }
-#ifdef PREFILL_DECODE
-        // The tile rows' pick tiles, after the visible tiles: each attended
-        // by its own row alone.
-        for (uint picked = max(tiles_lo, visible_tiles); PREFILL_PICKS && picked < tiles_hi; ++picked) {
-            const uint ordinal = picked - visible_tiles;
-            const uint64_t pick_row = tile_first + ordinal / pick_tiles;
-            if (pick_row >= rows)
-                break;
-            prefill_absorb(h, scratch_planes, PREFILL_FROM_PICKS, int((ordinal % pick_tiles) * PREFILL_KEYS), 0, true,
-                0, 0, pick_row, token, kv_head, chunk, column0, width, computes, block_queries, shared_queries,
-                scratch, row_scale, softmax, o);
         }
 #endif
         const float maximum = softmax.maximum;

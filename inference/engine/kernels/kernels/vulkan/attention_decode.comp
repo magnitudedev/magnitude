@@ -42,6 +42,7 @@ attention_history decode_history() {
 #define PREFILL_DECODE
 #define PREFILL_ROWS (16u * uint(SEISMIC_TUNE_SIMDS))
 #define PREFILL_PARTS uint(SEISMIC_TUNE_PARTS)
+#define PREFILL_SPAN SEISMIC_TUNE_SPAN
 #define PREFILL_PREPARED (SEISMIC_STATIC_G * (2 * SEISMIC_STATIC_P + SEISMIC_STATIC_S) * 2 > 32768)
 // A row's index-list picks (KS > 0), the last key tiles of its sequence.
 #define PREFILL_PICKS (SEISMIC_DIM_KS != 0)
