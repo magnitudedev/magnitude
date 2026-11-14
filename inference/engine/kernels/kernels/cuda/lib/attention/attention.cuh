@@ -154,6 +154,77 @@ __device__ __forceinline__ reduce::Located visible_locate(const Inputs &in, u64 
     return reduce::span_locate(spans + 1, key, VisibleLengths{in, row, spans}, lane);
 }
 
+// A key group's cursor over a decode row's keys in `span` order (history
+// spans 0..R-1, then the fresh span R): on span `span`, `length` keys from
+// token `lo` at key ordinal `offset`, holding the slab `slab` (rows from
+// `slab_lo`) of the last history row it reached. Vector decode reads a key
+// group's keys through it in position order, so it takes them in batches at
+// fixed positions of the row's own sequence, whichever of its keys are still
+// fresh and wherever its spans and slabs fall (the decode key rule,
+// `attention.seismic`). Rows and slabs are 32-bit: history rows are below
+// 2^31.
+struct KeyCursor {
+    static constexpr u32 NONE = 0xffffffffu;
+    const Inputs *in;
+    u64 row;
+    u64 spans;
+    u32 slab_rows;
+    u32 span;
+    long long offset;
+    int lo;
+    int length;
+    u32 slab;
+    u32 slab_lo;
+    // The first position past the run the cursor is in: the keys of one span
+    // and, in history, one slab. Inside it a seek is a compare.
+    long long run_end;
+
+    // The cursor on key `first` of `row` (`visible_locate`; the whole warp
+    // calls it).
+    __device__ static __forceinline__ KeyCursor at(const Inputs &in, u64 row, u64 spans, u64 slab_rows,
+                                                   long long first, int lane) {
+        const reduce::Located start = visible_locate(in, row, spans, first, lane);
+        KeyCursor cursor{&in, row, spans, static_cast<u32>(slab_rows), static_cast<u32>(start.span),
+                         start.offset, 0, 0, NONE, 0, 0};
+        if (cursor.span <= spans) cursor.enter();
+        return cursor;
+    }
+
+    // Moves the cursor to key `position` (at or past its own) and returns
+    // the key's token: a history row while `historical()`, whose slab the
+    // cursor then holds (`moved` when that changed it), else a fresh row.
+    __device__ __forceinline__ int seek(long long position, bool &moved) {
+        if (position < run_end) {
+            moved = false;
+            return lo + static_cast<int>(position - offset);
+        }
+        while (position >= offset + length) {
+            offset += length;
+            ++span;
+            enter();
+        }
+        const int token = lo + static_cast<int>(position - offset);
+        moved = historical() && (slab == NONE || static_cast<u32>(token) - slab_lo >= slab_rows);
+        if (moved) {
+            slab = static_cast<u32>(token) / slab_rows;
+            slab_lo = slab * slab_rows;
+        }
+        // The run ends with the span or, in history, the slab.
+        run_end = offset + length;
+        if (historical()) run_end = min(run_end, offset + (static_cast<long long>(slab_lo) + slab_rows - lo));
+        return token;
+    }
+
+    __device__ __forceinline__ bool historical() const { return span < spans; }
+
+  private:
+    __device__ __forceinline__ void enter() {
+        const Span s = attention::span(*in, row, span, spans);
+        lo = s.lo;
+        length = max(s.hi - s.lo, 0);
+    }
+};
+
 #endif
 
 // Part `index` of [lo, hi) split into parts of `per` keys (the last ones
@@ -162,6 +233,13 @@ struct Range {
     long long lo;
     long long hi;
 };
+// The decode key rule's run (`attention.seismic`): the units (keys, or key
+// tiles) a partition takes of a row's `units`, at least `floor_units`, few
+// enough that `parts` partitions cover the row. The one place it is written
+// on CUDA; the partitions that hold units are ceil(units / run).
+__device__ __forceinline__ long long partition_run(long long units, long long floor_units, long long parts) {
+    return max(floor_units, (units + parts - 1) / parts);
+}
 __device__ __forceinline__ Range partition(Range whole, long long per, long long index) {
     const long long lo = min(whole.hi, whole.lo + per * index);
     return Range{lo, min(whole.hi, lo + per)};

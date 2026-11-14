@@ -32,6 +32,15 @@ struct DenseReads {
         return slab::row(value, static_cast<u64>(token), slab_rows, value_row * Act::bytes) +
                static_cast<u64>(kv_head) * value_head * Act::bytes;
     }
+    // A slab's first (history row, kv head) vectors; later rows of the slab
+    // are `key_row` / `value_row` elements past them.
+    __device__ __forceinline__ const u8 *key_slab(u32 slab_index, int kv_head) const {
+        return slab::region(key, slab_index) + static_cast<u64>(kv_head) * key_head * Act::bytes;
+    }
+    __device__ __forceinline__ const u8 *value_slab(u32 slab_index, int kv_head) const {
+        if constexpr (STORED_KEY) return key_slab(slab_index, kv_head);
+        return slab::region(value, slab_index) + static_cast<u64>(kv_head) * value_head * Act::bytes;
+    }
 };
 
 // Dense history: key and value planes [T, KV, W] of the activation element.
@@ -67,6 +76,12 @@ struct DenseHistory {
     }
     __device__ __forceinline__ const u8 *value_vector(int token, int kv_head) const {
         return reads().value_vector(token, kv_head);
+    }
+    __device__ __forceinline__ const u8 *key_slab(u32 slab_index, int kv_head) const {
+        return reads().key_slab(slab_index, kv_head);
+    }
+    __device__ __forceinline__ const u8 *value_slab(u32 slab_index, int kv_head) const {
+        return reads().value_slab(slab_index, kv_head);
     }
 
     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],
@@ -233,23 +248,30 @@ struct AffineReads {
         const u32 *key_pairs;
         const u32 *value_codes;
         const u32 *value_pairs;
+        // Row `within` of the slab these are the first vectors of (row
+        // strides in words: codes 4-byte, pairs 2-byte elements).
+        __device__ __forceinline__ Vectors at(const AffineReads &h, u32 within) const {
+            return Vectors{key_codes + within * h.key_codes_row, key_pairs + within * (h.key_pairs_row / 2),
+                           value_codes + within * h.value_codes_row, value_pairs + within * (h.value_pairs_row / 2)};
+        }
     };
     __device__ __forceinline__ Vectors vectors(int token, int kv_head) const {
         const u32 rows = static_cast<u32>(slab_rows);
-        const u64 index = static_cast<u32>(token) / rows;
-        const u64 within = static_cast<u32>(token) % rows;
-        auto at = [&](const u32 *table, u64 row_bytes, u64 head_words) {
-            return reinterpret_cast<const u32 *>(slab::region(table, index) + within * row_bytes) +
+        return slab_vectors(static_cast<u32>(token) / rows, kv_head).at(*this, static_cast<u32>(token) % rows);
+    }
+    // A slab's first (history row, kv head) vectors; `at` steps them to a
+    // later row of the slab.
+    __device__ __forceinline__ Vectors slab_vectors(u32 slab_index, int kv_head) const {
+        auto at = [&](const u32 *table, u64 head_words) {
+            return reinterpret_cast<const u32 *>(slab::region(table, slab_index)) +
                    static_cast<u64>(kv_head) * head_words;
         };
-        auto pairs = [&](const u32 *table, u64 row_elements, u64 head_elements) {
+        auto pairs = [&](const u32 *table, u64 head_elements) {
             return reinterpret_cast<const u32 *>(
-                slab::region(table, index) + (within * row_elements + static_cast<u64>(kv_head) * head_elements) * 2);
+                slab::region(table, slab_index) + static_cast<u64>(kv_head) * head_elements * 2);
         };
-        return Vectors{at(key_codes, key_codes_row * 4, key_codes_head),
-                       pairs(key_pairs, key_pairs_row, key_pairs_head),
-                       at(value_codes, value_codes_row * 4, value_codes_head),
-                       pairs(value_pairs, value_pairs_row, value_pairs_head)};
+        return Vectors{at(key_codes, key_codes_head), pairs(key_pairs, key_pairs_head),
+                       at(value_codes, value_codes_head), pairs(value_pairs, value_pairs_head)};
     }
 };
 
@@ -298,6 +320,9 @@ struct AffineHistory {
 
     using Vectors = AffineReads::Vectors;
     __device__ __forceinline__ Vectors vectors(int token, int kv_head) const { return reads().vectors(token, kv_head); }
+    __device__ __forceinline__ Vectors slab_vectors(u32 slab_index, int kv_head) const {
+        return reads().slab_vectors(slab_index, kv_head);
+    }
 
     // A lane's share of a key's and a value's encodings.
     struct Encoding {

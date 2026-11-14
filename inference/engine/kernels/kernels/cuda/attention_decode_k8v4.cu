@@ -22,9 +22,9 @@
 // accumulator (`absorb`), so no element is decoded. History rows are read as
 // stored; a fresh row is prepared and quantized in registers exactly as the
 // append encodes it (`AffineHistory::quantize`), so it is absorbed as history
-// holds it. Its batches of TOKENS keys start at each slab's part of a span
-// and at the fresh span, so the order of a row's sums, though not the values
-// it sums, moves with which of its keys are still fresh. Partition 0 of a
+// holds it. Its batches of TOKENS keys sit at fixed positions of the row's
+// own key sequence (`attention::KeyCursor`), so the order of a row's sums does
+// not depend on which of its keys are still fresh. Partition 0 of a
 // layer with fresh rows appends the row's key and value encoded. L2
 // `attention_decode_k8v4_merge`: the dense entry's merge and gate.
 //
@@ -234,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     const u64 spans = SEISMIC_DIM_R;
     const long long total = attention::visible_total(in, row, spans, lane);
     const attention::Range partition =
-        attention::partition(attention::Range{0, total}, (total + PARTS - 1) / PARTS, part);
+        attention::partition(attention::Range{0, total}, attention::partition_run(total, 1, PARTS), part);
     const attention::Range slice = attention::partition(
         partition, (partition.hi - partition.lo + GROUPS - 1) / GROUPS, warp / SLICES);
 
@@ -244,84 +244,73 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
     for (int h = 0; h < H; ++h) bias[h] = 0.0f;
 
-    // The walk starts at the span holding the slice's first key.
-    const reduce::Located start = attention::visible_locate(in, row, spans, slice.lo, lane);
-    long long offset = start.offset;
-    for (u64 span = start.span; span <= spans && offset < slice.hi; ++span) {
-        const attention::Span s = attention::span(in, row, span, spans);
-        const long long length = s.hi > s.lo ? s.hi - s.lo : 0;
-        const long long first = max(slice.lo, offset);
-        const long long last = min(slice.hi, offset + length);
-        if (first < last) {
-            const int lo = s.lo + static_cast<int>(first - offset);
-            const int hi = s.lo + static_cast<int>(last - offset);
-            if (span < spans) {
-                // Each slab's part of the span resolves its first rows once;
-                // later rows are row strides past them (a per-token slab
-                // lookup divides 64-bit rows).
-                for (int part_lo = lo; part_lo < hi;) {
-                    const int part_hi = history.slab_end(part_lo, hi);
-                    const attention::AffineReads::Vectors v = history.reads().vectors(part_lo, kv);
-                    const u32 *key_rows = v.key_codes;
-                    const u32 *value_rows = v.value_codes;
-                    const u32 *key_pairs = v.key_pairs + pair;
-                    const u32 *value_pairs = v.value_pairs + pair;
-                    const u64 key_step = history.key_codes_row;
-                    const u64 value_step = history.value_codes_row;
-                    const u64 key_pair_step = history.key_pairs_row / 2;
-                    const u64 value_pair_step = history.value_pairs_row / 2;
-                    for (int token = part_lo; token < part_hi; token += TOKENS) {
-                        const int count = min(TOKENS, part_hi - token);
-                        u32 k[TOKENS][KeyCodes::words];
-                        u32 v[TOKENS][ValueCodes::words];
-                        float2 kc[TOKENS];
-                        float2 vc[TOKENS];
+    // The slice's keys absorb in batches of TOKENS at fixed positions
+    // slice.lo + i * TOKENS of the row's own key sequence, read through its
+    // cursor (`attention::KeyCursor`), as the dense entry's: a key's batch,
+    // and so the row's reduction order, depends on its position alone.
+    const attention::AffineReads reads = history.reads();
+    attention::KeyCursor cursor = attention::KeyCursor::at(in, row, spans, reads.slab_rows, slice.lo, lane);
+    // The cursor's slab's first vectors.
+    attention::AffineReads::Vectors slab{};
+    // A history row's lane share of codes and pairs, read as stored.
+    auto read_history = [&](const attention::AffineReads::Vectors &at, u32 (&k)[KeyCodes::words],
+                            u32 (&v)[ValueCodes::words], float2 &kc, float2 &vc) {
+        KeyCodes::load(at.key_codes, lane, k);
+        ValueCodes::load(at.value_codes, lane, v);
+        kc = attention::coefficients(at.key_pairs[pair]);
+        vc = attention::coefficients(at.value_pairs[pair]);
+    };
+    for (long long position = slice.lo; position < slice.hi; position += TOKENS) {
+        const int count = static_cast<int>(min(static_cast<long long>(TOKENS), slice.hi - position));
+        u32 k[TOKENS][KeyCodes::words];
+        u32 v[TOKENS][ValueCodes::words];
+        float2 kc[TOKENS];
+        float2 vc[TOKENS];
+        // The batch's first key; a batch of TOKENS keys inside one history run
+        // (a span's part of one slab) reads straight from the run's rows,
+        // each key a row stride past the first.
+        bool moved;
+        const int first = cursor.seek(position, moved);
+        if (cursor.historical() && moved) slab = reads.slab_vectors(cursor.slab, kv);
+        if (cursor.historical() && count == TOKENS && position + TOKENS <= cursor.run_end) {
+            const attention::AffineReads::Vectors head = slab.at(reads, static_cast<u32>(first) - cursor.slab_lo);
 #pragma unroll
-                        for (int t = 0; t < TOKENS; ++t) {
-                            // Past the part, reload its last key: `absorb`
-                            // skips it.
-                            const u64 at = static_cast<u64>(min(token + t, part_hi - 1) - part_lo);
-                            KeyCodes::load(key_rows + at * key_step, lane, k[t]);
-                            ValueCodes::load(value_rows + at * value_step, lane, v[t]);
-                            kc[t] = attention::coefficients(key_pairs[at * key_pair_step]);
-                            vc[t] = attention::coefficients(value_pairs[at * value_pair_step]);
-                        }
-                        absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
-                    }
-                    part_lo = part_hi;
+            for (int t = 0; t < TOKENS; ++t) read_history(head.at(reads, t), k[t], v[t], kc[t], vc[t]);
+        } else {
+#pragma unroll
+            for (int t = 0; t < TOKENS; ++t) {
+                // Past the slice, zero codes and pairs: `absorb` skips them.
+                if (t >= count) {
+#pragma unroll
+                    for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = 0u;
+#pragma unroll
+                    for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = 0u;
+                    kc[t] = vc[t] = make_float2(0.0f, 0.0f);
+                    continue;
                 }
-            } else {
-                // Fresh rows, encoded in registers as the append encodes them.
-                for (int token = lo; token < hi; token += TOKENS) {
-                    const int count = min(TOKENS, hi - token);
-                    u32 k[TOKENS][KeyCodes::words];
-                    u32 v[TOKENS][ValueCodes::words];
-                    float2 kc[TOKENS];
-                    float2 vc[TOKENS];
+                const int token = cursor.seek(position + t, moved);
+                if (cursor.historical()) {
+                    // A history row, read as stored.
+                    if (moved) slab = reads.slab_vectors(cursor.slab, kv);
+                    read_history(slab.at(reads, static_cast<u32>(token) - cursor.slab_lo), k[t], v[t], kc[t],
+                                 vc[t]);
+                } else {
+                    // A fresh row, encoded in registers as the append encodes it.
+                    float key[DPL];
+                    float value[DPL];
+                    attention::prepared_key(in, token, kv, key, own, lane);
+                    attention::fresh_value(in, token, kv, value, lane);
+                    const attention::AffineHistory::Encoding e = attention::AffineHistory::quantize(key, value);
 #pragma unroll
-                    for (int t = 0; t < TOKENS; ++t) {
-                        // Past the span, zero codes and pairs: `absorb` skips
-                        // them.
-                        attention::AffineHistory::Encoding e{};
-                        if (t < count) {
-                            float key[DPL];
-                            float value[DPL];
-                            attention::prepared_key(in, token + t, kv, key, own, lane);
-                            attention::fresh_value(in, token + t, kv, value, lane);
-                            e = attention::AffineHistory::quantize(key, value);
-                        }
+                    for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = e.key.codes[j];
 #pragma unroll
-                        for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = e.key.codes[j];
-#pragma unroll
-                        for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = e.value.codes[j];
-                        kc[t] = make_float2(e.key.scale, e.key.zero);
-                        vc[t] = make_float2(e.value.scale, e.value.zero);
-                    }
-                    absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
+                    for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = e.value.codes[j];
+                    kc[t] = make_float2(e.key.scale, e.key.zero);
+                    vc[t] = make_float2(e.value.scale, e.value.zero);
                 }
             }
         }
-        offset += length;
+        absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
     }
     fold(state, bias);
     attention::publish<WARPS, PARTS, SLICES>(state, exchange, warp_stats, partials, statistics, row,

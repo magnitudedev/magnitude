@@ -7,8 +7,10 @@
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_INTERLEAVED SEISMIC_DIM_I
 #define ATTENTION_SEPARATE SEISMIC_DIM_U
-// attention_prefill (M >= 16): flash attention on tensor cores over dense
-// history (bodies in lib/attention/prefill.cuh).
+// attention_prefill: flash attention on tensor cores over dense history
+// (bodies in lib/attention/prefill.cuh), for the prefill row classes
+// (`attention_prefill_attend`) and, where the decode entry holds no form of
+// the shape, the decode row classes (`attention_prefill_attend_rows`).
 
 #define ATTENTION_STAGES SEISMIC_TUNE_STAGES
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
@@ -75,17 +77,27 @@ extern "C" __global__ void __launch_bounds__(256) attention_prefill_prepare(SEIS
             SEISMIC_PARAM_SELECTED_SLAB_ROWS, SEISMIC_SELECTED_STRIDE_0, SEISMIC_SELECTED_STRIDE_1 \
     }
 
+#define PREFILL_ROWS(decode)                                                             \
+    attention::prefill::PrefillRows<decode>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), \
+                                          SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),      \
+                                          SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),    \
+                                          SEISMIC_RESULT_0_OUT, SPLIT()}
+#define PREFILL_BLOCK()                                                                    \
+    attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), \
+                              static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)}
+
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
     attention_prefill_attend(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::attend(
-        ATTENTION_INPUTS(), HISTORY().reads(),
-        attention::prefill::PrefillRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
-                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
-                                      SEISMIC_RESULT_0_OUT, SPLIT()},
-        attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
-                                static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)},
-        SELECTION(), PICKED());
+    attention::prefill::attend(ATTENTION_INPUTS(), HISTORY().reads(), PREFILL_ROWS(false), PREFILL_BLOCK(), SELECTION(),
+                               PICKED());
+}
+
+// The decode row classes (M <= VERIFY_ROWS, no WorkList): each row's keys on
+// the position grid, so a row's result does not depend on the rows beside it.
+extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
+    attention_prefill_attend_rows(SEISMIC_KERNEL_PARAMS) {
+    attention::prefill::attend(ATTENTION_INPUTS(), HISTORY().reads(), PREFILL_ROWS(true), PREFILL_BLOCK(), SELECTION(),
+                               PICKED());
 }
 
 extern "C" __global__ void attention_prefill_merge(SEISMIC_KERNEL_PARAMS) {

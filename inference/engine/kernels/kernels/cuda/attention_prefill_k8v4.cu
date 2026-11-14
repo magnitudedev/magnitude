@@ -184,10 +184,10 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + a
     attention_prefill_k8v4_attend(SEISMIC_KERNEL_PARAMS) {
     attention::prefill::attend(
         ATTENTION_INPUTS(), ATTEND_HISTORY(),
-        attention::prefill::PrefillRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
-                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-                                      SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
-                                      SEISMIC_RESULT_0_OUT, SPLIT()},
+        attention::prefill::PrefillRows<false>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
+                                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
+                                               SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
+                                               SEISMIC_RESULT_0_OUT, SPLIT()},
         attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
                                 static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)},
         SELECTION());
