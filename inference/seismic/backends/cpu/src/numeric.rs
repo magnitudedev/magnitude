@@ -257,7 +257,7 @@ atomic_helper!(
     AtomicOperation::Min
 );
 
-/// The host symbols a JIT module resolves: the math sequences and the team
+/// The host symbols a CPU program calls: the math sequences and the team
 /// barrier entry points.
 pub(crate) fn host_symbols() -> Vec<(&'static str, *const u8)> {
     vec![

@@ -1,0 +1,8 @@
+# One element plus one, with no loop: an entry whose Seismic IR leaves its
+# preparation no choice of mapping, so the kernel preparation forms is the
+# same in every process whatever its analytical context measured
+# (`tests/artifacts.rs`, `a_later_process_compiles_nothing`).
+fn add_one(x: &tensor[1] f32) -> tensor[1] f32:
+    let mut result = tensor[1] f32
+    result[0] = x[0] + 1.0
+    return result

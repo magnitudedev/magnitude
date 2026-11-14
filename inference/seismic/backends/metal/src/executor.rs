@@ -312,7 +312,7 @@ impl MetalSubmission {
             let encoder = command.computeCommandEncoder().ok_or_else(|| {
                 ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
             })?;
-            encoder.setComputePipelineState(&kernel.state);
+            encoder.setComputePipelineState(&kernel.pipeline().state);
             for (index, (buffer, offset)) in resolved.iter().enumerate() {
                 unsafe {
                     encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), *offset as usize, index)

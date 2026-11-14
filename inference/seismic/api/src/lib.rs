@@ -111,9 +111,12 @@ pub mod testing {
         }
     }
 }
-pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions, MemoryStore};
+pub use seismic_runtime::artifacts::{
+    ArtifactKey, ArtifactStore, DeviceOptions, DirectoryStore, Eviction, MemoryStore, ProgramStore,
+    DEFAULT_CAPACITY as DEFAULT_STORE_CAPACITY,
+};
 pub use seismic_runtime::api::device::Bounds;
-pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
+pub use seismic_runtime::probes::{carry as carry_probe_results, probe_misses, probe_runs, serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.
 pub use seismic_lang::device;
@@ -520,12 +523,6 @@ impl Device {
     }
     pub fn backend(&self) -> BackendName {
         self.inner.info().backend()
-    }
-    /// Whether this device's toolchain keeps what it compiles in the
-    /// platform's own cache (Metal's shader cache), which the process's
-    /// normal exit leaves written.
-    pub fn platform_cached(&self) -> bool {
-        self.inner.platform_cached()
     }
     /// The host threads this device's own execution keeps busy while its
     /// work runs: a CPU device's worker pool's participants, the submitting

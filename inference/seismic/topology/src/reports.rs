@@ -62,9 +62,9 @@ pub struct MetalReport {
     /// `MTLDevice.hasUnifiedMemory`: its memory is the host's.
     pub unified: bool,
     /// What the backend's kernels require: a compiler accepting one of the
-    /// language versions it emits (`seismic_metal::profile::language`).
+    /// language versions it emits (`seismic_metal::profile::MetalProbeAnswers::language`).
     pub admission: Result<(), String>,
-    /// `seismic_metal::profile::forms_tensor_operations`, for a device the
+    /// `seismic_metal::profile::MetalProbeAnswers::forms_tensor_operations`, for a device the
     /// backend admits.
     pub tensor_operations: bool,
     pub working_set: u64,

@@ -20,3 +20,7 @@ seismic-compiler = { workspace = true, features = ["fixtures"] }
 # The recorded GB10, whose reservation granule the driver is held to.
 seismic-topology = { workspace = true, features = ["fixtures"] }
 libc = "0.2"
+
+[build-dependencies]
+# The formation build identity (`toolchain::FORMATION_BUILD`).
+magnitude-source-identity = { path = "../../../engine/source-identity" }

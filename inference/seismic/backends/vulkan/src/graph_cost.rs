@@ -11,10 +11,10 @@
 
 use crate::device::{Device, ARGUMENT_CHUNK_BYTES};
 use crate::direct::{argument_block_bytes, DirectGraphBuilder, DirectLaunch};
-use crate::formation::DirectModule;
+use crate::VulkanPrograms;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCost;
-use seismic_native_target::ProgramEntry;
+use seismic_native_target::{ProgramEntry, ProgramSource};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -22,28 +22,9 @@ use std::sync::Mutex;
 /// holds of the least argument block, so their blocks fill a whole chunk.
 const LAUNCHES: u64 = ARGUMENT_CHUNK_BYTES / argument_block_bytes(0, 0);
 
-/// An empty compute shader of one invocation (SPIR-V 1.0): `main`, local
-/// size 1×1×1, returning at once.
-pub(crate) const EMPTY: [u32; 35] = [
-    // Magic, version 1.0, generator, bound 5, schema.
-    0x0723_0203, 0x0001_0000, 0, 5, 0,
-    // OpCapability Shader
-    0x0002_0011, 1,
-    // OpMemoryModel Logical GLSL450
-    0x0003_000E, 0, 1,
-    // OpEntryPoint GLCompute %1 "main"
-    0x0005_000F, 5, 1, 0x6E69_616D, 0,
-    // OpExecutionMode %1 LocalSize 1 1 1
-    0x0006_0010, 1, 17, 1, 1, 1,
-    // %2 = OpTypeVoid
-    0x0002_0013, 2,
-    // %3 = OpTypeFunction %2
-    0x0003_0021, 3, 2,
-    // %1 = OpFunction %2 None %3
-    0x0005_0036, 2, 1, 0, 3,
-    // %4 = OpLabel; OpReturn; OpFunctionEnd
-    0x0002_00F8, 4, 0x0001_00FD, 0x0001_0038,
-];
+/// An empty compute shader, formed with a group of one invocation
+/// ([`measure`]).
+const EMPTY: &str = "#version 460\nlayout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\nvoid main() {}\n";
 
 /// What a device's recorded graphs are charged at before [`graph_cost`]
 /// measured its command memory: a bound above what devices measured so far
@@ -53,32 +34,35 @@ pub(crate) const EMPTY: [u32; 35] = [
 pub const UNMEASURED: GraphCost = GraphCost::Chunked { launch: 1 << 10, chunk: ARGUMENT_CHUNK_BYTES };
 
 /// What graphs recorded on `device` hold, measured on its first call in
-/// the process and kept for the device after.
-pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {
+/// the process and kept for the device after. The empty pipeline it is
+/// measured with is formed through the device's `programs`, so a process
+/// after the first that formed it loads it.
+pub fn graph_cost(device: &Device, programs: &VulkanPrograms) -> Result<GraphCost, ExecutionError> {
     static COSTS: Mutex<BTreeMap<[u8; 16], GraphCost>> = Mutex::new(BTreeMap::new());
     let mut costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let uuid = device.facts().uuid;
     if let Some(cost) = costs.get(&uuid) {
         return Ok(*cost);
     }
-    let cost = measure(device)?;
+    let cost = measure(device, programs)?;
     costs.insert(uuid, cost);
     Ok(cost)
 }
 
-fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
+fn measure(device: &Device, programs: &VulkanPrograms) -> Result<GraphCost, ExecutionError> {
     let entry = ProgramEntry {
         symbol: "main".into(),
         group_size: Some([1, 1, 1]),
         constants: Vec::new(),
     };
-    let entries = [(&EMPTY[..], &entry)];
-    let (module, _) = DirectModule::compile(device, &entries).map_err(|error| {
+    let source = ProgramSource { text: EMPTY.into(), entries: vec![entry.clone()] };
+    let formed = programs.form(std::slice::from_ref(&source)).map_err(|error| {
         ExecutionError::SubmissionFailed(format!("measuring the graphs' command memory: {error}"))
     })?;
+    let (module, function) = formed[0].program(&entry);
     let launch = DirectLaunch {
-        module: &module,
-        function: 0,
+        module,
+        function,
         buffers: &[],
         words: &[],
         scalar_results: None,

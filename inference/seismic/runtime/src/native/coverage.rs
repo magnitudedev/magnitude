@@ -320,14 +320,18 @@ impl Former {
             BackendName::Metal => {
                 let device = seismic_metal::DeviceHandle::system_default()
                     .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?;
-                let language =
-                    seismic_metal::profile::probe_language_version(&device).ok_or_else(|| {
-                        CoverageError::ToolchainUnavailable(
-                            "no supported Metal language version".into(),
-                        )
-                    })?;
-                let tensor_ops =
-                    seismic_metal::toolchain::forms_tensor_operations(&device, language);
+                // The device's probe answers, as its discovery and open
+                // read them: from the process's one store.
+                let answers = seismic_metal::profile::probe_answers(
+                    &device,
+                    &*crate::artifacts::ProgramStore::user(),
+                );
+                let language = answers.language().map_err(|error| {
+                    CoverageError::ToolchainUnavailable(format!(
+                        "no supported Metal language version: {error}"
+                    ))
+                })?;
+                let tensor_ops = answers.forms_tensor_headers();
                 Ok(Self::Metal {
                     language,
                     tensor_ops,

@@ -23,6 +23,9 @@ opentelemetry = "0.33.0"
 serde.workspace = true
 postcard.workspace = true
 sha2 = "=0.11.0"
+# The artifact store's failures (writes, and stored artifacts damaged or
+# declined), as events the embedder's subscriber carries to its telemetry.
+tracing.workspace = true
 
 [features]
 # The offline formation coverage suite (`native::coverage`).

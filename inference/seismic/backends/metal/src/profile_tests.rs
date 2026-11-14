@@ -132,7 +132,7 @@ fn stated_rows_equal_the_contract_table() {
             "the transcription states {key:?} twice"
         );
     }
-    let description = open_device(&metal_device()).expect("Metal device description");
+    let description = open_device(&metal_device(), crate::test_support::store()).expect("Metal device description");
     let table = description.native_float();
     let mismatches: Vec<String> = every_key()
         .into_iter()
@@ -170,7 +170,7 @@ fn subgroup_width_is_the_pipeline_execution_width() {
 /// compiler accepts; the combinations include the two contract Fragment rows.
 #[test]
 fn fragment_formats_are_the_matrix_combinations() {
-    let description = open_device(&metal_device()).expect("Metal device description");
+    let description = open_device(&metal_device(), crate::test_support::store()).expect("Metal device description");
     let combinations = &description.facts().matrix_combinations;
     for (left, accumulator) in [(DType::F16, DType::F32), (DType::F32, DType::F32)] {
         assert!(
@@ -211,7 +211,7 @@ const GROUP: usize = 256;
 impl NativeProbe {
     fn open() -> Self {
         let device = metal_device();
-        let description = open_device(&device).expect("Metal device description");
+        let description = open_device(&device, crate::test_support::store()).expect("Metal device description");
         Self { device, description }
     }
 

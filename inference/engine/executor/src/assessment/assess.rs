@@ -803,7 +803,7 @@ pub(crate) mod tests {
     /// The fixture planned on the host's device with at most
     /// `capacity_bytes` of its stable capacity.
     fn environment_within(context_limit: u64, capacity_bytes: u64) -> Environment {
-        let inventory = std::sync::Arc::new(seismic::Inventory::discover(&[]).unwrap());
+        let inventory = std::sync::Arc::new(seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap());
         let catalog = seismic::Devices::new(inventory.clone());
         let mut selected = crate::platform::select_device(
             &catalog,

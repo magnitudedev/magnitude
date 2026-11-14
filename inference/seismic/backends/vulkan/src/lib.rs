@@ -25,6 +25,11 @@ pub use facts::{
     MemoryLayout, MemoryType, Probed, Properties, ReservationForm, Reserving, SUBGROUP_WIDTH,
 };
 pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
+
+/// The programs of one opened device under its toolchain: the one way the
+/// backend's code forms a program (the runtime's program former, over the
+/// process's program store).
+pub type VulkanPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::VulkanToolchain>>;
 pub use reservation::{ReservedBuffer, VulkanResizer};
 pub use instance::LoaderError;
 pub use memory::{AllocationAccount, Buffer, MemoryAccounts};

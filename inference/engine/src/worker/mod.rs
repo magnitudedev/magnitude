@@ -168,19 +168,26 @@ impl From<WorkerExit> for Served {
 
 impl Served {
     /// End this worker process with `code`. A process that served a load
-    /// ends at once: what it still holds is released by the process's end,
-    /// as by a kill, with no teardown of its own, which on CUDA takes longer
-    /// than the kernel's. A measurement job's ends as
-    /// [`measure::end_measured`] ends it. Any other exits normally, its exit
-    /// handlers run (a Prepare's leave the system's compiled-kernel caches
-    /// written).
+    /// ends at once ([`end_at_once`]). A measurement job's ends as
+    /// [`measure::end_measured`] ends it. Any other exits normally, its
+    /// devices dropped, each waiting for its own stores.
     pub fn end_process(self, code: i32) -> ! {
         match self._held {
-            Some(Held::Load { .. }) => magnitude_service_utils::process::end(code),
+            Some(Held::Load { _load: _loaded }) => end_at_once(code),
             Some(Held::Measurement { _points: points }) => measure::end_measured(Some(points), code),
             None => std::process::exit(code),
         }
     }
+}
+
+/// End this process with `code` at once, without dropping the device it
+/// held: once the programs the device compiled are stored (in the
+/// process's one store, `seismic::ProgramStore::user`), what it holds is
+/// released by the process's end, as by a kill, with no teardown of its
+/// own, which on CUDA takes longer than the kernel's.
+pub(crate) fn end_at_once(code: i32) -> ! {
+    seismic::ProgramStore::user().settle();
+    magnitude_service_utils::process::end(code)
 }
 
 /// A Prepare: search the tuning units of `manifest`'s model the kernel cache

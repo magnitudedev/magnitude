@@ -7,13 +7,10 @@
 //! documentation names it a backend rule.
 
 use crate::capability;
-use crate::driver::{
-    compile_image, load_module, module_function, Allocation, Context, Driver, DriverError, Event,
-    Stream,
-};
+use crate::driver::{Allocation, Context, Driver, DriverError, Event, Stream};
 use crate::nvrtc;
 use crate::{
-    Cuda, SERVICE_ATOMIC, SERVICE_BARRIER, SERVICE_GLOBAL_READ, SERVICE_GLOBAL_WRITE,
+    Cuda, CudaPtxPrograms, SERVICE_ATOMIC, SERVICE_BARRIER, SERVICE_GLOBAL_READ, SERVICE_GLOBAL_WRITE,
     SERVICE_INSTRUCTION, SERVICE_MATRIX, SERVICE_REPACK, SERVICE_SHARED_READ, SERVICE_SHARED_WRITE,
     SERVICE_SUBGROUP,
 };
@@ -22,7 +19,7 @@ use seismic_compiler::target::{
     assemble_device_description, DiscoveredTarget, ExecutionProfileParts,
 };
 use seismic_estimator::{
-    CompositionQualificationCase, CompositionQualificationParts, DurationInterval, FactProvenance,
+    AnalyticalService, CoreService, CompositionQualificationCase, CompositionQualificationParts, DurationInterval, FactProvenance,
     MeasurementBatch, MeasurementSeries, ProfileAcquisitionMetrics, ResourceTopology,
     ServiceAccuracyClass, ServiceClassId, ServiceCorrelationId, ServiceCurve, ServiceCurveRegime,
     ServiceDefinition, ServiceQualificationDomain,
@@ -31,8 +28,8 @@ const SERVICE_SUBMISSION: ServiceClassId = ServiceClassId::new("core.submission"
 const SERVICE_COPY: ServiceClassId = ServiceClassId::new("core.copy");
 const SERVICE_FILL: ServiceClassId = ServiceClassId::new("core.fill");
 const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-read");
-const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
-const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
+const SERVICE_ALLOCATION_INSTANCE: ServiceClassId = ServiceClassId::new("core.allocation-instance");
+const SERVICE_TENSOR_PUBLICATION: ServiceClassId = ServiceClassId::new("core.tensor-publication");
 use seismic_ir::kernel::Kernel;
 use seismic_ir::physical_target::{
     DataTypeSupport, KernelAbiAllocation, KernelAbiAllocationRole, KernelAbiFootprint,
@@ -798,14 +795,15 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
 }
 
 /// Acquires and assembles the complete profile on the exact context and
-/// production stream retained by the opened device service.
+/// production stream retained by the opened device service, its probe
+/// kernels formed through `programs`, the device's.
 pub(crate) fn profile_for_opened(
-    ordinal: u32,
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
+    service: &crate::Device,
     device: Arc<seismic_native_target::DeviceDescription<Cuda>>,
+    programs: &CudaPtxPrograms,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Cuda>, TargetError> {
     let total_started = Instant::now();
+    let (ordinal, context, stream) = (service.ordinal(), service.context(), service.stream());
     if context.ordinal()
         != c_int::try_from(ordinal).map_err(|_| {
             TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
@@ -815,7 +813,7 @@ pub(crate) fn profile_for_opened(
         panic!("CUDA profile acquisition received a context/stream for another opened device")
     }
     let (services, composition_qualification, probe_build_ns, probe_execution_ns) =
-        acquire_services(context, stream, device.facts())?;
+        acquire_services(service, device.facts(), programs)?;
     let execution_parts = ExecutionProfileParts::new(
         device,
         "seismic-cuda-probes-v5-classified-host-confidence95",
@@ -850,7 +848,6 @@ pub(crate) fn device_for_opened(
 const GPU_PROBE_REPETITIONS: usize = 64;
 const HOST_DETERMINISTIC_REPETITIONS: usize = 9;
 const HOST_STOCHASTIC_REPETITIONS: usize = 64;
-const HOST_COMPUTE_AMPLIFICATION_UNITS: u64 = 268_435_456;
 const GPU_CONFIDENCE_Z_95: f64 = 1.96;
 /// NVIDIA's CUDA Driver API documents `cuEventElapsedTime` with approximately
 /// 0.5 microsecond resolution. This is clock quantization, not the latency of
@@ -860,9 +857,9 @@ const MAX_GPU_ACQUISITION_ROUNDS: usize = 3;
 const MAX_HOST_ACQUISITION_ROUNDS: usize = 8;
 
 fn acquire_services(
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
+    service: &crate::Device,
     facts: &CudaFacts,
+    programs: &CudaPtxPrograms,
 ) -> Result<
     (
         Vec<ServiceDefinition>,
@@ -872,14 +869,20 @@ fn acquire_services(
     ),
     TargetError,
 > {
+    let (context, stream) = (service.context(), service.stream());
     let build_started = Instant::now();
-    let source = probe_source(facts.ptx);
-    let image = compile_image(context, &source).map_err(|error| {
-        TargetError::DeviceUnavailable(format!("CUDA probe compilation: {error:?}"))
+    let source = seismic_native_target::ProgramSource {
+        text: probe_source(facts.ptx),
+        entries: PROBE_ENTRIES.into_iter().map(seismic_native_target::ProgramEntry::named).collect(),
+    };
+    let formed = programs.form(std::slice::from_ref(&source)).map_err(|error| {
+        TargetError::DeviceUnavailable(format!("CUDA probe formation: {error:?}"))
     })?;
-    let (module, empty) = load_module(context, &image, "probe_empty").map_err(|error| {
-        TargetError::DeviceUnavailable(format!("CUDA probe loading: {error:?}"))
-    })?;
+    let probe = |entry: &str| {
+        let (module, position) = formed[0].program(&seismic_native_target::ProgramEntry::named(entry));
+        module.function(position)
+    };
+    let empty = probe("probe_empty");
     let probe_build_ns = u64::try_from(build_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let execution_started = Instant::now();
     let allocation = Allocation::new(context, 4096).map_err(unavailable)?;
@@ -904,9 +907,7 @@ fn acquire_services(
                           participants_per_unit: u64,
                           topology: ResourceTopology|
      -> Result<(), TargetError> {
-        let function = module_function(&module, entry).map_err(|error| {
-            TargetError::DeviceUnavailable(format!("CUDA probe `{entry}` lookup: {error:?}"))
-        })?;
+        let function = probe(entry);
         let latency_units = u64::from(latency_block[0])
             * u64::from(latency_block[1])
             * u64::from(latency_block[2])
@@ -1089,21 +1090,15 @@ fn acquire_services(
     )?;
 
     definitions.extend(acquire_core_services(
-        context,
-        stream,
-        empty,
+        service,
         &allocation,
-        facts,
         timer_resolution,
         &baseline,
     )?);
     let required: BTreeSet<_> =
         <seismic_estimator::CoreService as seismic_estimator::AnalyticalService>::ALL
             .iter()
-            .copied()
-            .map(|service| {
-                ServiceClassId::new(seismic_estimator::AnalyticalService::stable_name(service))
-            })
+            .map(|service| seismic_estimator::AnalyticalService::class(*service))
             .collect();
     debug_assert!(required
         .iter()
@@ -1150,6 +1145,21 @@ fn acquire_services(
     ))
 }
 
+/// The entries of [`probe_source`], in its order.
+const PROBE_ENTRIES: [&str; 11] = [
+    "probe_empty",
+    "probe_instruction",
+    "probe_global_read",
+    "probe_global_write",
+    "probe_shared_read",
+    "probe_shared_write",
+    "probe_atomic",
+    "probe_barrier",
+    "probe_subgroup",
+    "probe_matrix",
+    "probe_repack",
+];
+
 fn probe_source(target: PtxTarget) -> String {
     format!(
         "{}\
@@ -1181,6 +1191,18 @@ struct ProbeObservation {
 struct AcquiredBatch {
     observations: Vec<ProbeObservation>,
     acquisition_duration_ns: u64,
+    /// How its observations were timed, which decides how they bound an
+    /// interval.
+    timing: BatchTiming,
+}
+
+/// How a batch's observations were timed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchTiming {
+    /// By CUDA events on the device's stream: a confidence interval.
+    Device,
+    /// By the host's monotonic clock, its observations bounded by `spread`.
+    Host(HostSpread),
 }
 
 fn interval_qualified(interval: DurationInterval, percent: u128) -> bool {
@@ -1277,6 +1299,7 @@ fn measure_kernel(
         observations,
         acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
             .unwrap_or(u64::MAX),
+        timing: BatchTiming::Device,
     })
 }
 
@@ -1391,6 +1414,7 @@ fn measure_kernel_sequence_difference_round(
         observations,
         acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
             .unwrap_or(u64::MAX),
+        timing: BatchTiming::Device,
     })
 }
 
@@ -1403,10 +1427,9 @@ fn measured_definition(
     latency: &AcquiredBatch,
     saturated: &AcquiredBatch,
 ) -> ServiceDefinition {
-    let host_fact = probe.starts_with("probe_scalar_") || probe == "probe_data_check";
-    let stochastic_host_fact = probe == "probe_scalar_read";
+    let extrema = latency.timing == BatchTiming::Host(HostSpread::Extrema);
     let latency_interval = widen_interval(
-        if host_fact && !stochastic_host_fact {
+        if extrema {
             normalized_observation_interval(&latency.observations)
         } else {
             normalized_confidence_interval(&latency.observations)
@@ -1418,7 +1441,7 @@ fn measured_definition(
             normalized_confidence_interval(&saturated.observations),
             timer_resolution_ns,
         )
-    } else if host_fact && !stochastic_host_fact {
+    } else if extrema {
         widen_interval(
             differential_wave_interval(&saturated.observations, &baseline.observations, topology),
             timer_resolution_ns,
@@ -1433,12 +1456,10 @@ fn measured_definition(
             timer_resolution_ns,
         )
     };
-    let method = if stochastic_host_fact {
-        "bounded-whole-batch-v5/host-monotonic-confidence95-differential"
-    } else if host_fact {
-        "bounded-whole-batch-v5/host-monotonic-extrema-differential"
-    } else {
-        "bounded-whole-batch-v5/cuda-event-500ns-confidence95-differential"
+    let method = match latency.timing {
+        BatchTiming::Host(HostSpread::Confidence) => "calibrated-whole-batch-v6/host-monotonic-confidence95-differential",
+        BatchTiming::Host(HostSpread::Extrema) => "calibrated-whole-batch-v6/host-monotonic-extrema-differential",
+        BatchTiming::Device => "bounded-whole-batch-v5/cuda-event-500ns-confidence95-differential",
     };
     let saturated_units = saturated
         .observations
@@ -1526,6 +1547,8 @@ fn service_accuracy(class: seismic_estimator::ServiceClassId) -> ServiceAccuracy
             | SERVICE_FILL
             | SERVICE_SCALAR_READ
             | SERVICE_SUBMISSION
+            | SERVICE_ALLOCATION_INSTANCE
+            | SERVICE_TENSOR_PUBLICATION
     ) {
         ServiceAccuracyClass::MemoryOrTransfer
     } else {
@@ -1774,122 +1797,35 @@ fn differential_wave_confidence_interval(
     )
 }
 
+/// Every core service's definition, each measured on what this backend does
+/// for it.
 fn acquire_core_services(
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
-    _empty: crate::driver::Handle,
+    service: &crate::Device,
     allocation: &Allocation,
-    _facts: &CudaFacts,
     event_resolution: DurationInterval,
     launch_baseline: &AcquiredBatch,
 ) -> Result<Vec<ServiceDefinition>, TargetError> {
+    let (context, stream) = (service.context(), service.stream());
     let topology = ResourceTopology {
         resources: 1,
         max_concurrency: 1,
     };
-    let mut services = vec![measured_definition(
-        SERVICE_SUBMISSION,
-        topology,
-        "probe_empty",
-        event_resolution,
-        launch_baseline,
-        launch_baseline,
-        launch_baseline,
-    )];
     let bytes = 64 * 1024 * 1024;
     let transfer_source = Allocation::new(context, bytes).map_err(unavailable)?;
     let transfer_destination = Allocation::new(context, bytes).map_err(unavailable)?;
-    let copy = measure_stream_operation(
-        context,
-        stream,
-        bytes as u64,
-        event_resolution,
-        2,
-        "probe_device_copy",
-        || unsafe {
-            context.driver.check(
-                context.enqueue().memcpy_device_async(
-                    transfer_destination.pointer,
-                    transfer_source.pointer,
-                    bytes,
-                    stream.raw(),
-                ),
-                "profile device copy",
-            )
-        },
-    )?;
-    let fill = measure_stream_operation(
-        context,
-        stream,
-        bytes as u64,
-        event_resolution,
-        2,
-        "probe_device_fill",
-        || unsafe {
-            context.driver.check(
-                context.enqueue().memset_d8_async(transfer_source.pointer, 0, bytes, stream.raw()),
-                "profile device fill",
-            )
-        },
-    )?;
-    services.push(measured_definition(
-        SERVICE_COPY,
-        topology,
-        "probe_device_copy",
-        event_resolution,
-        launch_baseline,
-        &copy,
-        &copy,
-    ));
-    services.push(measured_definition(
-        SERVICE_FILL,
-        topology,
-        "probe_device_fill",
-        event_resolution,
-        launch_baseline,
-        &fill,
-        &fill,
-    ));
-
     let host_resolution = host_timer_resolution()?;
     let host_baseline = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
         host_resolution,
         1,
+        HostSpread::Extrema,
         "probe_host_baseline",
-        || std::hint::black_box(()),
-    )?;
-    let scalar_read = measure_host_result(32_768, host_resolution, 2, "probe_scalar_read", || {
-        let mut bytes = [0u8; 4];
-        allocation.download_at(0, &mut bytes).map_err(unavailable)
-    })?;
-    let scalar_move = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
-        host_resolution,
-        1,
-        "probe_scalar_move",
         || {
-            let source = std::hint::black_box(0x1234_5678_u64);
-            std::hint::black_box(source);
+            std::hint::black_box(());
+            Ok(())
         },
     )?;
-    let data_check = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
-        host_resolution,
-        1,
-        "probe_data_check",
-        || {
-            let left = std::hint::black_box(0x1234_5678_u64);
-            let right = std::hint::black_box(0x1234_5678_u64);
-            std::hint::black_box(left == right);
-        },
-    )?;
-    for (class, probe, observations) in [
-        (SERVICE_SCALAR_READ, "probe_scalar_read", scalar_read),
-        (SERVICE_SCALAR_MOVE, "probe_scalar_move", scalar_move),
-        (SERVICE_DATA_CHECK, "probe_data_check", data_check),
-    ] {
-        services.push(measured_definition(
+    let host = |class, probe, observations: AcquiredBatch| {
+        measured_definition(
             class,
             topology,
             probe,
@@ -1897,9 +1833,170 @@ fn acquire_core_services(
             &host_baseline,
             &observations,
             &observations,
-        ));
-    }
-    Ok(services)
+        )
+    };
+    <CoreService as AnalyticalService>::ALL
+        .iter()
+        .map(|core| -> Result<ServiceDefinition, TargetError> {
+            let class = core.class();
+            Ok(match core {
+                CoreService::Submission => measured_definition(
+                    class,
+                    topology,
+                    "probe_empty",
+                    event_resolution,
+                    launch_baseline,
+                    launch_baseline,
+                    launch_baseline,
+                ),
+                CoreService::Copy => {
+                    let copy = measure_stream_operation(
+                        context,
+                        stream,
+                        bytes as u64,
+                        event_resolution,
+                        2,
+                        "probe_device_copy",
+                        || unsafe {
+                            context.driver.check(
+                                context.enqueue().memcpy_device_async(
+                                    transfer_destination.pointer,
+                                    transfer_source.pointer,
+                                    bytes,
+                                    stream.raw(),
+                                ),
+                                "profile device copy",
+                            )
+                        },
+                    )?;
+                    measured_definition(
+                        class,
+                        topology,
+                        "probe_device_copy",
+                        event_resolution,
+                        launch_baseline,
+                        &copy,
+                        &copy,
+                    )
+                }
+                CoreService::Fill => {
+                    let fill = measure_stream_operation(
+                        context,
+                        stream,
+                        bytes as u64,
+                        event_resolution,
+                        2,
+                        "probe_device_fill",
+                        || unsafe {
+                            context.driver.check(
+                                context.enqueue().memset_d8_async(
+                                    transfer_source.pointer,
+                                    0,
+                                    bytes,
+                                    stream.raw(),
+                                ),
+                                "profile device fill",
+                            )
+                        },
+                    )?;
+                    measured_definition(
+                        class,
+                        topology,
+                        "probe_device_fill",
+                        event_resolution,
+                        launch_baseline,
+                        &fill,
+                        &fill,
+                    )
+                }
+                CoreService::ScalarRead => host(
+                    class,
+                    "probe_scalar_read",
+                    measure_host(
+                        host_resolution,
+                        2,
+                        HostSpread::Confidence,
+                        "probe_scalar_read",
+                        || {
+                            let mut bytes = [0u8; 4];
+                            allocation.download_at(0, &mut bytes).map_err(unavailable)
+                        },
+                    )?,
+                ),
+                CoreService::ScalarMove => host(
+                    class,
+                    "probe_scalar_move",
+                    measure_host(
+                        host_resolution,
+                        1,
+                        HostSpread::Extrema,
+                        "probe_scalar_move",
+                        || {
+                            let source = std::hint::black_box(0x1234_5678_u64);
+                            std::hint::black_box(source);
+                            Ok(())
+                        },
+                    )?,
+                ),
+                // A reached instance's backing, as the executor acquires one:
+                // the device's allocation of a block range, released after.
+                CoreService::AllocationInstance => host(
+                    class,
+                    "probe_allocation_instance",
+                    measure_host(
+                        host_resolution,
+                        2,
+                        HostSpread::Confidence,
+                        "probe_allocation_instance",
+                        || {
+                            let instance = <crate::Device as seismic_compiler::executable::DeviceService<Cuda>>::allocate(
+                                service,
+                                seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                                256,
+                            )
+                            .map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?;
+                            drop(std::hint::black_box(instance));
+                            Ok(())
+                        },
+                    )?,
+                ),
+                // A publication as the schedule's execution records it.
+                CoreService::TensorPublication => {
+                    let mut probe = seismic_compiler::executable::TensorPublicationProbe::new();
+                    host(
+                        class,
+                        "probe_tensor_publication",
+                        measure_host(
+                            host_resolution,
+                            2,
+                            HostSpread::Confidence,
+                            "probe_tensor_publication",
+                            || {
+                                probe.publish();
+                                Ok(())
+                            },
+                        )?,
+                    )
+                }
+                CoreService::DataCheck => host(
+                    class,
+                    "probe_data_check",
+                    measure_host(
+                        host_resolution,
+                        1,
+                        HostSpread::Extrema,
+                        "probe_data_check",
+                        || {
+                            let left = std::hint::black_box(0x1234_5678_u64);
+                            let right = std::hint::black_box(0x1234_5678_u64);
+                            std::hint::black_box(left == right);
+                            Ok(())
+                        },
+                    )?,
+                ),
+            })
+        })
+        .collect()
 }
 
 fn measure_stream_operation(
@@ -1944,6 +2041,7 @@ fn measure_stream_operation(
                 observations,
                 acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
                     .unwrap_or(u64::MAX),
+                timing: BatchTiming::Device,
             });
         }
         last = Some(interval);
@@ -1956,96 +2054,86 @@ fn measure_stream_operation(
     ))
 }
 
-fn measure_host(
-    mut units: u64,
-    timer_resolution: DurationInterval,
-    percent: u128,
-    probe: &str,
-    mut operation: impl FnMut(),
-) -> Result<AcquiredBatch, TargetError> {
-    units = units.max(1);
-    let mut last = None;
-    for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        let acquisition_started = Instant::now();
-        for _ in 0..units {
-            operation();
-        }
-        let observations = (0..HOST_DETERMINISTIC_REPETITIONS)
-            .map(|_| {
-                let start = Instant::now();
-                for _ in 0..units {
-                    operation();
-                }
-                ProbeObservation {
-                    nanoseconds: start.elapsed().as_nanos() as f64,
-                    units,
-                }
-            })
-            .collect::<Vec<_>>();
-        let interval = widen_interval(
-            normalized_observation_interval(&observations),
-            timer_resolution,
-        );
-        if interval_qualified(interval, percent) {
-            return Ok(AcquiredBatch {
-                observations,
-                acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
-                    .unwrap_or(u64::MAX),
-            });
-        }
-        last = Some(interval);
-    }
-    Err(acquisition_failure(
-        probe,
-        percent,
-        last.unwrap_or_else(|| DurationInterval::new(0, u64::MAX, 1)),
-        MAX_HOST_ACQUISITION_ROUNDS,
-    ))
+/// How a host probe's observations bound its interval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostSpread {
+    /// A deterministic operation: the extrema of a few observations.
+    Extrema,
+    /// A stochastic operation: the 95% confidence interval of the mean.
+    Confidence,
 }
 
-fn measure_host_result(
-    mut units: u64,
+impl HostSpread {
+    fn repetitions(self) -> usize {
+        match self {
+            Self::Extrema => HOST_DETERMINISTIC_REPETITIONS,
+            Self::Confidence => HOST_STOCHASTIC_REPETITIONS,
+        }
+    }
+
+    fn interval(self, observations: &[ProbeObservation]) -> DurationInterval {
+        match self {
+            Self::Extrema => normalized_observation_interval(observations),
+            Self::Confidence => normalized_confidence_interval(observations),
+        }
+    }
+}
+
+/// Measures a host operation in observations of a unit count calibrated to
+/// the duration the band needs at the host timer's resolution; a round that
+/// does not qualify grows the count for the next by how far it missed,
+/// within the round budget (`seismic_estimator::escalate_observation_units`).
+fn measure_host(
     timer_resolution: DurationInterval,
-    percent: u128,
+    percent: u64,
+    spread: HostSpread,
     probe: &str,
     mut operation: impl FnMut() -> Result<(), TargetError>,
 ) -> Result<AcquiredBatch, TargetError> {
-    units = units.max(1);
-    let mut last = None;
-    for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        let acquisition_started = Instant::now();
+    let mut observe = |units: u64| -> Result<u64, TargetError> {
+        let start = Instant::now();
         for _ in 0..units {
             operation()?;
         }
-        let mut observations = Vec::with_capacity(HOST_STOCHASTIC_REPETITIONS);
-        for _ in 0..HOST_STOCHASTIC_REPETITIONS {
-            let start = Instant::now();
-            for _ in 0..units {
-                operation()?;
-            }
+        Ok(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    };
+    let mut units = seismic_estimator::calibrate_observation_units(
+        seismic_estimator::required_observation_ns(timer_resolution.upper_numerator, percent),
+        &mut observe,
+    )?;
+    let mut last = None;
+    let mut rounds = 0;
+    while rounds < MAX_HOST_ACQUISITION_ROUNDS {
+        rounds += 1;
+        let acquisition_started = Instant::now();
+        observe(units)?;
+        let mut observations = Vec::with_capacity(spread.repetitions());
+        for _ in 0..spread.repetitions() {
             observations.push(ProbeObservation {
-                nanoseconds: start.elapsed().as_nanos() as f64,
+                nanoseconds: observe(units)? as f64,
                 units,
             });
         }
-        let interval = widen_interval(
-            normalized_confidence_interval(&observations),
-            timer_resolution,
-        );
-        if interval_qualified(interval, percent) {
+        let interval = widen_interval(spread.interval(&observations), timer_resolution);
+        if interval_qualified(interval, u128::from(percent)) {
             return Ok(AcquiredBatch {
                 observations,
                 acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
                     .unwrap_or(u64::MAX),
+                timing: BatchTiming::Host(spread),
             });
         }
         last = Some(interval);
+        match seismic_estimator::escalate_observation_units(units, acquisition_started.elapsed(), Some(interval), percent) {
+            Some(next) => units = next,
+            None => break,
+        }
     }
     Err(acquisition_failure(
         probe,
-        percent,
+        u128::from(percent),
         last.unwrap_or_else(|| DurationInterval::new(0, u64::MAX, 1)),
-        MAX_HOST_ACQUISITION_ROUNDS,
+        rounds,
     ))
 }
 
@@ -2243,13 +2331,9 @@ mod acquisition_tests {
     }
 
     #[test]
-    fn host_noop_baseline_uses_the_fixed_compute_amplification_domain() {
-        assert_eq!(HOST_COMPUTE_AMPLIFICATION_UNITS, 268_435_456);
+    fn host_noop_baseline_is_normalized_by_its_own_units() {
         let observed = [observation(65_536.0, 32_768)];
-        let baseline = [observation(
-            HOST_COMPUTE_AMPLIFICATION_UNITS as f64,
-            HOST_COMPUTE_AMPLIFICATION_UNITS,
-        )];
+        let baseline = [observation(268_435_456.0, 268_435_456)];
         assert_eq!(
             differential_interval(&observed, &baseline),
             DurationInterval::new(65_535, 65_535, 32_768),
@@ -2258,21 +2342,23 @@ mod acquisition_tests {
 
     #[test]
     fn host_probe_classification_separates_stochastic_downloads_from_compute() {
-        let batch = |values: Vec<f64>, units| AcquiredBatch {
+        let batch = |values: Vec<f64>, units, spread| AcquiredBatch {
             observations: values
                 .into_iter()
                 .map(|nanoseconds| observation(nanoseconds, units))
                 .collect(),
             acquisition_duration_ns: 1,
+            timing: BatchTiming::Host(spread),
         };
         let baseline = batch(
-            vec![HOST_COMPUTE_AMPLIFICATION_UNITS as f64; HOST_DETERMINISTIC_REPETITIONS],
-            HOST_COMPUTE_AMPLIFICATION_UNITS,
+            vec![268_435_456.0; HOST_DETERMINISTIC_REPETITIONS],
+            268_435_456,
+            HostSpread::Extrema,
         );
         let stochastic_values = (0..HOST_STOCHASTIC_REPETITIONS)
             .map(|index| if index % 2 == 0 { 90.0 } else { 110.0 })
             .collect::<Vec<_>>();
-        let stochastic = batch(stochastic_values.clone(), 1);
+        let stochastic = batch(stochastic_values.clone(), 1, HostSpread::Confidence);
         let scalar_read = measured_definition(
             SERVICE_SCALAR_READ,
             ResourceTopology {
@@ -2294,9 +2380,9 @@ mod acquisition_tests {
         };
         assert!(batches[1].method.contains("host-monotonic-confidence95"));
 
-        let deterministic = batch(stochastic_values, 1);
+        let deterministic = batch(stochastic_values, 1, HostSpread::Extrema);
         let scalar_move = measured_definition(
-            SERVICE_SCALAR_MOVE,
+            CoreService::ScalarMove.class(),
             ResourceTopology {
                 resources: 1,
                 max_concurrency: 1,
@@ -2374,6 +2460,7 @@ mod acquisition_tests {
                 .map(|_| observation(nanoseconds, 1))
                 .collect(),
             acquisition_duration_ns,
+            timing: BatchTiming::Device,
         };
         let baseline = batch(10.0, 11);
         let latency = batch(100.0, 22);

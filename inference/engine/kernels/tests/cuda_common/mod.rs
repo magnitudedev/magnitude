@@ -8,9 +8,10 @@ use magnitude_kernels::dense_expand;
 use seismic::{BackendName, Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
 use seismic_lang::registry::bf16_round;
 
-/// The CUDA device, opened with the test binary's one store of compiled
-/// programs ([`seismic_native_tests::devices`]): a form a test prepares again,
-/// for another row count, mode or mapping, compiles once in the process.
+/// The CUDA device, opened as every native test opens its devices
+/// ([`seismic_native_tests::devices`]): it forms through the user store, so a
+/// form a test prepares again, for another row count, mode or mapping, or
+/// that an earlier run formed, is loaded, not compiled.
 pub fn cuda() -> Option<Device> {
     seismic_native_tests::devices(&[BackendName::Cuda]).into_iter().next()
 }

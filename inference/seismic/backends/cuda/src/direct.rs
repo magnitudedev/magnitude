@@ -23,8 +23,10 @@ const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 /// The kernel functions of one CUDA program, loaded on one device.
 pub struct DirectModule {
     /// Keeps the functions' module loaded.
-    _module: Arc<Module>,
+    module: Arc<Module>,
     functions: Vec<DirectFunction>,
+    /// The bytes of the CUBIN the module was loaded from.
+    image_bytes: u64,
     /// How a replayed launch of this module depends on the launch before
     /// it: programmatic when the source declares
     /// `SEISMIC_PROGRAMMATIC_DEPENDENCY` (every kernel waits for its
@@ -73,11 +75,16 @@ pub(crate) fn formation_error(error: NvrtcError) -> NativeCompilationError {
 }
 
 fn jit_error(error: JitError) -> NativeCompilationError {
-    NativeCompilationError::ToolchainFailure(match error {
+    NativeCompilationError::ToolchainFailure(jit_report(error))
+}
+
+/// What a JIT failure reports: the driver's error and its log.
+pub(crate) fn jit_report(error: JitError) -> String {
+    match error {
         JitError::Toolchain { error, log } => format!("{error}\n{log}"),
         JitError::Driver(error) => error.to_string(),
         JitError::MalformedImage(message) => message,
-    })
+    }
 }
 
 fn driver_failure(error: DriverError) -> NativeCompilationError {
@@ -158,10 +165,26 @@ impl DirectModule {
             driver::Edge::Complete
         };
         Ok(Self {
-            _module: Arc::new(module),
+            module: Arc::new(module),
             functions,
+            image_bytes: u64::try_from(image.len()).expect("a CUBIN's size fits u64"),
             edge,
         })
+    }
+
+    /// The context the module is loaded in.
+    pub(crate) fn context(&self) -> &Arc<driver::Context> {
+        &self.module.context
+    }
+
+    /// The driver's handle of kernel `function`.
+    pub(crate) fn function(&self, function: usize) -> Handle {
+        self.functions[function].raw
+    }
+
+    /// The bytes of the CUBIN the module was loaded from.
+    pub fn image_bytes(&self) -> u64 {
+        self.image_bytes
     }
 
     pub fn max_threads_per_block(&self, function: usize) -> u64 {

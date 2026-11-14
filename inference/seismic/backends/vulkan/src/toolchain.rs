@@ -15,9 +15,14 @@
 use crate::device::Device;
 use crate::formation::{self, DirectModule};
 use seismic_native_target::{
-    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Artifact, Declined, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
     Toolchain, ToolchainIdentity,
 };
+
+/// This build's formation code ([`build.rs`](../build.rs)): its seal and
+/// validation passes, its glslang and SPIR-V Tools, and how it creates
+/// pipelines. Part of every stored artifact's key, never of tuning's.
+pub const FORMATION_BUILD: &str = env!("SEISMIC_FORMATION_BUILD");
 
 pub struct VulkanToolchain {
     device: Device,
@@ -29,6 +34,7 @@ impl VulkanToolchain {
         let identity = ToolchainIdentity {
             namespace: "vulkan",
             material: formation::formation(&device),
+            stored: format!("build {FORMATION_BUILD}"),
         };
         Self { device, identity }
     }
@@ -42,11 +48,9 @@ pub struct SpirvPipelines {
     pipelines: Vec<u8>,
 }
 
-impl Artifact for SpirvPipelines {
-    const ENCODING: u32 = 1;
-
-    /// The pipeline cache data, length-prefixed, then the modules
-    /// ([`pack`]).
+impl SpirvPipelines {
+    /// Its bytes, as [`Artifact::decode`] reads them: the pipeline cache
+    /// data, length-prefixed, then the modules ([`pack`]).
     fn encode(&self) -> Vec<u8> {
         let length = u32::try_from(self.pipelines.len()).expect("pipeline cache data fits u32");
         let mut bytes = length.to_le_bytes().to_vec();
@@ -54,8 +58,12 @@ impl Artifact for SpirvPipelines {
         bytes.extend(pack(&self.modules));
         bytes
     }
+}
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
+impl Artifact for SpirvPipelines {
+    const ENCODING: u32 = 1;
+
+    fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
         let length = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
         let end = 4usize.checked_add(length)?;
         Some(Self {
@@ -107,9 +115,8 @@ fn unpack(mut bytes: &[u8]) -> Option<Vec<(String, Vec<u32>)>> {
 impl Toolchain for VulkanToolchain {
     type Artifact = SpirvPipelines;
     type Program = DirectModule;
-    /// Pipelines are created from the artifact's data and fail where it
-    /// would take a compile.
-    const LOAD: Load = Load::Complete;
+    /// The artifact itself: the compile made it.
+    type Pending = SpirvPipelines;
 
     fn identity(&self) -> &ToolchainIdentity {
         &self.identity
@@ -143,11 +150,14 @@ impl Toolchain for VulkanToolchain {
         Ok((artifact, program))
     }
 
-    fn load(
-        &self,
-        artifact: &SpirvPipelines,
-        entries: &[ProgramEntry],
-    ) -> Result<Option<DirectModule>, NativeCompilationError> {
+    fn artifact(&self, artifact: SpirvPipelines) -> Result<Vec<u8>, NativeCompilationError> {
+        Ok(artifact.encode())
+    }
+
+    /// An artifact without a requested entry, or whose pipeline cache data
+    /// the driver would have to compile past, is declined: a miss,
+    /// compiled again.
+    fn load(&self, artifact: &SpirvPipelines, entries: &[ProgramEntry]) -> Result<DirectModule, Declined> {
         let held = entries
             .iter()
             .map(|entry| {
@@ -156,15 +166,11 @@ impl Toolchain for VulkanToolchain {
                     .iter()
                     .find(|(symbol, _)| *symbol == entry.symbol)
                     .map(|(_, words)| (words.as_slice(), entry))
-                    .ok_or_else(|| {
-                        NativeCompilationError::MalformedToolchainOutput(format!(
-                            "the Vulkan artifact holds no `{}`",
-                            entry.symbol
-                        ))
-                    })
+                    .ok_or_else(|| Declined(format!("the Vulkan artifact holds no `{}`", entry.symbol)))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        DirectModule::load(&self.device, &held, &artifact.pipelines)
+        DirectModule::load(&self.device, &held, &artifact.pipelines)?
+            .ok_or_else(|| Declined("the driver does not create a pipeline from the stored cache data without compiling".into()))
     }
 
     fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {
@@ -179,8 +185,8 @@ mod tests {
     /// A program compiled once loads from its artifact in another
     /// toolchain on the same device without compiling: its pipelines are
     /// created with `FAIL_ON_PIPELINE_COMPILE_REQUIRED`, so the load either
-    /// holds every pipeline or is a miss (the driver declined the data),
-    /// never a failure.
+    /// holds every pipeline or is declined for the driver's own reason
+    /// (it would compile), never for the artifact's.
     #[test]
     fn a_program_loads_from_its_artifact_or_misses() {
         for description in crate::test_devices() {
@@ -204,10 +210,10 @@ mod tests {
                 .expect("the program compiles")
                 .0
                 .encode();
-            let artifact = SpirvPipelines::decode(&bytes).expect("the artifact decodes");
-            VulkanToolchain::new(open())
-                .load(&artifact, &source.entries)
-                .expect("a load is served or misses");
+            let artifact = SpirvPipelines::decode(&bytes, None).expect("the artifact decodes");
+            if let Err(declined) = VulkanToolchain::new(open()).load(&artifact, &source.entries) {
+                assert!(declined.0.contains("without compiling"), "a load is served or the driver declines its data: {declined}");
+            }
         }
     }
 
@@ -218,7 +224,7 @@ mod tests {
                 modules: vec![("main".into(), vec![7, 8])],
                 pipelines: data.to_vec(),
             };
-            let decoded = SpirvPipelines::decode(&artifact.encode()).unwrap();
+            let decoded = SpirvPipelines::decode(&artifact.encode(), None).unwrap();
             assert_eq!(decoded.pipelines, data);
             assert_eq!(decoded.modules, artifact.modules);
         }

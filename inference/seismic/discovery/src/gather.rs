@@ -3,6 +3,7 @@
 //! topology revision.
 
 use crate::host;
+use seismic_native_target::ArtifactStore;
 use seismic_topology::{Availability, CpuReport, Reports, VolumeReport};
 use std::fmt;
 use std::path::PathBuf;
@@ -65,10 +66,10 @@ pub(crate) struct Natives {
 
 /// Read the backend crates and the OS. Only cheap native queries run, except
 /// what the backends themselves need to establish availability, grants and
-/// capability: a Metal device's language and tensor-operation probes
-/// (compiles), and a discrete CUDA device's usable memory, which needs its
-/// context (once per process).
-pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
+/// capability: a Metal device's capability probes (compiles), whose answers
+/// are read from `store` and run only where it lacks them, and a discrete
+/// CUDA device's usable memory, which needs its context (once per process).
+pub(crate) fn gather(paths: &[PathBuf], store: &dyn ArtifactStore) -> Result<Gathered, DiscoveryError> {
     let host = host::capacity().map_err(DiscoveryError::HostMemory)?;
     let os_build = host::os_build().map_err(DiscoveryError::OsBuild)?;
     let mut diagnostics = Vec::new();
@@ -87,11 +88,13 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
 
     #[cfg(target_os = "macos")]
     let (metal, natives) = {
-        let (metal, handles) = seismic_metal::topology::describe(&mut diagnostics)
+        let (metal, handles) = seismic_metal::topology::describe(&mut diagnostics, store)
             .into_iter()
             .unzip();
         (metal, Natives { metal: handles })
     };
+    #[cfg(not(target_os = "macos"))]
+    let _ = store;
     #[cfg(not(target_os = "macos"))]
     let mut natives = Natives::default();
     #[cfg(not(target_os = "macos"))]

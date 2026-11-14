@@ -1,15 +1,12 @@
-//! Direct typed-kernel to native compilation.
+//! Typed-kernel to native compilation: the kernel's function emitted as a
+//! CLIF program and formed through the device's programs, so a kernel any
+//! process of the user formed is loaded, compiling nothing.
 
-use crate::command::{CoherentCode, CompiledKernel, JitMemory};
-use crate::emit;
-use crate::{numeric, Cpu};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{default_libcall_names, Linkage, Module};
+use crate::command::CompiledKernel;
+use crate::{emit, toolchain, Cpu, CpuPrograms};
 use seismic_ir::kernel::Kernel;
 use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
-use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::time::Instant;
 
 pub struct NativeCandidate {
@@ -22,71 +19,30 @@ pub struct NativeCandidate {
 }
 
 pub(crate) fn compile_kernel(
+    programs: &CpuPrograms,
     target: &DeviceDescription<Cpu>,
     kernel: &Kernel<Cpu>,
     layout: &KernelEmissionLayout,
 ) -> Result<NativeCandidate, NativeCompilationError> {
     let started = Instant::now();
-    let isa = target.facts().codegen.isa()?;
-    let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
-    builder.memory_provider(Box::new(CoherentCode::new()));
-    for (name, address) in numeric::host_symbols() {
-        builder.symbol(name, address);
-    }
-    let mut module = JITModule::new(builder);
-    let emitted = emit::emit(
-        &mut module,
-        kernel,
-        layout,
-        target.facts().codegen.call_conv,
-    )?;
-    let declared = module
-        .declare_function(
-            "seismic_cpu_kernel",
-            Linkage::Local,
-            &emitted.function.signature,
-        )
-        .map_err(toolchain)?;
-    let mut context = module.make_context();
-    context.func = emitted.function;
-    context.func.name = cranelift_codegen::ir::UserFuncName::user(0, declared.as_u32());
-    for import in emitted.imports {
-        let imported = module
-            .declare_function(import.name, Linkage::Import, &import.signature)
-            .map_err(toolchain)?;
-        let native = module.declare_func_in_func(imported, &mut context.func);
-        context.func.dfg.ext_funcs[import.reference] = context.func.dfg.ext_funcs[native].clone();
-    }
-    module
-        .define_function(declared, &mut context)
-        .map_err(|error| {
-            NativeCompilationError::ToolchainFailure(format!("Cranelift definition: {error:?}"))
-        })?;
-    let compiled = context.compiled_code().ok_or_else(|| {
-        NativeCompilationError::ToolchainFailure(
-            "Cranelift did not retain authoritative compiled-code metadata".into(),
-        )
-    })?;
-    let frame_size = u64::from(compiled.frame_size);
-    let code_bytes = u64::from(compiled.code_info().total_size);
-    if code_bytes == 0 {
-        return Err(NativeCompilationError::ToolchainFailure(
-            "Cranelift produced an empty native function".into(),
-        ));
-    }
-    let artifact_digest: [u8; 32] = Sha256::digest(compiled.code_buffer()).into();
-    module.clear_context(&mut context);
-    module.finalize_definitions().map_err(toolchain)?;
-    let entry = unsafe {
-        std::mem::transmute::<*const u8, crate::workers::LaunchEntry>(
-            module.get_finalized_function(declared),
-        )
-    };
+    let emitted = emit::emit(kernel, layout, target.facts().codegen.call_conv)?;
+    let source = toolchain::source(&emitted);
+    let formed = programs
+        .form(std::slice::from_ref(&source))?
+        .pop()
+        .expect("one formed source per source");
+    let (program, _) = formed.program(&source.entries[0]);
+    let (entry, artifact_digest, frame_size, code_bytes) = (
+        program.entry(),
+        program.digest(),
+        program.frame_size(),
+        program.code_bytes(),
+    );
     let metadata_bytes = layout_metadata_bytes(layout)?;
     Ok(NativeCandidate {
         kernel: CompiledKernel {
             entry,
-            _memory: Arc::new(JitMemory::new(module)),
+            _program: formed,
             layout: layout.clone(),
         },
         artifact_digest,
@@ -140,8 +96,4 @@ fn layout_metadata_bytes(layout: &KernelEmissionLayout) -> Result<u64, NativeCom
             "CPU native artifact metadata footprint exceeds u64".into(),
         )
     })
-}
-
-fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {
-    NativeCompilationError::ToolchainFailure(error.to_string())
 }

@@ -26,7 +26,7 @@ use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
 use magnitude_executor::assessment::{requests, CostWalk, ExecutorCosts, PointRequests, StoredCosts};
-use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
+use magnitude_executor::KernelCache;
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, RecordStore, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
@@ -395,20 +395,13 @@ pub(super) fn measure_only(
 }
 
 /// End a measurement job's process with `code` once the job is reported,
-/// with what its points hold (`held`). It ends at once, what they hold
-/// released by the system, as by a kill, with no teardown and no wait for
-/// compiles still forming, except where what the job's compiles formed is
-/// kept in the platform's cache (`Held::platform_cached`): that process
-/// drops what its points hold, so the compiles it began end, and exits
-/// normally, its exit handlers leaving the platform's cache written, as a
-/// Prepare's does. A job that held nothing exits normally.
+/// with what its points hold (`held`): at once ([`super::end_at_once`]),
+/// with no wait for compiles still forming. A job that held nothing exits
+/// normally.
 pub fn end_measured(held: Option<magnitude_executor::assessment::Held>, code: i32) -> ! {
     match held {
-        Some(points) if points.platform_cached() => {
-            drop(points);
-            std::process::exit(code)
-        }
-        Some(_) => magnitude_service_utils::process::end(code),
+        // Held, not dropped, until the process ends.
+        Some(_points) => super::end_at_once(code),
         None => std::process::exit(code),
     }
 }
@@ -569,21 +562,20 @@ impl InProcessJobs {
 
 /// The measurement job's probing of the device alone, as a job probes before
 /// it measures ([`measure_machine`]): executor `executor` of the machine
-/// discovered with `paths` runs each of its probes the kernel cache at
-/// `kernels` holds no result of, in a process of its own, within `time`. A
-/// tool whose check reads probed properties runs it before the load it
-/// checks; a load never does.
+/// discovered with `paths` runs each of its probes the process's store
+/// (`seismic::ProgramStore::user`, which every device opens with) holds no
+/// result of, in a process of its own, within `time`. A tool whose check
+/// reads probed properties runs it before the load it checks; a load never
+/// does.
 pub fn probe_machine(
     paths: &[PathBuf],
-    kernels: &Path,
     executor: seismic::ExecutorSelector,
     time: std::time::Duration,
 ) -> Result<seismic::ProbeRun, String> {
     let deadline = std::time::Instant::now() + time;
     let catalog = Devices::discover(paths).map_err(|error| error.to_string())?;
-    let cache = KernelCache::open(kernels.to_path_buf(), DEFAULT_KERNEL_CACHE_BYTES).map_err(|error| error.to_string())?;
     let executor = catalog.resolve(executor).map_err(|error| error.to_string())?;
-    catalog.probe(executor, &cache, deadline).map_err(|error| error.to_string())
+    catalog.probe(executor, &*seismic::ProgramStore::user(), deadline).map_err(|error| error.to_string())
 }
 
 /// Measure the outstanding point requests of the request's executor, in
@@ -639,21 +631,21 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
         Ok(catalog) => catalog,
         Err(error) => return machine(error.to_string()),
     };
-    // The device forms through the kernel cache's artifact store, as a load's
-    // does: a program this job or a load compiled is loaded, not compiled
-    // again. It holds no limit: the walk passes over its paths by holding
-    // them. Its property probes run first, each in a process of its own,
-    // and keep their results in the same store, so the device opens with
-    // them, as every later load does; a probe that keeps nothing is
-    // reported, its property at its safe value.
+    // The device forms through the process's one store, as a load's does: a
+    // program this job or a load compiled is loaded, not compiled again. It
+    // holds no limit: the walk passes over its paths by holding them. Its
+    // property probes run first, each in a process of its own, and keep
+    // their results in the same store, so the device opens with them, as
+    // every later load does; a probe that keeps nothing is reported, its
+    // property at its safe value.
     let mut probing = Vec::new();
-    let device = match KernelCache::open(request.kernels.clone(), DEFAULT_KERNEL_CACHE_BYTES)
+    let device = match catalog
+        .resolve(request.executor)
         .map_err(|error| error.to_string())
-        .and_then(|cache| {
-            let executor = catalog
-                .resolve(request.executor)
+        .and_then(|executor| {
+            let probes = catalog
+                .probe(executor, &*seismic::ProgramStore::user(), deadlines.standing())
                 .map_err(|error| error.to_string())?;
-            let probes = catalog.probe(executor, &cache, deadlines.standing()).map_err(|error| error.to_string())?;
             for kept in &probes.kept {
                 tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
             }
@@ -662,7 +654,7 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
                 .open_with(
                     executor,
                     seismic::DeviceOptions {
-                        artifacts: Some(Arc::new(cache)),
+                        artifacts: None,
                         // The job's point of it (`PointRequest::GraphCost`).
                         graph_cost: None,
                     },

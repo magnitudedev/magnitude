@@ -27,7 +27,7 @@ pub const DIRECT_BUFFER_SLOTS: usize = 31;
 /// pipeline.
 #[derive(Clone)]
 pub struct DirectPipeline {
-    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 // Metal pipeline states are immutable and documented as thread-safe.

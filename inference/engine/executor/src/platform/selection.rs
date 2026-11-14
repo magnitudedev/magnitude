@@ -257,7 +257,7 @@ mod tests {
     /// automatic selection always succeeds.
     #[test]
     fn automatic_selection_takes_a_usable_device_of_the_first_usable_backend() {
-        let catalog = seismic::Inventory::discover(&[]).unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
         let usable = |backend| {
             topology.executors().iter().filter(move |device| {
@@ -332,7 +332,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn automatic_selection_prefers_metal_on_apple_silicon() {
-        let catalog = seismic::Inventory::discover(&[]).unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let selected = select(
             &catalog.topology(),
             ExecutionPath::Native,
@@ -345,7 +345,7 @@ mod tests {
     /// A software Vulkan device is never an automatic candidate.
     #[test]
     fn automatic_selection_leaves_software_vulkan_devices_out() {
-        let catalog = seismic::Inventory::discover(&[]).unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
         for device in topology
             .executors()
@@ -360,7 +360,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vulkan_request_is_refused_with_the_missing_runtime() {
-        let catalog = seismic::Inventory::discover(&[]).unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let request: DeviceRequest = "vulkan".parse().unwrap();
         assert_eq!(
             select(&catalog.topology(), ExecutionPath::Native, request),
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn explicit_backend_and_selector_requests_select_exactly_that_device() {
-        let catalog = seismic::Inventory::discover(&[]).unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
         for device in topology
             .executors()

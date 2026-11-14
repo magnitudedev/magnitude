@@ -69,6 +69,11 @@ pub enum PreparationError {
     PlannedRouteUnavailable {
         backend: seismic_lang::registry::BackendName,
     },
+    /// The device's execution profile, which analytical preparation
+    /// evaluates against, could not be opened (including a probe that did not
+    /// qualify). It is opened once for an open device; the next opening of
+    /// the executor measures it again.
+    ExecutionProfileUnavailable(TargetError),
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
@@ -321,6 +326,9 @@ impl fmt::Display for PreparationError {
                 "`{}` is a native-only backend: planned preparation is unavailable",
                 backend.as_str()
             ),
+            Self::ExecutionProfileUnavailable(e) => {
+                write!(f, "execution profile could not be opened: {e}")
+            }
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
             Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
             Self::InvalidCandidateDomain(s) => write!(f, "invalid candidate domain: {s}"),

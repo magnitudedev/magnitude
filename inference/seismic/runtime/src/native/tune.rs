@@ -1276,16 +1276,10 @@ struct FormationPrice {
 impl FormationPrice {
     /// The price of one challenger formation call that does `formative`;
     /// none while nothing it can be priced by was observed. `toolchain`:
-    /// what the device's toolchain's compiles took in this process. Where
-    /// the toolchain loads through a platform cache (`platform`), a load
-    /// may take a compile's time, so until one is observed it is priced as
-    /// the longest compile observed.
-    fn of(&self, (class, entries): Formative, toolchain: &Linear, platform: bool) -> Option<f64> {
+    /// what the device's toolchain's compiles took in this process.
+    fn of(&self, (class, entries): Formative, toolchain: &Linear) -> Option<f64> {
         match class {
-            FormationClass::Kept => self
-                .kept
-                .price()
-                .or_else(|| (platform && toolchain.longest() > 0.).then(|| toolchain.longest())),
+            FormationClass::Kept => self.kept.price(),
             FormationClass::Compiled => match (self.compiled.each(), self.compiled.mean()) {
                 (Some(_), _) => self.compiled.price(entries),
                 (None, Some((seconds, size))) => {
@@ -1589,7 +1583,6 @@ impl<'m> Formation<'_, 'm> {
         let mut quote = Quote::default();
         let threads = formation_threads(formables.len());
         let toolchain = self.device.programs.compiled();
-        let platform = self.device.programs.platform_cached();
         let formatives = formables
             .iter()
             .map(|formable| self.class(formable))
@@ -1606,7 +1599,7 @@ impl<'m> Formation<'_, 'm> {
             let in_turn = calls.len().div_ceil(threads) as f64 / calls.len() as f64;
             let seconds = calls
                 .iter()
-                .map(|formative| price.of(**formative, &toolchain, platform))
+                .map(|formative| price.of(**formative, &toolchain))
                 .sum::<Option<f64>>();
             quote.add(seconds.map(|seconds| seconds * in_turn), 1);
         }
@@ -4057,15 +4050,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             })
             .fold(self.longest, f64::max);
         let price = self.formation_price.lock().expect("formation price lock");
-        // A platform-cached toolchain's load may take a compile's time: until
-        // the unit has observed a load, it is held to the longest compile
-        // this process observed; after, to the longest load observed, which
-        // the formation price holds.
-        let compiles = match self.device.programs.platform_cached() && price.kept.price().is_none() {
-            true => self.device.programs.compiled().longest(),
-            false => 0.,
-        };
-        Duration::from_secs_f64(observed.max(compiles)).max(price.longest())
+        Duration::from_secs_f64(observed).max(price.longest())
     }
 
     /// The next discovery point: the first whose defaults are unmeasured.
@@ -10101,10 +10086,14 @@ mod tests {
     fn no_formation_starts_that_cannot_end_before_the_deadline() {
         use seismic_lang::checked::{NativeImplementation, SourceFile, SourceSet, check_source_with};
         use seismic_lang::registry::BackendName;
-        let Ok(device) = crate::devices::Devices::discover(&[])
-            .expect("device discovery")
-            .open_backend(BackendName::Metal)
-        else {
+        let devices = crate::devices::Devices::discover(&[]).expect("device discovery");
+        let Ok(metal) = devices.executor_of(BackendName::Metal) else {
+            return;
+        };
+        // A store of its own: no program another test formed is kept.
+        let store = Arc::new(crate::artifacts::ProgramStore::new(Arc::new(seismic_native_target::MemoryStore::default())));
+        let options = crate::artifacts::DeviceOptions { artifacts: Some(store.clone()), ..Default::default() };
+        let Ok(device) = devices.open_own_ledgers(metal, options) else {
             return;
         };
         let module = check_source_with(
@@ -10146,8 +10135,8 @@ mod tests {
             served: &[],
             price: &price,
         };
-        // The device was opened without a store and holds no program: the
-        // toolchain compiles this one.
+        // The device's store holds no program: the toolchain compiles this
+        // one.
         let program = Formable::Program(default.clone());
         assert_eq!(formation.class(&program), (FormationClass::Compiled, 1));
         let quote = formation.quote(std::slice::from_ref(&program));
@@ -10197,7 +10186,7 @@ mod tests {
         let compiled = price
             .lock()
             .unwrap()
-            .of((FormationClass::Compiled, 1), &Linear::default(), false);
+            .of((FormationClass::Compiled, 1), &Linear::default());
         assert!(compiled.is_some_and(|mean| mean < 5.), "{compiled:?}");
         assert!(
             programs
@@ -10228,18 +10217,20 @@ mod tests {
                 price
                     .lock()
                     .unwrap()
-                    .of((FormationClass::Kept, 0), &Linear::default(), false)
+                    .of((FormationClass::Kept, 0), &Linear::default())
                     .unwrap()
             )
         );
         assert!(again.priced < Duration::from_millis(2));
         // Given up by whatever held it, as another unit whose launches
         // render the same text gives up its compiles, the program is live
-        // no longer: forming it compiles again, and is classed so though
-        // this unit formed and released nothing since it was last asked.
+        // no longer. The store keeps what its compile stored, so forming it
+        // loads it and compiles nothing: it is classed so though this unit
+        // formed and released nothing since it was last asked.
         drop(held);
         drop(programs);
-        assert_eq!(formation.class(&program), (FormationClass::Compiled, 1));
+        store.settle();
+        assert_eq!(formation.class(&program), (FormationClass::Kept, 0));
     }
 
     /// A challenger formation is priced by the formations of its class
@@ -10252,7 +10243,7 @@ mod tests {
         let mut price = FormationPrice::default();
         price.canonical = Duration::from_millis(180);
         assert_eq!(
-            price.of((Compiled, 4), &none, false),
+            price.of((Compiled, 4), &none),
             None,
             "a class never observed has no price"
         );
@@ -10260,38 +10251,18 @@ mod tests {
         price.observe((Compiled, 4), Duration::from_secs(1));
         price.observe((Compiled, 4), Duration::from_secs(3));
         assert_eq!(
-            price.of((Kept, 0), &none, false),
+            price.of((Kept, 0), &none),
             None,
             "a compile says nothing of a kept formation"
         );
         price.observe((Kept, 0), Duration::ZERO);
         price.observe((Kept, 0), Duration::ZERO);
         // Calls of one size: their mean, whatever is asked.
-        assert_eq!(price.of((Compiled, 4), &none, false), Some(2.));
-        assert_eq!(price.of((Compiled, 1), &none, false), Some(2.));
-        assert_eq!(price.of((Kept, 0), &none, false), Some(0.));
+        assert_eq!(price.of((Compiled, 4), &none), Some(2.));
+        assert_eq!(price.of((Compiled, 1), &none), Some(2.));
+        assert_eq!(price.of((Kept, 0), &none), Some(0.));
         assert_eq!(price.longest(), Duration::from_secs(3));
         assert_eq!(price.total(), 4.18);
-    }
-
-    /// On a toolchain that loads through a platform cache, a load the
-    /// platform no longer serves takes a compile's time: until a load is
-    /// observed it is priced as the longest compile the process observed,
-    /// and unpriced while there is none.
-    #[test]
-    fn a_platform_load_is_priced_as_a_compile_until_one_is_observed() {
-        use FormationClass::Kept;
-        let price = FormationPrice::default();
-        assert_eq!(price.of((Kept, 0), &Linear::default(), true), None);
-        let mut toolchain = Linear::default();
-        toolchain.observe(2, 1.5);
-        toolchain.observe(4, 3.);
-        assert_eq!(price.of((Kept, 0), &toolchain, true), Some(3.));
-        let complete = price.of((Kept, 0), &toolchain, false);
-        assert_eq!(complete, None, "a complete load prices nothing it did not see");
-        let mut observed = FormationPrice::default();
-        observed.observe((Kept, 0), Duration::from_millis(5));
-        assert_eq!(observed.of((Kept, 0), &toolchain, true), Some(0.005));
     }
 
     /// A class nothing prices is one unknown in a piece, however many of
@@ -10412,19 +10383,19 @@ mod tests {
         // A unit that has compiled nothing is priced by the toolchain's
         // compiles: its first piece is not unpriced.
         let mut unit = FormationPrice::default();
-        close(unit.of((Compiled, 4), &toolchain, false), 1.2);
-        assert_eq!(unit.of((Compiled, 4), &Linear::default(), false), None);
+        close(unit.of((Compiled, 4), &toolchain), 1.2);
+        assert_eq!(unit.of((Compiled, 4), &Linear::default()), None);
         // One call of its own, twice what the toolchain's line says of its
         // size: the unit's level, the toolchain's shape.
         unit.observe((Compiled, 20), Duration::from_secs_f64(4.0));
-        close(unit.of((Compiled, 20), &toolchain, false), 4.0);
-        close(unit.of((Compiled, 4), &toolchain, false), 2.4);
+        close(unit.of((Compiled, 20), &toolchain), 4.0);
+        close(unit.of((Compiled, 4), &toolchain), 2.4);
         // A mean over its calls would price the small call at 4 s.
         // Calls of two sizes: the unit's own line, 3 s a call and 0.05 s
         // an entry.
         unit.observe((Compiled, 40), Duration::from_secs_f64(5.0));
-        close(unit.of((Compiled, 4), &toolchain, false), 3.2);
-        close(unit.of((Compiled, 60), &toolchain, false), 6.0);
+        close(unit.of((Compiled, 4), &toolchain), 3.2);
+        close(unit.of((Compiled, 60), &toolchain), 6.0);
         // Neither term is negative: sizes whose times fall as they grow
         // are priced at their mean.
         let mut falling = Linear::default();
@@ -10480,7 +10451,7 @@ mod tests {
         let ended = run(
             &sequence,
             budget,
-            |class| classed.borrow().of((class, 1), &Linear::default(), false),
+            |class| classed.borrow().of((class, 1), &Linear::default()),
             |class, took| {
                 classed
                     .borrow_mut()

@@ -595,7 +595,7 @@ mod tests {
     fn served_volumes_carry_their_roles() {
         let directory = std::env::temp_dir().join(format!("served-volume-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let inventory = Inventory::discover(&[directory.clone()]).unwrap();
+        let inventory = Inventory::discover(&[directory.clone()], seismic::ProgramStore::user()).unwrap();
         let mut served = ServedVolumes::new(Arc::new(VolumeReserves::new(None)));
         served.tag(&directory, HardwareVolumeRole::ModelStore).unwrap();
         served.tag(&directory, HardwareVolumeRole::KernelCache).unwrap();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn snapshot_keeps_physical_identity_and_all_placement_references() {
-        let inventory = Inventory::discover(&[]).unwrap();
+        let inventory = Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = inventory.topology();
         let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let observed = HardwareInventory::snapshot_with(

@@ -374,11 +374,18 @@ fn metal_scoped_tuning_searches_launches_separately() {
 
 /// A unit's compiles need no device and nothing of its search: the
 /// canonical program and each challenger piece's launch sources compile on
-/// another thread, and the unit's work then compiles nothing itself.
+/// another thread, and the unit's work then compiles nothing itself. The
+/// device has a store of its own, so what another test or process compiled
+/// never stands in for the compiles the test observes.
 #[test]
 fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothing() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let own = seismic::DeviceOptions {
+        artifacts: Some(std::sync::Arc::new(seismic::ProgramStore::new(std::sync::Arc::new(
+            seismic::MemoryStore::default(),
+        )))),
+        graph_cost: None,
+    };
+    let Some(device) = seismic_native_tests::devices_with(&[BackendName::Metal], own).pop() else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));

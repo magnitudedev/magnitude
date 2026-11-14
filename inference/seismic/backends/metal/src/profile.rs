@@ -12,10 +12,10 @@ use crate::facts::{
 };
 use crate::{Metal, BACKEND_REVISION};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSProcessInfo, NSString};
+use objc2_foundation::{NSError, NSProcessInfo, NSString};
 use objc2_metal::{
-    MTLCompileOptions, MTLComputePipelineState, MTLDevice, MTLGPUFamily, MTLLanguageVersion,
-    MTLLibrary, MTLMathFloatingPointFunctions, MTLMathMode,
+    MTLCompileOptions, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLLibraryError,
+    MTLLibraryErrorDomain, MTLMathFloatingPointFunctions, MTLMathMode,
 };
 use seismic_compiler::errors::TargetError;
 use seismic_compiler::target::{
@@ -30,10 +30,13 @@ use seismic_ir::physical_target::{
 };
 use seismic_lang::registry::{self, BackendName, RepresentationKind, REGISTRY_REVISION};
 use seismic_lang::types::DType;
-use seismic_native_target::{CompatibilityIdentity, DeviceDescription};
+use seismic_native_target::{
+    ArtifactKey, ArtifactStore, CompatibilityIdentity, DeviceDescription, PROBES,
+};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub const PROBE_SUITE_REVISION: &str = "seismic-metal-probes-v2";
@@ -64,25 +67,46 @@ pub fn registry() -> &'static CompilerRegistry<Metal> {
 pub fn open_analytical(
     device: &MetalDevice,
     description: std::sync::Arc<DeviceDescription<Metal>>,
+    programs: &crate::MetalPrograms,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Metal>, TargetError> {
-    let execution_parts = crate::pooled(|| acquire_execution_parts(device, description))?;
+    let execution_parts =
+        crate::pooled(|| acquire_execution_parts(device, description, programs))?;
     seismic_compiler::evaluation::AnalyticalEvaluationContext::assemble(
         execution_parts,
         crate::model::MetalAnalyticalModel,
     )
 }
 
+/// The description of `device`, its capability probes' answers read from
+/// `store` and the probes run only where it lacks them ([`probe_answers`]).
 pub fn open_device(
     device: &MetalDevice,
+    store: &dyn ArtifactStore,
 ) -> Result<std::sync::Arc<DeviceDescription<Metal>>, TargetError> {
-    crate::pooled(|| discover_device(device)).map(std::sync::Arc::new)
+    let answers = probe_answers(device.handle(), store);
+    crate::pooled(|| discover_device(device, &answers)).map(std::sync::Arc::new)
 }
 
-/// Gathers every Metal target fact of one device.
-fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, TargetError> {
+/// Gathers every Metal target fact of one device, its probes answered by
+/// `answers`.
+fn discover_device(
+    device: &MetalDevice,
+    answers: &MetalProbeAnswers,
+) -> Result<DeviceDescription<Metal>, TargetError> {
     let handle = device.handle();
     let raw = handle.raw();
-    let language = language(handle)?;
+    let MetalProbeAnswers::Accepted {
+        language,
+        scalar_collective_dtypes,
+        bfloat_arithmetic,
+        matrix_dtypes,
+        matrix_combinations,
+        tensor_matmul_forms,
+        tensor_headers_form: _,
+    } = answers.clone()
+    else {
+        return Err(unsupported_language());
+    };
     let size = raw.maxThreadsPerThreadgroup();
     let facts = MetalFacts {
         device_name: handle.name(),
@@ -100,11 +124,11 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
                 objc2_metal::MTLResourceOptions::StorageModeShared,
             )
             .align as u64,
-        scalar_collective_dtypes: probe_scalar_collectives(raw, language),
-        bfloat_arithmetic: probe_bfloat_arithmetic(raw, language),
-        matrix_dtypes: probe_matrix_dtypes(raw, language),
-        matrix_combinations: probe_matrix_combinations(raw, language),
-        properties: properties_at(raw, language),
+        scalar_collective_dtypes,
+        bfloat_arithmetic,
+        matrix_dtypes,
+        matrix_combinations,
+        properties: properties_at(raw, tensor_matmul_forms),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -115,38 +139,25 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
 fn acquire_execution_parts(
     device: &MetalDevice,
     description: std::sync::Arc<DeviceDescription<Metal>>,
+    programs: &crate::MetalPrograms,
 ) -> Result<ExecutionProfileParts<Metal>, TargetError> {
     let total_started = Instant::now();
-    let mut required_services: std::collections::BTreeSet<_> =
-        <seismic_estimator::CoreService as seismic_estimator::AnalyticalService>::ALL
-            .iter()
-            .copied()
-            .map(|service| {
-                seismic_estimator::ServiceClassId::new(
-                    seismic_estimator::AnalyticalService::stable_name(service),
-                )
-            })
-            .collect();
-    required_services.extend(
-        <seismic_estimator_metal::MetalService as seismic_estimator::AnalyticalService>::ALL
-            .iter()
-            .copied()
-            .filter(|service| {
-                seismic_estimator_metal::service_available(
-                    description.facts().bfloat_arithmetic,
-                    description.intrinsics(),
-                    *service,
-                )
-            })
-            .map(|service| {
-                seismic_estimator::ServiceClassId::new(
-                    seismic_estimator::AnalyticalService::stable_name(service),
-                )
-            }),
-    );
+    // The GPU services the device's model admits; the core services are
+    // the backend's own host and queue measurements (`services::acquire`).
+    let gpu_services = <seismic_estimator_metal::MetalService as seismic_estimator::AnalyticalService>::ALL
+        .iter()
+        .copied()
+        .filter(|service| {
+            seismic_estimator_metal::service_available(
+                description.facts().bfloat_arithmetic,
+                description.intrinsics(),
+                *service,
+            )
+        })
+        .collect::<Vec<_>>();
     let identity_and_limits_ns = total_started.elapsed().as_nanos() as u64;
     let service_acquisition =
-        crate::services::acquire(device, description.facts(), &required_services)?;
+        crate::services::acquire(device, programs, &gpu_services)?;
     let acquisition = ProfileAcquisitionMetrics {
         identity_and_limits_ns,
         probe_build_ns: service_acquisition.metrics.probe_build_ns,
@@ -503,59 +514,317 @@ pub fn operating_system() -> String {
         .to_string()
 }
 
-/// What the backend requires of a device: a compiler that accepts one of
-/// the language versions it emits (no GPU family is required). The highest
-/// accepted version, or why the device cannot run the backend's kernels.
-pub fn language(device: &crate::DeviceHandle) -> Result<LanguageVersion, TargetError> {
-    probe_language_version(device).ok_or_else(|| {
-        TargetError::UnsupportedToolchain(
-            "the Metal compiler accepts none of the language versions this backend emits".into(),
-        )
-    })
+/// What a device's capability probes answered: whether its compiler
+/// accepts a language version the backend emits, and, at the highest it
+/// accepts, what compiles to a pipeline. Each answer is determined by the
+/// probes, their compile options and this build's reading of them (the
+/// formation build), the device, and the Metal compiler, which the OS build
+/// ships, so it is kept in the program store under the key of exactly those
+/// ([`probe_answers`]) and the probes run once per key.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MetalProbeAnswers {
+    /// The compiler accepts none of the language versions this backend
+    /// emits.
+    Unsupported,
+    Accepted {
+        /// The highest language version the compiler accepts.
+        language: LanguageVersion,
+        /// Scalar dtypes whose SIMD-group reductions and shuffles form.
+        scalar_collective_dtypes: BTreeSet<DType>,
+        bfloat_arithmetic: bool,
+        /// Element dtypes whose SIMD-group matrices load and store.
+        matrix_dtypes: BTreeSet<DType>,
+        matrix_combinations: BTreeSet<MatrixCombination>,
+        /// Whether a tensor-operation `matmul2d` forms a pipeline
+        /// (`seismic_lang::device::metal`'s `tensor_matmul_forms`).
+        tensor_matmul_forms: bool,
+        /// Whether the compiler forms the tensor-operation types and
+        /// cooperative destinations (Metal 4), whatever the GPU executes.
+        tensor_headers_form: bool,
+    },
 }
 
-/// The highest language version accepted by the runtime compiler.
-pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVersion> {
-    let device = device.raw();
-    let source = NSString::from_str(&format!(
-        "{PROBE_PRELUDE}kernel void seismic_language_probe(device uint* output [[buffer(0)]]) {{ output[0] = 0u; }}\n"
-    ));
-    [
-        LanguageVersion::V4_1,
-        LanguageVersion::V4_0,
-        LanguageVersion::V3_2,
-        LanguageVersion::V3_1,
-        LanguageVersion::V3_0,
-        LanguageVersion::V2_4,
-        LanguageVersion::V2_3,
-    ]
-    .into_iter()
-    .find(|version| {
-        crate::pooled(|| {
-            device
-                .newLibraryWithSource_options_error(&source, Some(&compile_options(*version)))
-                .is_ok()
-        })
-    })
+impl MetalProbeAnswers {
+    /// The language version the backend compiles to, or why the device
+    /// cannot run the backend's kernels.
+    pub fn language(&self) -> Result<LanguageVersion, TargetError> {
+        match self {
+            Self::Accepted { language, .. } => Ok(*language),
+            Self::Unsupported => Err(unsupported_language()),
+        }
+    }
+
+    /// Whether `device`, whose probes these answers are, forms tensor
+    /// operations: the property its opened description holds, from the
+    /// same queries and answers, so planning before a device is opened and
+    /// the opened device agree.
+    pub fn forms_tensor_operations(&self, device: &crate::DeviceHandle) -> bool {
+        match self {
+            Self::Accepted { tensor_matmul_forms, .. } => {
+                properties_at(device.raw(), *tensor_matmul_forms).tensor_ops.holds()
+            }
+            Self::Unsupported => false,
+        }
+    }
+
+    /// Whether this host's Metal compiler forms tensor-operation types and
+    /// cooperative destinations, whatever the GPU executes: what forming a
+    /// `SEISMIC_HAS_TENSOR_OPS` source needs.
+    pub fn forms_tensor_headers(&self) -> bool {
+        match self {
+            Self::Accepted { tensor_headers_form, .. } => *tensor_headers_form,
+            Self::Unsupported => false,
+        }
+    }
+
+    /// Every probe run on `device`, at the highest language version its
+    /// compiler accepts, and the probes that did not run to a verdict
+    /// ([`Probe`]), each named by its kernel and language version: the
+    /// answers hold beyond this process only when there are none.
+    fn probe(device: &crate::DeviceHandle) -> (Self, Vec<String>) {
+        let raw = device.raw();
+        let mut not_run = Vec::new();
+        let mut forms = |language: LanguageVersion, function: &str, body: &str, pipeline: bool| {
+            match probe(raw, language, function, body, pipeline) {
+                Probe::Formed => true,
+                Probe::Rejected => false,
+                Probe::NotRun(error) => {
+                    not_run.push(format!("{function} (msl-{}: {error})", language.label()));
+                    false
+                }
+            }
+        };
+        let language_probe = language_probe();
+        let Some(language) = LANGUAGE_VERSIONS
+            .into_iter()
+            .find(|version| forms(*version, "seismic_language_probe", &language_probe, false))
+        else {
+            return (Self::Unsupported, not_run);
+        };
+        let mut collect = |dtypes: &mut dyn Iterator<Item = (ProbeDtype, String)>, function: &str| {
+            dtypes
+                .filter(|(_, body)| forms(language, function, body, true))
+                .map(|(probe, _)| probe.dtype())
+                .collect::<BTreeSet<_>>()
+        };
+        let scalar_collective_dtypes = collect(
+            &mut ProbeDtype::ALL.into_iter().map(|probe| (probe, scalar_collective_probe(probe))),
+            "seismic_scalar_probe",
+        );
+        let matrix_dtypes = collect(
+            &mut ProbeDtype::ALL.into_iter().map(|probe| (probe, matrix_transfer_probe(probe))),
+            "seismic_matrix_transfer_probe",
+        );
+        let bfloat_arithmetic = forms(language, "seismic_bfloat_probe", BFLOAT_PROBE, true);
+        let mut matrix_combinations = BTreeSet::new();
+        for accumulator in ProbeDtype::ALL {
+            for left in ProbeDtype::ALL {
+                for right in ProbeDtype::ALL {
+                    let body = matrix_combination_probe(accumulator, left, right);
+                    if forms(language, "seismic_matrix_probe", &body, true) {
+                        matrix_combinations.insert(MatrixCombination {
+                            accumulator: accumulator.dtype(),
+                            left: left.dtype(),
+                            right: right.dtype(),
+                        });
+                    }
+                }
+            }
+        }
+        let metal4 = language >= LanguageVersion::V4_0;
+        let tensor_matmul_forms = metal4 && forms(language, "seismic_tensor_probe", TENSOR_PROBE, true);
+        let tensor_headers_form =
+            metal4 && forms(language, "seismic_tensor_headers", TENSOR_HEADERS_PROBE, false);
+        let answers = Self::Accepted {
+            language,
+            scalar_collective_dtypes,
+            bfloat_arithmetic,
+            matrix_dtypes,
+            matrix_combinations,
+            tensor_matmul_forms,
+            tensor_headers_form,
+        };
+        (answers, not_run)
+    }
 }
 
-/// Compiles one probe kernel to a pipeline; `None` when any stage refuses.
-fn probe_pipeline(
+/// The answers of `device`'s capability probes, under the key of everything
+/// that determines them (this build's formation code, the device's name and
+/// GPU architecture, and the OS build, which ships the Metal compiler): this
+/// process's answers under that key, else `store`'s, else the probes' own,
+/// run here once ([`probe_runs`]). Every answer a process has is held for
+/// its life, so each key is read or probed once a process, and keys probe
+/// apart. Answers are kept in `store` only when every probe reached a
+/// verdict; otherwise a warning names the probes that did not, and a later
+/// process probes again. Bytes under the key that do not decode are a miss.
+/// A process's answers are its own whatever store a later call names: the
+/// key covers what determines them, not where they are kept.
+pub fn probe_answers(device: &crate::DeviceHandle, store: &dyn ArtifactStore) -> MetalProbeAnswers {
+    static HELD: Mutex<BTreeMap<String, Arc<OnceLock<MetalProbeAnswers>>>> = Mutex::new(BTreeMap::new());
+    let architecture = device.raw().architecture().name().to_string();
+    let key = ArtifactKey::of(&[
+        crate::toolchain::FORMATION_BUILD.as_bytes(),
+        device.name().as_bytes(),
+        architecture.as_bytes(),
+        operating_system().as_bytes(),
+    ]);
+    let held = HELD
+        .lock()
+        .expect("held probe answers")
+        .entry(key.as_str().to_owned())
+        .or_default()
+        .clone();
+    held.get_or_init(|| {
+        if let Some(bytes) = store.get(PROBES, &key) {
+            match serde_json::from_slice(&bytes) {
+                Ok(answers) => return answers,
+                Err(error) => {
+                    PROBE_MISSES.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        device = %device.name(),
+                        %error,
+                        "stored Metal capability probe answers do not decode: a miss; probing again"
+                    )
+                }
+            }
+        }
+        PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+        let (answers, not_run) = crate::pooled(|| MetalProbeAnswers::probe(device));
+        if not_run.is_empty() {
+            let bytes = serde_json::to_vec(&answers).expect("probe answers serialize");
+            store.put(PROBES, &key, &bytes);
+        } else {
+            tracing::warn!(
+                device = %device.name(),
+                not_run = %not_run.join(", "),
+                "Metal capability probes did not run to the compiler's verdict; their answers serve \
+                 this process only and are not kept, so a later process probes again"
+            );
+        }
+        answers
+    })
+    .clone()
+}
+
+/// The times this process ran its devices' capability probes: once per
+/// miss of both the store and the process's answers ([`probe_answers`]).
+pub fn probe_runs() -> u64 {
+    PROBE_RUNS.load(Ordering::Relaxed)
+}
+
+static PROBE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// The stored answers this process found damaged, which it probed again
+/// ([`probe_answers`]).
+pub fn probe_misses() -> u64 {
+    PROBE_MISSES.load(Ordering::Relaxed)
+}
+
+static PROBE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn unsupported_language() -> TargetError {
+    TargetError::UnsupportedToolchain(
+        "the Metal compiler accepts none of the language versions this backend emits".into(),
+    )
+}
+
+/// The language versions the backend emits, highest first.
+const LANGUAGE_VERSIONS: [LanguageVersion; 7] = [
+    LanguageVersion::V4_1,
+    LanguageVersion::V4_0,
+    LanguageVersion::V3_2,
+    LanguageVersion::V3_1,
+    LanguageVersion::V3_0,
+    LanguageVersion::V2_4,
+    LanguageVersion::V2_3,
+];
+
+/// How one probe came out.
+enum Probe {
+    Formed,
+    /// A verdict against the probe: its library rejected by the compiler,
+    /// or its pipeline refused by the device.
+    Rejected,
+    /// The compiler did not reach a verdict (interrupted, or its service
+    /// failed): no answer. It names the error's domain and code.
+    NotRun(String),
+}
+
+/// The `NSCocoaErrorDomain` codes of a broken connection to a service
+/// (`NSXPCConnectionInterrupted`, `NSXPCConnectionInvalid`,
+/// `NSXPCConnectionReplyInvalid`): the Metal compiler service failed, and
+/// gave no verdict.
+const XPC_FAILURES: [isize; 3] = [4097, 4099, 4101];
+
+impl Probe {
+    /// How a probe whose library failed to compile with `error` came out: a
+    /// rejection for a compile failure or a language version the compiler
+    /// does not support, both in the Metal library domain; otherwise not
+    /// run.
+    fn of_library(error: &NSError) -> Self {
+        let library_domain = unsafe { MTLLibraryErrorDomain };
+        let verdict = [MTLLibraryError::CompileFailure, MTLLibraryError::Unsupported]
+            .iter()
+            .any(|code| error.code() == code.0 as isize);
+        match *error.domain() == *library_domain && verdict {
+            true => Self::Rejected,
+            false => Self::not_run(error),
+        }
+    }
+
+    /// How a probe whose compiled library's pipeline failed to form with
+    /// `error` came out: not run where the compiler service failed (the
+    /// library domain's internal error, or a broken service connection);
+    /// otherwise the device refused it, a rejection, whatever the domain
+    /// its driver reports it in.
+    fn of_pipeline(error: &NSError) -> Self {
+        let library_domain = unsafe { MTLLibraryErrorDomain };
+        let cocoa_domain = unsafe { objc2_foundation::NSCocoaErrorDomain };
+        let service_failed = (*error.domain() == *library_domain
+            && error.code() == MTLLibraryError::Internal.0 as isize)
+            || (*error.domain() == *cocoa_domain && XPC_FAILURES.contains(&error.code()));
+        if service_failed {
+            return Self::not_run(error);
+        }
+        tracing::debug!(domain = %error.domain(), code = error.code(), "a Metal capability probe's pipeline was refused");
+        Self::Rejected
+    }
+
+    fn not_run(error: &NSError) -> Self {
+        Self::NotRun(format!("{} {}", error.domain(), error.code()))
+    }
+}
+
+/// One probe kernel compiled at `language`, and its pipeline formed where
+/// `pipeline` ([`Probe::of_library`], [`Probe::of_pipeline`]).
+fn probe(
     device: &ProtocolObject<dyn MTLDevice>,
     language: LanguageVersion,
     function: &str,
     body: &str,
-) -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+    pipeline: bool,
+) -> Probe {
     crate::pooled(|| {
         let source = NSString::from_str(&format!("{PROBE_PRELUDE}{body}"));
-        let library = device
-            .newLibraryWithSource_options_error(&source, Some(&compile_options(language)))
-            .ok()?;
-        let function = library.newFunctionWithName(&NSString::from_str(function))?;
-        device
-            .newComputePipelineStateWithFunction_error(&function)
-            .ok()
+        let library = match device.newLibraryWithSource_options_error(&source, Some(&compile_options(language))) {
+            Ok(library) => library,
+            Err(error) => return Probe::of_library(&error),
+        };
+        let function = library
+            .newFunctionWithName(&NSString::from_str(function))
+            .unwrap_or_else(|| panic!("a compiled Metal probe library lacks its kernel `{function}`"));
+        if !pipeline {
+            return Probe::Formed;
+        }
+        match device.newComputePipelineStateWithFunction_error(&function) {
+            Ok(_) => Probe::Formed,
+            Err(error) => Probe::of_pipeline(&error),
+        }
     })
+}
+
+fn language_probe() -> String {
+    "kernel void seismic_language_probe(device uint* output [[buffer(0)]]) { output[0] = 0u; }\n".into()
 }
 
 #[derive(Clone, Copy)]
@@ -585,93 +854,34 @@ impl ProbeDtype {
     }
 }
 
-fn probe_scalar_collectives(
-    device: &ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
-) -> BTreeSet<DType> {
-    ProbeDtype::ALL
-        .into_iter()
-        .filter(|probe| {
-            let ty = probe.msl();
-            probe_pipeline(
-                device,
-                language,
-                "seismic_scalar_probe",
-                &format!(
-                    "kernel void seismic_scalar_probe(device {ty}* values [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {{ {ty} x = values[0]; values[0] = simd_shuffle(simd_sum(x) + simd_max(x) + simd_min(x), lane); }}\n"
-                ),
-            )
-            .is_some()
-        })
-        .map(ProbeDtype::dtype)
-        .collect()
-}
-
-fn probe_bfloat_arithmetic(
-    device: &ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
-) -> bool {
-    probe_pipeline(
-        device,
-        language,
-        "seismic_bfloat_probe",
-        "kernel void seismic_bfloat_probe(device bfloat* values [[buffer(0)]]) { bfloat x = values[0]; values[0] = bfloat(fma(float(x), float(x), 1.0f)) * x; }\n",
+fn scalar_collective_probe(probe: ProbeDtype) -> String {
+    let ty = probe.msl();
+    format!(
+        "kernel void seismic_scalar_probe(device {ty}* values [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {{ {ty} x = values[0]; values[0] = simd_shuffle(simd_sum(x) + simd_max(x) + simd_min(x), lane); }}\n"
     )
-    .is_some()
 }
 
-fn probe_matrix_dtypes(
-    device: &ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
-) -> BTreeSet<DType> {
-    ProbeDtype::ALL
-        .into_iter()
-        .filter(|probe| {
-            let ty = probe.msl();
-            probe_pipeline(
-                device,
-                language,
-                "seismic_matrix_transfer_probe",
-                &format!(
-                    "kernel void seismic_matrix_transfer_probe(device {ty}* a [[buffer(0)]], device {ty}* c [[buffer(1)]]) {{ simdgroup_matrix<{ty}, 8, 8> f; simdgroup_load(f, a, 8); simdgroup_load(f, a, 8, ulong2(0, 0), true); simdgroup_store(f, c, 8); }}\n"
-                ),
-            )
-            .is_some()
-        })
-        .map(ProbeDtype::dtype)
-        .collect()
+const BFLOAT_PROBE: &str = "kernel void seismic_bfloat_probe(device bfloat* values [[buffer(0)]]) { bfloat x = values[0]; values[0] = bfloat(fma(float(x), float(x), 1.0f)) * x; }\n";
+
+fn matrix_transfer_probe(probe: ProbeDtype) -> String {
+    let ty = probe.msl();
+    format!(
+        "kernel void seismic_matrix_transfer_probe(device {ty}* a [[buffer(0)]], device {ty}* c [[buffer(1)]]) {{ simdgroup_matrix<{ty}, 8, 8> f; simdgroup_load(f, a, 8); simdgroup_load(f, a, 8, ulong2(0, 0), true); simdgroup_store(f, c, 8); }}\n"
+    )
 }
 
-fn probe_matrix_combinations(
-    device: &ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
-) -> BTreeSet<MatrixCombination> {
-    let mut combinations = BTreeSet::new();
-    for accumulator in ProbeDtype::ALL {
-        for left in ProbeDtype::ALL {
-            for right in ProbeDtype::ALL {
-                let (acc, l, r) = (accumulator.msl(), left.msl(), right.msl());
-                let body = format!(
-                    "kernel void seismic_matrix_probe(device {l}* a [[buffer(0)]], device {r}* b [[buffer(1)]], device {acc}* c [[buffer(2)]]) {{ simdgroup_matrix<{l}, 8, 8> af; simdgroup_matrix<{r}, 8, 8> bf; simdgroup_matrix<{acc}, 8, 8> cf; simdgroup_matrix<{acc}, 8, 8> df; simdgroup_load(af, a, 8); simdgroup_load(bf, b, 8); simdgroup_load(cf, c, 8); simdgroup_multiply_accumulate(df, af, bf, cf); simdgroup_store(df, c, 8); }}\n"
-                );
-                if probe_pipeline(device, language, "seismic_matrix_probe", &body).is_some() {
-                    combinations.insert(MatrixCombination {
-                        accumulator: accumulator.dtype(),
-                        left: left.dtype(),
-                        right: right.dtype(),
-                    });
-                }
-            }
-        }
-    }
-    combinations
+fn matrix_combination_probe(accumulator: ProbeDtype, left: ProbeDtype, right: ProbeDtype) -> String {
+    let (acc, l, r) = (accumulator.msl(), left.msl(), right.msl());
+    format!(
+        "kernel void seismic_matrix_probe(device {l}* a [[buffer(0)]], device {r}* b [[buffer(1)]], device {acc}* c [[buffer(2)]]) {{ simdgroup_matrix<{l}, 8, 8> af; simdgroup_matrix<{r}, 8, 8> bf; simdgroup_matrix<{acc}, 8, 8> cf; simdgroup_matrix<{acc}, 8, 8> df; simdgroup_load(af, a, 8); simdgroup_load(bf, b, 8); simdgroup_load(cf, c, 8); simdgroup_multiply_accumulate(df, af, bf, cf); simdgroup_store(df, c, 8); }}\n"
+    )
 }
 
-/// The queries of a device's properties (`seismic_lang::device::metal`)
-/// at `language`; the tensor query forms its pipeline when asked.
+/// The queries of a device's properties (`seismic_lang::device::metal`),
+/// the tensor query answered by its probe ([`MetalProbeAnswers`]).
 struct Queries<'d> {
     device: &'d ProtocolObject<dyn MTLDevice>,
-    language: LanguageVersion,
+    tensor_matmul_forms: bool,
 }
 
 impl seismic_lang::device::metal::Queries for Queries<'_> {
@@ -685,50 +895,44 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
         Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
     }
     fn tensor_matmul_forms(&self) -> Option<bool> {
-        Some(probe_tensor_ops(self.device, self.language))
+        Some(self.tensor_matmul_forms)
     }
 }
 
-/// The device's properties at `language` (Metal declares no probes).
-fn properties_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> Properties {
-    seismic_lang::device::metal::describe(&Queries { device, language }, &Default::default())
+/// The device's properties, its tensor query answered by
+/// `tensor_matmul_forms` (Metal declares no probes).
+fn properties_at(device: &ProtocolObject<dyn MTLDevice>, tensor_matmul_forms: bool) -> Properties {
+    seismic_lang::device::metal::describe(&Queries { device, tensor_matmul_forms }, &Default::default())
         .expect("every Metal property's query answers")
 }
 
-/// Whether an unopened device forms tensor operations: the property its
-/// opened description holds, from the same queries at the same language
-/// version, so planning before a device is opened and the opened device
-/// agree. It compiles the tensor query's pipeline; callers ask once per
-/// decision, not per
-/// enumeration.
-pub fn forms_tensor_operations(device: &crate::DeviceHandle) -> bool {
-    probe_language_version(device)
-        .is_some_and(|language| properties_at(device.raw(), language).tensor_ops.holds())
-}
+/// A `matmul2d` over a device and a threadgroup tensor into a cooperative
+/// F32 destination: the tensor-operation facilities native sources use
+/// under `SEISMIC_HAS_TENSOR_OPS`, which forms a pipeline where the GPU
+/// executes them.
+const TENSOR_PROBE: &str = "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+     kernel void seismic_tensor_probe(device bfloat* a [[buffer(0)]], device float* c [[buffer(1)]], uint t [[thread_index_in_threadgroup]]) { \
+     threadgroup half b[256]; b[t % 256] = half(t); threadgroup_barrier(mem_flags::mem_threadgroup); \
+     auto ta = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(a, dextents<int32_t, 2>(16, 16)); \
+     auto tb = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(b, dextents<int32_t, 2>(16, 16)); \
+     auto tc = tensor<device float, dextents<int32_t, 2>, tensor_inline>(c, dextents<int32_t, 2>(16, 16)); \
+     constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+     mpp::tensor_ops::matmul2d<d, execution_simdgroups<1>> op; \
+     auto acc = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>(); \
+     for (uint16_t i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f; \
+     op.run(ta, tb, acc); acc.store(tc); }\n";
 
-/// Whether a `matmul2d` over a device and a threadgroup tensor into a
-/// cooperative F32 destination forms a pipeline: the tensor-operation
-/// facilities native sources use under `SEISMIC_HAS_TENSOR_OPS`.
-fn probe_tensor_ops(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
-    language >= LanguageVersion::V4_0
-        && probe_pipeline(
-            device,
-            language,
-            "seismic_tensor_probe",
-            "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
-             kernel void seismic_tensor_probe(device bfloat* a [[buffer(0)]], device float* c [[buffer(1)]], uint t [[thread_index_in_threadgroup]]) { \
-             threadgroup half b[256]; b[t % 256] = half(t); threadgroup_barrier(mem_flags::mem_threadgroup); \
-             auto ta = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(a, dextents<int32_t, 2>(16, 16)); \
-             auto tb = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(b, dextents<int32_t, 2>(16, 16)); \
-             auto tc = tensor<device float, dextents<int32_t, 2>, tensor_inline>(c, dextents<int32_t, 2>(16, 16)); \
-             constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
-             mpp::tensor_ops::matmul2d<d, execution_simdgroups<1>> op; \
-             auto acc = op.get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>(); \
-             for (uint16_t i = 0; i < acc.get_capacity(); ++i) if (acc.is_valid_element(i)) acc[i] = 0.0f; \
-             op.run(ta, tb, acc); acc.store(tc); }\n",
-        )
-        .is_some()
-}
+/// Tensor-operation types and a cooperative destination, compiled only:
+/// whether the compiler forms them, whatever the GPU executes.
+const TENSOR_HEADERS_PROBE: &str = "#include <metal_tensor>\n\
+     #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n\
+     kernel void seismic_tensor_headers(device float* out [[buffer(0)]]) { \
+     using shape = metal::extents<int32_t, 16, 16>; \
+     using tile = metal::tensor<threadgroup half, shape, metal::tensor_inline>; \
+     constexpr auto d = mpp::tensor_ops::matmul2d_descriptor(16, 16, 16, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate); \
+     mpp::tensor_ops::matmul2d<d, metal::execution_simdgroups<1>> op; \
+     auto acc = op.get_destination_cooperative_tensor<tile, tile, float>(); \
+     out[0] = float(acc.get_capacity()); }\n";
 
 /// Pure target assembly from a complete immutable description. No device
 /// opening, native compilation, or timing acquisition occurs here.

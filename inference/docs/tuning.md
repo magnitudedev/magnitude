@@ -141,17 +141,53 @@ The cost graphs are priced at is part of the assessment's identity.
 ## Native programs
 
 Every native program is had through one owner per device, the program former. It keys an
-artifact by its source, its entry and the toolchain's identity (compiler, target, options, device
-and driver). A program whose artifact the store keeps is loaded; one it lacks is compiled once,
-its artifact stored, and the program the compile formed used. CUDA's artifact is its cubin and
-Vulkan's its SPIR-V with the pipeline data of creating its pipelines: loading either compiles
-nothing, and a Vulkan load that would have to compile fails, so every Vulkan compile also creates
-its pipelines again from that data and fails rather than store an artifact no load serves.
-Metal's artifact is its source, which the OS shader cache serves the compiled forms of. Loading a
-Metal artifact forms exactly the library its compile formed, whichever of its entries are asked
-for, so the cache serves it: measured at 0.5 s to re-form a 35B model's programs in a later
-process. Each process counts its compiles, and counts and times its re-formations through a
-platform cache, whose time shows whether the platform still serves them.
+artifact by its whole rendered source, its entry and the toolchain's identity: its material
+(compiler, target, options, device and driver) and the build of the backend's formation code (the
+sources and locked versions of its dependency closure), so no artifact is served to a build whose
+formation code differs. Tuning is keyed by the material alone, never the build: a rebuild of a
+backend compiles its programs again once per host and keeps every tuning choice and measurement.
+A program whose artifact the store keeps is loaded; one it lacks is compiled once and the program
+the compile formed used at once, while its artifact is made and stored off that path, on the
+store's one thread, in turn: Metal's archive serialization, about 40 ms a program on an M4 Pro,
+runs apart from the ~100 ms compile. Artifacts and pointers are written unsynced, as a reader
+misses a torn one; probe answers, kept and costly to form again, are synced. A device waits for its own stores when it drops, and a serving or measurement
+worker, which ends without dropping its device, for its store before it ends; a store that
+panicked fails every wait for it.
+
+Every process forms through one store, the user's (`seismic::ProgramStore::user`), a Seismic
+directory store in the user's cache directory (`$XDG_CACHE_HOME`, else `~/Library/Caches` or
+`~/.cache`, under `seismic/programs`) that every process of the user shares: a program any process
+formed, a load, a test or a measurement job, a later one loads and compiles nothing. Every Seismic-IR
+kernel, graph-cost kernel and analytical-service probe forms through it as a native entry does.
+It also keeps the devices' probe answers, which eviction never removes: Metal's capability probes
+run only where it lacks their answers, and Vulkan's measurement-job probes are read from it. A
+test that observes its own compiles names a store of its own for its devices' programs; probe
+answers are still the user store's. Where the user's directory cannot be opened, the same store
+serves with its bytes in memory, reported once at error level: each program then forms once in the
+process, and every process compiles again until the directory opens. The engine's kernel cache
+keeps tuning records and evidence, never programs. A directory store evicts its least
+recently used entries beyond its capacity on a thread of its own, when it opens and after every
+quarter of its capacity written; each store's layout defines its entries (a unit's choice and
+evidence are one). A program several formers of one store want at once (devices, threads, tests
+of one binary) is compiled by the first, which the rest wait for and then load, and a former's
+read of an entry, held or missed, holds until a store of that entry ends or a load of it misses.
+
+The CPU's native entries are compiled into the binary; its Seismic-IR kernels form through the
+store, their artifact the compiled code bytes and `Abs8` relocations, which a load copies into
+executable memory and patches through the same loader a compile uses, so no Cranelift runs. CUDA's
+PTX kernels form through a toolchain of their own, which compiles the PTX to a cubin. CUDA's artifact is its
+cubin and Vulkan's its SPIR-V with the pipeline data of creating its pipelines: loading either
+compiles nothing, and a Vulkan load that would have to compile fails, so every Vulkan compile also
+creates its pipelines again from that data and fails rather than store an artifact no load serves.
+Metal's artifact is the binary archive its compile added every pipeline to, which holds the
+library's functions and the pipelines' device code: a load opens it as both and forms each
+pipeline from it under `FailOnBinaryArchiveMiss`, compiling nothing, the archive opened in place
+where the store keeps it in a file. Each entry's pointer names the SHA-256 of the artifact it
+points to, which a load checks before a toolchain decodes the bytes, as a driver may take damaged
+bytes as code (Metal then opens the store's file, which another process may have replaced since
+with another archive of the same key): a damaged artifact, like one the platform declines, is a
+counted miss, compiled again and rewritten.
+Each process counts its compiles and the loads its platform declined.
 
 Tuning records what each launch's program uses as its backend's compiler reports it, read from
 the driver of every program formed, compiled or loaded, so no artifact carries it: CUDA's function

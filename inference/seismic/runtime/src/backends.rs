@@ -25,7 +25,7 @@ use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_reservation as host;
-use seismic_native_target::{TargetFamily, Toolchain};
+use seismic_native_target::{Programs, TargetFamily, Toolchain};
 use seismic_discovery::ObservationError;
 use seismic_topology::{Contract, DeviceTopology, Executor, ExecutorSelector, Placing};
 use std::sync::Arc;
@@ -263,13 +263,19 @@ pub(crate) fn open(
     options: crate::artifacts::DeviceOptions,
 ) -> Result<Arc<DeviceInner>, OpenError> {
     let selector = info.selector();
-    let mut programs = DevicePrograms::Cpu;
+    let store = options.artifacts.clone().unwrap_or_else(crate::artifacts::ProgramStore::user);
+    // Probe answers are the machine's, whatever store the opener names for
+    // programs (`crate::artifacts`).
+    let probes = crate::artifacts::ProgramStore::user();
     // The CPU records no graphs, and a Metal schedule is host data: only
     // CUDA's and Vulkan's graphs hold device memory, measured on opening
     // unless the opener has it.
     let mut graph_cost = GraphCost::None;
     let given = options.graph_cost;
-    let kind = match selector {
+    // Each arm builds the device's formers before anything it opens forms
+    // a program (graph cost, the analytical context), which forms through
+    // them.
+    let (kind, programs) = match selector {
         ExecutorSelector::HostCpu => {
             let seismic_cpu::OpenedCpu {
                 service,
@@ -277,14 +283,16 @@ pub(crate) fn open(
                 device,
             } = seismic_cpu::open_host(host_cores().map_err(|reason| OpenError::Unavailable { selector, reason })?)
                 .map_err(OpenError::Backend)?;
-            OpenedKind::Cpu(Arc::new(Opened::new(
+            let cpu = DeviceFormer::new(seismic_cpu::toolchain::CpuToolchain::new(&device), &store);
+            let kind = OpenedKind::Cpu(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_cpu::registry(),
                 device,
                 |_, executor, device| executor.analytical(device),
                 memory.clone(),
-            )))
+            )));
+            (kind, DevicePrograms::Cpu { cpu })
         }
         #[cfg(target_os = "macos")]
         ExecutorSelector::Metal { registry_id } => {
@@ -295,20 +303,22 @@ pub(crate) fn open(
             let service =
                 seismic_metal::MetalDevice::open(handle.clone()).map_err(OpenError::Backend)?;
             let device =
-                seismic_metal::profile::open_device(&service).map_err(OpenError::Backend)?;
+                seismic_metal::profile::open_device(&service, &*probes).map_err(OpenError::Backend)?;
             let executor = seismic_metal::MetalExecutor::new(service.clone());
-            programs = DevicePrograms::Metal(ProgramFormer::new(
+            let metal = DeviceFormer::new(
                 seismic_metal::toolchain::MetalToolchain::new(service.clone(), device.facts()),
-                options.artifacts.clone(),
-            ));
-            OpenedKind::Metal(Arc::new(Opened::new(
+                &store,
+            );
+            let analytical = metal.programs().clone();
+            let kind = OpenedKind::Metal(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_metal::profile::registry(),
                 device,
-                |service, _, device| seismic_metal::profile::open_analytical(service, device),
+                move |service, _, device| seismic_metal::profile::open_analytical(service, device, &analytical),
                 memory.clone(),
-            )))
+            )));
+            (kind, DevicePrograms::Metal { metal })
         }
         ExecutorSelector::Cuda { uuid } => {
             let mut ordinal = None;
@@ -329,39 +339,39 @@ pub(crate) fn open(
             };
             let seismic_cuda::OpenedCuda { service, device } =
                 seismic_cuda::open(ordinal, accounts).map_err(open_error)?;
-            graph_cost = given.map_or_else(|| seismic_cuda::graph_cost(&service).map_err(open_error), Ok)?;
-            let executor = seismic_cuda::Executor::new(service.clone());
             let capability = device.facts().compute_capability;
-            programs = DevicePrograms::Cuda(ProgramFormer::new(
-                seismic_cuda::toolchain::CudaToolchain::new(
-                    service.clone(),
-                    u32::from(capability.major) * 10 + u32::from(capability.minor),
-                ),
-                options.artifacts.clone(),
-            ));
-            OpenedKind::Cuda(Arc::new(Opened::new(
+            let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+            let cuda = DeviceFormer::new(seismic_cuda::toolchain::CudaToolchain::new(service.clone(), architecture), &store);
+            let cuda_ptx =
+                DeviceFormer::new(seismic_cuda::toolchain::CudaPtxToolchain::new(service.clone(), architecture), &store);
+            graph_cost = given
+                .map_or_else(|| seismic_cuda::graph_cost(&service, cuda_ptx.programs()).map_err(open_error), Ok)?;
+            let executor = seismic_cuda::Executor::new(service.clone());
+            let analytical = cuda_ptx.programs().clone();
+            let kind = OpenedKind::Cuda(Arc::new(Opened::new(
                 service,
                 executor,
                 seismic_cuda::registry(),
                 device,
-                |service, _, device| seismic_cuda::open_analytical(service, device),
+                move |service, _, device| seismic_cuda::open_analytical(service, device, &analytical),
                 memory.clone(),
-            )))
+            )));
+            (kind, DevicePrograms::Cuda { cuda, cuda_ptx })
         }
         #[cfg(not(target_os = "macos"))]
         ExecutorSelector::Vulkan { uuid } => {
             // What the measurement job stored of its probes, keyed by the
-            // executor's identity.
+            // executor's identity, in the user's store.
             let identity = topology.executor_identity(info.id()).expect("the executor is of its topology");
-            let probed = crate::probes::stored(options.artifacts.as_deref(), &identity, seismic_vulkan::probe::REVISION)
-                .map_err(|reason| OpenError::Unavailable { selector, reason })?;
+            let probed = crate::probes::stored(&*probes, &identity, seismic_vulkan::probe::REVISION);
             let opened = VulkanOpened::open(uuid, &info, memory.clone(), &probed)?;
-            graph_cost = given.map_or_else(|| seismic_vulkan::graph_cost(opened.service()).map_err(open_error), Ok)?;
-            programs = DevicePrograms::Vulkan(ProgramFormer::new(
-                seismic_vulkan::toolchain::VulkanToolchain::new(opened.service().clone()),
-                options.artifacts.clone(),
-            ));
-            OpenedKind::Vulkan(Arc::new(opened))
+            let vulkan =
+                DeviceFormer::new(seismic_vulkan::toolchain::VulkanToolchain::new(opened.service().clone()), &store);
+            graph_cost = given.map_or_else(
+                || seismic_vulkan::graph_cost(opened.service(), vulkan.programs()).map_err(open_error),
+                Ok,
+            )?;
+            (OpenedKind::Vulkan(Arc::new(opened)), DevicePrograms::Vulkan { vulkan })
         }
         // `info` is an executor of this process's topology, whose discovery
         // reports no executor of a backend the build lacks.
@@ -391,7 +401,7 @@ pub(crate) fn open(
         properties,
         programs,
         trace: std::sync::Mutex::new(None),
-        artifacts: options.artifacts,
+        artifacts: store,
         native: crate::native::NativeState::default(),
         graph_cost,
         tables_sealed: std::sync::atomic::AtomicBool::new(false),
@@ -399,76 +409,121 @@ pub(crate) fn open(
     }))
 }
 
-/// The program former of an opened device, by backend. The CPU backend
-/// renders no programs.
+/// One toolchain's former on an opened device, and the same former as the
+/// backend code that forms through it takes it ([`seismic_native_target::Programs`]).
+pub(crate) struct DeviceFormer<T: Toolchain> {
+    former: Arc<ProgramFormer<T>>,
+    programs: Arc<dyn Programs<T>>,
+}
+
+impl<T: Toolchain> DeviceFormer<T> {
+    /// The former of `toolchain`, forming through `store`.
+    fn new(toolchain: T, store: &Arc<crate::artifacts::ProgramStore>) -> Self {
+        let former = Arc::new(ProgramFormer::new(toolchain, store.clone()));
+        Self { programs: former.clone(), former }
+    }
+
+    /// The former as backend code forms through it.
+    pub(crate) fn programs(&self) -> &Arc<dyn Programs<T>> {
+        &self.programs
+    }
+}
+
+impl<T: Toolchain> std::ops::Deref for DeviceFormer<T> {
+    type Target = ProgramFormer<T>;
+
+    fn deref(&self) -> &ProgramFormer<T> {
+        &self.former
+    }
+}
+
+/// The program formers of an opened device, one for each toolchain its
+/// backend forms programs with, all over the device's store: what the
+/// device's native entries, its Seismic-IR kernels, its graph-cost kernel
+/// and its analytical-service probes form through. The native entries'
+/// toolchain is Metal's, CUDA's (`cuda`) and Vulkan's; the CPU's native
+/// entries are compiled into the binary, so it forms only Seismic-IR
+/// kernels (`cpu`), as CUDA forms them and its device kernels from PTX
+/// (`cuda_ptx`).
 pub(crate) enum DevicePrograms {
-    Cpu,
+    Cpu {
+        cpu: DeviceFormer<seismic_cpu::toolchain::CpuToolchain>,
+    },
     #[cfg(target_os = "macos")]
-    Metal(ProgramFormer<seismic_metal::toolchain::MetalToolchain>),
-    Cuda(ProgramFormer<seismic_cuda::toolchain::CudaToolchain>),
+    Metal {
+        metal: DeviceFormer<seismic_metal::toolchain::MetalToolchain>,
+    },
+    Cuda {
+        cuda: DeviceFormer<seismic_cuda::toolchain::CudaToolchain>,
+        cuda_ptx: DeviceFormer<seismic_cuda::toolchain::CudaPtxToolchain>,
+    },
     #[cfg(not(target_os = "macos"))]
-    Vulkan(ProgramFormer<seismic_vulkan::toolchain::VulkanToolchain>),
+    Vulkan {
+        vulkan: DeviceFormer<seismic_vulkan::toolchain::VulkanToolchain>,
+    },
 }
 
 impl DevicePrograms {
-    /// Lend the device's former `workers`, or take them back
-    /// ([`ProgramFormer::staff`]).
+    /// Lend the former of the device's native entries `workers`, or take
+    /// them back ([`ProgramFormer::staff`]). The CPU forms no native
+    /// entries; every other former forms on the thread that asks.
     pub(crate) fn staff(
         &self,
         workers: Option<Arc<seismic_native_target::workers::Workers>>,
     ) {
         match self {
-            Self::Cpu => {}
+            Self::Cpu { .. } => {}
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.staff(workers),
-            Self::Cuda(former) => former.staff(workers),
+            Self::Metal { metal } => metal.staff(workers),
+            Self::Cuda { cuda, .. } => cuda.staff(workers),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.staff(workers),
+            Self::Vulkan { vulkan } => vulkan.staff(workers),
         }
     }
 
-    /// The threads lent to the device's former, if any.
+    /// The threads lent to the former of the device's native entries, if
+    /// any.
     pub(crate) fn workers(&self) -> Option<Arc<seismic_native_target::workers::Workers>> {
         match self {
-            Self::Cpu => None,
+            Self::Cpu { .. } => None,
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.workers(),
-            Self::Cuda(former) => former.workers(),
+            Self::Metal { metal } => metal.workers(),
+            Self::Cuda { cuda, .. } => cuda.workers(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.workers(),
+            Self::Vulkan { vulkan } => vulkan.workers(),
         }
     }
 
-    /// What besides the source determines the programs this device's
-    /// toolchain forms ([`seismic_native_target::ToolchainIdentity`]): its
-    /// compiler, target and options. The CPU backend forms none: its
-    /// kernels are compiled into the binary.
-    pub(crate) fn toolchain(&self) -> Option<&str> {
+    /// What besides the source determines the native entries this device's
+    /// toolchain forms ([`seismic_native_target::ToolchainIdentity`]). The
+    /// CPU backend forms none: its native entries are compiled into the
+    /// binary.
+    pub(crate) fn toolchain(&self) -> Option<&seismic_native_target::ToolchainIdentity> {
         match self {
-            Self::Cpu => None,
+            Self::Cpu { .. } => None,
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => Some(&former.toolchain().identity().material),
-            Self::Cuda(former) => Some(&former.toolchain().identity().material),
+            Self::Metal { metal } => Some(metal.toolchain().identity()),
+            Self::Cuda { cuda, .. } => Some(cuda.toolchain().identity()),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => Some(&former.toolchain().identity().material),
+            Self::Vulkan { vulkan } => Some(vulkan.toolchain().identity()),
         }
     }
 
-    /// The native programs this device's toolchain has formed, and the
-    /// time its calls took.
+    /// The programs every toolchain of this device has formed, and the
+    /// time their calls took.
     pub(crate) fn programs_formed(&self) -> crate::formation::FormedPrograms {
         match self {
-            Self::Cpu => crate::formation::FormedPrograms::default(),
+            Self::Cpu { cpu } => cpu.programs_formed(),
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.programs_formed(),
-            Self::Cuda(former) => former.programs_formed(),
+            Self::Metal { metal } => metal.programs_formed(),
+            Self::Cuda { cuda, cuda_ptx } => [cuda.programs_formed(), cuda_ptx.programs_formed()].into_iter().sum(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.programs_formed(),
+            Self::Vulkan { vulkan } => vulkan.programs_formed(),
         }
     }
 
-    /// `sources` as this device's former reads them
-    /// ([`ProgramFormer::keyed`]). The CPU backend forms no programs.
+    /// `sources` as the former of this device's native entries reads them
+    /// ([`ProgramFormer::keyed`]). The CPU backend forms no native entries.
     pub(crate) fn keyed(
         &self,
         sources: Vec<seismic_native_target::ProgramSource>,
@@ -477,79 +532,92 @@ impl DevicePrograms {
             sources.into_iter().map(key).collect()
         };
         match self {
-            Self::Cpu => Vec::new(),
+            Self::Cpu { .. } => Vec::new(),
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => keyed(&|source| former.keyed(source)),
-            Self::Cuda(former) => keyed(&|source| former.keyed(source)),
+            Self::Metal { metal } => keyed(&|source| metal.keyed(source)),
+            Self::Cuda { cuda, .. } => keyed(&|source| cuda.keyed(source)),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => keyed(&|source| former.keyed(source)),
+            Self::Vulkan { vulkan } => keyed(&|source| vulkan.keyed(source)),
         }
     }
 
-    /// What forming `sources` together on this device does, known before
-    /// they are formed, and the most entries one source's compile forms.
+    /// What forming native entries' `sources` together on this device
+    /// does, known before they are formed, and the most entries one
+    /// source's compile forms.
     pub(crate) fn class(
         &self,
         sources: &[crate::formation::Keyed],
     ) -> (crate::formation::FormationClass, usize) {
         match self {
-            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
+            Self::Cpu { .. } => (crate::formation::FormationClass::Kept, 0),
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.class(sources),
-            Self::Cuda(former) => former.class(sources),
+            Self::Metal { metal } => metal.class(sources),
+            Self::Cuda { cuda, .. } => cuda.class(sources),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.class(sources),
+            Self::Vulkan { vulkan } => vulkan.class(sources),
         }
     }
 
-    /// Whether this device's toolchain loads a stored program through a
-    /// platform cache ([`seismic_native_target::Load::PlatformCached`]):
-    /// a load the platform no longer serves takes a compile's time.
-    pub(crate) fn platform_cached(&self) -> bool {
-        match self {
-            Self::Cpu => false,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.platform_cached(),
-            Self::Cuda(former) => former.platform_cached(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.platform_cached(),
-        }
-    }
-
-    /// What this device's toolchain's compiles have taken in this process,
-    /// by the entries each formed.
+    /// What the compiles of this device's native entries have taken in
+    /// this process, by the entries each formed.
     pub(crate) fn compiled(&self) -> crate::native::Linear {
         match self {
-            Self::Cpu => crate::native::Linear::default(),
+            Self::Cpu { .. } => crate::native::Linear::default(),
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.compiled(),
-            Self::Cuda(former) => former.compiled(),
+            Self::Metal { metal } => metal.compiled(),
+            Self::Cuda { cuda, .. } => cuda.compiled(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.compiled(),
+            Self::Vulkan { vulkan } => vulkan.compiled(),
         }
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &ProgramFormer<seismic_metal::toolchain::MetalToolchain> {
-        let Self::Metal(former) = self else {
+        let Self::Metal { metal } = self else {
             unreachable!("a Metal device forms Metal programs");
         };
-        former
+        metal
+    }
+
+    /// The programs a Metal device's Seismic-IR kernels form through: its
+    /// native entries' former.
+    #[cfg(target_os = "macos")]
+    fn metal_programs(&self) -> &seismic_metal::MetalPrograms {
+        let Self::Metal { metal } = self else {
+            unreachable!("a Metal device forms Metal programs");
+        };
+        metal.programs()
     }
 
     pub(crate) fn cuda(&self) -> &ProgramFormer<seismic_cuda::toolchain::CudaToolchain> {
-        let Self::Cuda(former) = self else {
+        let Self::Cuda { cuda, .. } = self else {
             unreachable!("a CUDA device forms CUDA programs");
         };
-        former
+        cuda
     }
 
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn vulkan(&self) -> &ProgramFormer<seismic_vulkan::toolchain::VulkanToolchain> {
-        let Self::Vulkan(former) = self else {
+        let Self::Vulkan { vulkan } = self else {
             unreachable!("a Vulkan device forms Vulkan programs");
         };
-        former
+        vulkan
+    }
+
+    /// The programs a CPU device's Seismic-IR kernels form through.
+    fn cpu_programs(&self) -> &seismic_cpu::CpuPrograms {
+        let Self::Cpu { cpu } = self else {
+            unreachable!("a CPU device forms CPU programs");
+        };
+        cpu.programs()
+    }
+
+    /// The programs a CUDA device's Seismic-IR kernels form through.
+    fn cuda_ptx_programs(&self) -> &seismic_cuda::CudaPtxPrograms {
+        let Self::Cuda { cuda_ptx, .. } = self else {
+            unreachable!("a CUDA device forms CUDA programs");
+        };
+        cuda_ptx.programs()
     }
 }
 
@@ -891,7 +959,7 @@ impl OpenedKind {
             Self::Cpu(device) => prepare(
                 device,
                 seismic_cpu::native_compiler(),
-                &(),
+                public_device.programs.cpu_programs(),
                 logical,
                 bindings,
                 public_device,
@@ -899,23 +967,20 @@ impl OpenedKind {
             )
             .map(PreparedKind::Cpu),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => {
-                let context = device.service_arc().handle().clone();
-                prepare(
-                    device,
-                    seismic_metal::native_compiler(),
-                    &context,
-                    logical,
-                    bindings,
-                    public_device,
-                    options,
-                )
-                .map(PreparedKind::Metal)
-            }
+            Self::Metal(device) => prepare(
+                device,
+                seismic_metal::native_compiler(),
+                public_device.programs.metal_programs(),
+                logical,
+                bindings,
+                public_device,
+                options,
+            )
+            .map(PreparedKind::Metal),
             Self::Cuda(device) => prepare(
                 device,
                 seismic_cuda::native_compiler(),
-                &(),
+                public_device.programs.cuda_ptx_programs(),
                 logical,
                 bindings,
                 public_device,
@@ -932,7 +997,7 @@ impl OpenedKind {
         module: &CheckedModule,
         entry: EntryId,
         bindings: ElementBindings,
-        public_device: &Arc<DeviceInner>,
+        public_device: &'a Arc<DeviceInner>,
         precision: seismic_lang::precision::PrecisionPolicy,
         options: seismic_compiler::feedback::FeedbackOptions,
     ) -> Result<(FeedbackKind<'a>, PreparedKind), crate::api::kernel::PrepareError> {
@@ -940,7 +1005,7 @@ impl OpenedKind {
             Self::Cpu(device) => driver::FeedbackCampaign::start(
                 device,
                 seismic_cpu::native_compiler(),
-                &(),
+                public_device.programs.cpu_programs(),
                 module,
                 entry,
                 bindings,
@@ -953,7 +1018,7 @@ impl OpenedKind {
             Self::Metal(device) => driver::FeedbackCampaign::start(
                 device,
                 seismic_metal::native_compiler(),
-                device.service().handle(),
+                public_device.programs.metal_programs(),
                 module,
                 entry,
                 bindings,
@@ -965,7 +1030,7 @@ impl OpenedKind {
             Self::Cuda(device) => driver::FeedbackCampaign::start(
                 device,
                 seismic_cuda::native_compiler(),
-                &(),
+                public_device.programs.cuda_ptx_programs(),
                 module,
                 entry,
                 bindings,
@@ -1190,25 +1255,36 @@ impl ReservedPending {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use seismic_lang::registry::BackendName;
 
     /// A stored tuning result is valid only for the programs it measured:
-    /// the toolchain that formed them (Metal's: the OS build and the
-    /// language version) is part of the identity it is keyed by.
+    /// the toolchain's material that formed them (Metal's: the OS build and
+    /// the language version) is part of the identity it is keyed by. The
+    /// build of the backend's formation code is not, so a rebuild keeps
+    /// every tuning record while its stored programs miss
+    /// (`formation::tests::a_rebuilt_formation_misses_the_programs_stored_before`).
+    /// Checked on each accelerator the host opens; Metal is on every Mac.
     #[test]
-    fn the_tuning_identity_names_the_toolchain() {
-        let device = crate::devices::Devices::discover(&[])
-            .expect("device discovery")
-            .open_backend(BackendName::Metal)
-            .expect("Metal device");
-        let super::OpenedKind::Metal(metal) = &device.kind else {
-            panic!("a Metal device opens as Metal");
-        };
-        let os = metal.device_description().facts().operating_system().to_owned();
-        let toolchain = device.programs.toolchain().expect("Metal forms programs");
-        assert!(toolchain.starts_with(&format!("metal;{os};msl-")));
-        assert!(device.tuning_identity().contains(&format!(";toolchain {toolchain}")));
+    fn the_tuning_identity_names_the_toolchain_and_not_its_build() {
+        let devices = crate::devices::Devices::discover(&[]).expect("device discovery");
+        for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let device = match devices.open_backend(backend) {
+                Ok(device) => device,
+                Err(_) if !(cfg!(target_os = "macos") && backend == BackendName::Metal) => continue,
+                Err(error) => panic!("a Mac opens Metal: {error:?}"),
+            };
+            #[cfg(target_os = "macos")]
+            if let super::OpenedKind::Metal(metal) = &device.kind {
+                let os = metal.device_description().facts().operating_system().to_owned();
+                let toolchain = device.programs.toolchain().expect("Metal forms programs");
+                assert!(toolchain.material.starts_with(&format!("metal;{os};msl-")));
+            }
+            let toolchain = device.programs.toolchain().expect("an accelerator forms programs");
+            let tuning = device.tuning_identity();
+            assert!(tuning.contains(&format!(";toolchain {}", toolchain.material)), "{tuning}");
+            assert!(!tuning.contains(&toolchain.stored), "{tuning}");
+        }
     }
 }

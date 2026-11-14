@@ -1,66 +1,113 @@
-//! One CPU native kernel. Schedule and emission layout remain core-owned.
+//! One CPU native kernel and the executable memory of its program.
+//! Schedule and emission layout remain core-owned.
 
+use crate::toolchain::CpuProgram;
 use crate::workers::LaunchEntry;
-use cranelift_jit::{BranchProtection, JITMemoryProvider, JITModule, SystemMemoryProvider};
-use cranelift_module::ModuleResult;
 use seismic_ir::physical_target::KernelEmissionLayout;
-use std::sync::Arc;
+use seismic_native_target::Formed;
 
-/// JIT memory whose executable bytes every core fetches as last written.
+/// Executable memory holding one program's image, whose bytes every core
+/// fetches as last written.
 ///
-/// A variant's code is freed with its last kernel, and the allocator hands
-/// the same addresses to the next variant compiled. On aarch64 instruction
-/// caches are not coherent with data writes, and Cranelift's system provider
-/// leaves their maintenance to `mprotect` (its cache clear is a no-op), which
-/// does not invalidate a page that already held code: a core that ran the
-/// earlier variant then executes its stale instructions over the new
-/// variant's frame. This provider invalidates every executable range once
-/// its final bytes are written, before it becomes executable; each
-/// participant entering a launch then discards instructions it fetched
-/// before ([`crate::workers`]).
+/// A program's code is freed with its last kernel, and the system hands the
+/// same addresses to the next program loaded. On aarch64 instruction
+/// caches are not coherent with data writes, and changing a page's
+/// protection does not invalidate a page that already held code: a core
+/// that ran the earlier program would then execute its stale instructions
+/// over the new program's frame. The image is invalidated once its final
+/// bytes are written, before it becomes executable; each participant
+/// entering a launch then discards instructions it fetched before
+/// ([`crate::workers`]).
 pub(crate) struct CoherentCode {
-    memory: SystemMemoryProvider,
-    /// Executable ranges written since the last finalization, as
-    /// (address, bytes).
-    written: Vec<(usize, usize)>,
+    base: std::ptr::NonNull<u8>,
+    /// The mapped bytes, whole pages.
+    mapped: usize,
 }
+
+// The mapping is immutable once executable and unmapped once, on drop.
+unsafe impl Send for CoherentCode {}
+unsafe impl Sync for CoherentCode {}
 
 impl CoherentCode {
-    pub(crate) fn new() -> Self {
-        Self {
-            memory: SystemMemoryProvider::new(),
-            written: Vec::new(),
+    /// `bytes` bytes of executable memory, written by `write` (given the
+    /// writable image and the address it executes at) before they become
+    /// executable. `branch_targets` marks the pages guarded (aarch64 BTI)
+    /// where the host enforces it.
+    pub(crate) fn new(
+        bytes: usize,
+        branch_targets: bool,
+        write: impl FnOnce(&mut [u8], usize),
+    ) -> Self {
+        assert!(bytes > 0, "a program image holds code");
+        // SAFETY: sysconf has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .expect("the host reports its page size");
+        let mapped = bytes.div_ceil(page) * page;
+        // SAFETY: a fresh private anonymous mapping, owned by this value.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            panic!(
+                "mapping {mapped} bytes for program code failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
+        let base = std::ptr::NonNull::new(base.cast::<u8>()).expect("mmap returned a mapping");
+        let code = Self { base, mapped };
+        // SAFETY: the mapping is writable and `bytes` long.
+        write(
+            unsafe { std::slice::from_raw_parts_mut(base.as_ptr(), bytes) },
+            base.as_ptr() as usize,
+        );
+        invalidate_instructions(base.as_ptr(), bytes);
+        let protection = libc::PROT_READ | libc::PROT_EXEC | guarded(branch_targets);
+        // SAFETY: the whole mapping, owned by this value.
+        if unsafe { libc::mprotect(base.as_ptr().cast(), mapped, protection) } != 0 {
+            panic!(
+                "making {mapped} bytes of program code executable failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        code
+    }
+
+    /// The address the image executes at.
+    pub(crate) fn base(&self) -> *const u8 {
+        self.base.as_ptr()
     }
 }
 
-impl JITMemoryProvider for CoherentCode {
-    fn allocate_readexec(&mut self, size: usize, align: u64) -> std::io::Result<*mut u8> {
-        let address = self.memory.allocate_readexec(size, align)?;
-        self.written.push((address as usize, size));
-        Ok(address)
+impl Drop for CoherentCode {
+    fn drop(&mut self) {
+        // SAFETY: every entry into this memory is held by the program that
+        // owns it, so none outlives the mapping.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.mapped) };
     }
+}
 
-    fn allocate_readwrite(&mut self, size: usize, align: u64) -> std::io::Result<*mut u8> {
-        self.memory.allocate_readwrite(size, align)
+/// The protection guarding branch targets (aarch64 BTI) of code that has
+/// landing pads, where the host enforces it.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn guarded(branch_targets: bool) -> libc::c_int {
+    const PROT_BTI: libc::c_int = 0x10;
+    if branch_targets && std::arch::is_aarch64_feature_detected!("bti") {
+        PROT_BTI
+    } else {
+        0
     }
+}
 
-    fn allocate_readonly(&mut self, size: usize, align: u64) -> std::io::Result<*mut u8> {
-        self.memory.allocate_readonly(size, align)
-    }
-
-    unsafe fn free_memory(&mut self) {
-        self.written.clear();
-        unsafe { self.memory.free_memory() };
-    }
-
-    /// Cranelift finalizes after writing and relocating every definition.
-    fn finalize(&mut self, branch_protection: BranchProtection) -> ModuleResult<()> {
-        for (address, bytes) in self.written.drain(..) {
-            invalidate_instructions(address as *const u8, bytes);
-        }
-        self.memory.finalize(branch_protection)
-    }
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+fn guarded(_: bool) -> libc::c_int {
+    0
 }
 
 /// Makes the instruction caches of every core agree with the data written
@@ -111,37 +158,10 @@ fn invalidate_instructions(address: *const u8, bytes: usize) {
 #[cfg(target_arch = "x86_64")]
 fn invalidate_instructions(_: *const u8, _: usize) {}
 
-/// The JIT memory of one variant, freed when its last kernel drops.
-pub(crate) struct JitMemory {
-    module: Option<JITModule>,
-}
-
-// Finalized code memory is immutable and freed once after the last kernel.
-unsafe impl Send for JitMemory {}
-unsafe impl Sync for JitMemory {}
-
-impl JitMemory {
-    pub(crate) fn new(module: JITModule) -> Self {
-        Self {
-            module: Some(module),
-        }
-    }
-}
-
-impl Drop for JitMemory {
-    fn drop(&mut self) {
-        if let Some(module) = self.module.take() {
-            // Every function pointer into this memory is retained by the same
-            // CompiledKernel Arc, so none can outlive the allocation.
-            unsafe { module.free_memory() };
-        }
-    }
-}
-
 pub struct CompiledKernel {
     pub(crate) entry: LaunchEntry,
-    /// Drop guard: keeps the JIT code `entry` points into alive.
-    pub(crate) _memory: Arc<JitMemory>,
+    /// Keeps the program `entry` points into alive.
+    pub(crate) _program: Formed<CpuProgram>,
     pub(crate) layout: KernelEmissionLayout,
 }
 

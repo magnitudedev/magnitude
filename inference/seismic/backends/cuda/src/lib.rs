@@ -62,6 +62,30 @@ pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, Opene
     Some((exclusive, opened))
 }
 
+/// Test-only: PTX programs of `opened` that compile every source they are
+/// given and keep nothing, for this crate's tests of the driver below the
+/// runtime's program store.
+#[cfg(test)]
+pub(crate) fn test_ptx_programs(opened: &OpenedCuda) -> CudaPtxPrograms {
+    use seismic_native_target::{ArtifactKey, Compile, Formed, ProgramSource, Programs, Toolchain};
+    struct Compiling(toolchain::CudaPtxToolchain);
+    impl Programs<toolchain::CudaPtxToolchain> for Compiling {
+        fn form(&self, sources: &[ProgramSource]) -> Result<Vec<Formed<direct::DirectModule>>, NativeCompilationError> {
+            sources
+                .iter()
+                .map(|source| {
+                    let (_, program) = self.0.compile(source)?;
+                    let compile = std::sync::Arc::new(Compile::new(source.entries.clone(), program));
+                    Ok(Formed::new(ArtifactKey::of(&[source.text.as_bytes()]), vec![compile]))
+                })
+                .collect()
+        }
+    }
+    let capability = opened.device.facts().compute_capability;
+    let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+    std::sync::Arc::new(Compiling(toolchain::CudaPtxToolchain::new(opened.service.clone(), architecture)))
+}
+
 pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
@@ -76,6 +100,11 @@ pub use profile::{
     BACKEND_REVISION,
 };
 pub use registry::registry;
+
+/// The PTX programs of one opened device ([`toolchain::CudaPtxToolchain`]):
+/// the one way this backend forms Seismic-IR kernels and its device probe
+/// kernels.
+pub type CudaPtxPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::CudaPtxToolchain>>;
 
 use seismic_estimator::ServiceClassId;
 use seismic_ir::physical_target::{
@@ -520,17 +549,17 @@ pub(crate) fn lower_semantic_intrinsic(
 }
 
 impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
-    type Context = ();
+    type Context = CudaPtxPrograms;
     type Candidate = NativeCandidate;
     type Handle = CompiledKernel;
     fn form(
         &self,
-        _context: &Self::Context,
+        programs: &Self::Context,
         target: &DeviceDescription<Cuda>,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        compile::compile_kernel(target, kernel, layout)
+        compile::compile_kernel(programs, target, kernel, layout)
     }
     fn reflect(
         &self,
@@ -540,8 +569,10 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Cuda, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
-        let context = candidate.module.context.clone();
-        let function = candidate.function;
+        let (program, position) = candidate.formed.entry(&candidate.entry);
+        let program = program.clone();
+        let context = program.program().context().clone();
+        let function = program.program().function(position);
         let attribute = |key| {
             crate::driver::function_attribute(&context, function, key)
                 .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))
@@ -636,11 +667,9 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             modes.push(CudaLaunchMode::CooperativeGrid);
         }
         let handle = CompiledKernel {
-            module: candidate.module,
-            function,
+            program,
+            function: position,
             layout: candidate.layout,
-            image: candidate.image,
-            entry: candidate.entry,
             configured_dynamic_shared_bytes: candidate.configured_dynamic_shared_bytes,
         };
         let description = NativeKernelDescription {

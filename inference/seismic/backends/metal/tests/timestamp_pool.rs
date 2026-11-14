@@ -12,7 +12,7 @@ use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 #[test]
 fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
     let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
-    let description = seismic_metal::profile::open_device(&device).unwrap();
+    let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
     let toolchain = MetalToolchain::new(device.clone(), description.facts());
     let source = ProgramSource {
         text: "#include <metal_stdlib>\nusing namespace metal;\n\

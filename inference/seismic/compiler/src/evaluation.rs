@@ -400,19 +400,11 @@ impl<T: seismic_native_target::TargetFamily> AnalyticalEvaluationContext<T> {
         let mut required: std::collections::BTreeSet<_> =
             <seismic_estimator::CoreService as seismic_estimator::AnalyticalService>::ALL
                 .iter()
-                .copied()
-                .map(|service| {
-                    seismic_estimator::ServiceClassId::new(
-                        seismic_estimator::AnalyticalService::stable_name(service),
-                    )
-                })
+                .map(|service| seismic_estimator::AnalyticalService::class(*service))
                 .collect();
         required.extend(services.iter().filter_map(|(service, state)| {
-            matches!(state, seismic_estimator::AnalyticalServiceState::Available).then(|| {
-                seismic_estimator::ServiceClassId::new(
-                    seismic_estimator::AnalyticalService::stable_name(*service),
-                )
-            })
+            matches!(state, seismic_estimator::AnalyticalServiceState::Available)
+                .then(|| seismic_estimator::AnalyticalService::class(*service))
         }));
         let profile = Arc::new(ExecutionProfile::assemble(required, parts)?);
         let model = Arc::new(BoundAnalyticalModel {

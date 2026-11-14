@@ -16,7 +16,8 @@ use seismic_lang::types::DType;
 #[test]
 fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
     let device = metal_device();
-    let target = profile::open_device(&device).unwrap();
+    let target = profile::open_device(&device, crate::test_support::store()).unwrap();
+    let programs = crate::test_support::programs(&device, &target);
     for name in ["q4g32", "q4g64", "q4k", "q6k", "nvfp4_e2m1_block16"] {
         let representation = registry::representation(name).unwrap();
         let RepresentationKind::Packed(layout) =
@@ -136,7 +137,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             let kernel = &construction.kernels()[0];
             let emission = target.kernel_emission_layout(kernel);
             let native =
-                compile::compile_kernel(device.handle(), &target, kernel, &emission).unwrap();
+                compile::form_kernel(&programs, kernel, &emission).unwrap();
             let mut words = vec![1u64; emission.words.total as usize];
             for (binding, extent) in emission.words.bindings.iter().zip([n, total]) {
                 words[binding.first as usize] = extent;
@@ -154,7 +155,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             let scratch = device.allocate_bytes(8).unwrap();
             let command = device.queue().commandBuffer().unwrap();
             let encoder = command.computeCommandEncoder().unwrap();
-            encoder.setComputePipelineState(&native.pipeline.state);
+            encoder.setComputePipelineState(&native.pipeline().state);
             for (index, buffer) in [
                 &input_buffer,
                 &output_buffer,
@@ -205,7 +206,8 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
 fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
     use seismic_ir::kernel::ops::{BinaryOp, ValueType};
     let device = metal_device();
-    let target = profile::open_device(&device).unwrap();
+    let target = profile::open_device(&device, crate::test_support::store()).unwrap();
+    let programs = crate::test_support::programs(&device, &target);
     let mut arena = ExprArena::default();
     let count = arena.nat(128);
     let mut construction = Construction::<Metal>::new(
@@ -246,7 +248,7 @@ fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
     builder.close();
     let kernel = &construction.kernels()[0];
     let layout = target.kernel_emission_layout(kernel);
-    let native = compile::compile_kernel(device.handle(), &target, kernel, &layout).unwrap();
+    let native = compile::form_kernel(&programs, kernel, &layout).unwrap();
     let mut words = vec![1u64; layout.words.total as usize];
     words[layout.words.bindings[0].first as usize] = 128;
     let word_bytes = words
@@ -259,7 +261,7 @@ fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
     let scratch = device.allocate_bytes(8).unwrap();
     let command = device.queue().commandBuffer().unwrap();
     let encoder = command.computeCommandEncoder().unwrap();
-    encoder.setComputePipelineState(&native.pipeline.state);
+    encoder.setComputePipelineState(&native.pipeline().state);
     for (index, buffer) in [&output, &table, &scratch, &scratch, &scratch]
         .into_iter()
         .enumerate()
@@ -293,7 +295,7 @@ fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
         .chunks_exact(4)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
         .collect::<Vec<_>>();
-    let subgroup_width = native.pipeline.state.threadExecutionWidth() as u32;
+    let subgroup_width = native.pipeline().state.threadExecutionWidth() as u32;
     assert_eq!(
         words,
         (0..64)

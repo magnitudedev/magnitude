@@ -8,4 +8,5 @@ license.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
