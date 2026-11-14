@@ -1,3 +1,15 @@
+# Chunked-form geometry, one owner for the kernels and the tests that derive
+# their bounds from it. A slot of at most SEQUENTIAL_ROWS rows advances
+# row-sequentially with the step's bits in every recurrent and state-space
+# entry (an MTP verify slot gets the bits of one-row decode); a longer slot's
+# rows before its stop row advance in the WY form over pieces of at most
+# METAL_CHUNK_PIECE rows (Metal) or CUDA_CHUNK_PIECE rows (CUDA). Vulkan has
+# no WY piece: its chunk advances every row sequentially, staging its inputs
+# in spans of rows.
+const SEQUENTIAL_ROWS = 16
+const METAL_CHUNK_PIECE = 8
+const CUDA_CHUNK_PIECE = 16
+
 # Recurrent (gated delta net) block execution: a normed projection, and the
 # state advance publishing the gated output rows. The output projection is a
 # plain residual projection (`attention_output` over [M, NV, W]).
@@ -305,23 +317,26 @@ fn gated_delta_convolve[M, B, S, P, CH, C, T](projection: &tensor[M, P] A,
                         window[target, tap, channel] = projection[publish + tap - (C - 1), channel]
     return convolved
 
-# `gated_delta_advance`: per slot, rows advance in order from their convolved
-# channels: L2-normalized q (scaled by W^-1/2) and k, beta = sigmoid(b),
-# decay = exp(rate * softplus(alpha + time_bias)), then the delta rule
-# S <- decay S + beta (v - decay S k) k^T and output S q. The slot starts from
-# its version's state (the bank's state advanced by its first `previous_tape`
-# tape rows); the rows after `stop` (up to T) are recorded in the successor's
-# tape. Each row's raw outputs are then gated: per value head, RMS-normalized,
-# scaled by the recurrent norm and multiplied by the output gate of z.
-fn gated_delta_advance[M, B, S, NK, NV, W, T](
-    projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
-    convolved: &tensor[M, (2 * NK + NV) * W] f32,
-    rate: &tensor[NV] f32, time_bias: &tensor[NV] f32, recurrent_norm: &tensor[W] RN,
+# `delta_advance`: the delta rule both recurrent forms share. Per slot, rows
+# advance in order from their convolved channels: L2-normalized q (scaled by
+# W^-1/2) and k, then S <- S diag(d), S <- S + beta (v - S k) k^T and output
+# S q, with the row's `beta` and decay factors d: `factors[row, head, c % DW]`
+# for state column c, one per value head (DW = 1, broadcast across W) or one
+# per key channel (DW = W). The slot starts from its version's state (the
+# bank's state advanced by its first `previous_tape` tape rows); the rows
+# after `stop` (up to T) are recorded in the successor's tape, a row being
+# (u [NV, W], k [NK, W], d [NV, DW]). Each row's raw outputs are then gated:
+# per value head, RMS-normalized, scaled by the recurrent norm and multiplied
+# by the output gate of its `gate` input z.
+fn delta_advance[M, B, S, NK, NV, W, T, DW](
+    factors: &tensor[M, NV, DW] f32, beta: &tensor[M, NV] f32, gate: &tensor[M, NV * W] A,
+    convolved: &tensor[M, (2 * NK + NV) * W] f32, recurrent_norm: &tensor[W] RN,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     delta: &mut tensor[S, NV, W, W] f32,
-    tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32) -> tensor[M, NV, W] A where T >= 0:
+    tape: &mut tensor[S, T, NV * W + NK * W + NV * DW] f32,
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32) -> tensor[M, NV, W] A
+    where T >= 0 and DW >= 1:
     let mut mixed = tensor[M, NV, W] A
     for row in 0..M:
         for head in 0..NV:
@@ -345,10 +360,10 @@ fn gated_delta_advance[M, B, S, NK, NV, W, T](
                     let mut key_head = head % NK
                     if grouped:
                         key_head = head * NK / NV
-                    let factor = tape[source, entry, NV * W + NK * W + head]
                     for state_row in 0..W:
                         let innovation = tape[source, entry, head * W + state_row]
                         for column in 0..W:
+                            let factor = tape[source, entry, NV * W + NK * W + head * DW + column % DW]
                             state[head, state_row, column] = fma(innovation,
                                 tape[source, entry, NV * W + key_head * W + column],
                                 state[head, state_row, column] * factor)
@@ -377,27 +392,23 @@ fn gated_delta_advance[M, B, S, NK, NV, W, T](
                     let mut key_head = value_head % NK
                     if grouped:
                         key_head = value_head * NK / NV
-                    let alpha = f32(projection[row, (2 * NK + NV) * W + NV * W + value_head])
-                    let beta_input = f32(projection[row, (2 * NK + NV) * W + NV * W + NV + value_head])
-                    let beta = 1.0 / (1.0 + exp(-beta_input))
-                    let shifted = alpha + time_bias[value_head]
-                    let softplus = max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))
-                    let factor = exp(rate[value_head] * softplus)
                     if row >= publish and row - publish < T:
-                        tape[target, row - publish, NV * W + NK * W + value_head] = factor
+                        for channel in 0..DW:
+                            let at = NV * W + NK * W + value_head * DW + channel
+                            tape[target, row - publish, at] = factors[row, value_head, channel]
                     for state_row in 0..W:
                         let mut remembered = f32(0.0)
                         for column in 0..W:
-                            remembered = fma(state[value_head, state_row, column] * factor,
+                            remembered = fma(state[value_head, state_row, column] * factors[row, value_head, column % DW],
                                 prepared[NK + key_head, column], remembered)
-                        let residual = (prepared[2 * NK + value_head, state_row] - remembered) * beta
+                        let residual = (prepared[2 * NK + value_head, state_row] - remembered) * beta[row, value_head]
                         if row >= publish and row - publish < T:
                             tape[target, row - publish, value_head * W + state_row] = residual
                         let mut output = f32(0.0)
                         for column in 0..W:
                             state[value_head, state_row, column] = fma(residual,
                                 prepared[NK + key_head, column],
-                                state[value_head, state_row, column] * factor)
+                                state[value_head, state_row, column] * factors[row, value_head, column % DW])
                             output = fma(state[value_head, state_row, column],
                                 prepared[key_head, column], output)
                         mixed[row, value_head, state_row] = output
@@ -426,11 +437,39 @@ fn gated_delta_advance[M, B, S, NK, NV, W, T](
                 squares = fma(f32(mixed[row, value_head, column]), f32(mixed[row, value_head, column]), squares)
             let inverse = rsqrt(squares / f32(W) + epsilon)
             for column in 0..W:
-                let gate = f32(projection[row, (2 * NK + NV) * W + value_head * W + column])
+                let z = f32(gate[row, value_head * W + column])
                 normalized[row, value_head, column] = f32(mixed[row, value_head, column]) * inverse * f32(recurrent_norm[column])
-                activated[row, value_head, column] = output_gate(gate, gate_function)
+                activated[row, value_head, column] = output_gate(z, gate_function)
                 gated[row, value_head, column] = f32(normalized[row, value_head, column]) * f32(activated[row, value_head, column])
     return gated
+
+# `gated_delta_advance`: `delta_advance` with one decay per value head,
+# decay = exp(rate * softplus(alpha + time_bias)), and beta = sigmoid(b),
+# each read from the row's projection with the output gate's input z.
+fn gated_delta_advance[M, B, S, NK, NV, W, T](
+    projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
+    convolved: &tensor[M, (2 * NK + NV) * W] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV] f32, recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    delta: &mut tensor[S, NV, W, W] f32,
+    tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32) -> tensor[M, NV, W] A where T >= 0:
+    let mut factors = tensor[M, NV, 1] f32
+    let mut beta = tensor[M, NV] f32
+    let mut gate = tensor[M, NV * W] A
+    for row in 0..M:
+        for value_head in 0..NV:
+            let alpha = f32(projection[row, (2 * NK + NV) * W + NV * W + value_head])
+            let beta_input = f32(projection[row, (2 * NK + NV) * W + NV * W + NV + value_head])
+            beta[row, value_head] = 1.0 / (1.0 + exp(-beta_input))
+            let shifted = alpha + time_bias[value_head]
+            let softplus = max(shifted, 0.0) + log(1.0 + exp(-abs(shifted)))
+            factors[row, value_head, 0] = exp(rate[value_head] * softplus)
+            for column in 0..W:
+                gate[row, value_head * W + column] = projection[row, (2 * NK + NV) * W + value_head * W + column]
+    return delta_advance(factors, beta, gate, convolved, recurrent_norm, segments, stop, previous_bank,
+        previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped, gate_function)
 
 # The whole oracle: the convolution, then the advance.
 fn gated_delta_rows[M, B, S, NK, NV, W, C, T](
@@ -525,15 +564,15 @@ native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
 # CPU: a work item per (value head, ROWS state rows, slot) holds its state
 # rows privately for the whole slot and computes each row's prologue itself;
 # grid z = B zeroes the raw rows no slot covers. ROWS never changes result
-# bits. Private bytes: the state rows, the key head's q and k, the rows' v.
-# `gate` then forms each row (one work item per row).
+# bits. Private bytes: the state rows, the key head's q and k, the rows' v and
+# the head's decay. `gate` then forms each row (one work item per row).
 native gated_delta_step for cpu from "cpu/gated_delta_step.rs":
     params (ROWS in [32, 16, 64, 128] default 32)
     scratch mixed bytes (M * NV * W * 4)
     launch gated_delta_step:
         threadgroups (NV, ceil_div(W, ROWS), B + 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((min(ROWS, W) * W + 2 * W + min(ROWS, W)) * 4)
+        shared_bytes ((min(ROWS, W) * W + 2 * W + min(ROWS, W) + 1) * 4)
     launch gated_delta_step_gate:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -646,8 +685,9 @@ native gated_delta_step_convolved for metal from "metal/gated_delta_step_convolv
 
 
 # Chunked state advance for large row classes: the same contract as
-# `gated_delta_step`, computed in the WY form over pieces of at most 8 rows
-# (a piece boundary at the stop row). The inputs launch convolves each row of
+# `gated_delta_step`, computed in the WY form over pieces of at most
+# METAL_CHUNK_PIECE rows on Metal and CUDA_CHUNK_PIECE on CUDA (a piece
+# boundary at the stop row). The inputs launch convolves each row of
 # every slot once into the `inputs` scratch (L2-normalized q and k, v, log
 # decay and beta). In the scan launch a threadgroup owns (`ROWS` state rows,
 # value head, slot), each simdgroup 16 state rows in registers; per piece it
@@ -655,10 +695,11 @@ native gated_delta_step_convolved for metal from "metal/gated_delta_step_convolv
 # cumulative decay, X = K S^T and Y = Q S^T, U = (I + A)^-1 diag(beta) (V - diag(gamma) X)
 # with A_ij = beta_i (gamma_i / gamma_j) k_i . k_j (j < i), outputs
 # diag(gamma) Y + (QK^T o D) U, S <- gamma_last S + U^T diag(gamma_last / gamma) K.
-# Slots of at most 16 rows (MTP verify) are not chunked: the scan advances them
-# row-sequentially with `gated_delta_step`'s bits; in a longer slot only
-# the rows before `stop` are chunked and the rows after it (whose innovations
-# feed the tape) advance row-sequentially from the published state. `ROWS`
+# Slots of at most SEQUENTIAL_ROWS rows (MTP verify) are not chunked: the scan
+# advances them row-sequentially with `gated_delta_step`'s bits; in a longer
+# slot only the rows before `stop` are chunked and the rows after it (whose
+# innovations feed the tape) advance row-sequentially from the published
+# state. `ROWS`
 # never changes result bits.
 fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
@@ -696,23 +737,24 @@ native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
         threadgroups (M * NV, 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
-# CUDA: pieces of 16 rows. `prepare` (per piece and key head) convolves the
-# piece's q, k and v rows once and forms, per value head, the decayed K K^T
-# system's inverse and Q K^T; the scan (per ROWS state rows, value head, slot)
-# keeps the state in tensor-core accumulators and applies the slot's pieces in
-# order on f16 m16n8k16 operands (state and key as high + low pairs). Slots of
-# at most 16 rows have no pieces, and the rows after a stop row none either:
-# they advance row-sequentially in the scan with the step's bits. The scan
+# CUDA: pieces of CUDA_CHUNK_PIECE rows. `prepare` (per piece and key head)
+# convolves the piece's q, k and v rows once and forms, per value head, the
+# decayed K K^T system's inverse and Q K^T; the scan (per ROWS state rows,
+# value head, slot) keeps the state in tensor-core accumulators and applies
+# the slot's pieces in order on f16 m16n8k16 operands (state and key as high
+# + low pairs). Slots of at most SEQUENTIAL_ROWS rows have no pieces, and the
+# rows after a stop row none either: they advance row-sequentially in the
+# scan with the step's bits. The scan
 # stores the raw outputs to `mixed`, and `gate` forms each row as the step's
 # does. The scan's ROWS divides W. (Metal: an `inputs` convolution launch; the
 # systems are built in its scan.)
 native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
     static (NK, NV, W, C)
     where W % 32 == 0 and W <= 256 and W % ROWS == 0 and NV % NK == 0 and NV / NK <= 8 and NV % 4 == 0
-    scratch pieces bytes ((ceil_div(M, 16) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
+    scratch pieces bytes ((ceil_div(M, CUDA_CHUNK_PIECE) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
     scratch mixed bytes (M * NV * W * 4)
     launch gated_delta_chunk_prepare:
-        threadgroups (ceil_div(M, 16) + B, NK, 1)
+        threadgroups (ceil_div(M, CUDA_CHUNK_PIECE) + B, NK, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_chunk_scan:
         params (ROWS in [128, 64, 32] default 128)
@@ -723,14 +765,15 @@ native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: `inputs` convolves and normalizes every chunked row once into
-# scratch with the step's arithmetic; the scan keeps the step's workgroup
-# geometry with each state row on 32 / ROWS lanes, so a row's dot products are
-# short per-lane chains and a group butterfly. Slots of at most 16 rows (MTP
-# verify) and zero-stop slots get the step's bits; the rows after a stop row
-# advance row-sequentially from the published state. The scan stores the raw
-# outputs to `mixed`, and `gate` forms each (head, row) as the step's does
-# beyond 8 rows.
+# Vulkan: no WY piece. `inputs` convolves and normalizes every chunked row
+# once into scratch with the step's arithmetic; the scan keeps the step's
+# workgroup geometry with each state row on a group of 8 lanes, so a row's dot
+# products are short per-lane chains and a group butterfly, and advances the
+# chunked rows sequentially, staging them in spans of rows. Slots of at most
+# SEQUENTIAL_ROWS rows (MTP verify) and zero-stop slots get the step's bits;
+# the rows after a stop row advance row-sequentially from the published
+# state. The scan stores the raw outputs to `mixed`, and `gate` forms each
+# (head, row) as the step's does past its projection GEMV's 8 rows.
 native gated_delta_chunk for vulkan from "vulkan/gated_delta_chunk.comp":
     static (NK, NV, W, C)
     params (ROWS in [4, 2] default 4, WARPS in [8, 4] default 8)
@@ -768,6 +811,251 @@ native gated_delta_chunk for cpu from "cpu/gated_delta_chunk.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (min(ROWS, W) * W * 4)
     launch gated_delta_chunk_gate:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (W * 8)
+
+
+# ---------------------------------------------------------------------------
+# Kimi Delta Attention (KDA): the gated delta rule with one decay per key
+# channel of each value head. Its state, window, tape and output contracts
+# are the ones above, with these differences:
+# - inputs: the convolved channels' raw row `projection[M, CH]` (q heads,
+#   k heads, v heads) and beta's input `beta[M, NV]`, the output gate's input
+#   `gate[M, NV * W]` (z) and the decay's input `decay[M, NV * W]`, each its
+#   own tensor (a general projection makes the down products of KDA's
+#   low-rank gate and decay, and `project_rows` their up products);
+# - decay: per key channel c of value head h, with input a and its own time
+#   bias, `log d = decay_lower * sigmoid(-rate[h] * (a + time_bias[h * W + c]))`
+#   (`decay_lower` < 0), and d = exp(log d) scales state column c;
+# - tape row i is (u [NV, W], k [NK, W], d [NV, W]): the decay factors of
+#   every channel, so S <- S diag(d) + u k^T replays it.
+# ---------------------------------------------------------------------------
+
+# `kimi_delta_advance`: `delta_advance` with one decay factor per key
+# channel, `log d = decay_lower * sigmoid(-rate[h] * (a + time_bias[h * W + c]))`,
+# and beta = sigmoid(b), each from its own input.
+fn kimi_delta_advance[M, B, S, NK, NV, W, T](
+    beta: &tensor[M, NV] A, gate: &tensor[M, NV * W] A, decay: &tensor[M, NV * W] A,
+    convolved: &tensor[M, (2 * NK + NV) * W] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV * W] f32, recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    delta: &mut tensor[S, NV, W, W] f32,
+    tape: &mut tensor[S, T, 2 * NV * W + NK * W] f32,
+    norm_epsilon: f32, epsilon: f32, decay_lower: f32, grouped: bool, gate_function: i32)
+    -> tensor[M, NV, W] A where T >= 0:
+    let mut factors = tensor[M, NV, W] f32
+    let mut row_beta = tensor[M, NV] f32
+    for row in 0..M:
+        for value_head in 0..NV:
+            row_beta[row, value_head] = 1.0 / (1.0 + exp(-f32(beta[row, value_head])))
+            for column in 0..W:
+                let channel = value_head * W + column
+                let shifted = f32(decay[row, channel]) + time_bias[channel]
+                factors[row, value_head, column] = exp(decay_lower / (1.0 + exp(rate[value_head] * shifted)))
+    return delta_advance(factors, row_beta, gate, convolved, recurrent_norm, segments, stop, previous_bank,
+        previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped, gate_function)
+
+# The whole oracle: the convolution, then the advance.
+fn kimi_delta_rows[M, B, S, NK, NV, W, C, T](
+    projection: &tensor[M, (2 * NK + NV) * W] A, beta: &tensor[M, NV] A,
+    gate: &tensor[M, NV * W] A, decay: &tensor[M, NV * W] A,
+    convolution: &tensor[(2 * NK + NV) * W, C] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV * W] f32, recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
+    delta: &mut tensor[S, NV, W, W] f32,
+    tape: &mut tensor[S, T, 2 * NV * W + NK * W] f32,
+    norm_epsilon: f32, epsilon: f32, decay_lower: f32, grouped: bool, gate_function: i32)
+    -> tensor[M, NV, W] A where T >= 0:
+    let convolved = gated_delta_convolve(projection, convolution, segments, stop, previous_bank,
+        previous_tape, following_bank, window)
+    return kimi_delta_advance(beta, gate, decay, convolved, rate, time_bias, recurrent_norm, segments,
+        stop, previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon,
+        decay_lower, grouped, gate_function)
+
+# Row-sequential state advance for small row classes: `gated_delta_step`'s
+# decomposition, each row staging its W decay factors per value head.
+fn kimi_delta_step[M, B, S, NK, NV, W, C, T](
+    projection: &tensor[M, (2 * NK + NV) * W] A, beta: &tensor[M, NV] A,
+    gate: &tensor[M, NV * W] A, decay: &tensor[M, NV * W] A,
+    convolution: &tensor[(2 * NK + NV) * W, C] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV * W] f32, recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
+    delta: &slab mut tensor[S, NV, W, W] f32,
+    tape: &slab mut tensor[S, T, 2 * NV * W + NK * W] f32,
+    norm_epsilon: f32, epsilon: f32, decay_lower: f32, grouped: bool, gate_function: i32,
+    slab_banks: u32) -> tensor[M, NV, W] A where T >= 0:
+    return kimi_delta_rows(projection, beta, gate, decay, convolution, rate, time_bias,
+        recurrent_norm, segments, stop, previous_bank, previous_tape, following_bank, window, delta,
+        tape, norm_epsilon, epsilon, decay_lower, grouped, gate_function)
+
+# Metal: `gated_delta_step`'s launch. A span of 2048 / W rows stages q and k
+# (W floats each), the value channels of the ROWS state rows, beta and W
+# decay factors in threadgroup memory beside the arrival flag; that must fit
+# the 32768 bytes, which refuses ROWS == W up to W = 64.
+native kimi_delta_step for metal from "metal/kimi_delta_step.metal":
+    static (NK, NV, W, C)
+    params (ROWS in [32, 16, 64] default 32)
+    where W % 32 == 0 and W <= 256 and ROWS <= W and W % ROWS == 0 and (2048 / W) * (3 * W + ROWS + 1) * 4 + 4 <= 32768
+    scratch mixed bytes (M * NV * W * 4)
+    scratch arrivals bytes (NV * 4) sync
+    launch kimi_delta_step:
+        threadgroups (NV, W / ROWS, B)
+        threads_per_threadgroup (128, 1, 1)
+
+# CUDA: `gated_delta_step`'s launch, staging W decay factors per row.
+native kimi_delta_step for cuda from "cuda/kimi_delta_step.cu":
+    static (NK, NV, W, C)
+    where W % 32 == 0 and NV % 4 == 0
+    scratch mixed bytes (M * NV * W * 4)
+    scratch arrivals bytes (NV * 4) sync
+    launch kimi_delta_step:
+        params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
+        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+
+# Vulkan: `gated_delta_step`'s launches; shared: a span's prepared q | k | v
+# channels, beta and the W decay factors of each row.
+native kimi_delta_step for vulkan from "vulkan/kimi_delta_step.comp":
+    static (NK, NV, W, C)
+    params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
+    where W % 32 == 0 and W <= 256 and W % (ROWS * WARPS) == 0 and C <= 8
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_step:
+        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
+    launch kimi_delta_step_gate:
+        threadgroups (NV, M, 1)
+        threads_per_threadgroup (32, 1, 1)
+        shared_bytes (128)
+
+# CPU: `gated_delta_step`'s work items; private bytes: the state rows, the
+# key head's q and k, the rows' v and the head's W decay factors.
+native kimi_delta_step for cpu from "cpu/kimi_delta_step.rs":
+    params (ROWS in [32, 16, 64, 128] default 32)
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_step:
+        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((min(ROWS, W) * W + 3 * W + min(ROWS, W)) * 4)
+    launch kimi_delta_step_gate:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (W * 8)
+
+# Chunked state advance for large row classes: `gated_delta_chunk`'s
+# contract and pieces (METAL_CHUNK_PIECE rows on Metal, CUDA_CHUNK_PIECE on
+# CUDA), with G_i the vector of the channels' cumulative log decays from the
+# piece's start and the decay inside the products:
+#        A_ij = beta_i sum_c k_ic k_jc exp(G_ic - G_jc)   (j < i),
+#        D_ij = sum_c q_ic k_jc exp(G_ic - G_jc)          (j <= i),
+#        X = (K o exp G) S^T,  Y = (Q o exp G) S^T,  U = T diag(beta) (V - X),
+#        out = Y + D U,  S^T <- diag(exp G_last) S^T + (K o exp(G_last - G))^T U.
+# Slots of at most SEQUENTIAL_ROWS rows and the rows after a stop row advance
+# row-sequentially with `kimi_delta_step`'s bits. `ROWS` never changes result
+# bits.
+fn kimi_delta_chunk[M, B, S, NK, NV, W, C, T](
+    projection: &tensor[M, (2 * NK + NV) * W] A, beta: &tensor[M, NV] A,
+    gate: &tensor[M, NV * W] A, decay: &tensor[M, NV * W] A,
+    convolution: &tensor[(2 * NK + NV) * W, C] f32,
+    rate: &tensor[NV] f32, time_bias: &tensor[NV * W] f32, recurrent_norm: &tensor[W] RN,
+    segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
+    previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
+    window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
+    delta: &slab mut tensor[S, NV, W, W] f32,
+    tape: &slab mut tensor[S, T, 2 * NV * W + NK * W] f32,
+    norm_epsilon: f32, epsilon: f32, decay_lower: f32, grouped: bool, gate_function: i32,
+    slab_banks: u32) -> tensor[M, NV, W] A where T >= 0:
+    return kimi_delta_rows(projection, beta, gate, decay, convolution, rate, time_bias,
+        recurrent_norm, segments, stop, previous_bank, previous_tape, following_bank, window, delta,
+        tape, norm_epsilon, epsilon, decay_lower, grouped, gate_function)
+
+# Metal: `gated_delta_chunk`'s launches. The scan forms each piece's shares
+# as direct sums over their key columns, each term's exponential in place.
+# Range: within a piece every exponent is a difference G_ic - G_jc (j <= i),
+# G_ic or G_last,c - G_ic, a sum of log decays of rows of the piece, each
+# <= 0. So no exponential exceeds 1 and none overflows, whatever the decays;
+# the cumulative sums are of at most METAL_CHUNK_PIECE terms, each finite. An
+# exponential that underflows has a true value below 2^-126 and scales a
+# product of unit-norm q and k channels or a state entry, so it drops a term
+# below 2^-126 |S| absolutely: below every output's rounding at any decay.
+native kimi_delta_chunk for metal from "metal/kimi_delta_chunk.metal":
+    static (NK, NV, W, C)
+    params (ROWS in [128, 64, 32] default 128)
+    where W % 32 == 0 and W <= 128 and W % ROWS == 0
+    scratch inputs bytes (M * ((2 * NK + NV) * W + NV + NV * W) * 4)
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_chunk_inputs:
+        threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch kimi_delta_chunk_scan:
+        threadgroups (W / ROWS, NV, B)
+        threads_per_threadgroup (2 * ROWS, 1, 1)
+    launch kimi_delta_chunk_gate:
+        threadgroups (M * NV, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# CUDA: `gated_delta_chunk`'s pieces of CUDA_CHUNK_PIECE rows, where
+# `prepare` forms, per value head, the decayed operand rows Q o exp G,
+# K o exp G and K o exp(G_last - G) and the channels' exp(G_last), and the
+# scan stages those.
+native kimi_delta_chunk for cuda from "cuda/kimi_delta_chunk.cu":
+    static (NK, NV, W, C)
+    where W % 32 == 0 and W <= 128 and W % ROWS == 0 and NV % NK == 0 and NV / NK <= 8 and NV % 4 == 0
+    scratch pieces bytes ((ceil_div(M, CUDA_CHUNK_PIECE) + B) * NV * (196 * W + 1024))
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_chunk_prepare:
+        threadgroups (ceil_div(M, CUDA_CHUNK_PIECE) + B, NK, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch kimi_delta_chunk_scan:
+        params (ROWS in [128, 64, 32] default 128)
+        threadgroups (W / ROWS, NV, B + 1)
+        threads_per_threadgroup (2 * ROWS, 1, 1)
+        shared_bytes (3 * (164 * W + 32 * ROWS + 1536) + ROWS / 16 * 16 * 17 * 4)
+    launch kimi_delta_chunk_gate:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: `gated_delta_chunk`'s launches, staging W decay factors per value
+# head and row.
+native kimi_delta_chunk for vulkan from "vulkan/kimi_delta_chunk.comp":
+    static (NK, NV, W, C)
+    params (ROWS in [4, 2] default 4, WARPS in [8, 4] default 8)
+    where W % 32 == 0 and W <= 256 and W % (ROWS * WARPS) == 0 and C <= 8
+    scratch inputs bytes (M * ((2 * NK + NV) * W + NV + NV * W) * 4)
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_chunk_inputs:
+        threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch kimi_delta_chunk_scan:
+        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threads_per_threadgroup (WARPS * 32, 1, 1)
+        shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
+    launch kimi_delta_chunk_gate:
+        threadgroups (NV, M, 1)
+        threads_per_threadgroup (32, 1, 1)
+        shared_bytes (128)
+
+# CPU: `gated_delta_chunk`'s launches, staging W decay factors per value head
+# and row.
+native kimi_delta_chunk for cpu from "cpu/kimi_delta_chunk.rs":
+    params (ROWS in [64, 32, 128] default 64)
+    scratch inputs bytes (M * ((2 * NK + NV) * W + NV + NV * W) * 4)
+    scratch mixed bytes (M * NV * W * 4)
+    launch kimi_delta_chunk_inputs:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch kimi_delta_chunk_scan:
+        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (min(ROWS, W) * W * 4)
+    launch kimi_delta_chunk_gate:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (W * 8)

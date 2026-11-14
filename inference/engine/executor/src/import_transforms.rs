@@ -10,12 +10,14 @@
 //! accumulator. A grid of block scales (`ScaleBlocks`) is the source's
 //! second plane: every later transform moves its rows with the rows of
 //! codes they scale, and the source's bytes are planar as the file stores
-//! them, each matrix's codes then its grid (`seismic::GgufScales::Grid`).
+//! them, each matrix's codes then its grid (`seismic::GgufScales::Grid`). A
+//! weight stored in parts (`AppendRows`) appends each part's rows, each under
+//! its own grid, next.
 
 use crate::residency::Stored;
 use magnitude_family_contracts::{
-    ImportTransform, ProgressiveCodeDepth, ProgressivePlane, ScaleCodes, ScaledActivations,
-    WeightDescriptor,
+    ImportTransform, ProgressiveCodeDepth, ProgressivePlane, RowPart, ScaleCodes,
+    ScaledActivations, WeightDescriptor,
 };
 use seismic::{Element, GgufScales, Grid, GridScale};
 
@@ -72,6 +74,22 @@ pub(crate) fn admit_transforms(
                     range.start + range.rows
                 ));
             }
+            // Each part's grid follows the grid before it, so the rows before
+            // and in every part are whole tile rows.
+            ImportTransform::AppendRows { parts }
+                if shape.len() >= 2
+                    && !std::iter::once(shape[shape.len() - 2])
+                        .chain(parts.iter().map(|part| part.rows))
+                        .all(|rows| rows.is_multiple_of(tile_rows)) =>
+            {
+                return Err(format!(
+                    "{:?}: the rows {}, then {:?}, of its stored parts are not whole tiles of \
+                     {tile_rows} rows of its scale grid",
+                    descriptor.name,
+                    shape[shape.len() - 2],
+                    parts.iter().map(|part| part.rows).collect::<Vec<_>>()
+                ));
+            }
             ImportTransform::PermuteRows { .. } if tile_rows != 1 => {
                 return Err(format!(
                     "{:?}: its rows share scales in tiles of {tile_rows} rows, so they cannot be \
@@ -79,11 +97,20 @@ pub(crate) fn admit_transforms(
                     descriptor.name
                 ));
             }
-            ImportTransform::Rows(_) | ImportTransform::PermuteRows { .. }
+            ImportTransform::Rows(_)
+            | ImportTransform::PermuteRows { .. }
+            | ImportTransform::AppendRows { .. }
                 if shape.len() == 1 && !dense =>
             {
                 return Err(format!(
                     "{:?}: element rows of a packed vector cannot be selected",
+                    descriptor.name
+                ));
+            }
+            ImportTransform::MergeTrailingAxes if !dense || descriptor.transforms.len() != 1 => {
+                return Err(format!(
+                    "{:?}: trailing axes merge only in dense storage, as the weight's only \
+                     transform",
                     descriptor.name
                 ));
             }
@@ -116,6 +143,20 @@ pub(crate) fn admit_transforms(
                     descriptor.name
                 ));
             }
+            // A second-level scale multiplies each stored matrix of a stack;
+            // merged, a stack of several has no matrices left to scale.
+            ImportTransform::MergeLeadingAxes
+                if stored.iter().rev().skip(2).product::<u64>() > 1
+                    && descriptor
+                        .transforms
+                        .iter()
+                        .any(|other| matches!(other, ImportTransform::ScaleByTensor { .. })) =>
+            {
+                return Err(format!(
+                    "{:?}: a stack of matrices scaled one by one cannot merge into one matrix",
+                    descriptor.name
+                ));
+            }
             ImportTransform::Progressive { .. } => {
                 if placement(descriptor, stored, source)?.is_none() {
                     return Err(format!(
@@ -126,11 +167,13 @@ pub(crate) fn admit_transforms(
             }
             _ => {}
         }
+        // The shape after this transform: its prefix's, which also checks
+        // where in the order it stands.
         shape = WeightDescriptor {
-            transforms: vec![transform.clone()],
+            transforms: descriptor.transforms[..=index].to_vec(),
             ..descriptor.clone()
         }
-        .transformed_shape(&shape)
+        .transformed_shape(stored)
         .map_err(|error| error.to_string())?;
     }
     Ok(shape)
@@ -176,28 +219,60 @@ pub(crate) fn placement(
     Ok(Some((plane, placement)))
 }
 
+/// The stored bytes of one part a weight appends
+/// (`ImportTransform::AppendRows`): its own, and its grid's of block scales
+/// where it is under one.
+pub(crate) struct PartBytes {
+    pub bytes: Vec<u8>,
+    pub grid: Option<Vec<u8>>,
+}
+
 /// The logical source bytes of a tensor with `stored` shape, after
 /// `descriptor`'s transforms (admitted by [`admit`]); `grid` is the stored
 /// bytes of its grid of block scales, where it has one, and the result then
 /// planar: each matrix's codes, then its grid ([`Planes::planar`]).
+/// `parts` are those of the parts it appends, in order.
 pub(crate) fn apply(
     descriptor: &WeightDescriptor,
     stored: &[u64],
     bytes: Vec<u8>,
     grid: Option<&[u8]>,
+    parts: &[PartBytes],
 ) -> Result<Vec<u8>, String> {
     let mut shape = stored.to_vec();
     let mut planes = Planes { own: bytes, grid: None };
+    let mut scale_codes = None;
     for transform in &descriptor.transforms {
         match transform {
+            ImportTransform::AppendRows { parts: appended } => {
+                if appended.len() != parts.len() {
+                    return Err(format!(
+                        "{:?}: {} parts read for {} appended",
+                        descriptor.name,
+                        parts.len(),
+                        appended.len()
+                    ));
+                }
+                let axis = shape.len().saturating_sub(2);
+                // A part's codes follow the codes before them, its grid the
+                // grid before it: whole tile rows each (`admit`).
+                for (RowPart { rows, .. }, part) in appended.iter().zip(parts) {
+                    planes.own.extend_from_slice(&part.bytes);
+                    match (&mut planes.grid, &part.grid, scale_codes) {
+                        (Some((grid, _)), Some(added), Some(codes)) => {
+                            check_scales(codes, added)?;
+                            grid.extend_from_slice(added);
+                        }
+                        (None, None, _) => {}
+                        _ => unreachable!("an admitted part is under a grid exactly when its tensor is"),
+                    }
+                    shape[axis] += rows;
+                }
+            }
             ImportTransform::ScaleBlocks { tile, codes, .. } => {
                 let grid = grid.expect("a weight under a scale grid is stored with it");
-                if *codes == ScaleCodes::F32 {
-                    for (at, value) in grid.chunks_exact(4).enumerate() {
-                        f32_scale(f32::from_le_bytes(value.try_into().expect("four bytes")))
-                            .map_err(|reason| format!("scale {at} of the grid: {reason}"))?;
-                    }
-                }
+                check_scales(*codes, grid)?;
+                scale_codes = Some(*codes);
                 planes.grid = Some((grid.to_vec(), to_usize(tile[0])?));
             }
             ImportTransform::Rows(range) => {
@@ -221,8 +296,15 @@ pub(crate) fn apply(
                 }
             }
             ImportTransform::Flatten => shape = vec![shape.iter().product()],
-            ImportTransform::DropUnitAxis => {
-                shape.remove(0);
+            ImportTransform::MergeTrailingAxes => {
+                let (rows, rest) =
+                    shape.split_first().expect("admission holds a merged tensor to rank 3 or more");
+                shape = vec![*rows, rest.iter().product()];
+            }
+            ImportTransform::MergeLeadingAxes => {
+                let (columns, leading) =
+                    shape.split_last().expect("admission holds a merged stack to a matrix or more");
+                shape = vec![leading.iter().product(), *columns];
             }
             ImportTransform::Scale { factor } => {
                 let factor = *factor as f32;
@@ -242,6 +324,18 @@ pub(crate) fn apply(
         }
     }
     Ok(planes.planar(&shape))
+}
+
+/// Whether the F32 scales of `grid` (`codes`) are ones the engine reads
+/// ([`f32_scale`]); an E8M0 scale is any byte.
+fn check_scales(codes: ScaleCodes, grid: &[u8]) -> Result<(), String> {
+    if codes == ScaleCodes::F32 {
+        for (at, value) in grid.chunks_exact(4).enumerate() {
+            f32_scale(f32::from_le_bytes(value.try_into().expect("four bytes")))
+                .map_err(|reason| format!("scale {at} of the grid: {reason}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// A tensor's bytes as [`apply`] moves them: its own, and under a grid of
@@ -285,10 +379,11 @@ impl Planes {
 }
 
 /// The bytes the importer uploads for `plan`'s weight, `bytes` the stored
-/// range of `stored`: the transformed bytes in the plan's upload
-/// representation. A packed weight whose upload differs from its source is
-/// dequantized exactly to F32; a progressive plane is placed from the codes
-/// of the stored rows ([`placement`]).
+/// range of `stored` (its grid's and parts' ranges it reads itself): the
+/// transformed bytes in the plan's upload representation. A packed weight
+/// whose upload differs from its source is dequantized exactly to F32; a
+/// progressive plane is placed from the codes of the stored rows
+/// ([`placement`]).
 pub(crate) fn upload_bytes(
     plan: &crate::WeightPlan,
     stored: &Stored,
@@ -302,8 +397,13 @@ pub(crate) fn upload_bytes(
         .grid()
         .map(|grid| grid.read().map_err(|error| error.to_string()))
         .transpose()?;
+    let parts = stored
+        .parts()
+        .iter()
+        .map(|part| part.read().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     let (descriptor, source, upload) = (&plan.descriptor, plan.source, plan.upload);
-    let transformed = apply(descriptor, shape, bytes, grid.as_deref())?;
+    let transformed = apply(descriptor, shape, bytes, grid.as_deref(), &parts)?;
     if upload == source {
         return Ok(transformed);
     }
@@ -327,6 +427,34 @@ pub(crate) fn scale_grid(codes: ScaleCodes, tile: [u64; 2]) -> Grid {
         ScaleCodes::F32 => GridScale::F32,
     };
     Grid { scale, tile }
+}
+
+/// The parts whose rows `descriptor` appends (`ImportTransform::AppendRows`),
+/// in order: none unless it appends some.
+pub(crate) fn appended(descriptor: &WeightDescriptor) -> &[RowPart] {
+    descriptor
+        .transforms
+        .iter()
+        .find_map(|transform| match transform {
+            ImportTransform::AppendRows { parts } => Some(&parts[..]),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
+/// The shape a part `descriptor` appends, stored with `stored` shape, has
+/// as it is read: through the transforms before `AppendRows`, as the
+/// tensor's own.
+pub(crate) fn read_part(descriptor: &WeightDescriptor, stored: &[u64]) -> Result<Vec<u64>, String> {
+    let before = descriptor
+        .transforms
+        .iter()
+        .take_while(|transform| !matches!(transform, ImportTransform::AppendRows { .. }))
+        .cloned()
+        .collect();
+    WeightDescriptor { transforms: before, ..descriptor.clone() }
+        .transformed_shape(stored)
+        .map_err(|error| error.to_string())
 }
 
 /// The stored grid of block scales `descriptor` names
@@ -377,7 +505,8 @@ pub(crate) fn assemble_row(
             row_tensors(descriptor).len()
         ));
     }
-    apply(descriptor, &[1, width], own.to_vec(), grid.first().copied())
+    // A stored table appends no parts (`push_stored_table`).
+    apply(descriptor, &[1, width], own.to_vec(), grid.first().copied(), &[])
 }
 
 /// Whether `scale`, an F32 block scale (`ScaleCodes::F32`), is one the
@@ -545,7 +674,7 @@ mod tests {
         let weight = descriptor(&[2, 2, 2], transforms);
         assert_eq!(admit(&weight, &stored, Element::f32()).unwrap(), [2, 2, 2]);
         let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
-        let out = apply(&weight, &stored, f32s(&values), None).unwrap();
+        let out = apply(&weight, &stored, f32s(&values), None, &[]).unwrap();
         assert_eq!(out, f32s(&[2., 3., 4., 5., 8., 9., 10., 11.]));
     }
 
@@ -560,7 +689,7 @@ mod tests {
         admit(&weight, &stored, q8).unwrap();
         // One Q8_0 block (34 bytes) per row; rows tagged by their first byte.
         let bytes = (0..4u8).flat_map(|row| vec![row; 34]).collect::<Vec<_>>();
-        let out = apply(&weight, &stored, bytes, None).unwrap();
+        let out = apply(&weight, &stored, bytes, None, &[]).unwrap();
         let tags = out.chunks(34).map(|row| row[0]).collect::<Vec<_>>();
         assert_eq!(tags, [1, 0, 3, 2]);
     }
@@ -570,7 +699,7 @@ mod tests {
         let weight = descriptor(&[2], vec![ImportTransform::Scale { factor: 0.5 }]);
         assert!(admit(&weight, &[2], Element::bf16()).is_err());
         admit(&weight, &[2], Element::f32()).unwrap();
-        let out = apply(&weight, &[2], f32s(&[3.0, -1.0]), None).unwrap();
+        let out = apply(&weight, &[2], f32s(&[3.0, -1.0]), None, &[]).unwrap();
         assert_eq!(out, f32s(&[1.5, -0.5]));
     }
 
@@ -578,12 +707,19 @@ mod tests {
     fn flattening_keeps_bytes_and_second_level_scales_stay_apart_from_them() {
         let flat = descriptor(&[8], vec![ImportTransform::Flatten]);
         assert_eq!(admit(&flat, &[2, 4], Element::f32()).unwrap(), [8]);
-        let table = descriptor(&[2, 4], vec![ImportTransform::DropUnitAxis]);
+        // A stack reads as one matrix of its rows: a table stored with a
+        // unit axis, depthwise planes, per-head stacks; a vector is refused.
+        let table = descriptor(&[2, 4], vec![ImportTransform::MergeLeadingAxes]);
         assert_eq!(admit(&table, &[1, 2, 4], Element::f32()).unwrap(), [2, 4]);
         assert!(admit(&table, &[2, 2, 4], Element::f32()).is_err());
+        assert_eq!(admit(&table, &[1, 2, 1, 4], Element::bf16()).unwrap(), [2, 4]);
+        let heads = descriptor(&[8, 4], vec![ImportTransform::MergeLeadingAxes]);
+        assert_eq!(admit(&heads, &[2, 4, 4], Element::bf16()).unwrap(), [8, 4]);
+        let vector = descriptor(&[4], vec![ImportTransform::MergeLeadingAxes]);
+        assert!(admit(&vector, &[4], Element::f32()).is_err());
         let values = f32s(&[1., 2., 3., 4., 5., 6., 7., 8.]);
         assert_eq!(
-            apply(&table, &[1, 2, 4], values.clone(), None).unwrap(),
+            apply(&table, &[1, 2, 4], values.clone(), None, &[]).unwrap(),
             values
         );
         let scale = || ImportTransform::ScaleByTensor {
@@ -595,10 +731,14 @@ mod tests {
         assert_eq!(admit(&scaled, &[2, 32], q8).unwrap(), [2, 32]);
         assert_eq!(scale_tensor(&scaled), Some("w.scale"));
         let bytes = vec![7u8; 68];
-        assert_eq!(apply(&scaled, &[2, 32], bytes.clone(), None).unwrap(), bytes);
+        assert_eq!(apply(&scaled, &[2, 32], bytes.clone(), None, &[]).unwrap(), bytes);
         // A flattened matrix has no matrices to scale; one scale per weight.
         let flattened = descriptor(&[64], vec![scale(), ImportTransform::Flatten]);
         assert!(admit(&flattened, &[2, 32], Element::f32()).is_err());
+        // Nor has a merged stack of several; a stack of one stays scaled.
+        let merged = |shape: &[u64]| descriptor(shape, vec![scale(), ImportTransform::MergeLeadingAxes]);
+        assert!(admit(&merged(&[4, 32]), &[2, 2, 32], q8).is_err());
+        assert_eq!(admit(&merged(&[2, 32]), &[1, 2, 32], q8).unwrap(), [2, 32]);
         let twice = descriptor(
             &[2, 32],
             vec![
@@ -610,6 +750,35 @@ mod tests {
             ],
         );
         assert!(admit(&twice, &[2, 32], q8).is_err());
+    }
+
+    /// A weight stored in parts is its tensor's rows, then each part's, in
+    /// order, bytes as stored: of a matrix, and of a vector (elements). The
+    /// parts must be read: as many as appended.
+    #[test]
+    fn appended_parts_follow_the_tensor_rows_as_stored() {
+        let part = |tensor: &str, rows| RowPart { tensor: tensor.into(), rows, grid: None };
+        let matrix = descriptor(
+            &[4, 2],
+            vec![ImportTransform::AppendRows { parts: vec![part("k", 2), part("v", 1)] }],
+        );
+        assert_eq!(admit(&matrix, &[1, 2], Element::bf16()).unwrap(), [4, 2]);
+        let bytes = |values: std::ops::Range<u8>| values.flat_map(|value| [value, 0x3f]).collect::<Vec<_>>();
+        let parts = [
+            PartBytes { bytes: bytes(2..6), grid: None },
+            PartBytes { bytes: bytes(6..8), grid: None },
+        ];
+        let out = apply(&matrix, &[1, 2], bytes(0..2), None, &parts).unwrap();
+        assert_eq!(out, bytes(0..8));
+        assert!(apply(&matrix, &[1, 2], bytes(0..2), None, &parts[..1]).is_err());
+        let vector = descriptor(&[3], vec![ImportTransform::AppendRows { parts: vec![part("b", 2)] }]);
+        assert_eq!(admit(&vector, &[1], Element::f32()).unwrap(), [3]);
+        let tail = [PartBytes { bytes: f32s(&[2., 3.]), grid: None }];
+        assert_eq!(apply(&vector, &[1], f32s(&[1.]), None, &tail).unwrap(), f32s(&[1., 2., 3.]));
+        // A packed vector's elements are no whole blocks to move.
+        let q8 = Element::named("gguf_q8_0").unwrap();
+        let packed = descriptor(&[64], vec![ImportTransform::AppendRows { parts: vec![part("b", 32)] }]);
+        assert!(admit(&packed, &[32], q8).is_err());
     }
 
     /// Under a grid a weight's bytes are planar, as the file stores them:
@@ -626,7 +795,7 @@ mod tests {
         admit(&stack, &[2, 2, 64], source).unwrap();
         let codes = (0..4u8).flat_map(|row| [row; 64]).collect::<Vec<_>>();
         let scales = (100..108u8).collect::<Vec<_>>();
-        let planar = apply(&stack, &[2, 2, 64], codes.clone(), Some(&scales)).unwrap();
+        let planar = apply(&stack, &[2, 2, 64], codes.clone(), Some(&scales), &[]).unwrap();
         assert_eq!(planar, [&codes[..128], &scales[..4], &codes[128..], &scales[4..]].concat());
         assert_eq!(planar.len() as u64, source.canonical_byte_len(&[2, 2, 64]).unwrap());
         // A [96, 32] matrix under [32, 32] tiles: rows 32..96 are its codes'
@@ -639,9 +808,34 @@ mod tests {
         let scales = [7u8, 8, 9];
         let taken = rows(32, 64);
         assert_eq!(admit(&taken, &[96, 32], source).unwrap(), [64, 32]);
-        assert_eq!(apply(&taken, &[96, 32], codes.clone(), Some(&scales)).unwrap(), [&codes[32 * 32..], &scales[1..]].concat());
+        assert_eq!(apply(&taken, &[96, 32], codes.clone(), Some(&scales), &[]).unwrap(), [&codes[32 * 32..], &scales[1..]].concat());
         let error = admit(&rows(16, 32), &[96, 32], source).unwrap_err();
         assert!(error.contains("tiles of 32 rows"), "{error}");
+    }
+
+    /// Parts under grids of their own append their codes, then their grids,
+    /// as one planar matrix; a part (or the rows before it) that is not
+    /// whole tile rows is refused with its shape, never padded.
+    #[test]
+    fn appended_parts_under_grids_stay_planar_and_whole_tiles() {
+        let part = |tensor: &str, rows| RowPart { tensor: tensor.into(), rows, grid: Some(format!("{tensor}.scale")) };
+        let grid = ImportTransform::ScaleBlocks { tensor: "q.scale".into(), tile: [32, 32], codes: ScaleCodes::Ue8m0 };
+        let source = Element::named("gguf_f8_e4m3_e8m0_32x32").unwrap();
+        let weight = |rows, parts| {
+            descriptor(&[rows, 32], vec![grid.clone(), ImportTransform::AppendRows { parts }])
+        };
+        let codes = |rows: u8, tag: u8| vec![tag; rows as usize * 32];
+        let stored = weight(96, vec![part("k", 32), part("v", 32)]);
+        assert_eq!(admit(&stored, &[32, 32], source).unwrap(), [96, 32]);
+        let parts = [
+            PartBytes { bytes: codes(32, 2), grid: Some(vec![12]) },
+            PartBytes { bytes: codes(32, 3), grid: Some(vec![13]) },
+        ];
+        let out = apply(&stored, &[32, 32], codes(32, 1), Some(&[11]), &parts).unwrap();
+        assert_eq!(out, [codes(32, 1), codes(32, 2), codes(32, 3), vec![11, 12, 13]].concat());
+        assert_eq!(out.len() as u64, source.canonical_byte_len(&[96, 32]).unwrap());
+        let error = admit(&weight(80, vec![part("k", 16), part("v", 32)]), &[32, 32], source).unwrap_err();
+        assert!(error.contains("[16, 32]") && error.contains("tiles of 32 rows"), "{error}");
     }
 
     /// A Q8_0 block (an f16 scale, then 32 int8 codes) dequantizes to the

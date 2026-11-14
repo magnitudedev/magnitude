@@ -12,9 +12,9 @@
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     CellReduction, LinearPart, NormPart, VisionActivation, VisionAttentionScale,
-    VisionAttentionSpan, VisionBlock, VisionDescription, VisionGatedConvolution, VisionLinear,
-    VisionLinearSite, VisionNorm, VisionNormSite, VisionOperator, VisionStem, VisionUp,
-    VisionWeight, WeightKind, WeightRole, WeightScope,
+    VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward,
+    VisionGatedConvolution, VisionLinear, VisionLinearSite, VisionNorm, VisionNormSite,
+    VisionOperator, VisionStem, VisionUp, VisionWeight, WeightKind, WeightRole, WeightScope,
 };
 use crate::programs::graph::facts::Numbers;
 use seismic::Element;
@@ -64,6 +64,15 @@ pub enum VisionValue {
     PatchRows(usize),
 }
 
+/// The bounds a linear's output is clamped to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LinearBounds {
+    /// Stored `[1]` F32 weights (a clippable linear's).
+    Stored { minimum: WeightRole, maximum: WeightRole },
+    /// Constants of the description, F32 bits (a gated feed-forward's limit).
+    Fixed { minimum: u32, maximum: u32 },
+}
+
 /// The operands of one invocation. Absent optional weights bind an empty
 /// F32 constant of the argument's shape. Its real scalar arguments are `R`s
 /// ([`Numbers`] over them): the model's floats in a program, their indexes
@@ -87,6 +96,8 @@ pub enum VisionOperands<R = f32> {
         epsilon: R,
         centered: bool,
         interleave: bool,
+        /// The activation applied to the normalized row (`0`: none).
+        activation: i32,
     },
     Linear {
         x: VisionValue,
@@ -96,7 +107,7 @@ pub enum VisionOperands<R = f32> {
         residual: Option<VisionValue>,
         gate: Option<VisionValue>,
         /// Output clamp bounds.
-        bounds: Option<(WeightRole, WeightRole)>,
+        bounds: Option<LinearBounds>,
         activation: i32,
     },
     Clamp {
@@ -155,8 +166,18 @@ impl<R> Numbers<R> for VisionOperands<R> {
             Self::PatchStem { frame, next_frame, bias, table } => {
                 VisionOperands::PatchStem { frame, next_frame, bias, table }
             }
-            Self::Norm { source, rows, weight, bias, gathered, epsilon, centered, interleave } => {
-                VisionOperands::Norm { source, rows, weight, bias, gathered, epsilon: f(epsilon), centered, interleave }
+            Self::Norm { source, rows, weight, bias, gathered, epsilon, centered, interleave, activation } => {
+                VisionOperands::Norm {
+                    source,
+                    rows,
+                    weight,
+                    bias,
+                    gathered,
+                    epsilon: f(epsilon),
+                    centered,
+                    interleave,
+                    activation,
+                }
             }
             Self::Linear { x, rows, weight, bias, residual, gate, bounds, activation } => {
                 VisionOperands::Linear { x, rows, weight, bias, residual, gate, bounds, activation }
@@ -212,7 +233,10 @@ impl<R> VisionOperands<R> {
             Self::Norm { weight, bias, .. } => weight.iter().chain(bias).copied().collect(),
             Self::Linear { weight, bias, bounds, .. } => std::iter::once(*weight)
                 .chain(*bias)
-                .chain(bounds.iter().flat_map(|&(minimum, maximum)| [minimum, maximum]))
+                .chain(bounds.iter().flat_map(|bounds| match *bounds {
+                    LinearBounds::Stored { minimum, maximum } => vec![minimum, maximum],
+                    LinearBounds::Fixed { .. } => Vec::new(),
+                }))
                 .collect(),
             Self::Clamp { minimum, maximum, .. } => vec![*minimum, *maximum],
             Self::Attention { query_norm, key_norm, .. } => {
@@ -296,6 +320,17 @@ fn block_scope(index: usize) -> Result<WeightScope, PlanError> {
     )?))
 }
 
+/// What a linear does with its projection: adds a residual row, multiplies
+/// by a gate, applies an activation (`0`: none), and clamps to the bounds of
+/// a feed-forward's limit.
+#[derive(Clone, Copy, Default)]
+struct Epilogue {
+    residual: Option<VisionValue>,
+    gate: Option<VisionValue>,
+    activation: i32,
+    limit: Option<LinearBounds>,
+}
+
 struct Builder<'a> {
     element: &'a dyn Fn(WeightRole) -> Result<Element, PlanError>,
     activation: Element,
@@ -342,6 +377,7 @@ impl Builder<'_> {
         output: Element,
         gathered: bool,
         interleave: bool,
+        activation: i32,
     ) -> Result<VisionValue, PlanError> {
         let part = |part| role(scope, VisionWeight::Norm { site, part });
         let (weight, bias, centered) = match norm {
@@ -380,12 +416,13 @@ impl Builder<'_> {
                 epsilon: norm.epsilon() as f32,
                 centered,
                 interleave,
+                activation,
             },
         ))
     }
 
     /// `linear` over `x` (`inputs` wide), its input clamped first when it
-    /// is clippable.
+    /// is clippable, then its `epilogue`.
     #[allow(clippy::too_many_arguments)]
     fn linear(
         &mut self,
@@ -396,10 +433,9 @@ impl Builder<'_> {
         scope: WeightScope,
         site: VisionLinearSite,
         output: Element,
-        residual: Option<VisionValue>,
-        gate: Option<VisionValue>,
-        activation: i32,
+        epilogue: Epilogue,
     ) -> Result<VisionValue, PlanError> {
+        let Epilogue { residual, gate, activation, limit } = epilogue;
         let part = |part| role(scope, VisionWeight::Linear { site, part });
         let x = match &linear.clamp {
             None => x,
@@ -425,12 +461,16 @@ impl Builder<'_> {
         };
         let weight = part(LinearPart::Weight);
         let bias = linear.bias.as_ref().map(|_| part(LinearPart::Bias));
-        let bounds = linear.clamp.as_ref().map(|_| {
-            (
-                part(LinearPart::OutputMinimum),
-                part(LinearPart::OutputMaximum),
-            )
-        });
+        let bounds = match (&linear.clamp, limit) {
+            (None, limit) => limit,
+            (Some(_), None) => Some(LinearBounds::Stored {
+                minimum: part(LinearPart::OutputMinimum),
+                maximum: part(LinearPart::OutputMaximum),
+            }),
+            (Some(_), Some(_)) => {
+                return Err(unsupported("a clippable vision linear under a feed-forward limit"));
+            }
+        };
         let outputs = linear.outputs();
         let elements = vec![
             ("A", self.activation),
@@ -522,9 +562,7 @@ impl Builder<'_> {
             scope,
             VisionLinearSite::ConvolutionInputGate,
             a,
-            None,
-            None,
-            0,
+            Epilogue::default(),
         )?;
         let value = self.linear(
             normalized,
@@ -534,9 +572,7 @@ impl Builder<'_> {
             scope,
             VisionLinearSite::ConvolutionValue,
             a,
-            None,
-            Some(input_gate),
-            0,
+            Epilogue { gate: Some(input_gate), ..Epilogue::default() },
         )?;
         let gate = self.linear(
             normalized,
@@ -546,9 +582,7 @@ impl Builder<'_> {
             scope,
             VisionLinearSite::ConvolutionOutputGate,
             a,
-            None,
-            None,
-            0,
+            Epilogue::default(),
         )?;
         let kernel = role(scope, VisionWeight::ConvolutionKernel);
         let side = convolution.side();
@@ -565,6 +599,69 @@ impl Builder<'_> {
                 kernel,
             },
         ))
+    }
+
+    /// The activated up half of `feedforward` over `x` (`width` wide): the
+    /// up projection's rows, or a gated one's, whose gate projection
+    /// publishes its activation for the up projection to multiply by.
+    fn feed_forward_up(
+        &mut self,
+        x: VisionValue,
+        rows: VisionRows,
+        width: u64,
+        feedforward: &VisionFeedForward,
+        scope: WeightScope,
+    ) -> Result<VisionValue, PlanError> {
+        let (a, code) = (self.activation, activation_code(feedforward.activation));
+        match &feedforward.up {
+            VisionUp::Plain(up) => self.linear(
+                x,
+                rows,
+                width,
+                up,
+                scope,
+                VisionLinearSite::Up,
+                a,
+                Epilogue { activation: code, ..Epilogue::default() },
+            ),
+            VisionUp::Gated { gate, up, limit } => {
+                let bounds = |minimum: f64, maximum: f64| {
+                    limit.map(|_| LinearBounds::Fixed {
+                        minimum: (minimum as f32).to_bits(),
+                        maximum: (maximum as f32).to_bits(),
+                    })
+                };
+                let limit = limit.unwrap_or(0.0);
+                let gate = self.linear(
+                    x,
+                    rows,
+                    width,
+                    gate,
+                    scope,
+                    VisionLinearSite::Gate,
+                    a,
+                    Epilogue {
+                        activation: code,
+                        limit: bounds(f64::NEG_INFINITY, limit),
+                        ..Epilogue::default()
+                    },
+                )?;
+                self.linear(
+                    x,
+                    rows,
+                    width,
+                    up,
+                    scope,
+                    VisionLinearSite::Up,
+                    a,
+                    Epilogue {
+                        gate: Some(gate),
+                        limit: bounds(-limit, limit),
+                        ..Epilogue::default()
+                    },
+                )
+            }
+        }
     }
 
     fn block(
@@ -588,6 +685,7 @@ impl Builder<'_> {
             a,
             false,
             false,
+            0,
         )?;
         let (mixed, inner, output, site) = match &block.operator {
             VisionOperator::Attention(attention) => {
@@ -600,9 +698,7 @@ impl Builder<'_> {
                     scope,
                     VisionLinearSite::Query,
                     a,
-                    None,
-                    None,
-                    0,
+                    Epilogue::default(),
                 )?;
                 let key = self.linear(
                     normalized,
@@ -612,9 +708,7 @@ impl Builder<'_> {
                     scope,
                     VisionLinearSite::Key,
                     a,
-                    None,
-                    None,
-                    0,
+                    Epilogue::default(),
                 )?;
                 let value = self.linear(
                     normalized,
@@ -624,9 +718,7 @@ impl Builder<'_> {
                     scope,
                     VisionLinearSite::Value,
                     a,
-                    None,
-                    None,
-                    0,
+                    Epilogue::default(),
                 )?;
                 let epsilons = [
                     attention.query_norm.as_ref().map(|norm| norm.epsilon),
@@ -697,13 +789,18 @@ impl Builder<'_> {
                 scope,
                 site,
                 f32e,
-                Some(h),
-                None,
-                0,
+                Epilogue { residual: Some(h), ..Epilogue::default() },
             )?,
             Some(norm) => {
                 let projected = self.linear(
-                    mixed, patches, inner, output, scope, site, f32e, None, None, 0,
+                    mixed,
+                    patches,
+                    inner,
+                    output,
+                    scope,
+                    site,
+                    f32e,
+                    Epilogue::default(),
                 )?;
                 self.post_norm(
                     h,
@@ -728,48 +825,9 @@ impl Builder<'_> {
             a,
             false,
             false,
+            0,
         )?;
-        let code = activation_code(feedforward.activation);
-        let up = match &feedforward.up {
-            VisionUp::Plain(up) => self.linear(
-                normalized,
-                patches,
-                hidden,
-                up,
-                scope,
-                VisionLinearSite::Up,
-                a,
-                None,
-                None,
-                code,
-            )?,
-            VisionUp::Gated { gate, up } => {
-                let gate = self.linear(
-                    normalized,
-                    patches,
-                    hidden,
-                    gate,
-                    scope,
-                    VisionLinearSite::Gate,
-                    a,
-                    None,
-                    None,
-                    code,
-                )?;
-                self.linear(
-                    normalized,
-                    patches,
-                    hidden,
-                    up,
-                    scope,
-                    VisionLinearSite::Up,
-                    a,
-                    None,
-                    Some(gate),
-                    0,
-                )?
-            }
-        };
+        let up = self.feed_forward_up(normalized, patches, hidden, feedforward, scope)?;
         Ok(match &block.feedforward_post_norm {
             None => self.linear(
                 up,
@@ -779,9 +837,7 @@ impl Builder<'_> {
                 scope,
                 VisionLinearSite::Down,
                 f32e,
-                Some(h),
-                None,
-                0,
+                Epilogue { residual: Some(h), ..Epilogue::default() },
             )?,
             Some(norm) => {
                 let projected = self.linear(
@@ -792,9 +848,7 @@ impl Builder<'_> {
                     scope,
                     VisionLinearSite::Down,
                     f32e,
-                    None,
-                    None,
-                    0,
+                    Epilogue::default(),
                 )?;
                 self.post_norm(
                     h,
@@ -895,6 +949,7 @@ pub(crate) fn vision_program(
                     f32e,
                     false,
                     false,
+                    0,
                 )?,
             };
             match register_table {
@@ -930,6 +985,7 @@ pub(crate) fn vision_program(
                 activation,
                 false,
                 false,
+                0,
             )?;
             let projected = b.linear(
                 normalized,
@@ -939,9 +995,7 @@ pub(crate) fn vision_program(
                 vision,
                 VisionLinearSite::Patch,
                 f32e,
-                None,
-                None,
-                0,
+                Epilogue::default(),
             )?;
             let projected = b.norm(
                 projected,
@@ -954,6 +1008,7 @@ pub(crate) fn vision_program(
                 f32e,
                 false,
                 false,
+                0,
             )?;
             let elements = vec![("PE", b.element(Some(table))?)];
             let positioned = b.push(
@@ -977,6 +1032,7 @@ pub(crate) fn vision_program(
                 f32e,
                 false,
                 false,
+                0,
             )?
         }
     };
@@ -1041,6 +1097,7 @@ pub(crate) fn vision_program(
                         f32e,
                         false,
                         false,
+                        0,
                     )?;
                     b.norm(
                         patch_rows(normalized),
@@ -1053,6 +1110,7 @@ pub(crate) fn vision_program(
                         activation,
                         false,
                         false,
+                        0,
                     )?
                 }
                 // The projection norm alone over each contiguous cell.
@@ -1067,6 +1125,7 @@ pub(crate) fn vision_program(
                     activation,
                     false,
                     false,
+                    0,
                 )?,
                 (Some(norm), None) => b.norm(
                     patch_rows(h),
@@ -1079,6 +1138,7 @@ pub(crate) fn vision_program(
                     activation,
                     windows,
                     interleave,
+                    0,
                 )?,
                 (None, Some(norm)) if cell_rows == 1 => b.norm(
                     patch_rows(h),
@@ -1091,6 +1151,7 @@ pub(crate) fn vision_program(
                     activation,
                     windows,
                     interleave,
+                    0,
                 )?,
                 _ => {
                     return Err(unsupported(
@@ -1146,6 +1207,7 @@ pub(crate) fn vision_program(
                 activation,
                 false,
                 false,
+                0,
             )?
         }
     };
@@ -1156,14 +1218,16 @@ pub(crate) fn vision_program(
             u32::try_from(stage_index)
                 .map_err(|_| PlanError::Arithmetic("vision merger stage index"))?,
         );
-        let output = if stage_index == last {
+        // The last operator's rows are F32 (the features, or the output
+        // norm's source); the others are the next operator's activations. A
+        // stage's linear publishes F32 rows for its own norm to read.
+        let terminal = stage_index == last && merger.feed_forward.is_none();
+        let code = stage.activation.map_or(0, activation_code);
+        let output = if terminal || stage.norm.is_some() {
             f32e
         } else {
             activation
         };
-        if (stage_index == last) == stage.activation.is_some() {
-            return Err(unsupported("vision merger activation placement"));
-        }
         x = b.linear(
             x,
             VisionRows::Cells,
@@ -1172,11 +1236,42 @@ pub(crate) fn vision_program(
             scope,
             VisionLinearSite::Merger,
             output,
-            None,
-            None,
-            stage.activation.map_or(0, activation_code),
+            Epilogue { activation: if stage.norm.is_some() { 0 } else { code }, ..Epilogue::default() },
         )?;
         width = stage.linear.outputs();
+        if let Some(norm) = &stage.norm {
+            x = b.norm(
+                x,
+                VisionRows::Cells,
+                1,
+                width,
+                norm,
+                scope,
+                VisionNormSite::MergerStage,
+                if terminal { f32e } else { activation },
+                false,
+                false,
+                code,
+            )?;
+        }
+    }
+    if let Some(feed_forward) = &merger.feed_forward {
+        let scope = WeightScope::VisionMerger(
+            u32::try_from(merger.stages.len())
+                .map_err(|_| PlanError::Arithmetic("vision merger stage index"))?,
+        );
+        let up = b.feed_forward_up(x, VisionRows::Cells, width, feed_forward, scope)?;
+        x = b.linear(
+            up,
+            VisionRows::Cells,
+            feed_forward.intermediate(),
+            &feed_forward.down,
+            scope,
+            VisionLinearSite::Down,
+            f32e,
+            Epilogue::default(),
+        )?;
+        width = feed_forward.down.outputs();
     }
     if let Some(norm) = &merger.output_norm {
         b.norm(
@@ -1190,6 +1285,7 @@ pub(crate) fn vision_program(
             f32e,
             false,
             false,
+            0,
         )?;
     }
     Ok(VisionProgram {

@@ -1,13 +1,26 @@
 // stream_collapse (contract and portable body in streams.seismic): one
-// workgroup per row, each invocation summing its columns' streams by the
-// row's pre in stream order (`streams_collapse`). As CUDA's.
+// workgroup per row, each invocation summing its columns' streams in stream
+// order, by the row's pre (P = 1, `streams_collapse`) or at weight 1 and
+// divided by S (P = 0, the mean, `streams_sum`). As CUDA's.
 #include <seismic/element.glsl>
 #include "lib/core/streams.glsl"
 
 void stream_collapse() {
     const uint64_t row = gl_WorkGroupID.x;
-    streams_collapse(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul, SEISMIC_HIDDEN_STRIDE_1,
-        SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PRE) + row * SEISMIC_PRE_STRIDE_0 * 4ul,
-        SEISMIC_PRE_STRIDE_1, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul,
-        SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+    const uint64_t hidden = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul;
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    if (SEISMIC_DIM_P == 1) {
+        streams_collapse(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2,
+            SEISMIC_PTR(SEISMIC_BUFFER_PRE) + row * SEISMIC_PRE_STRIDE_0 * 4ul, SEISMIC_PRE_STRIDE_1, result,
+            SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex,
+            gl_WorkGroupSize.x);
+    } else {
+        streams_sum(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, result, SEISMIC_RESULT_0_STRIDE_1,
+            uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+        // Each invocation divides the columns it wrote.
+        for (uint column = gl_LocalInvocationIndex; column < uint(SEISMIC_DIM_H); column += gl_WorkGroupSize.x) {
+            const uint64_t at = result + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1 * 4ul;
+            element_f32_put(at, seismic_div_rn(element_f32_at(at), float(SEISMIC_DIM_S)));
+        }
+    }
 }

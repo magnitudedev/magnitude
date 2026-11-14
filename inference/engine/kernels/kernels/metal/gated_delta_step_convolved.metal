@@ -1,10 +1,9 @@
 // `gated_delta_step` over the convolved channels `gated_delta_project_convolved`
 // publishes: the same threadgroups (value head, block of ROWS state rows,
-// slot), arithmetic and gating (`recurrent::advance_rows`,
-// `recurrent::gate_head`), with a prologue that loads each row's convolved
-// q, k and v channels instead of convolving them. The projection launch
-// published the successor windows, so no threadgroup touches a window. ROWS
-// never changes bits. Channels of the projection and convolved rows and the
+// slot), arithmetic and gating (`recurrent::step`), with a prologue that
+// loads each row's convolved q, k and v channels instead of convolving them.
+// The projection launch published the successor windows, so no threadgroup
+// touches a window. ROWS never changes bits. Channels of the projection and convolved rows and the
 // columns of the delta arena's rows must be contiguous (unit stride).
 // State rows per simdgroup.
 #define RST_LANE_ROWS (SEISMIC_TUNE_ROWS / 4)
@@ -41,23 +40,10 @@ kernel void gated_delta_step_convolved(
     threadgroup float beta_block[RST_BLOCK];
     threadgroup float decay_block[RST_BLOCK];
     threadgroup uint last;
-    const uint threads = threadgroup_shape.x;
-    const ulong head = group.x;
-    const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;
-    const ulong row0 = block_row0 + ulong(simdgroup) * RST_LANE_ROWS;
     const recurrent::Slot slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank,
         group.z, seismic_words);
-    recurrent::advance_rows<RST_LANE_ROWS, SEISMIC_TUNE_ROWS, RST_BLOCK, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(
-        projection, recurrent::Convolved{convolved, SEISMIC_CONVOLVED_STRIDE_0}, rate, time_bias, delta, tape, mixed, slot, slot.lo, head,
-        block_row0, row0, query_block, key_block, value_block, beta_block, decay_block, thread_index, threads,
-        simdgroup, lane, seismic_words);
-    // Rows after the last slot belong to no sequence; their raw output is zero.
-    if (group.z + 1 == SEISMIC_DIM_B && lane < RST_LANE_ROWS) {
-        for (ulong row = ulong(slot.hi); row < SEISMIC_DIM_M; ++row)
-            mixed[recurrent::raw_index(row, head, row0 + lane, seismic_words)] = element::Act::store(0.0f);
-    }
-    const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
-    if (!arrive::last(arrivals + head, expected, &last, thread_index))
-        return;
-    recurrent::gate_head(mixed, projection, recurrent_norm, gated, head, thread_index, threads, seismic_words);
+    recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolved{convolved, SEISMIC_CONVOLVED_STRIDE_0},
+        recurrent::HeadRule{projection, rate, time_bias}, recurrent::projected_gate(projection, seismic_words),
+        recurrent_norm, gated, mixed, arrivals, delta, tape, slot, group, query_block, key_block, value_block,
+        beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane, seismic_words);
 }

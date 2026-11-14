@@ -168,10 +168,7 @@ pub(super) fn qualify_attention(
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, ENTRY, label);
     let input_norm = rows.norm(device, binding.norm, hidden, ENTRY, label)?;
     // The query segment: the query rows, or a low-rank query's `qr` rows.
-    let query_segment_rows = binding
-        .low_rank_query
-        .map_or(shape.query_rows(), |low_rank| low_rank.rank);
-    let query = zeros(binding.query_segment(), &[query_segment_rows, hidden])?;
+    let query = zeros(binding.query_segment(), &[binding.query_segment_rows(), hidden])?;
     let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
     let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
     let value = zeros(binding.value, &[shape.value_rows(), hidden])?;
@@ -231,6 +228,7 @@ pub(super) fn qualify_attention(
             u64::from(shape.form.output_rotary),
             shape.stored_key(),
             shape.rounds_keys(),
+            u64::from(shape.form.absorbed_query),
         ],
         &[],
         ENTRY,
@@ -283,7 +281,7 @@ pub(super) fn qualify_attention(
                 .call(widen_rows::Args { rows: &projected.r0 })
                 .map_err(|e| qualification_dynamic("widen_rows", label, e))?
                 .value;
-            let up = zeros(binding.query, &[shape.query_rows(), low_rank.rank])?;
+            let up = zeros(binding.query, &[binding.query_rows(), low_rank.rank])?;
             let empty = zeros(binding.query, &[0, low_rank.rank])?;
             let kernel = &low_rank_kernels.project;
             let scale = |name| unit_scale(device, kernel, name, ENTRY, label);
@@ -314,6 +312,28 @@ pub(super) fn qualify_attention(
             "preparation gives a low-rank query, and only one, its kernels: {low_rank:?} with \
              kernels {}",
             low_rank_kernels.is_some()
+        ),
+    };
+    // An absorbed query's heads, each through its zero block of the key
+    // projections.
+    let query_rows = match (binding.absorbed, &kernels.absorbed) {
+        (None, None) => query_rows,
+        (Some(absorbed), Some(kernel)) => {
+            let shape = absorbed.shape;
+            kernel
+                .call(project_rows::Args {
+                    source: &per_head(&query_rows, &[1, shape.heads * shape.width])?,
+                    weight: &zeros(absorbed.element, &[shape.heads * shape.keys, shape.width])?,
+                    weight_scale: &unit_scale(device, kernel, "WS", "project_rows", label)?,
+                    weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", label)?,
+                })
+                .map_err(|e| qualification_dynamic("project_rows", label, e))?
+                .value
+        }
+        (absorbed, kernel) => unreachable!(
+            "preparation gives an absorbed query, and only one, its kernel: {absorbed:?} with \
+             kernel {}",
+            kernel.is_some()
         ),
     };
     let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate()])?;

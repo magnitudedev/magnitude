@@ -150,12 +150,13 @@ pub fn scatter<'r>(
 }
 
 /// `collapse` (streams.seismic) of one row: each column of `out` the
-/// streams' values of it (`stream(s)`) summed by `carried[s]` in stream
-/// order.
+/// `streams` streams' values of it (`stream(s)`) summed by `weight(s)` in
+/// stream order.
 #[inline(always)]
-pub fn collapse<'r>(carried: &[f32], stream: impl Fn(usize) -> &'r [f32], out: &mut [f32]) {
+pub fn collapse<'r>(streams: usize, weight: impl Fn(usize) -> f32, stream: impl Fn(usize) -> &'r [f32], out: &mut [f32]) {
     out.fill(0.0);
-    for (index, weight) in carried.iter().enumerate() {
+    for index in 0..streams {
+        let weight = weight(index);
         for (sum, value) in out.iter_mut().zip(stream(index)) {
             *sum = *sum + weight * value;
         }

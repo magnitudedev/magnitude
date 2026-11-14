@@ -25,7 +25,9 @@
 //   are [-1, -1].
 //
 // The workgroup scans are `reduce_group_exclusive_add`. Group memory (u32):
-// the scans' 8 subgroup sums, then X and whether unit X is taken [2].
+// the scans' 8 subgroup sums, then X and whether unit X is taken [2], then
+// the span offsets [R + 1] (R <= 64 by the contract): every search and
+// advance reads them there, each written once by the scan.
 #include <seismic/element.glsl>
 #include "lib/core/reduce.glsl"
 #include "lib/indexer/indexer.glsl"
@@ -33,12 +35,12 @@
 #define CANDIDATE_THREADS 256u
 #define CANDIDATE_SCAN 0u
 #define CANDIDATE_FILL 8u
+#define CANDIDATE_FIRST 10u
 
-// The row's views: its spans, picks, result and span offsets.
+// The row's views: its spans, picks and result, and its units.
 uint64_t candidate_spans;
 uint64_t candidate_picks;
 uint64_t candidate_result;
-uint64_t candidate_first;
 uint candidate_units;
 
 int candidate_pick(uint s) {
@@ -56,7 +58,7 @@ uint candidate_end_unit(uint s) {
 
 // The units before span `span` (span R: the row's).
 uint candidate_offset(uint span) {
-    return element_u32_at(candidate_first + uint64_t(span) * 4ul);
+    return seismic_shared_u32[CANDIDATE_FIRST + span];
 }
 
 // Each piece of the range [a, e) in unit order, cut where a list span
@@ -132,7 +134,6 @@ void candidate_rows() {
     candidate_spans = SEISMIC_PTR(SEISMIC_BUFFER_SPANS) + row * SEISMIC_SPANS_STRIDE_0 * 4ul;
     candidate_picks = SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + row * SEISMIC_BLOCKS_STRIDE_0 * 4ul;
     candidate_result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
-    candidate_first = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OFFSETS) + row * (uint64_t(r) + 1ul) * 4ul;
     uint total = 0u;
 
     // The span offsets [R + 1]: the units before each span, then the row's.
@@ -145,12 +146,12 @@ void candidate_rows() {
         uint chunk;
         const uint before = reduce_group_exclusive_add(length, CANDIDATE_SCAN, chunk);
         if (span < r)
-            element_u32_put(candidate_first + uint64_t(span) * 4ul, units + before);
+            seismic_shared_u32[CANDIDATE_FIRST + span] = units + before;
         units += chunk;
     }
     candidate_units = units;
     if (thread == 0u) {
-        element_u32_put(candidate_first + uint64_t(r) * 4ul, units);
+        seismic_shared_u32[CANDIDATE_FIRST + r] = units;
         seismic_shared_u32[CANDIDATE_FILL] = 0u;
         seismic_shared_u32[CANDIDATE_FILL + 1u] = 0u;
     }
@@ -193,7 +194,6 @@ void candidate_rows() {
             before += end - first;
         }
     }
-    memoryBarrierBuffer();
     barrier();
     const uint x = seismic_shared_u32[CANDIDATE_FILL];
     const bool x_followed = seismic_shared_u32[CANDIDATE_FILL + 1u] != 0u;

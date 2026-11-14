@@ -22,6 +22,7 @@
 #include "../core/reduce.glsl"
 #include "../core/head.glsl"
 #include "../core/rotary.glsl"
+#include "../core/staging.glsl"
 #include "../core/rounding.glsl"
 
 // The rotated pairs: P of them over the leading columns, or the trailing ones
@@ -37,8 +38,9 @@
 #ifndef ATTENTION_HEADS
 #define ATTENTION_HEADS ATTENTION_G
 #endif
-// Query heads one decode workgroup holds: a group of the kv head's G (the
-// entry's head-group split, its GROUPS parameter), or all G.
+// Query heads one vector-form workgroup holds (`lib/attention/vector.glsl`):
+// one group of the kv head's G (the decode entry's GROUPS split, the prefill
+// entry's SLICES), or all G.
 #ifndef ATTENTION_HEAD_GROUP
 #define ATTENTION_HEAD_GROUP ATTENTION_G
 #endif
@@ -407,11 +409,11 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
     return attention_attended(merged.z, merged.x, merged.y, head);
 }
 
-// Decode subgroups: subgroup sg holds the ATTENTION_HEADS query heads of
-// slice sg % slices (heads slice * ATTENTION_HEADS ..) over key group
-// sg / slices, one of subgroups / slices contiguous sub-ranges of the
-// partition (`attention_key_range`). Every key is read by one subgroup per
-// slice.
+// Vector-form subgroups: subgroup sg holds the ATTENTION_HEADS query heads of
+// slice sg % slices of its workgroup's ATTENTION_HEAD_GROUP (heads slice *
+// ATTENTION_HEADS ..) over key group sg / slices, one of subgroups / slices
+// contiguous sub-ranges of the partition (`attention_key_range`). Every key
+// is read by one subgroup per slice.
 uint attention_slices() { return ATTENTION_HEAD_GROUP / ATTENTION_HEADS; }
 uint attention_slice(uint sg) { return sg % attention_slices(); }
 uint attention_key_group(uint sg) { return sg / attention_slices(); }

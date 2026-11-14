@@ -1,9 +1,13 @@
-//! Recurrent (gated delta net) block graph: normed projection, the in-place
+//! Recurrent (gated delta rule) block graph: normed projection, the in-place
 //! state advance publishing the gated rows, and the plain residual output
-//! projection (`attention_output`). On a backend of the convolved
-//! [`StepForm`], the step row classes' projection also convolves and
-//! publishes the successor windows, and their step advances from the
-//! convolved channels. State never moves: the
+//! projection (`attention_output`). A Gated DeltaNet layer projects with
+//! `gated_delta_project` and advances with the `gated_delta_*` entries; on a
+//! backend of the convolved [`StepForm`], the step row classes' projection
+//! also convolves and publishes the successor windows, and their step
+//! advances from the convolved channels. A Kimi Delta Attention layer
+//! projects with `attention_project` (q | k | v, the gate's and decay's down
+//! products and beta), expands the down products with `project_rows` and
+//! advances with the `kimi_delta_*` entries. State never moves: the
 //! layer's window, delta and tape arenas are bound as ports, and per-slot
 //! tables select which version (bank and tape rows) each slot reads and which
 //! bank it publishes to.
@@ -17,18 +21,19 @@ use crate::programs::graph::{
 };
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
-    PackingBound, PlannedWeights, WeightPort, packed_weight, weight,
+    PackedWeight, PackingBound, PlannedWeights, WeightPort, packed_weight, weight,
 };
 use crate::{
-    RecurrentBinding, StateResourcePlan,
-    native::{RecurrentKernels, RecurrentStepKernels},
+    RecurrentBinding, RecurrentForm, StateResourcePlan,
+    native::{RecurrentFormKernels, RecurrentKernels, RecurrentStepKernels},
 };
 use magnitude_family_contracts::{
     GatedDelta, RecurrentHeadMapping, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
-    attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
-    gated_delta_step, gated_delta_step_convolved,
+    attention_output, attention_project, gated_delta_chunk, gated_delta_project,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, kimi_delta_chunk,
+    kimi_delta_step, project_rows,
 };
 use seismic::{
     BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor,
@@ -68,10 +73,27 @@ impl StepForm {
 }
 
 pub(crate) struct RecurrentGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, gated_delta_project::Entry>,
-    pub step: RecurrentStepEntries<'a, G>,
-    pub chunk: G::Binding<'a, gated_delta_chunk::Entry>,
+    pub form: RecurrentFormEntries<'a, G>,
     pub output: G::Binding<'a, attention_output::Entry>,
+}
+
+/// The entries of a layer's [`RecurrentForm`].
+pub(crate) enum RecurrentFormEntries<'a, G: GraphDraft + 'a> {
+    /// Gated DeltaNet.
+    Gated {
+        project: G::Binding<'a, gated_delta_project::Entry>,
+        step: RecurrentStepEntries<'a, G>,
+        chunk: G::Binding<'a, gated_delta_chunk::Entry>,
+    },
+    /// Kimi Delta Attention: the projection, the gate's and the decay's up
+    /// projections, and the state entries.
+    Kimi {
+        project: G::Binding<'a, attention_project::Entry>,
+        gate_up: G::Binding<'a, project_rows::Entry>,
+        alpha_up: G::Binding<'a, project_rows::Entry>,
+        step: G::Binding<'a, kimi_delta_step::Entry>,
+        chunk: G::Binding<'a, kimi_delta_chunk::Entry>,
+    },
 }
 
 /// The step row classes' entries of a [`StepForm`].
@@ -93,14 +115,29 @@ impl<'a, G: GraphDraft + 'a> Clone for RecurrentStepEntries<'a, G> {
 impl<'a> From<&'a RecurrentKernels> for RecurrentGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a RecurrentKernels) -> Self {
         Self {
-            project: &kernels.project,
-            step: match &kernels.step {
-                RecurrentStepKernels::Step(step) => RecurrentStepEntries::Step(step),
-                RecurrentStepKernels::Convolved { project, step } => {
-                    RecurrentStepEntries::Convolved { project, step }
-                }
+            form: match &kernels.form {
+                RecurrentFormKernels::Gated {
+                    project,
+                    step,
+                    chunk,
+                } => RecurrentFormEntries::Gated {
+                    project,
+                    step: match step {
+                        RecurrentStepKernels::Step(step) => RecurrentStepEntries::Step(step),
+                        RecurrentStepKernels::Convolved { project, step } => {
+                            RecurrentStepEntries::Convolved { project, step }
+                        }
+                    },
+                    chunk,
+                },
+                RecurrentFormKernels::Kimi(kimi) => RecurrentFormEntries::Kimi {
+                    project: &kimi.project,
+                    gate_up: &kimi.gate_up,
+                    alpha_up: &kimi.alpha_up,
+                    step: &kimi.step,
+                    chunk: &kimi.chunk,
+                },
             },
-            chunk: &kernels.chunk,
             output: &kernels.output,
         }
     }
@@ -108,41 +145,90 @@ impl<'a> From<&'a RecurrentKernels> for RecurrentGraphEntries<'a, NativeGraph> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedRecurrentEntries {
-    project: [(&'static str, Element); 6],
+    form: CheckedForm,
     state: [(&'static str, Element); 2],
-    form: StepForm,
     output: [(&'static str, Element); 2],
 }
 
+/// The element bindings of a [`RecurrentForm`]'s projection entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CheckedForm {
+    Gated {
+        project: [(&'static str, Element); 6],
+        step: StepForm,
+    },
+    Kimi {
+        project: [(&'static str, Element); 7],
+        up: [[(&'static str, Element); 3]; 2],
+    },
+}
+
 impl CheckedRecurrentEntries {
-    /// The entries of `binding` on `backend` (its [`StepForm`]).
+    /// The entries of `binding` on `backend` (a Gated DeltaNet layer's of its
+    /// [`StepForm`]).
     pub(crate) fn new(binding: RecurrentBinding, backend: BackendName) -> Result<Self, String> {
+        let form = match binding.form {
+            RecurrentForm::PerHead => CheckedForm::Gated {
+                project: [
+                    ("NW", binding.norm),
+                    ("QW", binding.qkv),
+                    ("GW", binding.gate),
+                    ("AW", binding.alpha),
+                    ("BW", binding.beta),
+                    ("A", binding.activation),
+                ],
+                step: StepForm::of(backend)?,
+            },
+            // The projection's segments q | k | v, the gate's and decay's
+            // down products and beta, published in A, the state entries'
+            // inputs, as the up projections publish theirs.
+            RecurrentForm::PerChannel { gate_up, alpha_up, .. } => CheckedForm::Kimi {
+                project: [
+                    ("NW", binding.norm),
+                    ("QW", binding.qkv),
+                    ("GW", binding.gate),
+                    ("KW", binding.alpha),
+                    ("VW", binding.beta),
+                    ("A", binding.activation),
+                    ("Y", binding.activation),
+                ],
+                up: [gate_up, alpha_up].map(|weight| {
+                    [("A", binding.activation), ("W", weight), ("Y", binding.activation)]
+                }),
+            },
+        };
         Ok(Self {
-            project: [
-                ("NW", binding.norm),
-                ("QW", binding.qkv),
-                ("GW", binding.gate),
-                ("AW", binding.alpha),
-                ("BW", binding.beta),
-                ("A", binding.activation),
-            ],
+            form,
             state: [("RN", binding.recurrent_norm), ("A", binding.activation)],
-            form: StepForm::of(backend)?,
             output: [("OW", binding.output), ("A", binding.activation)],
         })
     }
 
     pub(crate) fn entries(&self) -> RecurrentGraphEntries<'_, NativeGraphMetadata> {
         RecurrentGraphEntries {
-            project: &self.project,
-            step: match self.form {
-                StepForm::Step => RecurrentStepEntries::Step(&self.state[..]),
-                StepForm::Convolved => RecurrentStepEntries::Convolved {
-                    project: &self.project[..],
-                    step: &self.state[..],
+            form: match &self.form {
+                CheckedForm::Gated { project, step } => RecurrentFormEntries::Gated {
+                    project,
+                    step: match step {
+                        StepForm::Step => RecurrentStepEntries::Step(&self.state[..]),
+                        StepForm::Convolved => RecurrentStepEntries::Convolved {
+                            project: &project[..],
+                            step: &self.state[..],
+                        },
+                    },
+                    chunk: &self.state,
+                },
+                CheckedForm::Kimi {
+                    project,
+                    up: [gate_up, alpha_up],
+                } => RecurrentFormEntries::Kimi {
+                    project,
+                    gate_up,
+                    alpha_up,
+                    step: &self.state,
+                    chunk: &self.state,
                 },
             },
-            chunk: &self.state,
             output: &self.output,
         }
     }
@@ -226,6 +312,12 @@ pub(crate) struct RecurrentTopology<R = Argument<f64>> {
     /// entries' `grouped` argument, a flag no number can carry unguarded.
     pub grouped: bool,
     pub epsilon: R,
+    /// The q/k L2-norm epsilon.
+    pub key_norm_epsilon: R,
+    /// A Kimi Delta Attention layer's decay lower bound
+    /// (`gated_delta::decay_lower`), the `kimi_delta_*` entries'
+    /// `decay_lower`: none for Gated DeltaNet.
+    pub decay_lower: Option<R>,
     /// The elements of the layer's window, delta and tape components.
     pub bank: [Element; 3],
     /// How the graph takes its launch's slot tables.
@@ -238,6 +330,8 @@ impl<R> Numbers<R> for RecurrentTopology<R> {
         RecurrentTopology {
             grouped: self.grouped,
             epsilon: f(self.epsilon),
+            key_norm_epsilon: f(self.key_norm_epsilon),
+            decay_lower: self.decay_lower.map(&mut *f),
             bank: self.bank,
             controls: self.controls,
         }
@@ -257,7 +351,17 @@ pub(crate) struct RecurrentBlock<D = Dim> {
     /// The output gate's code (`gated_delta::gate_function`), the entries'
     /// `gate_function` argument.
     pub gate_function: D,
+    /// A Kimi Delta Attention layer's gate and decay ranks
+    /// (`gated_delta::ranks`): none for Gated DeltaNet.
+    pub ranks: Option<[D; 2]>,
     pub bank: RecurrentBank<D, 3>,
+}
+
+impl RecurrentBlock {
+    /// The convolved q | k | v channels (`CH`).
+    fn channels(&self) -> Dim {
+        (&self.key_heads * 2 + &self.value_heads) * &self.width
+    }
 }
 
 impl<D> Numbers<D> for RecurrentBlock<D> {
@@ -272,6 +376,7 @@ impl<D> Numbers<D> for RecurrentBlock<D> {
             width: f(self.width),
             convolution_width: f(self.convolution_width),
             gate_function: f(self.gate_function),
+            ranks: self.ranks.map(|ranks| ranks.map(&mut *f)),
             bank: self.bank.map(f),
         }
     }
@@ -295,6 +400,8 @@ pub(crate) fn split(
         RecurrentTopology {
             grouped: matches!(delta.head_mapping, RecurrentHeadMapping::Grouped),
             epsilon: f64::from(epsilon),
+            key_norm_epsilon: delta.key_norm_epsilon,
+            decay_lower: super::decay_lower(delta).map(f64::from),
             bank: elements,
             controls,
         },
@@ -307,9 +414,36 @@ pub(crate) fn split(
             width: delta.width,
             convolution_width: delta.convolution_width,
             gate_function: crate::operators::code(super::gate_function(delta)),
+            ranks: super::ranks(delta),
             bank,
         },
     ))
+}
+
+/// A layer's projection entries and weights, by its form.
+enum Projected<'a, G: GraphDraft + 'a> {
+    Gated {
+        project: G::Binding<'a, gated_delta_project::Entry>,
+        step: RecurrentStepEntries<'a, G>,
+        chunk: G::Binding<'a, gated_delta_chunk::Entry>,
+        /// The packed projections' bounds, where `gated_delta_project` runs.
+        bounds: Option<(PackingBound, PackingBound)>,
+        qkv: WorkflowTensor,
+        gate: WorkflowTensor,
+        alpha: WorkflowTensor,
+        beta: WorkflowTensor,
+    },
+    Kimi {
+        project: G::Binding<'a, attention_project::Entry>,
+        gate_up: G::Binding<'a, project_rows::Entry>,
+        alpha_up: G::Binding<'a, project_rows::Entry>,
+        step: G::Binding<'a, kimi_delta_step::Entry>,
+        chunk: G::Binding<'a, kimi_delta_chunk::Entry>,
+        qkv: PackedWeight,
+        gate: PackedWeight,
+        alpha: PackedWeight,
+        beta: PackedWeight,
+    },
 }
 
 pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
@@ -326,14 +460,19 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     join: &Join,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let chunked = chunked(&block.rows);
-    // The packed projections' bounds. The convolved decode form has no
+    // GDN's packed projections' bounds. The convolved decode form has no
     // packed form and reads none, so the input projection's are only where
     // `gated_delta_project` runs (an unread port is unbound).
-    let projects = chunked || matches!(kernels.step, RecurrentStepEntries::Step(_));
+    let projects = match kernels.form {
+        RecurrentFormEntries::Gated { step, .. } => {
+            chunked || matches!(step, RecurrentStepEntries::Step(_))
+        }
+        RecurrentFormEntries::Kimi { .. } => false,
+    };
     let mut bound = |graph: &mut G, kind| {
         PackingBound::planned(graph, weights, WeightRole { scope, kind }, ports, constants)
     };
-    let projection_bounds = match projects {
+    let mut projection_bounds = match projects {
         true => Some((
             bound(graph, WeightKind::RecurrentQueryKeyValue)?,
             bound(graph, WeightKind::RecurrentGate)?,
@@ -354,11 +493,47 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     } else {
         GraphConstant::absent(graph, constants)?.tensor().clone()
     };
+    let projected = match kernels.form {
+        RecurrentFormEntries::Gated {
+            project,
+            step,
+            chunk,
+        } => {
+            let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
+            Projected::Gated {
+                project,
+                step,
+                chunk,
+                bounds: projection_bounds.take(),
+                qkv: weight(graph, WeightKind::RecurrentQueryKeyValue)?,
+                gate: weight(graph, WeightKind::RecurrentGate)?,
+                alpha: weight(graph, WeightKind::RecurrentAlpha)?,
+                beta: weight(graph, WeightKind::RecurrentBeta)?,
+            }
+        }
+        RecurrentFormEntries::Kimi {
+            project,
+            gate_up,
+            alpha_up,
+            step,
+            chunk,
+        } => {
+            let mut weight =
+                |graph: &mut G, kind| packed_weight(graph, weights, scope, kind, ports, constants);
+            Projected::Kimi {
+                project,
+                gate_up,
+                alpha_up,
+                step,
+                chunk,
+                qkv: weight(graph, WeightKind::RecurrentQueryKeyValue)?,
+                gate: weight(graph, WeightKind::RecurrentGate)?,
+                alpha: weight(graph, WeightKind::RecurrentAlpha)?,
+                beta: weight(graph, WeightKind::RecurrentBeta)?,
+            }
+        }
+    };
     let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
-    let qkv_weight = weight(graph, WeightKind::RecurrentQueryKeyValue)?;
-    let gate_weight = weight(graph, WeightKind::RecurrentGate)?;
-    let alpha_weight = weight(graph, WeightKind::RecurrentAlpha)?;
-    let beta_weight = weight(graph, WeightKind::RecurrentBeta)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
     let rate = weight(graph, WeightKind::RecurrentDecay)?;
     let time_bias = weight(graph, WeightKind::RecurrentTimeBias)?;
@@ -377,38 +552,6 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     let gate_function = scalar::<i32>(&block.gate_function, "a recurrent gate code")?;
 
     let [parts, normalized] = input.form.dimensions(block.hidden.clone());
-    let project = |graph: &mut G| {
-        let Some((qkv_bound, gate_bound)) = &projection_bounds else {
-            return Err("the recurrent projection's packing bounds are absent".into());
-        };
-        graph
-            .enqueue(
-                kernels.project,
-                &[
-                    ("M", block.rows.clone()),
-                    ("H", block.hidden.clone()),
-                    ("NK", block.key_heads.clone()),
-                    ("NV", block.value_heads.clone()),
-                    ("W", block.width.clone()),
-                    parts.clone(),
-                    normalized.clone(),
-                    ("QB", qkv_bound.extent.clone()),
-                    ("ZB", gate_bound.extent.clone()),
-                ],
-                gated_delta_project::WorkflowArgs {
-                    hidden: input.rows.into(),
-                    input_norm: (&input_norm).into(),
-                    qkv_weight: (&qkv_weight).into(),
-                    gate_weight: (&gate_weight).into(),
-                    alpha_weight: (&alpha_weight).into(),
-                    beta_weight: (&beta_weight).into(),
-                    epsilon: topology.epsilon.f32(),
-                    qkv_bound: (&qkv_bound.tensor).into(),
-                    gate_bound: (&gate_bound.tensor).into(),
-                },
-            )
-            .map(|projection| projection.value)
-    };
     let dimensions = [
         ("M", &block.rows),
         ("B", &block.slots),
@@ -421,8 +564,13 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     ];
     // Every entry that binds the slot tables gives them the chunk's geometry,
     // whichever advances this class.
-    let table = |graph: &mut G, name: &str| {
-        graph.control_for(topology.controls, kernels.chunk, name, &dimensions)
+    let table = |graph: &mut G, name: &str| match &projected {
+        Projected::Gated { chunk, .. } => {
+            graph.control_for(topology.controls, *chunk, name, &dimensions)
+        }
+        Projected::Kimi { chunk, .. } => {
+            graph.control_for(topology.controls, *chunk, name, &dimensions)
+        }
     };
     let controls = RecurrentControlPorts {
         segments: table(graph, "segments")?,
@@ -431,46 +579,59 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         previous_tape: table(graph, "previous_tape")?,
         following_bank: table(graph, "following_bank")?,
     };
-    // The L2-norm epsilon of the q/k prologue, scaled as the model defines
-    // it: a scalar argument, so the trace holds for this width alone.
-    let norm_epsilon = (topology.epsilon * block.width.real()).f32();
-    let gated = if chunked {
-        let projection = project(graph)?;
-        graph
-            .enqueue(
-                kernels.chunk,
-                &dimensions,
-                gated_delta_chunk::WorkflowArgs {
-                    projection: (&projection).into(),
-                    convolution: (&convolution).into(),
-                    rate: (&rate).into(),
-                    time_bias: (&time_bias).into(),
-                    recurrent_norm: (&recurrent_norm).into(),
-                    segments: controls.segments.tensor().into(),
-                    stop: controls.stop.tensor().into(),
-                    previous_bank: controls.previous_bank.tensor().into(),
-                    previous_tape: controls.previous_tape.tensor().into(),
-                    following_bank: controls.following_bank.tensor().into(),
-                    window: window.tensor_mut().into(),
-                    delta: delta.tensor_mut().into(),
-                    tape: tape.tensor_mut().into(),
-                    norm_epsilon,
-                    epsilon: topology.epsilon.f32(),
-                    grouped: topology.grouped.into(),
-                    gate_function,
-                    slab_banks,
-                },
-            )?
-            .value
-    } else {
-        match kernels.step {
-            RecurrentStepEntries::Step(step) => {
+    // The L2-norm epsilon of the q/k prologue: a scalar argument, so the
+    // trace holds for this value alone.
+    let norm_epsilon = topology.key_norm_epsilon.f32();
+    let gated = match projected {
+        Projected::Gated {
+            project: project_entry,
+            step,
+            chunk,
+            bounds,
+            qkv: qkv_weight,
+            gate: gate_weight,
+            alpha: alpha_weight,
+            beta: beta_weight,
+        } => {
+            let project = |graph: &mut G| {
+                let Some((qkv_bound, gate_bound)) = &bounds else {
+                    return Err("the recurrent projection's packing bounds are absent".into());
+                };
+                graph
+                    .enqueue(
+                        project_entry,
+                        &[
+                            ("M", block.rows.clone()),
+                            ("H", block.hidden.clone()),
+                            ("NK", block.key_heads.clone()),
+                            ("NV", block.value_heads.clone()),
+                            ("W", block.width.clone()),
+                            parts.clone(),
+                            normalized.clone(),
+                            ("QB", qkv_bound.extent.clone()),
+                            ("ZB", gate_bound.extent.clone()),
+                        ],
+                        gated_delta_project::WorkflowArgs {
+                            hidden: input.rows.into(),
+                            input_norm: (&input_norm).into(),
+                            qkv_weight: (&qkv_weight).into(),
+                            gate_weight: (&gate_weight).into(),
+                            alpha_weight: (&alpha_weight).into(),
+                            beta_weight: (&beta_weight).into(),
+                            epsilon: topology.epsilon.f32(),
+                            qkv_bound: (&qkv_bound.tensor).into(),
+                            gate_bound: (&gate_bound.tensor).into(),
+                        },
+                    )
+                    .map(|projection| projection.value)
+            };
+            if chunked {
                 let projection = project(graph)?;
                 graph
                     .enqueue(
-                        step,
+                        chunk,
                         &dimensions,
-                        gated_delta_step::WorkflowArgs {
+                        gated_delta_chunk::WorkflowArgs {
                             projection: (&projection).into(),
                             convolution: (&convolution).into(),
                             rate: (&rate).into(),
@@ -492,58 +653,212 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                         },
                     )?
                     .value
+            } else {
+                match step {
+                    RecurrentStepEntries::Step(step) => {
+                        let projection = project(graph)?;
+                        graph
+                            .enqueue(
+                                step,
+                                &dimensions,
+                                gated_delta_step::WorkflowArgs {
+                                    projection: (&projection).into(),
+                                    convolution: (&convolution).into(),
+                                    rate: (&rate).into(),
+                                    time_bias: (&time_bias).into(),
+                                    recurrent_norm: (&recurrent_norm).into(),
+                                    segments: controls.segments.tensor().into(),
+                                    stop: controls.stop.tensor().into(),
+                                    previous_bank: controls.previous_bank.tensor().into(),
+                                    previous_tape: controls.previous_tape.tensor().into(),
+                                    following_bank: controls.following_bank.tensor().into(),
+                                    window: window.tensor_mut().into(),
+                                    delta: delta.tensor_mut().into(),
+                                    tape: tape.tensor_mut().into(),
+                                    norm_epsilon,
+                                    epsilon: topology.epsilon.f32(),
+                                    grouped: topology.grouped.into(),
+                                    gate_function,
+                                    slab_banks,
+                                },
+                            )?
+                            .value
+                    }
+                    RecurrentStepEntries::Convolved { project, step } => {
+                        // The projection launch convolves and publishes the
+                        // successor windows; the step advances from its
+                        // convolved channels.
+                        let projected = graph.enqueue(
+                            project,
+                            &[
+                                ("M", block.rows.clone()),
+                                ("B", block.slots.clone()),
+                                ("S", banks.clone()),
+                                ("H", block.hidden.clone()),
+                                ("NK", block.key_heads.clone()),
+                                ("NV", block.value_heads.clone()),
+                                ("W", block.width.clone()),
+                                ("C", block.convolution_width.clone()),
+                                ("T", tape_rows.clone()),
+                                parts,
+                                normalized,
+                            ],
+                            gated_delta_project_convolved::WorkflowArgs {
+                                hidden: input.rows.into(),
+                                input_norm: (&input_norm).into(),
+                                qkv_weight: (&qkv_weight).into(),
+                                gate_weight: (&gate_weight).into(),
+                                alpha_weight: (&alpha_weight).into(),
+                                beta_weight: (&beta_weight).into(),
+                                convolution: (&convolution).into(),
+                                segments: controls.segments.tensor().into(),
+                                stop: controls.stop.tensor().into(),
+                                previous_bank: controls.previous_bank.tensor().into(),
+                                previous_tape: controls.previous_tape.tensor().into(),
+                                following_bank: controls.following_bank.tensor().into(),
+                                window: window.tensor_mut().into(),
+                                epsilon: topology.epsilon.f32(),
+                                slab_banks,
+                            },
+                        )?;
+                        graph
+                            .enqueue(
+                                step,
+                                &[
+                                    ("M", &block.rows),
+                                    ("B", &block.slots),
+                                    ("S", banks),
+                                    ("NK", &block.key_heads),
+                                    ("NV", &block.value_heads),
+                                    ("W", &block.width),
+                                    ("T", &tape_rows),
+                                ],
+                                gated_delta_step_convolved::WorkflowArgs {
+                                    projection: (&projected.r0).into(),
+                                    convolved: (&projected.r1).into(),
+                                    rate: (&rate).into(),
+                                    time_bias: (&time_bias).into(),
+                                    recurrent_norm: (&recurrent_norm).into(),
+                                    segments: controls.segments.tensor().into(),
+                                    stop: controls.stop.tensor().into(),
+                                    previous_bank: controls.previous_bank.tensor().into(),
+                                    previous_tape: controls.previous_tape.tensor().into(),
+                                    following_bank: controls.following_bank.tensor().into(),
+                                    delta: delta.tensor_mut().into(),
+                                    tape: tape.tensor_mut().into(),
+                                    norm_epsilon,
+                                    epsilon: topology.epsilon.f32(),
+                                    grouped: topology.grouped.into(),
+                                    gate_function,
+                                    slab_banks,
+                                },
+                            )?
+                            .value
+                    }
+                }
             }
-            RecurrentStepEntries::Convolved { project, step } => {
-                // The projection launch convolves and publishes the successor
-                // windows; the step advances from its convolved channels.
-                let projected = graph.enqueue(
-                    project,
-                    &[
-                        ("M", block.rows.clone()),
-                        ("B", block.slots.clone()),
-                        ("S", banks.clone()),
-                        ("H", block.hidden.clone()),
-                        ("NK", block.key_heads.clone()),
-                        ("NV", block.value_heads.clone()),
-                        ("W", block.width.clone()),
-                        ("C", block.convolution_width.clone()),
-                        ("T", tape_rows.clone()),
-                        parts,
-                        normalized,
-                    ],
-                    gated_delta_project_convolved::WorkflowArgs {
-                        hidden: input.rows.into(),
-                        input_norm: (&input_norm).into(),
-                        qkv_weight: (&qkv_weight).into(),
-                        gate_weight: (&gate_weight).into(),
-                        alpha_weight: (&alpha_weight).into(),
-                        beta_weight: (&beta_weight).into(),
-                        convolution: (&convolution).into(),
-                        segments: controls.segments.tensor().into(),
-                        stop: controls.stop.tensor().into(),
-                        previous_bank: controls.previous_bank.tensor().into(),
-                        previous_tape: controls.previous_tape.tensor().into(),
-                        following_bank: controls.following_bank.tensor().into(),
-                        window: window.tensor_mut().into(),
-                        epsilon: topology.epsilon.f32(),
-                        slab_banks,
-                    },
-                )?;
+        }
+        Projected::Kimi {
+            project,
+            gate_up,
+            alpha_up,
+            step,
+            chunk,
+            qkv,
+            gate,
+            alpha,
+            beta,
+        } => {
+            let (Some([gate_rank, alpha_rank]), Some(decay_lower)) =
+                (&block.ranks, &topology.decay_lower)
+            else {
+                unreachable!("a per-channel layer's block has its ranks and decay lower bound")
+            };
+            // q | k | v, the gate's and decay's down products and beta, in A.
+            let projection = graph.enqueue(
+                project,
+                &[
+                    ("M", block.rows.clone()),
+                    ("D", block.hidden.clone()),
+                    ("Q", block.channels()),
+                    ("GR", gate_rank.clone()),
+                    ("K", alpha_rank.clone()),
+                    ("V", block.value_heads.clone()),
+                    ("QS", qkv.operands.scale.extent.clone()),
+                    ("GS", gate.operands.scale.extent.clone()),
+                    ("KS", alpha.operands.scale.extent.clone()),
+                    ("VS", beta.operands.scale.extent.clone()),
+                    ("QB", qkv.operands.bound.extent.clone()),
+                    ("GB", gate.operands.bound.extent.clone()),
+                    ("KB", alpha.operands.bound.extent.clone()),
+                    ("VB", beta.operands.bound.extent.clone()),
+                    parts,
+                    normalized,
+                ],
+                attention_project::WorkflowArgs {
+                    hidden: input.rows.into(),
+                    input_norm: (&input_norm).into(),
+                    query_weight: (&qkv.weight).into(),
+                    gate_weight: (&gate.weight).into(),
+                    key_weight: (&alpha.weight).into(),
+                    value_weight: (&beta.weight).into(),
+                    epsilon: topology.epsilon.f32(),
+                    project_mode: 0.into(),
+                    query_scale: (&qkv.operands.scale.tensor).into(),
+                    gate_scale: (&gate.operands.scale.tensor).into(),
+                    key_scale: (&alpha.operands.scale.tensor).into(),
+                    value_scale: (&beta.operands.scale.tensor).into(),
+                    query_bound: (&qkv.operands.bound.tensor).into(),
+                    gate_bound: (&gate.operands.bound.tensor).into(),
+                    key_bound: (&alpha.operands.bound.tensor).into(),
+                    value_bound: (&beta.operands.bound.tensor).into(),
+                },
+            )?;
+            // The gate and decay inputs: their down products through the up
+            // projections, in A.
+            let gate_up_weight =
+                packed_weight(graph, weights, scope, WeightKind::RecurrentGateUp, ports, constants)?;
+            let alpha_up_weight =
+                packed_weight(graph, weights, scope, WeightKind::RecurrentAlphaUp, ports, constants)?;
+            let expand = |graph: &mut G,
+                              entry: G::Binding<'a, project_rows::Entry>,
+                              source: &WorkflowTensor,
+                              rank: &Dim,
+                              up: &PackedWeight| {
                 graph
                     .enqueue(
-                        step,
+                        entry,
                         &[
-                            ("M", &block.rows),
-                            ("B", &block.slots),
-                            ("S", banks),
-                            ("NK", &block.key_heads),
-                            ("NV", &block.value_heads),
-                            ("W", &block.width),
-                            ("T", &tape_rows),
+                            ("M", block.rows.clone()),
+                            ("G", Dim::from(1)),
+                            ("K", rank.clone()),
+                            ("N", &block.value_heads * &block.width),
+                            ("WS", up.operands.scale.extent.clone()),
+                            ("WB", up.operands.bound.extent.clone()),
                         ],
-                        gated_delta_step_convolved::WorkflowArgs {
-                            projection: (&projected.r0).into(),
-                            convolved: (&projected.r1).into(),
+                        project_rows::WorkflowArgs {
+                            source: source.into(),
+                            weight: (&up.weight).into(),
+                            weight_scale: (&up.operands.scale.tensor).into(),
+                            weight_bound: (&up.operands.bound.tensor).into(),
+                        },
+                    )
+                    .map(|expanded| expanded.value)
+            };
+            let gate_input = expand(graph, gate_up, &projection.r1, gate_rank, &gate_up_weight)?;
+            let decay_input = expand(graph, alpha_up, &projection.r2, alpha_rank, &alpha_up_weight)?;
+            let decay_lower = decay_lower.f32();
+            if chunked {
+                graph
+                    .enqueue(
+                        chunk,
+                        &dimensions,
+                        kimi_delta_chunk::WorkflowArgs {
+                            projection: (&projection.r0).into(),
+                            beta: (&projection.r3).into(),
+                            gate: (&gate_input).into(),
+                            decay: (&decay_input).into(),
+                            convolution: (&convolution).into(),
                             rate: (&rate).into(),
                             time_bias: (&time_bias).into(),
                             recurrent_norm: (&recurrent_norm).into(),
@@ -552,10 +867,43 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                             previous_bank: controls.previous_bank.tensor().into(),
                             previous_tape: controls.previous_tape.tensor().into(),
                             following_bank: controls.following_bank.tensor().into(),
+                            window: window.tensor_mut().into(),
                             delta: delta.tensor_mut().into(),
                             tape: tape.tensor_mut().into(),
                             norm_epsilon,
                             epsilon: topology.epsilon.f32(),
+                            decay_lower,
+                            grouped: topology.grouped.into(),
+                            gate_function,
+                            slab_banks,
+                        },
+                    )?
+                    .value
+            } else {
+                graph
+                    .enqueue(
+                        step,
+                        &dimensions,
+                        kimi_delta_step::WorkflowArgs {
+                            projection: (&projection.r0).into(),
+                            beta: (&projection.r3).into(),
+                            gate: (&gate_input).into(),
+                            decay: (&decay_input).into(),
+                            convolution: (&convolution).into(),
+                            rate: (&rate).into(),
+                            time_bias: (&time_bias).into(),
+                            recurrent_norm: (&recurrent_norm).into(),
+                            segments: controls.segments.tensor().into(),
+                            stop: controls.stop.tensor().into(),
+                            previous_bank: controls.previous_bank.tensor().into(),
+                            previous_tape: controls.previous_tape.tensor().into(),
+                            following_bank: controls.following_bank.tensor().into(),
+                            window: window.tensor_mut().into(),
+                            delta: delta.tensor_mut().into(),
+                            tape: tape.tensor_mut().into(),
+                            norm_epsilon,
+                            epsilon: topology.epsilon.f32(),
+                            decay_lower,
                             grouped: topology.grouped.into(),
                             gate_function,
                             slab_banks,

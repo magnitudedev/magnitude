@@ -8,6 +8,12 @@
 
 include!("recurrent_stages.rs");
 
+/// Vulkan's step and chunk entries, for their bounds: the chunk is the
+/// step's row-sequential arithmetic with the state on lanes, so the two
+/// share a form.
+const STEP: Native = Native::Step(BackendName::Vulkan);
+const CHUNK: Native = Native::Chunk(BackendName::Vulkan);
+
 fn vulkan() -> Option<Device> {
     seismic_native_tests::devices(&[BackendName::Vulkan]).into_iter().next()
 }
@@ -20,10 +26,10 @@ fn vulkan_slab_bank_crossing_matches_host_model() {
     for reused in [false, true] {
         let step =
             case.vulkan_with_reused_slab(&device, Element::f32(), false, MAPPINGS[0], reused);
-        check("vulkan slab tape step", &case, &step, &host, (5e-4, 2e-5));
+        check("vulkan slab tape step", &case, &step, &host, against_host(STEP));
         let chunk =
             case.vulkan_with_reused_slab(&device, Element::f32(), true, MAPPINGS[3], reused);
-        check("vulkan slab tape chunk", &case, &chunk, &host, (5e-4, 2e-5));
+        check("vulkan slab tape chunk", &case, &chunk, &host, against_host(CHUNK));
     }
 }
 
@@ -51,33 +57,7 @@ impl Case {
     ) -> Outcome {
         let specialization = self.specialization(device, rows).with_param("WARPS", warps);
         let mut t = self.tensors_with_reused_slab(device, activation, reused);
-        let gated = if chunk {
-            gated_delta_chunk::native_for_device_with(
-                device,
-                gated_delta_chunk::Elements {
-                    RN: Element::f32(),
-                    A: activation,
-                },
-                &specialization,
-            )
-            .unwrap()
-            .call(t.chunk_args(self))
-            .unwrap()
-            .value
-        } else {
-            gated_delta_step::native_for_device_with(
-                device,
-                gated_delta_step::Elements {
-                    RN: Element::f32(),
-                    A: activation,
-                },
-                &specialization,
-            )
-            .unwrap()
-            .call(t.step_args(self))
-            .unwrap()
-            .value
-        };
+        let gated = t.run(device, self, activation, chunk, &specialization);
         Outcome {
             gated: read(&gated),
             window: read(&t.window),
@@ -90,7 +70,7 @@ impl Case {
     fn sequential_in_chunk(&self) -> bool {
         self.slots
             .iter()
-            .all(|slot| slot.rows <= 16 || slot.stop == 0)
+            .all(|slot| slot.rows <= SEQUENTIAL_ROWS || slot.stop == 0)
     }
 }
 
@@ -114,9 +94,12 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
         }
         let oracle = case.oracle();
         let mut reference: Option<Outcome> = None;
+        // One mapping per distinct kernel path: ROWS and WARPS never change result
+        // bits (`vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run`).
         for mapping in MAPPINGS
             .into_iter()
             .filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0)
+            .take(1)
         {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
             check(
@@ -124,7 +107,7 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
                 &case,
                 &step,
                 &oracle,
-                (2e-5, 2e-6),
+                between(STEP, ORACLE),
             );
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
             check(
@@ -132,7 +115,7 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
                 &case,
                 &chunk,
                 &oracle,
-                (5e-4, 2e-5),
+                between(CHUNK, ORACLE),
             );
             if case.sequential_in_chunk() {
                 assert!(
@@ -160,6 +143,7 @@ fn vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
         key_heads: 2,
         value_heads: 4,
         width: 128,
+        decay_width: 1,
         convolution: 4,
         banks: 3,
         tape: 0,
@@ -204,6 +188,7 @@ const QWEN_4B: Geometry = Geometry {
     key_heads: 16,
     value_heads: 32,
     width: 128,
+    decay_width: 1,
     convolution: 4,
     banks: 5,
     tape: 0,
@@ -234,7 +219,7 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
             &case,
             &step,
             &host,
-            (1.5e-2, 3e-3),
+            against_host(STEP),
         );
         let mut reference: Option<Outcome> = None;
         for mapping in MAPPINGS {
@@ -251,30 +236,15 @@ fn vulkan_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
                 &case,
                 &chunk,
                 &host,
-                (1.5e-2, 3e-3),
+                against_host(CHUNK),
             );
-            let (max, rms) = errors(&chunk.gated, &step.gated);
-            println!("4B {label}: vulkan chunk {mapping:?} vs step: max {max:.3e} rms {rms:.3e}");
-            // Both are within two BF16 ulps of the host model per element plus
-            // their relative bounds, so they differ by at most four ulps of
-            // the host value plus both bounds.
-            let scale = (host.gated.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
-                / host.gated.len() as f64)
-                .sqrt();
-            for (index, ((c, s), e)) in chunk
-                .gated
-                .iter()
-                .zip(&step.gated)
-                .zip(&host.gated)
-                .enumerate()
-            {
-                let allowed = (*e as f64).abs() * 2f64.powi(-5) + 2.0 * 1.5e-2 * scale;
-                assert!(
-                    (*c as f64 - *s as f64).abs() <= allowed,
-                    "4B {label}: vulkan chunk {mapping:?} gated[{index}] {c} vs step {s}"
-                );
-            }
-            assert!(rms <= 3e-3);
+            check(
+                &format!("4B {label}: vulkan chunk {mapping:?} vs step"),
+                &case,
+                &chunk,
+                &step,
+                between(CHUNK, STEP),
+            );
             match &reference {
                 Some(reference) => {
                     assert!(
@@ -297,13 +267,14 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
         key_heads: 16,
         value_heads: 32,
         width: 128,
+        decay_width: 1,
         convolution: 4,
         banks: 11,
         tape: 0,
     };
     let slots = vec![
         slot(4, 1, 1, 6),
-        slot(16, 9, 2, 7),
+        slot(SEQUENTIAL_ROWS, 9, 2, 7),
         slot(40, 40, 3, 8),
         slot(1, 1, 4, 9),
         slot(7, 0, 5, 10),
@@ -318,7 +289,7 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
         for s in &case.slots {
             let range = first * row_elements..(first + s.rows) * row_elements;
             first += s.rows;
-            if s.rows > 16 {
+            if s.rows > SEQUENTIAL_ROWS {
                 continue;
             }
             let bank =
@@ -341,7 +312,7 @@ fn vulkan_chunk_short_slots_get_the_step_bits() {
             &case,
             &chunk,
             &host,
-            (1.5e-2, 3e-3),
+            against_host(CHUNK),
         );
     }
 }
@@ -351,9 +322,12 @@ fn vulkan_tape_cases_match_the_portable_body() {
     let Some(device) = vulkan() else { return };
     for (label, case) in tape_cases() {
         let oracle = case.oracle();
+        // One mapping per distinct kernel path: ROWS and WARPS never change result
+        // bits (`vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run`).
         for mapping in MAPPINGS
             .into_iter()
             .filter(|(rows, warps)| case.geometry.width as u64 % (rows * warps) == 0)
+            .take(1)
         {
             let step = case.vulkan(&device, Element::f32(), false, mapping);
             check(
@@ -361,7 +335,7 @@ fn vulkan_tape_cases_match_the_portable_body() {
                 &case,
                 &step,
                 &oracle,
-                (2e-5, 2e-6),
+                between(STEP, ORACLE),
             );
             let chunk = case.vulkan(&device, Element::f32(), true, mapping);
             check(
@@ -369,7 +343,7 @@ fn vulkan_tape_cases_match_the_portable_body() {
                 &case,
                 &chunk,
                 &oracle,
-                (5e-4, 2e-5),
+                between(CHUNK, ORACLE),
             );
             if case.sequential_in_chunk() {
                 assert!(
@@ -387,12 +361,51 @@ fn vulkan_tape_cases_match_the_portable_body() {
 #[test]
 fn vulkan_tape_versions_equal_runs_that_stopped_there() {
     let Some(device) = vulkan() else { return };
+    let per_head = |case: Case| case.with_bf16_activations();
     for geometry in [SMALL, QWEN_4B] {
-        tape_versions_equal_stopped_runs("vulkan step", geometry, &|case| {
+        tape_versions_equal_stopped_runs("vulkan step", geometry, &per_head, STEP, &|case| {
             case.vulkan(&device, Element::bf16(), false, MAPPINGS[0])
         });
-        tape_versions_equal_stopped_runs("vulkan chunk", geometry, &|case| {
+        tape_versions_equal_stopped_runs("vulkan chunk", geometry, &per_head, CHUNK, &|case| {
             case.vulkan(&device, Element::bf16(), true, MAPPINGS[3])
         });
     }
+}
+
+/// The Vulkan entries for the per-channel checks: the step and the chunk (a
+/// row-sequential scan with the step's arithmetic per row) are sequential F32
+/// forms, every (ROWS, WARPS) mapping the width admits.
+fn vulkan_per_channel_entries(device: &Device) -> PerChannelEntries<'_> {
+    PerChannelEntries {
+        backend: "vulkan",
+        kind: BackendName::Vulkan,
+        step: Box::new(move |case: &Case, activation| case.vulkan(device, activation, false, MAPPINGS[0])),
+        chunks: MAPPINGS
+            .into_iter()
+            .take(1)
+            .map(|mapping| {
+                let run: Box<dyn Fn(&Case, Element) -> Outcome + '_> =
+                    Box::new(move |case: &Case, activation| case.vulkan(device, activation, true, mapping));
+                (format!("vulkan chunk {mapping:?}"), run)
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn vulkan_per_channel_decay_matches_the_portable_body() {
+    let Some(device) = vulkan() else { return };
+    per_channel_decay_matches_the_portable_body_on(&vulkan_per_channel_entries(&device));
+}
+
+#[test]
+fn vulkan_kda_geometry_step_and_chunk_agree_with_the_host_model() {
+    let Some(device) = vulkan() else { return };
+    kda_geometry_step_and_chunk_agree_with_the_host_model_on(&vulkan_per_channel_entries(&device));
+}
+
+#[test]
+fn vulkan_kda_prefill_then_decode_equals_decode_alone() {
+    let Some(device) = vulkan() else { return };
+    kda_prefill_then_decode_equals_decode_alone_on(&vulkan_per_channel_entries(&device));
 }

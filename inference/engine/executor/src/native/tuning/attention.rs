@@ -21,7 +21,7 @@ use super::{
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    DECODE_ROWS, indexer_project_dimensions, query_projection_dimensions,
+    DECODE_ROWS, query_projection_dimensions,
     rotary_amplitudes, rotary_components, rotary_frequencies, selected_segments,
 };
 use crate::programs::invocation_demand::Launch;
@@ -297,7 +297,7 @@ pub(crate) struct AttentionProjectCase {
 
 /// The unit scales of `attention_project`'s segments at `scope` (absent for
 /// a segment it does not read, `None`), at their planned extents.
-fn segment_scales(
+pub(super) fn segment_scales(
     inputs: &TuningInputs<'_, '_>,
     scope: WeightScope,
     kinds: [Option<WeightKind>; 4],
@@ -316,7 +316,7 @@ fn segment_scales(
 
 /// The packing bounds of `attention_project`'s segments at `scope` (absent
 /// for a segment it does not read, `None`).
-fn segment_bounds(
+pub(super) fn segment_bounds(
     inputs: &mut TuningInputs<'_, '_>,
     scope: WeightScope,
     kinds: [Option<WeightKind>; 4],
@@ -398,15 +398,13 @@ impl EntryTuning for AttentionProjectTuning {
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
         let query = operators::attention::query_segment_kind(operator(inputs, &self.scopes)?);
-        let rank = self.binding.low_rank_query.map(|low_rank| low_rank.rank);
+        let segment = self.binding.query_segment_rows();
         let [_, statics @ ..] = if self.binding.key_value_only {
             shape.key_value_dimensions(0)
         } else {
-            shape.project_dimensions(0, rank)
+            shape.project_dimensions(0, segment)
         };
-        if projection_shape(inputs, &self.scopes, query)?
-            != (rank.unwrap_or(shape.query_rows()), shape.widths.hidden)
-        {
+        if projection_shape(inputs, &self.scopes, query)? != (segment, shape.widths.hidden) {
             return Err("the query projection disagrees with the binding".into());
         }
         let mut statics = statics.to_vec();
@@ -513,138 +511,6 @@ impl EntryTuning for AttentionProjectTuning {
     generated_entry!(attention_project, this => this.elements());
 }
 
-/// `attention_project` as a selected read's indexer projection: the normed
-/// input's query heads (`heads · width` rows) and raw key (`width` rows),
-/// with no gate or value rows.
-#[derive(Clone)]
-pub(crate) struct IndexerProjectTuning {
-    pub binding: AttentionBinding,
-    pub selection: SelectionBinding,
-    pub scopes: Vec<WeightScope>,
-    pub epsilon: f32,
-}
-
-impl IndexerProjectTuning {
-    /// The indexer's segment weights in `attention_project`'s order: a query
-    /// and a key, no gate or value.
-    const OPERAND_KINDS: [Option<WeightKind>; 4] = [
-        Some(WeightKind::IndexerQuery),
-        None,
-        Some(WeightKind::IndexerKey),
-        None,
-    ];
-
-    fn elements(&self) -> attention_project::Elements {
-        let selection = self.selection;
-        attention_project::Elements {
-            NW: self.binding.norm,
-            QW: selection.query,
-            GW: selection.query,
-            KW: selection.key,
-            VW: selection.query,
-            A: self.binding.activation,
-            Y: self.binding.activation,
-        }
-    }
-}
-
-impl EntryTuning for IndexerProjectTuning {
-    type Entry = attention_project::Entry;
-    type Case = AttentionProjectCase;
-
-    fn launches(&self) -> usize {
-        self.scopes.len()
-    }
-
-    fn bindings(&self) -> String {
-        format!(
-            "NW={},QW={},KW={},A={};indexer",
-            self.binding.norm.name(),
-            self.selection.query.name(),
-            self.selection.key.name(),
-            self.binding.activation.name()
-        )
-    }
-
-    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let hidden = self.binding.shape.widths.hidden;
-        let [_, statics @ ..] = indexer_project_dimensions(
-            hidden,
-            self.selection.shape.heads,
-            self.selection.shape.width,
-            0,
-        );
-        if projection_shape(inputs, &self.scopes, WeightKind::IndexerQuery)?
-            != (statics[1].1, hidden)
-        {
-            return Err("the indexer query projection disagrees with the binding".into());
-        }
-        let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
-        let mut statics = [statics.as_slice(), &[("PT", parts), ("NM", norm)]].concat();
-        let [query, gate, key, value] = Self::OPERAND_KINDS;
-        statics.extend(scale_statics(
-            inputs,
-            &self.scopes,
-            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
-        )?);
-        statics.extend(packing_statics(
-            inputs,
-            &self.scopes,
-            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
-        )?);
-        Ok(statics)
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
-    fn rotation(
-        &self,
-        inputs: &mut TuningInputs<'_, '_>,
-        point: &PointShape,
-    ) -> Result<Vec<Self::Case>, BuildError> {
-        let hidden = self.binding.shape.widths.hidden;
-        let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
-        TuningInputs::rotation_scopes(&self.scopes, point)
-            .into_iter()
-            .enumerate()
-            .map(|(index, scope)| {
-                let query = inputs.weight(scope, WeightKind::IndexerQuery)?;
-                let empty = query
-                    .slice_leading(0, 0)
-                    .map_err(|error| error.to_string())?;
-                Ok(AttentionProjectCase {
-                    gate: empty.clone(),
-                    key: inputs.weight(scope, WeightKind::IndexerKey)?,
-                    value: empty,
-                    hidden: inputs.activation(
-                        Element::f32(),
-                        &[point.rows, parts * hidden],
-                        index as u64 + 1,
-                    )?,
-                    input_norm: inputs.input_norm(
-                        scope,
-                        WeightKind::InputNorm,
-                        self.binding.norm,
-                        norm,
-                    )?,
-                    query,
-                    epsilon: self.epsilon,
-                    scales: segment_scales(inputs, scope, Self::OPERAND_KINDS)?,
-                    bounds: segment_bounds(inputs, scope, Self::OPERAND_KINDS)?,
-                })
-            })
-            .collect()
-    }
-
-    fn args<'a>(case: &'a mut Self::Case) -> attention_project::Args<'a> {
-        AttentionProjectTuning::args(case)
-    }
-
-    generated_entry!(attention_project, this => this.elements());
-}
-
 /// `attention_project` as a low-rank query's up projection: the F32 `qr`
 /// rows (`rank` wide) normalized by their norm, then projected to the query
 /// rows, with no gate, key or value rows.
@@ -693,13 +559,13 @@ impl EntryTuning for LowRankQueryProjectTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let shape = self.binding.shape;
         let rank = self.low_rank.rank;
+        let rows = self.binding.query_rows();
         let query = operators::attention::query_kind(operator(inputs, &self.scopes)?);
-        if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), rank) {
+        if projection_shape(inputs, &self.scopes, query)? != (rows, rank) {
             return Err("the low-rank query's up projection disagrees with the binding".into());
         }
-        let [_, statics @ ..] = query_projection_dimensions(0, rank, shape.query_rows());
+        let [_, statics @ ..] = query_projection_dimensions(0, rank, rows);
         let mut statics = [statics.as_slice(), &[("PT", 1), ("NM", rank)]].concat();
         let [query, gate, key, value] = Self::operand_kinds(query);
         statics.extend(scale_statics(
@@ -850,7 +716,8 @@ impl PooledProjectTuning {
                 else {
                     return Err("a rate-1 key projection of a layer without its own pooled rows".into());
                 };
-                (WeightKind::PooledNorm, rows.norm.epsilon as f32)
+                let norm = operators::attention::pooled_norm(rows).map_err(|error| error.to_string())?;
+                (WeightKind::PooledNorm, norm.epsilon as f32)
             }
         })
     }
@@ -1629,17 +1496,25 @@ impl AttentionMix {
     /// [`magnitude_state::MAX_HISTORY_SPANS`], and the attend launches'
     /// threadgroup memory grows with the spans they schedule.
     fn served_dimensions(&self, shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
-        // A selected read's decode rows also read the indexer's segments.
-        let classes = std::iter::successors(Some(1u64), |segments| segments.checked_mul(2))
+        // A selected read's decode rows read their units' segments of
+        // each class's spans.
+        let spans = std::iter::successors(Some(1u64), |segments| segments.checked_mul(2))
             .take_while(|segments| {
                 *segments <= magnitude_state::MAX_HISTORY_SPANS.next_power_of_two() as u64
             })
-            .map(|segments| (segments, false))
-            .chain(
-                self.selection
-                    .map(|selection| (selected_segments(selection.shape.blocks), true)),
-            );
+            .collect::<Vec<_>>();
+        let selected = self.selection.into_iter().flat_map(|selection| {
+            spans
+                .iter()
+                .map(move |&segments| (selected_segments(selection.indexer.top, segments), true))
+        });
+        let classes = spans
+            .iter()
+            .map(|&segments| (segments, false))
+            .chain(selected)
+            .collect::<Vec<_>>();
         classes
+            .into_iter()
             .flat_map(|(segments, selected)| {
                 shapes.iter().filter_map(move |point| {
                     if selected && point.rows > DECODE_ROWS {
@@ -1897,6 +1772,7 @@ impl AttentionMix {
                         ]
                         .into_iter()
                         .chain(self.dense().then_some(shape.rounds_keys()))
+                        .chain(self.dense().then_some(u64::from(shape.form.absorbed_query)))
                         .collect::<Vec<_>>(),
                         &[],
                     )?,
@@ -2213,6 +2089,7 @@ mod tests {
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
+                            absorbed_query: false,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2325,6 +2202,7 @@ mod tests {
                         rotary_adjacent: false,
                         rotary_trailing: false,
                         output_rotary: false,
+                        absorbed_query: false,
                     },
                     key_rounding: crate::RoundingArgs::NONE,
                     widths: crate::planning::AttentionWidths {
@@ -2426,6 +2304,7 @@ mod tests {
                             rotary_adjacent: false,
                             rotary_trailing: false,
                             output_rotary: false,
+                            absorbed_query: false,
                         },
                         key_rounding: crate::RoundingArgs::NONE,
                         widths: crate::planning::AttentionWidths {
@@ -2551,6 +2430,7 @@ mod tests {
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
+                    absorbed_query: false,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2690,6 +2570,7 @@ mod tests {
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
+                    absorbed_query: false,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {
@@ -2789,6 +2670,7 @@ mod tests {
                     rotary_adjacent: false,
                     rotary_trailing: false,
                     output_rotary: false,
+                    absorbed_query: false,
                 },
                 key_rounding: crate::RoundingArgs::NONE,
                 widths: crate::planning::AttentionWidths {

@@ -694,6 +694,7 @@ impl AttentionShape {
         let form = &self.form;
         form.query_norm != form.key_norm
             || form.stored_key()
+            || form.absorbed_query
             || form.rotary_adjacent
             || form.rotary_trailing
             || form.output_rotary
@@ -735,17 +736,11 @@ impl AttentionShape {
         self.dims().1.static_width().fixed()
     }
 
-    /// The projection entry's dimensions at `rows` rows: the query
-    /// segment projects the query rows, or a low-rank query's `query_rank`
-    /// rows of `qr`.
-    pub fn project_dimensions(
-        &self,
-        rows: u64,
-        query_rank: Option<u64>,
-    ) -> [(&'static str, u64); 6] {
+    /// The projection entry's dimensions at `rows` rows, its query segment
+    /// projecting `query_segment` rows (`AttentionBinding::query_segment_rows`).
+    pub fn project_dimensions(&self, rows: u64, query_segment: u64) -> [(&'static str, u64); 6] {
         let (form, widths) = self.dims();
-        let query_rank = query_rank.map(Dim::from);
-        fixed(widths.project_dimensions(&form, Dim::from(rows), query_rank.as_ref()))
+        fixed(widths.project_dimensions(&form, Dim::from(rows), Dim::from(query_segment)))
     }
 
     /// Projection of history rows has no query or gate outputs.
@@ -755,7 +750,7 @@ impl AttentionShape {
     }
 
     /// The static axes of the fused attention entries.
-    pub fn mix_statics(&self) -> [(&'static str, u64); 15] {
+    pub fn mix_statics(&self) -> [(&'static str, u64); 16] {
         let (form, widths) = self.dims();
         fixed(widths.mix_statics(&form))
     }
@@ -774,7 +769,7 @@ impl AttentionShape {
     /// Whether the cache-publishing entries lack the fused entries' axis
     /// `name`.
     pub fn unread_by_appends(name: &str) -> bool {
-        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R" | "KS" | "TS")
+        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R" | "KS" | "TS" | "AB")
     }
 
     /// The dense fused entries' dimensions: [`Self::mix_dimensions`], the
@@ -801,7 +796,7 @@ impl AttentionShape {
         rows: u64,
         history_rows: u64,
         segments: u64,
-    ) -> [(&'static str, u64); 18] {
+    ) -> [(&'static str, u64); 19] {
         let (form, widths) = self.dims();
         fixed(widths.mix_dimensions(
             &form,
@@ -856,6 +851,9 @@ pub struct AttentionForm {
     pub rotary_adjacent: bool,
     pub rotary_trailing: bool,
     pub output_rotary: bool,
+    /// `AB`: whether the queries are absorbed into the latent keys
+    /// (`QueryKeys::Absorbed`), a read no F16-staged form attends.
+    pub absorbed_query: bool,
 }
 
 impl AttentionForm {
@@ -975,19 +973,19 @@ impl AttentionWidths<Dim> {
         &self.width - &self.rotary_pairs * 2
     }
 
-    /// The projection entry's dimensions at `rows` rows: its query segment
-    /// projects the query rows, or a low-rank query's `query_rank` rows of
-    /// `qr`.
+    /// The projection entry's dimensions at `rows` rows, its query segment
+    /// projecting `query_segment` rows: the query projection's rows, or a
+    /// low-rank query's `rank` rows of `qr`.
     pub(crate) fn project_dimensions(
         &self,
         form: &AttentionForm,
         rows: Dim,
-        query_rank: Option<&Dim>,
+        query_segment: Dim,
     ) -> [(&'static str, Dim); 6] {
         [
             ("M", rows),
             ("D", self.hidden.clone()),
-            ("Q", query_rank.cloned().unwrap_or_else(|| self.query_rows(form))),
+            ("Q", query_segment),
             ("GR", self.gate_rows(form)),
             ("K", self.key_rows(form)),
             ("V", self.value_rows(form)),
@@ -1000,14 +998,13 @@ impl AttentionWidths<Dim> {
         form: &AttentionForm,
         rows: Dim,
     ) -> [(&'static str, Dim); 6] {
-        let mut dimensions = self.project_dimensions(form, rows, None);
-        dimensions[2].1 = Dim::from(0);
+        let mut dimensions = self.project_dimensions(form, rows, Dim::from(0));
         dimensions[3].1 = Dim::from(0);
         dimensions
     }
 
     /// The static axes of the fused attention entries.
-    pub(crate) fn mix_statics(&self, form: &AttentionForm) -> [(&'static str, Dim); 15] {
+    pub(crate) fn mix_statics(&self, form: &AttentionForm) -> [(&'static str, Dim); 16] {
         [
             ("KV", self.kv_heads.clone()),
             ("G", self.group.clone()),
@@ -1024,6 +1021,7 @@ impl AttentionWidths<Dim> {
             ("RT", axis(form.rotary_trailing)),
             ("RO", axis(form.output_rotary)),
             ("VK", axis(form.stored_key())),
+            ("AB", axis(form.absorbed_query)),
         ]
     }
 
@@ -1041,8 +1039,8 @@ impl AttentionWidths<Dim> {
         rows: Dim,
         history_rows: Dim,
         segments: Dim,
-    ) -> [(&'static str, Dim); 18] {
-        let [kv, g, p, s, i, u, f, nq, n, nv, sk, ra, rt, ro, vk] = self.mix_statics(form);
+    ) -> [(&'static str, Dim); 19] {
+        let [kv, g, p, s, i, u, f, nq, n, nv, sk, ra, rt, ro, vk, ab] = self.mix_statics(form);
         [
             ("M", rows),
             ("T", history_rows),
@@ -1061,6 +1059,7 @@ impl AttentionWidths<Dim> {
             rt,
             ro,
             vk,
+            ab,
             ("R", segments),
         ]
     }
@@ -1096,6 +1095,9 @@ pub struct AttentionBinding {
     /// A grouped output's first product (`OutputProjection::GroupedLowRank`'s
     /// `a`); none for a full output projection.
     pub grouped: Option<GroupedOutputBinding>,
+    /// An absorbed query's per-head products (`QueryKeys::Absorbed`); none
+    /// for queries that meet the keys directly.
+    pub absorbed: Option<AbsorbedQueryBinding>,
     /// The second source a row reads by its picks (`KS = shape.widths.picks`);
     /// none for a layer reading one source.
     pub picked: Option<PickedBinding>,
@@ -1168,13 +1170,15 @@ impl PooledBinding {
     }
 }
 
-/// An indexer over a pooled source's index keys (`selection.rs`): its
-/// heads, their width and its picks, its query's and head weights'
-/// elements, and the candidates it scores. The most rows a row's list
+/// An indexer (`selection.rs`): the row its query projects, its heads,
+/// their width and its picks, its query's and head weights' elements, and
+/// the candidates it scores. The most rows a row's list
 /// holds (`N`) is its class's
 /// ([`crate::operators::attention::list_scores`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct IndexerBinding {
+    /// The row its query projects: `x`, or the low-rank query's `qr`.
+    pub input: magnitude_family_contracts::IndexerInput,
     pub heads: u64,
     pub width: u64,
     pub top: u64,
@@ -1261,12 +1265,44 @@ pub struct GroupedOutputShape {
     pub rank: u64,
 }
 
+/// An absorbed query's per-head products (`project_rows` with one group a
+/// head) and the element of their weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AbsorbedQueryBinding {
+    pub shape: AbsorbedQueryShape,
+    pub element: Element,
+}
+
+/// `project_rows`' axes of an absorbed query (`QueryKeys::Absorbed`): its
+/// `heads` (G), each projecting its `width`-wide projected row (K) to the
+/// `keys`-wide query the attention entries read (N, their `W`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AbsorbedQueryShape {
+    pub heads: u64,
+    pub width: u64,
+    pub keys: u64,
+}
+
 impl AttentionBinding {
     /// The weight the projection's query segment reads: the query's, or a
     /// low-rank query's `down`.
     pub fn query_segment(&self) -> Element {
         self.low_rank_query
             .map_or(self.query, |low_rank| low_rank.down)
+    }
+
+    /// `Q`: the rows its query projection (a low-rank query's up) yields:
+    /// the attended query rows, or an absorbed query's heads at their own
+    /// width (`AttentionBlock::query_projection_rows`).
+    pub fn query_rows(&self) -> u64 {
+        self.absorbed
+            .map_or(self.shape.query_rows(), |absorbed| absorbed.shape.heads * absorbed.shape.width)
+    }
+
+    /// The rows its projection's query segment yields: the query rows, or a
+    /// low-rank query's `rank`.
+    pub fn query_segment_rows(&self) -> u64 {
+        self.low_rank_query.map_or(self.query_rows(), |low_rank| low_rank.rank)
     }
 }
 
@@ -1281,27 +1317,63 @@ pub struct LowRankQueryBinding {
     pub norm: Element,
 }
 
-/// The indexer of a selected attention read (`indexer_select`): its shape
-/// and the elements of its query and key projections.
+/// The indexer of a selected attention read over the layer's token rows
+/// (`HistoryReads::Selected` of its first source): its pooled keys
+/// (`pool_rows` into the keys' Window and Block, [`SelectionKeysBinding`])
+/// and the indexer that scores and picks their units (`selection.rs`),
+/// whose picks become the reads attention takes (`unit_reads`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SelectionBinding {
     pub shape: SelectionShape,
-    pub query: Element,
-    pub key: Element,
+    pub keys: SelectionKeysBinding,
+    pub indexer: IndexerBinding,
 }
 
-/// A selected read's static axes: `heads` indexer query heads of `width`
-/// columns score blocks of `block` keys, of which a row past `blocks`
-/// complete ones reads the `blocks` best and its tail. Prefill rows read
-/// their blocks through a bitmap of `words` 32-block words (`B`), enough for
-/// every block of the served context.
+/// A selected read's pooled keys (`IndexerKeys::Pooled`, unrounded): the
+/// per-token key projection's element and the softmax gate's (none for a
+/// mean pool), whether the gate has a per-place term (`PR` = rate), and the
+/// keys' norm: on the pooled key, or per token with its bias (`TN`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectionKeysBinding {
+    pub projection: Element,
+    pub gate: Option<Element>,
+    pub place: bool,
+    pub norm: Element,
+    pub token_norm: bool,
+}
+
+impl SelectionKeysBinding {
+    /// `GT` ∈ {0, 1}: whether the pool is softmax-gated.
+    pub fn gt(&self) -> u64 {
+        u64::from(self.gate.is_some())
+    }
+
+    /// `PR`: the per-place gate term's rows, `rate` when it has one.
+    pub fn pr(&self, rate: u64) -> u64 {
+        if self.place { rate } else { 0 }
+    }
+
+    /// `TN` ∈ {0, 1}: whether the keys are normed per token.
+    pub fn tn(&self) -> u64 {
+        u64::from(self.token_norm)
+    }
+}
+
+/// A selected read's static axes: units of `block` keys, which a row past
+/// its indexer's `top` complete ones reads the best of, and its tail.
+/// Prefill rows read their units through a bitmap of `words` 32-unit words
+/// (`B`), enough for every unit of the served context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SelectionShape {
-    pub heads: u64,
-    pub width: u64,
     pub block: u64,
-    pub blocks: u64,
     pub words: u64,
+}
+
+impl SelectionShape {
+    /// `N`: the units a row scores, at most every unit the bitmap covers.
+    pub fn units(&self) -> u64 {
+        self.words * 32
+    }
 }
 
 /// How a sublayer's output projection joins the residual stream (the
@@ -1324,6 +1396,14 @@ pub struct RecurrentBinding {
     pub value_heads: u64,
     pub width: u64,
     pub convolution_width: u64,
+    /// Log-decays per value head and row (`GatedDelta::decay_width`).
+    pub decay_width: u64,
+    /// The epsilon of the q and k L2 norms (`GatedDelta::key_norm_epsilon`),
+    /// as `f32` bits: the entries' `norm_epsilon`.
+    pub key_norm_epsilon: u32,
+    /// The output gate's code (`gated_delta::gate_function`): the entries'
+    /// `gate_function`.
+    pub gate_function: i32,
     pub norm: Element,
     pub qkv: Element,
     pub gate: Element,
@@ -1332,6 +1412,32 @@ pub struct RecurrentBinding {
     pub recurrent_norm: Element,
     pub output: Element,
     pub activation: Element,
+    pub form: RecurrentForm,
+}
+
+/// How a recurrent layer forms its decay and output-gate inputs, which
+/// decides its entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecurrentForm {
+    /// Gated DeltaNet: one softplus decay per value head and the full
+    /// output-gate projection; `gated_delta_project` publishes every input of
+    /// the `gated_delta_*` state entries.
+    PerHead,
+    /// Kimi Delta Attention: one bounded decay per key channel. `gate` and
+    /// `alpha` are the low-rank down projections, which `attention_project`
+    /// publishes with qkv and beta, and `project_rows` expands their products
+    /// through these up projections for the `kimi_delta_*` state entries.
+    /// `gate_rank` and `alpha_rank` are the down projections' rows
+    /// (`gated_delta::ranks`), `attention_project`'s gate and key segments.
+    /// `decay_lower` is the bounded decay's lower bound
+    /// (`gated_delta::decay_lower`) as `f32` bits: the entries' `decay_lower`.
+    PerChannel {
+        decay_lower: u32,
+        gate_up: Element,
+        alpha_up: Element,
+        gate_rank: u64,
+        alpha_rank: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3063,9 +3169,10 @@ fn push_weight(
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
     // f16 matrices or f32 biases to the activation dtype only loses bits.
+    // A role its kernel reads in F32 alone (`is_fixed_dense_role`) is F32.
     let stored_dense = source.dtype();
     let dense_resident = match (role.kind, stored_dense) {
-        (WeightKind::Vision(_), Some(dtype)) => dtype,
+        (WeightKind::Vision(_), Some(dtype)) if !operators::is_fixed_dense_role(kind) => dtype,
         _ => resident_dtype(role, form.activation),
     };
     if operators::is_fixed_dense_role(kind) && stored_dense.is_none() {
@@ -3099,40 +3206,64 @@ fn push_weight(
             })?,
         ),
     };
-    // The bytes the tensor stores: its source's, or under a grid of block
-    // scales its codes', one block of its encoding a value.
-    let source_bytes = match scales {
-        GgufScales::Own => representation_bytes(source, &stored.shape)?,
-        GgufScales::Grid(_) => {
-            elements(&stored.shape)
-                .and_then(|values| values.checked_mul(stored.encoding.block_bytes()))
-                .ok_or("a weight's byte count overflows")?
-        }
-    };
-    if source_bytes != stored.nbytes {
-        return Err(format!(
-            "weight {:?} ({role:?}) stores {} bytes, but its {:?} shape {:?} is {source_bytes}",
-            descriptor.name, stored.nbytes, stored.encoding, stored.shape
-        ));
-    }
-    // Under a grid (the binder's, `Tensors::companion_scale`) the source is
+    // The bytes a tensor of the weight stores: its source's, or under a grid
+    // of block scales its codes', one block of its encoding a value; and
+    // under a grid (the binder's, `Tensors::companion_scale`) the source is
     // the codes and the grid planar, every byte of each as stored.
-    if let Some((name, _)) = crate::import_transforms::grid(descriptor) {
-        let grid = inventory
-            .iter()
-            .find(|tensor| tensor.name == name)
-            .ok_or_else(|| format!("weight {:?}: its scale grid {name:?} is absent from its component", descriptor.name))?;
-        let planar = representation_bytes(source, &stored.shape)?;
-        if stored.nbytes.checked_add(grid.nbytes) != Some(planar) {
+    let stores = |tensor: &TensorDescriptor, grid: Option<&str>| -> Result<(), String> {
+        let source_bytes = match scales {
+            GgufScales::Own => representation_bytes(source, &tensor.shape)?,
+            GgufScales::Grid(_) => elements(&tensor.shape)
+                .and_then(|values| values.checked_mul(tensor.encoding.block_bytes()))
+                .ok_or("a weight's byte count overflows")?,
+        };
+        if source_bytes != tensor.nbytes {
             return Err(format!(
-                "weight {:?} ({role:?}) stores {} bytes of codes and its grid {name:?} {}, but \
-                 its {} source of shape {:?} is {planar}",
-                descriptor.name,
-                stored.nbytes,
-                grid.nbytes,
-                source.name(),
-                stored.shape
+                "weight {:?} ({role:?}) stores {} bytes, but its {:?} shape {:?} is {source_bytes}",
+                tensor.name, tensor.nbytes, tensor.encoding, tensor.shape
             ));
+        }
+        if let Some(name) = grid {
+            let grid = inventory
+                .iter()
+                .find(|stored| stored.name == name)
+                .ok_or_else(|| format!("weight {:?}: its scale grid {name:?} is absent from its component", tensor.name))?;
+            let planar = representation_bytes(source, &tensor.shape)?;
+            if tensor.nbytes.checked_add(grid.nbytes) != Some(planar) {
+                return Err(format!(
+                    "weight {:?} ({role:?}) stores {} bytes of codes and its grid {name:?} {}, but \
+                     its {} source of shape {:?} is {planar}",
+                    tensor.name,
+                    tensor.nbytes,
+                    grid.nbytes,
+                    source.name(),
+                    tensor.shape
+                ));
+            }
+        }
+        Ok(())
+    };
+    stores(stored, crate::import_transforms::grid(descriptor).map(|(name, _)| name))?;
+    // Each part the weight appends is stored as its tensor is and read as
+    // it is, to its rows (`ImportTransform::AppendRows`, of a matrix or
+    // vector, admitted above).
+    let appended = crate::import_transforms::appended(descriptor);
+    if !appended.is_empty() {
+        let mut read = crate::import_transforms::read_part(descriptor, &stored.shape)?;
+        for part in appended {
+            let tensor = inventory
+                .iter()
+                .find(|tensor| tensor.name == part.tensor)
+                .ok_or_else(|| format!("part {:?} of {:?} is absent from its component", part.tensor, descriptor.name))?;
+            read[0] = part.rows;
+            let part_read = crate::import_transforms::read_part(descriptor, &tensor.shape);
+            if tensor.encoding != stored.encoding || part_read.as_ref() != Ok(&read) {
+                return Err(format!(
+                    "part {:?} of {:?} is {:?} {:?}, not read as its tensor is to {:?} {read:?}",
+                    part.tensor, descriptor.name, tensor.encoding, tensor.shape, stored.encoding
+                ));
+            }
+            stores(tensor, part.grid.as_deref())?;
         }
     }
     let resident_bytes = representation_bytes(resident, &logical)?;
@@ -3546,6 +3677,68 @@ mod host_peak_tests {
             .bytes()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod vision_residency_tests {
+    use super::*;
+    use magnitude_family_contracts::{LinearPart, VisionLinearSite, VisionWeight};
+
+    /// The resident element `push_weight` plans for a BF16 projector vector
+    /// of `weight`.
+    fn resident(weight: VisionWeight) -> Element {
+        let inventory = [TensorDescriptor {
+            name: "v.blk.0.vector".into(),
+            shape: vec![64],
+            encoding: Encoding::BF16,
+            offset: 0,
+            nbytes: 128,
+        }];
+        let mut out = Vec::new();
+        push_weight(
+            &mut out,
+            &inventory,
+            ArtifactComponent {
+                kind: ArtifactComponentKind::Projector,
+                identity: ArtifactIdentity([0; 32]),
+            },
+            WeightScope::VisionBlock(0),
+            WeightKind::Vision(weight),
+            &WeightDescriptor::stored("v.blk.0.vector", [64]),
+            ResidentForm {
+                activation: DType::BF16,
+                layout: Layout::Packet,
+            },
+        )
+        .unwrap();
+        out.remove(0).resident
+    }
+
+    /// A projector role its kernel reads in F32 alone is resident in F32
+    /// whatever its stored element; any other keeps its stored element.
+    #[test]
+    fn a_bf16_projector_weight_its_kernel_reads_in_f32_is_resident_in_f32() {
+        let f32_roles = [
+            VisionWeight::QueryNorm,
+            VisionWeight::KeyNorm,
+            VisionWeight::Linear {
+                site: VisionLinearSite::Up,
+                part: LinearPart::InputMinimum,
+            },
+            VisionWeight::Linear {
+                site: VisionLinearSite::Up,
+                part: LinearPart::OutputMaximum,
+            },
+        ];
+        for weight in f32_roles {
+            assert_eq!(resident(weight), Element::f32(), "{weight:?}");
+        }
+        let bias = VisionWeight::Linear {
+            site: VisionLinearSite::Up,
+            part: LinearPart::Bias,
+        };
+        assert_eq!(resident(bias), Element::dense(DType::BF16));
     }
 }
 
@@ -4319,6 +4512,243 @@ mod scale_grid_tests {
             std::fs::remove_file(&path).unwrap();
             assert!(error.contains("scale 5 of the grid") && error.contains(reason), "{bad:e}: {error}");
         }
+    }
+
+    /// GLM's KDA q, k and v projections, stored apart (F8_E4M3 under F32
+    /// 128×128 grids, codes `at` as bytes, each part its own scales), import
+    /// as one fp8g128 weight of their rows in order: every value the F32
+    /// reference's of its own part. A part stored in another encoding, or of
+    /// another row width, is refused at plan time, naming it.
+    #[test]
+    fn a_projection_stored_in_parts_imports_their_rows_in_order() {
+        const PARTS: [(&str, &str, [u64; 2], [u64; 2]); 3] = [
+            ("blk.0.attn_q.weight", "blk.0.attn_q.scale", [256, 256], [2, 2]),
+            ("blk.0.attn_k.weight", "blk.0.attn_k.scale", [256, 256], [2, 2]),
+            ("blk.0.attn_v.weight", "blk.0.attn_v.scale", [128, 256], [1, 2]),
+        ];
+        let scales = [&F32_SCALES[0..4], &F32_SCALES[4..8], &F32_SCALES[8..10]];
+        let header = StoredHeader::new(
+            3,
+            Vec::new(),
+            PARTS.iter().flat_map(|&(weight, scale, shape, grid)| {
+                [
+                    (weight.to_owned(), shape.to_vec(), Encoding::F8E4M3),
+                    (scale.to_owned(), grid.to_vec(), Encoding::F32),
+                ]
+            }),
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len();
+        let payloads = PARTS.iter().zip(scales).flat_map(|(&(_, _, shape, _), scales)| {
+            [
+                (0..shape[0] * shape[1]).map(|at| at as u8).collect::<Vec<_>>(),
+                f32_bytes(scales),
+            ]
+        });
+        for (tensor, payload) in header.tensors.iter().zip(payloads) {
+            bytes.resize(data + tensor.offset as usize, 0);
+            bytes.extend_from_slice(&payload);
+        }
+        let path = std::env::temp_dir().join(format!("magnitude-row-parts-{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let mut tensors = magnitude_family_common::Tensors::new(artifact.directory());
+        let descriptor = tensors
+            .bind_rows(
+                (PARTS[0].0, &PARTS[0].2[..]),
+                &[(PARTS[1].0, &PARTS[1].2[..]), (PARTS[2].0, &PARTS[2].2[..])],
+                false,
+            )
+            .unwrap();
+        tensors.finish().unwrap();
+        let inventory = artifact.directory().tensors.clone();
+        let planned = plan(&inventory, &descriptor, Layout::Rows8).unwrap();
+        let source = Element::gguf_source(Encoding::F8E4M3, GgufScales::Grid(Grid::REGISTERED[2]), 128).unwrap();
+        assert_eq!((planned.source, planned.upload, planned.shape.clone()), (source, source, vec![640, 256]));
+        assert_eq!(Some(planned.source_bytes), source.canonical_byte_len(&[640, 256]).ok());
+        let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+        let (file, offset, nbytes) = stored.file_range();
+        let codes = file.read(offset, nbytes as usize).unwrap();
+        let blocks = crate::import_transforms::upload_bytes(&planned, &stored, codes).unwrap();
+        let values = crate::import_transforms::dequantize(planned.source, &planned.shape, &blocks).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let expected = PARTS
+            .iter()
+            .zip(scales)
+            .flat_map(|(&(_, _, shape, _), scales)| f32_reference(&shape, scales));
+        for (at, (value, expected)) in values.chunks_exact(4).zip(expected).enumerate() {
+            let value = f32::from_le_bytes(value.try_into().unwrap());
+            assert!(
+                value.to_bits() == expected.to_bits() || value.is_nan() && expected.is_nan(),
+                "value {at}: {value:e}, not {expected:e}"
+            );
+        }
+        assert_eq!(values.len(), 640 * 256 * 4);
+        // v stored as BF16, or 128 wide, is no part of the weight.
+        let edited = |edit: &dyn Fn(&mut TensorDescriptor)| {
+            let mut inventory = inventory.clone();
+            edit(inventory.iter_mut().find(|tensor| tensor.name == PARTS[2].0).unwrap());
+            plan(&inventory, &descriptor, Layout::Rows8).unwrap_err()
+        };
+        for error in [
+            edited(&|v| {
+                v.encoding = Encoding::BF16;
+                v.nbytes = 128 * 256 * 2;
+            }),
+            edited(&|v| {
+                v.shape = vec![128, 128];
+                v.nbytes = 128 * 128;
+            }),
+        ] {
+            assert!(error.contains(PARTS[2].0), "{error}");
+        }
+    }
+
+    /// GLM's fused KDA q, k and v projections at their real extents (each
+    /// `[4096, 4096]` F8_E4M3 under an F32 128×128 grid) plan as one planar
+    /// `[12288, 4096]` source, and its import source is a tensor a device
+    /// addresses: its codes and its grid as a matrix's, not a flat run of
+    /// 50,331,648 values (which a load refused). The file is sparse; only
+    /// its header and extents matter.
+    #[test]
+    fn a_fused_planar_projection_at_real_extents_has_an_addressable_import_source() {
+        const PARTS: [(&str, &str); 3] = [
+            ("blk.0.attn_q.weight", "blk.0.attn_q.scale"),
+            ("blk.0.attn_k.weight", "blk.0.attn_k.scale"),
+            ("blk.0.attn_v.weight", "blk.0.attn_v.scale"),
+        ];
+        let header = StoredHeader::new(
+            3,
+            Vec::new(),
+            PARTS.iter().flat_map(|&(weight, scale)| {
+                [
+                    (weight.to_owned(), vec![4096, 4096], Encoding::F8E4M3),
+                    (scale.to_owned(), vec![32, 32], Encoding::F32),
+                ]
+            }),
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len() as u64;
+        let end = header.tensors.iter().map(|tensor| tensor.offset + tensor.nbytes).max().unwrap();
+        let path = std::env::temp_dir().join(format!("magnitude-real-extents-{}.gguf", std::process::id()));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&std::mem::take(&mut bytes)).unwrap();
+            file.set_len(data + end).unwrap();
+        }
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let mut tensors = magnitude_family_common::Tensors::new(artifact.directory());
+        let rows = [4096u64, 4096];
+        let descriptor = tensors
+            .bind_rows((PARTS[0].0, &rows[..]), &[(PARTS[1].0, &rows[..]), (PARTS[2].0, &rows[..])], false)
+            .unwrap();
+        tensors.finish().unwrap();
+        let planned = plan(&artifact.directory().tensors, &descriptor, Layout::Rows8).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(planned.shape, vec![3 * 4096, 4096]);
+        assert!(planned.source.is_planar());
+        let canonical = planned.source.canonical_byte_len(&planned.shape).unwrap();
+        assert_eq!(planned.source_bytes, canonical);
+        assert_eq!(canonical, 3 * 4096 * 4096 + (3 * 32) * 32 * 4);
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        // SAFETY: nothing reads the tensor.
+        let upload = unsafe { crate::resources::import_upload(&planned, &device) }.unwrap();
+        assert_eq!((upload.extents(), upload.byte_len()), (&planned.shape[..], canonical));
+    }
+
+    /// GLM's KDA convolution planes, stored apart as BF16 `[1, 8192, 1, 4]`,
+    /// import as one `[3·8192, 4]` weight whose bytes are q's, k's and v's
+    /// as stored, in order.
+    #[test]
+    fn convolution_planes_stored_apart_import_as_their_bytes_in_order() {
+        const PLANES: [&str; 3] =
+            ["blk.0.ssm_conv1d_q.weight", "blk.0.ssm_conv1d_k.weight", "blk.0.ssm_conv1d_v.weight"];
+        const STORED: [u64; 4] = [1, 8192, 1, 4];
+        let header = StoredHeader::new(
+            3,
+            Vec::new(),
+            PLANES.iter().map(|name| ((*name).to_owned(), STORED.to_vec(), Encoding::BF16)),
+        )
+        .unwrap();
+        let plane = |index: usize| {
+            (0..8192 * 4u32).flat_map(move |at| ((at * 3 + index as u32) as u16).to_le_bytes()).collect::<Vec<_>>()
+        };
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len();
+        for (index, tensor) in header.tensors.iter().enumerate() {
+            bytes.resize(data + tensor.offset as usize, 0);
+            bytes.extend(plane(index));
+        }
+        let path = std::env::temp_dir().join(format!("magnitude-conv-planes-{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let descriptor = magnitude_family_common::Tensors::new(artifact.directory())
+            .bind_rows(
+                (PLANES[0], &STORED[..]),
+                &[(PLANES[1], &STORED[..]), (PLANES[2], &STORED[..])],
+                true,
+            )
+            .unwrap();
+        let planned = plan(&artifact.directory().tensors, &descriptor, Layout::Rows8).unwrap();
+        assert_eq!((planned.source, planned.shape.clone()), (Element::bf16(), vec![3 * 8192, 4]));
+        let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+        let (file, offset, nbytes) = stored.file_range();
+        let own = file.read(offset, nbytes as usize).unwrap();
+        let uploaded = crate::import_transforms::upload_bytes(&planned, &stored, own).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(uploaded, (0..3).flat_map(plane).collect::<Vec<_>>());
+    }
+
+    /// GLM's per-head latent projections, stored as BF16 stacks `attn_k_b`
+    /// `[64, 512, 256]` and `attn_v_b` `[64, 256, 512]`, import with their
+    /// leading axes merged into rows as the matrices `[64·512, 256]` and
+    /// `[64·256, 512]` whose bytes are the stored bytes in order: no copy,
+    /// transposition or composition at load.
+    #[test]
+    fn per_head_stacks_import_as_their_stored_bytes() {
+        const STACKS: [(&str, [u64; 3]); 2] =
+            [("blk.0.attn_k_b.weight", [64, 512, 256]), ("blk.0.attn_v_b.weight", [64, 256, 512])];
+        let header = StoredHeader::new(
+            3,
+            Vec::new(),
+            STACKS.iter().map(|(name, shape)| ((*name).to_owned(), shape.to_vec(), Encoding::BF16)),
+        )
+        .unwrap();
+        let stack = |index: usize| {
+            (0..64 * 512 * 256u32)
+                .flat_map(move |at| ((at.wrapping_mul(7) + index as u32) as u16).to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len();
+        for (index, tensor) in header.tensors.iter().enumerate() {
+            bytes.resize(data + tensor.offset as usize, 0);
+            bytes.extend(stack(index));
+        }
+        let path = std::env::temp_dir().join(format!("magnitude-head-stacks-{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let mut tensors = magnitude_family_common::Tensors::new(artifact.directory());
+        for (index, (name, stored)) in STACKS.iter().enumerate() {
+            let descriptor = tensors
+                .bind_transformed(name, stored, vec![ImportTransform::MergeLeadingAxes])
+                .unwrap();
+            let planned = plan(&artifact.directory().tensors, &descriptor, Layout::Rows8).unwrap();
+            assert_eq!(
+                (planned.source, planned.shape.clone()),
+                (Element::bf16(), vec![stored[0] * stored[1], stored[2]])
+            );
+            let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+            let (file, offset, nbytes) = stored.file_range();
+            let own = file.read(offset, nbytes as usize).unwrap();
+            let uploaded = crate::import_transforms::upload_bytes(&planned, &stored, own).unwrap();
+            assert!(uploaded == stack(index), "{name}: the upload differs from the stored bytes");
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }
 

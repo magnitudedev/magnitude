@@ -178,6 +178,14 @@ impl<'a> QualificationView<'a> {
                     super::target::qualify_routed(device, binding, kernels, form, &reads)?;
                     attended
                 }
+                (
+                    FeedForwardProgramSlot::GeneralRouted(binding),
+                    AttestedFeedForward::GeneralRouted(kernels),
+                ) => {
+                    let reads = super::target::ExpertReads::general(device, binding)?;
+                    super::target::qualify_general_routed(device, binding, kernels, &reads)?;
+                    attended
+                }
                 _ => {
                     return Err(qualification_dynamic(
                         "head",

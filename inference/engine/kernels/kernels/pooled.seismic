@@ -1,20 +1,24 @@
-# Pooled history rows (`RowProducer::Pooled`, `PooledRows`): one row per
-# complete group of RATE tokens [b RATE, (b + 1) RATE), from the F32
-# per-token projections u (and, softmax-gated, the gate scores g):
+# Pooled rows (`PooledRows`: a pooled history source's rows, `RowProducer::Pooled`, or an indexer's pooled keys,
+# `IndexerKeys::Pooled`): one row per complete group of RATE tokens [b RATE, (b + 1) RATE), from the F32 per-token
+# projections u (and, softmax-gated, the gate scores g), each token's u normed first when TN = 1:
 #
-#   pooled[c] = sum_i u_i[c] / RATE                         (GT = 0: Mean)
-#             = sum_i softmax_i(g[c])_i u_i[c]              (GT = 1: SoftmaxGated)
-#   latent    = rms(pooled) * norm
+#   u_i       = layer_norm(u_i) * norm + bias                     (TN = 1: `PoolNorm::Token`)
+#   pooled[c] = sum_i u_i[c] / RATE                               (GT = 0: Mean)
+#             = sum_i softmax_i(g_i[c] + position[i, c]) u_i[c]   (GT = 1: SoftmaxGated)
+#   latent    = rms(pooled) * norm                                (TN = 0: `PoolNorm::Pooled`)
+#             = pooled                                            (TN = 1)
 #   row       = block_round(rotate_pairs(latent, coordinates of the group's first token))
 #
-# with W = 2P + S, the softmax over the group's tokens per channel
-# (m = max_i g_i[c], e_i = exp(g_i[c] - m), p_i = e_i / sum_i e_i, then
+# with W = 2P + S, i the token's place in its group, `position` [PR, W] the per-place gate term (PR = RATE; PR = 0
+# has none), `layer_norm(u) = (u - mean(u)) * rsqrt(var(u) + epsilon)` with the biased variance (`token_norm`), the
+# softmax over the group's tokens per channel (m = max_i s_i[c], e_i = exp(s_i[c] - m), p_i = e_i / sum_i e_i, then
 # sum_i p_i u_i[c]), and the rotary the reading attention's key rotary in its
 # layout (`form`'s RA, RT; `rotate_pairs`). `form` also carries RATE and GT,
 # which no tensor extent determines alone. The rounding is the four scalars
 # of `rounding.seismic` (`block` 0 rounds nothing). Everything is F32 until
-# the row is stored in the activation element A, which holds every rounded
-# value exactly (BF16), except that a rounded row (`block` > 0) is rounded
+# the row is stored in the row element Y: the activation element for a
+# history source's rows (it holds every rounded value exactly, BF16), F32 for
+# an indexer's keys, which it scores in F32. A rounded row (`block` > 0) is rounded
 # from the values the model holds in A: the pooled row, the latent and the
 # rotated row are each held in A (DeepSeek V4.1's `Compressor.forward`
 # `kv.to(dtype)`, its norm's `.to(dtype)` and its in-place rotation), so the
@@ -24,7 +28,7 @@
 # `attention_append_dense` stores it as a window history stores its keys.
 #
 # State contract. The incomplete group's tokens are producer state: each
-# row's u (then g) and its rotary coordinates, in a Window(RATE - 1) history
+# row's u (normed when TN = 1; then g, without its place term) and its rotary coordinates, in a Window(RATE - 1) history
 # domain (`window_rows` [TW, (1 + GT) W] F32, `window_coordinates` [TW, 4]
 # i32). Every row appends at `window_destinations[row]`
 # (-1 none). A row that completes a group (block_destinations[row] >= 0)
@@ -40,27 +44,28 @@
 # others; `latent_coordinates` [M, 4], the coordinates of its group's first
 # token (the row's rotary origin), zeros for the others. All are indexed by
 # the launch row.
-fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
+fn pool_rows[M, TW, TB, P, S, GT, PR, TN, R, RA, RT, RATE](
     u: &tensor[M, 2 * P + S] f32, g: &tensor[M, GT * (2 * P + S)] f32,
-    norm: &tensor[1, 2 * P + S] f32,
+    position: &tensor[PR, 2 * P + S] f32, norm: &tensor[1, 2 * P + S] f32, bias: &tensor[TN, 2 * P + S] f32,
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
     window_visible: &tensor[M, R, 2] i32, window_destinations: &tensor[M] i32,
     block_destinations: &tensor[M] i32,
     window_rows: &slab mut tensor[TW, (1 + GT) * (2 * P + S)] f32,
     window_coordinates: &slab mut tensor[TW, 4] i32,
-    block_rows: &slab mut tensor[TB, 2 * P + S] A, form: &host tensor[0, RA, RT, RATE, GT] i32,
+    block_rows: &slab mut tensor[TB, 2 * P + S] Y, form: &host tensor[0, RA, RT, RATE, GT] i32,
     epsilon: f32, window_slab_rows: u32, block_slab_rows: u32,
     block: i32, element: i32, scale: i32, amax_floor: f32)
     -> (tensor[M, 2 * P + S] f32, tensor[M] i32, tensor[M, 4] i32)
-    where P >= 0 and S >= 0 and 2 * P + S >= 1 and GT >= 0 and GT <= 1 and RATE >= 2 and R >= 0 and TW >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and GT >= 0 and GT <= 1 and RATE >= 2 and PR >= 0 and PR <= RATE and (PR == 0 or (PR == RATE and GT == 1)) and TN >= 0 and TN <= 1 and R >= 0 and TW >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
     let layout = tensor[0, RA, RT, 0] i32
     # Pending rows first: a completing row reads the pending rows of this
     # launch's earlier rows.
     for row in 0..M:
         if window_destinations[row] >= 0:
+            let normed = token_norm(u[row], norm, bias, epsilon)
             for column in 0..2 * P + S:
-                window_rows[window_destinations[row], column] = u[row, column]
+                window_rows[window_destinations[row], column] = normed[column]
             for column in 0..GT * (2 * P + S):
                 window_rows[window_destinations[row], 2 * P + S + column] = g[row, column]
             window_coordinates[window_destinations[row]] = coordinates[row]
@@ -100,10 +105,16 @@ fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
                     values[member, column] = window_rows[members[member], column]
                 for column in 0..GT * (2 * P + S):
                     gates[member, column] = window_rows[members[member], 2 * P + S + column]
+            let own = token_norm(u[row], norm, bias, epsilon)
             for column in 0..2 * P + S:
-                values[RATE - 1, column] = u[row, column]
+                values[RATE - 1, column] = own[column]
             for column in 0..GT * (2 * P + S):
                 gates[RATE - 1, column] = g[row, column]
+            # Each member's place term (PR = RATE; a gated pool only).
+            if GT == 1:
+                for place in 0..PR:
+                    for column in 0..2 * P + S:
+                        gates[place, column] = gates[place, column] + position[place, column]
             let mut origin = tensor[4] i32
             origin[:] = window_coordinates[members[0]]
             let mut pooled = tensor[2 * P + S] f32
@@ -127,7 +138,10 @@ fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
             let mut held = tensor[2 * P + S] A
             if block > 0:
                 pooled[:] = held_in_activation(pooled, held)
-            latent[row] = head_norm(pooled, norm, epsilon)
+            if TN == 0:
+                latent[row] = head_norm(pooled, norm, epsilon)
+            else:
+                latent[row] = pooled
             if block > 0:
                 latent[row] = held_in_activation(latent[row], held)
             let mut rotated = tensor[2 * P + S] f32
@@ -140,6 +154,25 @@ fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
             latent_coordinates[row] = origin
     return (latent, latent_rows, latent_coordinates)
 
+# A token's projection under `PoolNorm::Token` (N = 1):
+# `(u - mean) * rsqrt(var + epsilon) * weight + bias`, the variance biased;
+# N = 0 leaves it as is.
+fn token_norm[W, N](u: &tensor[W] f32, weight: &tensor[1, W] f32, bias: &tensor[N, W] f32, epsilon: f32)
+    -> tensor[W] f32 where N >= 0 and N <= 1:
+    let x = f32(u)
+    let mut normed = zeros_like(x, dtype=f32)
+    for i in 0..W:
+        normed[i] = x[i]
+    for layer in 0..N:
+        let mean = sum_any_order(x) / f32(W)
+        let mut centered = zeros_like(x, dtype=f32)
+        for i in 0..W:
+            centered[i] = x[i] - mean
+        let inv = rsqrt(sum_any_order(centered * centered) / f32(W) + epsilon)
+        for i in 0..W:
+            normed[i] = centered[i] * inv * weight[0, i] + bias[layer, i]
+    return normed
+
 # Metal: `append` per row (its u, g and coordinates into the window planes),
 # then `complete` per completing row, one simdgroup, lane l holding columns
 # [l E, (l + 1) E), E = W / 32: the group's members gathered, pooled, normed
@@ -147,7 +180,7 @@ fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
 # rotated columns are whole lanes), rounded (`rounding::round_lanes`),
 # stored, with the latent and its row published.
 native pool_rows for metal from "metal/pool_rows.metal":
-    static (P, S, GT, RA, RT, RATE)
+    static (P, S, GT, PR, TN, RA, RT, RATE)
     where RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and RATE <= 16
     launch pool_rows_append:
         threadgroups (M, 1, 1)
@@ -158,8 +191,11 @@ native pool_rows for metal from "metal/pool_rows.metal":
 
 # CUDA: Metal's launches, a warp each; the rotation exchanges partners
 # through the warp's W floats of shared memory (`rotary::layout::rotate`).
+# `append` holds a row's columns strided across the lanes, `complete` each
+# lane's E consecutive ones; the per-token norm is `norm`'s arithmetic over
+# them (`lib/core/norm`, vision's row norm's).
 native pool_rows for cuda from "cuda/pool_rows.cu":
-    static (P, S, GT, RA, RT, RATE)
+    static (P, S, GT, PR, TN, RA, RT, RATE)
     where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0 and RATE <= 16
     launch pool_rows_append:
         threadgroups (M, 1, 1)
@@ -173,8 +209,10 @@ native pool_rows for cuda from "cuda/pool_rows.cu":
 # its rotation `attention::prepare_rounded_head`'s).
 # Vulkan: CUDA's launches, a logical subgroup each; the rotation exchanges
 # partners by shuffles across the lanes, as Metal's (`rotary_lane_rotate`).
+# Its lanes hold a row's columns as CUDA's, and its per-token norm is
+# `norm_*`'s arithmetic (`lib/core/norm`, vision's row norm's).
 native pool_rows for vulkan from "vulkan/pool_rows.comp":
-    static (P, S, GT, RA, RT, RATE)
+    static (P, S, GT, PR, TN, RA, RT, RATE)
     where RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and RATE <= 16
     launch pool_rows_append:
         threadgroups (M, 1, 1)
@@ -184,7 +222,7 @@ native pool_rows for vulkan from "vulkan/pool_rows.comp":
         threads_per_threadgroup (32, 1, 1)
 
 native pool_rows for cpu from "cpu/pool_rows.rs":
-    static (P, S, GT, RA, RT, RATE)
+    static (P, S, GT, PR, TN, RA, RT, RATE)
     where RATE <= 64
     launch pool_rows_append:
         threadgroups (M, 1, 1)

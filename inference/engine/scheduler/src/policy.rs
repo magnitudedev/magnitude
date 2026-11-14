@@ -23,12 +23,20 @@ impl ServiceLimits {
     /// one drafter launch drafts for: the decode allowance. A decode round
     /// never exceeds it; the owner admits no prefill round beyond it.
     pub fn selection_bound(&self) -> usize {
-        self.decode_tokens
+        self.steps().selection_bound()
+    }
+
+    /// The step token allowances the load's launch bounds follow from.
+    pub fn steps(&self) -> magnitude_executor::StepAllowances {
+        magnitude_executor::StepAllowances {
+            prefill_tokens: self.prefill_tokens,
+            decode_tokens: self.decode_tokens,
+        }
     }
 
     /// The most rows one launch carries: the larger step token allowance.
     pub fn launch_rows(&self) -> usize {
-        self.prefill_tokens.max(self.decode_tokens)
+        self.steps().launch_rows()
     }
 
     /// The decode time owed each unit of time prefill runs while decode

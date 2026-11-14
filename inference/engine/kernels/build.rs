@@ -133,6 +133,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
     ),
     (
+        "lib/attention/vector",
+        &[BackendName::Vulkan],
+        "the vector attention body shared by the decode entry and the prefill entry's vector form, apart from `attention.glsl` so the K8/V4 entries, which bind other history ports, include none of it; Metal and CUDA keep their vector decode in their entries",
+    ),
+    (
         "lib/core/matrix",
         &[BackendName::Vulkan],
         "cooperative-matrix fragment types and the one zero accumulator every Vulkan matrix body clears with",
@@ -166,6 +171,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/readout/progressive",
         &[BackendName::Metal, BackendName::Cuda],
         "the progressive head's plane decoding and certified levels",
+    ),
+    (
+        "lib/core/staging",
+        &[BackendName::Vulkan],
+        "the power-of-two exponent Vulkan stages F32 and BF16 matrix operands in F16 by (projection and attention prefill); Metal and CUDA take their matrix operands in the activation element and stage nothing",
     ),
     (
         "lib/core/precise",
@@ -211,6 +221,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/recurrent/convolution",
         &[BackendName::Metal],
         "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",
+    ),
+    (
+        "lib/recurrent/chunk",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the chunked delta-rule entries' common code, shared by `gated_delta_chunk` and `kimi_delta_chunk` (CUDA and Metal: the piece geometry and helpers beside each rule's WY form; Vulkan: both entries' launches); the CPU's chunk entries run the row-sequential advance of `lib/recurrent/recurrent`",
     ),
     (
         "lib/routed/router",

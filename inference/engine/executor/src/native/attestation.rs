@@ -114,8 +114,8 @@ pub(crate) fn reads_layer_scale(tail: Option<SublayerTail>) -> bool {
     matches!(tail, Some(SublayerTail::PostNorm { scaled: true, .. }))
 }
 
-/// The F32 source values of a planned role, read through the tuning weight
-/// source.
+/// The source values of a planned role stored as F32 or BF16, as F32 (a
+/// BF16 value widens exactly), read through the tuning weight source.
 fn source_f32s(
     load: &crate::ModelLoadPlan,
     tuning: TuningContext<'_>,
@@ -125,20 +125,18 @@ fn source_f32s(
         .weights()
         .find(|weight| weight.role == role)
         .ok_or_else(|| format!("{role:?} is not planned"))?;
-    if plan.source != seismic::Element::f32() {
-        return Err(format!(
-            "{role:?} is stored as {}, not f32",
-            plan.source.name()
-        ));
-    }
     let bytes = tuning.weights.source_bytes(plan, false)?;
-    if bytes.len() % 4 != 0 {
+    let (width, value): (usize, fn(&[u8]) -> f32) = if plan.source == seismic::Element::f32() {
+        (4, |chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    } else if plan.source == seismic::Element::bf16() {
+        (2, |chunk| f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16))
+    } else {
+        return Err(format!("{role:?} is stored as {}, not f32 or bf16", plan.source.name()));
+    };
+    if bytes.len() % width != 0 {
         return Err(format!("{role:?} holds {} bytes", bytes.len()));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+    Ok(bytes.chunks_exact(width).map(value).collect())
 }
 
 /// Reject an artifact whose stored rotary divisors (`rope_freqs`) do not
@@ -509,14 +507,9 @@ impl AttestedPrograms {
                     .ok_or("head graph requires a draft head block")?,
             )
             .map_err(|error| error.to_string())?;
-            let history = state.sole_history()?;
-            let history_rows =
-                u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
             let classes = crate::programs::native_head::head_graph_classes(
                 limits,
-                history_rows,
-                history.slab_rows,
-                state.span_limit(),
+                state.head_geometry()?,
                 proposals,
             )?;
             let landing = self.landing(load, TARGET_TABLE)?;
@@ -1210,14 +1203,20 @@ impl AttestedPrograms {
                                     .cloned()
                                     .ok_or_else(|| missing("routed_stages", binding))?,
                             ),
-                            // `operators::admit` keeps draft heads on the
-                            // fused routed form.
-                            FeedForwardProgramSlot::GeneralRouted(_)
-                            | FeedForwardProgramSlot::Parallel(_) => {
+                            FeedForwardProgramSlot::GeneralRouted(_) => AttestedFeedForward::GeneralRouted(
+                                handles
+                                    .general_routed
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("general_routed_stages", binding))?,
+                            ),
+                            // `operators::admit` refuses a draft head's
+                            // parallel feed-forward form.
+                            FeedForwardProgramSlot::Parallel(_) => {
                                 return Err(CatalogFailure::Preparation {
                                     entry: "routed_select",
                                     bindings: format!("{binding:?}"),
-                                    outcome: "draft heads run the fused routed form only".into(),
+                                    outcome: "draft heads run no parallel feed-forward form".into(),
                                 });
                             }
                         },

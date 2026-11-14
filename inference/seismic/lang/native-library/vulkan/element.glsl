@@ -35,6 +35,16 @@
 
 // ---------------------------------------------------------------------------
 // Raw words at byte addresses. Reads go through `readonly` references.
+//
+// Memory is exchanged between invocations of a dispatch only through group
+// memory or subgroup operations, and between dispatches through the dispatch
+// boundary: never by one invocation putting a word that another invocation
+// of the same dispatch then reads here. The reads are `readonly` and the
+// puts plain, and a Vulkan source enables no memory model, so a
+// `memoryBarrierBuffer(); barrier();` pair orders only `coherent` accesses
+// and the driver is free to serve a read from a path that never sees the
+// put, or to move it across the barrier: an exchange that way is exact on
+// one driver and loses words on another (GB10's `candidate_rows`).
 
 layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_ro_u8 { uint8_t v; };
 layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_ro_i8 { int8_t v; };
@@ -156,14 +166,6 @@ void element_put2(const int kind, uint64_t base, uint64_t index, float first, fl
         element_put(kind, base, index, first);
         element_put(kind, base, index + 1ul, second);
     }
-}
-
-// Four contiguous elements from `index`, aligned to four elements.
-vec4 element_load4(const int kind, uint64_t base, uint64_t index) {
-    if (kind == ELEMENT_F32)
-        return element_vec4_at(base + index * 4ul);
-    const uvec2 words = element_uvec2_at(base + index * 2ul);
-    return vec4(element_unpack2(kind, words.x), element_unpack2(kind, words.y));
 }
 
 // Eight contiguous elements from `index`, aligned to eight elements, as

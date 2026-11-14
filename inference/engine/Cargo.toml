@@ -58,6 +58,11 @@ flate2.workspace = true
 # The recorded machines (`seismic::fixtures::recorded`), to assess on.
 seismic = { workspace = true, features = ["fixtures"] }
 tempfile = "3.24.0"
+# The postcard wires' serde rule reads the worker protocol's and the checked
+# bundle's type closures from source (`tests/postcard_wires.rs`).
+syn = { version = "=2.0.119", features = ["full", "visit", "parsing", "printing"] }
+quote = "=1.0.47"
+proc-macro2 = "=1.0.107"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "=0.2.189"

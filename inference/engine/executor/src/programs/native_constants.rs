@@ -207,7 +207,9 @@ impl RowRule<Dim> {
         match self {
             Self::Identity | Self::Filled(_) => vec![count.clone()],
             Self::Count => vec![Dim::from(1)],
-            Self::Zeros { width, .. } | Self::OneHot { width } => vec![count.clone(), width.clone()],
+            Self::Zeros { width, .. } | Self::OneHot { width } => {
+                vec![count.clone(), width.clone()]
+            }
             Self::Empty { width, .. } => vec![Dim::from(0), count.clone(), width.clone()],
         }
     }
@@ -236,16 +238,7 @@ impl RowRule {
                 value: ConstantValue::Bytes(Arc::from([])),
             },
             Self::Filled(value) => table(vec![value; usize::try_from(rows).map_err(|_| "row count exceeds usize")?]),
-            Self::OneHot { width } => {
-                let width = usize::try_from(width).map_err(|_| "one-hot width exceeds usize")?;
-                let rows = usize::try_from(rows).map_err(|_| "row count exceeds usize")?;
-                let values = (0..rows * width).map(|at| if at % width == 0 { 1.0f32 } else { 0.0 });
-                ConstantStorage {
-                    element: Element::f32(),
-                    extents: Box::new([rows as u64, width as u64]),
-                    value: ConstantValue::Bytes(values.flat_map(f32::to_le_bytes).collect()),
-                }
-            }
+            Self::OneHot { width } => f32_rows(rows, width, |column| if column == 0 { 1.0 } else { 0.0 })?,
             Self::Count => {
                 let rows = i32::try_from(rows).map_err(|_| "row count exceeds i32")?;
                 ConstantStorage {
@@ -256,6 +249,19 @@ impl RowRule {
             }
         })
     }
+}
+
+/// The F32 matrix `[rows, width]` whose every row holds `column`'s value at
+/// each column.
+fn f32_rows(rows: u64, width: u64, column: impl Fn(u64) -> f32) -> Result<ConstantStorage, String> {
+    let count = rows.checked_mul(width).ok_or("row constant extent exceeds u64")?;
+    usize::try_from(count).map_err(|_| "row constant extent exceeds usize")?;
+    let values = (0..count).flat_map(|at| column(at % width).to_le_bytes());
+    Ok(ConstantStorage {
+        element: Element::f32(),
+        extents: Box::new([rows, width]),
+        value: ConstantValue::Bytes(values.collect()),
+    })
 }
 
 /// A constant's value: what the binder uploads for it.
@@ -564,10 +570,12 @@ impl GraphConstant {
         Ok(port)
     }
 
-    /// A zero-extent inject port `[rows, 0]` for an output that joins a
-    /// single residual stream, its rows following the class dimension
-    /// `class`, or fixed without one.
-    pub(crate) fn absent_inject<G: GraphDraft, R>(
+    /// A zero-extent F32 port `[rows, 0]` for a row argument its entry reads
+    /// nothing of (the inject values of an output that joins a single
+    /// residual stream, the previous pre of a Sinkhorn site mixing by its
+    /// own), its rows following the class dimension `class`, or fixed
+    /// without one.
+    pub(crate) fn absent_rows<G: GraphDraft, R>(
         graph: &mut G,
         rows: R,
         class: Option<&'static str>,

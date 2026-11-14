@@ -8,6 +8,7 @@ license.workspace = true
 magnitude-family-contracts = { path = "../contracts" }
 magnitude-family-deepseek41 = { path = "../deepseek41" }
 magnitude-family-gemma4 = { path = "../gemma4" }
+magnitude-family-glm5next = { path = "../glm5next" }
 magnitude-family-lfm2 = { path = "../lfm2" }
 magnitude-family-llama = { path = "../llama" }
 magnitude-family-muse-glimmer = { path = "../muse_glimmer" }

@@ -1,7 +1,8 @@
 // stream_mix_sinkhorn on CPU (contract and portable body in streams.seismic):
 // one work item per row, which projects its flattened streams by every
 // function row under the row's one RMS statistic, forms pre, post and the
-// Sinkhorn comb in place, and mixes the streams by the previous site's pre.
+// Sinkhorn comb in place, and mixes the streams by the previous site's pre
+// (P = 1, publishing its own for the next) or its own (P = 0).
 
 use lib::core::{activation, functions, reduce};
 
@@ -41,13 +42,13 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
         *mix = projected * inverse;
     }
     // SAFETY: each work item writes its own row of every result.
-    let (input, pre, join) = unsafe {
-        (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0]), cx.result_2().row_mut([row, 0]))
-    };
+    let (input, join) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };
+    let mut pre = [0.0f32; MAX_STREAMS];
     for stream in 0..s {
         pre[stream] = activation::sigmoid(mix[stream] * scale.get([0]) + base.get([stream])) + epsilon;
         join[stream] = 2.0 * activation::sigmoid(mix[s + stream] * scale.get([1]) + base.get([s + stream]));
     }
+    let pre = &pre[..s];
     let mut comb = [[0.0f32; MAX_STREAMS]; MAX_STREAMS];
     for (source, values) in comb.iter_mut().enumerate().take(s) {
         let values = &mut values[..s];
@@ -84,6 +85,12 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
     for source in 0..s {
         join[s + source * s..s + (source + 1) * s].copy_from_slice(&comb[source][..s]);
     }
-    let previous = cx.arg_previous().row([row, 0]);
-    functions::collapse(previous, |stream| streams[stream], input);
+    let carried = if cx.dim_p() > 0 {
+        // SAFETY: each work item writes its own row of every result.
+        unsafe { cx.result_1().row_mut([row, 0]) }.copy_from_slice(pre);
+        cx.arg_previous().row([row, 0])
+    } else {
+        pre
+    };
+    functions::collapse(carried.len(), |stream| carried[stream], |stream| streams[stream], input);
 }

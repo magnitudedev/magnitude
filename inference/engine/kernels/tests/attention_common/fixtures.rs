@@ -3,6 +3,8 @@
 // history, the host model of the portable body, the devices, device tensors
 // and the row builders.
 
+include!("vulkan_prefill.rs");
+
 fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
@@ -432,11 +434,12 @@ fn half_split_append_layout(device: &Device) -> Tensor {
     Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
 }
 
-/// The dense entries' `form` (`RA`, `RT`, `RO`, `VK`, `KR`): half-split
-/// leading, no output rotary, values of their own, no key rounding.
+/// The dense entries' `form` (`RA`, `RT`, `RO`, `VK`, `KR`, `AB`): half-split
+/// leading, no output rotary, values of their own, no key rounding, no
+/// absorbed latent read.
 #[allow(dead_code)]
 fn dense_layout(device: &Device) -> Tensor {
-    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0, 0], &[]).unwrap()
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0, 0, 0], &[]).unwrap()
 }
 
 /// The dense append's `form` (`RA`, `RT`, `VK`, `KR`): half-split leading,
@@ -450,7 +453,7 @@ fn dense_append_layout(device: &Device) -> Tensor {
 /// (`KR`) and no index-list source (`KS`).
 #[allow(dead_code)]
 fn dense_statics(specialization: NativeSpecialization) -> NativeSpecialization {
-    specialization.with_static("KR", 0).with_static("KS", 0)
+    specialization.with_static("KR", 0).with_static("AB", 0).with_static("KS", 0)
 }
 
 /// A dense entry's absent index-list source: `rows` rows of no picks

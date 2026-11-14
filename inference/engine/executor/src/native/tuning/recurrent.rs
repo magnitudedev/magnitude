@@ -3,14 +3,18 @@
 //! (`gated_delta_step` below [`CHUNKED_ROWS`] rows, `gated_delta_chunk` from
 //! there), and the plain residual output projection (`attention_output`); on
 //! a backend of the convolved step form, `gated_delta_project_convolved` and
-//! `gated_delta_step_convolved` below [`CHUNKED_ROWS`] rows.
+//! `gated_delta_step_convolved` below [`CHUNKED_ROWS`] rows. A Kimi Delta
+//! Attention layer's cases are its own: its projection (`attention_project`),
+//! and `kimi_delta_step` and `kimi_delta_chunk` over its per-channel decay
+//! (its up projections are `ProjectRowsTuning`'s).
 //!
 //! The state entries write the layer's window and delta arenas in place. Each
 //! argument set owns small arenas of three banks (the zero seed, the bank the
 //! slot reads, the bank it publishes to), filled with pseudo-random state; the
 //! published bank is the case state restored before each validation run.
 
-use super::cases::{packing_statics, projection_shape, scale_extent};
+use super::attention::{segment_bounds, segment_scales};
+use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -18,8 +22,9 @@ use super::{
 use crate::operators::gated_delta::{self, graph::CHUNKED_ROWS};
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_kernels::{
-    attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
-    gated_delta_step, gated_delta_step_convolved,
+    attention_output, attention_project, gated_delta_chunk, gated_delta_project,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, kimi_delta_chunk,
+    kimi_delta_step,
 };
 use seismic::{BuildError, Element, Tensor};
 
@@ -36,6 +41,8 @@ pub(crate) struct RecurrentShape {
     pub value_heads: u64,
     pub width: u64,
     pub convolution_width: u64,
+    /// Log-decays per value head and row (`GatedDelta::decay_width`).
+    pub decay_width: u64,
     pub scopes: Vec<WeightScope>,
 }
 
@@ -392,7 +399,8 @@ fn window_state(
 }
 
 /// A tuning arena's delta and tape banks of pseudo-random state (seeds
-/// `seed + 3` and `seed + 4`).
+/// `seed + 3` and `seed + 4`), its tape rows recording the shape's decay
+/// factors.
 fn delta_tape_states(
     inputs: &mut TuningInputs<'_, '_>,
     shape: &RecurrentShape,
@@ -408,7 +416,7 @@ fn delta_tape_states(
         &[
             TUNING_BANKS,
             TUNING_TAPE_ROWS,
-            (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads,
+            (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads * shape.decay_width,
         ],
         seed + 4,
     )?;
@@ -442,6 +450,8 @@ struct RecurrentCodes {
     /// Whether the q/k heads map to value heads in groups.
     grouped: bool,
     gate_function: i32,
+    /// The q/k L2-norm epsilon, as the layer states it.
+    key_norm_epsilon: f32,
 }
 
 /// Tape rows of a tuning case's banks: one, the least a store holds. Cases
@@ -476,6 +486,7 @@ impl RecurrentState {
             Operator::GatedDelta(delta) => Ok(RecurrentCodes {
                 grouped: matches!(delta.head_mapping, RecurrentHeadMapping::Grouped),
                 gate_function: gated_delta::gate_function(delta),
+                key_norm_epsilon: delta.key_norm_epsilon as f32,
             }),
             other => Err(format!("a {} layer has no recurrent mixer", other.name())),
         }
@@ -508,7 +519,7 @@ impl RecurrentState {
             delta,
             tape,
             slab_banks: TUNING_BANKS as u32,
-            norm_epsilon: self.epsilon * shape.width as f32,
+            norm_epsilon: codes.key_norm_epsilon,
             epsilon: self.epsilon,
             codes,
         })
@@ -765,7 +776,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
                     delta,
                     tape,
                     slab_banks: TUNING_BANKS as u32,
-                    norm_epsilon: state.epsilon * shape.width as f32,
+                    norm_epsilon: codes.key_norm_epsilon,
                     epsilon: state.epsilon,
                     codes,
                 })
@@ -804,3 +815,356 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
         A: this.0.activation,
     });
 }
+
+/// The projection segments of a Kimi Delta Attention layer, in
+/// `attention_project`'s order: q | k | v (query), the gate's down product
+/// (gate), the decay's down product (key) and beta (value).
+const KIMI_SEGMENTS: [WeightKind; 4] = [
+    WeightKind::RecurrentQueryKeyValue,
+    WeightKind::RecurrentGate,
+    WeightKind::RecurrentAlpha,
+    WeightKind::RecurrentBeta,
+];
+
+/// `attention_project` as a Kimi Delta Attention layer's projection: RMS
+/// prologue, then q | k | v, the gate's and decay's down products and beta,
+/// each with its accumulator scale.
+#[derive(Clone)]
+pub(crate) struct KimiProjectTuning {
+    pub norm: Element,
+    pub qkv: Element,
+    pub gate: Element,
+    pub alpha: Element,
+    pub beta: Element,
+    pub activation: Element,
+    /// The gate's and decay's ranks (`RecurrentForm::PerChannel`).
+    pub ranks: [u64; 2],
+    pub shape: RecurrentShape,
+    pub epsilon: f32,
+}
+
+pub(crate) struct KimiProjectCase {
+    hidden: Tensor,
+    input_norm: Tensor,
+    /// The segments' weights, scales and packing bounds, in
+    /// [`KIMI_SEGMENTS`]'s order.
+    weights: [Tensor; 4],
+    scales: [Tensor; 4],
+    bounds: [Tensor; 4],
+    epsilon: f32,
+}
+
+impl KimiProjectTuning {
+    fn elements(&self) -> attention_project::Elements {
+        attention_project::Elements {
+            NW: self.norm,
+            QW: self.qkv,
+            GW: self.gate,
+            KW: self.alpha,
+            VW: self.beta,
+            A: self.activation,
+            Y: self.activation,
+        }
+    }
+}
+
+impl EntryTuning for KimiProjectTuning {
+    type Entry = attention_project::Entry;
+    type Case = KimiProjectCase;
+
+    fn launches(&self) -> usize {
+        self.shape.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        format!(
+            "NW={},QW={},GW={},KW={},VW={},A={}",
+            self.norm.name(),
+            self.qkv.name(),
+            self.gate.name(),
+            self.alpha.name(),
+            self.beta.name(),
+            self.activation.name()
+        )
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let scopes = &self.shape.scopes;
+        let [qkv, gate, alpha, beta] =
+            KIMI_SEGMENTS.map(|kind| projection_shape(inputs, scopes, kind));
+        let ((channels, hidden), (gate_rows, _), (alpha_rows, _), (heads, _)) =
+            (qkv?, gate?, alpha?, beta?);
+        let [gate_rank, alpha_rank] = self.ranks;
+        if (channels, gate_rows, alpha_rows, heads)
+            != (self.shape.channels(), gate_rank, alpha_rank, self.shape.value_heads)
+        {
+            return Err("the recurrent projection disagrees with the binding".into());
+        }
+        let (parts, norm) = inputs.input_form(scopes, hidden)?;
+        let mut statics = vec![
+            ("D", hidden),
+            ("Q", channels),
+            ("GR", gate_rank),
+            ("K", alpha_rank),
+            ("V", heads),
+            ("PT", parts),
+            ("NM", norm),
+        ];
+        let [query, gate, key, value] = KIMI_SEGMENTS.map(Some);
+        statics.extend(scale_statics(
+            inputs,
+            scopes,
+            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
+        )?);
+        statics.extend(packing_statics(
+            inputs,
+            scopes,
+            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
+        )?);
+        Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        TuningInputs::rotation_scopes(&self.shape.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let [qkv, gate, alpha, beta] = KIMI_SEGMENTS;
+                let weights = [
+                    inputs.weight(scope, qkv)?,
+                    inputs.weight(scope, gate)?,
+                    inputs.weight(scope, alpha)?,
+                    inputs.weight(scope, beta)?,
+                ];
+                let hidden = weights[0].extents()[1];
+                let (parts, norm) = inputs.input_form(&self.shape.scopes, hidden)?;
+                Ok(KimiProjectCase {
+                    hidden: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, parts * hidden],
+                        index as u64 + 1,
+                    )?,
+                    input_norm: inputs.input_norm(scope, WeightKind::InputNorm, self.norm, norm)?,
+                    weights,
+                    scales: segment_scales(inputs, scope, KIMI_SEGMENTS.map(Some))?,
+                    bounds: segment_bounds(inputs, scope, KIMI_SEGMENTS.map(Some))?,
+                    epsilon: self.epsilon,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> attention_project::Args<'a> {
+        attention_project::Args {
+            hidden: &case.hidden,
+            input_norm: &case.input_norm,
+            query_weight: &case.weights[0],
+            gate_weight: &case.weights[1],
+            key_weight: &case.weights[2],
+            value_weight: &case.weights[3],
+            epsilon: case.epsilon,
+            project_mode: 0,
+            query_scale: &case.scales[0],
+            gate_scale: &case.scales[1],
+            key_scale: &case.scales[2],
+            value_scale: &case.scales[3],
+            query_bound: &case.bounds[0],
+            gate_bound: &case.bounds[1],
+            key_bound: &case.bounds[2],
+            value_bound: &case.bounds[3],
+        }
+    }
+
+    generated_entry!(attention_project, this => this.elements());
+}
+
+/// What both Kimi Delta Attention state entries tune over: `RecurrentState`'s
+/// advance with one decay per key channel.
+#[derive(Clone)]
+pub(crate) struct KimiState(pub RecurrentState);
+
+/// `kimi_delta_step`, for row classes below [`CHUNKED_ROWS`].
+#[derive(Clone)]
+pub(crate) struct KimiStepTuning(pub KimiState);
+
+/// `kimi_delta_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
+#[derive(Clone)]
+pub(crate) struct KimiChunkTuning(pub KimiState);
+
+/// One argument set of either Kimi Delta Attention state entry.
+pub(crate) struct KimiStateCase {
+    projection: Tensor,
+    beta: Tensor,
+    gate: Tensor,
+    decay: Tensor,
+    convolution: Tensor,
+    rate: Tensor,
+    time_bias: Tensor,
+    recurrent_norm: Tensor,
+    tables: SlotTables,
+    window: CaseState,
+    delta: CaseState,
+    tape: CaseState,
+    slab_banks: u32,
+    epsilon: f32,
+    codes: KimiCodes,
+}
+
+/// The model's per-layer Kimi Delta Attention codes a state entry takes.
+#[derive(Clone, Copy)]
+struct KimiCodes {
+    recurrent: RecurrentCodes,
+    /// The bounded decay's lower bound.
+    decay_lower: f32,
+}
+
+impl KimiState {
+    fn codes(&self, inputs: &TuningInputs<'_, '_>) -> Result<KimiCodes, String> {
+        let recurrent = self.0.codes(inputs)?;
+        let Operator::GatedDelta(delta) = inputs.operator(&self.0.shape.scopes)? else {
+            unreachable!("the recurrent codes are a gated delta layer's")
+        };
+        let decay_lower = gated_delta::decay_lower(delta)
+            .expect("a Kimi Delta Attention case's layers have the per-channel decay");
+        Ok(KimiCodes {
+            recurrent,
+            decay_lower,
+        })
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<KimiStateCase>, BuildError> {
+        let codes = self.codes(inputs)?;
+        TuningInputs::rotation_scopes(&self.0.shape.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| self.case(inputs, scope, point.rows, 8 * index as u64, codes))
+            .collect()
+    }
+
+    fn case(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        scope: WeightScope,
+        rows: u64,
+        seed: u64,
+        codes: KimiCodes,
+    ) -> Result<KimiStateCase, BuildError> {
+        let state = &self.0;
+        let shape = &state.shape;
+        let inner = shape.value_heads * shape.width;
+        let tables = SlotTables::new(inputs, rows)?;
+        let window = window_state(inputs, shape, state.activation, seed + 2)?;
+        let (delta, tape) = delta_tape_states(inputs, shape, seed)?;
+        Ok(KimiStateCase {
+            projection: inputs.activation(state.activation, &[rows, shape.channels()], seed + 1)?,
+            beta: inputs.activation(state.activation, &[rows, shape.value_heads], seed + 5)?,
+            gate: inputs.activation(state.activation, &[rows, inner], seed + 6)?,
+            decay: inputs.activation(state.activation, &[rows, inner], seed + 7)?,
+            convolution: inputs.weight(scope, WeightKind::RecurrentConvolution)?,
+            rate: inputs.weight(scope, WeightKind::RecurrentDecay)?,
+            time_bias: inputs.weight(scope, WeightKind::RecurrentTimeBias)?,
+            recurrent_norm: inputs.weight(scope, WeightKind::RecurrentNorm)?,
+            tables,
+            window,
+            delta,
+            tape,
+            slab_banks: TUNING_BANKS as u32,
+            epsilon: state.epsilon,
+            codes,
+        })
+    }
+}
+
+/// The two Kimi Delta Attention state entries differ only in the rows they
+/// serve; they share one contract and argument set.
+macro_rules! kimi_state_entry {
+    ($tuning:ident, $module:ident, $serves:expr) => {
+        impl EntryTuning for $tuning {
+            type Entry = $module::Entry;
+            type Case = KimiStateCase;
+
+            fn launches(&self) -> usize {
+                self.0.0.shape.scopes.len()
+            }
+
+            fn bindings(&self) -> String {
+                self.0.0.bindings()
+            }
+
+            fn statics(
+                &self,
+                _inputs: &ModelInputs<'_>,
+            ) -> Result<Vec<(&'static str, u64)>, String> {
+                Ok(self.0.0.shape.state_statics())
+            }
+
+            fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+                served_row_points(limits, $serves)
+            }
+
+            fn rotation(
+                &self,
+                inputs: &mut TuningInputs<'_, '_>,
+                point: &PointShape,
+            ) -> Result<Vec<Self::Case>, BuildError> {
+                self.0.rotation(inputs, point)
+            }
+
+            fn args<'a>(case: &'a mut Self::Case) -> $module::Args<'a> {
+                $module::Args {
+                    projection: &case.projection,
+                    beta: &case.beta,
+                    gate: &case.gate,
+                    decay: &case.decay,
+                    convolution: &case.convolution,
+                    rate: &case.rate,
+                    time_bias: &case.time_bias,
+                    recurrent_norm: &case.recurrent_norm,
+                    segments: &case.tables.segments,
+                    stop: &case.tables.stop,
+                    previous_bank: &case.tables.previous_bank,
+                    previous_tape: &case.tables.previous_tape,
+                    following_bank: &case.tables.following_bank,
+                    window: case.window.tensor_mut(),
+                    delta: case.delta.tensor_mut(),
+                    tape: case.tape.tensor_mut(),
+                    slab_banks: case.slab_banks,
+                    norm_epsilon: case.codes.recurrent.key_norm_epsilon,
+                    epsilon: case.epsilon,
+                    decay_lower: case.codes.decay_lower,
+                    grouped: case.codes.recurrent.grouped,
+                    gate_function: case.codes.recurrent.gate_function,
+                }
+            }
+
+            fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+                vec![
+                    ("window", &case.window),
+                    ("delta", &case.delta),
+                    ("tape", &case.tape),
+                ]
+            }
+
+            generated_entry!($module, this => $module::Elements {
+                RN: this.0.0.recurrent_norm,
+                A: this.0.0.activation,
+            });
+        }
+    };
+}
+
+kimi_state_entry!(KimiStepTuning, kimi_delta_step, |rows| rows < CHUNKED_ROWS);
+kimi_state_entry!(KimiChunkTuning, kimi_delta_chunk, |rows| rows >= CHUNKED_ROWS);
+

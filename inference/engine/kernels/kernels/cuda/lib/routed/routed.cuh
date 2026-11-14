@@ -42,6 +42,8 @@ struct GroupedRows {
     __device__ __forceinline__ const u8 *row(u64 m) const {
         return x + (u64)order[m * order_stride] * stride * 2;
     }
+    // Whether every row starts 16-byte aligned (`ActivationRows::wide`).
+    __device__ __forceinline__ bool wide() const { return stride % 8 == 0 && ((u64)x & 15) == 0; }
 };
 
 // Decode choices that share an expert (M <= DECODE_ROWS rows of K choices, a row's

@@ -14,11 +14,11 @@ fn vision_linear_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     let (k, n) = (cx.dim_k() as usize, cx.dim_n() as usize);
     // SAFETY: each work item writes its own row of the scratch.
     let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * k, k) };
-    seismic::cpu::tensor::widen_row::<E::A>(cx.arg_x().row([row, 0]), staged);
+    cx.arg_x().decode_row(row, staged);
     if cx.dim_ng() == 1 {
         // SAFETY: each work item writes its own row of the scratch.
         let gate = unsafe { cx.scratch_gates().slice_mut::<f32>(4 * row * n, n) };
-        seismic::cpu::tensor::widen_row::<E::A>(cx.arg_gate().row([0, row, 0]), gate);
+        cx.arg_gate().decode_row(row, gate);
     }
 }
 
@@ -50,9 +50,9 @@ fn vision_linear_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
                 value = value.max(minimum).min(maximum);
             }
             if code != 0 {
-                value = vision::activate(code, activation::publish::<E::A>(value));
+                value = vision::activate(code, value);
             } else if let Some(gates) = gates {
-                value = activation::publish::<E::A>(value) * gates[row * n + output];
+                value = value * gates[row * n + output];
             } else if cx.dim_nr() == 1 {
                 value = residual.get([0, row, output]) + value;
             }

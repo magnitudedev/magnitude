@@ -26,7 +26,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 /// Rows of one prefill forward, as the service bounds them.
-pub const PREFILL_ROWS: usize = 512;
+pub const PREFILL_ROWS: usize = magnitude_executor::EVALUATION_PREFILL_ROWS;
 
 /// How every load of one run is made.
 pub struct EngineOptions {
@@ -61,8 +61,8 @@ impl EngineOptions {
 
 /// What one load serves.
 pub struct Load {
-    /// Load the catalog drafter (its own method) rather than the target alone.
-    pub drafter: bool,
+    /// How the load generates: `Plain` the target alone, else the engine's own selection of a drafter.
+    pub method: ModelMethod,
     pub proposals: Option<u8>,
     pub context_tokens: usize,
     /// Sequences the load holds at once, each up to `context_tokens`: the
@@ -81,17 +81,17 @@ pub fn configuration(
     options: &EngineOptions,
     load: &Load,
 ) -> Result<ResolvedEngineConfiguration, String> {
-    let draft = if load.drafter {
-        Some(
-            artifacts
-                .drafter
-                .as_ref()
-                .ok_or_else(|| format!("{} declares no drafter", artifacts.model))?
-                .path
-                .clone(),
-        )
-    } else {
-        None
+    let separate = |named: bool| match (&artifacts.drafter, named) {
+        (Some(drafter), _) => Ok(Some(drafter.path.clone())),
+        (None, false) => Ok(None),
+        (None, true) => Err(format!("{} declares no drafter", artifacts.model)),
+    };
+    // A separate draft is loaded where the method takes one: `Auto` takes the catalog's when it has one (else its
+    // draft head), a method naming a separate draft's variant requires it, and the others take none.
+    let draft = match (load.method, load.method.draft_variant()) {
+        (ModelMethod::Auto, _) => separate(false)?,
+        (_, Some(_)) => separate(true)?,
+        (_, None) => None,
     };
     // The machine's figures live in the kernel cache, keyed by its host.
     let topology = match &options.cache_dir {
@@ -107,11 +107,7 @@ pub fn configuration(
         },
         model: ModelPolicy {
             draft_policy: None,
-            method: if load.drafter {
-                ModelMethod::Auto
-            } else {
-                ModelMethod::Plain
-            },
+            method: load.method,
             mtp_proposals: load.proposals,
             kv_codec: options.kv_codec,
             lookahead: load.lookahead,

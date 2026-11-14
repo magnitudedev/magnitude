@@ -376,6 +376,15 @@ pub(crate) fn decode_local(index: u32) -> Result<(), WireError> {
     decoding(|context| reach(&mut scope(context)?.locals, index))
 }
 
+/// Serializes a dimension ordinal as the `u32` it is, exactly as the derive
+/// writes one.
+pub(crate) fn serialize_dimension<S: serde::Serializer>(
+    ordinal: &u32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u32(*ordinal)
+}
+
 /// Deserializes an ordinal into the dimensions of the enclosing scoped
 /// element.
 pub(crate) fn deserialize_dimension<'de, D: serde::Deserializer<'de>>(
@@ -386,6 +395,17 @@ pub(crate) fn deserialize_dimension<'de, D: serde::Deserializer<'de>>(
     decoding(|context| reach(&mut scope(context)?.dimensions, ordinal))
         .map_err(D::Error::custom)?;
     Ok(ordinal)
+}
+
+/// Serializes scoped elements as the sequence of the elements alone, exactly
+/// as the derive writes a slice of them: a scope is decoding's own and is
+/// never written.
+pub(crate) fn serialize_scoped<S, T>(elements: &[(T, Scope)], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: serde::Serialize,
+{
+    serializer.collect_seq(elements.iter().map(|(element, _)| element))
 }
 
 /// Deserializes a sequence whose elements each decode in their own [`Scope`].
@@ -496,5 +516,71 @@ mod tests {
         let handle = arena.int(1);
         assert!(postcard::to_stdvec(&handle).is_err());
         assert!(postcard::from_bytes::<IntExpr>(&[0, 0]).is_err());
+    }
+
+    /// Each serde function a wire field names writes exactly the bytes the
+    /// derive writes for the field's own type, so naming it changes no bundle.
+    #[test]
+    fn serde_functions_write_what_the_derive_writes() {
+        #[derive(serde::Serialize)]
+        enum Named {
+            Dimension(#[serde(serialize_with = "serialize_dimension")] u32),
+        }
+        #[derive(serde::Serialize)]
+        enum Derived {
+            Dimension(u32),
+        }
+        for ordinal in [0, 1, 127, 128, 300, u32::MAX] {
+            assert_eq!(
+                postcard::to_stdvec(&Named::Dimension(ordinal)).unwrap(),
+                postcard::to_stdvec(&Derived::Dimension(ordinal)).unwrap(),
+            );
+        }
+
+        #[derive(serde::Serialize)]
+        struct NamedName {
+            capability: u32,
+            #[serde(serialize_with = "crate::registry::serialize_declared_name")]
+            name: crate::registry::DeclaredName,
+        }
+        #[derive(serde::Serialize)]
+        struct DerivedName {
+            capability: u32,
+            name: &'static str,
+        }
+        for name in ["", "simdgroup_matrix", "a name longer than one hundred and twenty-seven bytes, so its length prefix takes two varint bytes on the wire ......"] {
+            assert_eq!(
+                postcard::to_stdvec(&NamedName { capability: 7, name }).unwrap(),
+                postcard::to_stdvec(&DerivedName { capability: 7, name }).unwrap(),
+            );
+        }
+
+        // `CheckedParts` writes its scoped elements where `CheckedFields`
+        // writes a slice of them.
+        #[derive(serde::Serialize)]
+        struct Scoped {
+            before: u8,
+            #[serde(serialize_with = "serialize_scoped")]
+            elements: Vec<((u32, String), Scope)>,
+            after: u8,
+        }
+        #[derive(serde::Serialize)]
+        struct Slice<'a> {
+            before: u8,
+            elements: &'a [(u32, String)],
+            after: u8,
+        }
+        for count in [0usize, 1, 3, 200] {
+            let elements: Vec<(u32, String)> = (0..count).map(|at| (at as u32 * 1000, format!("element {at}"))).collect();
+            let scoped = Scoped {
+                before: 1,
+                elements: elements.iter().cloned().map(|element| (element, Scope::default())).collect(),
+                after: 2,
+            };
+            assert_eq!(
+                postcard::to_stdvec(&scoped).unwrap(),
+                postcard::to_stdvec(&Slice { before: 1, elements: &elements, after: 2 }).unwrap(),
+            );
+        }
     }
 }

@@ -73,7 +73,7 @@ void attention_decode_k8v4_partial() {
     prefill_attend(attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
         SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
         SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
-        prefill_scratch(0ul, 0ul, 0ul, 0ul));
+        prefill_scratch(0ul, 0ul, 0ul, 0ul, 0ul));
 }
 
 void attention_decode_k8v4_merge() { prefill_decode_merge(); }
@@ -109,6 +109,13 @@ uint decode_keywise_batches(
         offset += length;
     }
     return batches;
+}
+
+// The keywise fresh batch calls of a row's keys [first, last), whose fresh
+// keys are those from `fresh_first`: one per HISTORY_FRESH_KEYS of them.
+uint decode_fresh_batches(uint first, uint last, uint fresh_first) {
+    const uint from = max(first, fresh_first);
+    return (max(last, from) - from + HISTORY_FRESH_KEYS - 1u) / HISTORY_FRESH_KEYS;
 }
 
 // A slab's part of a historical span from the part's first key `token`: its
@@ -311,16 +318,25 @@ void attention_decode_k8v4_partial() {
     const uint slab_rows = uint(h.slab_rows);
     const uvec2 range = attention_key_range(partition_lo, partition_hi, attention_key_group(sg));
     if (DECODE_KEYWISE) {
-        // One loop of the busiest group's number of batch calls. The subgroup
-        // carries a cursor through its keys (span, slab part, position), moved
+        // Every subgroup passes the same subgroup barriers: on NVIDIA 570 a
+        // workgroup whose subgroups pass different numbers of them computes
+        // garbage. So the history and the fresh keys each take one loop of the
+        // busiest group's number of batch calls, a group with fewer making
+        // the rest as empty batches. In the history loop the subgroup carries
+        // a cursor through its keys (span, slab part, position), moved
         // between calls; out of keys, it stays on its last part with empty
         // batches. A group with no historical keys stays on the partition's
         // first, which is one whenever any group has batches. The cursor
         // starts on the span holding its first key.
+        int fresh_lo, fresh_hi;
+        attention_span(visible, fresh, row, spans, spans, fresh_lo, fresh_hi);
+        const uint fresh_first = total - uint(max(fresh_hi - fresh_lo, 0));
         uint busiest = 0u;
+        uint fresh_busiest = 0u;
         for (uint group = 0u; group < attention_key_groups(); ++group) {
             const uvec2 keys = attention_key_range(partition_lo, partition_hi, group);
             busiest = max(busiest, decode_keywise_batches(visible, fresh, row, spans, slab_rows, keys.x, keys.y));
+            fresh_busiest = max(fresh_busiest, decode_fresh_batches(keys.x, keys.y, fresh_first));
         }
         const uint batches = decode_keywise_batches(visible, fresh, row, spans, slab_rows, range.x, range.y);
         uint position = batches > 0u ? range.x : partition_lo;
@@ -356,16 +372,16 @@ void attention_decode_k8v4_partial() {
         }
         // Then its fresh keys, the last of the row's sequence: they enter the
         // history batch's scoring and value product through the tile,
-        // encoded as history will hold them.
-        int fresh_lo, fresh_hi;
-        attention_span(visible, fresh, row, spans, spans, fresh_lo, fresh_hi);
-        const uint fresh_first = total - uint(max(fresh_hi - fresh_lo, 0));
-        for (uint key = max(range.x, fresh_first); key < range.y;) {
-            const uint n = min(HISTORY_FRESH_KEYS, range.y - key);
-            const uint64_t first = uint64_t(fresh_lo) + (key - fresh_first);
+        // encoded as history will hold them. An empty batch encodes and
+        // scores the row's first fresh key, which is one whenever any group
+        // has fresh batches, and absorbs nothing.
+        uint key = max(range.x, fresh_first);
+        for (uint batch = 0u; batch < fresh_busiest; ++batch) {
+            const uint n = min(HISTORY_FRESH_KEYS, max(range.y, key) - key);
+            const uint64_t first = uint64_t(fresh_lo) + (n > 0u ? key - fresh_first : 0u);
             // The tile's previous rows are read.
             subgroupBarrier();
-            for (uint j = 0u; j < n; ++j) {
+            for (uint j = 0u; j < max(n, 1u); ++j) {
                 uint w[HISTORY_LANE_WORDS];
                 uint pair;
                 decode_fresh_codes(true, first + j, kv_head, w, pair);
@@ -374,7 +390,7 @@ void attention_decode_k8v4_partial() {
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             float score[ATTENTION_HEADS];
-            history_keywise_fresh_score(n - 1u, staging, prepared, sums, head0, score);
+            history_keywise_fresh_score(max(n, 1u) - 1u, staging, prepared, sums, head0, score);
             // Its barriers order the key rows' reads before the values
             // replace them.
             attention_keywise_softmax(n, score, weights, maximum, denominator, result);

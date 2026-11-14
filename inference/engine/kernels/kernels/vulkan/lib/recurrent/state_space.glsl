@@ -49,7 +49,7 @@
 
 // Slots of at most this many rows advance row-sequentially in either entry,
 // so a request's state bits never depend on its row class or its peers.
-#define STATE_SPACE_SEQUENTIAL_ROWS 16
+#define STATE_SPACE_SEQUENTIAL_ROWS int(SEISMIC_CONST_SEQUENTIAL_ROWS)
 // The chunk's pieces: a slot of more than STATE_SPACE_SEQUENTIAL_ROWS rows
 // splits its rows before the stop row into pieces of at most
 // STATE_SPACE_PIECE rows from its first row; other slots have none. Pieces

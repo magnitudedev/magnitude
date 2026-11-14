@@ -14,9 +14,13 @@
 #![allow(dead_code)]
 
 mod common;
+mod declared;
 mod rounding_model;
 
-use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
+use common::bound::{self, Float, Products, assert_within, gamma};
+include!("attention_common/vulkan_prefill.rs");
+
+use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill, project_rows};
 use rounding_model::Rounding;
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -183,6 +187,12 @@ struct Case {
     selected_slab_rows: usize,
     /// The trained rounding of the prepared key (`KR = 1`), or none.
     key_rounding: Option<Rounding>,
+    /// The prefill's WorkList read (`B` words a row, `BR = block_rows` keys a
+    /// block): row r's bitmap is `selection[r * B..][..B]`; no words (`B = 0`)
+    /// reads every key.
+    selection: Vec<u32>,
+    selection_words: usize,
+    block_rows: usize,
 }
 
 /// Splits each span at slab edges: a history span never crosses one.
@@ -288,7 +298,57 @@ impl Case {
             selected: Vec::new(),
             selected_slab_rows: 1,
             key_rounding: None,
+            selection: Vec::new(),
+            selection_words: 0,
+            block_rows: 1,
         }
+    }
+
+    /// The keys row `row` sees: its visible spans, then its fresh span.
+    fn keys_of(&self, row: usize) -> usize {
+        let spans = (0..self.spans).map(|span| {
+            let lo = self.visible[(row * self.spans + span) * 2].max(0);
+            (self.visible[(row * self.spans + span) * 2 + 1] - lo).max(0) as usize
+        });
+        let fresh = (self.fresh[row * 2 + 1] - self.fresh[row * 2].max(0)).max(0) as usize;
+        spans.sum::<usize>() + fresh * usize::from(self.form.fresh)
+    }
+
+    /// Whether row `row` reads its key `ordinal` (spans in order, then fresh
+    /// rows): the bit of its block in the row's bitmap, a block past the
+    /// bitmap unread.
+    fn reads(&self, row: usize, ordinal: usize) -> bool {
+        if self.selection_words == 0 {
+            return true;
+        }
+        let block = ordinal / self.block_rows;
+        block / 32 < self.selection_words
+            && self.selection[row * self.selection_words + block / 32] >> (block % 32) & 1 != 0
+    }
+
+    /// This case as a WorkList read over units of `BR = 4` keys, each row's
+    /// bitmap as `unit_reads` emits it: `picks` pseudo-random units of its
+    /// complete ones, and every unit from its tail unit (c = keys / 4) on.
+    fn with_unit_reads(mut self, picks: usize, seed: u64) -> Self {
+        const UNIT: usize = 4;
+        let complete = (0..self.rows).map(|row| self.keys_of(row) / UNIT).collect::<Vec<_>>();
+        let words = (complete.iter().max().unwrap() + 1).div_ceil(32);
+        let mut noise = Noise(seed);
+        self.selection = complete
+            .iter()
+            .flat_map(|&c| {
+                let picked = (0..picks)
+                    .map(|_| ((noise.next() * 0.5 + 0.5) * c as f32) as usize % c.max(1))
+                    .collect::<std::collections::BTreeSet<_>>();
+                (0..words).map(move |word| {
+                    (0..32).filter(|bit| word * 32 + bit >= c || picked.contains(&(word * 32 + bit)))
+                        .fold(0u32, |bits, bit| bits | 1 << bit)
+                })
+            })
+            .collect();
+        self.selection_words = words;
+        self.block_rows = UNIT;
+        self
     }
 
     /// This case with an index-list source: `picks` picks a row over a
@@ -330,9 +390,11 @@ impl Case {
 
     /// The extents of the entries' empty `form` table: the layer form's,
     /// then KR.
-    fn extents(&self) -> [usize; 6] {
+    /// The dense entries' `form`: the form's axes, the key rounding (`KR`),
+    /// and no absorbed latent read (`AB`).
+    fn extents(&self) -> [usize; 7] {
         let [zero, ra, rt, ro, vk] = self.form.extents();
-        [zero, ra, rt, ro, vk, usize::from(self.key_rounding.is_some())]
+        [zero, ra, rt, ro, vk, usize::from(self.key_rounding.is_some()), 0]
     }
 
     /// The key-rounding scalars (block 0 rounds nothing).
@@ -502,6 +564,12 @@ impl Case {
                         ));
                     }
                 }
+                let mut entries = entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(ordinal, _)| self.reads(row, *ordinal))
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>();
                 // The index-list source's rows, each read as key and value.
                 entries.extend(self.picked(row, kv_head).map(|picked| (picked, picked)));
                 let scores = entries
@@ -657,6 +725,7 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(dtype, shape, values)))
     };
     let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
+    let floats_u32 = |values: &[u32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let ints = |values: &[i32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let rows = |values: &[f32], count: usize| {
         floats(
@@ -707,12 +776,12 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         Arg::Scalar(ReferenceScalar::I32(case.rounding_scalars().scale)),
         Arg::Scalar(ReferenceScalar::F32(case.rounding_scalars().amax_floor.to_bits())),
     ];
-    // The prefill takes its WorkList bitmap (none: B = 0) and block keys
-    // (BR = 1) after the destinations.
+    // The prefill takes its WorkList bitmap and block keys after the
+    // destinations.
     let prefill = entry == "attention_prefill";
     if prefill {
-        args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
-        args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
+        args.insert(15, tensor(DType::I32, vec![0, case.block_rows], Vec::new()));
+        args.insert(15, tensor(DType::U32, vec![m, case.selection_words], floats_u32(&case.selection)));
     }
     // The history planes' ordinals, after the index-list source.
     let planes = if prefill { 19 } else { 17 };
@@ -816,9 +885,9 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
-    /// The prefill's absent WorkList bitmap ([M, 0]).
+    /// The prefill's WorkList bitmap ([M, B]; B = 0 reads every key).
     selection: Tensor,
-    /// Its blocks' keys (`[0, 1]`: every key read).
+    /// Its blocks' keys (`[0, BR]`).
     block_slots: Tensor,
     /// The index-list source: its picks and its slab-stored plane.
     selected_rows: Tensor,
@@ -927,8 +996,14 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
-            selection: Tensor::from_host(device, Element::u32(), &[m as u64, 0], &[]).unwrap(),
-            block_slots: Tensor::from_host(device, Element::i32(), &[0, 1], &[]).unwrap(),
+            selection: Tensor::from_host(
+                device,
+                Element::u32(),
+                &[m as u64, case.selection_words as u64],
+                &case.selection.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            block_slots: Tensor::from_host(device, Element::i32(), &[0, case.block_rows as u64], &[]).unwrap(),
             selected_rows: i32_tensor(device, &[m, case.picks], &case.selected_rows),
             selected,
             _selected_slabs: selected_slabs,
@@ -967,6 +1042,7 @@ fn statics(device: &Device, form: Form, sinks: usize) -> NativeSpecialization {
         ("RT", usize::from(form.rotary.trailing)),
         ("RO", usize::from(form.rotary.inverse_output)),
         ("VK", usize::from(form.stored_key)),
+        ("AB", 0),
     ];
     let gpu = [("KV", form.kv), ("G", form.g)];
     let base = common
@@ -1356,17 +1432,23 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
             });
             decode_admitted(device, form, vector.into_iter().chain(matrix).collect())
         }
-        (BackendName::Vulkan, false) => vec![
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 256)],
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 1)],
-        ],
+        (BackendName::Vulkan, false) => {
+            vec![
+                vulkan_prefill_vector(32, 16, 4),
+                vulkan_prefill_vector(64, 64, 8),
+                vulkan_prefill_matrix(64, 256),
+                vulkan_prefill_matrix(64, 1),
+            ]
+        }
         (other, _) => panic!("no configurations for {other:?}"),
     }
 }
 
 /// [`configurations`] that can hold `case`: an index-list source runs in
-/// Metal's fragment prefill form alone (its declaration refuses DIRECT), and
-/// in Metal's matrix decode forms at one row a threadgroup.
+/// Metal's fragment prefill form alone (its declaration refuses DIRECT), a
+/// case without a stored key or with an index-list source in Vulkan's matrix
+/// prefill form alone (its vector form is declared for VK = 1 only and reads
+/// no picks), and in Metal's matrix decode forms at one row a threadgroup.
 fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&'static str, u64)>> {
     if !decode && case.picks > 0 && device.backend() == BackendName::Metal {
         // A prefill with picks attends in the shared tile: attend's
@@ -1388,12 +1470,17 @@ fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&
     let metal_decode = decode && device.backend() == BackendName::Metal;
     configurations(device, decode, case.form)
         .into_iter()
+        // Metal's declaration refuses DIRECT under a WorkList (B > 0).
+        .filter(|config| case.selection_words == 0 || !config.contains(&("DIRECT", 1)))
         .filter(|config| {
-            case.picks == 0
-                || !(config.contains(&("DIRECT", 1))
-                    || (metal_decode
-                        && !((config.contains(&("MATRIX", 1)) || config.contains(&("MATRIX", 2)))
-                            && config.contains(&("TOKENS", 1)))))
+            let vulkan_vector = !decode && device.backend() == BackendName::Vulkan && config.contains(&("MATRIX", 0));
+            !(vulkan_vector && !case.form.stored_key)
+                && (case.picks == 0
+                    || !(config.contains(&("DIRECT", 1))
+                        || vulkan_vector
+                        || (metal_decode
+                            && !((config.contains(&("MATRIX", 1)) || config.contains(&("MATRIX", 2)))
+                                && config.contains(&("TOKENS", 1))))))
         })
         .collect()
 }
@@ -1407,12 +1494,13 @@ fn run(
     case: &Case,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
     let mut bound = Bound::new(device, case);
-    // The prefill in its Visible form: no WorkList bitmap (B = 0, a static
-    // of the GPU natives).
+    assert!(!decode || case.selection_words == 0, "the decode entry reads no WorkList bitmap");
+    // The prefill's WorkList words (B, a static of the GPU natives; the
+    // Visible form has none).
     let specialization = &if decode || device.backend() == BackendName::Cpu {
         specialization.clone()
     } else {
-        specialization.clone().with_static("B", 0)
+        specialization.clone().with_static("B", case.selection_words as u64)
     }
     // The case's key rounding and index-list source.
     .with_static("KR", u64::from(case.key_rounding.is_some()))
@@ -1420,12 +1508,12 @@ fn run(
     let rounding = case.rounding_scalars();
     macro_rules! call {
         ($module:ident $(, $extra:ident: $value:expr)*) => {{
-            let kernel = $module::native_for_device_with(
-                device,
-                $module::Elements { A: Element::bf16() },
-                specialization,
-            )
-            .map_err(|error| error.to_string())?;
+            // The case's statics and pinned parameters, every other
+            // parameter at its declared default.
+            let entry = $module::native_entry_with($module::Elements { A: Element::bf16() });
+            let specialization = declared::declared_at(device, &entry, specialization)
+                .map_err(|error| format!("native specialization: {error}"))?;
+            let kernel = entry.prepare(device, &specialization).map_err(|error| error.to_string())?;
             kernel
                 .call($module::Args {
                     $($extra: $value,)*
@@ -2618,6 +2706,72 @@ fn v41_natives_match_reference() {
     }
 }
 
+impl Case {
+    /// This case with every query head row's largest prepared value 3.5 ·
+    /// 2^`exponent`, its softmax unchanged: column 0, which no pair turns,
+    /// set to 3.5 (each turned pair's values stay within 2√2 < 3.5), every
+    /// query value times 2^`exponent` and the scale times 2^-`exponent`, all
+    /// exact.
+    fn with_query_rows_at(mut self, exponent: i32) -> Self {
+        let (w, factor) = (self.form.w(), 2f32.powi(exponent));
+        assert!(self.form.i() == 0 && !self.form.query_norm && self.form.s > 0);
+        for row in self.query.chunks_mut(w) {
+            row[0] = 3.5;
+            row.iter_mut().for_each(|value| *value *= factor);
+        }
+        self.scale /= factor;
+        self
+    }
+}
+
+/// Vulkan's matrix decode stages a query row whose largest value is past
+/// F16's range (3.5 · 2^17 > 65504) scaled into it by 2^-e and scores it
+/// times 2^e, so its result equals, bit for bit, that of the row it scales
+/// to (3.5 · 2^13, within [2^14, 2^15), which stages unscaled), and both meet
+/// the F32 reference: with its queries staged in the workgroup's tile (a
+/// small V4.1 form) and from the prepare launch (V4.1's G = 64 at W = 512).
+#[test]
+fn vulkan_decode_query_rows_past_f16_scale_exactly() {
+    let small = Case::new(SMALL_V41, 64, decode_rows(5), 16, 1.0, 0.125, 70)
+        .with_theta(1.0e4)
+        .with_sinks(80);
+    let v41 = Case::new(V41, 320, decode_rows(260), 128, 1.0, 1.0 / (512f32).sqrt(), 90)
+        .with_theta(1.0e4)
+        .with_sinks(91);
+    let mut failures = Vec::new();
+    for (name, case) in [("in-tile queries", small), ("prepared queries", v41)] {
+        let within = case.clone().with_query_rows_at(13);
+        let past = case.with_query_rows_at(17);
+        let host = within.expected();
+        let expected = (within.v41_reference(), host.1, host.2);
+        for device in devices()
+            .into_iter()
+            .filter(|device| device.backend() == BackendName::Vulkan)
+        {
+            for config in case_configurations(&device, true, &within) {
+                let specialization = config
+                    .iter()
+                    .fold(statics(&device, within.form, within.sink_rows()), |s, (n, v)| {
+                        s.with_param(*n, *v)
+                    });
+                let label = format!("{name} {config:?}");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let unscaled = run(&device, true, &specialization, &within)
+                        .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    check(&label, &unscaled, &expected, &within);
+                    let scaled = run(&device, true, &specialization, &past)
+                        .unwrap_or_else(|error| panic!("{label} past F16: {error}"));
+                    assert_eq!(bits(&scaled.0), bits(&unscaled.0), "{label}: past F16's range");
+                }));
+                if outcome.is_err() {
+                    failures.push(label);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Stored-key values (`VK = 1`).
 
@@ -2741,6 +2895,13 @@ fn bits(values: &[f32]) -> Vec<u32> {
 /// and the CUDA prefill entry: the result, and the key plane the row's keys
 /// are appended to. The two-plane run's value plane ends equal to its key
 /// plane. The CUDA decode entry refuses every stored-key form.
+///
+/// Vulkan's prefill vector form (MATRIX = 0) is declared for stored keys
+/// alone, so its twin is the form the declaration admits over two planes:
+/// the matrix form (MATRIX = 1) at its declared defaults (ROWS 64,
+/// SPLIT_GROUPS 256: `vulkan_prefill_matrix(64, 256)`). The planes stay
+/// bit-exact (both forms append the same bf16 prepared keys); the results
+/// differ by the forms' arithmetic, held to [`cross_form_bounds`].
 #[test]
 fn stored_key_attention_equals_key_valued_planes() {
     let mut failures = Vec::new();
@@ -2770,9 +2931,28 @@ fn stored_key_attention_equals_key_valued_planes() {
                     };
                     assert!(stored.2.is_empty(), "{label}: a value plane");
                     let twin = case.key_valued(case.prepared_keys(&stored.1));
-                    let planes = run(&device, decode, &specialization(twin.form), &twin)
+                    let cross_form = !decode && backend == BackendName::Vulkan && config.contains(&("MATRIX", 0));
+                    let twin_specialization = if cross_form {
+                        vulkan_prefill_matrix(64, 256)
+                            .into_iter()
+                            .fold(statics(&device, twin.form, case.sink_rows()), |s, (n, v)| s.with_param(n, v))
+                    } else {
+                        specialization(twin.form)
+                    };
+                    let planes = run(&device, decode, &twin_specialization, &twin)
                         .unwrap_or_else(|error| panic!("{label} over two planes: {error}"));
-                    assert_eq!(bits(&stored.0), bits(&planes.0), "{label}: result");
+                    if cross_form {
+                        let outside = stored
+                            .0
+                            .iter()
+                            .zip(&planes.0)
+                            .zip(cross_form_bounds(&case, &stored.0))
+                            .filter(|((a, b), bound)| (*a - *b).abs() > *bound)
+                            .count();
+                        assert_eq!(outside, 0, "{label}: results outside the cross-form bound");
+                    } else {
+                        assert_eq!(bits(&stored.0), bits(&planes.0), "{label}: result");
+                    }
                     assert_eq!(bits(&stored.1), bits(&planes.1), "{label}: key plane");
                     assert_eq!(bits(&planes.2), bits(&planes.1), "{label}: value plane");
                     eprintln!("{label}: one plane equals two");
@@ -2786,11 +2966,32 @@ fn stored_key_attention_equals_key_valued_planes() {
     assert!(failures.is_empty(), "failed: {failures:?}");
 }
 
+/// The bound between Vulkan's prefill vector form `f0` (published as
+/// `vector`) and its matrix form `f1` at one row, exact row `r`:
+/// - `f1` is within the native bound of `r` ([`result_bounds`]: an attended
+///   row's bar, or the turned bound under the output rotary);
+/// - `f0` reads every operand in A, as the host model does, and accumulates
+///   in F32: its one rounding above F32 is its bf16 publication, half a step,
+///   so `|f0 - r| <= (2^-8 + 2^-20) |r|`;
+/// - so `|f0 - f1| <= bound(r) + (2^-8 + 2^-20) |r|`, taken at the measured
+///   `f0` with `|r| <= u |f0|`, `u = 1 + 2^-8`: every bound grows with its
+///   row's magnitude, so it is [`result_bounds`] at `u f0`, widened by
+///   `(2^-8 + 2^-20) u |f0|` per component.
+fn cross_form_bounds(case: &Case, vector: &[f32]) -> Vec<f32> {
+    let u = 1.0 + 2f32.powi(-8);
+    let reach: Vec<f32> = vector.iter().map(|x| u * x).collect();
+    result_bounds(case, &reach)
+        .into_iter()
+        .zip(vector)
+        .map(|((bound, _), x)| bound + (2f32.powi(-8) + 2f32.powi(-20)) * u * x.abs())
+        .collect()
+}
+
 /// The dense append of `case` on `device`: its final key and value planes.
 fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), String> {
     let mut bound = Bound::new(device, case);
     let form = case.form;
-    let [_, ra, rt, _, vk, kr] = case.extents();
+    let [_, ra, rt, _, vk, kr, _] = case.extents();
     let append_form = Tensor::from_host(
         device,
         Element::i32(),
@@ -2803,7 +3004,7 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
     let specialization = statics(device, form, 0)
         .statics()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "SK"))
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "SK" | "AB"))
         .fold(NativeSpecialization::new(), |s, (name, value)| {
             s.with_static(name, *value)
         })
@@ -3272,6 +3473,9 @@ impl Case {
         case.selected = self.selected.clone();
         case.selected_slab_rows = self.selected_slab_rows;
         case.key_rounding = self.key_rounding;
+        case.selection = self.selection[first * self.selection_words..].to_vec();
+        case.selection_words = self.selection_words;
+        case.block_rows = self.block_rows;
         case
     }
 }
@@ -3287,7 +3491,10 @@ impl Case {
 /// matrix and shared-tile forms, Vulkan's vector form and its matrix form's
 /// one-row tiles, the CPU's; over Muse, and V4.1's compressed layer small and
 /// at its heads (picks, rounded keys, sinks, stored-key values, the output
-/// rotary). The re-appended rows equal the widest launch's.
+/// rotary). The re-appended rows equal the widest launch's. GLM's selected
+/// read (a WorkList bitmap of picked units and the tail, which the prefill
+/// entry alone reads) holds the same through Vulkan's prefill vector form,
+/// whose unselected keys are attended as none at their own positions.
 ///
 /// The history is the smallest that reaches every path at every width: 70
 /// rows over 32-row slabs, so a row's 71 to 86 keys cross slab edges (32, 64)
@@ -3302,10 +3509,12 @@ fn decode_rows_are_the_same_at_every_verify_width() {
     let rows = || verify_rows(&[(0, history)], VERIFY_ROWS);
     let store = history as usize + VERIFY_ROWS;
     let scale = 1.0 / (512f32).sqrt();
+    // Each case with the entry that attends its decode rows.
     let cases = [
-        ("muse", Case::new(MUSE, store, rows(), slab_rows, 1.0, 0.125, 110)),
+        ("muse", true, Case::new(MUSE, store, rows(), slab_rows, 1.0, 0.125, 110)),
         (
             "small v41",
+            true,
             Case::new(SMALL_V41, store, rows(), slab_rows, 1.0, 0.125, 111)
                 .with_theta(1.0e4)
                 .with_sinks(112)
@@ -3314,11 +3523,17 @@ fn decode_rows_are_the_same_at_every_verify_width() {
         ),
         (
             "v41",
+            true,
             Case::new(V41, store, rows(), slab_rows, 1.0, scale, 114)
                 .with_theta(1.0e4)
                 .with_sinks(115)
                 .with_picks(picks, pooled, slab_rows, 116)
                 .with_key_rounding(KEY_ROUNDING),
+        ),
+        (
+            "glm selected",
+            false,
+            Case::new(GLM, store, rows(), slab_rows, 1.0, scale, 117).with_unit_reads(8, 118),
         ),
     ];
     let mut failures = Vec::new();
@@ -3326,7 +3541,16 @@ fn decode_rows_are_the_same_at_every_verify_width() {
         .into_iter()
         .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Vulkan | BackendName::Cpu))
     {
-        for (name, case) in &cases {
+        for (name, decode, case) in &cases {
+            // The selected read is checked in Vulkan's prefill vector form,
+            // whose keys absorb at fixed positions. The prefill matrix form is
+            // exempt: its key tiles start at each span's edges (history, then
+            // fresh), which move with the verify width, so its reduction
+            // order is not a row's key positions alone; only the decode
+            // entry's matrix form cuts its tiles at fixed positions.
+            if !decode && device.backend() != BackendName::Vulkan {
+                continue;
+            }
             // Row tiles of several rows (Metal's TOKENS > 1, Vulkan's matrix
             // form where 16 * SIMDS rows hold two or more rows of G heads)
             // share tiles across rows; Vulkan's vector form holds one row a
@@ -3338,18 +3562,21 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                         || param("MATRIX") == Some(0)
                         || param("SIMDS").is_some_and(|simds| 16 * simds / case.form.g as u64 == 1))
             };
-            for config in case_configurations(&device, true, case).into_iter().filter(|config| one_row(config)) {
+            let configurations = case_configurations(&device, *decode, case).into_iter().filter(|config| {
+                one_row(config) && (*decode || config.contains(&("MATRIX", 0)))
+            });
+            for config in configurations {
                 let specialization = config
                     .iter()
                     .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
                 let label = format!("{name} {:?} {config:?}", device.backend());
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let widest = run(&device, true, &specialization, case)
+                    let widest = run(&device, *decode, &specialization, case)
                         .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
                     let row = case.form.heads() * case.form.w();
                     for width in [8usize, 4, 2, 1] {
                         let narrow = case.narrowed(history, width, &widest.1, &widest.2);
-                        let actual = run(&device, true, &specialization, &narrow)
+                        let actual = run(&device, *decode, &specialization, &narrow)
                             .unwrap_or_else(|error| panic!("{label} width {width}: {error}"));
                         assert_eq!(
                             bits(&actual.0),
@@ -3830,5 +4057,582 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
             format!("vector GROUPS {groups} SLICES {slices} SIMDS {simds} PARTS {parts}"),
             configuration
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Absorbed latent attention (GLM-5.3-Flash's NoPE MLA, `QueryKeys::Absorbed`).
+
+/// GLM-5.3-Flash's attention as the history entries read it: one 512-wide
+/// latent row a token under its RMS norm, read by 64 query heads as key and
+/// value, without positions.
+const GLM: Form = Form {
+    kv: 1,
+    g: 64,
+    p: 0,
+    s: 512,
+    interleaved: false,
+    separate: 0,
+    softplus: false,
+    fresh: true,
+    query_norm: false,
+    norm: true,
+    value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: true,
+};
+
+/// The width of GLM's projected query heads and of each head's value (D).
+const GLM_HEAD: usize = 256;
+
+/// An absorbed layer's own inputs beside its history entries': the projected
+/// query heads `[M, heads, D]` and the stored per-head latent projections,
+/// `k_b` `[heads, latent, D]` (block h: W_UK_hᵀ, read by the absorption) and
+/// `v_b` `[heads, D, latent]` (block h: W_UV_h, read by the grouped output).
+/// The scores' spread (about 1.3) leaves tens of rows weighing in a softmax
+/// over hundreds, and the values about unit size.
+struct LatentHeads {
+    queries: Vec<f32>,
+    k_b: Vec<f32>,
+    v_b: Vec<f32>,
+}
+
+impl LatentHeads {
+    fn new(case: &Case, seed: u64) -> Self {
+        let (heads, latent) = (case.form.heads(), case.form.w());
+        let mut noise = Noise(seed);
+        let mut values = |count: usize, scale: f32| {
+            (0..count).map(|_| bf16(noise.next() * scale)).collect::<Vec<_>>()
+        };
+        Self {
+            queries: values(case.rows * heads * GLM_HEAD, 2.0),
+            k_b: values(heads * latent * GLM_HEAD, 0.05),
+            v_b: values(heads * GLM_HEAD * latent, 0.05),
+        }
+    }
+}
+
+/// `y = W x` per group, F32 sums rounded to BF16 (`project_rows`' portable
+/// body at A = Y = BF16): `source` `[rows, groups·inputs]`, `weight`
+/// `[groups·outputs, inputs]`.
+fn grouped_rows(source: &[f32], weight: &[f32], groups: usize, inputs: usize, outputs: usize) -> Vec<f32> {
+    source
+        .chunks(groups * inputs)
+        .flat_map(|row| {
+            (0..groups * outputs).map(move |out| {
+                let group = out / outputs;
+                let x = &row[group * inputs..][..inputs];
+                bf16(x.iter().zip(&weight[out * inputs..][..inputs]).map(|(a, b)| a * b).sum::<f32>())
+            })
+        })
+        .collect()
+}
+
+/// A native's grouped product `actual` on `backend` of BF16 `source` and
+/// `weight` within the bound of its form ([`bound::Form::projection`]) of
+/// [`grouped_rows`] over the same inputs: both sum the same K products in
+/// F32, in their own orders, and round once to BF16.
+fn check_grouped_rows(
+    label: &str,
+    backend: BackendName,
+    actual: &[f32],
+    source: &[f32],
+    weight: &[f32],
+    groups: usize,
+    inputs: usize,
+    outputs: usize,
+) {
+    let expected = grouped_rows(source, weight, groups, inputs, outputs);
+    let form = bound::Form::projection(backend, source.len() / (groups * inputs), Float::Bf16, Element::bf16());
+    let bound = source
+        .chunks(groups * inputs)
+        .flat_map(|x| {
+            (0..groups * outputs).map(move |out| {
+                Products::of(&x[(out / outputs) * inputs..][..inputs], &weight[out * inputs..][..inputs])
+            })
+        })
+        .zip(&expected)
+        .map(|(products, y)| form.rounded(&products, Float::Bf16, *y))
+        .collect::<Vec<_>>();
+    assert_within(label, actual, &expected, &bound);
+}
+
+/// `project_rows` on `device` in BF16 (no scale, no bound), at the
+/// declaration's default configuration for the case's statics: with G > 1,
+/// Metal's domain admits only its untiled, unpacked, scalar launches.
+fn native_grouped_rows(
+    device: &Device,
+    source: &[f32],
+    weight: &[f32],
+    groups: usize,
+    inputs: usize,
+    outputs: usize,
+) -> Vec<f32> {
+    let rows = source.len() / (groups * inputs);
+    let statics = NativeSpecialization::new().with_static("WS", 0);
+    // Each backend's declared statics: the CPU's WS alone, Metal's with
+    // its row-bound extent WB.
+    let shape = [("G", groups), ("K", inputs), ("N", outputs)];
+    let statics = match device.backend() {
+        BackendName::Cpu => statics,
+        BackendName::Metal => shape
+            .into_iter()
+            .chain([("WB", 0)])
+            .fold(statics, |s, (name, value)| s.with_static(name, value as u64)),
+        BackendName::Cuda | BackendName::Vulkan => {
+            shape.into_iter().fold(statics, |s, (name, value)| s.with_static(name, value as u64))
+        }
+    };
+    let specialization = seismic::generated::native_default_specialization::<project_rows::Entry>(
+        device,
+        &statics,
+        &[("A", Element::bf16()), ("W", Element::bf16()), ("Y", Element::bf16())],
+    )
+    .unwrap()
+    .expect("project_rows admits the case's groups on this backend");
+    let kernel = project_rows::native_for_device_with(
+        device,
+        project_rows::Elements { A: Element::bf16(), W: Element::bf16(), Y: Element::bf16() },
+        &specialization,
+    )
+    .unwrap();
+    let out = kernel
+        .call(project_rows::Args {
+            source: &bf16_tensor(device, &[rows, groups * inputs], source),
+            weight: &bf16_tensor(device, &[groups * outputs, inputs], weight),
+            weight_scale: &f32_tensor(device, &[0], &[]),
+            weight_bound: &f32_tensor(device, &[0], &[]),
+        })
+        .unwrap()
+        .value;
+    bf16_values(&out)
+}
+
+impl Case {
+    /// The attention output as GLM-5.3-Flash's reference computes it
+    /// (`glm5next.py`'s `attention`), in F32 from the case's inputs, written
+    /// apart from the host model and without absorption: each fresh latent
+    /// RMS(kv) * norm, rounded to bf16 and stored once (as every history row
+    /// is, the history plane's rows too); each head's key k_h = W_UK_h c and
+    /// value v_h = W_UV_h c expanded per row; softmax(q_h · k_h * scale) over
+    /// the visible and fresh rows times the values, unrounded.
+    fn glm_reference(&self, heads: &LatentHeads) -> Vec<f32> {
+        let form = self.form;
+        assert!(form.kv == 1 && form.p == 0 && form.norm && form.fresh && form.stored_key);
+        let (g, w, d) = (form.g, form.w(), GLM_HEAD);
+        let fresh = self.glm_fresh_latents();
+        // Every head's k_h[e] = Σ_r c[r] k_b[h][r][e] and v_h[e] = Σ_r c[r]
+        // v_b[h][e][r] of a latent c, `[heads, D]` each.
+        let expand = |c: &[f32]| {
+            let mut keys = vec![0.0f32; g * d];
+            let mut values = vec![0.0f32; g * d];
+            for head in 0..g {
+                let key = &mut keys[head * d..][..d];
+                for (r, x) in c.iter().enumerate() {
+                    for (k, b) in key.iter_mut().zip(&heads.k_b[(head * w + r) * d..][..d]) {
+                        *k += x * b;
+                    }
+                }
+                for (e, v) in values[head * d..][..d].iter_mut().enumerate() {
+                    *v = c.iter().zip(&heads.v_b[(head * d + e) * w..][..w]).map(|(x, b)| x * b).sum();
+                }
+            }
+            (keys, values)
+        };
+        let history = (0..self.history_rows)
+            .map(|token| expand(&self.history_key[token * w..][..w]))
+            .collect::<Vec<_>>();
+        let fresh = fresh.iter().map(|c| expand(c)).collect::<Vec<_>>();
+        let mut out = vec![0.0; self.rows * g * d];
+        for row in 0..self.rows {
+            let mut expanded: Vec<&(Vec<f32>, Vec<f32>)> = Vec::new();
+            for span in 0..self.spans {
+                let (lo, hi) = (
+                    self.visible[(row * self.spans + span) * 2],
+                    self.visible[(row * self.spans + span) * 2 + 1],
+                );
+                expanded.extend((lo.max(0)..hi).map(|token| &history[token as usize]));
+            }
+            expanded.extend((self.fresh[row * 2].max(0)..self.fresh[row * 2 + 1]).map(|token| &fresh[token as usize]));
+            for head in 0..g {
+                let q = &heads.queries[(row * g + head) * d..][..d];
+                let scores = expanded
+                    .iter()
+                    .map(|(k, _)| q.iter().zip(&k[head * d..][..d]).map(|(a, b)| a * b).sum::<f32>() * self.scale)
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores.iter().map(|score| (score - maximum).exp()).collect::<Vec<_>>();
+                let denominator = weights.iter().sum::<f32>().max(1e-30);
+                for e in 0..d {
+                    out[(row * g + head) * d + e] = expanded
+                        .iter()
+                        .zip(&weights)
+                        .map(|((_, v), weight)| weight * v[head * d + e])
+                        .sum::<f32>()
+                        / denominator;
+                }
+            }
+        }
+        out
+    }
+
+    /// The reference's fresh latents: RMS(kv) * norm in F32, rounded to bf16.
+    fn glm_fresh_latents(&self) -> Vec<Vec<f32>> {
+        let w = self.form.w();
+        (0..self.rows)
+            .map(|row| {
+                let raw = &self.key[row * w..][..w];
+                let rms = (raw.iter().map(|x| x * x).sum::<f32>() / w as f32 + self.epsilon).sqrt();
+                raw.iter().zip(&self.key_norm).map(|(x, n)| bf16(x / rms * n)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Each output's bound of the host model's `host` against
+    /// [`Self::glm_reference`], from the values the two routes compute
+    /// (`queries`: the host's absorbed BF16 queries; `attended`: its published
+    /// latent rows). Per row, head and visible latent `t`, with the host's
+    /// softmax weights `p`, `V_t = v_b ℓ_t` and `A_t = Σ|v_b||ℓ_t|` (the
+    /// reference's latent `ℓ_t`; the host's is `ℓ̂_t`):
+    /// - scores: the host's differ from the exact `scale q'·ℓ_t` by
+    ///   `scale (Δq'·ℓ_t + q̂'·(ℓ̂_t - ℓ_t))`, both evaluated from the actual
+    ///   `Δq' = q̂' - k_bᵀq` and latents; the reference's F32 route (`k_b ℓ`, then
+    ///   `q·k`) by at most `scale γ_{W+D} Σ_r (Σ_e |q_e||k_b,re|) |ℓ_r|`, its
+    ///   scaling, shift and exp by `2^-24 (2|s| + |s - max|) + 2^-23`. Their sum
+    ///   `S_t` bounds `|Δs_t|`;
+    /// - softmax, to first order `Δp_t = p_t (Δs_t - Σ_j p_j Δs_j)`, moves
+    ///   `Σ p_t V_t` by `Σ p_t Δs_t (V_t - y)`: at most `Σ p_t S_t |V_t - y|`;
+    /// - values: the host's latents move it by `Σ p_t |v_b (ℓ̂_t - ℓ_t)|`; the
+    ///   reference's expansion and weighted sum (F32) by `γ_W Σ p_t A_t` and
+    ///   `γ_{2T+1} Σ p_t A_t` over its `T` latents;
+    /// - the host's output: its published latent is within `2^-8/(1 - 2^-8)` of
+    ///   its exact one, its F32 product within `γ_W`, both of `Σ|v_b||ℓ̂|`; its
+    ///   own publication adds `2^-8 |ŷ| / (1 - 2^-8)`.
+    /// The host model's own sums are F64, below every term here.
+    fn glm_reference_bounds(&self, heads: &LatentHeads, queries: &[f32], attended: &[f32], host: &[f32]) -> Vec<f32> {
+        let (g, w, d) = (self.form.g, self.form.w(), GLM_HEAD);
+        let (reference, scale) = (self.glm_fresh_latents(), f64::from(self.scale));
+        let host_fresh = (0..self.rows)
+            .map(|row| self.prepare_rounded(&self.key[row * w..][..w], Some(&self.key_norm[..]), true, row, self.rounding_scalars()))
+            .collect::<Vec<_>>();
+        // Every latent, the history's then the fresh rows', as (reference, host).
+        let latents: Vec<(&[f32], &[f32])> = (0..self.history_rows)
+            .map(|t| (&self.history_key[t * w..][..w], &self.history_key[t * w..][..w]))
+            .chain(reference.iter().zip(&host_fresh).map(|(r, h)| (&r[..], &h[..])))
+            .collect();
+        // Per latent and output `head·D + e`: V, A and |v_b (ℓ̂ - ℓ)|.
+        let expanded: Vec<Vec<[f64; 3]>> = latents
+            .iter()
+            .map(|(l, h)| {
+                (0..g * d)
+                    .map(|out| {
+                        let v = &heads.v_b[out * w..][..w];
+                        let [mut value, mut magnitude, mut departure] = [0.0f64; 3];
+                        for c in 0..w {
+                            let (x, y) = (f64::from(v[c]), f64::from(l[c]));
+                            value += x * y;
+                            magnitude += (x * y).abs();
+                            departure += x * (f64::from(h[c]) - y);
+                        }
+                        [value, magnitude, departure.abs()]
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut bounds = vec![0.0f32; host.len()];
+        for row in 0..self.rows {
+            let mut entries = Vec::new();
+            for span in 0..self.spans {
+                let at = (row * self.spans + span) * 2;
+                entries.extend((self.visible[at].max(0)..self.visible[at + 1]).map(|t| t as usize));
+            }
+            entries.extend((self.fresh[row * 2].max(0)..self.fresh[row * 2 + 1]).map(|t| self.history_rows + t as usize));
+            for head in 0..g {
+                let at = row * g + head;
+                let (q, absorbed) = (&heads.queries[at * d..][..d], &queries[at * w..][..w]);
+                // The exact absorption k_bᵀq and Σ_e |q_e||k_b,re|, per latent column.
+                let (exact, size): (Vec<f64>, Vec<f64>) = (0..w)
+                    .map(|r| {
+                        q.iter().zip(&heads.k_b[(head * w + r) * d..][..d]).fold((0.0, 0.0), |(s, m), (a, b)| {
+                            let x = f64::from(*a) * f64::from(*b);
+                            (s + x, m + x.abs())
+                        })
+                    })
+                    .unzip();
+                let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+                let scores = entries.iter().map(|&t| scale * dot(absorbed, latents[t].1)).collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights = scores.iter().map(|s| (s - maximum).exp()).collect::<Vec<_>>();
+                let denominator = weights.iter().sum::<f64>().max(1e-30);
+                let p = weights.iter().map(|x| x / denominator).collect::<Vec<_>>();
+                let shifts = entries
+                    .iter()
+                    .zip(&scores)
+                    .map(|(&t, &s)| {
+                        let (l, h) = latents[t];
+                        let (mut query, mut latent, mut route) = (0.0f64, 0.0f64, 0.0f64);
+                        for r in 0..w {
+                            query += (f64::from(absorbed[r]) - exact[r]) * f64::from(l[r]);
+                            latent += f64::from(absorbed[r]) * (f64::from(h[r]) - f64::from(l[r]));
+                            route += size[r] * f64::from(l[r]).abs();
+                        }
+                        scale * (query.abs() + latent.abs() + gamma(w + d) * route)
+                            + 2f64.powi(-24) * (2.0 * s.abs() + (s - maximum).abs())
+                            + 2f64.powi(-23)
+                    })
+                    .collect::<Vec<_>>();
+                let published = &attended[at * w..][..w];
+                for e in 0..d {
+                    let out = head * d + e;
+                    let y: f64 = entries.iter().zip(&p).map(|(&t, p)| p * expanded[t][out][0]).sum();
+                    let attention: f64 = entries
+                        .iter()
+                        .zip(p.iter().zip(&shifts))
+                        .map(|(&t, (p, shift))| {
+                            let [value, magnitude, departure] = expanded[t][out];
+                            p * (shift * (value - y).abs() + departure + (gamma(w) + gamma(2 * entries.len() + 1)) * magnitude)
+                        })
+                        .sum();
+                    let products: f64 = heads.v_b[out * w..][..w].iter().zip(published).map(|(v, l)| (f64::from(*v) * f64::from(*l)).abs()).sum();
+                    let half = Float::Bf16.unit();
+                    let output = products * (half / (1.0 - half) + gamma(w));
+                    let rounding = half * f64::from(host[at * d + e]).abs() / (1.0 - half);
+                    bounds[at * d + e] = (attention + output + rounding) as f32;
+                }
+            }
+        }
+        bounds
+    }
+
+    /// This case attending with `queries` (`[M, heads, W]`).
+    fn with_queries(mut self, queries: Vec<f32>) -> Self {
+        assert_eq!(queries.len(), self.query.len());
+        self.query = queries;
+        self
+    }
+}
+
+/// GLM's shapes at a decode step (single and verification rows over a long
+/// history, a row without a destination, a padding row) and over causal
+/// prompt rows after a history, each with its layer's own inputs.
+fn glm_cases() -> Vec<(&'static str, bool, Case, LatentHeads)> {
+    let scale = 1.0 / (GLM_HEAD as f32).sqrt();
+    [
+        ("glm decode", true, Case::new(GLM, 320, decode_rows(260), 128, 1.0, scale, 120), 121),
+        ("glm prompt", false, Case::new(GLM, 256, window_rows(24, 100, 1 << 16), 64, 1.0, scale, 122), 123),
+    ]
+    .into_iter()
+    .map(|(name, decode, case, seed)| {
+        let heads = LatentHeads::new(&case, seed);
+        (name, decode, case, heads)
+    })
+    .collect()
+}
+
+/// The host model of the absorbed layer: the query heads absorbed through
+/// `k_b` (`project_rows` over the heads), the portable body's attention over
+/// the latent rows, and each head's attended latent through `v_b`: the
+/// absorbed case, its published latent rows and its outputs.
+fn glm_host_model(case: &Case, heads: &LatentHeads) -> (Case, Vec<f32>, Vec<f32>) {
+    let (g, w, d) = (case.form.g, case.form.w(), GLM_HEAD);
+    let absorbed = case.clone().with_queries(grouped_rows(&heads.queries, &heads.k_b, g, d, w));
+    let attended = absorbed.expected().0;
+    let result = grouped_rows(&attended, &heads.v_b, g, w, d);
+    (absorbed, attended, result)
+}
+
+/// The host model of the absorbed layer equals GLM's F32 reference with K
+/// and V expanded, at GLM's shapes, each output within the bound its
+/// roundings and the reference's F32 route give ([`Case::glm_reference_bounds`]),
+/// and so stands for it below.
+#[test]
+fn glm_host_model_matches_reference() {
+    for (name, _, case, heads) in glm_cases() {
+        let (absorbed, attended, host) = glm_host_model(&case, &heads);
+        let reference = case.glm_reference(&heads);
+        let bounds = case.glm_reference_bounds(&heads, &absorbed.query, &attended, &host);
+        let outside: Vec<String> = host
+            .iter()
+            .zip(&reference)
+            .zip(&bounds)
+            .enumerate()
+            .filter(|(_, ((h, r), b))| (*h - *r).abs() > **b)
+            .map(|(index, ((h, r), b))| format!("[{index}] {h} vs {r} (bound {b:.2e})"))
+            .collect();
+        let used = host.iter().zip(&reference).zip(&bounds).map(|((h, r), b)| (h - r).abs() / b).fold(0.0f32, f32::max);
+        eprintln!("{name}: at most {used:.2} of the bound");
+        assert!(outside.is_empty(), "{name}: {} outputs outside the bound: {}", outside.len(), outside[..outside.len().min(12)].join(", "));
+    }
+}
+
+/// At GLM's shapes every backend's natives of the absorbed layer equal its
+/// host model, which equals the F32 reference (above), each stage
+/// held to the bound of its own arithmetic: the absorption and the value
+/// projection by `project_rows` over the 64 heads ([`check_grouped_rows`],
+/// over the native's own inputs to each), and the latent attention, over the
+/// native's absorbed queries, by the entry the executor attends it with
+/// (`graph::dense_decodes`) to the attended-row bar ([`check`]): decode rows
+/// by the CPU's decode entry and by the prefill entry on every backend,
+/// whose Metal and CUDA forms stage nothing in F16 (their operands are the
+/// BF16 activation element), and on Vulkan in both its forms, the vector
+/// default and the F16 matrix candidate; prompt rows by the prefill entry.
+/// The same rows under GLM's selected read (a WorkList bitmap of unit picks
+/// and the tail) are held to the host model's reading of the bitmap by the
+/// prefill entry alone, which is the one that reads it. The attended-row bar holds an attended row, not its product through `v_b`,
+/// which carries each latent component's error into every output.
+#[test]
+fn glm_natives_match_reference() {
+    let mut failures = Vec::new();
+    // Each case read in full (against the F32 reference) and as GLM's
+    // selected read (against the host model's bitmap read): eight picked
+    // units of four keys and the tail, as `unit_reads` emits them.
+    let selected = glm_cases().into_iter().map(|(name, decode, case, heads)| {
+        (format!("{name} selected"), decode, case.with_unit_reads(8, 124), heads)
+    });
+    let full = glm_cases().into_iter().map(|(name, decode, case, heads)| (name.to_string(), decode, case, heads));
+    for (name, decode, case, heads) in full.chain(selected) {
+        let (g, w, d) = (case.form.g, case.form.w(), GLM_HEAD);
+        for device in devices() {
+            let backend = device.backend();
+            let queries = native_grouped_rows(&device, &heads.queries, &heads.k_b, g, d, w);
+            let label = format!("{name} {backend:?} absorption");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_grouped_rows(&label, backend, &queries, &heads.queries, &heads.k_b, g, d, w);
+            }));
+            if outcome.is_err() {
+                failures.push(label);
+            }
+            let absorbed = case.clone().with_queries(queries);
+            let expected = absorbed.expected();
+            // The decode entry reads no WorkList bitmap.
+            let entries = match (decode, backend) {
+                (true, BackendName::Cpu) if absorbed.selection_words == 0 => vec![true, false],
+                _ => vec![false],
+            };
+            for decode in entries {
+                for config in case_configurations(&device, decode, &absorbed) {
+                    let specialization = config
+                        .iter()
+                        .fold(statics(&device, absorbed.form, 0), |s, (n, v)| s.with_param(*n, *v));
+                    let label = format!("{name} {backend:?} decode {decode} {config:?}");
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let attention =
+                            run(&device, decode, &specialization, &absorbed).unwrap_or_else(|error| panic!("{label}: {error}"));
+                        check(&label, &attention, &expected, &absorbed);
+                        let result = native_grouped_rows(&device, &attention.0, &heads.v_b, g, w, d);
+                        check_grouped_rows(
+                            &format!("{label} output"), backend, &result, &attention.0, &heads.v_b, g, w, d,
+                        );
+                    }));
+                    if outcome.is_err() {
+                        failures.push(label);
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The decode entry's configurations `device`'s declaration admits at `form`
+/// read as an absorbed latent (`AB` = 1) or not, those with `MATRIX` past 0
+/// (which stage values in F16) or the others.
+fn decode_admitted_absorbed(device: &Device, form: Form, absorbed: bool, matrix: bool) -> usize {
+    let entry =
+        attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    let statics = statics(device, form, 0)
+        .with_static("KR", 0)
+        .with_static("KS", 0)
+        .with_static("AB", u64::from(absorbed));
+    configurations(device, true, form)
+        .into_iter()
+        .filter(|config| config.iter().any(|(name, value)| *name == "MATRIX" && *value > 0) == matrix)
+        .filter(|config| {
+            let specialization = config.iter().fold(statics.clone(), |s, (n, v)| s.with_param(*n, *v));
+            entry.specialization_valid(device, &specialization).unwrap()
+        })
+        .count()
+}
+
+/// The prefill entry's configurations `device`'s declaration admits at `form`
+/// read as an absorbed latent or not, with `picks` listed rows per query and
+/// `words` WorkList words (`B`), those with `MATRIX` past 0 (Vulkan's F16
+/// operands) or the others.
+fn prefill_admitted_absorbed(device: &Device, form: Form, absorbed: bool, picks: u64, words: u64, matrix: bool) -> usize {
+    let entry =
+        attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() });
+    let statics = statics(device, form, 0)
+        .with_static("KR", 0)
+        .with_static("KS", picks)
+        .with_static("B", words)
+        .with_static("AB", u64::from(absorbed));
+    // A declared SLICES (Vulkan's prefill splits a query group into them, the
+    // configurations leave it to the tuner) makes each of its values a form of
+    // its own.
+    let slices = attention_prefill::native_implementation(device)
+        .unwrap()
+        .and_then(|implementation| {
+            implementation.params.iter().find(|parameter| parameter.name == "SLICES").map(|parameter| parameter.values.clone())
+        })
+        .map_or_else(|| vec![None], |values| values.into_iter().map(Some).collect());
+    configurations(device, false, form)
+        .into_iter()
+        .filter(|config| config.iter().any(|(name, value)| *name == "MATRIX" && *value > 0) == matrix)
+        .flat_map(|config| slices.iter().map(move |slices| (config.clone(), *slices)))
+        .filter(|(config, slices)| {
+            let with_slices = slices.map_or_else(|| statics.clone(), |slices| statics.clone().with_param("SLICES", slices));
+            let specialization = config.iter().fold(with_slices, |s, (n, v)| s.with_param(*n, *v));
+            entry.specialization_valid(device, &specialization).unwrap()
+        })
+        .count()
+}
+
+#[test]
+fn an_absorbed_read_has_no_f16_staged_decode_form() {
+    // The declarations decide: a stored-key read's matrix decode forms stage
+    // in F16 and are admitted, an absorbed latent read's are not; its vector
+    // form (F32 products) is, where it holds the group: Vulkan's holds GLM's
+    // 64 queries of 512, Metal's does not.
+    for device in devices() {
+        let backend = device.backend();
+        if !matches!(backend, BackendName::Metal | BackendName::Vulkan) {
+            continue;
+        }
+        assert!(decode_admitted_absorbed(&device, V41, false, true) > 0, "{backend:?}: stored key, matrix");
+        assert_eq!(decode_admitted_absorbed(&device, V41, true, true), 0, "{backend:?}: absorbed, matrix");
+        assert_eq!(decode_admitted_absorbed(&device, GLM, true, true), 0, "{backend:?}: GLM, matrix");
+        assert_eq!(
+            decode_admitted_absorbed(&device, GLM, true, false) > 0,
+            backend == BackendName::Vulkan,
+            "{backend:?}: GLM, vector"
+        );
+    }
+}
+
+#[test]
+fn an_absorbed_read_has_no_f16_staged_prefill_form() {
+    // Metal's shared-tile prefill (picks, KS > 0) takes its values as F16
+    // operands, and Vulkan's matrix forms (MATRIX past 0) stage them so; the
+    // other forms read an absorbed latent in place, with or without a
+    // WorkList bitmap (the form GLM's selected read takes).
+    for device in devices() {
+        match device.backend() {
+            BackendName::Metal => {
+                assert!(prefill_admitted_absorbed(&device, V41, false, 512, 0, false) > 0, "stored key, picks");
+                assert_eq!(prefill_admitted_absorbed(&device, V41, true, 512, 0, false), 0, "absorbed, picks");
+                for words in [0, 64] {
+                    assert!(
+                        prefill_admitted_absorbed(&device, GLM, true, 0, words, false) > 0,
+                        "absorbed, no picks, {words} words"
+                    );
+                }
+            }
+            BackendName::Vulkan => {
+                assert!(prefill_admitted_absorbed(&device, V41, false, 0, 0, true) > 0, "stored key, matrix");
+                assert_eq!(prefill_admitted_absorbed(&device, GLM, true, 0, 0, true), 0, "absorbed, matrix");
+                assert!(prefill_admitted_absorbed(&device, GLM, true, 0, 0, false) > 0, "absorbed, vector");
+            }
+            _ => {}
+        }
     }
 }

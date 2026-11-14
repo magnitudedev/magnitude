@@ -2,11 +2,12 @@
 // Every row count takes one form: threadgroup (slice, tile) reduces the
 // squares and every mix of a tile of a row's columns' contiguous slice
 // [slice * width / SINKHORN_SPLIT rounded up, the next slice's first) into
-// the scratch, in fixed order, and mixes its share of the tile's input
-// columns by the previous site's pre (`streams::collapse`); a second launch
-// sums each row's SINKHORN_SPLIT partials in slice order and forms pre,
-// post and the Sinkhorn comb (`stream_mix_sinkhorn_finish`). The launch
-// boundary orders every partial before its sum.
+// the scratch, in fixed order, and under P = 1 mixes its share of the
+// tile's input columns by the previous site's pre (`streams::collapse`); a
+// second launch sums each row's SINKHORN_SPLIT partials in slice order and
+// forms pre, post and the Sinkhorn comb (`stream_mix_sinkhorn_finish`), and
+// under P = 0 mixes the row's input by that pre, which nothing carries. The
+// launch boundary orders every partial before its sum.
 // Decode rows (M <= DECODE_ROWS, `stream_mix_sinkhorn_split`) take a tile of
 // one row, all eight simdgroups over its columns, reading the function
 // matrix straight from device memory: a row's function matrix streams
@@ -20,6 +21,8 @@
 
 constant constexpr uint STREAMS = uint(SEISMIC_DIM_S);
 constant constexpr uint MIXES = (2u + STREAMS) * STREAMS;
+// Whether the input mixes by the previous site's pre (P = 1) or this site's.
+constant constexpr bool CARRIED = uint(SEISMIC_DIM_P) != 0u;
 constant constexpr uint THREADS = 256u;
 // A slice's reduced values: its squares, then every mix.
 constant constexpr uint SUMS = 1u + MIXES;
@@ -31,9 +34,11 @@ constant constexpr uint SUMS = 1u + MIXES;
 // each of its sums over its row or column read there in index order, so
 // every element takes the same operations in the same order as one thread
 // forming them all would. Every thread of the threadgroup calls it.
-// Independent of any entry ABI: the caller passes its views' strides.
+// Independent of any entry ABI: the caller passes its views' strides, and
+// `own` is device or threadgroup memory.
+template <typename Own>
 inline void publish_coefficients(thread const float (&mixes)[MIXES], threadgroup float *comb, uint thread_index,
-    device const float *base, ulong base_stride, device const float *scale, ulong scale_stride, device float *own,
+    device const float *base, ulong base_stride, device const float *scale, ulong scale_stride, Own own,
     ulong own_stride, device float *joined, ulong joined_stride, float epsilon, uint iterations) {
     const uint source = thread_index / STREAMS, target = thread_index % STREAMS;
     const bool owns = thread_index < STREAMS * STREAMS;
@@ -205,12 +210,14 @@ inline void reduce_slice(device const float *hidden, device const float *previou
         }
     }
     // The sublayer's input: the streams mixed by the previous site's pre.
-    for (uint r = 0; r < TILE && row0 + r < rows; ++r) {
-        const ulong row = row0 + r;
-        streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
-            SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0, SEISMIC_PREVIOUS_STRIDE_1,
-            input + row * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, h, group.x * THREADS + thread_index,
-            split * THREADS);
+    if (CARRIED) {
+        for (uint r = 0; r < TILE && row0 + r < rows; ++r) {
+            const ulong row = row0 + r;
+            streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
+                SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0, SEISMIC_PREVIOUS_STRIDE_1,
+                input + row * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, h,
+                group.x * THREADS + thread_index, split * THREADS);
+        }
     }
 }
 
@@ -235,9 +242,11 @@ STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tiles, PREFILL_TILE, MIXES * CHUNK)
 // Threadgroup row: its SINKHORN_SPLIT partials summed in slice order, then its
 // coefficients (`publish_coefficients`).
 kernel void stream_mix_sinkhorn_finish(
+    device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],
     device const float *base [[buffer(SEISMIC_BUFFER_BASE)]],
     device const float *scale [[buffer(SEISMIC_BUFFER_SCALE)]],
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
+    device float *input [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *pre [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device float *join [[buffer(SEISMIC_RESULT_2_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -260,7 +269,22 @@ kernel void stream_mix_sinkhorn_finish(
     float mixes[MIXES];
     for (uint j = 0; j < MIXES; ++j)
         mixes[j] = reduced[1u + j] * inverse;
-    publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-        pre + ulong(row) * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
-        join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
+    if (CARRIED) {
+        publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            pre + ulong(row) * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
+            join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
+    } else {
+        // Every thread holds its mixes, so `reduced` takes the pre.
+        publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            reduced, 1ul, join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
+            iterations);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The sublayer's input: the streams mixed by this site's pre.
+        float own[STREAMS];
+        for (uint stream = 0; stream < STREAMS; ++stream)
+            own[stream] = reduced[stream];
+        streams::collapse<STREAMS>(hidden + ulong(row) * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
+            SEISMIC_HIDDEN_STRIDE_2, own, input + ulong(row) * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+            h, thread_index, THREADS);
+    }
 }

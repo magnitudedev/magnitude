@@ -796,13 +796,13 @@ fn block_histories_hold_the_complete_blocks() {
     // The indexer's domains follow the one attention reads; a launch row
     // reads each.
     assert_eq!(store.history_reads().len(), 3);
-    assert_eq!(store.index_key_domains(0, 0), Some((Some(RAW), BLOCKS)));
+    assert_eq!(store.produced_domains(LayerRef::IndexKeys { block: 0, part: 0 }), Some((Some(RAW), BLOCKS)));
     assert!(!store.is_produced_domain(HistoryDomainId(0)));
     assert!(store.is_produced_domain(RAW) && store.is_produced_domain(BLOCKS));
     // Raw keys carry their coordinates; block keys do not.
     assert_eq!(store.history_components(RAW)[0].planes().len(), 2);
     assert_eq!(store.history_components(BLOCKS)[0].planes().len(), 1);
-    assert_eq!(store.index_key_domains(1, 0), None);
+    assert_eq!(store.produced_domains(LayerRef::IndexKeys { block: 1, part: 0 }), None);
     // Ten rows from 0 complete blocks 0 and 1: two block rows, the
     // advance's destinations in block order.
     let advance = OwnedStateAdvance::begin(store.create().unwrap(), 10).ok().unwrap();
@@ -959,8 +959,8 @@ fn pooled_extent(state: &SequenceState) -> (usize, usize, usize) {
 fn a_rejected_verify_keeps_the_accepted_prefix_partial_group() {
     let device = cpu_device();
     let store = pooled_store(device.clone(), 64, 8);
-    assert_eq!(store.pooled_domains(0, 1), Some((Some(PENDING), POOLED)));
-    assert_eq!(store.index_key_domains(0, 1), Some((None, POOLED)));
+    assert_eq!(store.produced_domains(LayerRef::Pooled { block: 0, part: 1 }), Some((Some(PENDING), POOLED)));
+    assert_eq!(store.produced_domains(LayerRef::IndexKeys { block: 0, part: 1 }), Some((None, POOLED)));
     // Three rows (positions 0..3): group 0 complete, position 2 pending.
     let state = commit(store.create().unwrap(), 3);
     assert_eq!(pooled_extent(&state), (2, 1, 1));
@@ -1016,7 +1016,7 @@ fn produced_domains_follow_the_per_token_ones() {
         bindings.history_source(pooled).map(|source| source.domain),
         Some(HistoryDomainId(1))
     );
-    assert_eq!(bindings.index_key_domains(0, 0), Some((None, HistoryDomainId(1))));
+    assert_eq!(bindings.produced_domains(LayerRef::IndexKeys { block: 0, part: 0 }), Some((None, HistoryDomainId(1))));
     assert_eq!(bindings.history_reads().read(pooled), Some(1));
     assert_eq!(bindings.history_reads().read(INDEX_KEYS), None);
     assert!(ComponentDescriptor::produced(LayerRef::Target(0), DType::F32, 4, true).is_err());

@@ -2538,10 +2538,19 @@ pub(crate) fn position(table: Table, key: u32) -> Option<u32> {
 pub(crate) fn declared_name(name: &str) -> Option<&'static str> {
     internals::declared_name(name)
 }
-/// A name the registry declares. Fields of this type deserialize through
+/// A name the registry declares. Fields of this type serialize through
+/// [`serialize_declared_name`] and deserialize through
 /// [`deserialize_declared_name`]; naming the type keeps serde from treating
 /// the field as borrowed from the input.
 pub(crate) type DeclaredName = &'static str;
+/// Serializes a registry-declared name as the string it is, exactly as the
+/// derive writes a `&str`.
+pub(crate) fn serialize_declared_name<S: serde::Serializer>(
+    name: &DeclaredName,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(name)
+}
 /// Deserializes a registry-declared name back to the registry's own copy.
 pub(crate) fn deserialize_declared_name<'de, D: serde::Deserializer<'de>>(
     deserializer: D,

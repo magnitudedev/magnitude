@@ -1,6 +1,16 @@
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_prefill: streaming attention for prefill rows over dense history.
-// The body (its launches) is `lib/attention/prefill.glsl`.
+// Two forms (MATRIX): the vector form (0, the canonical default), whose
+// partial launch is `lib/attention/vector.glsl`'s, the decode entry's vector
+// body, over every prefill row, with F32 products over activation-element
+// operands; and the matrix form (1), `lib/attention/prefill.glsl`'s launches,
+// whose cooperative-matrix products stage their operands in F16.
+#if !SEISMIC_TUNE_MATRIX
+// The vector form splits a kv head's G query heads into SLICES workgroups of
+// G / SLICES heads, each held by every subgroup of its workgroup.
+#define ATTENTION_HEAD_GROUP (uint(SEISMIC_DIM_G) / uint(SEISMIC_TUNE_SLICES))
+#define ATTENTION_HEADS ATTENTION_HEAD_GROUP
+#endif
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
@@ -49,7 +59,8 @@ attention_history prefill_history() {
 
 prefill_scratch prefill_scratch_planes() {
     return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS));
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS));
 }
 
 prefill_picked prefill_picked_planes() {
@@ -59,6 +70,26 @@ prefill_picked prefill_picked_planes() {
     return prefill_picked(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS) + states * uint64_t(ATTENTION_W) * 4ul,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS) + states * 8ul);
 }
+
+#if !SEISMIC_TUNE_MATRIX
+#include "lib/attention/vector.glsl"
+
+// Workgroup (kv head * SLICES + slice, partition, row).
+void attention_prefill_vector() {
+    const uint slices = uint(SEISMIC_TUNE_SLICES);
+    vector_partial(prefill_history(), gl_WorkGroupID.x / slices, gl_WorkGroupID.x % slices, gl_WorkGroupID.y,
+        gl_WorkGroupID.z, 0u, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
+}
+
+// Workgroup (query head, row), one invocation per column: the fixed-order
+// merge of the row's partitions and the output gate.
+void attention_prefill_gate() {
+    attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
+        0u, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
+}
+#endif
 
 void attention_prefill_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }

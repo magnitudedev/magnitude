@@ -26,13 +26,14 @@ pub use decoder::{
     BlockElement, BlockRounding, BlockScale, Candidates, HeadWeights, HistoryReads, HistoryRows,
     HistorySource, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
     HyperConnectionWeights, HyperConnections, LowRankGatedSite, Indexer, IndexerInput,
-    IndexerKeys, IndexerQuery, InputNorm, LatentAttention, Pool, PooledRows, ProjectedRows,
+    IndexerKeys, IndexerQuery, InputNorm, Pool, PoolNorm, PooledRows, ProjectedRows,
     RowProducer, RowRounding, Selection, TokenDomain, LatentExperts, LayerNorm, MediaRowAttention,
     NGramConvolution, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
-    PerLayerInput, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
+    PerLayerInput, QueryKeys, QueryProjection, DecayGate, GateProjection, LowRank, RecurrentDecay,
+    RecurrentGate, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
     RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
     RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
-    SharedExpertGate, ShortConv, SinkhornSite, StateSpace, Sublayer, SublayerIndex,
+    SharedExpertGate, ShortConv, SinkhornInput, SinkhornSite, StateSpace, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm,
     ValueSource, grouped_output_columns,
 };
@@ -44,8 +45,8 @@ pub use draft::{
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{
-    ImageCrop, ImageMarkers, SequentialImageInput, SpatialControls, image_crop_identity,
-    image_crops,
+    ImageCrop, ImageMarkers, SequentialImageInput, SpatialControls, cell_raster_controls,
+    image_crop_identity, image_crops,
 };
 pub use inputs::{
     InputPreparationError, ModelInputAdapter, PreparedModelInput, PreparedVisionInput, TokenPlan,
@@ -119,7 +120,7 @@ impl WeightDescriptor {
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
         let mut shape = stored.to_vec();
-        for transform in &self.transforms {
+        for (index, transform) in self.transforms.iter().enumerate() {
             let axis = row_axis(&shape).ok_or_else(|| {
                 DefinitionError::new(format!("{:?} has no row axis to transform", self.name))
             })?;
@@ -161,14 +162,25 @@ impl WeightDescriptor {
                 ImportTransform::Flatten => {
                     shape = vec![checked_product(&shape)?];
                 }
-                ImportTransform::DropUnitAxis => {
-                    if shape.len() < 2 || shape[0] != 1 {
+                ImportTransform::MergeLeadingAxes => {
+                    let Some((&columns, leading)) = shape.split_last().filter(|(_, leading)| !leading.is_empty())
+                    else {
                         return Err(DefinitionError::new(format!(
-                            "{:?} has no outer unit axis to drop",
+                            "{:?} {shape:?} is no matrix or stack of matrices",
                             self.name
                         )));
-                    }
-                    shape.remove(0);
+                    };
+                    shape = vec![checked_product(leading)?, columns];
+                }
+                ImportTransform::MergeTrailingAxes => {
+                    let Some((&rows, rest)) = shape.split_first().filter(|(_, rest)| rest.len() > 1)
+                    else {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} {shape:?} has no trailing axes to merge",
+                            self.name
+                        )));
+                    };
+                    shape = vec![rows, checked_product(rest)?];
                 }
                 ImportTransform::ScaleByTensor { tensor, .. } => {
                     if tensor.is_empty() || *tensor == self.name {
@@ -191,6 +203,63 @@ impl WeightDescriptor {
                              power-of-two {tile:?} tiles",
                             self.name
                         )));
+                    }
+                }
+                ImportTransform::AppendRows { parts } => {
+                    let refused = |reason: &str| {
+                        DefinitionError::new(format!("rows appended to {:?}: {reason}", self.name))
+                    };
+                    // The parts are read as the tensor is: only its grid of
+                    // block scales, each part under its own, and its unit
+                    // axes' removal come before them.
+                    let mut named = std::collections::HashSet::from([self.name.as_str()]);
+                    let mut grid = None;
+                    for read in &self.transforms[..index] {
+                        match read {
+                            ImportTransform::ScaleBlocks { tensor, tile, .. } => {
+                                named.insert(tensor.as_str());
+                                grid = Some(*tile);
+                            }
+                            ImportTransform::MergeLeadingAxes => {}
+                            _ => {
+                                return Err(refused(
+                                    "they follow a transform other than a scale grid or a merge of leading axes",
+                                ));
+                            }
+                        }
+                    }
+                    if shape.len() > 2 {
+                        return Err(refused("a stack of matrices takes no appended rows"));
+                    }
+                    if parts.is_empty() {
+                        return Err(refused("no part is named"));
+                    }
+                    for part in parts {
+                        if part.tensor.is_empty() || !named.insert(part.tensor.as_str()) {
+                            return Err(refused(&format!(
+                                "part {:?} must name another stored tensor",
+                                part.tensor
+                            )));
+                        }
+                        let tiled = match (grid, &part.grid) {
+                            (None, None) => true,
+                            (Some(tile), Some(name)) => {
+                                !name.is_empty()
+                                    && named.insert(name.as_str())
+                                    && part.rows.is_multiple_of(tile[0])
+                            }
+                            _ => false,
+                        };
+                        if part.rows == 0 || !tiled {
+                            return Err(refused(&format!(
+                                "part {:?} is no whole rows read as the tensor is, under its \
+                                 own grid exactly when the tensor is under one",
+                                part.tensor
+                            )));
+                        }
+                        shape[axis] = shape[axis]
+                            .checked_add(part.rows)
+                            .ok_or_else(|| refused("the rows overflow"))?;
                     }
                 }
                 ImportTransform::Progressive { plane, depth } => {
@@ -238,9 +307,20 @@ pub enum ImportTransform {
     /// Read the stored tensor as one vector of all its elements in storage
     /// order (a parameter vector stored as `[1, n]` or `[groups, n/groups]`).
     Flatten,
-    /// Read the stored tensor without its outermost axis, of extent one (a
-    /// matrix stored with a trailing unit GGML dimension).
-    DropUnitAxis,
+    /// Read the stored stack of matrices `[.., rows, columns]` as the one
+    /// matrix `[stack·rows, columns]` of every matrix's rows in stack order:
+    /// a per-head weight stored as `[heads, rows, columns]`, or a matrix
+    /// stored with unit GGML dimensions, as a projector's table `[1, rows,
+    /// columns]` or a depthwise convolution `[1, channels, 1, taps]`.
+    /// Storage order is unchanged, so its bytes are too; a matrix reads as
+    /// itself, and a vector is refused.
+    MergeLeadingAxes,
+    /// Read the stored tensor `[rows, ..]` as the matrix of its rows'
+    /// elements `[rows, columns]`, `columns` the product of the other axes:
+    /// a convolution kernel `[out, in, height, width]` as the linear over
+    /// its flattened windows (`in`-major). Storage order is unchanged. Dense
+    /// storage only, and the weight's only transform.
+    MergeTrailingAxes,
     /// Multiply every matrix of a stack (the whole tensor when it is not a
     /// stack) by the matching element of the stored F32 tensor `tensor`,
     /// shaped `[1]` or `[stack]`. A container format's second-level scale
@@ -264,6 +344,15 @@ pub enum ImportTransform {
         tile: [u64; 2],
         codes: ScaleCodes,
     },
+    /// Append the rows of further stored tensors, in order, after the
+    /// stored tensor's own: one weight stored in parts (a projection whose
+    /// q, k and v are kept apart). A vector's parts append elements. Each
+    /// part is stored as the tensor is, in its encoding and with its row
+    /// width, and is read as it is: only the tensor's grid of block scales
+    /// (`ScaleBlocks`), each part under its own `grid` of the same tile and
+    /// codes, and the merge of its leading axes (`MergeLeadingAxes`) come before, and
+    /// `rows` are the part's as they leave them.
+    AppendRows { parts: Vec<RowPart> },
     /// One plane of a symmetric 32-value code matrix (the last
     /// transform; `ProgressivePlane`).
     Progressive {
@@ -481,7 +570,7 @@ impl std::hash::Hash for ImportTransform {
             Self::Rows(range) => (range.start, range.rows).hash(state),
             Self::PermuteRows { order } => order.hash(state),
             Self::Scale { factor } => factor.to_bits().hash(state),
-            Self::Flatten | Self::DropUnitAxis => {}
+            Self::Flatten | Self::MergeLeadingAxes | Self::MergeTrailingAxes => {}
             Self::ScaleByTensor {
                 tensor,
                 activations,
@@ -498,6 +587,7 @@ impl std::hash::Hash for ImportTransform {
                 tile.hash(state);
                 codes.hash(state);
             }
+            Self::AppendRows { parts } => parts.hash(state),
             Self::Progressive { plane, depth } => {
                 plane.hash(state);
                 depth.hash(state);
@@ -570,6 +660,8 @@ pub enum WeightKind {
     /// A low-rank query's `down` projection and the norm of its `qr` row.
     QueryDown,
     QueryDownNorm,
+    /// An absorbed query's per-head key projections (`QueryKeys::Absorbed`).
+    QueryKeys,
     AttentionGate,
     Key,
     Value,
@@ -583,23 +675,36 @@ pub enum WeightKind {
     /// An attention's per-head sink logits (`Attention::sinks`).
     AttentionSinks,
     /// A pooled history source's per-token projection, gate and norm
-    /// (`PooledRows`).
+    /// (`PooledRows`), its gate's per-place term and a per-token norm's
+    /// bias.
     PooledProjection,
     PooledGate,
+    PooledGatePosition,
     PooledNorm,
+    PooledNormBias,
     IndexerQuery,
     /// An indexer's key projection: its pooled keys' projection, or its
     /// latent keys' (`IndexerKeys`).
     IndexerKey,
-    /// The gate of an indexer's softmax-gated pooled keys.
+    /// The gate of an indexer's softmax-gated pooled keys, and its
+    /// per-place term.
     IndexerKeyGate,
+    IndexerKeyGatePosition,
     IndexerQueryNorm,
     IndexerKeyNorm,
+    /// The bias of an indexer's per-token key norm (`PoolNorm::Token`).
+    IndexerKeyNormBias,
     /// An indexer's projected per-head score weights (`HeadWeights`).
     IndexerHeadWeights,
     RecurrentQueryKeyValue,
+    /// The output gate's projection, or the `down` of its low-rank one.
     RecurrentGate,
+    /// The `up` of a low-rank output gate projection.
+    RecurrentGateUp,
+    /// The per-head decay's projection, or the `down` of a per-channel one.
     RecurrentAlpha,
+    /// The `up` of a per-channel decay's projection.
+    RecurrentAlphaUp,
     RecurrentBeta,
     RecurrentConvolution,
     RecurrentConvolutionBias,
@@ -1002,6 +1107,16 @@ impl Head {
     }
 }
 
+/// A stored tensor whose `rows` (elements of a vector) a weight appends
+/// (`ImportTransform::AppendRows`), under its stored grid of block scales
+/// where the weight's rows are under one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RowPart {
+    pub tensor: String,
+    pub rows: u64,
+    pub grid: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRange {
     pub start: u64,
@@ -1160,6 +1275,7 @@ mod tests {
                 kv_heads: 1,
                 width: 2,
                 query: QueryProjection::Full(weight(&format!("{name}.q"), &[4, 4])),
+                query_keys: QueryKeys::Direct,
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
                 history,
@@ -1357,6 +1473,145 @@ mod tests {
         );
     }
 
+    /// GLM-5.3-Flash's NoPE multi-head latent attention, absorbed: a
+    /// low-rank query of 64 heads 256 wide, each absorbed into the 512-wide
+    /// latent row its layer stores once as key and value, and the grouped
+    /// output whose blocks are the heads' value projections. Every other
+    /// combination its absorption admits none of is refused by name.
+    #[test]
+    fn absorbed_latent_attention_validates_at_glm_shapes() {
+        const HIDDEN: u64 = 4096;
+        const HEADS: u64 = 64;
+        const HEAD: u64 = 256;
+        const LATENT: u64 = 512;
+        let mut model = definition(vec![attention("a", Vec::new())]);
+        let decoder = &mut model.decoder;
+        decoder.hidden = HIDDEN;
+        decoder.entry.embedding = weight("embedding", &[8, HIDDEN]);
+        decoder.exit.norm = ExitNorm::Rms(rms("output_norm", HIDDEN));
+        decoder.exit.output = weight("embedding", &[8, HIDDEN]);
+        decoder.blocks[0].sublayers[0].input = InputNorm::Rms(rms("a.norm", HIDDEN));
+        let attention = attention_of(&mut model, 0);
+        *attention = Attention {
+            heads: HEADS,
+            kv_heads: 1,
+            width: LATENT,
+            query: QueryProjection::LowRank {
+                down: weight("a.q_a", &[1536, HIDDEN]),
+                norm: rms("a.q_a_norm", 1536),
+                up: weight("a.q_b", &[HEADS * HEAD, 1536]),
+            },
+            query_keys: QueryKeys::Absorbed {
+                weight: weight("a.k_b", &[HEADS * LATENT, HEAD]),
+                width: HEAD,
+            },
+            gate: AttentionGate::None,
+            query_norm: HeadNorm::None,
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: weight("a.kv_a", &[LATENT, HIDDEN]),
+                    value: ValueSource::StoredKey,
+                    key_norm: HeadNorm::Rms(rms("a.kv_a_norm", LATENT)),
+                    value_norm: ValueNorm::None,
+                    domain: TokenDomain::Token,
+                    rounding: RowRounding::None,
+                },
+            )))],
+            rotary: Rotary::None,
+            scale: (HEAD as f64).powf(-0.5),
+            media_rows: MediaRowAttention::Causal,
+            sinks: None,
+            output: OutputProjection::GroupedLowRank {
+                groups: HEADS,
+                rank: HEAD,
+                a: weight("a.v_b", &[HEADS * HEAD, LATENT]),
+                b: weight("a.o", &[HIDDEN, HEADS * HEAD]),
+            },
+        };
+        model.validate().unwrap();
+
+        let invalid = |change: &dyn Fn(&mut Attention), error: &str| {
+            let mut model = model.clone();
+            change(attention_of(&mut model, 0));
+            assert_eq!(model.validate().unwrap_err().to_string(), error);
+        };
+        fn rows(attention: &mut Attention) -> &mut ProjectedRows {
+            let HistoryRows::Own(RowProducer::Projected(rows)) = &mut attention.history[0].rows else {
+                unreachable!()
+            };
+            rows
+        }
+        // The query projection yields the heads at their own width, and
+        // each absorbs through a block as wide as the latent.
+        invalid(
+            &|attention| {
+                let QueryProjection::LowRank { up, .. } = &mut attention.query else {
+                    unreachable!()
+                };
+                *up = weight("a.q_b", &[HEADS * LATENT, 1536]);
+            },
+            "invalid attention query up shape for \"a.q_b\"",
+        );
+        invalid(
+            &|attention| {
+                let QueryKeys::Absorbed { weight: keys, .. } = &mut attention.query_keys else {
+                    unreachable!()
+                };
+                *keys = weight("a.k_b", &[HEADS * HEAD, HEAD]);
+            },
+            "invalid absorbed query keys shape for \"a.k_b\"",
+        );
+        invalid(
+            &|attention| {
+                attention.query_keys = QueryKeys::Absorbed {
+                    weight: weight("a.k_b", &[HEADS * LATENT, 0]),
+                    width: 0,
+                };
+            },
+            "invalid absorbed query width",
+        );
+        invalid(
+            &|attention| {
+                attention.rotary = Rotary::Table {
+                    pairs: vec![RotaryPair { frequency: 1.0, amplitude: 1.0 }],
+                    layout: RotaryLayout::HALF_SPLIT_LEADING,
+                    divisors: None,
+                    output: OutputRotary::None,
+                };
+            },
+            "absorbed query keys with a rotary",
+        );
+        invalid(
+            &|attention| rows(attention).value = ValueSource::RawKey,
+            "absorbed query keys over rows other than the layer's own stored keys",
+        );
+        invalid(
+            &|attention| {
+                rows(attention).value = ValueSource::Projected(weight("a.v", &[LATENT, HIDDEN]));
+            },
+            "absorbed query keys over rows other than the layer's own stored keys",
+        );
+        invalid(
+            &|attention| {
+                attention.query_norm = HeadNorm::Rms(rms("a.q_norm", LATENT));
+            },
+            "absorbed query keys with a query norm",
+        );
+        invalid(
+            &|attention| {
+                attention.kv_heads = 2;
+                rows(attention).key = weight("a.kv_a", &[2 * LATENT, HIDDEN]);
+            },
+            "absorbed query keys over more than one key head",
+        );
+        invalid(
+            &|attention| {
+                attention.gate = AttentionGate::Interleaved { function: GateFunction::Sigmoid };
+            },
+            "absorbed query keys with an interleaved gate",
+        );
+    }
+
     #[test]
     fn shared_history_must_name_an_earlier_owning_attention_layer() {
         let source = SublayerIndex {
@@ -1489,8 +1744,9 @@ mod tests {
                 projection: weight(&format!("{name}.compressor.kv"), &[2, 4]),
                 pool: Pool::SoftmaxGated {
                     gate: weight(&format!("{name}.compressor.gate"), &[2, 4]),
+                    position: None,
                 },
-                norm: rms(&format!("{name}.compressor.norm"), 2),
+                norm: PoolNorm::Pooled(rms(&format!("{name}.compressor.norm"), 2)),
                 rounding: RowRounding::Block(BlockRounding {
                     element: BlockElement::E2M1,
                     block: 2,
@@ -1755,7 +2011,7 @@ mod tests {
                 rate: 4,
                 projection: weight("a.indexer.k", &[2, 4]),
                 pool: Pool::Mean,
-                norm: rms("a.indexer.k_norm", 2),
+                norm: PoolNorm::Pooled(rms("a.indexer.k_norm", 2)),
                 rounding: RowRounding::None,
             }),
             head_weights: HeadWeights::Uniform,
@@ -1766,6 +2022,54 @@ mod tests {
         let model = hyper_connected(vec![ngram(), mixed(selected, "a")]);
         model.validate().unwrap();
         assert_eq!(model.deferred_forms(), []);
+    }
+
+    /// GLM-5.3-Flash's indexer keys: each token's key LayerNorm-ed with a
+    /// bias before pooling, pooled per 4 tokens by a softmax gate with a
+    /// per-place term. A bias, or a per-place term, of another shape is
+    /// refused.
+    #[test]
+    fn pooled_keys_normed_per_token_and_gated_by_place_validate() {
+        let model = |bias: &[u64], position: &[u64]| {
+            let mut selected = attention("a", owned("a", TokenDomain::Token));
+            let Operator::Attention(operator) = &mut selected.op else {
+                unreachable!()
+            };
+            operator.history[0].reads = HistoryReads::Selected(Selection::Own(Box::new(Indexer {
+                heads: 2,
+                width: 2,
+                query: IndexerQuery {
+                    input: IndexerInput::Hidden,
+                    projection: weight("a.indexer.q", &[4, 4]),
+                    norm: HeadNorm::None,
+                    rounding: RowRounding::None,
+                },
+                keys: IndexerKeys::Pooled(PooledRows {
+                    rate: 4,
+                    projection: weight("a.indexer.k", &[2, 4]),
+                    pool: Pool::SoftmaxGated {
+                        gate: weight("a.indexer.gate", &[2, 4]),
+                        position: Some(weight("a.indexer.ape", position)),
+                    },
+                    norm: PoolNorm::Token {
+                        norm: LayerNorm {
+                            weight: weight("a.indexer.k_norm", &[2]),
+                            epsilon: 1e-6,
+                        },
+                        bias: weight("a.indexer.k_norm_bias", bias),
+                    },
+                    rounding: RowRounding::None,
+                }),
+                head_weights: HeadWeights::Projected(weight("a.indexer.w", &[2, 4])),
+                scale: 0.5,
+                top: 2,
+                candidates: crate::Candidates::All,
+            })));
+            hyper_connected(vec![mixed(selected, "a")])
+        };
+        model(&[2], &[4, 2]).validate().unwrap();
+        assert!(model(&[4], &[4, 2]).validate().is_err());
+        assert!(model(&[2], &[2, 2]).validate().is_err());
     }
 
     #[test]
@@ -1789,9 +2093,15 @@ mod tests {
         assert_eq!(rejects(exit_injects), "decoder output norm injects into no stream");
     }
 
-    /// Two streams over hidden 4 under single-pass Sinkhorn mixing: each
-    /// sublayer's site forms (2 + 2)·2 = 8 mixes of the 8 stream values.
+    /// Two streams over hidden 4 under single-pass Sinkhorn mixing from the
+    /// previous site's pre, exiting by the last site's: each sublayer's site
+    /// forms (2 + 2)·2 = 8 mixes of the 8 stream values.
     fn sinkhorn(sublayers: Vec<Sublayer>) -> ModelDefinition {
+        sinkhorn_of(sublayers, SinkhornInput::PreviousSite, ExitSite::PreviousSite)
+    }
+
+    /// [`sinkhorn`] with each site mixing by `input`'s pre, exiting at `site`.
+    fn sinkhorn_of(sublayers: Vec<Sublayer>, input: SinkhornInput, site: ExitSite) -> ModelDefinition {
         let mut model = definition(sublayers);
         model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
             streams: 2,
@@ -1799,10 +2109,11 @@ mod tests {
                 iterations: 20,
                 epsilon: 1e-6,
                 norm_epsilon: 1e-20,
+                input,
             },
         });
         model.decoder.exit.norm = ExitNorm::HyperConnectionHead(HyperConnectionExit {
-            site: ExitSite::PreviousSite,
+            site,
             norm: Some(rms("output_norm", 4)),
         });
         model
@@ -1837,8 +2148,22 @@ mod tests {
         previous.decoder.exit.norm = model.decoder.exit.norm.clone();
         assert_eq!(
             rejects(previous),
-            "decoder output norm reads the previous site's coefficients without Sinkhorn mixing"
+            "decoder output norm reads the previous site's coefficients without Sinkhorn mixing that carries them"
         );
+        // Sites mixing by their own pre carry none to the exit, which
+        // takes the streams' mean; a mean exit is valid under any mixing.
+        let own = |site| sinkhorn_of(vec![sinkhorn_mixed(plain.clone(), "a")], SinkhornInput::OwnSite, site);
+        own(ExitSite::Mean).validate().unwrap();
+        assert_eq!(
+            rejects(own(ExitSite::PreviousSite)),
+            "decoder output norm reads the previous site's coefficients without Sinkhorn mixing that carries them"
+        );
+        sinkhorn_of(vec![sinkhorn_mixed(plain.clone(), "a")], SinkhornInput::PreviousSite, ExitSite::Mean)
+            .validate()
+            .unwrap();
+        let mut low_rank_mean = hyper_connected(vec![mixed(plain.clone(), "a")]);
+        low_rank_mean.decoder.exit.norm = own(ExitSite::Mean).decoder.exit.norm;
+        low_rank_mean.validate().unwrap();
         // A low-rank site under Sinkhorn mixing, and the reverse.
         assert_eq!(
             rejects(sinkhorn(vec![mixed(plain.clone(), "a")])),
@@ -2113,6 +2438,65 @@ mod tests {
         assert_eq!(scaled.transformed_shape(&[2, 4, 8]).unwrap(), [2, 4, 8]);
     }
 
+    /// Appended parts add their rows to the stored tensor's, read as it is:
+    /// first, or after its grid with a grid of their own of whole tile
+    /// rows; never twice the same tensor, nor after another transform.
+    #[test]
+    fn appended_rows_add_whole_parts_read_as_the_tensor_is() {
+        let part = |tensor: &str, rows, grid: Option<&str>| RowPart {
+            tensor: tensor.into(),
+            rows,
+            grid: grid.map(Into::into),
+        };
+        let append = |parts| ImportTransform::AppendRows { parts };
+        let descriptor = |transforms| WeightDescriptor {
+            name: "attn_q.weight".into(),
+            shape: vec![],
+            transforms,
+        };
+        let grid = || ImportTransform::ScaleBlocks {
+            tensor: "attn_q.scale".into(),
+            tile: [128, 128],
+            codes: ScaleCodes::F32,
+        };
+        let qkv = descriptor(vec![
+            grid(),
+            append(vec![
+                part("attn_k.weight", 256, Some("attn_k.scale")),
+                part("attn_v.weight", 128, Some("attn_v.scale")),
+            ]),
+        ]);
+        assert_eq!(qkv.transformed_shape(&[256, 512]).unwrap(), [640, 512]);
+        // GLM's convolution planes, stored [1, channels, 1, taps].
+        let conv = descriptor(vec![
+            ImportTransform::MergeLeadingAxes,
+            append(vec![part("conv_k", 8192, None), part("conv_v", 8192, None)]),
+        ]);
+        assert_eq!(conv.transformed_shape(&[1, 8192, 1, 4]).unwrap(), [24_576, 4]);
+        let vector = descriptor(vec![append(vec![part("b", 3, None)])]);
+        assert_eq!(vector.transformed_shape(&[5]).unwrap(), [8]);
+        for refused in [
+            // A part without the grid the tensor is read under, or one with
+            // a grid the tensor has not.
+            descriptor(vec![grid(), append(vec![part("attn_k.weight", 256, None)])]),
+            descriptor(vec![append(vec![part("attn_k.weight", 256, Some("attn_k.scale"))])]),
+            // Rows not whole tiles; no rows; no parts.
+            descriptor(vec![grid(), append(vec![part("attn_k.weight", 64, Some("attn_k.scale"))])]),
+            descriptor(vec![append(vec![part("attn_k.weight", 0, None)])]),
+            descriptor(vec![append(vec![])]),
+            // The tensor itself, a part twice, a grid that is a part.
+            descriptor(vec![append(vec![part("attn_q.weight", 256, None)])]),
+            descriptor(vec![append(vec![part("k", 256, None), part("k", 256, None)])]),
+            descriptor(vec![grid(), append(vec![part("attn_k.weight", 256, Some("attn_q.scale"))])]),
+            // After another transform.
+            descriptor(vec![ImportTransform::Rows(RowRange { start: 0, rows: 128 }), append(vec![part("k", 128, None)])]),
+        ] {
+            assert!(refused.transformed_shape(&[256, 512]).is_err(), "{:?}", refused.transforms);
+        }
+        // A stack takes none.
+        assert!(descriptor(vec![append(vec![part("k", 2, None)])]).transformed_shape(&[2, 4, 8]).is_err());
+    }
+
     /// A grid gives a tile only when it divides the matrix into power-of-two
     /// tiles: a partial last tile (300 rows in tiles of 32, 10 grid rows)
     /// or a non-power-of-two inferred tile (192 rows in tiles of 128, 2 grid
@@ -2150,6 +2534,21 @@ mod tests {
         assert!(tiled([0, 32]).transformed_shape(&[64, 256]).is_err());
         assert_eq!(tiled([32, 32]).transformed_shape(&[3, 64, 256]).unwrap(), [3, 64, 256]);
         assert!(tiled([32, 32]).transformed_shape(&[2, 3, 64, 256]).is_err());
+    }
+
+    /// A stack of matrices reads as one matrix of all their rows, a matrix
+    /// as itself; a vector has no rows to merge.
+    #[test]
+    fn merged_leading_axes_read_a_stack_as_one_matrix() {
+        let merged = WeightDescriptor {
+            name: "attn_k_b.weight".into(),
+            shape: vec![],
+            transforms: vec![ImportTransform::MergeLeadingAxes],
+        };
+        assert_eq!(merged.transformed_shape(&[64, 512, 256]).unwrap(), [64 * 512, 256]);
+        assert_eq!(merged.transformed_shape(&[2, 3, 4, 5]).unwrap(), [24, 5]);
+        assert_eq!(merged.transformed_shape(&[4, 5]).unwrap(), [4, 5]);
+        assert!(merged.transformed_shape(&[8]).is_err());
     }
 
     /// An I8 grid holds UE8M0 bytes and an F32 grid F32 scales; a grid of

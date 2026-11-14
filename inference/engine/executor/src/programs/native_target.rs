@@ -13,6 +13,7 @@ use super::{
     },
     native_target_graph::{
         BankRun, BoundTargetGraphs, EntryTokens, GroupBuffers, LaunchControl, LaunchControlLayout, TokenRow,
+        complete, packed_selection_scores,
     },
 };
 use crate::device_table::{SelectedRead, SubmittedRead};
@@ -75,34 +76,6 @@ fn padded_spans(visible: &[u8], segments: u64, padded: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Whether a selected read scores in a launch whose rows read the block-key
-/// history `blocks` over `segments` spans a row: whether some row has more
-/// than `selected` complete blocks, the block rows it sees and its own when
-/// it completes one (`indexer_select`). A launch where none does reads every
-/// row's whole history through the class that does not score.
-fn selection_scores(blocks: &HistoryControls, segments: u64, selected: u64) -> bool {
-    let word = |bytes: &[u8], at: usize| {
-        i64::from(i32::from_le_bytes([
-            bytes[at],
-            bytes[at + 1],
-            bytes[at + 2],
-            bytes[at + 3],
-        ]))
-    };
-    let row = (segments as usize * 8).max(1);
-    blocks
-        .visible
-        .chunks_exact(row)
-        .zip(blocks.destinations.chunks_exact(4))
-        .any(|(spans, destination)| {
-            let seen = spans
-                .chunks_exact(8)
-                .map(|span| word(span, 4) - word(span, 0))
-                .sum::<i64>();
-            let own = i64::from(word(destination, 0) >= 0);
-            seen + own > selected as i64
-        })
-}
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
     values
@@ -700,7 +673,7 @@ impl RowState<'_> {
     fn indexer(&self, block: u32) -> Result<[(usize, Vec<&Tensor>); 2], SubmitError> {
         let store = self.0.store();
         let (Some(window), blocks) = store
-            .index_key_domains(block, 0)
+            .produced_domains(LayerRef::IndexKeys { block, part: 0 })
             .ok_or_else(|| invalid("a selected attention layer has no indexer history"))?
         else {
             return Err(invalid("a selected attention layer's indexer keeps no raw keys"));
@@ -725,13 +698,13 @@ impl RowState<'_> {
         Ok([of(window), of(blocks)])
     }
     /// Target block `block`'s pooled source `part`
-    /// (`StateStore::pooled_domains`): its Window read with its pending
+    /// (`StateStore::produced_domains`): its Window read with its pending
     /// rows and coordinates (none at rate 1), its Block read with its pooled
     /// rows, and the index keys an own indexer keeps beside them.
     fn pooled(&self, block: u32, part: u32) -> Result<PooledPlanes<'_>, SubmitError> {
         let store = self.0.store();
         let (window, blocks) = store
-            .pooled_domains(block, part)
+            .produced_domains(LayerRef::Pooled { block, part })
             .ok_or_else(|| invalid("an index-list source has no pooled history"))?;
         let planes = self
             .0
@@ -1818,7 +1791,12 @@ impl NativeTargetProgram {
                     .histories
                     .get(block_read)
                     .ok_or_else(|| invalid("the batch lacks an indexer's history read"))?;
-                selection_scores(blocks, segments, selection.blocks)
+                packed_selection_scores(
+                    &blocks.visible,
+                    &blocks.destinations,
+                    segments as usize,
+                    selection.indexer.top,
+                )
             }
         };
         let class = BlockRun {
@@ -2239,18 +2217,19 @@ impl NativeTargetProgram {
                         }
                     }
                 }
-                // A selected read's indexer: its planes, and its rows'
-                // spans and destinations in its two histories, written
-                // as the block's own read is.
+                // A selected read's keys: their planes, its rows' spans and
+                // destinations in their Window read and destinations in
+                // their Block read, and where its class scores, its
+                // indexer's spans, complete units and unit lists there.
                 match (indexer_planes, indexer) {
                     (Some(planes), Some(tables)) => {
                         let [(window_read, window), (block_read, blocks)] =
                             state.indexer(index as u32)?;
                         let [window_keys, window_coordinates] = window.as_slice() else {
-                            return Err(invalid("an indexer's raw-key planes are not two"));
+                            return Err(invalid("a selected read's pending-key planes are not two"));
                         };
                         let [block_keys] = blocks.as_slice() else {
-                            return Err(invalid("an indexer's block-key planes are not one"));
+                            return Err(invalid("a selected read's unit-key planes are not one"));
                         };
                         for (port, plane) in [
                             (&planes.window_keys, window_keys),
@@ -2259,27 +2238,27 @@ impl NativeTargetProgram {
                         ] {
                             bindings.set(port, plane).map_err(device)?;
                         }
-                        for (read, visible, destinations) in [
-                            (
-                                window_read,
-                                &tables.window_visible,
-                                &tables.window_destinations,
-                            ),
-                            (block_read, &tables.block_visible, &tables.block_destinations),
-                        ] {
-                            bindings
-                                .set(visible, controls.bound(LaunchControl::Visible { read })?)
-                                .map_err(device)?;
-                            bindings
-                                .set(
-                                    destinations,
-                                    controls.bound(LaunchControl::Destinations { read })?,
-                                )
-                                .map_err(device)?;
+                        let read = |read| LaunchControl::Visible { read };
+                        let index_tables = tables.index.iter().flat_map(|index| {
+                            [
+                                (&index.block_visible, read(block_read)),
+                                (&index.complete, LaunchControl::Complete { read: block_read }),
+                                (&index.units, LaunchControl::Units { read: block_read }),
+                            ]
+                        });
+                        for (port, control) in [
+                            (&tables.window_visible, read(window_read)),
+                            (&tables.window_destinations, LaunchControl::Destinations { read: window_read }),
+                            (&tables.block_destinations, LaunchControl::Destinations { read: block_read }),
+                        ]
+                        .into_iter()
+                        .chain(index_tables)
+                        {
+                            bindings.set(port, controls.bound(control)?).map_err(device)?;
                         }
                     }
                     (None, None) => {}
-                    _ => return Err(invalid("an indexer's planes and tables disagree")),
+                    _ => return Err(invalid("a selected read's planes and tables disagree")),
                 }
                 let (read, history) = state.history(LayerRef::Target(index as u32))?;
                 if history.len() != ports.len() {
@@ -2603,21 +2582,12 @@ impl GraphControls {
                     LaunchControl::Fresh { read: at } => pairs(&read(at)?.0.fresh),
                     LaunchControl::Destinations { read: at } => read(at)?.1.destinations.clone(),
                     // The rows a row's visible spans list in a Block read are
-                    // its complete groups.
-                    LaunchControl::Complete { read: at } => i32_bytes(
-                        &read(at)?
-                            .0
-                            .visible
-                            .iter()
-                            .map(|spans| {
-                                spans
-                                    .iter()
-                                    .map(|&[start, end]| {
-                                        assert!(end >= start, "a visible span [{start}, {end}) ends before it starts");
-                                        end - start
-                                    })
-                                    .sum::<i32>()
-                            })
+                    // its complete groups, and its unit list `[0, c)`.
+                    LaunchControl::Complete { read: at } => i32_bytes(&complete(&read(at)?.0.visible)),
+                    LaunchControl::Units { read: at } => i32_bytes(
+                        &complete(&read(at)?.0.visible)
+                            .into_iter()
+                            .flat_map(|complete| [0, complete])
                             .collect::<Vec<_>>(),
                     ),
                     // The picks and the candidate pool the read's own layer

@@ -68,6 +68,7 @@
 #include "../core/reduce.glsl"
 #include "../core/functions.glsl"
 #include "../core/matrix.glsl"
+#include "../core/staging.glsl"
 
 #include "stage.glsl"
 #include "join.glsl"
@@ -866,13 +867,7 @@ void projection_gemm_scan_rows(projection_prologue in_, const uint tm, uint m0, 
     barrier();
     for (uint row = gl_LocalInvocationIndex; row < tm; row += gl_WorkGroupSize.x) {
         const float largest = uintBitsToFloat(seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_MAXIMUM)]);
-        int exponent = 0;
-        if (largest >= 32768.0 && !isinf(largest)) {
-            int e;
-            frexp(largest, e);
-            exponent = e - 15;
-        }
-        seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_EXPONENT)] = uint(exponent);
+        seismic_shared_u32[projection_gemm_row_word(row, PROJECTION_GEMM_ROW_EXPONENT)] = uint(staging_f16_exponent(largest));
     }
     barrier();
 }

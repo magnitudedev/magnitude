@@ -40,7 +40,7 @@ constant constexpr uint COLUMNS = N / 32;
 // Slots of at most this many rows advance row-sequentially in either entry,
 // so a request's state bits never depend on its row class or its peers (a
 // speculative verify slot gets the bits of one-row decode).
-#define STATE_SPACE_SEQUENTIAL_ROWS 16
+#define STATE_SPACE_SEQUENTIAL_ROWS SEISMIC_CONST_SEQUENTIAL_ROWS
 
 // The operands of one call.
 struct Operands {

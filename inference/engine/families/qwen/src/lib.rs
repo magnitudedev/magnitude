@@ -18,7 +18,7 @@ use magnitude_family_common::{architecture_keys, array_elements};
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
-    Operator, ProjectedRows, RowProducer, RowRounding, TokenDomain, OutputProjection, QueryProjection, RecurrentHeadMapping, RmsNorm,
+    GateProjection, Operator, ProjectedRows, RecurrentDecay, RecurrentGate, RowProducer, RowRounding, TokenDomain, OutputProjection, QueryKeys, QueryProjection, RecurrentHeadMapping, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, ValueNorm, ValueSource,
     WeightDescriptor, checked_product,
@@ -405,6 +405,7 @@ impl Geometry {
                 "attn_q.weight",
                 &[product(&[2, heads, width])?, hidden],
             )?),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::Interleaved {
                 function: GateFunction::Sigmoid,
             },
@@ -452,14 +453,24 @@ impl Geometry {
             width: self.recurrent_width,
             head_mapping: RecurrentHeadMapping::Tiled,
             query_key_value: weight("attn_qkv.weight", &[channels, hidden])?,
-            gate: weight("attn_gate.weight", &[inner, hidden])?,
-            alpha: weight("ssm_alpha.weight", &[value_heads, hidden])?,
-            beta: weight("ssm_beta.weight", &[value_heads, hidden])?,
             convolution: weight("ssm_conv1d.weight", &[channels, self.convolution_width])?,
-            decay: weight("ssm_a", &[value_heads])?,
-            time_bias: weight("ssm_dt.bias", &[value_heads])?,
+            beta: weight("ssm_beta.weight", &[value_heads, hidden])?,
+            decay: RecurrentDecay::PerHead {
+                alpha: weight("ssm_alpha.weight", &[value_heads, hidden])?,
+                time_bias: weight("ssm_dt.bias", &[value_heads])?,
+                decay: weight("ssm_a", &[value_heads])?,
+            },
+            // The engine's own choice, not the model's: Qwen's L2 norm of q and
+            // k (FLA's l2norm) adds 1e-6 to the sum of squares, and the engine
+            // adds the RMS epsilon scaled by the head width, as it did before
+            // the definition stated it; its KL against the reference is
+            // judged with that choice.
+            key_norm_epsilon: self.epsilon * self.recurrent_width as f64,
             norm: self.rms(weight("ssm_norm.weight", &[self.recurrent_width])?),
-            output_gate,
+            output_gate: RecurrentGate {
+                projection: GateProjection::Full(weight("attn_gate.weight", &[inner, hidden])?),
+                function: output_gate,
+            },
             output: weight("ssm_out.weight", &[hidden, inner])?,
         })
     }

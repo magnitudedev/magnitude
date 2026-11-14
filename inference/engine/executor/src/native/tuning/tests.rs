@@ -3129,6 +3129,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
                 rotary_adjacent: false,
                 rotary_trailing: false,
                 output_rotary: false,
+                absorbed_query: false,
             },
             key_rounding: crate::RoundingArgs::NONE,
             widths: crate::planning::AttentionWidths {

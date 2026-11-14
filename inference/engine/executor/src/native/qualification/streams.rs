@@ -520,13 +520,15 @@ fn qualify_stream_binding(
 }
 
 /// A Sinkhorn binding's entries, on one row of ones streams `[S, H]` with
-/// the one-hot pre, zero function and base weights and unit scales: every
-/// mix is 0, so the site's input is the first stream's row of ones, its pre
-/// `sigmoid(0) + epsilon`, its post `2 sigmoid(0) = 1`, and its comb the
+/// zero function and base weights and unit scales: every mix is 0, so the
+/// site's pre is `sigmoid(0) + epsilon` (published when its mixing carries
+/// it), its input the first stream's row of ones by the one-hot previous pre
+/// or `S (0.5 + epsilon)` by its own, its post `2 sigmoid(0) = 1`, and its
+/// comb the
 /// uniform softmax rows `1/S + epsilon` under the binding's normalizations,
 /// each entry `c / (S c + epsilon)` of the uniform `c` before it. The
-/// collapse of ones streams by unit pre is `S`, and the join of ones streams
-/// and output with unit post and comb `S + 1`.
+/// collapse of ones streams by unit pre is `S` and their mean 1, and the
+/// join of ones streams and output with unit post and comb `S + 1`.
 fn qualify_sinkhorn_binding(
     device: &Device,
     binding: SinkhornBinding,
@@ -537,17 +539,17 @@ fn qualify_sinkhorn_binding(
     let MixingKernels::Sinkhorn(sinkhorn) = &kernels.mixing else {
         unreachable!("preparation gives Sinkhorn streams their entries: {label}")
     };
-    let SinkhornBinding { hidden: h, streams: s, mixing } = binding;
+    let SinkhornBinding { hidden: h, streams: s, mixing, .. } = binding;
     let ones = |extents: &[u64]| semantic_ones(device, Element::f32(), extents, entry, &label);
     let zeros = |extents: &[u64]| semantic_zeros(device, Element::f32(), extents, entry, &label);
     let streams = ones(&[1, s * h])?;
-    let mut one_hot = vec![0.0; s as usize];
-    one_hot[0] = 1.0;
+    let carried = binding.carried();
+    let one_hot = (0..carried * s).map(|at| if at == 0 { 1.0 } else { 0.0 }).collect::<Vec<_>>();
     let site = sinkhorn
         .site
         .call(stream_mix_sinkhorn::Args {
             hidden: &view(&streams, &[1, s, h], entry, &label)?,
-            previous: &semantic_f32(device, &[1, s], &one_hot, entry, &label)?,
+            previous: &semantic_f32(device, &[1, carried * s], &one_hot, entry, &label)?,
             function: &zeros(&[(2 + s) * s, s * h])?,
             base: &zeros(&[(2 + s) * s])?,
             scale: &ones(&[3])?,
@@ -565,18 +567,22 @@ fn qualify_sinkhorn_binding(
         comb = normalize(comb);
     }
     let join = (0..s + s * s).map(|at| if at < s { 1.0 } else { comb }).collect::<Vec<_>>();
-    require_f32_near(&site.r0, &vec![1.0; h as usize], "stream_mix_sinkhorn", &label)?;
-    require_f32_near(&site.r1, &vec![0.5 + mixing.epsilon; s as usize], "stream_mix_sinkhorn", &label)?;
+    let pre = 0.5 + mixing.epsilon;
+    let input = if carried > 0 { 1.0 } else { s as f32 * pre };
+    require_f32_near(&site.r0, &vec![input; h as usize], "stream_mix_sinkhorn", &label)?;
+    require_f32_near(&site.r1, &vec![pre; (carried * s) as usize], "stream_mix_sinkhorn", &label)?;
     require_f32_near(&site.r2, &join, "stream_mix_sinkhorn", &label)?;
+    let previous = binding.exit.previous();
     let collapsed = sinkhorn
         .collapse
         .call(stream_collapse::Args {
             hidden: &view(&streams, &[1, s, h], entry, &label)?,
-            pre: &ones(&[1, s])?,
+            pre: &ones(&[1, previous * s])?,
         })
         .map_err(|error| qualification_dynamic("stream_collapse", &label, error))?
         .value;
-    require_f32_near(&collapsed, &vec![s as f32; h as usize], "stream_collapse", &label)?;
+    let collapse = if previous > 0 { s as f32 } else { 1.0 };
+    require_f32_near(&collapsed, &vec![collapse; h as usize], "stream_collapse", &label)?;
     let joined = sinkhorn
         .join
         .call(stream_join::Args {

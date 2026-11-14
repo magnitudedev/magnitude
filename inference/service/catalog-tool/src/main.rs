@@ -139,6 +139,17 @@ enum Command {
         #[command(subcommand)]
         source: GgufSource,
     },
+    /// Write the provenance record `<OUTPUT>.json` of a local slice another tool wrote (a
+    /// converter's slice of a checkpoint's main layers), in `slice`'s format.
+    SliceRecord {
+        /// The source files as provenance names them (`REPO@REVISION/PATH`), in order.
+        #[arg(long = "source", required = true)]
+        source: Vec<String>,
+        /// The source main layers the slice keeps, ascending, comma-separated.
+        #[arg(long, value_delimiter = ',', required = true)]
+        layers: Vec<usize>,
+        output: PathBuf,
+    },
     /// Audit the tensor types of the locked catalog: tally each catalog component file's tensor
     /// encodings from the header export (see `headers`) under `--headers`, written first unless
     /// it is current, into `--output`. Fails when a file declares a tensor type the parser
@@ -593,6 +604,18 @@ async fn main() -> anyhow::Result<()> {
             };
             slice::run(options).await
         }
+        Command::SliceRecord {
+            source,
+            layers,
+            output,
+        } => {
+            slice::record_existing(slice::RecordOptions {
+                output,
+                source,
+                layers,
+            })
+            .await
+        }
         Command::Audit {
             headers: output,
             output: report,
@@ -669,6 +692,8 @@ mod tests {
         assert!(!parses(&[&["header"], &hub[..]].concat()));
         assert!(parses(&[&["header"], &hub[..], &["--model-store", "/m"]].concat()));
         assert!(parses(&["slice", "--output", "s.gguf", "local", "m.gguf"]));
+        assert!(parses(&["slice-record", "--source", "r@c/a", "--source", "r@c/b", "--layers", "0,3", "s.gguf"]));
+        assert!(!parses(&["slice-record", "--layers", "0,3", "s.gguf"]));
         assert!(parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "local", "m.gguf"]));
         assert!(!parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "ollama", "--model", "q", "--digest", "sha256:0"]));
     }

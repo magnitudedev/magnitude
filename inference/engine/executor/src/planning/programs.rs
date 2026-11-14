@@ -14,7 +14,7 @@ use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
 use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
-use crate::operators::streams::BlockStreams;
+use crate::operators::streams::{BlockStreams, SinkhornExit};
 use crate::operators::vision::VisionKernel;
 use crate::operators::{
     self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
@@ -747,18 +747,22 @@ pub(super) fn derive_program_plan(
             .with_streams(
                 streams
                     .map(|geometry| {
-                        BlockStreams::of(geometry, |geometry| {
-                            // The last block ends with the decoder's exit site.
-                            let last = index as usize + 1 == decoder.blocks.len();
-                            operators::streams::binding(
-                                geometry,
-                                mixer,
-                                paired.feed_forward.is_some().then_some(feed_forward),
-                                last.then_some(WeightScope::Target),
-                                |scope, kind| lookup(target, scope, kind),
-                                active_element,
-                            )
-                        })
+                        BlockStreams::of(
+                            geometry,
+                            |geometry| {
+                                // The last block ends with the decoder's exit site.
+                                let last = index as usize + 1 == decoder.blocks.len();
+                                operators::streams::binding(
+                                    geometry,
+                                    mixer,
+                                    paired.feed_forward.is_some().then_some(feed_forward),
+                                    last.then_some(WeightScope::Target),
+                                    |scope, kind| lookup(target, scope, kind),
+                                    active_element,
+                                )
+                            },
+                            || SinkhornExit::of_decoder(decoder),
+                        )
                     })
                     .transpose()?,
             )
@@ -929,6 +933,7 @@ pub(super) fn derive_program_plan(
                     |kind| planned_scalable(weights, mixer, kind),
                     active_element,
                     KvCodec::Dense,
+                    Some(decoder.context_limit),
                 )?;
                 let streams = operators::streams::StreamsGeometry::from_residual(
                     decoder.hidden,
@@ -1134,6 +1139,7 @@ fn draft_program_plan(
             |kind| planned_scalable(weights, mixer, kind),
             activation,
             KvCodec::Dense,
+            None,
         )?;
         let dense = dense_slot(
             &paired

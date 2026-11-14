@@ -314,6 +314,7 @@ native routed_expand for metal from "metal/routed_expand.metal":
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S, GS, US)
     params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
+    where H % 64 == 0
     scratch operands bytes (M * H * 2) when operands(EGW) + operands(SGW) > 0
     launch routed_expand_stage when operands(EGW) + operands(SGW) > 0:
         threadgroups (M, 1, 1)
@@ -470,6 +471,7 @@ native routed_output for metal from "metal/routed_output.metal":
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, SN, IN, K, F, S)
     params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
+    where F % 64 == 0 and S % 64 == 0
     scratch published bytes (M * (K + 1) * H * 2)
     scratch arrivals bytes (ceil_div(H, 16) * 4) sync
     scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
@@ -737,6 +739,7 @@ native routed_experts for metal from "metal/routed_experts.metal":
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F, GS, US, LB)
     params (arithmetic OPERAND in [0, 1] default 0)
+    where H % 64 == 0 and F % 64 == 0
     scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
     scratch stage_grid bytes (12)
@@ -910,6 +913,7 @@ native routed_combine for metal from "metal/routed_combine.metal":
 native routed_combine for cuda from "cuda/routed_combine.cu":
     static (H, SN, IN, K, S)
     params (arithmetic OPERAND in [0, 1] default 0)
+    where H % 64 == 0 and S % 64 == 0
     scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch shared_product bytes (M * S * 2)
     launch routed_combine_stage when OPERAND == 1:

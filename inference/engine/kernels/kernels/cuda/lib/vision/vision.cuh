@@ -13,6 +13,7 @@
 // is bound canonically (row-major, unit innermost stride).
 
 #include "../core/activation.cuh"
+#include "../core/norm.cuh"
 #include "../core/reduce.cuh"
 
 namespace vision {
@@ -99,9 +100,10 @@ template <> struct Mma<element::Bf16> {
 
 // ---------------------------------------------------------------------------
 // GEMM: y[m, n] = epilogue(sum_k x[m, k] * w[n, k]) over x [M, K] (element X,
-// row stride `x_stride`) and w [N, K] (element W, rows of K). K is a multiple
-// of 8 (whole 16-byte chunks). Block tile GEMM_M x GEMM_N x GEMM_K in two cp.async stages; eight
-// warps as 2 x 4, each owning 64 x 32 outputs (4 x 4 m16n8 tiles).
+// row stride `x_stride`) and w [N, K] (element W, rows of K). x's rows hold
+// whole 16-byte chunks past K, zero beyond it; w's rows may be any K. Block
+// tile GEMM_M x GEMM_N x GEMM_K in two cp.async stages; eight warps as 2 x 4,
+// each owning 64 x 32 outputs (4 x 4 m16n8 tiles).
 
 constexpr u32 GEMM_M = 128;
 constexpr u32 GEMM_N = 128;
@@ -163,12 +165,34 @@ template <class X> struct Staged<X, element::F32> {
     typedef X type;
 };
 
+// Stages k-step `step` of 16-bit weight rows of a K that is no multiple of 8,
+// whose rows past the first start off 16-byte alignment: plain loads, zero
+// past K.
+__device__ __forceinline__ void gemm_stage_unaligned(u16 *tile, const u8 *base, u64 stride, u32 first, u32 limit,
+                                                     u32 step, u32 k) {
+    constexpr u32 CHUNKS = GEMM_K / 8; // eight weights per chunk
+    for (u32 item = threadIdx.x; item < GEMM_M * CHUNKS; item += GEMM_THREADS) {
+        const u32 row = item / CHUNKS, chunk = item % CHUNKS;
+        const u32 column = step * GEMM_K + chunk * 8;
+        u32 v[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        if (first + row < limit) {
+            const u16 *source = reinterpret_cast<const u16 *>(base) + (u64)(first + row) * stride + column;
+            for (u32 i = 0; i < 8 && column + i < k; ++i)
+                v[i] = source[i];
+        }
+        *reinterpret_cast<uint4 *>(tile + row * GEMM_PITCH + chunk * 8) =
+            make_uint4(v[0] | v[1] << 16, v[2] | v[3] << 16, v[4] | v[5] << 16, v[6] | v[7] << 16);
+    }
+}
+
 template <class X, class W>
 __device__ __forceinline__ void gemm_stage_weights(u16 *tile, const u8 *w, u32 first, u32 limit, u32 step, u32 k) {
     if constexpr (W::bytes == 4)
         gemm_stage_f32<X>(tile, w, k, first, limit, step, k);
-    else
+    else if (k % 8 == 0)
         gemm_stage(tile, w, k, first, limit, step, k);
+    else
+        gemm_stage_unaligned(tile, w, k, first, limit, step, k);
 }
 
 // Epilogues receive (m, n, value(n), value(n + 1)) for n even, n + 1 < N.
@@ -247,8 +271,8 @@ __device__ __forceinline__ void gemm(GemmShared &shared, const u8 *x, u64 x_stri
 // ---------------------------------------------------------------------------
 // The `vision_linear` epilogue: the projection is acc, plus bias[n] when
 // BIAS, clamped to [minimum, maximum] when CLAMP. With `activation` nonzero
-// y = Y(act(round_A(projection))); with GATE y = Y(round_A(projection) ·
-// gate[m, n]); otherwise y = Y(projection), plus the F32 residual row when
+// y = Y(act(projection)), rounded once, as published; with GATE
+// y = Y(projection · gate[m, n]), rounded once; otherwise y = Y(projection), plus the F32 residual row when
 // RESIDUAL.
 template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool CLAMP> struct Linear {
     u8 *y;
@@ -268,9 +292,9 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
         if constexpr (CLAMP)
             projected = fminf(fmaxf(projected, minimum), maximum);
         if (activation != 0)
-            return activate(activation, A::round(projected));
+            return activate(activation, projected);
         if constexpr (GATE)
-            return A::round(projected) * element::at<A>(gate, (u64)m * gate_stride + n);
+            return projected * element::at<A>(gate, (u64)m * gate_stride + n);
         if constexpr (RESIDUAL)
             return residual[(u64)m * residual_stride + n] + projected;
         return projected;
@@ -281,39 +305,31 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
 };
 
 // ---------------------------------------------------------------------------
-// Norm of one F32 row of `width` values (the whole block): two-pass F32
-// statistics, centered (a layer norm) or not (the mean taken as 0, a
-// root-mean-square norm), out[i * stride] = Y(centered * inverse [* weight]
-// [+ bias]). `partials` holds one float per warp.
+// Norm of one F32 row of `width` values (the whole block): `norm`'s
+// two-pass statistics, centered (a layer norm) or not (the mean taken as 0,
+// a root-mean-square norm), out[i * stride] = Y(centered * inverse
+// [* weight] [+ bias]), then `activation`'s code of `vision_linear` when nonzero.
+// `partials` holds one float per warp.
 
 template <class Y, class WN, class BN, bool WEIGHT, bool BIAS>
 __device__ __forceinline__ void norm(const float *row, u8 *out, u64 stride, const u8 *weight, const u8 *bias,
-                                     u32 width, bool centered, float epsilon, float *partials) {
+                                     u32 width, bool centered, float epsilon, int activation, float *partials) {
     float mean = 0.0f;
     if (centered) {
         float sum = 0.0f;
         for (u32 i = threadIdx.x; i < width; i += blockDim.x)
             sum += row[i];
-        mean = reduce::group_sum(sum, partials) / float(width);
+        mean = row_norm::mean(reduce::group_sum(sum, partials), width);
     }
     float squares = 0.0f;
+    for (u32 i = threadIdx.x; i < width; i += blockDim.x)
+        squares = row_norm::square(row[i] - mean, squares);
+    const float inverse = row_norm::inverse(reduce::group_sum(squares, partials), width, epsilon);
     for (u32 i = threadIdx.x; i < width; i += blockDim.x) {
-        const float value = row[i] - mean;
-        squares = fmaf(value, value, squares);
-    }
-    const float inverse = rsqrtf(reduce::group_sum(squares, partials) / float(width) + epsilon);
-    // One expression per form, as the layer norm has always been written.
-    for (u32 i = threadIdx.x; i < width; i += blockDim.x) {
-        float value;
-        if constexpr (WEIGHT && BIAS)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i) + element::at<BN>(bias, i);
-        else if constexpr (WEIGHT)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i);
-        else if constexpr (BIAS)
-            value = (row[i] - mean) * inverse + element::at<BN>(bias, i);
-        else
-            value = (row[i] - mean) * inverse;
-        element::put<Y>(out, (u64)i * stride, value);
+        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
+        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        element::put<Y>(out, (u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
     }
 }
 

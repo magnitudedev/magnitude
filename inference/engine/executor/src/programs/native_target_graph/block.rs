@@ -22,7 +22,7 @@ use crate::{
             streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank},
         },
         streams::{
-            ResidualCarry, StreamsGeometry, StreamsMixing,
+            ResidualCarry, SinkhornExit, StreamsGeometry, StreamsMixing,
             graph::{CheckedStreamsEntries, MixingEntries, StreamsEntries, collapse, mix_site, widen},
         },
     },
@@ -366,7 +366,7 @@ impl<R, T> Numbers<R> for BlockShape<R, T> {
             split: self.split,
             exit: self.exit.map(|exit| match exit {
                 ExitTopology::LowRank { epsilon } => ExitTopology::LowRank { epsilon: f(epsilon) },
-                ExitTopology::Collapse => ExitTopology::Collapse,
+                ExitTopology::Collapse(exit) => ExitTopology::Collapse(exit),
             }),
             sublayers: self.sublayers.map(f),
         }
@@ -375,11 +375,12 @@ impl<R, T> Numbers<R> for BlockShape<R, T> {
 
 /// The decoder's exit at the end of the last block of residual streams: a
 /// low-rank exit site at its norm's epsilon, whose partials the readout
-/// sums, or the collapse of Sinkhorn streams by the last site's pre.
+/// sums, or the collapse of Sinkhorn streams by the last site's pre or into
+/// their mean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ExitTopology<R> {
     LowRank { epsilon: R },
-    Collapse,
+    Collapse(SinkhornExit),
 }
 
 /// Every number a block graph is sized by: the rows a pass groups, its
@@ -471,7 +472,9 @@ impl<'a> BlockGraphInputs<'a> {
                     (ExitMix::Own(site), StreamsMixing::LowRank { .. }) => {
                         ExitTopology::LowRank { epsilon: site.norm.epsilon }
                     }
-                    (ExitMix::Previous(_), StreamsMixing::Sinkhorn(_)) => ExitTopology::Collapse,
+                    (mix, StreamsMixing::Sinkhorn { .. }) => ExitTopology::Collapse(
+                        SinkhornExit::of(mix).ok_or("the decoder's exit disagrees with its streams' mixing")?,
+                    ),
                     _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
                 })
             }
@@ -525,14 +528,15 @@ fn layer_bank<'p, 'a, G: GraphDraft + 'a>(
 /// (`ResidualCarry`): the embedded rows into block 0, and the streams
 /// (`S * H`) into every later block of a decoder with residual streams and
 /// into every back, which reads the carry its front's mixer left; with the
-/// `[rows, S]` pre of Sinkhorn streams (none into block 0, whose first site
-/// reads the one-hot pre). The pass reads only crossed rows.
+/// `[rows, S]` pre of Sinkhorn streams mixing by the previous site's (none
+/// into block 0, whose first site reads the one-hot pre). The pass reads
+/// only crossed rows.
 pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) -> Result<Option<ResidualCarry<u64>>, String> {
     let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
     let carry = |reads_streams: bool| match streams {
         Some(streams) if reads_streams => ResidualCarry {
             rows: streams.width(),
-            pre: streams.sinkhorn().map(|_| streams.streams),
+            pre: streams.carried_pre(),
         },
         _ => ResidualCarry::rows(geometry.hidden),
     };
@@ -719,7 +723,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let residual = shape.residual.then(|| output.clone());
     // The decoder's last block ends with its exit: a low-rank exit site,
     // whose partials the readout sums, or the collapse of Sinkhorn streams
-    // by the last site's pre, which the readout normalizes.
+    // by the last site's pre or into their mean, which the readout
+    // normalizes.
     let carry = ResidualCarry { rows: output, pre };
     let output = match (shape.exit, streams, streams_entries.map(|entries| entries.mixing)) {
         (None, _, _) => carry,
@@ -742,8 +747,16 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             .partials;
             ResidualCarry::rows(partials)
         }
-        (Some(ExitTopology::Collapse), Some(streams), Some(MixingEntries::Sinkhorn(entries))) => {
-            ResidualCarry::rows(collapse(graph, entries.collapse, streams.clone(), &carry, rows.clone())?)
+        (Some(ExitTopology::Collapse(exit)), Some(streams), Some(MixingEntries::Sinkhorn(entries))) => {
+            ResidualCarry::rows(collapse(
+                graph,
+                entries.collapse,
+                streams.clone(),
+                &carry,
+                exit,
+                rows.clone(),
+                constants,
+            )?)
         }
         _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
     };
@@ -929,7 +942,10 @@ pub(super) fn certify_block<L: Certified>(
     let bank = layer_bank(inputs.stage, entries.bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
     let (shape, numbers) = inputs.split(slot, &bank, tap)?;
     let mut facts = FactSink::new();
-    let numbers = facts.index(BlockNumbers { sublayers: numbers.sublayers.share_classes(), ..numbers });
+    // Shared once indexed, each class dimension is one fact: the block's,
+    // which its classes vary, wherever an operator reads it.
+    let mut numbers = facts.index(numbers);
+    numbers.sublayers = numbers.sublayers.share_classes();
     // The key names what the block reads relative to it (`relative_scope`),
     // as its graph does.
     let block = inputs.block()?;

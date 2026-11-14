@@ -956,9 +956,9 @@ impl ManagedModelStore {
         self.materialize_preview(artifact)
     }
 
-    /// Write `artifact`'s exact header, extended sparsely to its file's size, under `root` at
-    /// `<repository>/<revision>/<path>`, read as a preview of its pinned source reads it (from
-    /// the derived cache when it holds it).
+    /// Write `artifact`'s exact header, every shard's of a split GGUF, each extended sparsely
+    /// to its file's size, under `root` at `<repository>/<revision>/<path>`, read as a preview
+    /// of its pinned source reads it (from the derived cache when it holds it).
     pub async fn export_artifact_header(
         &self,
         artifact: &ArtifactHeader,
@@ -971,18 +971,19 @@ impl ManagedModelStore {
             additional_components: Vec::new(),
         };
         let cached = self.preview_artifact(&source).await?;
-        let [component] = cached.components.as_slice() else {
-            return Err(InventoryError::Integrity(format!(
-                "{} is not one GGUF file",
-                artifact.path.display()
-            )));
-        };
-        let header = self
-            .cache
-            .read_header(&component.header_digest)
-            .or_else(|| component.acquired_header.clone())
-            .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
-        write_header_file(&header, component.component.size_bytes, &artifact.file(root))
+        for component in &cached.components {
+            let header = self
+                .cache
+                .read_header(&component.header_digest)
+                .or_else(|| component.acquired_header.clone())
+                .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
+            write_header_file(
+                &header,
+                component.component.size_bytes,
+                &artifact.component_file(root, &component.component.path),
+            )?;
+        }
+        Ok(())
     }
 
     /// The preview artifact of `source`: its components and their header digests, from the

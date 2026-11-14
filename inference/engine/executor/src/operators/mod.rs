@@ -149,7 +149,7 @@ impl Join {
         match &self.values {
             Some(values) => Ok(values.clone()),
             None => {
-                crate::programs::native_constants::GraphConstant::absent_inject(
+                crate::programs::native_constants::GraphConstant::absent_rows(
                     graph,
                     &rows.into(),
                     self.class,
@@ -361,6 +361,8 @@ pub(crate) enum ExitMix<'a> {
     /// The streams collapsed by the last site's pre, which the readout
     /// normalizes by `norm`.
     Previous(&'a RmsNorm),
+    /// The streams' mean, which the readout normalizes by `norm`.
+    Mean(&'a RmsNorm),
 }
 
 impl ExitMix<'_> {
@@ -382,6 +384,14 @@ impl ExitMix<'_> {
                 site: ExitSite::PreviousSite,
                 norm: None,
             } => Err(PlanError::Unsupported("an unnormalized previous-site hyper-connection exit")),
+            HyperConnectionExit {
+                site: ExitSite::Mean,
+                norm: Some(norm),
+            } => Ok(ExitMix::Mean(norm)),
+            HyperConnectionExit {
+                site: ExitSite::Mean,
+                norm: None,
+            } => Err(PlanError::Unsupported("an unnormalized mean hyper-connection exit")),
         }
     }
 
@@ -389,7 +399,7 @@ impl ExitMix<'_> {
     pub(crate) fn epsilon(&self) -> f64 {
         match self {
             Self::Own(site) => site.norm.epsilon,
-            Self::Previous(norm) => norm.epsilon,
+            Self::Previous(norm) | Self::Mean(norm) => norm.epsilon,
         }
     }
 }
@@ -589,8 +599,23 @@ impl SharedHead<'_> {
 pub(crate) fn head_form<'a>(head: &'a Head, decoder: &Decoder) -> Result<HeadForm<'a>, PlanError> {
     match head.history {
         HeadHistory::Own => {
-            for block in &head.blocks {
-                CausalHeadBlock::of(head, block)?;
+            let blocks = head
+                .blocks
+                .iter()
+                .map(|block| CausalHeadBlock::of(head, block))
+                .collect::<Result<Vec<_>, _>>()?;
+            // A selecting head's store holds its block's indexer state, and
+            // its graphs address that one block's.
+            let selects = |block: &CausalHeadBlock| {
+                block.block.sublayers.iter().any(|sublayer| {
+                    matches!(&sublayer.op, Operator::Attention(attention)
+                        if !matches!(attention.fresh().reads, HistoryReads::Visible))
+                })
+            };
+            if blocks.len() > 1 && blocks.iter().any(selects) {
+                return Err(PlanError::Unsupported(
+                    "a selecting causal draft head of more than one block",
+                ));
             }
             Ok(HeadForm::Causal)
         }
@@ -733,7 +758,6 @@ fn operator_weights<'a>(
     let mut push = |kind, weight| weights.push((role(scope, kind), weight));
     match op {
         Operator::Attention(operator) => attention::weights(operator, &mut push),
-        Operator::LatentAttention(_) => {}
         Operator::GatedDelta(operator) => gated_delta::weights(operator, &mut push),
         Operator::ShortConv(operator) => short_conv::weights(operator, &mut push),
         Operator::StateSpace(operator) => state_space::weights(operator, &mut push),
@@ -773,8 +797,11 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::IndexerQueryNorm
             | WeightKind::IndexerKeyNorm
             // `pool_rows` normalizes the pooled rows in F32 (at rate 1,
-            // `attention_append_dense` and the index keys' projection).
+            // `attention_append_dense` and the index keys' projection), and
+            // reads a token norm's bias and the gate's place term in F32.
             | WeightKind::PooledNorm
+            | WeightKind::IndexerKeyNormBias
+            | WeightKind::IndexerKeyGatePosition
             | WeightKind::RecurrentConvolution
             | WeightKind::RecurrentConvolutionBias
             | WeightKind::NGramConvolution
@@ -791,6 +818,19 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::HyperConnectionFunction
             | WeightKind::HyperConnectionBase
             | WeightKind::HyperConnectionScale
+            // `vision_attention` reads its head norms in F32, and
+            // `vision_clamp` and `vision_linear` a clippable linear's bounds.
+            | WeightKind::Vision(
+                magnitude_family_contracts::VisionWeight::QueryNorm
+                    | magnitude_family_contracts::VisionWeight::KeyNorm
+                    | magnitude_family_contracts::VisionWeight::Linear {
+                        part: magnitude_family_contracts::LinearPart::InputMinimum
+                            | magnitude_family_contracts::LinearPart::InputMaximum
+                            | magnitude_family_contracts::LinearPart::OutputMinimum
+                            | magnitude_family_contracts::LinearPart::OutputMaximum,
+                        ..
+                    }
+            )
     ) || matches!(kind, WeightKind::Corrector(weight) if draft::corrector_reads_f32(weight))
 }
 
@@ -1023,7 +1063,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
         return Err(PlanError::Deferred(*form));
     }
     let decoder = &definition.decoder;
-    streams::StreamsGeometry::of(decoder)?;
+    let streams = streams::StreamsGeometry::of(decoder)?;
     // `embedding_rows` scales (`embedding_transform`) and normalizes text
     // rows. Media rows enter as their projector leaves them: a family whose
     // text rows are normalized at entry normalizes its media rows in its
@@ -1036,7 +1076,13 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     // residual form).
     let exit_epsilon = match &decoder.exit.norm {
         ExitNorm::Rms(norm) => norm.epsilon,
-        ExitNorm::HyperConnectionHead(exit) => ExitMix::of(exit)?.epsilon(),
+        ExitNorm::HyperConnectionHead(exit) => match ExitMix::of(exit)? {
+            // The streams' collapse is a Sinkhorn streams' entry.
+            ExitMix::Mean(_) if streams.is_some_and(|streams| streams.sinkhorn().is_none()) => {
+                return Err(PlanError::Unsupported("a mean exit over low-rank hyper-connection streams"));
+            }
+            exit => exit.epsilon(),
+        },
         _ => return Err(PlanError::Unsupported("readout normalization")),
     };
     for block in &decoder.blocks {
@@ -1084,13 +1130,15 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
                     "draft head block without feed-forward",
                 ));
             };
-            if matches!(
-                feed_forward.op,
-                FeedForward::GeneralRouted(_) | FeedForward::Parallel(_)
-            ) {
-                return Err(PlanError::Unsupported(
-                    "draft head routed feed-forward form",
-                ));
+            // A general routed form is the body's, over a single residual;
+            // the parallel form has no head lowering.
+            if matches!(feed_forward.op, FeedForward::Parallel(_)) {
+                return Err(PlanError::Unsupported("draft head parallel feed-forward form"));
+            }
+            if matches!(feed_forward.op, FeedForward::GeneralRouted(_))
+                && matches!(block.residual, ResidualForm::HyperConnections(_))
+            {
+                return Err(PlanError::Unsupported("draft head general routed feed-forward over low-rank streams"));
             }
             let expected = match block.residual {
                 ResidualForm::Single => OutputForm::Residual,
@@ -1156,7 +1204,9 @@ fn admit_shared_head(head: &SharedHead) -> Result<(), PlanError> {
 /// The attention binding of a block whose mixer must be attention (a draft
 /// head's or a separate draft's); `lookup` resolves the planned element of a
 /// role in the mixer sublayer's scope, `scalable` that of a projection bound
-/// with an accumulator-scale port.
+/// with an accumulator-scale port. `context` is the context a selected read
+/// serves (its bitmap covers its units): a draft head's (the decoder's), and
+/// none for a separate draft, whose graphs run no indexer.
 pub(crate) fn attention_slot(
     paired: &PairedBlock,
     hidden: u64,
@@ -1164,21 +1214,25 @@ pub(crate) fn attention_slot(
     scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
     history: magnitude_state::KvCodec,
+    context: Option<u64>,
 ) -> Result<crate::AttentionBinding, PlanError> {
     let Mixer::Attention(operator) = paired.mixer else {
         return Err(PlanError::Unsupported(
             "a draft block mixer other than attention",
         ));
     };
-    if operator.history.len() > 1 || !matches!(operator.fresh().reads, HistoryReads::Visible) {
-        return Err(PlanError::Unsupported("a draft block's selected attention"));
+    if operator.history.len() > 1 {
+        return Err(PlanError::Unsupported("a draft block's attention over more than one source"));
+    }
+    if context.is_none() && !matches!(operator.fresh().reads, HistoryReads::Visible) {
+        return Err(PlanError::Unsupported("a separate draft's selected attention"));
     }
     let lookup = |kind| paired.mixer_input.lookup(kind, &lookup);
     attention::binding(
         operator,
         paired.mixer_output,
         hidden,
-        0,
+        context.unwrap_or(0),
         lookup,
         scalable,
         activation,
@@ -1380,21 +1434,16 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
         }
         op => return Err(unsupported_operator(op, "mixer")),
     };
-    // Of the mixers, only attention reads a Sinkhorn site's input row and
-    // joins its output through the site; the state-space and
-    // short-convolution kernels read only the normalized residual row.
-    match (mixer_input, &mixer_op) {
-        (SublayerSource::Sinkhorn(_), mixer) if !matches!(mixer, Mixer::Attention(_)) => {
-            return Err(PlanError::Unsupported(
-                "a Sinkhorn hyper-connection input to a mixer other than attention",
-            ));
-        }
-        (SublayerSource::Mix(_), Mixer::StateSpace(_) | Mixer::ShortConv(_)) => {
-            return Err(PlanError::Unsupported(
-                "a low-rank hyper-connection input to a state-space or short-convolution mixer",
-            ));
-        }
-        _ => {}
+    // Attention and the gated delta read a site's input (`SublayerInput`)
+    // and join their output through it (`attention_output`'s `Join`); the
+    // state-space and short-convolution kernels read only the normalized
+    // residual row.
+    if matches!(mixer_input, SublayerSource::Sinkhorn(_) | SublayerSource::Mix(_))
+        && matches!(mixer_op, Mixer::StateSpace(_) | Mixer::ShortConv(_))
+    {
+        return Err(PlanError::Unsupported(
+            "a hyper-connection input to a state-space or short-convolution mixer",
+        ));
     }
     // Post-norm tails exist for the attention, short-convolution and dense
     // output projections.
@@ -1430,13 +1479,16 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                     "sublayer post-norm after this operator",
                 ));
             }
-            // Of the feed-forwards, only the general routed form reads a
-            // Sinkhorn site's input row and joins its branch through the
-            // site.
-            if matches!(input, SublayerSource::Sinkhorn(_)) && !matches!(op, FeedForward::GeneralRouted(_)) {
+            // The dense and general routed forms read a Sinkhorn site's
+            // input row and join their branch through the site
+            // (`BlockSublayers::sinkhorn_branch`).
+            if matches!(input, SublayerSource::Sinkhorn(_))
+                && (!matches!(op, FeedForward::Dense(_) | FeedForward::GeneralRouted(_))
+                    || !joins(&feed_forward.output))
+            {
                 return Err(PlanError::Unsupported(
-                    "a Sinkhorn hyper-connection input to a feed-forward other than the general \
-                     routed form",
+                    "a Sinkhorn hyper-connection input to a feed-forward other than a joined dense \
+                     or general routed form",
                 ));
             }
             Ok(FeedForwardSublayer {

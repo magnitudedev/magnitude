@@ -30,7 +30,7 @@ use magnitude_family_contracts::{
     GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource, ImportTransform,
     InputNorm, InputSemantics, MediaRowAttention, ProjectedRows, RowProducer, RowRounding,
     TokenDomain, ModelDefinition, Operator, OutputForm,
-    OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer,
+    OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer,
     UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
 };
@@ -212,6 +212,7 @@ pub fn inspect_components(
             kv_heads,
             width,
             query: QueryProjection::Full(paired("attn_q.weight", &[query_rows, hidden])?),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::Separate {
                 weight: gate,
                 function: GateFunction::Sigmoid,

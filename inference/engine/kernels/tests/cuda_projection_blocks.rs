@@ -21,23 +21,18 @@ fn statics_specialization(statics: &[(&str, usize)]) -> NativeSpecialization {
         })
 }
 
-/// One segment's expected A-rounded projection and tolerance over operand
-/// rows `x` with per-value `slack`.
+/// [`project_with_slack`] published in A: each value and its tolerance.
 fn rounded_segment(
     x: &[f32],
-    slack: &[f32],
+    slack: &[f64],
     weight: &Weight,
     m: usize,
     n: usize,
     k: usize,
     mapping: Mapping,
 ) -> (Vec<f64>, Vec<f64>) {
-    let (values, magnitude) = project(x, &weight.values, m, n, k);
-    let bound = slack_bound(slack, &weight.values, m, n, k);
-    let dequant = dequant_bound(x, &weight.values, m, n, k, mapping);
-    let tolerance = (0..values.len())
-        .map(|i| values[i].abs() / 256.0 + magnitude[i] * 2.5e-4 + bound[i] + dequant[i] + 1e-6)
-        .collect();
+    let (values, sums) = project_with_slack(x, slack, weight, m, n, k, mapping);
+    let tolerance = values.iter().zip(&sums).map(|(y, d)| published_bound(*y, *d)).collect();
     (values, tolerance)
 }
 
@@ -116,11 +111,12 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
             let norm_values: Vec<f32> = (0..h).map(|_| rng.uniform(0.25, 1.25)).collect();
-            let normed = normalized(&hidden_values, &norm_values, m, h);
+            let (normed, flips) = normalized(&hidden_values, &norm_values, m, h);
             let hidden = f32_tensor(&device, &[m as u64, h as u64], &hidden_values);
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
             for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
-                let (x, slack) = operand_rows(&normed, h, mapping, formats[0]);
+                let (x, operand) = operand_rows(&normed, h, mapping, formats[0]);
+                let slack = sum_slack(&flips, &operand);
                 let mut expected = vec![0.0; m * width];
                 let mut tolerance = vec![0.0; m * width];
                 for (weight, (offset, n)) in
@@ -147,7 +143,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                     })
                     .unwrap()
                     .value;
-                check(
+                assert_within(
                     &format!("recurrent project {formats:?} M={m} {mapping:?}"),
                     &read_bf16(&projected),
                     &expected,
@@ -216,14 +212,15 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-3.0, 3.0)).collect();
             let norm_values: Vec<f32> = (0..d).map(|_| rng.uniform(0.25, 1.25)).collect();
-            let normed = normalized(&hidden_values, &norm_values, m, d);
+            let (normed, flips) = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
                 seismic_native_tests::progress(format_args!(
                     "attention project {formats:?} M={m} {mapping:?}"
                 ));
-                let (x, slack) = operand_rows(&normed, d, mapping, Some(formats[0]));
+                let (x, operand) = operand_rows(&normed, d, mapping, Some(formats[0]));
+                let slack = sum_slack(&flips, &operand);
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
                     .iter()
                     .zip([query, keys, keys])
@@ -261,7 +258,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     ("key beside zeroed segments", &zeroed.r2, &expected[1]),
                     ("value beside zeroed segments", &zeroed.r3, &expected[2]),
                 ] {
-                    check(
+                    assert_within(
                         &format!("attention project {name} {formats:?} M={m} {mapping:?}"),
                         &read_bf16(tensor),
                         values,
@@ -322,14 +319,14 @@ fn attention_output_matches_host_model(format: Format) {
         for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
             // The heads are exact input, so the INT8 emulation is exact too.
             let (x, _) = operand_rows(&gated_values, q * w, mapping, Some(format));
-            let (projected, magnitude) = project(&x, &output.values, m, d, q * w);
-            let expected: Vec<f64> = (0..m * d)
-                .map(|i| f64::from(hidden_values[i]) + projected[i])
-                .collect();
-            let dequant = dequant_bound(&x, &output.values, m, d, q * w, mapping);
-            let tolerance: Vec<f64> = (0..m * d)
-                .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
-                .collect();
+            let (projected, sums) =
+                project(&x, &output.values, format.resident(), m, d, q * w, mapping);
+            let (expected, tolerance): (Vec<f64>, Vec<f64>) = (0..m * d)
+                .map(|i| {
+                    let residual = f64::from(hidden_values[i]);
+                    (residual + projected[i], residual_bound(residual, projected[i], sums[i]))
+                })
+                .unzip();
             let result = projection
                 .kernel(&device, mapping)
                 .call(attention_output::Args {
@@ -342,7 +339,7 @@ fn attention_output_matches_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("attention output {format:?} M={m} {mapping:?}"),
                 &read_f32(&result),
                 &expected,
@@ -409,7 +406,7 @@ fn cuda_scaled_projections_match_host_model() {
             let gated_values: Vec<f32> = (0..m * k)
                 .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
                 .collect();
-            let normed = normalized(&hidden_values, &norm_values, m, d);
+            let (normed, flips) = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             let gated = bf16_tensor(
@@ -420,7 +417,8 @@ fn cuda_scaled_projections_match_host_model() {
             for mapping in mappings(m, |mapping| {
                 projection.admits(&device, mapping) && output_projection.admits(&device, mapping)
             }) {
-                let (x, slack) = operand_rows(&normed, d, mapping, Some(format));
+                let (x, operand) = operand_rows(&normed, d, mapping, Some(format));
+                let slack = sum_slack(&flips, &operand);
                 let projected = projection
                     .kernel(&device, mapping)
                     .call(attention_project::Args {
@@ -445,7 +443,7 @@ fn cuda_scaled_projections_match_host_model() {
                 let outputs = [&projected.r0, &projected.r1, &projected.r2, &projected.r3];
                 for (segment, projected) in outputs.into_iter().enumerate() {
                     let segment_factor = f64::from(SCALES[segment]);
-                    let (values, tolerance) = rounded_segment(
+                    let (values, sums) = project_with_slack(
                         &x,
                         &slack,
                         &projections[segment],
@@ -454,34 +452,39 @@ fn cuda_scaled_projections_match_host_model() {
                         d,
                         mapping,
                     );
-                    check(
+                    // The F32 sum times the scale, rounded to F32, then to A.
+                    let (scaled, tolerance): (Vec<f64>, Vec<f64>) = values
+                        .iter()
+                        .zip(&sums)
+                        .map(|(value, sums)| {
+                            let scaled = segment_factor * value;
+                            let product =
+                                Float::F32.rounded_from_exact(segment_factor.abs() * sums, scaled);
+                            (scaled, published_bound(scaled, product))
+                        })
+                        .unzip();
+                    assert_within(
                         &format!(
                             "scaled attention project {format:?} M={m} {mapping:?} segment {segment}"
                         ),
                         &read_bf16(projected),
-                        &values
-                            .iter()
-                            .map(|value| segment_factor * value)
-                            .collect::<Vec<_>>(),
-                        &tolerance
-                            .iter()
-                            .map(|tolerance| segment_factor * tolerance + 1e-6)
-                            .collect::<Vec<_>>(),
+                        &scaled,
+                        &tolerance,
                     );
                 }
 
                 let (x, _) = operand_rows(&gated_values, k, mapping, Some(format));
-                let (projected, magnitude) = project(&x, &output.values, m, d, k);
-                let dequant = dequant_bound(&x, &output.values, m, d, k, mapping);
-                let expected: Vec<f64> = (0..m * d)
-                    .map(|i| f64::from(hidden_values[i]) + factor * projected[i])
-                    .collect();
-                let tolerance: Vec<f64> = (0..m * d)
+                let (projected, sums) =
+                    project(&x, &output.values, format.resident(), m, d, k, mapping);
+                // residual + round_A(fl(scale · ŝ)), in F32.
+                let (expected, tolerance): (Vec<f64>, Vec<f64>) = (0..m * d)
                     .map(|i| {
-                        factor * (projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i])
-                            + 1e-6
+                        let residual = f64::from(hidden_values[i]);
+                        let scaled = factor * projected[i];
+                        let product = Float::F32.rounded_from_exact(factor.abs() * sums[i], scaled);
+                        (residual + scaled, residual_bound(residual, scaled, product))
                     })
-                    .collect();
+                    .unzip();
                 let result = output_projection
                     .kernel(&device, mapping)
                     .call(attention_output::Args {
@@ -494,7 +497,7 @@ fn cuda_scaled_projections_match_host_model() {
                     })
                     .unwrap()
                     .value;
-                check(
+                assert_within(
                     &format!("scaled attention output {format:?} M={m} {mapping:?}"),
                     &read_f32(&result),
                     &expected,

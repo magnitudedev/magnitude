@@ -9,8 +9,8 @@
 //! different operator.
 //!
 //! Some forms exist only as interface points for deferred families (plan §9):
-//! hyper-connection mixing inside parallel branches, latent attention, and an
-//! n-gram input outside the decoder. They are legal descriptions;
+//! hyper-connection mixing inside parallel branches and an n-gram input
+//! outside the decoder. They are legal descriptions;
 //! [`ModelDefinition::deferred_forms`](crate::ModelDefinition::deferred_forms)
 //! names them so an executor rejects them with a typed error.
 
@@ -61,10 +61,8 @@ pub enum HyperConnectionMixing {
     /// normalized streams, `B = I`, `C` the inject values.
     LowRankGated { rank: u64 },
     /// Each site projects the flattened streams once ([`SinkhornSite`]),
-    /// in a single pass: `A` the per-stream scalars `pre` of the *previous*
-    /// site (a `[S]` F32 carry per row from one site to the next, across
-    /// block boundaries; the one-hot `[1, 0, .., 0]` before the first
-    /// site), `B` this site's doubly stochastic `comb` after `iterations`
+    /// in a single pass: `A` per-stream scalars `pre`, whose site `input`
+    /// names, `B` this site's doubly stochastic `comb` after `iterations`
     /// normalizations, `C` its `post` values. `epsilon` is added to `pre`,
     /// to `comb`'s softmax and to every normalization's denominator;
     /// `norm_epsilon` is the projection's RMS statistic's.
@@ -72,7 +70,20 @@ pub enum HyperConnectionMixing {
         iterations: u64,
         epsilon: f64,
         norm_epsilon: f64,
+        input: SinkhornInput,
     },
+}
+
+/// Whose `pre` a Sinkhorn site mixes its sublayer's input with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SinkhornInput {
+    /// The *previous* site's: a `[S]` F32 carry per row from one site to
+    /// the next, across block boundaries; the one-hot `[1, 0, .., 0]`
+    /// before the first site (DeepSeek V4.1).
+    PreviousSite,
+    /// The site's own, formed from the streams it mixes; nothing is carried
+    /// between sites (GLM-5.3-Flash).
+    OwnSite,
 }
 
 /// How token rows enter the residual stream.
@@ -154,8 +165,12 @@ pub struct HyperConnectionExit {
 pub enum ExitSite {
     /// A low-rank site of its own, without inject weights.
     Own(LowRankGatedSite),
-    /// The last sublayer site's `pre`, under Sinkhorn mixing.
+    /// The last sublayer site's `pre`, under Sinkhorn mixing from the
+    /// previous site's (`SinkhornInput::PreviousSite`), which carries it.
     PreviousSite,
+    /// No site: the streams' unweighted mean `Σ_s X[s] / S`, under any
+    /// mixing.
+    Mean,
 }
 
 /// One hyper-connection mix site's weights, of the decoder's
@@ -202,8 +217,8 @@ pub struct LowRankGatedSite {
 ///        comb / (rowsum(comb) + epsilon), comb / (colsum(comb) + epsilon)
 /// ```
 ///
-/// The sublayer input is `Σ_s pre[s]·X[s]` with the previous site's `pre`,
-/// normalized by its input's norm; the
+/// The sublayer input is `Σ_s pre[s]·X[s]` with the `pre` the mixing's
+/// [`SinkhornInput`] names, normalized by its input's norm; the
 /// sublayer's [`OutputForm::Scatter`] writes `post[d]·y + Σ_s comb[s, d]·X[s]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SinkhornSite {
@@ -289,8 +304,6 @@ pub enum OutputForm {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operator {
     Attention(Box<Attention>),
-    /// Deferred (§9): latent multi-query attention.
-    LatentAttention(Box<LatentAttention>),
     GatedDelta(Box<GatedDelta>),
     ShortConv(Box<ShortConv>),
     StateSpace(Box<StateSpace>),
@@ -310,7 +323,6 @@ impl Operator {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Attention(_) => "attention",
-            Self::LatentAttention(_) => "latent attention",
             Self::GatedDelta(_) => "gated delta",
             Self::ShortConv(_) => "short convolution",
             Self::StateSpace(_) => "state space",
@@ -339,14 +351,17 @@ pub enum BranchOutput {
 
 // --- attention ---------------------------------------------------------------
 
-/// Softmax attention over history spans. `W` is the head width of queries,
-/// keys and values alike.
+/// Softmax attention over history spans. `W` is the head width of the
+/// queries the softmax reads, of keys and of values alike; with absorbed
+/// query keys ([`QueryKeys::Absorbed`]) the query projection's heads have
+/// their own width.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Attention {
     pub heads: u64,
     pub kv_heads: u64,
     pub width: u64,
     pub query: QueryProjection,
+    pub query_keys: QueryKeys,
     pub gate: AttentionGate,
     pub query_norm: HeadNorm,
     /// The history sources one softmax reads, never empty. The first is the
@@ -369,7 +384,8 @@ pub struct Attention {
 
 /// The projection of the normed input `x` to the query heads (and, when the
 /// gate is interleaved, their gate rows): `Q` rows, `heads·W`, or `2·heads·W`
-/// when the gate is interleaved with each head's query rows.
+/// when the gate is interleaved with each head's query rows, or
+/// `heads·width` before an absorption ([`QueryKeys`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum QueryProjection {
     /// `[Q, hidden]`.
@@ -382,6 +398,30 @@ pub enum QueryProjection {
         norm: RmsNorm,
         up: WeightDescriptor,
     },
+}
+
+/// How each projected query head meets the keys: directly, or through its
+/// own projection into the keys' space, the query-side twin of a grouped
+/// output ([`OutputProjection::GroupedLowRank`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum QueryKeys {
+    /// The query projection yields `heads·W` rows (with an interleaved gate,
+    /// `2·heads·W`): each head is the `W`-wide query the softmax reads.
+    Direct,
+    /// The query projection yields `heads·width` rows; head `h`'s query is
+    /// `q'_h = weight[h·W .. (h+1)·W] · q_h`, `weight` `[heads·W, width]`,
+    /// accumulated in F32 at run time. Each history row is one latent `c`
+    /// every head reads as its key and value through its own projections
+    /// (`k_h = W_UK_h c`, `v_h = W_UV_h c`): `weight`'s block `h` is
+    /// `W_UK_hᵀ`, so `q_h · k_h = q'_h · c`, and `W_UV_h` is a grouped
+    /// output's block `h` (multi-head latent attention, absorbed).
+    ///
+    /// The rows are the layer's own projected key rows, stored as their
+    /// values ([`ValueSource::StoredKey`]), one key head, with neither a
+    /// rotary nor a query norm. A rotary part (partial-RoPE latent
+    /// attention) would follow the latent in each row and keep its own
+    /// query columns after each head's `q'_h`.
+    Absorbed { weight: WeightDescriptor, width: u64 },
 }
 
 /// The columns of each of a grouped low-rank output's `groups` runs over
@@ -564,27 +604,42 @@ impl From<TokenDomain> for HistoryDomain {
 /// One row per complete group of `rate` tokens, `[t·rate, (t+1)·rate)`:
 ///
 /// ```text
-/// u_i     = projection·x_i                       (F32, per token i of the group)
+/// u_i     = token_norm(projection·x_i)           (F32, per token i of the group)
 /// pooled  = pool(u)                              (per channel)
-/// latent  = RMS(pooled)·norm
+/// latent  = pooled_norm(pooled)
 /// row     = rounding(rotary(latent, coordinates(first token of the group)))
 /// ```
 ///
-/// The rotary is the reading attention's key rotary in its layout over `W`.
-/// A group's row exists once its last token has been seen, so a query at `t`
-/// reads rows `b < (t + 1) / rate`. The tokens of the incomplete group are
-/// producer state: their F32 projections (and gate scores) in a
-/// `Window(rate − 1)` domain, which rollback, fork and checkpoints treat as
-/// any window.
+/// with the one norm `norm` places ([`PoolNorm`]) and the other the
+/// identity. The rotary is the reading attention's key rotary in its layout
+/// over `W`. A group's row exists once its last token has been seen, so a
+/// query at `t` reads rows `b < (t + 1) / rate`. The tokens of the
+/// incomplete group are producer state: their F32 projections (and gate
+/// scores) in a `Window(rate − 1)` domain, which rollback, fork and
+/// checkpoints treat as any window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PooledRows {
     pub rate: u64,
     /// `[W, hidden]`.
     pub projection: WeightDescriptor,
     pub pool: Pool,
-    /// `[W]`.
-    pub norm: RmsNorm,
+    pub norm: PoolNorm,
     pub rounding: RowRounding,
+}
+
+/// Where a pooled source's norm sits, and its kind.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PoolNorm {
+    /// On the pooled row: `RMS(pooled)·weight`, `weight` `[W]` (DeepSeek
+    /// V4.1, Qwen4exp).
+    Pooled(RmsNorm),
+    /// On each token's projection before pooling:
+    /// `(u − mean(u)) · rsqrt(var(u) + epsilon) · norm.weight + bias`,
+    /// `norm.weight` and `bias` `[W]` (GLM-5.3-Flash's indexer keys).
+    Token {
+        norm: LayerNorm,
+        bias: WeightDescriptor,
+    },
 }
 
 /// How a group's per-token projections become one row, per channel `d`.
@@ -594,9 +649,15 @@ pub enum Pool {
     Identity,
     /// `rate >= 2`: `Σ_i u_i[d] / rate`.
     Mean,
-    /// `rate >= 2`: `Σ_i softmax_i(g[d])·u_i[d]`, with `g_i = gate·x_i`
-    /// (`gate` `[W, hidden]`, F32) and the softmax over the group's tokens.
-    SoftmaxGated { gate: WeightDescriptor },
+    /// `rate >= 2`: `Σ_i softmax_i(g_i[d])·u_i[d]`, with
+    /// `g_i = gate·x_i (+ position[i])` (`gate` `[W, hidden]`, F32), `i` the
+    /// token's place in its group, and the softmax over the group's tokens.
+    /// `position` `[rate, W]` is an additive per-place gate term
+    /// (GLM-5.3-Flash's `ape`).
+    SoftmaxGated {
+        gate: WeightDescriptor,
+        position: Option<WeightDescriptor>,
+    },
 }
 
 /// A trained rounding of a row's values, part of the model's numerics: the
@@ -889,14 +950,6 @@ pub struct RotaryDivisors {
     pub bases: Vec<f64>,
 }
 
-/// Deferred (§9): latent multi-query attention over pre-roped latent rows.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LatentAttention {
-    pub heads: u64,
-    pub latent_width: u64,
-    pub rotary_width: u64,
-}
-
 // --- recurrent mixers --------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,7 +959,14 @@ pub enum RecurrentHeadMapping {
     Tiled,
 }
 
-/// Gated DeltaNet.
+/// The gated delta rule over `value_heads` heads of `width`-square state
+/// (Gated DeltaNet; Kimi Delta Attention). Per row: `q | k | v` channels are
+/// projected, convolved (depthwise, causal, `convolution_width` taps, then
+/// SiLU), `q` and `k` L2-normalized per head (`x / sqrt(Σx² + key_norm_epsilon)`,
+/// `q` then scaled by `width^-1/2`); with `β = sigmoid(beta·x)` per head and
+/// the decay `d` (one log-decay per head or per key channel, [`RecurrentDecay`]),
+/// each head's state (rows by value, columns by key) advances
+/// `S ← S·diag(d)`, `S ← S + β (v − S k) kᵀ` and outputs `S q`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GatedDelta {
     pub convolution_width: u64,
@@ -914,22 +974,19 @@ pub struct GatedDelta {
     pub value_heads: u64,
     pub width: u64,
     pub head_mapping: RecurrentHeadMapping,
-    /// `[channels, hidden]`.
+    /// `[channels, hidden]`: q heads, k heads, then v heads.
     pub query_key_value: WeightDescriptor,
-    /// `[value_heads·W, hidden]`.
-    pub gate: WeightDescriptor,
-    /// `[value_heads, hidden]`.
-    pub alpha: WeightDescriptor,
-    pub beta: WeightDescriptor,
     /// `[channels, convolution_width]`.
     pub convolution: WeightDescriptor,
-    /// `[value_heads]`.
-    pub decay: WeightDescriptor,
-    pub time_bias: WeightDescriptor,
+    /// `[value_heads, hidden]`.
+    pub beta: WeightDescriptor,
+    pub decay: RecurrentDecay,
+    /// The epsilon of the q and k L2 norms.
+    pub key_norm_epsilon: f64,
     /// Gated normalization of each head's output, `[W]`:
-    /// `RMS(o)·norm ⊙ output_gate(gate·x)`.
+    /// `RMS(o)·norm ⊙ output_gate.function(output_gate.projection·x)`.
     pub norm: RmsNorm,
-    pub output_gate: GateFunction,
+    pub output_gate: RecurrentGate,
     /// `[hidden, value_heads·W]`.
     pub output: WeightDescriptor,
 }
@@ -943,6 +1000,67 @@ impl GatedDelta {
             .and_then(|count| count.checked_mul(self.width))
             .ok_or_else(|| DefinitionError::new("gated delta dimensions overflow"))
     }
+
+    /// Log-decays per value head and row: one, or one per key channel.
+    pub fn decay_width(&self) -> u64 {
+        match self.decay {
+            RecurrentDecay::PerHead { .. } => 1,
+            RecurrentDecay::PerChannel { .. } => self.width,
+        }
+    }
+}
+
+/// `up·(down·x)`: `down` `[rank, input]`, `up` `[output, rank]`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LowRank {
+    pub down: WeightDescriptor,
+    pub up: WeightDescriptor,
+}
+
+/// A gated delta rule's decay, as its natural log `log d ≤ 0`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RecurrentDecay {
+    /// One per head (Gated DeltaNet): `log d_h = decay[h]·softplus(alpha·x +
+    /// time_bias[h])`, `alpha` `[value_heads, hidden]`, `time_bias` and
+    /// `decay` (`−exp(A_log)`) `[value_heads]`.
+    PerHead {
+        alpha: WeightDescriptor,
+        time_bias: WeightDescriptor,
+        decay: WeightDescriptor,
+    },
+    /// One per key channel of each head (Kimi Delta Attention):
+    /// `log d_{h,c} = gate(−decay[h]·(projection·x + bias)_{h,c})`,
+    /// `projection` `[value_heads·W]` rows, `bias` `[value_heads·W]`, `decay`
+    /// (`−exp(A_log)`) `[value_heads]`.
+    PerChannel {
+        projection: LowRank,
+        bias: WeightDescriptor,
+        decay: WeightDescriptor,
+        gate: DecayGate,
+    },
+}
+
+/// The map from a per-channel decay's scaled input to its log-decay.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DecayGate {
+    /// `lower·sigmoid(z)`, `lower < 0`: each step's log-decay is in
+    /// `(lower, 0)`.
+    BoundedSigmoid { lower: f64 },
+}
+
+/// The gate of a gated delta rule's normalized output: `function` of the
+/// `[value_heads·W]` row `projection` makes of `x`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecurrentGate {
+    pub projection: GateProjection,
+    pub function: GateFunction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GateProjection {
+    /// `[value_heads·W, hidden]`.
+    Full(WeightDescriptor),
+    LowRank(LowRank),
 }
 
 /// Gated short convolution (LFM2): `y = C ⊙ conv(B ⊙ X)` with a depthwise
@@ -1415,7 +1533,6 @@ impl NGramHash {
 pub enum DeferredForm {
     HyperConnectionMix,
     HyperConnectionHead,
-    LatentAttention,
     NGramInput,
 }
 
@@ -1424,7 +1541,6 @@ impl DeferredForm {
         match self {
             Self::HyperConnectionMix => "hyper-connection input mixing",
             Self::HyperConnectionHead => "hyper-connection readout head",
-            Self::LatentAttention => "latent attention",
             Self::NGramInput => "n-gram input",
         }
     }
@@ -1618,7 +1734,6 @@ pub(crate) fn blocks_deferred_forms(blocks: &[Block], forms: &mut Vec<DeferredFo
 fn operator_deferred_forms(op: &Operator, forms: &mut Vec<DeferredForm>) {
     match op {
         Operator::Attention(_) => {}
-        Operator::LatentAttention(_) => forms.push(DeferredForm::LatentAttention),
         Operator::NGramInput(_) => forms.push(DeferredForm::NGramInput),
         Operator::Parallel(branches) => {
             for branch in branches {
@@ -2045,14 +2160,6 @@ fn validate_operator(op: &Operator, context: &Context) -> Result<(), DefinitionE
     let hidden = context.hidden;
     match op {
         Operator::Attention(attention) => validate_attention(attention, context),
-        Operator::LatentAttention(latent) => {
-            if [latent.heads, latent.latent_width].contains(&0)
-                || latent.rotary_width > latent.latent_width
-            {
-                return Err(DefinitionError::new("invalid latent attention geometry"));
-            }
-            Ok(())
-        }
         Operator::GatedDelta(delta) => validate_gated_delta(delta, hidden),
         Operator::ShortConv(conv) => {
             if conv.channels == 0 || conv.width < 2 {
@@ -2144,9 +2251,22 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
         return Err(DefinitionError::new("invalid attention geometry"));
     }
     let head_rows = checked_product(&[attention.heads, width])?;
-    let query_rows = match attention.gate {
-        AttentionGate::Interleaved { .. } => checked_product(&[2, head_rows])?,
-        _ => head_rows,
+    let query_rows = match &attention.query_keys {
+        QueryKeys::Direct => match attention.gate {
+            AttentionGate::Interleaved { .. } => checked_product(&[2, head_rows])?,
+            _ => head_rows,
+        },
+        QueryKeys::Absorbed {
+            weight,
+            width: query_width,
+        } => {
+            validate_absorbed(attention)?;
+            if *query_width == 0 {
+                return Err(DefinitionError::new("invalid absorbed query width"));
+            }
+            expect_shape(weight, &[head_rows, *query_width], "absorbed query keys")?;
+            checked_product(&[attention.heads, *query_width])?
+        }
     };
     match &attention.query {
         QueryProjection::Full(query) => {
@@ -2287,6 +2407,32 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
     }
 }
 
+/// The form absorbed query keys read ([`QueryKeys::Absorbed`]): the layer's
+/// own latent rows, stored as their own values, of one key head, without a
+/// rotary, a query norm or gate rows interleaved with the query's.
+fn validate_absorbed(attention: &Attention) -> Result<(), DefinitionError> {
+    let refused = |what: &str| Err(DefinitionError::new(format!("absorbed query keys {what}")));
+    if attention.kv_heads != 1 {
+        return refused("over more than one key head");
+    }
+    if !matches!(attention.rotary, Rotary::None) {
+        return refused("with a rotary");
+    }
+    if !matches!(attention.query_norm, HeadNorm::None) {
+        return refused("with a query norm");
+    }
+    if matches!(attention.gate, AttentionGate::Interleaved { .. }) {
+        return refused("with an interleaved gate");
+    }
+    match attention.history.first().map(|source| &source.rows) {
+        Some(HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+            value: ValueSource::StoredKey,
+            ..
+        }))) => Ok(()),
+        _ => refused("over rows other than the layer's own stored keys"),
+    }
+}
+
 fn validate_projected(
     rows: &ProjectedRows,
     attention: &Attention,
@@ -2333,8 +2479,11 @@ fn validate_pooled(
     let pooled = match &rows.pool {
         Pool::Identity => rows.rate == 1,
         Pool::Mean => rows.rate >= 2,
-        Pool::SoftmaxGated { gate } => {
+        Pool::SoftmaxGated { gate, position } => {
             expect_shape(gate, &[width, hidden], role)?;
+            if let Some(position) = position {
+                expect_shape(position, &[rows.rate, width], role)?;
+            }
             rows.rate >= 2
         }
     };
@@ -2342,7 +2491,14 @@ fn validate_pooled(
         return Err(DefinitionError::new(format!("{role}: pool and rate disagree")));
     }
     expect_shape(&rows.projection, &[width, hidden], role)?;
-    validate_rms(&rows.norm, width, role)?;
+    match &rows.norm {
+        PoolNorm::Pooled(norm) => validate_rms(norm, width, role)?,
+        PoolNorm::Token { norm, bias } => {
+            expect_shape(&norm.weight, &[width], role)?;
+            positive_epsilon(norm.epsilon)?;
+            expect_shape(bias, &[width], role)?;
+        }
+    }
     validate_rounding(rows.rounding, width, role)
 }
 
@@ -2530,37 +2686,70 @@ fn validate_gated_delta(delta: &GatedDelta, hidden: u64) -> Result<(), Definitio
     {
         return Err(DefinitionError::new("invalid gated delta geometry"));
     }
+    positive_epsilon(delta.key_norm_epsilon)?;
     let channels = delta.channels()?;
     let inner = checked_product(&[delta.value_heads, delta.width])?;
+    let heads = delta.value_heads;
     expect_shape(
         &delta.query_key_value,
         &[channels, hidden],
         "gated delta query/key/value projection",
-    )?;
-    expect_shape(&delta.gate, &[inner, hidden], "gated delta gate")?;
-    expect_shape(
-        &delta.alpha,
-        &[delta.value_heads, hidden],
-        "gated delta alpha",
-    )?;
-    expect_shape(
-        &delta.beta,
-        &[delta.value_heads, hidden],
-        "gated delta beta",
     )?;
     expect_shape(
         &delta.convolution,
         &[channels, delta.convolution_width],
         "gated delta convolution",
     )?;
-    expect_shape(&delta.decay, &[delta.value_heads], "gated delta decay")?;
-    expect_shape(
-        &delta.time_bias,
-        &[delta.value_heads],
-        "gated delta time bias",
-    )?;
+    expect_shape(&delta.beta, &[heads, hidden], "gated delta beta")?;
+    match &delta.decay {
+        RecurrentDecay::PerHead {
+            alpha,
+            time_bias,
+            decay,
+        } => {
+            expect_shape(alpha, &[heads, hidden], "gated delta alpha")?;
+            expect_shape(time_bias, &[heads], "gated delta time bias")?;
+            expect_shape(decay, &[heads], "gated delta decay")?;
+        }
+        RecurrentDecay::PerChannel {
+            projection,
+            bias,
+            decay,
+            gate: DecayGate::BoundedSigmoid { lower },
+        } => {
+            if !lower.is_finite() || *lower >= 0.0 {
+                return Err(DefinitionError::new(
+                    "gated delta decay lower bound must be finite and negative",
+                ));
+            }
+            validate_low_rank_projection(projection, inner, hidden, "gated delta decay projection")?;
+            expect_shape(bias, &[inner], "gated delta decay bias")?;
+            expect_shape(decay, &[heads], "gated delta decay")?;
+        }
+    }
+    match &delta.output_gate.projection {
+        GateProjection::Full(gate) => expect_shape(gate, &[inner, hidden], "gated delta gate")?,
+        GateProjection::LowRank(gate) => {
+            validate_low_rank_projection(gate, inner, hidden, "gated delta gate")?
+        }
+    }
     validate_rms(&delta.norm, delta.width, "gated delta norm")?;
     expect_shape(&delta.output, &[hidden, inner], "gated delta output")
+}
+
+/// `projection` maps `input` columns to `output` rows through a nonzero rank.
+fn validate_low_rank_projection(
+    projection: &LowRank,
+    output: u64,
+    input: u64,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    let rank = projection.down.shape.first().copied().unwrap_or(0);
+    if rank == 0 {
+        return Err(DefinitionError::new(format!("{role} has no rank")));
+    }
+    expect_shape(&projection.down, &[rank, input], role)?;
+    expect_shape(&projection.up, &[output, rank], role)
 }
 
 fn validate_state_space(space: &StateSpace, hidden: u64) -> Result<(), DefinitionError> {
@@ -2710,15 +2899,19 @@ pub(crate) fn validate_exit_norm(
                     if !matches!(
                         context.residual,
                         ResidualForm::HyperConnections(HyperConnections {
-                            mixing: HyperConnectionMixing::Sinkhorn { .. },
+                            mixing: HyperConnectionMixing::Sinkhorn {
+                                input: SinkhornInput::PreviousSite,
+                                ..
+                            },
                             ..
                         })
                     ) {
                         return Err(DefinitionError::new(format!(
-                            "{role} reads the previous site's coefficients without Sinkhorn mixing"
+                            "{role} reads the previous site's coefficients without Sinkhorn mixing that carries them"
                         )));
                     }
                 }
+                ExitSite::Mean => {}
             }
             validate_mixed_norm(exit.norm.as_ref(), context, role)
         }

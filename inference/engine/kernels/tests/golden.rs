@@ -2064,6 +2064,7 @@ fn vision_norm(ctx: &Ctx) -> Vec<Variant> {
                             f32s(1e-6),
                             i32s(1),
                             i32s(0),
+                            i32s(0),
                         ],
                     })
                     .collect();

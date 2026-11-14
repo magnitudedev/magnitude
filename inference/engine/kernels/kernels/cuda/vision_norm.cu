@@ -23,5 +23,5 @@ extern "C" __global__ void vision_norm(SEISMIC_KERNEL_PARAMS) {
     vision::norm<Y, WeightElement, BiasElement, SEISMIC_DIM_NW == 1, SEISMIC_DIM_NB == 1>(
         source + (u64)from * h, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + first * Y::bytes, interleave ? g : 1,
         SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_PTR(SEISMIC_BUFFER_BIAS), h, (int)SEISMIC_PARAM_CENTERED != 0,
-        __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), partials);
+        __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), (int)SEISMIC_PARAM_ACTIVATION, partials);
 }

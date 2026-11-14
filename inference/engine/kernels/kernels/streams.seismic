@@ -10,9 +10,9 @@
 # output joins the streams through the output entry's `scatter` with the
 # inject values (`functions.seismic`). The decoder's exit is a mix site
 # without inject (C = 0) whose partials the readout sums. Under Sinkhorn
-# mixing a site is one entry (`stream_mix_sinkhorn`) reading the previous
-# site's pre, and the exit collapses the streams by the last site's pre
-# (`stream_collapse`).
+# mixing a site is one entry (`stream_mix_sinkhorn`) mixing by the previous
+# site's pre or its own, and the exit collapses the streams by the last
+# site's pre or into their mean (`stream_collapse`).
 #
 # The mix entries read the streams and their norm through `[M, S, H]` and
 # `[S, H]` views of the row-major `[M, S * H]` and `[S * H]` tensors, which
@@ -95,20 +95,24 @@ fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, L
 #   comb = rowsoftmax(m[2S:] scale[2] + base[2S:]) + epsilon      ([S, S], source major)
 #   then `iterations` sweeps, each comb = comb / (rowsum + epsilon) (every
 #   sweep but the first) and comb = comb / (colsum + epsilon)
-# in F32. Results: the sublayer's input `sum_s previous[s] X[s]` (the
-# previous site's pre, which its consumer normalizes: `form_input`, PT = 1),
-# this site's pre (the next site's `previous`), and the join row
-# post | comb its sublayer's output entry scatters with (`scatter`,
-# IN = S + S * S). `iterations`, the model's Sinkhorn iteration count, is a
-# runtime argument, as epsilon is; zero leaves comb at its softmax rows.
-fn stream_mix_sinkhorn[M, H, S](hidden: &tensor[M, S, H] f32, previous: &tensor[M, S] f32,
+# in F32. Results: the sublayer's input `sum_s pre'[s] X[s]` (which its
+# consumer normalizes: `form_input`, PT = 1), the pre the next site reads,
+# and the join row post | comb its sublayer's output entry scatters with
+# (`scatter`, IN = S + S * S). `P` names whose pre' mixes the input
+# (`SinkhornInput`): P = 1 the previous site's `previous`, and the site
+# publishes its own pre for the next; P = 0 its own, and nothing is carried
+# (`previous` and the published pre are empty). `iterations`, the model's
+# Sinkhorn iteration count, is a runtime argument, as epsilon is; zero
+# leaves comb at its softmax rows.
+fn stream_mix_sinkhorn[M, H, S, P](hidden: &tensor[M, S, H] f32, previous: &tensor[M, P * S] f32,
     function: &tensor[(2 + S) * S, S * H] f32, base: &tensor[(2 + S) * S] f32, scale: &tensor[3] f32,
     epsilon: f32, norm_epsilon: f32, iterations: u32)
-    -> (tensor[M, H] f32, tensor[M, S] f32, tensor[M, S + S * S] f32) where S >= 1:
+    -> (tensor[M, H] f32, tensor[M, P * S] f32, tensor[M, S + S * S] f32) where S >= 1 and P >= 0 and P <= 1:
     let mut flat = tensor[M, S * H] f32
     let mut mixes = tensor[M, (2 + S) * S] f32
     let mut input = tensor[M, H] f32
     let mut pre = tensor[M, S] f32
+    let mut carried = tensor[M, P * S] f32
     let mut join = tensor[M, S + S * S] f32
     parallel for row in 0..M:
         parallel for stream in 0..S:
@@ -154,13 +158,19 @@ fn stream_mix_sinkhorn[M, H, S](hidden: &tensor[M, S, H] f32, previous: &tensor[
         for source in 0..S:
             for target in 0..S:
                 join[row, S + source * S + target] = comb[source, target]
-    collapse(hidden, previous, input)
-    return input, pre, join
+    parallel for row in 0..M:
+        parallel for stream in 0..P * S:
+            carried[row, stream] = pre[row, stream]
+    if P > 0:
+        collapse(hidden, previous[:, 0:S], input)
+    else:
+        collapse(hidden, pre, input)
+    return input, carried, join
 
 # Each row's streams collapsed by its per-stream scalars `carried`:
 # `sum_s carried[s] X[s]` in F32, in stream order. A Sinkhorn site's
-# sublayer input (with the previous site's pre) and the decoder's exit (with
-# the last site's pre, `stream_collapse`).
+# sublayer input (with the previous site's pre or its own) and the
+# decoder's exit (`stream_collapse`).
 fn collapse[M, H, S](hidden: &tensor[M, S, H] f32, carried: &tensor[M, S] f32,
     result: &mut tensor[M, H] f32):
     parallel for row in 0..M:
@@ -170,13 +180,24 @@ fn collapse[M, H, S](hidden: &tensor[M, S, H] f32, carried: &tensor[M, S] f32,
                 sum = sum + carried[row, stream] * hidden[row, stream, column]
             result[row, column] = sum
 
-# The decoder's exit over Sinkhorn streams (`ExitSite::PreviousSite`): the
-# streams collapsed by the last site's pre (`collapse`), which the readout
-# normalizes by the exit norm.
-fn stream_collapse[M, H, S](hidden: &tensor[M, S, H] f32, pre: &tensor[M, S] f32) -> tensor[M, H] f32
-    where S >= 1:
+# The decoder's exit over Sinkhorn streams, which the readout normalizes by
+# the exit norm. `P` names the exit, as it names a site's input
+# (`stream_mix_sinkhorn`): P = 1 the streams collapsed by the last site's
+# pre (`ExitSite::PreviousSite`); P = 0 their mean (`ExitSite::Mean`, `pre`
+# empty), summed in stream order and divided by S, `Σ_s X[s] / S` exactly
+# for any S.
+fn stream_collapse[M, H, S, P](hidden: &tensor[M, S, H] f32, pre: &tensor[M, P * S] f32)
+    -> tensor[M, H] f32 where S >= 1 and P >= 0 and P <= 1:
     let mut result = tensor[M, H] f32
-    collapse(hidden, pre, result)
+    if P > 0:
+        collapse(hidden, pre[:, 0:S], result)
+    else:
+        parallel for row in 0..M:
+            parallel for column in 0..H:
+                let mut sum = f32(0.0)
+                for stream in 0..S:
+                    sum = sum + hidden[row, stream, column]
+                result[row, column] = sum / f32(S)
     return result
 
 # A sublayer's F32 output `y` joining the streams by its site's inject
@@ -439,15 +460,16 @@ const SINKHORN_TILE = 16
 
 # Metal, CUDA and Vulkan: at every row count SINKHORN_SPLIT threadgroups a
 # row tile each reduce a contiguous slice of its rows' columns into the
-# scratch and mix their share of the input, and a second launch sums each
-# row's partials in slice order and forms the coefficients: each mix a sum
-# of the same S * H products in a fixed order. A decode row is a tile of its
+# scratch and, under P = 1, mix their share of the input by the previous
+# site's pre; a second launch sums each row's partials in slice order and
+# forms the coefficients, and under P = 0 mixes the row's input by the pre
+# it formed: each mix a sum of the same S * H products in a fixed order. A decode row is a tile of its
 # own, its function matrix streaming through many cores; prefill rows
 # (M > DECODE_ROWS) take tiles of SINKHORN_TILE rows that read each function
 # column once a tile. Vulkan declares its group memory: the slice sums, the
 # prefill tiles' staged columns, and the finishing launch's sums and comb.
 native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
-    static (H, S)
+    static (H, S, P)
     where S <= 8
     scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
@@ -461,7 +483,7 @@ native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
         threads_per_threadgroup (256, 1, 1)
 
 native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
-    static (H, S)
+    static (H, S, P)
     where S <= 8
     scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
@@ -475,7 +497,7 @@ native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
         threads_per_threadgroup (256, 1, 1)
 
 native stream_mix_sinkhorn for vulkan from "vulkan/stream_mix_sinkhorn.comp":
-    static (H, S)
+    static (H, S, P)
     where S <= 8
     scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
     launch stream_mix_sinkhorn_split when M <= DECODE_ROWS:
@@ -503,19 +525,19 @@ native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
 # Metal, CUDA and Vulkan: one threadgroup per row, its threads over the
 # columns.
 native stream_collapse for metal from "metal/stream_collapse.metal":
-    static (H, S)
+    static (H, S, P)
     launch stream_collapse:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_collapse for cuda from "cuda/stream_collapse.cu":
-    static (H, S)
+    static (H, S, P)
     launch stream_collapse:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native stream_collapse for vulkan from "vulkan/stream_collapse.comp":
-    static (H, S)
+    static (H, S, P)
     launch stream_collapse:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)

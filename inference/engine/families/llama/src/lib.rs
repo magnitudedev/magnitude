@@ -25,7 +25,7 @@ use magnitude_family_contracts::{
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     FeedForwardUp, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
     MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
-    QueryProjection, ResidualForm, RmsNorm, Sublayer,
+    QueryKeys, QueryProjection, ResidualForm, RmsNorm, Sublayer,
     ValueNorm, ValueSource, WeightDescriptor, FamilyError,
 };
 use std::{error, fmt};
@@ -391,6 +391,7 @@ pub fn inspect_components(
                 kv_heads,
                 width,
                 query: QueryProjection::Full(query),
+                query_keys: QueryKeys::Direct,
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
                 history: vec![HistorySource::visible(HistoryRows::Own(

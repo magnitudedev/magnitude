@@ -23,7 +23,9 @@ pub(crate) use certify::{CheckedTargetFamily, checked_target_and_undrafted, chec
 pub(crate) use certify::checked_target_family_storage;
 #[cfg(test)]
 pub(crate) use outline_parity::{recorded_traces, target_outline_differences};
-pub(crate) use classes::{LaunchControl, LaunchControlLayout};
+pub(crate) use classes::{
+    LaunchControl, LaunchControlLayout, complete, packed_selection_scores, selection_scores,
+};
 #[cfg(test)]
 pub(crate) use entry::checked_entry_graph_storage;
 pub(crate) use entry::{EntryTokens, TARGET_TABLE, embedding_transform};

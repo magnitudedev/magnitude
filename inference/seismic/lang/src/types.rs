@@ -239,7 +239,10 @@ pub(crate) enum ValueType {
     /// A backend-opaque intrinsic value.
     Opaque {
         capability: CapabilityId,
-        #[serde(deserialize_with = "crate::registry::deserialize_declared_name")]
+        #[serde(
+            serialize_with = "crate::registry::serialize_declared_name",
+            deserialize_with = "crate::registry::deserialize_declared_name"
+        )]
         name: crate::registry::DeclaredName,
     },
     /// The canonical form of an empty result or tuple.

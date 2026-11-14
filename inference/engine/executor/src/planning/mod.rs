@@ -25,6 +25,7 @@ pub use assessment::{
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, TargetGraphBounds, UndraftedBounds, VisionGraphBounds, measurement_process_bytes,
 };
 pub(crate) use assessment::fit_depth;
+pub(crate) use resources::{DomainRows, HeadHistoryGeometry};
 pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankLayers, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
@@ -53,7 +54,7 @@ pub use programs::{
     TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    ByPass, CPU_IMAGE_CELLS, FlightDepth, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
+    ByPass, CPU_IMAGE_CELLS, EVALUATION_PREFILL_ROWS, FlightDepth, StepAllowances, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
     PassLaunches, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
@@ -63,13 +64,13 @@ pub(crate) use weights::{AttentionForm, AttentionWidths, GateForm, RoundingArgum
 pub use weights::{
     AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
     DenseBinding, DenseBranchBinding, DenseScales,
-    DirectoryForm, EmbeddingBinding, FeaturesBinding, GroupedOutputBinding, GroupedOutputShape,
+    AbsorbedQueryBinding, AbsorbedQueryShape, DirectoryForm, EmbeddingBinding, FeaturesBinding, GroupedOutputBinding, GroupedOutputShape,
     HeadBinding, Holding, HostPeak, HostTablePlan, IndexerBinding, LowRankQueryBinding,
     ModelLoadPlan, PickedBinding, PooledBinding,
     NGramBinding, NGramGateForm, NGramRowRule, NGramTaps, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
     ReadoutBinding,
-    ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoundingArgs, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlacement, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    ReadoutClassChoice, ReadoutHead, RecurrentBinding, RecurrentForm, RoundingArgs, RoutedBinding, ScalableWeight,
+    SelectionBinding, SelectionKeysBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlacement, WeightPlan, WeightScalePlan, WeightStorageIdentity,
     held_storage, resident_element, resident_elements, resident_layout, scaled_source_element,
     rounding_args, source_element, stored_weights,
 };
@@ -191,6 +192,12 @@ pub(crate) mod tests {
             WeightKind::RecurrentDecay,
             WeightKind::RecurrentTimeBias,
             WeightKind::SharedRouter,
+            WeightKind::Vision(magnitude_family_contracts::VisionWeight::QueryNorm),
+            WeightKind::Vision(magnitude_family_contracts::VisionWeight::KeyNorm),
+            WeightKind::Vision(magnitude_family_contracts::VisionWeight::Linear {
+                site: magnitude_family_contracts::VisionLinearSite::Merger,
+                part: magnitude_family_contracts::LinearPart::OutputMaximum,
+            }),
         ] {
             assert_eq!(resident_dtype(role(kind), DType::BF16), DType::F32);
         }

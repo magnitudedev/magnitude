@@ -2,11 +2,12 @@
 // form of Metal's and CUDA's. Every row count takes one form: workgroup
 // (slice, tile) reduces the squares and every mix of a tile of rows over one
 // contiguous slice of their columns [slice * width / SINKHORN_SPLIT rounded
-// up, the next slice's first) into the scratch, in fixed order, and mixes
-// its share of the tile's input columns by the previous site's pre
-// (`streams_collapse`); a second launch sums each row's SINKHORN_SPLIT
+// up, the next slice's first) into the scratch, in fixed order, and under
+// P = 1 mixes its share of the tile's input columns by the previous site's
+// pre (`streams_collapse`); a second launch sums each row's SINKHORN_SPLIT
 // partials in slice order and forms pre, post and the Sinkhorn comb
-// (`stream_mix_sinkhorn_finish`). The launch boundary orders every partial
+// (`stream_mix_sinkhorn_finish`), and under P = 0 mixes the row's input by
+// that pre, which nothing carries. The launch boundary orders every partial
 // before its sum.
 // Decode rows (M <= DECODE_ROWS, `stream_mix_sinkhorn_split`) take a tile of
 // one row, all eight subgroups over its columns, reading the function
@@ -16,13 +17,16 @@
 // by every row of the tile, so the function matrix is read once a tile.
 // Group memory: the slice launches' subgroup sums [SUMS][8], then (prefill)
 // the staged columns [MIXES][SINKHORN_CHUNK]; the finishing launch's reduced
-// sums [SUMS], then the comb [S][S].
+// sums [SUMS], then the comb [S][S], whose first S floats take the pre
+// under P = 0.
 #include <seismic/element.glsl>
 #include "lib/core/precise.glsl"
 #include "lib/core/streams.glsl"
 
 #define SINKHORN_STREAMS uint(SEISMIC_DIM_S)
 #define SINKHORN_MIXES ((2u + SINKHORN_STREAMS) * SINKHORN_STREAMS)
+// Whether the input mixes by the previous site's pre (P = 1) or this site's.
+#define SINKHORN_CARRIED (uint(SEISMIC_DIM_P) != 0u)
 // A slice's reduced values: its squares, then every mix.
 #define SINKHORN_SUMS (1u + SINKHORN_MIXES)
 #define SINKHORN_THREADS 256u
@@ -133,13 +137,15 @@ void sinkhorn_slice(const bool tiled) {
         }
     }
     // The sublayer's input: the streams mixed by the previous site's pre.
-    for (uint r = 0u; r < tile_rows && row0 + r < rows; ++r) {
-        const uint64_t row = uint64_t(row0 + r);
-        streams_collapse(hidden + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul, SEISMIC_HIDDEN_STRIDE_1,
-            SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS) + row * SEISMIC_PREVIOUS_STRIDE_0 * 4ul,
-            SEISMIC_PREVIOUS_STRIDE_1, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul,
-            SEISMIC_RESULT_0_STRIDE_1, SINKHORN_STREAMS, h, gl_WorkGroupID.x * SINKHORN_THREADS + thread,
-            split * SINKHORN_THREADS);
+    if (SINKHORN_CARRIED) {
+        for (uint r = 0u; r < tile_rows && row0 + r < rows; ++r) {
+            const uint64_t row = uint64_t(row0 + r);
+            streams_collapse(hidden + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul, SEISMIC_HIDDEN_STRIDE_1,
+                SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS) + row * SEISMIC_PREVIOUS_STRIDE_0 * 4ul,
+                SEISMIC_PREVIOUS_STRIDE_1, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul,
+                SEISMIC_RESULT_0_STRIDE_1, SINKHORN_STREAMS, h, gl_WorkGroupID.x * SINKHORN_THREADS + thread,
+                split * SINKHORN_THREADS);
+        }
     }
 }
 
@@ -233,14 +239,32 @@ void stream_mix_sinkhorn_finish() {
     const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1 * 4ul;
     if (owns)
         element_f32_put(joined + uint64_t(SINKHORN_STREAMS + thread) * join_stride, value);
+    // Under P = 0 the pre replaces the comb in group memory once every
+    // invocation has read it.
+    if (!SINKHORN_CARRIED)
+        barrier();
     if (thread < SINKHORN_STREAMS) {
         const uint stream = thread;
-        element_f32_put(own + uint64_t(stream) * own_stride,
-            sinkhorn_sigmoid(seismic_shared_f32[1u + stream] * inverse * element_f32_at(scale)
-                + element_f32_at(base + uint64_t(stream) * base_stride)) + epsilon);
+        const float pre = sinkhorn_sigmoid(seismic_shared_f32[1u + stream] * inverse * element_f32_at(scale)
+            + element_f32_at(base + uint64_t(stream) * base_stride)) + epsilon;
+        if (SINKHORN_CARRIED)
+            element_f32_put(own + uint64_t(stream) * own_stride, pre);
+        else
+            seismic_shared_f32[comb + stream] = pre;
         element_f32_put(joined + uint64_t(stream) * join_stride,
             2.0 * sinkhorn_sigmoid(seismic_shared_f32[1u + SINKHORN_STREAMS + stream] * inverse
                 * element_f32_at(scale + scale_stride)
                 + element_f32_at(base + uint64_t(SINKHORN_STREAMS + stream) * base_stride)));
+    }
+    if (!SINKHORN_CARRIED) {
+        barrier();
+        // The sublayer's input: the streams mixed by this site's pre.
+        float carried[8];
+        for (uint stream = 0u; stream < SINKHORN_STREAMS; ++stream)
+            carried[stream] = seismic_shared_f32[comb + stream];
+        streams_collapse(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul,
+            SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, carried,
+            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul, SEISMIC_RESULT_0_STRIDE_1,
+            SINKHORN_STREAMS, uint(SEISMIC_DIM_H), thread, SINKHORN_THREADS);
     }
 }

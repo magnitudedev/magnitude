@@ -6,7 +6,7 @@ use super::tuning::{
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
-        IndexerProjectTuning, LowRankQueryProjectTuning, PooledProjectInput,
+        LowRankQueryProjectTuning, PooledProjectInput,
         PooledProjectTuning, PrefillListing, history_window, picked_rows,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
@@ -21,9 +21,9 @@ use super::tuning::{
         SelectedRowsTuning, ShapeRowsTuning,
     },
     recurrent::{
-        RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectConvolvedTuning,
-        RecurrentProjectTuning, RecurrentShape, RecurrentState, RecurrentStepConvolvedTuning,
-        RecurrentStepTuning,
+        KimiChunkTuning, KimiProjectTuning, KimiState, KimiStepTuning, RecurrentChunkTuning,
+        RecurrentOutputTuning, RecurrentProjectConvolvedTuning, RecurrentProjectTuning,
+        RecurrentShape, RecurrentState, RecurrentStepConvolvedTuning, RecurrentStepTuning,
     },
     routed::{
         RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
@@ -44,7 +44,7 @@ use crate::operators::routed::fused_graph::DecodeForm;
 use crate::operators::streams::{BlockStreams, SinkhornBinding, SiteEntryBindings};
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
-    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
+    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, RecurrentForm, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
 use magnitude_family_contracts::{
@@ -57,7 +57,7 @@ use magnitude_kernels::{
     draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, indexer_keys, indexer_score, moe_tail, ngram_add, ngram_gate,
-    ngram_inject, ngram_rows, pool_rows, rows_topk,
+    ngram_inject, ngram_rows, pool_rows, rows_topk, unit_reads,
     packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
     selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
@@ -1613,35 +1613,11 @@ impl<'a> Preparation<'a> {
                 unreachable!("the attention form refuses a rotated K4/V4 history")
             }
         };
-        // A selected read's indexer: its projection, tuned over the layers'
-        // indexer weights, and its selection at the attention's rotary.
+        // A selected read's keys, indexer and reads, and its codec's
+        // WorkList prefill.
         let selection = match binding.selection {
             None => Some(None),
             Some(selection) => {
-                let project = self.spec.tuned(
-                    &mut self.tuning,
-                    &IndexerProjectTuning {
-                        binding,
-                        selection,
-                        scopes: scopes.clone(),
-                        epsilon: self.epsilon,
-                    },
-                )?;
-                let select = fixed!(
-                    self.spec,
-                    indexer_select,
-                    format!("{selection:?};P={}", shape.widths.rotary_pairs),
-                    indexer_select::Elements {
-                        A: binding.activation
-                    },
-                    statics
-                        & [
-                            ("H", selection.shape.heads),
-                            ("P", shape.widths.rotary_pairs),
-                            ("S", selection.shape.width - 2 * shape.widths.rotary_pairs),
-                            ("SB", selection.shape.block),
-                        ]
-                );
                 let prefill = match binding.history.encoding() {
                     magnitude_state::HistoryEncoding::Affine => self
                         .spec
@@ -1652,14 +1628,9 @@ impl<'a> Preparation<'a> {
                         .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?
                         .map(SelectedPrefillKernel::Dense),
                 };
-                match (project, select, prefill) {
-                    (Some(project), Some(select), Some(prefill)) => Some(Some(SelectionKernels {
-                        project,
-                        select,
-                        prefill,
-                    })),
-                    _ => None,
-                }
+                // Every entry is prepared whatever another yields: a demand
+                // walk collects each one's launches.
+                self.selection(binding, selection, &scopes, prefill)?.map(Some)
             }
         };
         // A grouped output's first product publishes the activation rows the
@@ -1675,6 +1646,25 @@ impl<'a> Preparation<'a> {
                         activation,
                         kind: WeightKind::AttentionOutputGrouped,
                         groups: grouped.shape.groups,
+                        output: activation,
+                        scopes: scopes.clone(),
+                    },
+                )?
+                .map(Some),
+        };
+        // An absorbed query's per-head products publish the activation
+        // rows the history entry attends with.
+        let absorbed = match binding.absorbed {
+            None => Some(None),
+            Some(absorbed) => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &ProjectRowsTuning {
+                        weight: absorbed.element,
+                        activation,
+                        kind: WeightKind::QueryKeys,
+                        groups: absorbed.shape.heads,
                         output: activation,
                         scopes: scopes.clone(),
                     },
@@ -1705,12 +1695,13 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::PostNorm),
         };
-        Ok(match (project, history, output, grouped, selection, low_rank_query, picked) {
+        Ok(match (project, history, output, grouped, absorbed, selection, low_rank_query, picked) {
             (
                 Some(project),
                 Some(history),
                 Some(output),
                 Some(grouped),
+                Some(absorbed),
                 Some(selection),
                 Some(low_rank_query),
                 Some(picked),
@@ -1721,6 +1712,7 @@ impl<'a> Preparation<'a> {
                     history,
                     output,
                     grouped,
+                    absorbed,
                     selection,
                     low_rank_query,
                     picked,
@@ -1744,7 +1736,7 @@ impl<'a> Preparation<'a> {
         let Some(elements) = crate::operators::attention::pooled::PickedElements::of(binding) else {
             return Ok(Some(None));
         };
-        let index = elements.indexer;
+        let index = elements.indexer.indexer;
         let shape = binding.shape;
         let activation = binding.activation;
         let project = |this: &mut Self, elements, segments, input| {
@@ -1805,11 +1797,11 @@ impl<'a> Preparation<'a> {
                         self.spec,
                         pool_rows,
                         format!("{pooled:?};{shape:?}"),
-                        pool_rows::Elements { A: activation },
+                        pool_rows::Elements { A: activation, Y: activation },
                         statics
                             & [
                                 width.as_slice(),
-                                &[("GT", pooled.gt()), ("RATE", pooled.rate)],
+                                &[("GT", pooled.gt()), ("PR", 0), ("TN", 0), ("RATE", pooled.rate)],
                                 &rotary,
                             ]
                             .concat()
@@ -1842,21 +1834,50 @@ impl<'a> Preparation<'a> {
                  {picked:?} with rows {rows:?}"
             ),
         };
+        let indexer = self.indexer(binding, elements.indexer, scopes)?;
+        Ok(rows.zip(indexer).map(|(rows, indexer)| Some(PickedKernels { rows, indexer })))
+    }
+
+    /// An indexer's entries (`IndexerKernels`, `operators::attention::selection`):
+    /// its query and head-weight projections, each tuned over the layers'
+    /// weights at the elements `IndexerElements` assigns, its scores at the
+    /// attention's rotary, its picks and a producing indexer's candidate
+    /// pool.
+    fn indexer(
+        &mut self,
+        binding: AttentionBinding,
+        elements: crate::operators::attention::selection::IndexerElements,
+        scopes: &[WeightScope],
+    ) -> Result<Option<IndexerKernels>, CatalogFailure> {
+        let index = elements.indexer;
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let pairs = shape.widths.rotary_pairs;
+        let project = |this: &mut Self, elements, kind, input| {
+            this.spec.tuned(
+                &mut this.tuning,
+                &PooledProjectTuning {
+                    elements,
+                    segments: [Some(kind), None],
+                    input,
+                    scopes: scopes.to_vec(),
+                    epsilon: this.epsilon,
+                },
+            )
+        };
+        let hidden = PooledProjectInput::Hidden { hidden: shape.widths.hidden };
         let query_project = project(
             self,
             elements.query_project,
-            [Some(WeightKind::IndexerQuery), None],
-            PooledProjectInput::QueryRank { rank: elements.query_rank },
+            WeightKind::IndexerQuery,
+            match elements.query_rank {
+                None => hidden,
+                Some(rank) => PooledProjectInput::QueryRank { rank },
+            },
         )?;
         let weights_project = match elements.weights_project {
             None => Some(None),
-            Some(elements) => project(
-                self,
-                elements,
-                [Some(WeightKind::IndexerHeadWeights), None],
-                hidden,
-            )?
-            .map(Some),
+            Some(elements) => project(self, elements, WeightKind::IndexerHeadWeights, hidden)?.map(Some),
         };
         let score = fixed!(
             self.spec,
@@ -1865,17 +1886,14 @@ impl<'a> Preparation<'a> {
             indexer_score::Elements { A: activation },
             statics
                 & [
-                    [
-                        ("H", index.heads),
-                        ("P", pairs),
-                        ("S", index.width - 2 * pairs),
-                        ("NQ", index.query_norm),
-                        ("HW", if index.head_weights.is_some() { index.heads } else { 0 }),
-                    ]
-                    .as_slice(),
-                    &rotary,
+                    ("H", index.heads),
+                    ("P", pairs),
+                    ("S", index.width - 2 * pairs),
+                    ("NQ", index.query_norm),
+                    ("HW", if index.head_weights.is_some() { index.heads } else { 0 }),
+                    ("RA", u64::from(shape.form.rotary_adjacent)),
+                    ("RT", u64::from(shape.form.rotary_trailing)),
                 ]
-                .concat()
         );
         let topk = fixed!(self.spec, rows_topk, format!("{index:?}"));
         // A producing indexer's candidate pool.
@@ -1889,28 +1907,88 @@ impl<'a> Preparation<'a> {
             }
             crate::CandidatesBinding::All | crate::CandidatesBinding::Restrict(_) => Some(None),
         };
-        Ok(
-            match (rows, query_project, weights_project, score, topk, candidates) {
-                (
-                    Some(rows),
-                    Some(query_project),
-                    Some(weights_project),
-                    Some(score),
-                    Some(topk),
-                    Some(candidates),
-                ) => Some(Some(PickedKernels {
-                    rows,
-                    indexer: IndexerKernels {
-                        query_project,
-                        weights_project,
-                        score,
-                        topk,
-                        candidates,
-                    },
-                })),
-                _ => None,
+        Ok(match (query_project, weights_project, score, topk, candidates) {
+            (Some(query_project), Some(weights_project), Some(score), Some(topk), Some(candidates)) => {
+                Some(IndexerKernels { query_project, weights_project, score, topk, candidates })
+            }
+            _ => None,
+        })
+    }
+
+    /// A selected read's entries over token rows (`SelectionKernels`): its
+    /// keys' `u | g` projection over `x` (tuned over the layers' weights at
+    /// the elements `pooled::tokens_project` assigns), their widening and
+    /// pooling into F32 keys (`pool_rows`), its indexer ([`Self::indexer`]),
+    /// its reads (`unit_reads`, and `candidate_rows` listing a row's units,
+    /// no fill), beside the codec's WorkList `prefill`.
+    fn selection(
+        &mut self,
+        binding: AttentionBinding,
+        selection: crate::SelectionBinding,
+        scopes: &[WeightScope],
+        prefill: Option<SelectedPrefillKernel>,
+    ) -> Result<Option<SelectionKernels>, CatalogFailure> {
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let (keys, index) = (selection.keys, selection.indexer);
+        let pairs = shape.widths.rotary_pairs;
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &PooledProjectTuning {
+                elements: crate::operators::attention::pooled::tokens_project(
+                    activation,
+                    binding.norm,
+                    keys.projection,
+                    keys.gate,
+                ),
+                segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
+                input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
+                scopes: scopes.to_vec(),
+                epsilon: self.epsilon,
             },
-        )
+        )?;
+        let widen = fixed!(
+            self.spec,
+            widen_rows,
+            format!("A={}", activation.name()),
+            widen_rows::Elements { A: activation }
+        );
+        let pool = fixed!(
+            self.spec,
+            pool_rows,
+            format!("{selection:?};{shape:?}"),
+            pool_rows::Elements { A: activation, Y: Element::f32() },
+            statics
+                & [
+                    ("P", pairs),
+                    ("S", index.width - 2 * pairs),
+                    ("GT", keys.gt()),
+                    ("PR", keys.pr(selection.shape.block)),
+                    ("TN", keys.tn()),
+                    ("RATE", selection.shape.block),
+                    ("RA", u64::from(shape.form.rotary_adjacent)),
+                    ("RT", u64::from(shape.form.rotary_trailing)),
+                ]
+        );
+        let indexer = self.indexer(
+            binding,
+            crate::operators::attention::selection::IndexerElements::of(binding, index),
+            scopes,
+        )?;
+        let reads = fixed!(self.spec, unit_reads, format!("{selection:?}"));
+        let rows = fixed!(self.spec, candidate_rows, format!("{selection:?}"));
+        Ok(match (project, widen, pool, indexer, reads, rows, prefill) {
+            (Some(project), Some(widen), Some(pool), Some(indexer), Some(reads), Some(rows), Some(prefill)) => {
+                Some(SelectionKernels {
+                    keys: SelectionKeyKernels { project, widen, pool },
+                    indexer,
+                    reads,
+                    rows,
+                    prefill,
+                })
+            }
+            _ => None,
+        })
     }
 
     /// The state-space entries (`operators::state_space`): the projection and
@@ -2036,6 +2114,7 @@ impl<'a> Preparation<'a> {
             value_heads: b.value_heads,
             width: b.width,
             convolution_width: b.convolution_width,
+            decay_width: b.decay_width,
             scopes,
         };
         let state = || RecurrentState {
@@ -2044,6 +2123,30 @@ impl<'a> Preparation<'a> {
             shape: shape.clone(),
             epsilon: self.epsilon,
         };
+        let form = match b.form {
+            RecurrentForm::PerHead => self.gated_delta(b, &shape, state())?,
+            RecurrentForm::PerChannel { gate_up, alpha_up, gate_rank, alpha_rank, .. } => {
+                self.kimi_delta(b, [gate_up, alpha_up], [gate_rank, alpha_rank], &shape, state())?
+            }
+        };
+        let output = self.spec.tuned(
+            &mut self.tuning,
+            &RecurrentOutputTuning {
+                output: b.output,
+                activation: b.activation,
+                shape,
+            },
+        )?;
+        Ok(form.zip(output).map(|(form, output)| RecurrentKernels { form, output }))
+    }
+
+    /// A Gated DeltaNet layer's projection and state entries.
+    fn gated_delta(
+        &mut self,
+        b: RecurrentBinding,
+        shape: &RecurrentShape,
+        state: RecurrentState,
+    ) -> Result<Option<RecurrentFormKernels>, CatalogFailure> {
         let form =
             StepForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
                 entry: "gated_delta_step_convolved",
@@ -2063,7 +2166,7 @@ impl<'a> Preparation<'a> {
         let step = match form {
             StepForm::Step => self
                 .spec
-                .tuned(&mut self.tuning, &RecurrentStepTuning(state()))?
+                .tuned(&mut self.tuning, &RecurrentStepTuning(state.clone()))?
                 .map(RecurrentStepKernels::Step),
             StepForm::Convolved => {
                 let project = self.spec.tuned(
@@ -2072,7 +2175,7 @@ impl<'a> Preparation<'a> {
                 )?;
                 let step = self
                     .spec
-                    .tuned(&mut self.tuning, &RecurrentStepConvolvedTuning(state()))?;
+                    .tuned(&mut self.tuning, &RecurrentStepConvolvedTuning(state.clone()))?;
                 project
                     .zip(step)
                     .map(|(project, step)| RecurrentStepKernels::Convolved { project, step })
@@ -2080,23 +2183,72 @@ impl<'a> Preparation<'a> {
         };
         let chunk = self
             .spec
-            .tuned(&mut self.tuning, &RecurrentChunkTuning(state()))?;
+            .tuned(&mut self.tuning, &RecurrentChunkTuning(state))?;
         let project = self.spec.tuned(&mut self.tuning, &project_tuning())?;
-        let output = self.spec.tuned(
-            &mut self.tuning,
-            &RecurrentOutputTuning {
-                output: b.output,
-                activation: b.activation,
-                shape,
-            },
-        )?;
-        Ok(match (project, step, chunk, output) {
-            (Some(project), Some(step), Some(chunk), Some(output)) => Some(RecurrentKernels {
+        Ok(match (project, step, chunk) {
+            (Some(project), Some(step), Some(chunk)) => Some(RecurrentFormKernels::Gated {
                 project,
                 step,
                 chunk,
-                output,
             }),
+            _ => None,
+        })
+    }
+
+    /// A Kimi Delta Attention layer's projection, up projections (publishing
+    /// its gate and decay inputs in A) and state entries.
+    fn kimi_delta(
+        &mut self,
+        b: RecurrentBinding,
+        [gate_up, alpha_up]: [Element; 2],
+        ranks: [u64; 2],
+        shape: &RecurrentShape,
+        state: RecurrentState,
+    ) -> Result<Option<RecurrentFormKernels>, CatalogFailure> {
+        let state = KimiState(state);
+        let step = self
+            .spec
+            .tuned(&mut self.tuning, &KimiStepTuning(state.clone()))?;
+        let chunk = self.spec.tuned(&mut self.tuning, &KimiChunkTuning(state))?;
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &KimiProjectTuning {
+                norm: b.norm,
+                qkv: b.qkv,
+                gate: b.gate,
+                alpha: b.alpha,
+                beta: b.beta,
+                activation: b.activation,
+                ranks,
+                shape: shape.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let mut up = |weight, kind| {
+            self.spec.tuned(
+                &mut self.tuning,
+                &ProjectRowsTuning {
+                    weight,
+                    activation: b.activation,
+                    kind,
+                    groups: 1,
+                    output: b.activation,
+                    scopes: shape.scopes.clone(),
+                },
+            )
+        };
+        let gate_up = up(gate_up, WeightKind::RecurrentGateUp)?;
+        let alpha_up = up(alpha_up, WeightKind::RecurrentAlphaUp)?;
+        Ok(match (project, gate_up, alpha_up, step, chunk) {
+            (Some(project), Some(gate_up), Some(alpha_up), Some(step), Some(chunk)) => {
+                Some(RecurrentFormKernels::Kimi(KimiKernels {
+                    project,
+                    gate_up,
+                    alpha_up,
+                    step,
+                    chunk,
+                }))
+            }
             _ => None,
         })
     }
@@ -2296,11 +2448,20 @@ impl<'a> Preparation<'a> {
             if prepared.sinkhorn.contains_key(&binding) {
                 continue;
             }
-            let SinkhornBinding { hidden, streams, .. } = binding;
-            let label = format!("H={hidden} S={streams}");
+            let SinkhornBinding { hidden, streams, exit, .. } = binding;
+            let carried = binding.carried();
+            let label = format!("H={hidden} S={streams} P={carried}");
             let spec = &mut self.spec;
-            let site = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_mix_sinkhorn::native_entry())?;
-            let collapse = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_collapse::native_entry())?;
+            let site = spec.fixed(
+                &label,
+                &[("H", hidden), ("S", streams), ("P", carried)],
+                stream_mix_sinkhorn::native_entry(),
+            )?;
+            let collapse = spec.fixed(
+                &format!("H={hidden} S={streams} P={}", exit.previous()),
+                &[("H", hidden), ("S", streams), ("P", exit.previous())],
+                stream_collapse::native_entry(),
+            )?;
             let join = spec.fixed(
                 &label,
                 &[("H", hidden), ("SN", streams), ("IN", streams + streams * streams)],
@@ -3236,12 +3397,15 @@ impl<'a> Preparation<'a> {
                 FeedForwardProgramSlot::Routed(binding) => self
                     .routed(binding, feed_forward_layers.scopes(b))?
                     .map(AttestedFeedForward::Routed),
-                // `operators::admit` keeps draft heads on the fused form.
-                FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
+                FeedForwardProgramSlot::GeneralRouted(binding) => self
+                    .general_routed(binding, feed_forward_layers.scopes(b))?
+                    .map(AttestedFeedForward::GeneralRouted),
+                // `operators::admit` refuses a draft head's parallel form.
+                FeedForwardProgramSlot::Parallel(_) => {
                     return Err(CatalogFailure::Preparation {
                         entry: "routed_select",
                         bindings: format!("{b:?}"),
-                        outcome: "draft heads run the fused routed form only".into(),
+                        outcome: "draft heads run no parallel feed-forward form".into(),
                     });
                 }
             };
@@ -3324,11 +3488,14 @@ impl<'a> Preparation<'a> {
                     AttestedFeedForward::Routed(routed) => {
                         head.routed.insert(b, routed);
                     }
-                    AttestedFeedForward::GeneralRouted(_) | AttestedFeedForward::Parallel(_) => {
+                    AttestedFeedForward::GeneralRouted(general) => {
+                        head.general_routed.insert(b, general);
+                    }
+                    AttestedFeedForward::Parallel(_) => {
                         return Err(CatalogFailure::Preparation {
                             entry: "routed_select",
                             bindings: format!("{b:?}"),
-                            outcome: "draft heads run the fused routed form only".into(),
+                            outcome: "draft heads run no parallel feed-forward form".into(),
                         });
                     }
                 }

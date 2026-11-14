@@ -4,7 +4,7 @@ use crate::{
     FeatureRows, InvariantError, NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass,
     ResourceDomainId,
 };
-use magnitude_batching::{HeadPasses, ValidatedHeadBatch};
+use magnitude_batching::{coalesce_spans, HeadPasses, ValidatedHeadBatch};
 use magnitude_state::{SequenceState, StateStore, TentativeAdvance};
 use std::rc::Rc;
 
@@ -329,15 +329,15 @@ impl HeadLaunchInputs {
                 }
                 continue;
             }
-            // The draft head's store has one Token domain.
-            let domain = store
-                .sole_history_domain()
-                .map_err(|error| invalid(error.to_string()))?;
-            let history = slot
-                .history(domain.0)
-                .ok_or_else(|| invalid(format!("slot {index} lacks its history domain")))?;
-            let chain = self.batch.chain_destinations(index, domain.0);
-            let written = chain
+            // The head's own rows' domain; its indexer's, if it keeps one,
+            // are produced from them.
+            let tokens = store
+                .history_source(magnitude_state::LayerRef::Head(0))
+                .ok_or_else(|| invalid("the head's store keeps no history of its block".into()))?
+                .domain;
+            let written = self
+                .batch
+                .chain_destinations(index, tokens.0)
                 .iter()
                 .filter(|destination| **destination >= 0)
                 .count();
@@ -347,28 +347,44 @@ impl HeadLaunchInputs {
                 )));
             }
             // Entry rows append first, then each chained row in step order;
-            // a chained row past the request's own proposals appends nowhere.
-            let expected = binding.destinations[domain.0]
-                .iter()
-                .map(|destination| i32::try_from(*destination).ok())
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| invalid(format!("slot {index} destination exceeds i32")))?;
-            let packed = history
-                .destinations
-                .iter()
-                .copied()
-                .chain(
-                    chain
-                        .iter()
-                        .copied()
-                        .filter(|destination| *destination >= 0),
-                )
-                .collect::<Vec<_>>();
-            if packed != expected {
-                return Err(invalid(format!("slot {index} destinations differ")));
+            // a chained row past the request's own proposals appends nowhere,
+            // and a row appends to a produced domain only where it completes
+            // a unit.
+            for domain in store.history_domains() {
+                let history = slot
+                    .history(domain.0)
+                    .ok_or_else(|| invalid(format!("slot {index} lacks its history domain")))?;
+                let expected = binding.destinations[domain.0]
+                    .iter()
+                    .map(|destination| i32::try_from(*destination).ok())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| invalid(format!("slot {index} destination exceeds i32")))?;
+                // Only a produced domain's entry rows may append nowhere (a
+                // row completes a unit or does not); a chained row past the
+                // request's proposals appends nowhere in every domain.
+                let produced = store.is_produced_domain(domain);
+                let packed = history
+                    .destinations
+                    .iter()
+                    .copied()
+                    .filter(|destination| !produced || *destination >= 0)
+                    .chain(
+                        self.batch
+                            .chain_destinations(index, domain.0)
+                            .into_iter()
+                            .filter(|destination| *destination >= 0),
+                    )
+                    .collect::<Vec<_>>();
+                if packed != expected {
+                    return Err(invalid(format!("slot {index} destinations differ")));
+                }
             }
-            let visible = advance
-                .history_ranges(domain)
+            // Every entry row reads the accepted rows, then, where its rows
+            // read their launch's earlier ones as stored history
+            // (`cached_causal_domain`, the rule the producer reads), the
+            // advance's earlier rows, as one run where they adjoin.
+            let accepted = advance
+                .history_ranges(tokens)
                 .into_iter()
                 .map(|(start, count)| {
                     let end = start.checked_add(count)?;
@@ -380,16 +396,28 @@ impl HeadLaunchInputs {
                         "slot {index} history range exceeds packed coordinates"
                     ))
                 })?;
-            if history.visible.iter().any(|row| {
-                row.len() < visible.len()
-                    || &row[..visible.len()] != visible.as_slice()
-                    || row[visible.len()..]
-                        .iter()
-                        .any(|padding| *padding != [0, 0])
-            }) {
-                return Err(invalid(format!(
-                    "slot {index} visibility differs from accepted state"
-                )));
+            let history = slot
+                .history(tokens.0)
+                .ok_or_else(|| invalid(format!("slot {index} lacks its history domain")))?;
+            let cached = crate::domain::cached_causal_domain(store, tokens);
+            let earlier = &binding.destinations[tokens.0];
+            for (row, visible) in history.visible.iter().enumerate() {
+                let mut expected = accepted.clone();
+                for destination in earlier.iter().take(if cached { row } else { 0 }) {
+                    let destination = i32::try_from(*destination)
+                        .map_err(|_| invalid(format!("slot {index} destination exceeds i32")))?;
+                    expected.push([destination, destination + 1]);
+                }
+                let read = visible
+                    .iter()
+                    .copied()
+                    .take_while(|span| *span != [0, 0])
+                    .collect::<Vec<_>>();
+                if read != coalesce_spans(&expected) {
+                    return Err(invalid(format!(
+                        "slot {index} visibility differs from accepted state"
+                    )));
+                }
             }
         }
         Ok(())

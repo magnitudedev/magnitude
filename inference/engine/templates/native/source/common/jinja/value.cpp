@@ -12,6 +12,7 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <unordered_set>
 
 #define FILENAME "jinja-value"
 
@@ -947,8 +948,36 @@ const func_builtins & value_bool_t::get_builtins() const {
     return builtins;
 }
 
-[[noreturn]] static value array_unique_not_implemented(const func_args &) {
-    throw not_implemented_exception("Array unique builtin not implemented");
+// The value an item is compared by in `sort`, `unique`, `min`, `max` and `dictsort`, as Jinja's
+// `make_attrgetter(..., postprocess=ignore_case)`: the item's `attribute` (an index of an array or a
+// key of an object) when one is named, and a string in lower case unless `case_sensitive`.
+static value comparison_key(const value & item, const value & attribute, bool case_sensitive) {
+    value key = item;
+    if (!attribute->is_undefined()) {
+        if (is_val<value_int>(attribute) && is_val<value_array>(item)) {
+            key = item->at(attribute->as_int());
+        } else if (!is_val<value_int>(attribute) && is_val<value_object>(item)) {
+            key = item->at(attribute);
+        } else {
+            throw raised_exception("unsupported attribute " + attribute->type() + " of " + item->type());
+        }
+    }
+    if (case_sensitive || !is_val<value_string>(key)) {
+        return key;
+    }
+    return mk_val<value_string>(key->as_string().lowercase());
+}
+
+// The positions of `keys` in Python's stable sorted order, ascending or descending, each key computed once.
+static std::vector<size_t> stable_order(const std::vector<value> & keys, bool reverse) {
+    std::vector<size_t> order(keys.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return value_compare(keys[a], keys[b], reverse ? value_compare_op::gt : value_compare_op::lt);
+    });
+    return order;
 }
 
 const func_builtins & value_array_t::get_builtins() const {
@@ -1119,28 +1148,17 @@ const func_builtins & value_array_t::get_builtins() const {
             value val_reverse = args.get_kwarg_or_pos("reverse",        1);
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 2);
             value attribute   = args.get_kwarg_or_pos("attribute",      3);
-            // FIXME: sorting is currently always case sensitive
-            //const bool case_sensitive = val_case->as_bool(); // undefined == false
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
             const bool reverse = val_reverse->as_bool(); // undefined == false
-            const bool attr_is_int = is_val<value_int>(attribute);
-            const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
-            std::vector<value> arr = val->as_array(); // copy
-            std::sort(arr.begin(), arr.end(),[&](const value & a, const value & b) {
-                value val_a = a;
-                value val_b = b;
-                if (!attribute->is_undefined()) {
-                    if (attr_is_int && is_val<value_array>(a) && is_val<value_array>(b)) {
-                        val_a = a->at(attr_int);
-                        val_b = b->at(attr_int);
-                    } else if (!attr_is_int && is_val<value_object>(a) && is_val<value_object>(b)) {
-                        val_a = a->at(attribute);
-                        val_b = b->at(attribute);
-                    } else {
-                        throw raised_exception("sort: unsupported object attribute comparison between " + a->type() + " and " + b->type());
-                    }
-                }
-                return value_compare(val_a, val_b, reverse ? value_compare_op::gt : value_compare_op::lt);
-            });
+            const auto & items = val->as_array();
+            std::vector<value> keys;
+            for (const auto & item : items) {
+                keys.push_back(comparison_key(item, attribute, case_sensitive));
+            }
+            std::vector<value> arr;
+            for (size_t i : stable_order(keys, reverse)) {
+                arr.push_back(items[i]);
+            }
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
         {"reverse", [](const func_args & args) -> value {
@@ -1155,18 +1173,15 @@ const func_builtins & value_array_t::get_builtins() const {
             args.ensure_vals<value_array>();
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value attribute   = args.get_kwarg_or_pos("attribute",      2);
-            if (!attribute->is_undefined()) {
-                throw not_implemented_exception("min: attribute not implemented");
-            }
-            // FIXME: min is currently always case sensitive
-            (void) val_case;
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
             const auto & arr = args.get_pos(0)->as_array();
             if (arr.empty()) {
                 return mk_val<value_undefined>();
             }
             value result = arr[0];
             for (size_t i = 1; i < arr.size(); ++i) {
-                if (value_compare(arr[i], result, value_compare_op::lt)) {
+                if (value_compare(comparison_key(arr[i], attribute, case_sensitive),
+                                  comparison_key(result, attribute, case_sensitive), value_compare_op::lt)) {
                     result = arr[i];
                 }
             }
@@ -1177,24 +1192,41 @@ const func_builtins & value_array_t::get_builtins() const {
             args.ensure_vals<value_array>();
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value attribute   = args.get_kwarg_or_pos("attribute",      2);
-            if (!attribute->is_undefined()) {
-                throw not_implemented_exception("max: attribute not implemented");
-            }
-            // FIXME: max is currently always case sensitive
-            (void) val_case;
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
             const auto & arr = args.get_pos(0)->as_array();
             if (arr.empty()) {
                 return mk_val<value_undefined>();
             }
             value result = arr[0];
             for (size_t i = 1; i < arr.size(); ++i) {
-                if (value_compare(arr[i], result, value_compare_op::gt)) {
+                if (value_compare(comparison_key(arr[i], attribute, case_sensitive),
+                                  comparison_key(result, attribute, case_sensitive), value_compare_op::gt)) {
                     result = arr[i];
                 }
             }
             return result;
         }},
-        {"unique", array_unique_not_implemented},
+        {"unique", [](const func_args & args) -> value {
+            args.ensure_count(1, 3);
+            args.ensure_vals<value_array>();
+            value val       = args.get_pos(0);
+            value val_case  = args.get_kwarg_or_pos("case_sensitive", 1);
+            value attribute = args.get_kwarg_or_pos("attribute",      2);
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
+            // Each item whose key is new, in order, as Jinja's set of seen keys.
+            std::unordered_set<value, value_hasher, value_equivalence> seen;
+            auto out = mk_val<value_array>();
+            for (const auto & item : val->as_array()) {
+                value key = comparison_key(item, attribute, case_sensitive);
+                if (!key->is_hashable()) {
+                    throw raised_exception("unique: unhashable " + key->type());
+                }
+                if (seen.insert(key).second) {
+                    out->push_back(item);
+                }
+            }
+            return out;
+        }},
     };
     return builtins;
 }
@@ -1280,18 +1312,20 @@ const func_builtins & value_object_t::get_builtins() const {
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value val_by      = args.get_kwarg_or_pos("by",             2);
             value val_reverse = args.get_kwarg_or_pos("reverse",        3);
-            // FIXME: sorting is currently always case sensitive
-            //const bool case_sensitive = val_case->as_bool(); // undefined == false
+            const bool case_sensitive = val_case->as_bool(); // undefined == false
             const bool reverse = val_reverse->as_bool(); // undefined == false
             const bool by_value = is_val<value_string>(val_by) && val_by->as_string().str() == "value" ? true : false;
+            const value no_attribute = mk_val<value_undefined>();
             auto result = mk_val<value_object>(val_input); // copy
-            std::sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
-                if (by_value) {
-                    return value_compare(a.second, b.second, reverse ? value_compare_op::gt : value_compare_op::lt);
-                } else {
-                    return value_compare(a.first, b.first, reverse ? value_compare_op::gt : value_compare_op::lt);
-                }
-            });
+            const auto pairs = result->val_obj;
+            std::vector<value> keys;
+            for (const auto & pair : pairs) {
+                keys.push_back(comparison_key(by_value ? pair.second : pair.first, no_attribute, case_sensitive));
+            }
+            result->val_obj.clear();
+            for (size_t i : stable_order(keys, reverse)) {
+                result->val_obj.push_back(pairs[i]);
+            }
             return result;
         }},
         {"join", object_join_not_implemented},

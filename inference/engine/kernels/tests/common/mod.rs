@@ -2,6 +2,9 @@
 
 use seismic_lang::checked::{CheckedModule, SourceSet};
 
+pub mod bound;
+pub mod recurrent_bound;
+
 /// `sources`, held in memory, checked with each native implementation's
 /// source read from the crate's `kernels/`, where the declarations name
 /// them.

@@ -21,7 +21,7 @@ use magnitude_family_contracts::{
     ExitSite, GateFunction, HeadComponent, HeadNorm, HeadWeights, HistoryReads,
     HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing, HyperConnectionWeights,
     HyperConnections, Indexer, IndexerInput, IndexerKeys, IndexerQuery, InputNorm, Pool,
-    PooledRows, RowRounding, Selection,
+    PoolNorm, PooledRows, RowRounding, Selection,
     LowRankGatedSite, InputSemantics, ModelDefinition, NGramConvolution, NGramGate, NGramHash,
     NGramInput, NGramMedia,
     Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
@@ -223,7 +223,7 @@ impl Extensions {
             rate: block,
             projection: weight("indexer.k_proj.weight", &[width, hidden])?,
             pool: if block == 1 { Pool::Identity } else { Pool::Mean },
-            norm: geometry.rms(weight("indexer.k_norm.weight", &[width])?),
+            norm: PoolNorm::Pooled(geometry.rms(weight("indexer.k_norm.weight", &[width])?)),
             rounding: RowRounding::None,
         });
         Ok(HistoryReads::Selected(Selection::Own(Box::new(Indexer {

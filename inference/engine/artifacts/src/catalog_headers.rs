@@ -80,9 +80,16 @@ pub struct ArtifactHeader {
 }
 
 impl ArtifactHeader {
-    /// The artifact's file under an export directory.
+    /// The artifact's file under an export directory: the one a load opens,
+    /// the first shard of a split GGUF.
     pub fn file(&self, root: &Path) -> PathBuf {
-        source_file(root, &self.repository, &self.revision, &self.path)
+        self.component_file(root, &self.path)
+    }
+
+    /// The file of the artifact's component at `path` in its repository (a
+    /// shard of a split GGUF) under an export directory.
+    pub fn component_file(&self, root: &Path, path: &Path) -> PathBuf {
+        source_file(root, &self.repository, &self.revision, path)
     }
 }
 
@@ -94,7 +101,8 @@ impl ArtifactHeader {
 /// architectures and drafts the engine supports but the catalog does not
 /// list: LFM2.5 2.6B and 8B-A1B with their DSpark drafts, LFM3-VL 2B,
 /// MiniCPM5 2B with its DSpark draft, MiniCPM-V 4.7 1B and 35B-A3B, and
-/// Nemotron 3.5 Lightning 30B-A3B with its DFlash draft.
+/// Nemotron 3.5 Lightning 30B-A3B with its DFlash draft; and GLM-5.3-Flash's
+/// FP8 file, all seven shards, until it is in the catalog.
 pub fn artifacts() -> Vec<ArtifactHeader> {
     [
         (
@@ -234,6 +242,12 @@ pub fn artifacts() -> Vec<ArtifactHeader> {
             "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF",
             "4f5b414b9388a4543dcc4b24758e09d68140a6fe",
             "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf",
+        ),
+        (
+            "glm-5.3-flash-fp8",
+            "magnitudedev/GLM-5.3-Flash-GGUF",
+            "06087538ebffc3fa8993a316f652166ca3297a41",
+            "FP8/GLM-5.3-Flash-FP8-00001-of-00007.gguf",
         ),
     ]
     .into_iter()

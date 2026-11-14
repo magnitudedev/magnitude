@@ -1,0 +1,17 @@
+// kimi_delta_chunk (large row classes): the same contract as
+// `kimi_delta_step`, in `lib/recurrent/chunk.glsl`'s launches over Kimi's
+// gates (one decay factor per key column).
+#include "lib/recurrent/kimi.glsl"
+#include "lib/recurrent/chunk.glsl"
+
+void kimi_delta_chunk_inputs() {
+    chunk_inputs();
+}
+
+void kimi_delta_chunk_scan() {
+    chunk_scan();
+}
+
+void kimi_delta_chunk_gate() {
+    recurrent_gate(false);
+}

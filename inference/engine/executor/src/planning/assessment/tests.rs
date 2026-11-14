@@ -167,7 +167,9 @@ fn checked_embedding_graph_distinguishes_upload_from_selected_input() {
         mismatch,
         Err(seismic::NativeGraphMetadataError::Call(
             seismic::CallError::Workflow(seismic::WorkflowError::NativeGraphArgumentMismatch {
-                parameter: 0
+                entry: "embedding_rows",
+                parameter: 0,
+                ..
             })
         ))
     ));
@@ -320,12 +322,10 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     let head = definition.head.clone().unwrap();
     let head_block = crate::operators::CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
     let head_state = state.head_state().unwrap();
-    let head_history = head_state.sole_history().unwrap();
+    let geometry = head_state.head_geometry().unwrap();
     let classes = crate::programs::native_head::head_graph_classes(
         limits,
-        head_history.rows as u64,
-        head_history.slab_rows,
-        head_state.span_limit(),
+        geometry,
         method.draft_rows(),
     )
     .unwrap();
@@ -433,9 +433,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         HostProcessBytes::derive(&definition, &load, &plan, limits, backend).unwrap();
         let classes = crate::programs::native_head::head_graph_classes(
             limits,
-            head_history.rows as u64,
-            head_history.slab_rows,
-            head_state.span_limit(),
+            geometry,
             method.draft_rows(),
         )
         .unwrap();
@@ -559,9 +557,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         plan.head().unwrap().blocks()[0],
         crate::programs::native_head::head_graph_classes(
             limits,
-            head_history.rows as u64,
-            head_history.slab_rows,
-            head_state.span_limit(),
+            geometry,
             method.draft_rows(),
         )
         .unwrap(),
@@ -589,7 +585,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     let mut site = match &definition.decoder.exit.norm {
         ExitNorm::HyperConnectionHead(exit) => match crate::operators::ExitMix::of(exit).unwrap() {
             crate::operators::ExitMix::Own(site) => site.clone(),
-            crate::operators::ExitMix::Previous(_) => unreachable!(),
+            crate::operators::ExitMix::Previous(_) | crate::operators::ExitMix::Mean(_) => unreachable!(),
         },
         _ => unreachable!(),
     };
@@ -663,12 +659,10 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     let head = definition.head.as_ref().unwrap();
     let block = crate::operators::CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
     let head_state = state.head_state().unwrap();
-    let history = head_state.sole_history().unwrap();
+    let geometry = head_state.head_geometry().unwrap();
     let classes = crate::programs::native_head::head_graph_classes(
         limits,
-        history.rows as u64,
-        history.slab_rows,
-        head_state.span_limit(),
+        geometry,
         method.draft_rows(),
     )
     .unwrap();
@@ -1428,14 +1422,17 @@ fn checked_vision_family_bounds_exact_patch_classes() {
             projection_norm: None,
             stages: vec![
                 MergerStage {
+                    norm: None,
                     linear: linear("mm.0", 512, 512),
                     activation: Some(VisionActivation::GeluErf),
                 },
                 MergerStage {
+                    norm: None,
                     linear: linear("mm.2", 128, 512),
                     activation: None,
                 },
             ],
+            feed_forward: None,
             output_norm: None,
         },
     };
@@ -1467,6 +1464,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
         }),
         stages: vec![
             MergerStage {
+                norm: None,
                 linear: VisionLinear {
                     bias: None,
                     ..linear("mm.1", 256, 512)
@@ -1474,6 +1472,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
                 activation: Some(VisionActivation::ReluSquared),
             },
             MergerStage {
+                norm: None,
                 linear: VisionLinear {
                     bias: None,
                     ..linear("mm.3", 128, 256)
@@ -1481,6 +1480,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
                 activation: None,
             },
         ],
+        feed_forward: None,
         output_norm: None,
     };
     radio.validate().unwrap();
@@ -2444,4 +2444,131 @@ fn a_drafted_loads_state_claims_include_its_heads_rows() {
     let bytes = |store: &crate::StateStorePlan| crate::memory::ledger::LoadShape::of_states(store, None).state_bytes(1);
     assert!(bytes(head) > 0, "the head's rows hold state");
     assert_eq!(shape.state_bytes(1), bytes(target) + bytes(head), "a row is charged in both stores");
+}
+
+/// GLM-5.3-Flash's MTP head (block 1's latent attention over its indexer's
+/// selection, then its general routed feed-forward, over a single residual)
+/// plans, and its checked head graphs certify at every class on every
+/// backend: the body's general routed lowering reads the head's rows.
+#[test]
+fn glm_mtp_heads_general_routed_graphs_certify_on_every_backend() {
+    let (definition, manifest) = crate::planning::fixtures::glm_slice_b_mtp_fixture();
+    let method = PlannedMethod::Mtp { greedy_proposals: 1, sampled_proposals: 1, widths: crate::DraftWidths::Adaptive };
+    let limits = crate::ResourceLimits {
+        max_launch_rows: 256,
+        max_launch_slots: 16,
+        max_selected_rows: 16,
+        max_drafting_slots: 16,
+        exported_logits_rows: 0,
+        max_images_per_request: 1,
+        max_image_cells: 0,
+        lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+        let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection { head: true, vision: false },
+            layout,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            method,
+            KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity { domain_bytes: 512 * 1024 * 1024, tensor_operations: crate::TensorOperations::Absent },
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        let head = definition.head.clone().unwrap();
+        let head_block = crate::operators::CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let head_state = state.head_state().unwrap();
+        let geometry = head_state.head_geometry().unwrap();
+        let classes = crate::programs::native_head::head_graph_classes(
+            limits,
+            geometry,
+            method.draft_rows(),
+        )
+        .unwrap();
+        let family = crate::programs::native_head::checked_head_family_storage(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            classes.clone(),
+        )
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        crate::programs::native_head::verify_head_family_certificates(
+            backend,
+            &load,
+            &definition.decoder,
+            head_block,
+            plan.head().unwrap().blocks()[0],
+            &classes,
+        )
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        assert!(family.storage.workspace > 0, "{backend:?}");
+    }
+}
+
+/// The draft head's general routed form, certified above for every backend, also qualifies on this host's device:
+/// its programs prepare and attest at the fixture's widths with zero weights, as the target's do, so a head form
+/// that certifies but cannot qualify fails here and not in a model's load.
+#[test]
+fn glm_mtp_head_qualifies_on_the_selected_device() {
+    let (definition, manifest) = crate::planning::fixtures::glm_slice_b_mtp_fixture();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let chosen = crate::platform::select_device(
+        &catalog,
+        crate::ExecutionPath::Native,
+        crate::platform::DeviceRequest::Automatic,
+        &crate::platform::MemoryReserves::of_machine(None),
+    )
+    .unwrap();
+    let device = catalog.open(catalog.resolve(chosen.info.selector()).unwrap()).unwrap();
+    let limits = crate::ResourceLimits {
+        max_launch_rows: 256,
+        max_launch_slots: 16,
+        max_selected_rows: 16,
+        max_drafting_slots: 16,
+        exported_logits_rows: 0,
+        max_images_per_request: 1,
+        max_image_cells: 0,
+        lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    let draft = crate::ExecutionPlanner::prepare(
+        &chosen,
+        &manifest,
+        &definition,
+        ComponentSelection { head: true, vision: false },
+        crate::ExecutionPath::Native,
+        PlannedMethod::Mtp { greedy_proposals: 1, sampled_proposals: 1, widths: crate::DraftWidths::Adaptive },
+        KvCodec::Dense,
+        limits,
+    )
+    .unwrap();
+    crate::AttestedPrograms::prepare_draft(
+        &draft,
+        &device,
+        crate::TuningContext {
+            definition: &definition,
+            weights: &crate::ZeroTuningWeights,
+            observer: &crate::UnreportedTuning,
+            cache: None,
+            numerical_profile: crate::ResolvedNumericalProfile::standard(),
+            settings: crate::TuningSettings::STANDARD,
+        },
+        crate::UnpreparedUnits::ServeDefaults,
+    )
+    .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
 }

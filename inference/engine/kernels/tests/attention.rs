@@ -347,16 +347,17 @@ fn prefill_specializations_on(
                 .map(move |direct| ((query_tile, split_groups), direct))
         })
         .map(|((query_tile, split_groups), direct)| {
-            // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the
-            // one tile admissible at every tested geometry, whatever QT asks for.
-            let tile = if device.backend() == BackendName::Vulkan {
-                ("ROWS", 64)
+            // Vulkan's matrix form tiles ROWS = 64 matrix rows (query tile x
+            // query heads), the one tile admissible at every tested
+            // geometry, whatever QT asks for.
+            let params = if device.backend() == BackendName::Vulkan {
+                vulkan_prefill_matrix(64, split_groups)
             } else {
-                ("QT", query_tile)
+                vec![("QT", query_tile), ("SPLIT_GROUPS", split_groups)]
             };
-            let specialization = qwen_form(statics(geometry), geometry)
-                .with_param(tile.0, tile.1)
-                .with_param("SPLIT_GROUPS", split_groups);
+            let specialization = params
+                .into_iter()
+                .fold(qwen_form(statics(geometry), geometry), |s, (name, value)| s.with_param(name, value));
             (
                 format!(
                     "{:?} (QT, SPLIT_GROUPS, DIRECT) {:?}",
@@ -641,7 +642,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
         // Half-split leading rotary pairs, no output rotary, own values, no
         // key rounding.
-        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0], Vec::new()),
+        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
@@ -745,10 +746,22 @@ fn prefill_natives_match_host_model() {
     }
 }
 
+/// A 192-column head: each lane holds six columns, a count no staged uvec4
+/// divides, so the matrix form gathers each uvec4 of a staged row from the
+/// lanes holding its columns.
+#[test]
+fn prefill_with_six_columns_a_lane_matches_host_model() {
+    let case = Case::new(Geometry { kv: 1, g: 2, p: 48, s: 96 }, 400, 2, &prefill_rows(20, 300), 29);
+    for device in devices() {
+        seismic_native_tests::progress(format_args!("six-column prefill on {:?}", device.backend()));
+        prefill_matches_portable_body_on(&device, &case);
+    }
+}
+
 fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
     for (config, specialization) in
-        prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)])
+        prefill_specializations_on(device, case.geometry, &[(16, 1), (8, 1), (16, 256), (8, 256)])
     {
         seismic_native_tests::progress(format_args!("small prefill {config}"));
         let kernel = prefill_kernel(device, &specialization);
@@ -1211,7 +1224,7 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
     specialization
         .statics()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO"))
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "AB"))
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })

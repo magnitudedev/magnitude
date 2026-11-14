@@ -40,6 +40,13 @@ pub enum ImageResize {
         min_patches: usize,
         max_patches: usize,
     },
+    /// The aspect-kept content scaled into a canvas of cell-multiple sides
+    /// within the pixel bounds, the rest of the canvas black before
+    /// normalization (GLM-5 `smart_resize`, whose canvas rounds sides up).
+    PaddedCanvas {
+        min_pixels: usize,
+        max_pixels: usize,
+    },
 }
 
 /// The separable, scale-aware (antialiasing) resampling filter.
@@ -80,6 +87,10 @@ impl ImageProcessorConfig {
                 ImageResize::PixelBounds {
                     min_pixels,
                     max_pixels,
+                }
+                | ImageResize::PaddedCanvas {
+                    min_pixels,
+                    max_pixels,
                 } => min_pixels == 0 || min_pixels > max_pixels,
                 ImageResize::PatchBudget { max_patches } => max_patches == 0,
                 ImageResize::CellBudget { max_cells } => max_cells == 0,
@@ -118,6 +129,10 @@ impl ImageProcessorConfig {
                 min_patches,
                 max_patches,
             } => (b"patch-bounds:one-tile", [min_patches, max_patches]),
+            ImageResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => (b"padded-canvas:ceil-align:black", [min_pixels, max_pixels]),
         };
         let resampling: &[u8] = match self.resampling {
             Resampling::Bicubic => b"bicubic:a=-0.5:scale-aware-antialias:rgb8",
@@ -170,6 +185,13 @@ impl ImageProcessor {
 
     /// The `(height, width)` an image of the given size is resized to.
     pub fn resized_size(&self, height: usize, width: usize) -> Result<(usize, usize), String> {
+        Ok(self.target(height, width)?.canvas)
+    }
+
+    /// The canvas an image of the given size becomes, and the content size
+    /// its pixels are resampled to: the canvas itself unless the canvas is
+    /// padded.
+    fn target(&self, height: usize, width: usize) -> Result<Target, String> {
         if height == 0 || width == 0 {
             return Err("image dimensions must be nonzero".into());
         }
@@ -179,27 +201,32 @@ impl ImageProcessor {
             return Err("image aspect ratio exceeds processor limit".into());
         }
         let cell = self.config.patch * self.config.merge;
+        let whole = |canvas| Target {
+            canvas,
+            content: canvas,
+        };
         match self.config.resize {
-            ImageResize::Slices { resolution, .. } => Ok(slicing::best_size(
+            ImageResize::Slices { resolution, .. } => Ok(whole(slicing::best_size(
                 height as f64,
                 width as f64,
                 resolution,
                 self.config.patch,
                 true,
-            )),
+            ))),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
-            } => pixel_bounds_size(height, width, cell, min_pixels, max_pixels),
+            } => pixel_bounds_size(height, width, cell, min_pixels, max_pixels).map(whole),
             ImageResize::PatchBudget { max_patches } => patch_budget_size(
                 height,
                 width,
                 self.config.patch,
                 self.config.merge,
                 max_patches,
-            ),
+            )
+            .map(whole),
             ImageResize::CellBudget { max_cells } => {
-                cell_budget_size(height, width, cell, max_cells)
+                cell_budget_size(height, width, cell, max_cells).map(whole)
             }
             ImageResize::PatchBounds {
                 min_patches,
@@ -211,7 +238,12 @@ impl ImageProcessor {
                 self.config.merge,
                 min_patches,
                 max_patches,
-            ),
+            )
+            .map(whole),
+            ImageResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => padded_canvas(height, width, cell, min_pixels, max_pixels),
         }
     }
 
@@ -255,10 +287,13 @@ impl ImageProcessor {
                     crops
                 }
                 _ => {
-                    let (h, w) =
-                        self.resized_size(image.height() as usize, image.width() as usize)?;
+                    let Target {
+                        canvas: (h, w),
+                        content: (content_h, content_w),
+                    } = self.target(image.height() as usize, image.width() as usize)?;
                     self.prepared_rows(rows, h, w)?;
-                    vec![resize(&source, w, h, self.config.resampling)?]
+                    let content = resize(&source, content_w, content_h, self.config.resampling)?;
+                    vec![pad(content, w, h)]
                 }
             };
             for crop in crops {
@@ -350,6 +385,72 @@ impl ImageProcessor {
         }
         Ok(())
     }
+}
+
+/// A resized image's canvas and the content size inside it (the content's
+/// top-left corner is the canvas's).
+#[derive(Clone, Copy, Debug)]
+struct Target {
+    canvas: (usize, usize),
+    content: (usize, usize),
+}
+
+/// `content` on a black canvas of `width` by `height`, at the top left.
+fn pad(content: image::Rgb32FImage, width: usize, height: usize) -> image::Rgb32FImage {
+    if content.width() as usize == width && content.height() as usize == height {
+        return content;
+    }
+    let mut canvas = image::Rgb32FImage::new(width as u32, height as u32);
+    image::imageops::replace(&mut canvas, &content, 0, 0);
+    canvas
+}
+
+/// GLM-5's `smart_resize` and `resize` for one frame of an image (the
+/// released processor's two-frame budgets are these pixel bounds): the sides
+/// rounded up to cell multiples; scaled up to the minimum or, past the
+/// maximum, fitted by bisection on the content height; the content scaled by
+/// the canvas's tighter ratio, never up once the image holds the minimum.
+fn padded_canvas(
+    height: usize,
+    width: usize,
+    cell: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<Target, String> {
+    let align = |value: usize| value.div_ceil(cell) * cell;
+    if max_pixels < cell * cell {
+        return Err("the pixel bound holds no cell".into());
+    }
+    let (mut canvas_height, mut canvas_width) = (align(height), align(width));
+    if canvas_height * canvas_width < min_pixels {
+        let scale = (min_pixels as f64 / (height as f64 * width as f64)).sqrt();
+        canvas_height = align(((height as f64 * scale).ceil() as usize).max(1));
+        canvas_width = align(((width as f64 * scale).ceil() as usize).max(1));
+    }
+    if canvas_height * canvas_width > max_pixels {
+        let (mut low, mut high) = (1usize, height);
+        (canvas_height, canvas_width) = (cell, cell);
+        while low <= high {
+            let content_height = (low + high) / 2;
+            let content_width = ((width * content_height) / height).max(1);
+            let candidate = (align(content_height), align(content_width));
+            if candidate.0 * candidate.1 <= max_pixels {
+                (canvas_height, canvas_width) = candidate;
+                low = content_height + 1;
+            } else {
+                high = content_height - 1;
+            }
+        }
+    }
+    let mut scale = (canvas_height as f64 / height as f64).min(canvas_width as f64 / width as f64);
+    if height * width >= min_pixels {
+        scale = scale.min(1.0);
+    }
+    let content = |side: usize, canvas: usize| ((side as f64 * scale).floor() as usize).clamp(1, canvas);
+    Ok(Target {
+        canvas: (canvas_height, canvas_width),
+        content: (content(height, canvas_height), content(width, canvas_width)),
+    })
 }
 
 /// Qwen3-VL `smart_resize`: sides rounded half to even to multiples of

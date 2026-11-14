@@ -27,12 +27,14 @@ pub enum BankComponent {
     /// The gated delta rule state `[heads, width, width]`, F32.
     DeltaState { heads: usize, width: usize },
     /// The gated delta tape: per row the innovations `[value_heads, width]`,
-    /// keys `[key_heads, width]` and decays `[value_heads]`, F32. Replay
-    /// applies the delta rule row by row.
+    /// keys `[key_heads, width]` and decays `[value_heads, decay_width]` (one
+    /// per head, or one per key channel), F32. Replay applies the delta rule
+    /// row by row.
     DeltaTape {
         value_heads: usize,
         key_heads: usize,
         width: usize,
+        decay_width: usize,
     },
     /// The Mamba-2 state `[heads, head_width, state_width]`, F32: it
     /// accumulates, and its reference keeps it F32.
@@ -82,13 +84,16 @@ impl BankComponent {
                 value_heads,
                 key_heads,
                 width,
+                decay_width,
             } => (
                 vec![
                     tape,
                     value_heads
                         .checked_add(key_heads)
                         .and_then(|heads| heads.checked_mul(width))
-                        .and_then(|vectors| vectors.checked_add(value_heads))
+                        .and_then(|vectors| {
+                            vectors.checked_add(value_heads.checked_mul(decay_width)?)
+                        })
                         .ok_or_else(overflow)?,
                 ],
                 DType::F32,
@@ -166,11 +171,25 @@ mod tests {
                 value_heads: 4,
                 key_heads: 2,
                 width: 8,
+                decay_width: 1,
             }
             .spec(3)
             .unwrap()
             .shape,
             [3, 52]
+        );
+        // A per-channel decay records `[value_heads, width]` decays.
+        assert_eq!(
+            BankComponent::DeltaTape {
+                value_heads: 4,
+                key_heads: 2,
+                width: 8,
+                decay_width: 8,
+            }
+            .spec(3)
+            .unwrap()
+            .shape,
+            [3, 80]
         );
         let ssm = BankComponent::SsmState {
             heads: 64,

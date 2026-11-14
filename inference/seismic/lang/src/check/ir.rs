@@ -522,7 +522,13 @@ pub(crate) enum ExprKind {
     Literal(ReferenceScalar),
     /// A dimension of the definition used as a value; ordinal into
     /// `Definition::dimensions`.
-    Dimension(#[serde(deserialize_with = "crate::wire::deserialize_dimension")] u32),
+    Dimension(
+        #[serde(
+            serialize_with = "crate::wire::serialize_dimension",
+            deserialize_with = "crate::wire::deserialize_dimension"
+        )]
+        u32,
+    ),
     Local(LocalId),
     Primitive {
         id: PrimitiveId,
@@ -563,7 +569,10 @@ pub(crate) enum ExprKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IntrinsicOverload {
     pub capability: CapabilityId,
-    #[serde(deserialize_with = "crate::registry::deserialize_declared_name")]
+    #[serde(
+        serialize_with = "crate::registry::serialize_declared_name",
+        deserialize_with = "crate::registry::deserialize_declared_name"
+    )]
     pub name: crate::registry::DeclaredName,
     pub rows: Vec<IntrinsicId>,
 }

@@ -171,10 +171,37 @@ impl StoredGrid {
     }
 }
 
-/// Storage representation of one semantic model weight.
+/// The byte ranges of one stored part a weight appends
+/// (`ImportTransform::AppendRows`): its own, and its grid's where it is
+/// under one.
+#[derive(Clone, Debug)]
+pub struct StoredPart {
+    pub source: Arc<FileSource>,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub grid: Option<StoredGrid>,
+}
+
+impl StoredPart {
+    pub(crate) fn read(&self) -> Result<crate::import_transforms::PartBytes, WeightImportError> {
+        let length = usize::try_from(self.nbytes)
+            .map_err(|_| invalid("stored part exceeds the host address range"))?;
+        Ok(crate::import_transforms::PartBytes {
+            bytes: self.source.read(self.offset, length)?,
+            grid: self.grid.as_ref().map(StoredGrid::read).transpose()?,
+        })
+    }
+}
+
+/// Storage representation of one semantic model weight: its stored tensor,
+/// and the parts whose rows it appends, which the host's transforms read
+/// (`import_transforms::upload_bytes`).
 #[derive(Clone, Debug)]
 pub enum Stored {
-    Dense(StoredTensor),
+    Dense {
+        tensor: StoredTensor,
+        parts: Vec<StoredPart>,
+    },
     /// Blocks of `encoding`, scaled by their own scales or, with a `grid`,
     /// by its block scales (`seismic::GgufScales`).
     GgmlBlocks {
@@ -184,6 +211,7 @@ pub enum Stored {
         shape: Vec<u64>,
         encoding: Encoding,
         grid: Option<StoredGrid>,
+        parts: Vec<StoredPart>,
     },
 }
 
@@ -215,9 +243,25 @@ impl ImportArtifactTensor {
 }
 
 impl Stored {
+    /// A stored tensor read as it is.
+    pub fn dense(tensor: StoredTensor) -> Self {
+        Self::Dense {
+            tensor,
+            parts: Vec::new(),
+        }
+    }
+
+    /// The parts whose rows the weight appends, in order.
+    pub fn parts(&self) -> &[StoredPart] {
+        match self {
+            Self::Dense { parts, .. } | Self::GgmlBlocks { parts, .. } => parts,
+        }
+    }
+
+    /// The stored tensor's own range (not its parts').
     pub(crate) fn file_range(&self) -> (&Arc<FileSource>, u64, u64) {
         match self {
-            Self::Dense(tensor) => (&tensor.source, tensor.offset, tensor.nbytes),
+            Self::Dense { tensor, .. } => (&tensor.source, tensor.offset, tensor.nbytes),
             Self::GgmlBlocks {
                 source,
                 offset,
@@ -229,7 +273,7 @@ impl Stored {
 
     pub fn shape(&self) -> &[u64] {
         match self {
-            Self::Dense(tensor) => &tensor.shape,
+            Self::Dense { tensor, .. } => &tensor.shape,
             Self::GgmlBlocks { shape, .. } => shape,
         }
     }
@@ -238,7 +282,7 @@ impl Stored {
     /// grid's too, which the source lays planar beside its codes.
     pub fn source_bytes(&self) -> u64 {
         match self {
-            Self::Dense(tensor) => tensor.nbytes,
+            Self::Dense { tensor, .. } => tensor.nbytes,
             Self::GgmlBlocks { nbytes, grid, .. } => nbytes + grid.as_ref().map_or(0, |grid| grid.nbytes),
         }
     }
@@ -246,14 +290,14 @@ impl Stored {
     /// The grid of block scales the stored blocks are read under.
     pub fn grid(&self) -> Option<&StoredGrid> {
         match self {
-            Self::Dense(_) => None,
+            Self::Dense { .. } => None,
             Self::GgmlBlocks { grid, .. } => grid.as_ref(),
         }
     }
 
     pub fn source_element(&self) -> Option<Element> {
         match self {
-            Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
+            Self::Dense { tensor, .. } => Some(Element::dense(tensor.dtype)),
             Self::GgmlBlocks {
                 encoding,
                 shape,
@@ -269,18 +313,27 @@ impl Stored {
 
     /// The first `rows` of the tensor's leading dimension (an expert stack's
     /// first `rows` experts), which lie first in the file: its bytes, and
-    /// its scale grid's, in proportion. None where the tensor's bytes do not
-    /// divide evenly into its leading rows.
-    fn leading(&self, rows: u64) -> Option<Self> {
-        let leading = *self.shape().first()?;
-        let part = |nbytes: u64| crate::planning::leading_bytes(nbytes, leading, rows);
+    /// its scale grid's, in proportion. Refused, saying why, where it appends
+    /// stored parts, whose rows no prefix of its own bytes holds, or where its
+    /// bytes do not divide evenly into its leading rows.
+    fn leading(&self, rows: u64) -> Result<Self, String> {
+        let (Self::Dense { parts, .. } | Self::GgmlBlocks { parts, .. }) = self;
+        if !parts.is_empty() {
+            return Err("it appends stored parts, whose rows no prefix of its own bytes holds".into());
+        }
+        let stored = *self.shape().first().ok_or("it has no leading dimension")?;
+        let divides = || format!("its bytes hold no first {rows} of its {stored} leading rows in proportion");
+        let part = |nbytes: u64| crate::planning::leading_bytes(nbytes, stored, rows).ok_or_else(divides);
         match self {
-            Self::Dense(tensor) => Some(Self::Dense(StoredTensor {
-                nbytes: part(tensor.nbytes)?,
-                shape: [&[rows][..], &tensor.shape[1..]].concat(),
-                ..tensor.clone()
-            })),
-            Self::GgmlBlocks { source, offset, nbytes, shape, encoding, grid } => Some(Self::GgmlBlocks {
+            Self::Dense { tensor, .. } => Ok(Self::Dense {
+                tensor: StoredTensor {
+                    nbytes: part(tensor.nbytes)?,
+                    shape: [&[rows][..], &tensor.shape[1..]].concat(),
+                    ..tensor.clone()
+                },
+                parts: Vec::new(),
+            }),
+            Self::GgmlBlocks { source, offset, nbytes, shape, encoding, grid, .. } => Ok(Self::GgmlBlocks {
                 source: source.clone(),
                 offset: *offset,
                 nbytes: part(*nbytes)?,
@@ -290,6 +343,7 @@ impl Stored {
                     Some(grid) => Some(StoredGrid { nbytes: part(grid.nbytes)?, ..grid.clone() }),
                     None => None,
                 },
+                parts: Vec::new(),
             }),
         }
     }
@@ -314,7 +368,7 @@ impl Stored {
         let name = &weight.descriptor.name;
         let leading = stored
             .leading(rows)
-            .ok_or_else(|| invalid(format!("{rows} leading rows of {name:?} ({stored_rows} stored)")))?;
+            .map_err(|reason| invalid(format!("{rows} leading rows of {name:?} ({stored_rows} stored): {reason}")))?;
         match leading.shape()[1..] == weight.shape[1..] {
             true => Ok(leading),
             false => Err(invalid(format!(
@@ -327,38 +381,58 @@ impl Stored {
 
     /// The stored tensor `descriptor` names, with its grid of block scales
     /// where it names one (bound and admitted with the weight,
-    /// `Tensors::companion_scale`).
+    /// `Tensors::companion_scale`), and the parts it appends, each with its
+    /// own.
     pub fn from_gguf(
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<Self, WeightImportError> {
-        let grid = crate::import_transforms::grid(descriptor)
-            .map(|(name, grid)| {
-                let stored = artifact.tensor(name)?;
-                Ok::<_, WeightImportError>(StoredGrid {
-                    source: stored.source,
-                    offset: stored.offset,
-                    nbytes: stored.nbytes,
-                    grid,
+        let grid_of = |name: &str, grid: Grid| {
+            let stored = artifact.tensor(name)?;
+            Ok::<_, WeightImportError>(StoredGrid {
+                source: stored.source,
+                offset: stored.offset,
+                nbytes: stored.nbytes,
+                grid,
+            })
+        };
+        let weight_grid = crate::import_transforms::grid(descriptor);
+        let grid = weight_grid.map(|(name, grid)| grid_of(name, grid)).transpose()?;
+        let parts = crate::import_transforms::appended(descriptor)
+            .iter()
+            .map(|part| {
+                let tensor = artifact.tensor(&part.tensor)?;
+                Ok(StoredPart {
+                    source: tensor.source,
+                    offset: tensor.offset,
+                    nbytes: tensor.nbytes,
+                    grid: match (&part.grid, weight_grid) {
+                        (Some(name), Some((_, grid))) => Some(grid_of(name, grid)?),
+                        (None, None) => None,
+                        _ => unreachable!("an admitted part is under a grid exactly when its weight is"),
+                    },
                 })
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>, WeightImportError>>()?;
         let tensor = artifact.tensor(&descriptor.name)?;
         match tensor.encoding {
             Encoding::F32 | Encoding::F16 | Encoding::BF16 => {
                 assert!(grid.is_none(), "an admitted dense weight {:?} has no scale grid", descriptor.name);
-                Ok(Self::Dense(StoredTensor {
-                source: tensor.source,
-                offset: tensor.offset,
-                nbytes: tensor.nbytes,
-                dtype: match tensor.encoding {
-                    Encoding::F32 => DType::F32,
-                    Encoding::F16 => DType::F16,
-                    Encoding::BF16 => DType::BF16,
-                    _ => unreachable!("dense encoding was matched above"),
-                },
-                shape: tensor.shape,
-                }))
+                Ok(Self::Dense {
+                    tensor: StoredTensor {
+                        source: tensor.source,
+                        offset: tensor.offset,
+                        nbytes: tensor.nbytes,
+                        dtype: match tensor.encoding {
+                            Encoding::F32 => DType::F32,
+                            Encoding::F16 => DType::F16,
+                            Encoding::BF16 => DType::BF16,
+                            _ => unreachable!("dense encoding was matched above"),
+                        },
+                        shape: tensor.shape,
+                    },
+                    parts,
+                })
             }
             encoding => Ok(Self::GgmlBlocks {
                 source: tensor.source,
@@ -367,6 +441,7 @@ impl Stored {
                 shape: tensor.shape,
                 encoding,
                 grid,
+                parts,
             }),
         }
     }
@@ -1272,7 +1347,7 @@ impl ResidencyStore {
         // read dense weights only: it uploads F32 and becomes dense.
         let dequantized = planned.upload != planned.source;
         let (upload, actual_resident) = match stored {
-            Stored::Dense(_) => (actual_source, Element::dense(target)),
+            Stored::Dense { .. } => (actual_source, Element::dense(target)),
             Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
             Stored::GgmlBlocks { .. } => (
                 actual_source,
@@ -1597,7 +1672,7 @@ pub(crate) fn import_scale(
     scale: &crate::WeightScalePlan,
 ) -> Result<Tensor, WeightImportError> {
     let descriptor = WeightDescriptor::stored(scale.tensor.as_str(), [scale.stored]);
-    let Stored::Dense(stored) = Stored::from_gguf(artifact, &descriptor)? else {
+    let Stored::Dense { tensor: stored, .. } = Stored::from_gguf(artifact, &descriptor)? else {
         return Err(invalid(format!(
             "second-level scale {:?} is not stored dense",
             scale.tensor
@@ -1851,7 +1926,7 @@ fn validate_request(
     // The stored tensor's own byte layout, before any transform.
     let count = element_count(stored.shape())?;
     match stored {
-        Stored::Dense(stored) => {
+        Stored::Dense { tensor: stored, .. } => {
             if validate_dense(stored)? != count {
                 return Err(invalid(
                     "stored dense weight does not match its logical descriptor",
@@ -1942,14 +2017,43 @@ mod tests {
             shape: vec![8, 3, 2],
             encoding: Encoding::Q4K,
             grid: Some(StoredGrid { source, offset: 64, nbytes: 16, grid: Grid::REGISTERED[0] }),
+            parts: Vec::new(),
         };
-        let Some(Stored::GgmlBlocks { offset, nbytes, shape, grid: Some(grid), .. }) = stack.leading(3) else {
+        let Ok(Stored::GgmlBlocks { offset, nbytes, shape, grid: Some(grid), .. }) = stack.leading(3) else {
             panic!("a stack of 8 experts has a leading 3");
         };
         assert_eq!((offset, nbytes, shape), (16, 18, vec![3, 3, 2]));
         assert_eq!((grid.offset, grid.nbytes), (64, 6));
-        assert!(stack.leading(9).is_none(), "more experts than the stack holds");
-        assert!(stack.leading(8).is_some());
+        assert_eq!(
+            stack.leading(9).unwrap_err(),
+            "its bytes hold no first 9 of its 8 leading rows in proportion",
+            "more experts than the stack holds"
+        );
+        assert!(stack.leading(8).is_ok());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A weight that appends stored parts has no leading rows: its parts'
+    /// rows follow its own, so no prefix of its own bytes holds them, and
+    /// `leading` refuses it by that cause.
+    #[test]
+    fn a_weight_appending_stored_parts_has_no_leading_rows() {
+        let path = std::env::temp_dir().join(format!("magnitude-leading-parts-{}.bin", std::process::id()));
+        std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
+        let source = Arc::new(FileSource::open(&path).unwrap());
+        let weight = Stored::GgmlBlocks {
+            source: source.clone(),
+            offset: 0,
+            nbytes: 48,
+            shape: vec![8, 3, 2],
+            encoding: Encoding::Q4K,
+            grid: None,
+            parts: vec![StoredPart { source, offset: 48, nbytes: 16, grid: None }],
+        };
+        assert_eq!(
+            weight.leading(4).unwrap_err(),
+            "it appends stored parts, whose rows no prefix of its own bytes holds"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 

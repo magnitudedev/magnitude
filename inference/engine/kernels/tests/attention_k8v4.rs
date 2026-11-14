@@ -511,7 +511,8 @@ fn vulkan_vector_fits(geometry: Geometry, simds: u64, slices: u64, keywise: u64)
 
 /// Vulkan's grouped-query matrix decode configurations (PARTS, SIMDS) whose
 /// SIMDS * 16 matrix rows hold the query group, within the declaration's
-/// shared bytes (the K/V tile, the subgroup scratch, the query tile).
+/// shared bytes (the K/V tile, the subgroup scratch, the query tile and its
+/// rows' factors).
 fn vulkan_matrix_configs(
     geometry: Geometry,
     configs: &[(u64, u64)],
@@ -521,7 +522,7 @@ fn vulkan_matrix_configs(
         .iter()
         .filter(|(_, simds)| {
             geometry.g as u64 <= simds * 16
-                && 64 * (w.min(256) + 8) + simds * 2048 + simds * 16 * (w + 8) * 2 <= 32768
+                && 64 * (w.min(256) + 8) + simds * 2048 + simds * 16 * ((w + 8) * 2 + 4) <= 32768
         })
         .map(|&(parts, simds)| {
             vec![

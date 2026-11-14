@@ -175,10 +175,11 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction,
+    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction, GateProjection,
+    RecurrentDecay, RecurrentGate,
     GatedDelta, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
     MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
-    QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+    QueryKeys, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
     SharedExpert, SharedExpertGate, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 
@@ -248,6 +249,7 @@ pub(crate) fn declared_model(
                     vec![2 * c.heads * c.head_width, c.hidden],
                     true,
                 )),
+                query_keys: QueryKeys::Direct,
                 gate: AttentionGate::Interleaved {
                     function: GateFunction::Sigmoid,
                 },
@@ -301,18 +303,27 @@ pub(crate) fn declared_model(
                 width: c.state_width,
                 head_mapping: RecurrentHeadMapping::Tiled,
                 query_key_value: tensor(name("attn_qkv"), vec![channels, c.hidden], true),
-                gate: tensor(name("attn_gate"), vec![inner, c.hidden], true),
-                alpha: tensor(name("ssm_alpha"), vec![c.value_heads, c.hidden], true),
                 beta: tensor(name("ssm_beta"), vec![c.value_heads, c.hidden], true),
                 convolution: tensor(
                     name("ssm_conv1d"),
                     vec![channels, c.convolution_width],
                     false,
                 ),
-                decay: tensor(name("ssm_a"), vec![c.value_heads], false),
-                time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
+                decay: RecurrentDecay::PerHead {
+                    alpha: tensor(name("ssm_alpha"), vec![c.value_heads, c.hidden], true),
+                    time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
+                    decay: tensor(name("ssm_a"), vec![c.value_heads], false),
+                },
+                key_norm_epsilon: 1e-6 * c.state_width as f64,
                 norm: rms(tensor(name("ssm_norm"), vec![c.state_width], false)),
-                output_gate: GateFunction::Silu,
+                output_gate: RecurrentGate {
+                    projection: GateProjection::Full(tensor(
+                        name("attn_gate"),
+                        vec![inner, c.hidden],
+                        true,
+                    )),
+                    function: GateFunction::Silu,
+                },
                 output: tensor(name("ssm_out"), vec![c.hidden, inner], true),
             }))
         };

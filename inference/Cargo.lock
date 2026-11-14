@@ -2240,6 +2240,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "libc",
+ "magnitude-artifacts",
  "magnitude-ggml",
  "seismic-io",
  "serde",
@@ -2300,11 +2301,14 @@ dependencies = [
  "opentelemetry-otlp 0.33.0",
  "opentelemetry_sdk 0.33.0",
  "postcard",
+ "proc-macro2",
+ "quote",
  "seismic",
  "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "tempfile",
  "tokio",
  "tracing",
@@ -2360,11 +2364,13 @@ dependencies = [
 name = "magnitude-family-common"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "magnitude-artifacts",
  "magnitude-family-common",
  "magnitude-family-contracts",
  "magnitude-family-dflash",
  "magnitude-family-registry",
+ "postcard",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2413,6 +2419,16 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-family-common",
  "magnitude-family-contracts",
+]
+
+[[package]]
+name = "magnitude-family-glm5next"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "serde_json",
 ]
 
 [[package]]
@@ -2489,6 +2505,7 @@ dependencies = [
  "magnitude-family-contracts",
  "magnitude-family-deepseek41",
  "magnitude-family-gemma4",
+ "magnitude-family-glm5next",
  "magnitude-family-lfm2",
  "magnitude-family-llama",
  "magnitude-family-muse-glimmer",
@@ -2687,6 +2704,7 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-engine",
  "magnitude-executor",
+ "magnitude-family-common",
  "magnitude-service-api",
  "magnitude-service-contracts",
  "magnitude-service-models",

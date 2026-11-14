@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use crate::ReadoutHead;
+use crate::{ReadoutHead, RecurrentForm};
 use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
 use crate::planning::RecordTensors;
 use magnitude_family_contracts::ProgressivePlane;
@@ -114,6 +114,7 @@ impl<'a> QualificationView<'a> {
             // reads, bank 1 its successor. Zero weights leave the residual
             // unchanged.
             let w = binding.width;
+            let (norm_epsilon, gate_function) = (f32::from_bits(binding.key_norm_epsilon), binding.gate_function);
             let (key_heads, value_heads) = (binding.key_heads, binding.value_heads);
             let taps = binding.convolution_width;
             let channels = (2 * key_heads + value_heads) * w;
@@ -128,75 +129,20 @@ impl<'a> QualificationView<'a> {
                 entry,
                 &label,
             )?;
-            let qkv = semantic_zeros(
-                device,
-                binding.qkv,
-                &[channels, hidden],
-                "target_recurrent",
-                &label,
-            )?;
-            let gate = semantic_zeros(
-                device,
-                binding.gate,
-                &[value_heads * w, hidden],
-                "target_recurrent",
-                &label,
-            )?;
-            let alpha = semantic_zeros(
-                device,
-                binding.alpha,
-                &[value_heads, hidden],
-                "target_recurrent",
-                &label,
-            )?;
-            let beta = semantic_zeros(
-                device,
-                binding.beta,
-                &[value_heads, hidden],
-                "target_recurrent",
-                &label,
-            )?;
-            let convolution = semantic_zeros(
-                device,
-                Element::f32(),
-                &[channels, taps],
-                "target_recurrent",
-                &label,
-            )?;
-            let rate = semantic_zeros(
-                device,
-                Element::f32(),
-                &[value_heads],
-                "target_recurrent",
-                &label,
-            )?;
-            let time_bias = semantic_zeros(
-                device,
-                Element::f32(),
-                &[value_heads],
-                "target_recurrent",
-                &label,
-            )?;
-            let recurrent_norm = semantic_zeros(
-                device,
-                binding.recurrent_norm,
-                &[w],
-                "target_recurrent",
-                &label,
-            )?;
-            let output = semantic_zeros(
-                device,
-                binding.output,
-                &[hidden, value_heads * w],
-                "target_recurrent",
-                &label,
-            )?;
+            let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+            let qkv = zeros(binding.qkv, &[channels, hidden])?;
+            let beta = zeros(binding.beta, &[value_heads, hidden])?;
+            let convolution = zeros(Element::f32(), &[channels, taps])?;
+            let rate = zeros(Element::f32(), &[value_heads])?;
+            let recurrent_norm = zeros(binding.recurrent_norm, &[w])?;
+            let output = zeros(binding.output, &[hidden, value_heads * w])?;
             let segments =
                 semantic_i32(device, &[2, 2], &[0, 1, 1, 1], "target_recurrent", &label)?;
             let stop = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
             let previous_bank = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
             let previous_tape = semantic_i32(device, &[1], &[0], "target_recurrent", &label)?;
             let following_bank = semantic_i32(device, &[1], &[1], "target_recurrent", &label)?;
+            let decays = value_heads * binding.decay_width;
             // One tape row, the least a bank holds.
             let mut banks = seismic::SlabTensor::new(
                 device,
@@ -213,7 +159,7 @@ impl<'a> QualificationView<'a> {
                     },
                     seismic::SlabRegion {
                         element: Element::f32(),
-                        row_shape: vec![1, (value_heads + key_heads) * w + value_heads],
+                        row_shape: vec![1, (value_heads + key_heads) * w + decays],
                     },
                 ],
             )
@@ -230,116 +176,229 @@ impl<'a> QualificationView<'a> {
             let mut tape = banks
                 .logical_region(2)
                 .map_err(|error| qualification_dynamic("target_recurrent", &label, error))?;
-            let projection = kernels
-                .project
-                .call(gated_delta_project::Args {
-                    hidden: &input,
-                    input_norm: &norm,
-                    qkv_weight: &qkv,
-                    gate_weight: &gate,
-                    alpha_weight: &alpha,
-                    beta_weight: &beta,
-                    epsilon: 1.0e-5,
-                    qkv_bound: &any_row_bound(device, &kernels.project, "QB", "gated_delta_project", &label)?,
-                    gate_bound: &any_row_bound(device, &kernels.project, "ZB", "gated_delta_project", &label)?,
-                })
-                .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
-                .value;
-            let gated = match &kernels.step {
-                RecurrentStepKernels::Step(step) => {
-                    step.call(gated_delta_step::Args {
-                        projection: &projection,
-                        convolution: &convolution,
-                        rate: &rate,
-                        time_bias: &time_bias,
-                        recurrent_norm: &recurrent_norm,
-                        segments: &segments,
-                        stop: &stop,
-                        previous_bank: &previous_bank,
-                        previous_tape: &previous_tape,
-                        following_bank: &following_bank,
-                        window: &mut window,
-                        delta: &mut delta,
-                        tape: &mut tape,
-                        norm_epsilon: 1.0e-5,
-                        epsilon: 1.0e-5,
-                        grouped: false,
-                        gate_function: 0,
-                        slab_banks: 2,
-                    })
-                    .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
-                    .value
-                }
-                RecurrentStepKernels::Convolved { project, step } => {
-                    let projected = project
-                        .call(gated_delta_project_convolved::Args {
+            let gated = match &kernels.form {
+                RecurrentFormKernels::Gated {
+                    project,
+                    step,
+                    chunk,
+                } => {
+                    let gate = zeros(binding.gate, &[value_heads * w, hidden])?;
+                    let alpha = zeros(binding.alpha, &[value_heads, hidden])?;
+                    let time_bias = zeros(Element::f32(), &[value_heads])?;
+                    let projection = project
+                        .call(gated_delta_project::Args {
                             hidden: &input,
                             input_norm: &norm,
                             qkv_weight: &qkv,
                             gate_weight: &gate,
                             alpha_weight: &alpha,
                             beta_weight: &beta,
+                            epsilon: 1.0e-5,
+                            qkv_bound: &any_row_bound(device, project, "QB", "gated_delta_project", &label)?,
+                            gate_bound: &any_row_bound(device, project, "ZB", "gated_delta_project", &label)?,
+                        })
+                        .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
+                        .value;
+                    let gated = match step {
+                        RecurrentStepKernels::Step(step) => {
+                            step.call(gated_delta_step::Args {
+                                projection: &projection,
+                                convolution: &convolution,
+                                rate: &rate,
+                                time_bias: &time_bias,
+                                recurrent_norm: &recurrent_norm,
+                                segments: &segments,
+                                stop: &stop,
+                                previous_bank: &previous_bank,
+                                previous_tape: &previous_tape,
+                                following_bank: &following_bank,
+                                window: &mut window,
+                                delta: &mut delta,
+                                tape: &mut tape,
+                                norm_epsilon,
+                                epsilon: 1.0e-5,
+                                grouped: false,
+                                gate_function,
+                                slab_banks: 2,
+                            })
+                            .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
+                            .value
+                        }
+                        RecurrentStepKernels::Convolved { project, step } => {
+                            let projected = project
+                                .call(gated_delta_project_convolved::Args {
+                                    hidden: &input,
+                                    input_norm: &norm,
+                                    qkv_weight: &qkv,
+                                    gate_weight: &gate,
+                                    alpha_weight: &alpha,
+                                    beta_weight: &beta,
+                                    convolution: &convolution,
+                                    segments: &segments,
+                                    stop: &stop,
+                                    previous_bank: &previous_bank,
+                                    previous_tape: &previous_tape,
+                                    following_bank: &following_bank,
+                                    window: &mut window,
+                                    epsilon: 1.0e-5,
+                                    slab_banks: 2,
+                                })
+                                .map_err(|error| {
+                                    qualification_dynamic("gated_delta_project_convolved", &label, error)
+                                })?;
+                            step.call(gated_delta_step_convolved::Args {
+                                projection: &projected.r0,
+                                convolved: &projected.r1,
+                                rate: &rate,
+                                time_bias: &time_bias,
+                                recurrent_norm: &recurrent_norm,
+                                segments: &segments,
+                                stop: &stop,
+                                previous_bank: &previous_bank,
+                                previous_tape: &previous_tape,
+                                following_bank: &following_bank,
+                                delta: &mut delta,
+                                tape: &mut tape,
+                                norm_epsilon,
+                                epsilon: 1.0e-5,
+                                grouped: false,
+                                gate_function,
+                                slab_banks: 2,
+                            })
+                            .map_err(|error| {
+                                qualification_dynamic("gated_delta_step_convolved", &label, error)
+                            })?
+                            .value
+                        }
+                    };
+                    chunk
+                        .call(gated_delta_chunk::Args {
+                            projection: &projection,
                             convolution: &convolution,
+                            rate: &rate,
+                            time_bias: &time_bias,
+                            recurrent_norm: &recurrent_norm,
                             segments: &segments,
                             stop: &stop,
                             previous_bank: &previous_bank,
                             previous_tape: &previous_tape,
                             following_bank: &following_bank,
                             window: &mut window,
+                            delta: &mut delta,
+                            tape: &mut tape,
+                            norm_epsilon,
                             epsilon: 1.0e-5,
+                            grouped: false,
+                            gate_function,
                             slab_banks: 2,
                         })
-                        .map_err(|error| {
-                            qualification_dynamic("gated_delta_project_convolved", &label, error)
-                        })?;
-                    step.call(gated_delta_step_convolved::Args {
-                        projection: &projected.r0,
-                        convolved: &projected.r1,
-                        rate: &rate,
-                        time_bias: &time_bias,
-                        recurrent_norm: &recurrent_norm,
-                        segments: &segments,
-                        stop: &stop,
-                        previous_bank: &previous_bank,
-                        previous_tape: &previous_tape,
-                        following_bank: &following_bank,
-                        delta: &mut delta,
-                        tape: &mut tape,
-                        norm_epsilon: 1.0e-5,
-                        epsilon: 1.0e-5,
-                        grouped: false,
-                        gate_function: 0,
-                        slab_banks: 2,
-                    })
-                    .map_err(|error| {
-                        qualification_dynamic("gated_delta_step_convolved", &label, error)
-                    })?
-                    .value
+                        .map_err(|error| qualification_dynamic("gated_delta_chunk", &label, error))?;
+                    gated
+                }
+                RecurrentFormKernels::Kimi(kimi) => {
+                    let RecurrentForm::PerChannel { decay_lower, gate_up, alpha_up, gate_rank, alpha_rank } = binding.form
+                    else {
+                        unreachable!("preparation gives a per-channel layer the Kimi entries")
+                    };
+                    let decay_lower = f32::from_bits(decay_lower);
+                    let gate = zeros(binding.gate, &[gate_rank, hidden])?;
+                    let alpha = zeros(binding.alpha, &[alpha_rank, hidden])?;
+                    let time_bias = zeros(Element::f32(), &[value_heads * w])?;
+                    let scale = |name| unit_scale(device, &kimi.project, name, "attention_project", &label);
+                    let bound = |name| any_row_bound(device, &kimi.project, name, "attention_project", &label);
+                    let projected = kimi
+                        .project
+                        .call(attention_project::Args {
+                            hidden: &input,
+                            input_norm: &norm,
+                            query_weight: &qkv,
+                            gate_weight: &gate,
+                            key_weight: &alpha,
+                            value_weight: &beta,
+                            epsilon: 1.0e-5,
+                            project_mode: 0,
+                            query_scale: &scale("QS")?,
+                            gate_scale: &scale("GS")?,
+                            key_scale: &scale("KS")?,
+                            value_scale: &scale("VS")?,
+                            query_bound: &bound("QB")?,
+                            gate_bound: &bound("GB")?,
+                            key_bound: &bound("KB")?,
+                            value_bound: &bound("VB")?,
+                        })
+                        .map_err(|error| qualification_dynamic("attention_project", &label, error))?;
+                    // The gate and decay inputs: the down products through
+                    // zero up projections.
+                    let expand = |kernel: &NativeKernel<project_rows::Entry>, source: &Tensor, element, rank| {
+                        kernel
+                            .call(project_rows::Args {
+                                source,
+                                weight: &zeros(element, &[value_heads * w, rank])?,
+                                weight_scale: &unit_scale(device, kernel, "WS", "project_rows", &label)?,
+                                weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", &label)?,
+                            })
+                            .map(|expanded| expanded.value)
+                            .map_err(|error| qualification_dynamic("project_rows", &label, error))
+                    };
+                    let gate_input = expand(&kimi.gate_up, &projected.r1, gate_up, gate_rank)?;
+                    let decay_input = expand(&kimi.alpha_up, &projected.r2, alpha_up, alpha_rank)?;
+                    let gated = kimi
+                        .step
+                        .call(kimi_delta_step::Args {
+                            projection: &projected.r0,
+                            beta: &projected.r3,
+                            gate: &gate_input,
+                            decay: &decay_input,
+                            convolution: &convolution,
+                            rate: &rate,
+                            time_bias: &time_bias,
+                            recurrent_norm: &recurrent_norm,
+                            segments: &segments,
+                            stop: &stop,
+                            previous_bank: &previous_bank,
+                            previous_tape: &previous_tape,
+                            following_bank: &following_bank,
+                            window: &mut window,
+                            delta: &mut delta,
+                            tape: &mut tape,
+                            norm_epsilon,
+                            epsilon: 1.0e-5,
+                            decay_lower,
+                            grouped: false,
+                            gate_function,
+                            slab_banks: 2,
+                        })
+                        .map_err(|error| qualification_dynamic("kimi_delta_step", &label, error))?
+                        .value;
+                    kimi.chunk
+                        .call(kimi_delta_chunk::Args {
+                            projection: &projected.r0,
+                            beta: &projected.r3,
+                            gate: &gate_input,
+                            decay: &decay_input,
+                            convolution: &convolution,
+                            rate: &rate,
+                            time_bias: &time_bias,
+                            recurrent_norm: &recurrent_norm,
+                            segments: &segments,
+                            stop: &stop,
+                            previous_bank: &previous_bank,
+                            previous_tape: &previous_tape,
+                            following_bank: &following_bank,
+                            window: &mut window,
+                            delta: &mut delta,
+                            tape: &mut tape,
+                            norm_epsilon,
+                            epsilon: 1.0e-5,
+                            decay_lower,
+                            grouped: false,
+                            gate_function,
+                            slab_banks: 2,
+                        })
+                        .map_err(|error| qualification_dynamic("kimi_delta_chunk", &label, error))?;
+                    gated
                 }
             };
-            kernels
-                .chunk
-                .call(gated_delta_chunk::Args {
-                    projection: &projection,
-                    convolution: &convolution,
-                    rate: &rate,
-                    time_bias: &time_bias,
-                    recurrent_norm: &recurrent_norm,
-                    segments: &segments,
-                    stop: &stop,
-                    previous_bank: &previous_bank,
-                    previous_tape: &previous_tape,
-                    following_bank: &following_bank,
-                    window: &mut window,
-                    delta: &mut delta,
-                    tape: &mut tape,
-                    norm_epsilon: 1.0e-5,
-                    epsilon: 1.0e-5,
-                    grouped: false,
-                    gate_function: 0,
-                    slab_banks: 2,
-                })
-                .map_err(|error| qualification_dynamic("gated_delta_chunk", &label, error))?;
             let result = kernels
                 .output
                 .call(attention_output::Args {

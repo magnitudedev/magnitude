@@ -11,7 +11,7 @@
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, text};
 use crate::render::Rendered;
-use magnitude_engine::options::ResolvedMethod;
+use magnitude_engine::options::{ModelMethod, ResolvedMethod};
 use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureSpan, HeadPhase, Operation, Outcome, PhysicalDecision,
     ReservedResources, TokenId, WorkKind,
@@ -25,6 +25,8 @@ use std::path::Path;
 pub struct DraftOptions {
     /// Anchors per fixture, spread evenly over its scored positions.
     pub anchors: usize,
+    /// How the load drafts: the catalog's drafter or head (`Auto`), or a named method.
+    pub method: ModelMethod,
     /// Proposals per draft; the catalog drafter's own width when absent.
     pub proposals: Option<u8>,
     /// Time each anchor's draft, its verification and one plain decode step
@@ -50,12 +52,12 @@ pub fn run(
         artifacts,
         options,
         &Load {
-            drafter: true,
+            method: draft.method,
             proposals: draft.proposals,
             context_tokens: longest + 2 * usize::from(u8::MAX),
             // One fixture's sequence at a time.
             sequences: std::num::NonZeroUsize::MIN,
-            decode_rows: 16,
+            decode_rows: magnitude_executor::StepAllowances::EVALUATION_DRAFTING.decode_tokens,
             exported_logits_rows: 0,
             lookahead: false,
         },

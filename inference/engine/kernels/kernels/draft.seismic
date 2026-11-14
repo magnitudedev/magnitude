@@ -66,6 +66,8 @@ native draft_rows for metal from "metal/draft_rows.metal":
 # CUDA shares the standard projection row bands. Large classes stage each
 # normalized row/stream once and share combine weight tiles across rows.
 native draft_rows for cuda from "cuda/draft_rows.cu":
+    static (D)
+    where D % 64 == 0
     scratch joined bytes (M * S * D * 4) when M * S > 16
     launch draft_rows when M * S <= 16:
         threadgroups (ceil_div(D, 32), M * S, 1)

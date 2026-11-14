@@ -8,9 +8,10 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-    EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
+    EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, GateProjection,
+    RecurrentDecay, RecurrentGate, HeadNorm,
     HistoryRows, HistorySource, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
-    Operator, OutputForm, OutputProjection, ProjectedRows, QueryProjection, ResidualForm,
+    Operator, OutputForm, OutputProjection, ProjectedRows, QueryKeys, QueryProjection, ResidualForm,
     RmsNorm, Rotary, RowProducer, RowRounding, Sublayer, TokenDomain, ValueNorm, ValueSource,
     WeightDescriptor,
 };
@@ -59,6 +60,7 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
         kv_heads: 1,
         width: WIDTH,
         query: QueryProjection::Full(descriptor("qg", &[2 * 2 * WIDTH, hidden])),
+        query_keys: QueryKeys::Direct,
         gate: AttentionGate::Interleaved {
             function: GateFunction::Sigmoid,
         },
@@ -442,11 +444,34 @@ pub fn exit_norm(site: magnitude_family_contracts::LowRankGatedSite) -> ExitNorm
 /// blocks of attention then a general routed feed-forward of 32 experts,
 /// all selected, every sublayer reading through its Sinkhorn site over the
 /// hyper-connection fixtures' streams (20 iterations) under its own norm,
-/// and an exit that collapses the streams by the last site's pre under the
-/// output norm.
+/// mixing by the previous site's pre, and an exit that collapses the
+/// streams by the last site's pre under the output norm.
 pub fn sinkhorn_fixture_definition(blocks: u64) -> ModelDefinition {
+    use magnitude_family_contracts::{ExitSite, SinkhornInput};
+    sinkhorn_fixture_definition_of(blocks, SinkhornInput::PreviousSite, ExitSite::PreviousSite)
+}
+
+/// [`sinkhorn_fixture_definition`] with every site mixing by `input`'s pre
+/// and the exit at `exit` (GLM-5.3's: each site's own, the streams' mean).
+pub fn sinkhorn_fixture_definition_of(
+    blocks: u64,
+    input: magnitude_family_contracts::SinkhornInput,
+    exit: magnitude_family_contracts::ExitSite,
+) -> ModelDefinition {
+    sinkhorn_fixture_definition_over(STREAMS, blocks, input, exit)
+}
+
+/// [`sinkhorn_fixture_definition_of`] over `streams` streams rather than the
+/// hyper-connection fixtures' [`STREAMS`]: every site's weights are sized
+/// from the count, so the definition stays consistent at any of them.
+pub fn sinkhorn_fixture_definition_over(
+    streams: u64,
+    blocks: u64,
+    input: magnitude_family_contracts::SinkhornInput,
+    exit: magnitude_family_contracts::ExitSite,
+) -> ModelDefinition {
     use magnitude_family_contracts::{
-        ExitSite, ExpertSelection, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
+        ExpertSelection, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
         HyperConnectionWeights, HyperConnections, RouteNormalization, RoutedFfn, Router, RouterInput,
         ScoreFunction, SinkhornSite,
     };
@@ -454,13 +479,13 @@ pub fn sinkhorn_fixture_definition(blocks: u64) -> ModelDefinition {
     const FEATURES: u64 = 64;
     let mut definition = fixture_definition();
     let decoder = &mut definition.decoder;
-    let (hidden, wide) = (decoder.hidden, STREAMS * decoder.hidden);
+    let (hidden, wide) = (decoder.hidden, streams * decoder.hidden);
     decoder.residual = ResidualForm::HyperConnections(HyperConnections {
-        streams: STREAMS,
-        mixing: HyperConnectionMixing::Sinkhorn { iterations: 20, epsilon: 1e-6, norm_epsilon: 1e-6 },
+        streams,
+        mixing: HyperConnectionMixing::Sinkhorn { iterations: 20, epsilon: 1e-6, norm_epsilon: 1e-6, input },
     });
     let rms = |name: &str| RmsNorm { weight: descriptor(name, &[hidden]), epsilon: 1e-6 };
-    let mixes = (2 + STREAMS) * STREAMS;
+    let mixes = (2 + streams) * streams;
     let sited = |prefix: &str, op: Operator| Sublayer {
         input: InputNorm::HyperConnectionMix(HyperConnectionInput {
             site: HyperConnectionWeights::Sinkhorn(SinkhornSite {
@@ -505,10 +530,382 @@ pub fn sinkhorn_fixture_definition(blocks: u64) -> ModelDefinition {
         })
         .collect();
     decoder.exit.norm = ExitNorm::HyperConnectionHead(HyperConnectionExit {
-        site: ExitSite::PreviousSite,
+        site: exit,
         norm: Some(rms("output_norm")),
     });
     definition
+}
+
+/// GLM-5.3-Flash's slice A over the fixture geometry: one block of Kimi
+/// Delta Attention (per-channel decay under its lower bound, low-rank decay
+/// and sigmoid output gate) and a clamped dense feed-forward, each reading
+/// through its own Sinkhorn site by that site's own pre, and the streams'
+/// mean exit.
+pub fn glm_slice_fixture_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{
+        DecayGate, ExitSite, GatedDelta, GluLimit, LowRank, RecurrentHeadMapping, SinkhornInput,
+    };
+    const STATE: u64 = 128;
+    const RANK: u64 = 64;
+    const FEATURES: u64 = 64;
+    let mut definition = sinkhorn_fixture_definition_of(1, SinkhornInput::OwnSite, ExitSite::Mean);
+    let hidden = definition.decoder.hidden;
+    let heads = 4;
+    let inner = heads * STATE;
+    let low_rank = |down: &str, up: &str| LowRank {
+        down: descriptor(down, &[RANK, hidden]),
+        up: descriptor(up, &[inner, RANK]),
+    };
+    let kda = Operator::GatedDelta(Box::new(GatedDelta {
+        convolution_width: 4,
+        key_heads: heads,
+        value_heads: heads,
+        width: STATE,
+        head_mapping: RecurrentHeadMapping::Grouped,
+        query_key_value: descriptor("blk.0.attn_qkv", &[3 * inner, hidden]),
+        beta: descriptor("blk.0.ssm_beta", &[heads, hidden]),
+        convolution: descriptor("blk.0.ssm_conv1d", &[3 * inner, 4]),
+        decay: RecurrentDecay::PerChannel {
+            projection: low_rank("blk.0.ssm_f_a", "blk.0.ssm_f_b"),
+            bias: descriptor("blk.0.ssm_dt", &[inner]),
+            decay: descriptor("blk.0.ssm_a", &[heads]),
+            gate: DecayGate::BoundedSigmoid { lower: -5.0 },
+        },
+        key_norm_epsilon: 1e-6,
+        // The recurrent norm shares its sublayer's input norm epsilon.
+        norm: RmsNorm { weight: descriptor("blk.0.ssm_norm", &[STATE]), epsilon: 1e-6 },
+        output_gate: RecurrentGate {
+            projection: GateProjection::LowRank(low_rank("blk.0.ssm_g_a", "blk.0.ssm_g_b")),
+            function: GateFunction::Sigmoid,
+        },
+        output: descriptor("blk.0.attn_output", &[hidden, inner]),
+    }));
+    let dense = Operator::DenseFfn(Box::new(DenseFfn {
+        intermediate: FEATURES,
+        up: FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            limit: Some(GluLimit::new(10.0).expect("a positive limit")),
+            gate: descriptor("blk.0.ffn_gate", &[FEATURES, hidden]),
+            up: descriptor("blk.0.ffn_up", &[FEATURES, hidden]),
+        },
+        down: descriptor("blk.0.ffn_down", &[hidden, FEATURES]),
+    }));
+    let [mixer, feed_forward] = definition.decoder.blocks[0].sublayers.as_mut_slice() else {
+        unreachable!("the Sinkhorn fixture's blocks are a mixer and a feed-forward")
+    };
+    mixer.op = kda;
+    feed_forward.op = dense;
+    definition
+}
+
+/// GLM-5.3-Flash's slice B over the fixture geometry, with its package
+/// manifest: slice A's block, then a block of GLM's latent attention and its
+/// routed feed-forward, each behind its own Sinkhorn site.
+/// - The attention: 4 query heads 64 wide off a rank-128 `qr`, absorbed per
+///   head into the 128-wide latent row stored once as key and value, read
+///   without positions over the rows its indexer picks: 4 heads 64 wide
+///   querying from `qr`, each token's key LayerNorm-ed with a bias, pooled
+///   per 4 tokens by a softmax gate with a per-place term, weighted per
+///   head by a projection of the row.
+/// - The feed-forward: 32 experts choosing 8 by sigmoid scores ranked on a
+///   selection bias, weighted over their sum plus 1e-20 times 2.5, the
+///   experts and the ungated shared expert clamped.
+///
+/// Its query, latent and output projections, experts and shared expert are
+/// F8_E4M3 codes under F32 grids of 128×128 tiles, as GLM stores them.
+///
+/// Its indexer pools `GLM_SLICE_B_RATE` tokens to a unit and picks the
+/// `GLM_SLICE_B_TOP` best.
+pub fn glm_slice_b_fixture() -> (ModelDefinition, PackageManifest) {
+    use magnitude_family_contracts::{
+        Candidates, ExpertSelection, GluLimit, HeadWeights, HistoryReads, ImportTransform, Indexer,
+        IndexerInput, IndexerKeys, IndexerQuery, LayerNorm, Pool, PoolNorm, PooledRows,
+        RouteNormalization, RoutedFfn, Router, RouterInput, ScaleCodes, ScoreFunction, Selection,
+        SharedExpert, SharedExpertGate,
+    };
+    const HEADS: u64 = 4;
+    const HEAD: u64 = 64;
+    const LATENT: u64 = 128;
+    const QUERY_RANK: u64 = 128;
+    const INDEX_WIDTH: u64 = 64;
+    const RATE: u64 = GLM_SLICE_B_RATE;
+    const EXPERTS: u64 = 32;
+    const FEATURES: u64 = 128;
+    const TILE: u64 = 128;
+    let mut definition = glm_slice_fixture_definition();
+    let hidden = definition.decoder.hidden;
+    let name = |part: &str| format!("blk.1.{part}");
+    let weight = |part: &str, shape: &[u64]| descriptor(&name(part), shape);
+    // An FP8 weight under its `.scale` grid of whole tiles.
+    let fp8 = |part: &str, shape: &[u64]| WeightDescriptor {
+        transforms: vec![ImportTransform::ScaleBlocks {
+            tensor: name(&format!("{part}.scale")),
+            tile: [TILE, TILE],
+            codes: ScaleCodes::F32,
+        }],
+        ..weight(part, shape)
+    };
+    let merged = |part: &str, stack: &[u64; 3]| WeightDescriptor {
+        transforms: vec![ImportTransform::MergeLeadingAxes],
+        ..weight(part, &[stack[0] * stack[1], stack[2]])
+    };
+    let rms = |part: &str, width| RmsNorm { weight: weight(part, &[width]), epsilon: 1e-6 };
+    let limit = || Some(GluLimit::new(10.0).expect("a positive limit"));
+    let indexer = Indexer {
+        heads: HEADS,
+        width: INDEX_WIDTH,
+        query: IndexerQuery {
+            input: IndexerInput::QueryRank,
+            projection: weight("indexer.attn_q_b", &[HEADS * INDEX_WIDTH, QUERY_RANK]),
+            norm: HeadNorm::None,
+            rounding: RowRounding::None,
+        },
+        keys: IndexerKeys::Pooled(PooledRows {
+            rate: RATE,
+            projection: weight("indexer.attn_k", &[INDEX_WIDTH, hidden]),
+            pool: Pool::SoftmaxGated {
+                gate: weight("indexer_compressor_gate", &[INDEX_WIDTH, hidden]),
+                position: Some(weight("indexer_compressor_ape", &[RATE, INDEX_WIDTH])),
+            },
+            norm: PoolNorm::Token {
+                norm: LayerNorm { weight: weight("indexer.k_norm", &[INDEX_WIDTH]), epsilon: 1e-6 },
+                bias: weight("indexer.k_norm.bias", &[INDEX_WIDTH]),
+            },
+            rounding: RowRounding::None,
+        }),
+        head_weights: HeadWeights::Projected(weight("indexer.proj", &[HEADS, hidden])),
+        scale: ((HEADS * INDEX_WIDTH) as f64).powf(-0.5),
+        top: GLM_SLICE_B_TOP,
+        candidates: Candidates::All,
+    };
+    let attention = Operator::Attention(Box::new(Attention {
+        heads: HEADS,
+        kv_heads: 1,
+        width: LATENT,
+        query: QueryProjection::LowRank {
+            down: fp8("attn_q_a", &[QUERY_RANK, hidden]),
+            norm: rms("attn_q_a_norm", QUERY_RANK),
+            up: fp8("attn_q_b", &[HEADS * HEAD, QUERY_RANK]),
+        },
+        query_keys: QueryKeys::Absorbed { weight: merged("attn_k_b", &[HEADS, LATENT, HEAD]), width: HEAD },
+        gate: AttentionGate::None,
+        query_norm: HeadNorm::None,
+        history: vec![HistorySource {
+            rows: HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                key: fp8("attn_kv_a_mqa", &[LATENT, hidden]),
+                value: ValueSource::StoredKey,
+                key_norm: HeadNorm::Rms(rms("attn_kv_a_norm", LATENT)),
+                value_norm: ValueNorm::None,
+                domain: TokenDomain::Token,
+                rounding: RowRounding::None,
+            })),
+            reads: HistoryReads::Selected(Selection::Own(Box::new(indexer))),
+        }],
+        rotary: Rotary::None,
+        scale: (HEAD as f64).powf(-0.5),
+        media_rows: MediaRowAttention::Causal,
+        sinks: None,
+        output: OutputProjection::GroupedLowRank {
+            groups: HEADS,
+            rank: HEAD,
+            a: merged("attn_v_b", &[HEADS, HEAD, LATENT]),
+            b: fp8("attn_output", &[hidden, HEADS * HEAD]),
+        },
+    }));
+    let gated = |gate, up| FeedForwardUp::Gated { activation: ActivationFunction::Silu, limit: limit(), gate, up };
+    let stacked = [EXPERTS, FEATURES, hidden];
+    let routed = Operator::RoutedFfn(Box::new(RoutedFfn {
+        experts: EXPERTS,
+        selected: 8,
+        intermediate: FEATURES,
+        router: Router {
+            weight: weight("ffn_gate_inp", &[EXPERTS, hidden]),
+            input: RouterInput::Operator,
+            score: ScoreFunction::Sigmoid,
+            selection: ExpertSelection::TopK { bias: Some(weight("exp_probs_b.bias", &[EXPERTS])) },
+            media_bias: None,
+            normalization: RouteNormalization::SumPlusEpsilon(1e-20),
+            scale: 2.5,
+        },
+        expert_up: gated(fp8("ffn_gate_exps", &stacked), fp8("ffn_up_exps", &stacked)),
+        expert_down: fp8("ffn_down_exps", &[EXPERTS, hidden, FEATURES]),
+        expert_scale: None,
+        latent: None,
+        shared: Some(SharedExpert {
+            intermediate: FEATURES,
+            up: gated(fp8("ffn_gate_shexp", &[FEATURES, hidden]), fp8("ffn_up_shexp", &[FEATURES, hidden])),
+            down: fp8("ffn_down_shexp", &[hidden, FEATURES]),
+            gate: SharedExpertGate::None,
+        }),
+    }));
+    let mut block = definition.decoder.blocks[0].clone();
+    let [mixer, feed_forward] = block.sublayers.as_mut_slice() else {
+        unreachable!("slice A's block is a mixer and a feed-forward")
+    };
+    // Each sublayer keeps its Sinkhorn site's form under block 1's names.
+    for (sublayer, site, op) in [(mixer, "attn", attention), (feed_forward, "ffn", routed)] {
+        let InputNorm::HyperConnectionMix(input) = &mut sublayer.input else {
+            unreachable!("slice A's sublayers read through Sinkhorn sites")
+        };
+        let magnitude_family_contracts::HyperConnectionWeights::Sinkhorn(weights) = &mut input.site else {
+            unreachable!("slice A's sites are Sinkhorn sites")
+        };
+        for (descriptor, part) in [(&mut weights.function, "fn"), (&mut weights.base, "base"), (&mut weights.scale, "scale")] {
+            descriptor.name = name(&format!("{site}_hc_{part}"));
+        }
+        if let Some(norm) = &mut input.norm {
+            norm.weight.name = name(&format!("{site}_norm"));
+        }
+        sublayer.op = op;
+    }
+    definition.decoder.blocks.push(block);
+    definition.validate().expect("the slice B fixture validates");
+    let manifest = glm_slice_b_manifest(&definition);
+    (definition, manifest)
+}
+
+/// Slice B's package (`glm_slice_b_fixture`): the stored weights of
+/// `definition`'s decoder and head, its FP8 weights' codes each under its
+/// grid of scales.
+fn glm_slice_b_manifest(definition: &ModelDefinition) -> PackageManifest {
+    use magnitude_family_contracts::ImportTransform;
+    const HEADS: u64 = 4;
+    const HEAD: u64 = 64;
+    const LATENT: u64 = 128;
+    const TILE: u64 = 128;
+    let name = |part: &str| format!("blk.1.{part}");
+    // Each FP8 weight's codes, one byte a value, then its grid of scales.
+    let grids = crate::operators::decoder_weights(&definition.decoder)
+        .into_iter()
+        .filter_map(|(_, descriptor)| match descriptor.transforms.as_slice() {
+            [ImportTransform::ScaleBlocks { tensor, .. }] => Some((descriptor.name.clone(), tensor.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let codes = grids.iter().map(|(codes, _)| codes.clone()).collect::<Vec<_>>();
+    let mut manifest = relaid_manifest(fixture_manifest(definition), &codes, Encoding::F8E4M3, 32);
+    let target = &mut manifest.target;
+    // Every vector (a norm, a bias) is F32, as GLM stores them.
+    let mut offset = 0;
+    for tensor in &mut target.tensors {
+        if let [width] = tensor.shape[..] {
+            tensor.encoding = Encoding::F32;
+            tensor.nbytes = 4 * width;
+        }
+        tensor.offset = offset;
+        offset += tensor.nbytes;
+    }
+    target.files[0].size = offset;
+    // The per-head stacks are stored as stacks.
+    for (part, stack) in [("attn_k_b", [HEADS, LATENT, HEAD]), ("attn_v_b", [HEADS, HEAD, LATENT])] {
+        let tensor = target.tensors.iter_mut().find(|tensor| tensor.name == name(part)).expect("a stored stack");
+        tensor.shape = stack.to_vec();
+    }
+    for (codes, scale) in grids {
+        let shape = &target.tensors.iter().find(|tensor| tensor.name == codes).expect("a stored weight").shape;
+        let (leading, [rows, columns]) = shape.split_at(shape.len() - 2) else {
+            unreachable!("a matrix or a stack of them")
+        };
+        let grid = leading.iter().copied().chain([rows / TILE, columns / TILE]).collect::<Vec<_>>();
+        let (offset, nbytes) = (target.files[0].size, 4 * grid.iter().product::<u64>());
+        target.tensors.push(TensorDescriptor { name: scale, shape: grid, encoding: Encoding::F32, offset, nbytes });
+        target.files[0].size += nbytes;
+    }
+    manifest
+}
+
+/// `op`'s own indexer's weights, each renamed by `rename`.
+#[cfg(test)]
+fn rename_indexer_weights(op: &mut Operator, rename: &dyn Fn(&str) -> String) {
+    use magnitude_family_contracts::{HeadWeights, HistoryReads, IndexerKeys, Pool, PoolNorm, Selection};
+    let Operator::Attention(attention) = op else { return };
+    let [HistorySource { reads: HistoryReads::Selected(Selection::Own(indexer)), .. }] = attention.history.as_mut_slice()
+    else {
+        return;
+    };
+    let head = |weight: &mut WeightDescriptor| weight.name = rename(&weight.name);
+    head(&mut indexer.query.projection);
+    let IndexerKeys::Pooled(keys) = &mut indexer.keys else { panic!("the fixture's indexer pools its own keys") };
+    head(&mut keys.projection);
+    let Pool::SoftmaxGated { gate, position } = &mut keys.pool else { panic!("the fixture's indexer pools by a gate") };
+    head(gate);
+    position.iter_mut().for_each(head);
+    let PoolNorm::Token { norm, bias } = &mut keys.norm else { panic!("the fixture's indexer norms its tokens") };
+    head(&mut norm.weight);
+    head(bias);
+    let HeadWeights::Projected(weights) = &mut indexer.head_weights else { panic!("the fixture's indexer projects head weights") };
+    head(weights);
+}
+
+/// Tokens an indexer unit of [`glm_slice_b_fixture`] pools.
+pub const GLM_SLICE_B_RATE: u64 = 4;
+/// Units its indexer picks.
+pub const GLM_SLICE_B_TOP: u64 = 2;
+
+/// Slice B with an MTP head of the shape GLM-5.3-Flash's is: a head block
+/// of block 1's mixer and general routed feed-forward (the latent attention
+/// over its history, selected by an indexer of the head's own, then the
+/// routed FP8 experts and the shared expert), plain-normed over a single
+/// residual, read out through the target vocabulary projection and chaining
+/// its output. Its operators' weights are block 1's (tied: stored once);
+/// its norms, combine and indexer's are its own.
+#[cfg(test)]
+pub fn glm_slice_b_mtp_fixture() -> (ModelDefinition, PackageManifest) {
+    glm_slice_b_mtp_fixture_of(true)
+}
+
+/// [`glm_slice_b_mtp_fixture`], its head's indexer reading the body's tied
+/// weights where `own_indexer` is false. Both lay out the same tensors, the
+/// head's own indexer's stored beside the body's, so a file written of either
+/// holds every other tensor alike.
+#[cfg(test)]
+pub fn glm_slice_b_mtp_fixture_of(own_indexer: bool) -> (ModelDefinition, PackageManifest) {
+    use magnitude_family_contracts::{
+        Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, VocabularyProjection,
+    };
+    let (mut definition, _) = glm_slice_b_fixture();
+    let hidden = definition.decoder.hidden;
+    let named = |name: &str, shape: &[u64]| descriptor(&format!("head_{name}"), shape);
+    let rms = |name: &str| RmsNorm { weight: named(name, &[hidden]), epsilon: 1e-6 };
+    let trunk = &definition.decoder.blocks[1];
+    // The head keeps its own pooled indexer state and selects as block 1
+    // does, by indexer weights of its own.
+    let plain = |norm: &str, sublayer: &Sublayer| {
+        let mut op = sublayer.op.clone();
+        rename_indexer_weights(&mut op, &|name| format!("head_{name}"));
+        Sublayer { input: InputNorm::Rms(rms(norm)), op, output: OutputForm::Residual }
+    };
+    let head_block = Block {
+        sublayers: vec![plain("attn_norm", &trunk.sublayers[0]), plain("ffn_norm", &trunk.sublayers[1])],
+    };
+    definition.head = Some(Head {
+        blocks: vec![HeadBlock {
+            residual: ResidualForm::Single,
+            input: HeadInput::Combine {
+                embedding_norm: rms("enorm"),
+                hidden_norm: rms("hnorm"),
+                combine: named("eh_proj", &[hidden, 2 * hidden]),
+            },
+            blocks: vec![head_block],
+            output_norm: ExitNorm::Rms(rms("shared_head_norm")),
+            readout: HeadReadout::full(VocabularyProjection::Target),
+            chain: HeadChain::Output,
+        }],
+        history: HeadHistory::Own,
+        component: HeadComponent::Target,
+    });
+    let manifest = glm_slice_b_manifest(&definition);
+    if !own_indexer {
+        // The head's indexer reads the body's tensors; its own stay stored.
+        let head = definition.head.as_mut().expect("the fixture has a head");
+        for sublayer in &mut head.blocks[0].blocks[0].sublayers {
+            rename_indexer_weights(&mut sublayer.op, &|name| {
+                name.strip_prefix("head_").expect("an indexer weight the head owns").to_owned()
+            });
+        }
+    }
+    definition.validate().expect("the slice B MTP fixture validates");
+    (definition, manifest)
 }
 
 /// A qwen4exp-shaped decoder over the hyper-connection fixture's
@@ -602,14 +999,22 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
         width: STATE,
         head_mapping: RecurrentHeadMapping::Tiled,
         query_key_value: descriptor("blk.0.attn_qkv", &[channels, hidden]),
-        gate: descriptor("blk.0.attn_gate", &[value_heads * STATE, hidden]),
-        alpha: descriptor("blk.0.ssm_alpha", &[value_heads, hidden]),
         beta: descriptor("blk.0.ssm_beta", &[value_heads, hidden]),
         convolution: descriptor("blk.0.ssm_conv1d", &[channels, 4]),
-        decay: descriptor("blk.0.ssm_a", &[value_heads]),
-        time_bias: descriptor("blk.0.ssm_dt", &[value_heads]),
+        decay: RecurrentDecay::PerHead {
+            alpha: descriptor("blk.0.ssm_alpha", &[value_heads, hidden]),
+            time_bias: descriptor("blk.0.ssm_dt", &[value_heads]),
+            decay: descriptor("blk.0.ssm_a", &[value_heads]),
+        },
+        key_norm_epsilon: 1e-6 * STATE as f64,
         norm: rms("blk.0.ssm_norm", STATE),
-        output_gate: GateFunction::Sigmoid,
+        output_gate: RecurrentGate {
+            projection: GateProjection::Full(descriptor(
+                "blk.0.attn_gate",
+                &[value_heads * STATE, hidden],
+            )),
+            function: GateFunction::Sigmoid,
+        },
         output: descriptor("blk.0.ssm_out", &[hidden, value_heads * STATE]),
     }));
     let (context, heads_per_order) = (2, 2);
@@ -827,6 +1232,7 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
             kv_heads: KV_HEADS,
             width: WIDTH,
             query: QueryProjection::Full(descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, hidden])),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::Interleaved { function: GateFunction::Sigmoid },
             query_norm: HeadNorm::Rms(rms(name("attn_q_norm"), WIDTH)),
             history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(ProjectedRows {

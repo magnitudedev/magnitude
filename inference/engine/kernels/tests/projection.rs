@@ -6,6 +6,7 @@
 
 mod common;
 
+use common::bound::{Float, Form, Library, Products, assert_within};
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, dense_up, embedding_rows,
     gated_delta_project, packing_bound, project_rows, readout_features_rows, readout_head_rows,
@@ -100,11 +101,10 @@ impl Act {
             })
             .collect()
     }
-    /// Relative size of one unit in the last place.
-    fn ulp(self) -> f32 {
+    fn float(self) -> Float {
         match self {
-            Act::Bf16 => 1.0 / 128.0,
-            Act::F16 => 1.0 / 1024.0,
+            Act::Bf16 => Float::Bf16,
+            Act::F16 => Float::F16,
         }
     }
 }
@@ -258,6 +258,13 @@ fn no_scale(device: &Device) -> Tensor {
 }
 
 impl Weight {
+    /// The form `backend`'s projections multiply this weight in at `rows`
+    /// activation rows of `act`, over the weight as `backend` holds it.
+    fn form(&self, backend: BackendName, act: Act, rows: usize) -> Form {
+        let resident = self.repr.element_in(backend.resident_layout());
+        Form::projection(backend, rows, act.float(), resident)
+    }
+
     /// Rows `x` of `k` as products over this weight take them: as NVFP4
     /// operands where the registry's recipe of its representation says so.
     fn operand_rows(&self, x: &[f32]) -> Vec<f32> {
@@ -494,15 +501,9 @@ fn gguf_weight_of(format: Format, rows: usize, k: usize, external: &[u8]) -> Wei
 // ---------------------------------------------------------------------------
 // References.
 
-/// Ordered F32 FMA dot and the magnitude sum bounding its reassociation error.
-fn dot(x: &[f32], w: &[f32]) -> (f32, f32) {
-    let mut acc = 0f32;
-    let mut magnitude = 0f32;
-    for (a, b) in x.iter().zip(w) {
-        acc = a.mul_add(*b, acc);
-        magnitude += (a * b).abs();
-    }
-    (acc, magnitude)
+/// Ordered F32 FMA dot, and its products as the bound reads them.
+fn dot(x: &[f32], w: &[f32]) -> (f32, Products) {
+    (x.iter().zip(w).fold(0f32, |acc, (a, b)| a.mul_add(*b, acc)), Products::of(x, w))
 }
 
 fn silu(value: f32) -> f32 {
@@ -510,52 +511,32 @@ fn silu(value: f32) -> f32 {
 }
 
 /// RMS normalization of one row rounded to the activation, with, per element,
-/// the rounding flip a device may legitimately take because its square sum is
-/// ordered differently (zero away from rounding boundaries).
-fn rms_row(act: Act, x: &[f32], norm: &[f32], epsilon: f32) -> (Vec<f32>, Vec<f32>) {
+/// the rounding flip `backend`'s native prologue may take from it: the
+/// native's and this F32 host's normalized values are each within
+/// [`Library::rms`] of the exact one (zero away from rounding boundaries).
+fn rms_row(
+    backend: BackendName,
+    act: Act,
+    x: &[f32],
+    norm: &[f32],
+    epsilon: f32,
+) -> (Vec<f32>, Vec<f64>) {
     let squares = x.iter().fold(0f32, |sum, value| value.mul_add(*value, sum));
     let inverse = 1.0 / (squares / x.len() as f32 + epsilon).sqrt();
-    let values = x
-        .iter()
-        .zip(norm)
-        .map(|(v, w)| act.round(v * inverse * w))
-        .collect();
-    let slack = x
-        .iter()
+    let native = Library::of(backend).rms(x.len());
+    let host = Library::of(BackendName::Cpu).rms(x.len());
+    let window = (native + host) / (1.0 - host);
+    x.iter()
         .zip(norm)
         .map(|(v, w)| {
-            let exact = v * inverse * w;
-            (act.round(exact * (1.0 + 1e-5)) - act.round(exact * (1.0 - 1e-5))).abs()
+            let value = v * inverse * w;
+            (act.round(value), act.float().flip(f64::from(value), window))
         })
-        .collect();
-    (values, slack)
+        .unzip()
 }
 
-fn slack_dot(slack: &[f32], w: &[f32]) -> f32 {
-    slack.iter().zip(w).map(|(s, w)| s * w.abs()).sum()
-}
-
-/// Bound for an A-rounded projection: reassociation plus one rounding flip.
-fn rounded_bound(act: Act, value: f32, magnitude: f32) -> f32 {
-    reassociation_bound(magnitude) + value.abs() * act.ulp() + 1e-7
-}
-
-fn assert_within(label: &str, actual: &[f32], expected: &[f32], bound: &[f32]) {
-    assert_eq!(actual.len(), expected.len(), "{label}: length");
-    let failures = (0..expected.len())
-        .filter(|i| !((actual[*i] - expected[*i]).abs() <= bound[*i]))
-        .collect::<Vec<_>>();
-    assert!(
-        failures.is_empty(),
-        "{label}: {} of {} outside tolerance; first {:?}",
-        failures.len(),
-        expected.len(),
-        failures
-            .iter()
-            .take(4)
-            .map(|i| (*i, actual[*i], expected[*i], bound[*i]))
-            .collect::<Vec<_>>()
-    );
+fn slack_dot(slack: &[f64], w: &[f32]) -> f64 {
+    slack.iter().zip(w).map(|(s, w)| s * f64::from(w.abs())).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -764,29 +745,6 @@ const MAPPINGS: [Mapping; 4] = [
         int8_tile: 128,
     },
 ];
-
-/// Relative bound on the reassociation error of a dot product over
-/// `outputs` output rows: F32 accumulation in the GEMV (outputs <= 2), plus
-/// half-rounded operands on the matrix units (batched GEMV and GEMM).
-fn reassociation(outputs: usize) -> f32 {
-    if outputs > 2 { 7e-4 } else { 3e-5 }
-}
-
-thread_local! {
-    static REASSOCIATION: std::cell::Cell<f32> = const { std::cell::Cell::new(3e-5) };
-}
-
-fn reassociation_bound(magnitude: f32) -> f32 {
-    REASSOCIATION.with(|factor| factor.get()) * magnitude
-}
-
-/// Evaluate a reference under the reassociation bound of `outputs` rows.
-fn under<T>(outputs: usize, reference: impl FnOnce() -> T) -> T {
-    REASSOCIATION.with(|factor| factor.set(reassociation(outputs)));
-    let value = reference();
-    REASSOCIATION.with(|factor| factor.set(3e-5));
-    value
-}
 
 /// The static dimensions of an entry on `device`: CPU implementations have
 /// none.
@@ -1634,6 +1592,7 @@ fn dense_expand_native_arithmetic(
 }
 
 fn dense_expand_reference(
+    backend: BackendName,
     act: Act,
     gate: &Weight,
     up: &Weight,
@@ -1642,30 +1601,29 @@ fn dense_expand_reference(
     out_rows: &[i32],
     eps: f32,
     limit: f32,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f64>) {
     let (h, f) = (gate.k, gate.rows);
+    let (gate_form, up_form) = (gate.form(backend, act, out_rows.len()), up.form(backend, act, out_rows.len()));
     let mut expected = Vec::new();
     let mut bound = Vec::new();
     for row in out_rows {
         let source = *row as usize;
-        let (x, slack) = rms_row(act, &residual[source * h..(source + 1) * h], norm, eps);
+        let (x, slack) = rms_row(backend, act, &residual[source * h..(source + 1) * h], norm, eps);
         let (xg, xu) = (gate.operand_rows(&x), up.operand_rows(&x));
         for n in 0..f {
-            let (g, gm) = dot(&xg, gate.row(n));
-            let (u, um) = dot(&xu, up.row(n));
+            let (g, gp) = dot(&xg, gate.row(n));
+            let (u, up_products) = dot(&xu, up.row(n));
+            let (g, u) = (act.round(g), act.round(u));
+            let gate_error = gate_form.rounded(&gp, act.float(), g) + slack_dot(&slack, gate.row(n));
+            let up_error = up_form.rounded(&up_products, act.float(), u) + slack_dot(&slack, up.row(n));
             // DeepSeek V4.1's clamp: the gate to (-inf, L], up to [-L, L],
             // before the activation.
-            let (g, u) = (act.round(g).min(limit), act.round(u).clamp(-limit, limit));
+            let (g, u) = (g.min(limit), u.clamp(-limit, limit));
             let a = act.round(silu(g));
             let value = act.round(a * u);
             expected.push(value);
-            let gate_error =
-                reassociation_bound(gm) + g.abs() * act.ulp() + slack_dot(&slack, gate.row(n));
-            let up_error =
-                reassociation_bound(um) + u.abs() * act.ulp() + slack_dot(&slack, up.row(n));
-            bound.push(
-                1.2 * (gate_error * u.abs() + up_error * a.abs()) + value.abs() * act.ulp() + 1e-6,
-            );
+            let product = 1.2 * (gate_error * f64::from(u.abs()) + up_error * f64::from(a.abs()));
+            bound.push(act.float().rounded(product, value) + 1e-6);
         }
     }
     (expected, bound)
@@ -1736,9 +1694,9 @@ fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Re
             );
             let oracle = result(&outcome, 0);
             for mapping in MAPPINGS {
-                let (_, bound) = under(out_rows.len(), || {
-                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-                });
+                let (_, bound) = dense_expand_reference(
+                    device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+                );
                 let native = dense_expand_native(
                     &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
                 );
@@ -1781,9 +1739,9 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
                 .map(|i| ((i * 7 + 3) % rows) as i32)
                 .collect::<Vec<_>>();
             for mapping in MAPPINGS {
-                let (expected, bound) = under(out_rows.len(), || {
-                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-                });
+                let (expected, bound) = dense_expand_reference(
+                    device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+                );
                 let native = dense_expand_native(
                     &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
                 );
@@ -1815,9 +1773,9 @@ fn metal_dense_expand_scoped_launches_match_the_host() {
         let mut rng = Rng::new(rows as u64);
         let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
-        let (expected, bound) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-        });
+        let (expected, bound) = dense_expand_reference(
+            device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+        );
         for mapping in [MAPPINGS[0], MAPPINGS[2]] {
             let actual = dense_expand_native(
                 &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
@@ -1854,7 +1812,7 @@ fn dense_expand_clamps_deepseek41s_shared_expert() {
             .map(|at| if at % 2 == 0 { rng.symmetric() } else { -rng.symmetric() })
             .collect::<Vec<_>>();
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
-        let (x, _) = rms_row(act, &residual[..h], &norm, 1e-6);
+        let (x, _) = rms_row(BackendName::Cpu, act, &residual[..h], &norm, 1e-6);
         let sums = |weight: &Weight| {
             let x = weight.operand_rows(&x);
             (0..f).map(|n| act.round(dot(&x, weight.row(n)).0)).collect::<Vec<_>>()
@@ -1865,16 +1823,22 @@ fn dense_expand_clamps_deepseek41s_shared_expert() {
             ups.iter().any(|up| *up > LIMIT) && ups.iter().any(|up| *up < -LIMIT),
             "up sums pass ±{LIMIT}"
         );
-        let (expected, bound) =
-            under(rows, || dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, LIMIT));
-        let (unclamped, _) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-        });
-        assert!(
-            expected.iter().zip(&unclamped).zip(&bound).any(|((clamped, plain), bound)| (clamped - plain).abs() > *bound),
-            "the clamp moves the expansion past its bound"
-        );
         for device in devices() {
+            let (expected, bound) =
+                dense_expand_reference(device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, LIMIT);
+            let (unclamped, _) =
+                dense_expand_reference(
+                    device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+                );
+            assert!(
+                expected
+                    .iter()
+                    .zip(&unclamped)
+                    .zip(&bound)
+                    .any(|((clamped, plain), bound)| f64::from((clamped - plain).abs()) > *bound),
+                "{:?}: the clamp moves the expansion past its bound",
+                device.backend()
+            );
             let actual = dense_expand_native_arithmetic(
                 &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, Some(LIMIT), MAPPINGS[0], false,
             );
@@ -1916,9 +1880,9 @@ fn metal_dense_expand_matrix_pair_matches_host() {
                 for rows in [3usize, 5, 8, 13, 16] {
                     let residual = uniform_values(rows * h, rows as u64, 1.0);
                     let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
-                    let (expected, bound) = under(rows, || {
-                        dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-                    });
+                    let (expected, bound) = dense_expand_reference(
+                        device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+                    );
                     for parts in [1, 2, 4] {
                         let mapping = Mapping {
                             batch_from: 3,
@@ -2083,7 +2047,10 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
             let narrow = (0..rows * outputs)
                 .map(|_| rng.symmetric())
                 .collect::<Vec<_>>();
-            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            // The products as the native reads them: `dense_output_native`
+            // publishes them as A rows, so the host model takes them rounded
+            // to A too.
+            let product = (0..rows * k).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
             let expand = |mapping| {
                 dense_expand_native(
@@ -2096,12 +2063,12 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
                 )
             };
             let (expand_staged, output_staged) = (expand(staged), output(staged));
-            let (expand_expected, expand_bound) = under(rows, || {
-                dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-            });
-            let (output_expected, output_bound) = under(rows, || {
-                dense_output_reference(act, &down, &narrow, &product, &out_rows)
-            });
+            let (expand_expected, expand_bound) = dense_expand_reference(
+                device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+            );
+            let (output_expected, output_bound) = dense_output_reference(
+                device.backend(), act, &down, &narrow, &product, &out_rows,
+            );
             for tile in TALL_TILES {
                 let mapping = Mapping {
                     tall: Some(tile),
@@ -3415,24 +3382,34 @@ fn metal_int8_dense_expand_agrees_with_the_tall_form() {
 }
 
 fn dense_output_reference(
+    backend: BackendName,
     act: Act,
     down: &Weight,
     residual: &[f32],
     product: &[f32],
     out_rows: &[i32],
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f64>) {
     let (h, f) = (down.rows, down.k);
+    let form = down.form(backend, act, out_rows.len());
     let mut expected = Vec::new();
     let mut bound = Vec::new();
     for (r, row) in out_rows.iter().enumerate() {
         let x = down.operand_rows(&product[r * f..(r + 1) * f]);
         for n in 0..h {
-            let (acc, magnitude) = dot(&x, down.row(n));
-            expected.push(residual[*row as usize * h + n] + act.round(acc));
-            bound.push(rounded_bound(act, acc, magnitude));
+            let (acc, products) = dot(&x, down.row(n));
+            let (projected, value) = residual_output(act, acc, residual[*row as usize * h + n]);
+            expected.push(value);
+            bound.push(Float::F32.rounded(form.rounded(&products, act.float(), projected), value));
         }
     }
     (expected, bound)
+}
+
+/// A residual output: the sum `acc` rounded to A, and added to `residual`
+/// in F32.
+fn residual_output(act: Act, acc: f32, residual: f32) -> (f32, f32) {
+    let projected = act.round(acc);
+    (projected, residual + projected)
 }
 
 /// `packing_bound` on Metal equals its portable body over a format the PACK
@@ -3567,22 +3544,27 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                 ],
             );
             let oracle = result(&outcome, 0);
-            // The host model's bound: reassociation, the rounding flips of
-            // the normalized rows, and one rounding of the product.
-            let mut bound = Vec::new();
-            for row in &out_rows {
-                let source = *row as usize;
-                let (x, slack) = rms_row(act, &residual[source * h..(source + 1) * h], &norm, 1e-6);
-                let x = up.operand_rows(&x);
-                for n in 0..f {
-                    let (u, magnitude) = dot(&x, up.row(n));
-                    let u = act.round(u);
-                    let error = reassociation_bound(magnitude) + u.abs() * act.ulp()
-                        + slack_dot(&slack, up.row(n));
-                    let value = act.round(u.max(0.0) * u.max(0.0));
-                    bound.push(1.2 * 2.0 * u.abs() * error + value.abs() * act.ulp() + 1e-6);
+            // The host model's bound on `backend`: its form's, the rounding
+            // flips of the normalized rows, and one rounding of the product.
+            let bound = |backend: BackendName| {
+                let form = up.form(backend, act, outputs);
+                let mut bound = Vec::new();
+                for row in &out_rows {
+                    let source = *row as usize;
+                    let (x, slack) = rms_row(
+                        backend, act, &residual[source * h..(source + 1) * h], &norm, 1e-6,
+                    );
+                    let x = up.operand_rows(&x);
+                    for n in 0..f {
+                        let (u, products) = dot(&x, up.row(n));
+                        let u = act.round(u);
+                        let error = form.rounded(&products, act.float(), u) + slack_dot(&slack, up.row(n));
+                        let value = act.round(u.max(0.0) * u.max(0.0));
+                        bound.push(act.float().rounded(1.2 * 2.0 * f64::from(u.abs()) * error, value) + 1e-6);
+                    }
                 }
-            }
+                bound
+            };
             for device in devices() {
                 let entry = dense_up::native_entry_with(dense_up::Elements {
                     NW: Element::bf16(),
@@ -3618,7 +3600,7 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                     &format!("dense_up {repr:?} {:?} rows {outputs}", device.backend()),
                     &read_act(act, &native),
                     &oracle,
-                    &bound,
+                    &bound(device.backend()),
                 );
             }
         }
@@ -3661,7 +3643,7 @@ fn dense_output_at_partial_block_widths_on(device: &Device, format: Format) {
             ],
         );
         let oracle = result(&outcome, 0);
-        let (_, bound) = dense_output_reference(act, &down, &residual, &product, &out_rows);
+        let (_, bound) = dense_output_reference(device.backend(), act, &down, &residual, &product, &out_rows);
         for mapping in MAPPINGS {
             let native = dense_output_native(
                 &device, act, &down, &residual, rows, &product, &out_rows, mapping,
@@ -3686,9 +3668,9 @@ fn dense_output_at_partial_block_widths_on(device: &Device, format: Format) {
             let product = (0..rows * f)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let (expected, bound) = under(out_rows.len(), || {
-                dense_output_reference(act, &down, &residual, &product, &out_rows)
-            });
+            let (expected, bound) = dense_output_reference(
+                device.backend(), act, &down, &residual, &product, &out_rows,
+            );
             for mapping in MAPPINGS {
                 let native = dense_output_native(
                     &device, act, &down, &residual, rows, &product, &out_rows, mapping,
@@ -3722,9 +3704,7 @@ fn metal_dense_output_scoped_launches_match_the_host() {
             .map(|_| act.round(rng.symmetric()))
             .collect::<Vec<_>>();
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
-        let (expected, bound) = under(rows, || {
-            dense_output_reference(act, &down, &residual, &product, &out_rows)
-        });
+        let (expected, bound) = dense_output_reference(device.backend(), act, &down, &residual, &product, &out_rows);
         let splits: &[u64] = if rows == 128 { &[1, 2, 4] } else { &[1] };
         for &split in splits {
             let actual = dense_output_native(
@@ -3769,9 +3749,9 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
                     .map(|_| act.round(rng.symmetric()))
                     .collect::<Vec<_>>();
                 let out_rows = (0..rows as i32).collect::<Vec<_>>();
-                let (expected, bound) = under(rows, || {
-                    dense_output_reference(act, &down, &residual, &product, &out_rows)
-                });
+                let (expected, bound) = dense_output_reference(
+                    device.backend(), act, &down, &residual, &product, &out_rows,
+                );
                 for (batch_simdgroups, batch_parts) in [(8, 2), (4, 1), (16, 4), (4, 4), (32, 2)] {
                     let actual = dense_output_native(
                         &device,
@@ -3833,9 +3813,7 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
         );
         let oracle = result(&outcome, 0);
         for mapping in MAPPINGS {
-            let (_, bound) = under(out_rows.len(), || {
-                dense_output_reference(act, &down, &residual, &product, &out_rows)
-            });
+            let (_, bound) = dense_output_reference(device.backend(), act, &down, &residual, &product, &out_rows);
             let native = dense_output_native(
                 &device, act, &down, &residual, rows, &product, &out_rows, mapping,
             );
@@ -3860,9 +3838,9 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
             .map(|_| act.round(rng.symmetric()))
             .collect::<Vec<_>>();
         for mapping in MAPPINGS {
-            let (expected, bound) = under(out_rows.len(), || {
-                dense_output_reference(act, &down, &residual, &product, &out_rows)
-            });
+            let (expected, bound) = dense_output_reference(
+                device.backend(), act, &down, &residual, &product, &out_rows,
+            );
             let native = dense_output_native(
                 &device, act, &down, &residual, rows, &product, &out_rows, mapping,
             );
@@ -4071,9 +4049,9 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
     let (single6, single4) = (output_single(&down6), output_single(&down4));
     for rows in 1..=rows_max {
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
-        let (expected, bound) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
-        });
+        let (expected, bound) = dense_expand_reference(
+            device.backend(), act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY,
+        );
         let native = dense_expand_native(
             &device, act, &gate, &up, &residual, rows_max, &norm, &out_rows, 1e-6, mapping,
         );
@@ -4084,9 +4062,9 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
             &bound,
         );
         for (label, down, single) in [("q6k", &down6, &single6), ("q4k", &down4, &single4)] {
-            let (expected, bound) = under(rows, || {
-                dense_output_reference(act, down, &residual, &product[..rows * f], &out_rows)
-            });
+            let (expected, bound) = dense_output_reference(
+                device.backend(), act, down, &residual, &product[..rows * f], &out_rows,
+            );
             let output = dense_output_native(
                 &device,
                 act,
@@ -4174,9 +4152,12 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
     let module = module();
     let act = Act::Bf16;
     let scoped = cases == Cases::Scoped;
-    // A small geometry over every mapping, then the pinned 4B geometry over
-    // the decode and verify rows with the decode mapping; each with its qkv,
-    // gate, alpha and beta representations.
+    // The smallest geometry that reaches every path, over every mapping and
+    // row class, each with its qkv, gate, alpha and beta representations:
+    // H 512 is two Q5_K/Q4_K superblocks and sixteen 32-column steps (the
+    // GEMVs' and the batched GEMV's K split over its 2 and 4 parts, the
+    // GEMM's SPLIT 2 and 4), and qkv's 256 rows are four 64-row and two
+    // 128-row weight tiles; the row classes reach every launch band.
     let k_quants = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
     let iq4_blocks = [
         Repr::gguf(Encoding::Iq4Nl),
@@ -4185,14 +4166,11 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
         Repr::Q8,
     ];
     let geometries = match cases {
-        Cases::Scoped => vec![(256usize, 1usize, 1usize, 64usize, false, k_quants)],
-        Cases::Checked => vec![
-            (512, 2, 4, 32, false, k_quants),
-            (2560, 16, 32, 128, true, k_quants),
-        ],
-        Cases::Iq4Blocks => vec![(640, 2, 4, 32, false, iq4_blocks)],
+        Cases::Scoped => vec![(256usize, 1usize, 1usize, 64usize, k_quants)],
+        Cases::Checked => vec![(512, 2, 4, 32, k_quants)],
+        Cases::Iq4Blocks => vec![(640, 2, 4, 32, iq4_blocks)],
     };
-    for (h, nk, nv, w, four_b, reprs) in geometries {
+    for (h, nk, nv, w, reprs) in geometries {
         let rows_of = [(2 * nk + nv) * w, nv * w, nv, nv];
         let total: usize = rows_of.iter().sum();
         let weights = (0..4)
@@ -4203,14 +4181,16 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             let mut expected = Vec::new();
             let mut bound = Vec::new();
             for r in 0..rows {
-                let (x, slack) = rms_row(act, &hidden[r * h..(r + 1) * h], &norm, 1e-6);
+                let (x, slack) = rms_row(device.backend(), act, &hidden[r * h..(r + 1) * h], &norm, 1e-6);
                 for wt in &weights {
                     let x = wt.operand_rows(&x);
                     for n in 0..wt.rows {
-                        let (acc, magnitude) = dot(&x, wt.row(n));
-                        expected.push(act.round(acc));
+                        let (acc, products) = dot(&x, wt.row(n));
+                        let value = act.round(acc);
+                        expected.push(value);
                         bound.push(
-                            rounded_bound(act, acc, magnitude) + slack_dot(&slack, wt.row(n)),
+                            wt.form(device.backend(), act, rows).rounded(&products, act.float(), value)
+                                + slack_dot(&slack, wt.row(n)),
                         );
                     }
                 }
@@ -4255,9 +4235,11 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
         let (row_classes, mappings) = if scoped {
             (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
-            checked_classes(four_b)
+            checked_classes(false)
         };
-        let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[3, 17] };
+        // The portable body has no row classes: one multi-row count decides
+        // it against every mapping's native.
+        let portable_rows: &[usize] = if scoped { &[] } else { &[3] };
         for &rows in portable_rows {
             let mut rng = Rng::new(rows as u64 + 3);
             let hidden = (0..rows * h)
@@ -4289,8 +4271,8 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             );
             let oracle = result(&outcome, 0);
             assert_eq!(oracle.len(), rows * total);
+            let (_, bound) = reference(&hidden, rows);
             for mapping in MAPPINGS {
-                let (_, bound) = under(rows, || reference(&hidden, rows));
                 assert_within(
                     &format!("recurrent_project portable rows {rows} {mapping:?}"),
                     &native(&hidden, rows, mapping),
@@ -4304,8 +4286,8 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             let hidden = (0..rows * h)
                 .map(|_| rng.symmetric() * 2.0)
                 .collect::<Vec<_>>();
+            let (expected, bound) = reference(&hidden, rows);
             for &mapping in &mappings {
-                let (expected, bound) = under(rows, || reference(&hidden, rows));
                 assert_within(
                     &format!("recurrent_project H {h} M {rows} {mapping:?}"),
                     &native(&hidden, rows, mapping),
@@ -4378,9 +4360,11 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 let mut bound = Vec::new();
                 for r in 0..rows {
                     for n in 0..h {
-                        let (acc, magnitude) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
-                        expected.push(hidden[r * h + n] + act.round(acc));
-                        bound.push(rounded_bound(act, acc, magnitude));
+                        let (acc, products) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
+                        let (projected, value) = residual_output(act, acc, hidden[r * h + n]);
+                        expected.push(value);
+                        let form = out_weight.form(device.backend(), act, rows);
+                        bound.push(Float::F32.rounded(form.rounded(&products, act.float(), projected), value));
                     }
                 }
                 (expected, bound)
@@ -4431,7 +4415,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 );
                 let oracle = result(&outcome, 0);
                 for mapping in MAPPINGS {
-                    let (_, bound) = under(rows, || reference(&hidden, &gated, rows));
+                    let (_, bound) = reference(&hidden, &gated, rows);
                     assert_within(
                         &format!("recurrent_output portable {repr:?} rows {rows} {mapping:?}"),
                         &native(&hidden, &gated, rows, mapping),
@@ -4443,7 +4427,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
             for &rows in &row_classes {
                 let (hidden, gated) = case(rows);
                 for &mapping in &mappings {
-                    let (expected, bound) = under(rows, || reference(&hidden, &gated, rows));
+                    let (expected, bound) = reference(&hidden, &gated, rows);
                     assert_within(
                         &format!("recurrent_output {repr:?} H {h} M {rows} {mapping:?}"),
                         &native(&hidden, &gated, rows, mapping),
@@ -4622,14 +4606,16 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 (Vec::new(), Vec::new()),
             ];
             for r in 0..rows {
-                let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                let (x, slack) = rms_row(device.backend(), act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
                 for (i, wt) in weights.iter().enumerate() {
                     let x = wt.operand_rows(&x);
                     for n in 0..wt.rows {
-                        let (acc, magnitude) = dot(&x, wt.row(n));
-                        out[i].0.push(act.round(acc));
+                        let (acc, products) = dot(&x, wt.row(n));
+                        let value = act.round(acc);
+                        out[i].0.push(value);
                         out[i].1.push(
-                            rounded_bound(act, acc, magnitude) + slack_dot(&slack, wt.row(n)),
+                            wt.form(device.backend(), act, rows).rounded(&products, act.float(), value)
+                                + slack_dot(&slack, wt.row(n)),
                         );
                     }
                 }
@@ -4675,7 +4661,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 ],
             );
             for mapping in MAPPINGS {
-                let expected = under(rows, || reference(&hidden, rows));
+                let expected = reference(&hidden, rows);
                 let native = project(&hidden, rows, mapping, 0);
                 for i in 0..3 {
                     assert_within(
@@ -4694,7 +4680,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 .map(|_| rng.symmetric() * 2.0)
                 .collect::<Vec<_>>();
             for &mapping in &mappings {
-                let expected = under(rows, || reference(&hidden, rows));
+                let expected = reference(&hidden, rows);
                 let native = project(&hidden, rows, mapping, 0);
                 for i in 0..3 {
                     assert_within(
@@ -4712,7 +4698,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 let hidden = (0..rows * d)
                     .map(|_| rng.symmetric() * 2.0)
                     .collect::<Vec<_>>();
-                let expected = under(rows, || reference(&hidden, rows));
+                let expected = reference(&hidden, rows);
                 let native = project(&hidden, rows, MAPPINGS[0], 1);
                 assert!(native[0].iter().all(|&value| value == 0.0));
                 for i in 1..3 {
@@ -4769,9 +4755,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 let mut bound = Vec::new();
                 for r in 0..rows {
                     for n in 0..d_out {
-                        let (acc, magnitude) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
-                        expected.push(hidden[r * d_out + n] + act.round(acc));
-                        bound.push(rounded_bound(act, acc, magnitude));
+                        let (acc, products) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
+                        let (projected, value) = residual_output(act, acc, hidden[r * d_out + n]);
+                        expected.push(value);
+                        let form = out_weight.form(device.backend(), act, rows);
+                        bound.push(Float::F32.rounded(form.rounded(&products, act.float(), projected), value));
                     }
                 }
                 (expected, bound)
@@ -4785,7 +4773,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     .map(|_| act.round(rng.symmetric()))
                     .collect::<Vec<_>>();
                 if !four_b && !scoped && (rows == 3 || rows == 16) {
-                    let (_, bound) = under(rows, || reference(&hidden, &gated, rows));
+                    let (_, bound) = reference(&hidden, &gated, rows);
                     let outcome = interpret(
                         &module,
                         "attention_output",
@@ -4809,7 +4797,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     );
                 }
                 for &mapping in &mappings {
-                    let (expected, bound) = under(rows, || reference(&hidden, &gated, rows));
+                    let (expected, bound) = reference(&hidden, &gated, rows);
                     assert_within(
                         &format!("attention_output {repr:?} D {d_out} M {rows} {mapping:?}"),
                         &native(&hidden, &gated, rows, mapping),
@@ -4985,15 +4973,16 @@ fn scaled_projections_on(device: &Device) {
                 let (projection, scale) = (&projections[segment], SCALES[segment]);
                 let (mut expected, mut bound) = (Vec::new(), Vec::new());
                 for r in 0..rows {
-                    let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                    let (x, slack) = rms_row(device.backend(), act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
                     let x = projection.operand_rows(&x);
                     for n in 0..segments[segment] {
-                        let (acc, magnitude) = dot(&x, projection.row(n));
-                        expected.push(act.round(scale * acc));
-                        bound.push(
-                            rounded_bound(act, scale * acc, scale * magnitude)
-                                + scale * slack_dot(&slack, projection.row(n)),
-                        );
+                        let (acc, products) = dot(&x, projection.row(n));
+                        let value = act.round(scale * acc);
+                        expected.push(value);
+                        let sums = projection.form(device.backend(), act, rows).sums(&products)
+                            + slack_dot(&slack, projection.row(n));
+                        let scaled = Float::F32.rounded(f64::from(scale.abs()) * sums, scale * acc);
+                        bound.push(act.float().rounded(scaled, value));
                     }
                 }
                 (expected, bound)
@@ -5003,9 +4992,12 @@ fn scaled_projections_on(device: &Device) {
             let (mut expected, mut bound) = (Vec::new(), Vec::new());
             for r in 0..rows {
                 for n in 0..d {
-                    let (acc, magnitude) = dot(&output.operand_rows(&gated[r * k..(r + 1) * k]), output.row(n));
-                    expected.push(hidden[r * d + n] + act.round(SCALE * acc));
-                    bound.push(rounded_bound(act, SCALE * acc, SCALE * magnitude));
+                    let (acc, products) = dot(&output.operand_rows(&gated[r * k..(r + 1) * k]), output.row(n));
+                    let (projected, value) = residual_output(act, SCALE * acc, hidden[r * d + n]);
+                    expected.push(value);
+                    let sums = output.form(device.backend(), act, rows).sums(&products);
+                    let scaled = Float::F32.rounded(f64::from(SCALE.abs()) * sums, SCALE * acc);
+                    bound.push(Float::F32.rounded(act.float().rounded(scaled, projected), value));
                 }
             }
             (expected, bound)
@@ -5062,8 +5054,8 @@ fn scaled_projections_on(device: &Device) {
                 floats(&[0], &[]),
             ],
         );
-        let project_reference_at = under(rows, || project_reference(&hidden, rows));
-        let (_, output_bound) = under(rows, || output_reference(&hidden, &gated, rows));
+        let project_reference_at = project_reference(&hidden, rows);
+        let (_, output_bound) = output_reference(&hidden, &gated, rows);
         let projected_native = project(&hidden, rows, MAPPINGS[0], None);
         for (segment, (_, project_bound)) in project_reference_at.iter().enumerate() {
             assert_within(
@@ -5083,9 +5075,9 @@ fn scaled_projections_on(device: &Device) {
         // Every launch class against the host reference.
         for rows in rows_classes {
             let (hidden, gated) = case(rows);
-            let project_expected = under(rows, || project_reference(&hidden, rows));
+            let project_expected = project_reference(&hidden, rows);
             let (output_expected, output_bound) =
-                under(rows, || output_reference(&hidden, &gated, rows));
+                output_reference(&hidden, &gated, rows);
             for mapping in mappings {
                 let projected = project(&hidden, rows, mapping, None);
                 for (segment, (expected, bound)) in project_expected.iter().enumerate() {
@@ -5299,9 +5291,10 @@ fn head_logits_match_the_host(
             }
         }
         let values = expected.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+        let form = head.form(device.backend(), act, rows);
         let bounds = expected
             .iter()
-            .map(|(_, magnitude)| reassociation(rows) * magnitude + 1e-7)
+            .map(|(_, products)| form.sums(products))
             .collect::<Vec<_>>();
         let mappings = if is_cpu(device) {
             &mappings[..1]
@@ -5371,21 +5364,24 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
             let mut logit_bound = Vec::new();
             let mut chosen = Vec::new();
             let mut chosen_bound = Vec::new();
+            let form = head.form(device.backend(), act, outputs);
             for row in &out_rows {
                 let source = *row as usize;
-                let (x, slack) = rms_row(act, &hidden[source * d..(source + 1) * d], &norm, 1e-6);
+                let (x, slack) = rms_row(
+                    device.backend(), act, &hidden[source * d..(source + 1) * d], &norm, 1e-6,
+                );
                 features.extend_from_slice(&x);
                 feature_bound.extend_from_slice(&slack);
                 let x = head.operand_rows(&x);
                 for n in 0..v {
-                    let (acc, magnitude) = dot(&x, head.row(n));
+                    let (acc, products) = dot(&x, head.row(n));
                     logits.push(acc);
-                    logit_bound.push((magnitude, 1e-7 + slack_dot(&slack, head.row(n))));
+                    logit_bound.push(form.sums(&products) + slack_dot(&slack, head.row(n)));
                 }
                 for n in &selected {
-                    let (acc, magnitude) = dot(&x, head.row(*n as usize));
+                    let (acc, products) = dot(&x, head.row(*n as usize));
                     chosen.push(acc);
-                    chosen_bound.push((magnitude, 1e-7 + slack_dot(&slack, head.row(*n as usize))));
+                    chosen_bound.push(form.sums(&products) + slack_dot(&slack, head.row(*n as usize)));
                 }
             }
             let hidden_tensor = f32_tensor(&device, &[rows, d], &hidden);
@@ -5421,16 +5417,15 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
             let scaled_logits = logits.iter().map(|z| z * factor).collect::<Vec<_>>();
             let scaled_logit_bound = logit_bound
                 .iter()
-                .map(|(magnitude, rest)| (magnitude * factor, rest * factor))
+                .zip(&scaled_logits)
+                .map(|(sums, z)| match check.weight_scale {
+                    Some(scale) => Float::F32.rounded(f64::from(scale.abs()) * sums, *z),
+                    None => *sums,
+                })
                 .collect::<Vec<_>>();
             // The softcap c * tanh(z / c) has slope at most 1, so a logit's
             // bound carries over; its exp form adds a few ulp of c.
-            let bounds = |terms: &[(f32, f32)]| {
-                terms
-                    .iter()
-                    .map(|(magnitude, rest)| reassociation(outputs) * magnitude + rest + 1e-6 * cap)
-                    .collect::<Vec<_>>()
-            };
+            let bounds = |logits: &[f64]| logits.iter().map(|bound| bound + 1e-6 * f64::from(cap)).collect::<Vec<_>>();
             let capped = |values: &[f32]| {
                 values
                     .iter()
@@ -5780,7 +5775,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
                 epsilon: 1e-5,
             })
             .unwrap();
-            let (values, bound): (Vec<f32>, Vec<f32>) = tokens
+            let (values, bound): (Vec<f32>, Vec<f64>) = tokens
                 .iter()
                 .flat_map(|t| {
                     let row = table
@@ -5798,7 +5793,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
                         1.0
                     };
                     row.into_iter()
-                        .map(move |v| (act.round(v * inverse), (v * inverse).abs() / 128.0))
+                        .map(move |v| (act.round(v * inverse), f64::from((v * inverse).abs()) / 128.0))
                         .collect::<Vec<_>>()
                 })
                 .unzip();
@@ -5883,7 +5878,7 @@ gguf_format_tests! {
 /// An F8_E4M3 weight under its UE8M0 grid (mxfp8g32) at DeepSeek V4.1
 /// Flash's attention shapes, `wq_b` `[32768, 1280]` and `wo_b` `[5120,
 /// 8192]`, projects a decode row (GEMV) and a verify block (GEMM) within
-/// the reassociation bound of the F32 host reference
+/// the bound of its form against the F32 host reference
 /// (`fp8_projections_match_the_host_reference`).
 #[test]
 fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
@@ -5894,7 +5889,7 @@ fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
 /// shapes, a routed expert's down `[4096, 2048]`, the dense FFN's down
 /// `[4096, 12288]` and MLA's `q_b` `[16384, 1536]`, projects a decode row
 /// (GEMV), a verify block and a prefill block (GEMMs) within the
-/// reassociation bound of the F32 host reference
+/// bound of its form against the F32 host reference
 /// (`fp8_projections_match_the_host_reference`).
 #[test]
 fn fp8g128_projections_at_glm_shapes_match_the_host_reference() {
@@ -5907,7 +5902,7 @@ fn fp8g128_projections_at_glm_shapes_match_the_host_reference() {
 
 /// `format`'s `[h, f]` weights of `shapes` (each with its seed) project
 /// blocks of each of `rows` rows on every device within the
-/// reassociation bound of the F32 host reference. The weight's rows repeat
+/// bound of its form against the F32 host reference. The weight's rows repeat
 /// a host-built 509 (prime, so no tile or row block repeats with them),
 /// which the host decodes in seconds rather than the whole matrix's tens of
 /// minutes.
@@ -5924,10 +5919,9 @@ fn fp8_projections_match_the_host_reference(format: Format, shapes: &[(usize, us
             let product = (0..rows * f)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let (expected, bound) = under(rows, || {
-                dense_output_reference(act, &down, &residual, &product, &out_rows)
-            });
             for device in devices() {
+                let (expected, bound) =
+                    dense_output_reference(device.backend(), act, &down, &residual, &product, &out_rows);
                 let native = dense_output_native(
                     &device, act, &down, &residual, rows, &product, &out_rows, mapping,
                 );
@@ -6119,28 +6113,28 @@ fn query_key_project(
 /// One normed projection's host reference over `rows` rows of `x`
 /// (`[rows, weight.k]`): each row's RMS under `norm` rounded to the
 /// activation, then its F32 dot with each of the weight's periodic rows,
-/// rounded; with each output's bound (reassociation, one rounding flip, and
-/// the normed row's rounding flips).
+/// rounded; with each output's bound on `backend` (its form's and the
+/// normed row's rounding flips).
 fn normed_projection_reference(
+    backend: BackendName,
     act: Act,
     x: &[f32],
     rows: usize,
     norm: &[f32],
     epsilon: f32,
     weight: &Weight,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f64>) {
     let k = weight.k;
+    let form = weight.form(backend, act, rows);
     let (mut expected, mut bound) = (Vec::new(), Vec::new());
     for r in 0..rows {
-        let (normed, slack) = rms_row(act, &x[r * k..(r + 1) * k], norm, epsilon);
+        let (normed, slack) = rms_row(backend, act, &x[r * k..(r + 1) * k], norm, epsilon);
         let normed = weight.operand_rows(&normed);
         let period = (0..weight.rows.min(PERIOD))
             .map(|n| {
-                let (acc, magnitude) = dot(&normed, weight.row(n));
-                (
-                    act.round(acc),
-                    rounded_bound(act, acc, magnitude) + slack_dot(&slack, weight.row(n)),
-                )
+                let (acc, products) = dot(&normed, weight.row(n));
+                let value = act.round(acc);
+                (value, form.rounded(&products, act.float(), value) + slack_dot(&slack, weight.row(n)))
             })
             .collect::<Vec<_>>();
         for n in 0..weight.rows {
@@ -6217,17 +6211,17 @@ fn grouped_project_rows_native(
 
 /// The independent host reference of a grouped projection: output column
 /// g * N + j of row r is the ordered F32 dot of the row's run g (columns
-/// g * K ..) with weight row g * N + j, under the reassociation bound.
-fn grouped_reference(weight: &Weight, groups: usize, source: &[f32]) -> (Vec<f32>, Vec<f32>) {
+/// g * K ..) with weight row g * N + j, under the bound of `form`.
+fn grouped_reference(weight: &Weight, groups: usize, source: &[f32], form: Form) -> (Vec<f32>, Vec<f64>) {
     let (k, n) = (weight.k, weight.rows / groups);
     let mut expected = Vec::new();
     let mut bound = Vec::new();
     for run in source.chunks_exact(k).map(|run| weight.operand_rows(run)) {
         let group = expected.len() / n % groups;
         for j in 0..n {
-            let (acc, magnitude) = dot(&run, weight.row(group * n + j));
+            let (acc, products) = dot(&run, weight.row(group * n + j));
             expected.push(acc);
-            bound.push(reassociation_bound(magnitude) + 1e-7);
+            bound.push(form.sums(&products));
         }
     }
     (expected, bound)
@@ -6261,13 +6255,11 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
             let x = (0..rows * HIDDEN)
                 .map(|_| rng.symmetric() * 2.0)
                 .collect::<Vec<_>>();
-            let (qr_expected, qr_bound) = under(rows, || {
-                normed_projection_reference(act, &x, rows, &input_norm, EPSILON, &down)
-            });
-            let (key_expected, key_bound) = under(rows, || {
-                normed_projection_reference(act, &x, rows, &input_norm, EPSILON, &key)
-            });
             for device in devices() {
+                let (qr_expected, qr_bound) =
+                    normed_projection_reference(device.backend(), act, &x, rows, &input_norm, EPSILON, &down);
+                let (key_expected, key_bound) =
+                    normed_projection_reference(device.backend(), act, &x, rows, &input_norm, EPSILON, &key);
                 let label = format!("{} M {rows} on {:?}", repr.name(), device.backend());
                 let hidden = f32_tensor(&device, &[rows, HIDDEN], &x);
                 let (qr, keys) = query_key_project(
@@ -6303,9 +6295,9 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
                 let (query, _) = query_key_project(
                     &device, act, &widened, &query_norm, &up, None, EPSILON, MAPPINGS[0],
                 );
-                let (expected, bound) = under(rows, || {
-                    normed_projection_reference(act, &qr_values, rows, &query_norm, EPSILON, &up)
-                });
+                let (expected, bound) = normed_projection_reference(
+                    device.backend(), act, &qr_values, rows, &query_norm, EPSILON, &up,
+                );
                 assert_within(&format!("query {label}"), &read_act(act, &query), &expected, &bound);
             }
         }
@@ -6329,7 +6321,7 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
             let source = (0..rows * groups * k)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
+            let (expected, bound) = grouped_reference(&weight, groups, &source, Form::F32);
             if rows == 3 {
                 let outcome = interpret(
                     &module,
@@ -6350,6 +6342,9 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
                 assert_within(&format!("grouped portable body {repr:?} M {rows}"), &oracle, &expected, &bound);
             }
             for device in grouped_devices() {
+                let (expected, bound) = grouped_reference(
+                    &weight, groups, &source, weight.form(device.backend(), act, rows),
+                );
                 // Each split of the GEMM (Metal's and Vulkan's SPLIT; the
                 // CPU native has none).
                 let splits: &[u64] = match device.backend() {
@@ -6406,7 +6401,7 @@ fn metal_grouped_tall_project_rows_equals_its_staged_tiles() {
 
 /// DeepSeek V4.1 Flash's grouped attention output `wo_a` (8 groups, each
 /// `[1024, 4096]`, over a `[rows, 32768]` input) projects a decode row and a
-/// 17-row prefill within the reassociation bound of the per-group F32 host
+/// 17-row prefill within the bound of its form against the per-group F32 host
 /// products, over F8_E4M3 under its grid (mxfp8g32) and BF16. The weight is
 /// periodic (`periodic_weight`): N = 1024 is no multiple of the period, so
 /// every group's block differs. Only the GPU devices run this shape: the
@@ -6429,8 +6424,10 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
             let source = (0..rows * groups * k)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
             for device in &devices {
+                let (expected, bound) = grouped_reference(
+                    &weight, groups, &source, weight.form(device.backend(), act, rows),
+                );
                 let native = grouped_project_rows_native(device, act, &weight, groups, &source, 1, None);
                 assert_within(
                     &format!("wo_a {repr:?} M {rows} on {:?}", device.backend()),
@@ -6484,24 +6481,26 @@ fn metal_convolved_matrix_columns_match_host() {
             .collect::<Vec<_>>();
         for rows in [8usize, 13] {
             let hidden = uniform_values(rows * h, rows as u64, 1.0);
-            let (expected, bound) = under(rows, || {
+            let (expected, bound) = {
                 let mut expected = Vec::new();
                 let mut bound = Vec::new();
                 for row in hidden.chunks_exact(h) {
-                    let (x, slack) = rms_row(act, row, &norm, 1e-6);
+                    let (x, slack) = rms_row(device.backend(), act, row, &norm, 1e-6);
                     for wt in &weights {
                         let x = wt.operand_rows(&x);
                         for n in 0..wt.rows {
-                            let (acc, magnitude) = dot(&x, wt.row(n));
-                            expected.push(act.round(acc));
+                            let (acc, products) = dot(&x, wt.row(n));
+                            let value = act.round(acc);
+                            expected.push(value);
                             bound.push(
-                                rounded_bound(act, acc, magnitude) + slack_dot(&slack, wt.row(n)),
+                                wt.form(device.backend(), act, rows).rounded(&products, act.float(), value)
+                                    + slack_dot(&slack, wt.row(n)),
                             );
                         }
                     }
                 }
                 (expected, bound)
-            });
+            };
             // (lo, count, stop, source bank, source tape, target bank).
             // The final row is padding and must publish a zero convolution.
             let slots = [
@@ -6652,7 +6651,7 @@ fn metal_convolved_matrix_columns_match_host() {
                 // Same F32 tap chain; allow the host/Metal exponential's final rounding.
                 let convolution_bound = expected_convolved
                     .iter()
-                    .map(|v| 2e-6 * v.abs() + 1e-7)
+                    .map(|v| 2e-6 * f64::from(v.abs()) + 1e-7)
                     .collect::<Vec<_>>();
                 assert_within(
                     &format!("{label}: convolution"),
@@ -6759,18 +6758,20 @@ fn metal_attention_output_matrix_matches_host() {
                     .into_iter()
                     .map(|v| act.round(v))
                     .collect::<Vec<_>>();
-                let (expected, bound) = under(rows, || {
+                let (expected, bound) = {
+                    let form = weights.form(device.backend(), act, rows);
                     let mut expected = Vec::new();
                     let mut bound = Vec::new();
                     for r in 0..rows {
                         for n in 0..d {
-                            let (acc, magnitude) = dot(&weights.operand_rows(&gated[r * k..(r + 1) * k]), weights.row(n));
-                            expected.push(hidden[r * d + n] + act.round(acc));
-                            bound.push(rounded_bound(act, acc, magnitude));
+                            let (acc, products) = dot(&weights.operand_rows(&gated[r * k..(r + 1) * k]), weights.row(n));
+                            let (projected, value) = residual_output(act, acc, hidden[r * d + n]);
+                            expected.push(value);
+                            bound.push(Float::F32.rounded(form.rounded(&products, act.float(), projected), value));
                         }
                     }
                     (expected, bound)
-                });
+                };
                 for parts in [1, 2, 4] {
                     let mapping = Mapping {
                         batch_from: 3,
@@ -6834,9 +6835,9 @@ fn metal_q4_verify_rows_match_host() {
             .map(|x| act.round(x))
             .collect::<Vec<_>>();
         let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
-        let (expected, bounds) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &source, &norm, &out_rows, 1e-6, f32::INFINITY)
-        });
+        let (expected, bounds) = dense_expand_reference(
+            device.backend(), act, &gate, &up, &source, &norm, &out_rows, 1e-6, f32::INFINITY,
+        );
         for parts in [1, 4] {
             let mapping = Mapping {
                 batch_from: 2,
@@ -6848,18 +6849,19 @@ fn metal_q4_verify_rows_match_host() {
             );
             assert_within("Q4 paired verify", &actual, &expected, &bounds);
             let actual = project_rows_native(&device, act, &gate, &source, mapping, None);
-            let (expected, bounds) = under(rows, || {
+            let (expected, bounds) = {
+                let form = gate.form(device.backend(), act, rows);
                 let mut expected = Vec::new();
                 let mut bounds = Vec::new();
                 for m in 0..rows {
                     for n in 0..f {
-                        let (sum, magnitude) = dot(&gate.operand_rows(&source[m * h..(m + 1) * h]), gate.row(n));
+                        let (sum, products) = dot(&gate.operand_rows(&source[m * h..(m + 1) * h]), gate.row(n));
                         expected.push(sum);
-                        bounds.push(reassociation_bound(magnitude) + 1e-7);
+                        bounds.push(form.sums(&products));
                     }
                 }
                 (expected, bounds)
-            });
+            };
             assert_within("Q4 plain verify", &actual, &expected, &bounds);
             // Changing a peer row cannot change this row's result.
             let mut changed = source.clone();

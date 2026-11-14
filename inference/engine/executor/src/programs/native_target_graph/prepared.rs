@@ -60,7 +60,7 @@ pub struct PreparedTargetGraphs {
     pub(super) keeps: Vec<BlockKeeps>,
     /// Per block, its selected read's shape, which decides whether a launch
     /// takes its scoring class.
-    selections: Vec<Option<crate::SelectionShape>>,
+    selections: Vec<Option<crate::SelectionBinding>>,
     family: NativeGraphFamily,
     max_output_bytes: u64,
     /// Per block, the tap indices its graph writes.
@@ -986,8 +986,8 @@ impl PreparedTargetGraphs {
         self.listings[index].segments(segments, self.max_segments)
     }
 
-    /// Block `index`'s selected read's shape, when it reads one.
-    pub(crate) fn selection(&self, index: usize) -> Option<crate::SelectionShape> {
+    /// Block `index`'s selected read, when it reads one.
+    pub(crate) fn selection(&self, index: usize) -> Option<crate::SelectionBinding> {
         self.selections.get(index).copied().flatten()
     }
 

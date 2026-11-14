@@ -259,6 +259,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
             feedforward_norm: rms(reader.tensor(&format!("{p}ln2.weight"), &[hidden])?),
             feedforward: VisionFeedForward {
                 up: VisionUp::Gated {
+                    limit: None,
                     gate: reader.linear(&format!("{p}ffn_gate"), intermediate, hidden)?,
                     up: reader.linear(&format!("{p}ffn_up"), intermediate, hidden)?,
                 },
@@ -315,9 +316,11 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                 epsilon,
             }),
             stages: vec![MergerStage {
+                norm: None,
                 linear: reader.linear("mm.input_projection", output_hidden, hidden)?,
                 activation: None,
             }],
+            feed_forward: None,
             output_norm: None,
         },
     })
@@ -383,9 +386,11 @@ fn unified(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                 epsilon,
             }),
             stages: vec![MergerStage {
+                norm: None,
                 linear: reader.linear("mm.input_projection", output_hidden, hidden)?,
                 activation: None,
             }],
+            feed_forward: None,
             output_norm: None,
         },
     })

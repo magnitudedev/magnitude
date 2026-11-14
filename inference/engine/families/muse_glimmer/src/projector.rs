@@ -183,6 +183,7 @@ pub fn describe_projector(
     let adapter = t.rows("mm.0.weight")?;
     let mut stage = |name: &str, outputs, inputs, activation| {
         Ok::<_, Error>(MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: t.bind(name, &[outputs, inputs])?,
                 bias: None,
@@ -233,6 +234,7 @@ pub fn describe_projector(
             standardize: None,
             projection_norm: None,
             stages,
+            feed_forward: None,
             output_norm: Some(VisionNorm::Rms {
                 weight: None,
                 epsilon: feature_epsilon,

@@ -51,7 +51,8 @@ attention_history prefill_history() {
 
 prefill_scratch prefill_scratch_planes() {
     return prefill_scratch(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS));
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTS),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERY_FACTORS));
 }
 
 void attention_prefill_k8v4_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }

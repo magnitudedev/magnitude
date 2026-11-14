@@ -32,12 +32,13 @@
 //! are separate graphs, so the picks and the pool cross between them as the
 //! launch-scoped tables they bind, as the launch's bound controls do.
 
-use super::graph::PickedReads;
+use super::graph::{IndexerWeights, PickedReads};
 use crate::operators::scalar;
 use super::split::{AttentionBlock, AttentionTopology, Candidates, IndexedReals, IndexedSource, OwnReals, OwnRows, Plane, both};
 use crate::planning::{RoundingArguments, axis};
 use super::selection::{
-    self, IndexerClass, IndexerEntries, IndexerInputs, KeyWrite, Projection, ProjectionInput,
+    self, IndexerClass, IndexerElements, IndexerEntries, IndexerInputs, KeyWrite, Projection, ProjectionInput,
+    segment,
 };
 use crate::operators::InputForm;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
@@ -46,7 +47,7 @@ use crate::programs::native_target_graph::PackedWeight;
 use crate::{CandidatesBinding, PickedBinding};
 use magnitude_family_contracts::{Indexer, Pool, PooledRows};
 use magnitude_kernels::{attention_append_dense, attention_project, indexer_keys, pool_rows, widen_rows};
-use seismic::{Argument, Dim, Element, NativeGraphClassSlice, NativePort, WorkflowTensor, WorkflowTensorView};
+use seismic::{Argument, Dim, Element, NativePort, WorkflowTensor, WorkflowTensorView};
 
 /// An own source's rows' entries at one graph class: the `u` and `g`
 /// projections (the query and gate segments), their widening to the F32
@@ -133,21 +134,14 @@ impl<'a, G: GraphDraft + 'a> Clone for PickedEntries<'a, G> {
 /// source's rows' (the `u | g` projection over `x` under the input norm,
 /// its index keys' over the F32 latent: no norm, a zero-row view of the key
 /// norm; at rate 1 over `u` under the pooled rows' norm), and its indexer's
-/// query over `qr` under the low-rank query's norm and head weights over
-/// `x`; and whether it produces a candidate pool. Each reads its input in
-/// A; the index projections are published in A, and `u | g` in F32 for a
+/// ([`IndexerElements`]: admission holds an index-list source's indexer to
+/// the query rank). The `u | g` projection is published in F32 for a
 /// softmax-gated pool (whose pooling is F32 from its projections on) and in
 /// A otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PickedElements {
-    /// The indexer the layer runs itself.
-    pub indexer: crate::IndexerBinding,
+    pub indexer: IndexerElements,
     pub rows: Option<PooledElements>,
-    /// The low-rank query's rank, the width of the `qr` rows the indexer's
-    /// query projects.
-    pub query_rank: u64,
-    pub query_project: [(&'static str, Element); 7],
-    pub weights_project: Option<[(&'static str, Element); 7]>,
 }
 
 /// An own source's rows' projections' elements (`PickedElements::rows`),
@@ -161,64 +155,50 @@ pub(crate) struct PooledElements {
 
 impl PickedElements {
     /// `None` for a binding without an indexer of its own (no index-list
-    /// source, or a reused one). An indexer's query reads the low-rank
-    /// query's `qr` rows: admission (`operators::attention`) holds an
-    /// index-list source's indexer to `IndexerInput::QueryRank`, which
-    /// `Decoder::validate` holds to a low-rank query.
+    /// source, or a reused one).
     pub(crate) fn of(binding: crate::AttentionBinding) -> Option<Self> {
         let picked = binding.picked?;
         let indexer = picked.indexer()?;
-        let low_rank = binding
-            .low_rank_query
-            .expect("an admitted indexer reads the low-rank query's rows");
         let activation = binding.activation;
-        let segment = |norm, weight| {
-            [
-                ("NW", norm),
-                ("QW", weight),
-                ("GW", weight),
-                ("KW", weight),
-                ("VW", weight),
-                ("A", activation),
-                ("Y", activation),
-            ]
-        };
         Some(Self {
-            indexer,
+            indexer: IndexerElements::of(binding, indexer),
             rows: match picked {
                 // A mean or identity pool's absent gate segment binds a
                 // zero-row view of the projection, at its element (as
                 // `attention::binding`'s absent segments bind the query's).
                 PickedBinding::Own(pooled) => Some(PooledElements {
-                    project: [
-                        ("NW", binding.norm),
-                        ("QW", pooled.projection),
-                        ("GW", pooled.gate.unwrap_or(pooled.projection)),
-                        ("KW", pooled.projection),
-                        ("VW", pooled.projection),
-                        ("A", activation),
-                        ("Y", if pooled.gate.is_some() { Element::f32() } else { activation }),
-                    ],
+                    project: tokens_project(activation, binding.norm, pooled.projection, pooled.gate),
                     key_project: match Pooling::of(pooled.rate) {
-                        Pooling::Grouped => segment(pooled.key_norm, pooled.key),
-                        Pooling::Identity => segment(pooled.norm, pooled.key),
+                        Pooling::Grouped => segment(activation, pooled.key_norm, pooled.key, activation),
+                        Pooling::Identity => segment(activation, pooled.norm, pooled.key, activation),
                     },
                     pooling: Pooling::of(pooled.rate),
                 }),
                 PickedBinding::Reindex { .. } | PickedBinding::Reused => None,
             },
-            query_rank: low_rank.rank,
-            query_project: segment(low_rank.norm, indexer.query),
-            weights_project: indexer
-                .head_weights
-                .map(|weights| segment(binding.norm, weights)),
         })
     }
+}
 
-    /// Whether the indexer produces a candidate pool.
-    pub(crate) fn produces(&self) -> bool {
-        matches!(self.indexer.candidates, CandidatesBinding::Produce(_))
-    }
+/// The `u | g` projection's elements over `x` under the input norm `norm`:
+/// `u` through `projection` and, gated, `g` through `gate` (a mean pool's
+/// absent gate a zero-row view of the projection), published in F32 for a
+/// softmax-gated pool and in A otherwise.
+pub(crate) fn tokens_project(
+    activation: Element,
+    norm: Element,
+    projection: Element,
+    gate: Option<Element>,
+) -> [(&'static str, Element); 7] {
+    [
+        ("NW", norm),
+        ("QW", projection),
+        ("GW", gate.unwrap_or(projection)),
+        ("KW", projection),
+        ("VW", projection),
+        ("A", activation),
+        ("Y", if gate.is_some() { Element::f32() } else { activation }),
+    ]
 }
 
 /// An own source's rows' weights: the pooled rows' projection, gate
@@ -234,14 +214,11 @@ pub(crate) struct PooledWeights {
 }
 
 /// An indexing source's weights: its own rows' (none for a Reindex
-/// source), and its indexer's query, the query heads' own norm (if it has
-/// one) and its head weights (if projected).
+/// source), and its indexer's.
 #[derive(Clone)]
 pub(crate) struct PickedWeights {
     pub rows: Option<PooledWeights>,
-    pub query: PackedWeight,
-    pub query_norm: Option<WorkflowTensor>,
-    pub head_weights: Option<PackedWeight>,
+    pub indexer: IndexerWeights,
 }
 
 /// The Block plane an index-list source's picks address at one graph
@@ -365,34 +342,6 @@ pub(crate) struct IndexPorts {
     pub complete: NativePort,
     pub lists: ListPorts,
     pub own: Option<OwnPorts>,
-}
-
-/// The class scope of a candidate pool's lists, `[rows, blocks + R, 2]`:
-/// the producing indexer's pool table and every node of a restricted
-/// indexer over it, whose spans are the pool's blocks beside the class's
-/// segments.
-pub(crate) const CANDIDATE_LISTS: &str = "candidate_lists";
-
-/// The class slice of a block whose index-list source is `picked`: a
-/// candidate pool's lists ([`CANDIDATE_LISTS`]) take the pool's blocks
-/// beside each of the class's `segments`.
-pub(crate) fn candidate_class_segments(
-    slice: NativeGraphClassSlice,
-    picked: Option<PickedBinding>,
-    segments: impl Iterator<Item = u64>,
-) -> NativeGraphClassSlice {
-    let pool = picked
-        .and_then(|picked| picked.indexer())
-        .and_then(|indexer| match indexer.candidates {
-            CandidatesBinding::All => None,
-            CandidatesBinding::Produce(pool) | CandidatesBinding::Restrict(pool) => Some(pool),
-        });
-    match pool {
-        None => slice,
-        Some(pool) => {
-            slice.scoped(CANDIDATE_LISTS, "R", segments.map(|segments| pool.blocks + segments))
-        }
-    }
 }
 
 /// The table of an indexer's lists.
@@ -593,6 +542,8 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                     ("TB", plane_numbers.rows.clone()),
                     ("TW", window.rows.clone()),
                     ("GT", gt.clone()),
+                    ("PR", Dim::from(0)),
+                    ("TN", Dim::from(0)),
                     ("R", numbers.segments.clone()),
                     ("RATE", own.rate.clone()),
                 ],
@@ -622,7 +573,9 @@ fn own_rows<'a, G: GraphDraft + 'a>(
                 pool_rows::WorkflowArgs {
                     u: (&u).into(),
                     g: (&g).into(),
+                    position: (&norm.slice_leading(0, 0)).into(),
                     norm: (&norm).into(),
+                    bias: (&norm.slice_leading(0, 0)).into(),
                     rotary_components: components.into(),
                     rotary_frequencies: frequencies.into(),
                     rotary_amplitudes: amplitudes.into(),
@@ -770,7 +723,6 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
     };
     let IndexedSource {
         plane: plane_numbers,
-        heads,
         width: index_width,
         top,
         spans,
@@ -822,31 +774,16 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
         scores: list_scores.clone(),
         rotary_pairs: pairs.clone(),
     };
-    let score_dimensions = [
-        ("M", rows.clone()),
-        ("H", heads.clone()),
-        ("P", pairs.clone()),
-        ("S", index_width - pairs * 2),
-        ("NQ", axis(weights.query_norm.is_some())),
-        (
-            "HW",
-            if weights.head_weights.is_some() {
-                heads.clone()
-            } else {
-                Dim::from(0)
-            },
-        ),
-        ("TB", plane_numbers.rows.clone()),
-        ("R", list_spans.clone()),
-        ("N", list_scores.clone()),
-        ("RA", axis(form.rotary_adjacent)),
-        ("RT", axis(form.rotary_trailing)),
-    ];
+    let score_dimensions = class.score_dimensions(
+        weights.indexer.query_norm.is_some(),
+        weights.indexer.head_weights.is_some(),
+        form.rotary_adjacent,
+        form.rotary_trailing,
+    );
     let entries = inputs.entries.indexer;
     // The lists: the read's visible spans (a launch control), or the pool
-    // table a restricted indexer binds. A pool table's spans, and every
-    // node of a restricted indexer over them, take the pool's blocks beside
-    // the class's segments ([`CANDIDATE_LISTS`]).
+    // table a restricted indexer binds. A pool table's spans take the
+    // pool's blocks beside the class's segments.
     let lists = match &index.candidates {
         Candidates::All => ListPorts::Visible {
             spans: graph.control_for(topology.controls, entries.score, "spans", &score_dimensions)?,
@@ -865,20 +802,13 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
                 "spans",
                 &score_dimensions,
             )?;
-            graph.set_class_scope(Some(CANDIDATE_LISTS));
-            let table = graph.port_for(entries.score, "spans", &pool_dimensions);
-            graph.set_class_scope(None);
             ListPorts::Visible {
                 spans: visible,
-                pool: Some(table?),
+                pool: Some(graph.port_for(entries.score, "spans", &pool_dimensions)?),
             }
         }
-        Candidates::Restrict(_) => {
-            graph.set_class_scope(Some(CANDIDATE_LISTS));
-            ListPorts::Pool(graph.port_for(entries.score, "spans", &score_dimensions)?)
-        }
+        Candidates::Restrict(_) => ListPorts::Pool(graph.port_for(entries.score, "spans", &score_dimensions)?),
     };
-    let restricted = matches!(index.candidates, Candidates::Restrict(_));
     let spans_port = match &lists {
         ListPorts::Visible { spans, .. } | ListPorts::Pool(spans) => spans,
     };
@@ -894,6 +824,7 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
         ],
     )?;
     let query_norm = weights
+        .indexer
         .query_norm
         .as_ref()
         .map(|norm| norm.reshape(&[Dim::from(1), index_width.clone()]));
@@ -902,7 +833,7 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
         .tensor()
         .reshape(&[rows.clone(), list_spans, Dim::from(2)]);
     let complete_view = complete.tensor().reshape(&[rows.clone()]);
-    let head_weights = match (index.head_weights, &weights.head_weights) {
+    let head_weights = match (index.head_weights, &weights.indexer.head_weights) {
         (true, Some(weight)) => Some((
             ProjectionInput {
                 rows: inputs.x.rows,
@@ -973,8 +904,8 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
                 form: inputs.qr.form,
             },
             query: Projection {
-                weight: &weights.query.weight,
-                operands: &weights.query.operands,
+                weight: &weights.indexer.query.weight,
+                operands: &weights.indexer.query.operands,
                 norm: inputs.qr_norm,
                 epsilon: inputs.qr_epsilon,
             },
@@ -988,12 +919,10 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             keys: &mut index_keys,
             spans: &spans_view,
             complete: &complete_view,
+            picks: selection::Picks::Rows,
         },
         constants,
     )?;
-    if restricted {
-        graph.set_class_scope(None);
-    }
     // A producing indexer's candidate pool, from its scores over the
     // read's spans, for the restricted indexers after it.
     match (&index.candidates, &lists, entries.candidates) {

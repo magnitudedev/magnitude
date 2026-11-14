@@ -46,6 +46,43 @@ impl ImageMarkers {
 pub type SpatialControls =
     fn(&ModelDefinition, [usize; 3]) -> Result<VisionSpatialControls, InputPreparationError>;
 
+/// The spatial controls of a tower that places patches by rotary alone: the
+/// patch rows cell by cell (the `merge`² cells in raster order), each cell's
+/// patches in raster order, as the processor flattens them and the tower
+/// holds them, each row's rotary coordinates its patch's grid row and
+/// column.
+pub fn cell_raster_controls(
+    definition: &ModelDefinition,
+    grid: [usize; 3],
+) -> Result<VisionSpatialControls, InputPreparationError> {
+    let vision = definition
+        .vision
+        .as_ref()
+        .ok_or(InputPreparationError::UnsupportedMedia)?;
+    let merge = usize::try_from(vision.preprocessing.merge)
+        .map_err(|_| InputPreparationError::VisionGeometry)?;
+    let [t, h, w] = grid;
+    if t != 1 || merge == 0 || h == 0 || w == 0 || h % merge != 0 || w % merge != 0 {
+        return Err(InputPreparationError::VisionGeometry);
+    }
+    let coordinate =
+        |value: usize| i32::try_from(value).map_err(|_| InputPreparationError::VisionGeometry);
+    let mut coordinates = Vec::with_capacity(h * w);
+    for cell_row in 0..h / merge {
+        for cell_col in 0..w / merge {
+            for inner_row in 0..merge {
+                for inner_col in 0..merge {
+                    coordinates.push([
+                        coordinate(cell_row * merge + inner_row)?,
+                        coordinate(cell_col * merge + inner_col)?,
+                    ]);
+                }
+            }
+        }
+    }
+    VisionSpatialControls::new((0..h * w).collect(), coordinates, None, Vec::new())
+}
+
 /// Rows at their absolute positions; images expanded between their markers.
 #[derive(Clone, Debug)]
 pub struct SequentialImageInput {

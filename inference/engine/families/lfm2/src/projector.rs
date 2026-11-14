@@ -211,6 +211,7 @@ pub fn describe_projector(
             feedforward_norm: rms(weight("ln2.weight", &[hidden])?),
             feedforward: VisionFeedForward {
                 up: VisionUp::Gated {
+                    limit: None,
                     gate: linear(weight("ffn_gate.weight", &[intermediate, hidden])?),
                     up: linear(weight("ffn_up.weight", &[intermediate, hidden])?),
                 },
@@ -232,6 +233,7 @@ pub fn describe_projector(
         .ok_or_else(|| invalid("missing projector merger stage"))?;
     let stages = vec![
         MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: tensor("mm.0.weight", &[projector_hidden, merger_hidden])?,
                 bias: Some(tensor("mm.0.bias", &[projector_hidden])?),
@@ -240,6 +242,7 @@ pub fn describe_projector(
             activation: Some(VisionActivation::GeluErf),
         },
         MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: tensor("mm.2.weight", &[output_hidden, projector_hidden])?,
                 bias: Some(tensor("mm.2.bias", &[output_hidden])?),
@@ -282,6 +285,7 @@ pub fn describe_projector(
             standardize: None,
             projection_norm: None,
             stages,
+            feed_forward: None,
             output_norm: None,
         },
     };

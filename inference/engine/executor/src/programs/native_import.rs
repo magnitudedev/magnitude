@@ -284,7 +284,7 @@ mod tests {
         fs::write(&path, file_bytes).unwrap();
         let file = Arc::new(FileSource::open(&path).unwrap());
         fs::remove_file(&path).unwrap();
-        let stored = Stored::Dense(crate::StoredTensor {
+        let stored = Stored::dense(crate::StoredTensor {
             source: file,
             offset: 37,
             nbytes: values.len() as u64,

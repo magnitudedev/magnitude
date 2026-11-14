@@ -3,6 +3,7 @@
   "LiquidAI/LFM2.5-24B-A2B-GGUF": "0912d33141f77e10705345a6732bfd83f0252fdc",
   "LiquidAI/LFM3-1.7B-GGUF": "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf",
   "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF": "689503584971b7b96545821d712a9a71d8f7ac31",
+  "magnitudedev/GLM-5.3-Flash-GGUF": "244e6041783cc31981cb561b1a57c534e37b7d81",
   "magnitudedev/Muse-Glimmer-30B-DFlash-GGUF": "40434dabff898ca2dda99f88a02b422a03715d67",
   "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF": "341de320b3c2802b22c1a633c97ce78d51512bc6",
   "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr-GGUF": "8602acac5a96c69bf094ce83d941341944b2789d",

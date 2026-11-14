@@ -2,8 +2,9 @@
 //!
 //! A reference holds a corpus encoded by the model's original `tokenizer.json`
 //! and chat requests rendered by the model's own chat format, with their ids.
-//! DeepSeek V4.1's also holds assistant replies with tool calls, as its
-//! encoding writes them, which the engine must read back.
+//! DeepSeek V4.1's and GLM-5.3-Flash's also hold assistant replies with tool
+//! calls, as the model's own format writes them, which the engine must read
+//! back.
 //!
 //! - DeepSeek V4.1's reference is committed and always runs:
 //!   `tests/assets/deepseek41.json` beside the published GGUF's vocabulary,
@@ -13,13 +14,16 @@
 //!   `tokenizer.json` and its encoding (`encoding/encoding.py`).
 //! - Any other model's comes from `transformers` `apply_chat_template` over the
 //!   GGUF's template, written by
-//!   `inference/engine/chat/tests/support/tokenizer_reference.py`. Run with
-//!   `MAGNITUDE_TEST_GGUF=<name>.gguf MAGNITUDE_TEST_REFERENCE=<name>.json
+//!   `inference/engine/chat/tests/support/tokenizer_reference.py`. GLM-5.3-Flash's
+//!   is committed and always runs: `tests/assets/glm53.json` beside the
+//!   vocabulary llama.cpp's converter writes from the checkpoint
+//!   (`glm53.gguf.gz`), whose template it renders. Any other runs with
+//!   `MAGNITUDE_TEST_GGUF=<name>.gguf.gz MAGNITUDE_TEST_REFERENCE=<name>.json
 //!   cargo test -p magnitude-chat --test real_tokenizer -- --ignored`. The GGUF
-//!   may be a complete file or the generator's vocabulary-only header.
+//!   may be a complete file or the generator's gzipped vocabulary-only header.
 use flate2::read::GzDecoder;
 use magnitude_artifacts::{
-    gguf::{inspect_header, read_header},
+    gguf::{inspect_header, read_header, Directory},
     TemplatePayload, TemplateSource, TokenizerPayload,
 };
 use magnitude_chat::{
@@ -77,22 +81,35 @@ struct Reference {
     now: i64,
     corpus: Vec<Case>,
     renders: Vec<Render>,
-    /// Only DeepSeek V4.1's reference has replies.
+    /// Only some references hold replies.
     #[serde(default)]
     replies: Vec<Reply>,
 }
 
-fn load() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
-    let path = std::env::var("MAGNITUDE_TEST_GGUF").expect("MAGNITUDE_TEST_GGUF names a GGUF");
-    let directory = inspect_header(&path).unwrap();
-    let tokenizer_payload = TokenizerPayload::from_directory(&directory);
+/// The header of a GGUF's gzipped vocabulary.
+fn gunzipped_header(vocabulary: &[u8]) -> Directory {
+    let mut header = Vec::new();
+    GzDecoder::new(vocabulary).read_to_end(&mut header).unwrap();
+    read_header(header).unwrap()
+}
+
+/// The tokenizer of a GGUF's header, and `templates` with its special tokens.
+fn adapt(directory: &Directory, templates: &TemplatePayload) -> (ByteBpeTokenizer, TemplateBundle) {
+    let tokenizer_payload = TokenizerPayload::from_directory(directory);
     let tokenizer =
         ByteBpeTokenizer::new(gguf_byte_bpe(&tokenizer_payload, "test".into()).unwrap()).unwrap();
-    let templates = gguf_templates(
-        &TemplatePayload::from_directory(&directory, &path).unwrap(),
-        &tokenizer_payload,
-    )
-    .unwrap();
+    (tokenizer, gguf_templates(templates, &tokenizer_payload).unwrap())
+}
+
+fn load() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
+    let path = std::env::var("MAGNITUDE_TEST_GGUF").expect("MAGNITUDE_TEST_GGUF names a GGUF");
+    let directory = if path.ends_with(".gz") {
+        gunzipped_header(&std::fs::read(&path).unwrap())
+    } else {
+        inspect_header(&path).unwrap()
+    };
+    let (tokenizer, templates) =
+        adapt(&directory, &TemplatePayload::from_directory(&directory, &path).unwrap());
     let reference = std::env::var("MAGNITUDE_TEST_REFERENCE")
         .expect("MAGNITUDE_TEST_REFERENCE names the reference JSON");
     let reference = serde_json::from_slice(&std::fs::read(reference).unwrap()).unwrap();
@@ -110,14 +127,8 @@ const DEEPSEEK41_VOCABULARY: &[u8] =
 const DEEPSEEK41_REFERENCE: &str = include_str!("assets/deepseek41.json");
 
 fn deepseek41() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
-    let mut header = Vec::new();
-    GzDecoder::new(DEEPSEEK41_VOCABULARY)
-        .read_to_end(&mut header)
-        .unwrap();
-    let tokenizer_payload = TokenizerPayload::from_directory(&read_header(header).unwrap());
-    let tokenizer =
-        ByteBpeTokenizer::new(gguf_byte_bpe(&tokenizer_payload, "test".into()).unwrap()).unwrap();
-    let templates = gguf_templates(
+    let (tokenizer, templates) = adapt(
+        &gunzipped_header(DEEPSEEK41_VOCABULARY),
         &TemplatePayload {
             sources: vec![TemplateSource {
                 name: "default".into(),
@@ -125,11 +136,23 @@ fn deepseek41() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
                 provenance: "magnitude-conversion deepseek41.jinja".into(),
             }],
         },
-        &tokenizer_payload,
-    )
-    .unwrap();
-    let reference = serde_json::from_str(DEEPSEEK41_REFERENCE).unwrap();
-    (tokenizer, templates, reference)
+    );
+    (tokenizer, templates, serde_json::from_str(DEEPSEEK41_REFERENCE).unwrap())
+}
+
+/// The vocabulary and chat template llama.cpp's converter writes from
+/// GLM-5.3-Flash's checkpoint, and the reference, as `tokenizer_reference.py`
+/// writes them.
+const GLM53_VOCABULARY: &[u8] = include_bytes!("assets/glm53.gguf.gz");
+const GLM53_REFERENCE: &str = include_str!("assets/glm53.json");
+
+fn glm53() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
+    let directory = gunzipped_header(GLM53_VOCABULARY);
+    let (tokenizer, templates) = adapt(
+        &directory,
+        &TemplatePayload::from_directory(&directory, "glm53.gguf.gz").unwrap(),
+    );
+    (tokenizer, templates, serde_json::from_str(GLM53_REFERENCE).unwrap())
 }
 
 fn ids(tokens: &[TokenId]) -> Vec<u32> {
@@ -248,6 +271,94 @@ fn deepseek41_requests_render_as_its_encoding() {
     renders_agree(&tokenizer, &templates, &reference);
 }
 
+/// GLM's corpus encodes as its `tokenizer.json` with no implicit BOS, and its
+/// turns end at its generation config's EOS identities: the end of text, the
+/// user's turn and a tool's observation.
+#[test]
+fn glm53_corpus_encodes_as_its_tokenizer_json() {
+    let (tokenizer, _, reference) = glm53();
+    assert_eq!(tokenizer.implicit_bos(), None);
+    assert_eq!(
+        ids(&tokenizer.stop_tokens().iter().copied().collect::<Vec<_>>()),
+        [154820, 154827, 154829]
+    );
+    corpus_agrees(&tokenizer, &reference);
+}
+
+#[test]
+fn glm53_requests_render_as_its_template() {
+    let (tokenizer, templates, reference) = glm53();
+    renders_agree(&tokenizer, &templates, &reference);
+}
+
+/// An image in a user message and an image in a tool result both reach
+/// GLM-5.3-Flash's prompt as its media marker, in place: the engine renders
+/// images as `media_marker` parts, which the native normalization joins into
+/// the message's string content, so the template's `visible_text` and
+/// `tool_response` print them as text (its `image` and `image_url` types
+/// never occur).
+#[test]
+fn glm53_images_in_user_messages_and_tool_results_reach_the_prompt() {
+    use magnitude_chat::request::{
+        AssistantTurn, ChatInput, Conversation, Entry, ImageInput, OutputFormat, ToolCall,
+        ToolExchange, ToolResultPart, Tools, UserPart,
+    };
+    const MARKER: &str = "<|begin_of_image|><|image|><|end_of_image|>";
+    let (tokenizer, templates, _) = glm53();
+    let tokenizer = Arc::new(tokenizer);
+    let image = || ImageInput {
+        media_type: "image/png".into(),
+        bytes: Arc::from(&b"\x89PNG"[..]),
+    };
+    let input = ChatInput {
+        conversation: Conversation::new(
+            None,
+            vec![
+                Entry::User(vec![
+                    UserPart::Text("Look at this.".into()),
+                    UserPart::Image(image()),
+                ]),
+                Entry::Assistant(AssistantTurn {
+                    reasoning: None,
+                    text: None,
+                    tool_calls: vec![ToolExchange {
+                        call: ToolCall {
+                            id: "call_1".into(),
+                            name: "screenshot".into(),
+                            arguments: Map::new(),
+                        },
+                        result: vec![
+                            ToolResultPart::Text("captured".into()),
+                            ToolResultPart::Image(image()),
+                        ],
+                    }],
+                }),
+            ],
+        )
+        .unwrap(),
+        tools: Tools::none(),
+        reasoning: Default::default(),
+        output: OutputFormat::Text,
+        template_arguments: Map::new(),
+    };
+    let rendered = input.render(0, Some(MARKER)).unwrap();
+    assert_eq!(rendered.images.len(), 2);
+    let prepared = PreparedChat::prepare(
+        &templates,
+        &tokenizer,
+        &rendered.request,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
+    let prompt = prepared.prompt();
+    assert!(prompt.contains(&format!("<|user|>Look at this.{MARKER}")), "{prompt}");
+    assert!(
+        prompt.contains(&format!("<tool_response>captured{MARKER}</tool_response>")),
+        "{prompt}"
+    );
+    assert_eq!(prompt.matches(MARKER).count(), 2, "{prompt}");
+}
+
 /// Reasoning is on by default at the encoding's default effort, turns off
 /// with `enable_thinking`, and takes exactly the encoding's named efforts.
 #[test]
@@ -281,7 +392,8 @@ impl Reply {
     }
 }
 
-/// `text` generated after `request`'s prompt: its tokens, then EOS.
+/// `text` generated after `request`'s prompt: its tokens, then the stop
+/// token `end`.
 struct Generated {
     tokenizer: Arc<ByteBpeTokenizer>,
     prepared: PreparedChat,
@@ -294,14 +406,13 @@ impl Generated {
         templates: &TemplateBundle,
         request: &ChatRequest,
         text: &str,
+        end: &str,
     ) -> Self {
         let prepared =
             PreparedChat::prepare(templates, tokenizer, request, &TemplateSelection::default())
                 .unwrap();
         let mut tokens = tokenizer.encode(text, SpecialTokens::Recognize).unwrap();
-        let eos = tokenizer
-            .encode("<｜end▁of▁sentence｜>", SpecialTokens::Recognize)
-            .unwrap();
+        let eos = tokenizer.encode(end, SpecialTokens::Recognize).unwrap();
         assert!(eos.len() == 1 && tokenizer.stop_tokens().contains(&eos[0]));
         tokens.extend(eos);
         Self {
@@ -383,21 +494,28 @@ impl Generated {
     }
 }
 
-/// Every reply the encoding writes is admitted by its request's grammar and
-/// reads back as the reasoning, content and calls (names, and arguments as
-/// JSON) it was written from.
-#[test]
-fn deepseek41_replies_read_back_as_their_calls() {
-    let (tokenizer, templates, reference) = deepseek41();
+/// The stop token DeepSeek V4.1's replies end with.
+const DEEPSEEK41_END: &str = "<｜end▁of▁sentence｜>";
+
+/// Every reply the model's format writes, ended by the stop token `end`, is
+/// admitted by its request's grammar and reads back as the reasoning, content
+/// and calls (names, and arguments as JSON) it was written from.
+fn replies_read_back(
+    tokenizer: ByteBpeTokenizer,
+    templates: &TemplateBundle,
+    reference: &Reference,
+    end: &str,
+) {
     let tokenizer = Arc::new(tokenizer);
     assert!(!reference.replies.is_empty());
     let mut failures = Vec::new();
     for reply in &reference.replies {
         let generated = Generated::new(
             &tokenizer,
-            &templates,
+            templates,
             &reply.request(reference.now),
             &reply.text,
+            end,
         );
         if let Err(error) = generated.admitted() {
             failures.push(format!("{}: {error}", reply.name));
@@ -420,6 +538,22 @@ fn deepseek41_replies_read_back_as_their_calls() {
     eprintln!("{} replies read back", reference.replies.len());
 }
 
+#[test]
+fn deepseek41_replies_read_back_as_their_calls() {
+    let (tokenizer, templates, reference) = deepseek41();
+    replies_read_back(tokenizer, &templates, &reference, DEEPSEEK41_END);
+}
+
+/// GLM's tool calls, as its release template writes them (string values raw,
+/// every other value JSON, a call without arguments as its bare name), read
+/// back through the generic tagged-argument format, published token by token.
+/// Its turn ends at the end of text, one of its generation config's EOS.
+#[test]
+fn glm53_replies_read_back_as_their_calls() {
+    let (tokenizer, templates, reference) = glm53();
+    replies_read_back(tokenizer, &templates, &reference, "<|endoftext|>");
+}
+
 /// A parameter without its `string` attribute is not V4.1's format (the
 /// encoding's own reader refuses it, encoding.py:927-929): the grammar never
 /// writes it, and the parser refuses it.
@@ -439,6 +573,7 @@ fn deepseek41_refuses_a_parameter_without_its_string_attribute() {
         &templates,
         &reply.request(reference.now),
         &malformed,
+        DEEPSEEK41_END,
     );
     assert_eq!(
         generated.admitted(),
@@ -475,6 +610,7 @@ fn deepseek41_reads_fenced_json_output() {
         &templates,
         &request,
         "Two plus two.</think>```json\n{\"answer\": 4}\n```",
+        DEEPSEEK41_END,
     );
     generated.admitted().unwrap();
     let parsed = generated.parsed().unwrap();

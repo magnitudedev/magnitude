@@ -765,27 +765,79 @@ impl<X: TraceOutput> Trace<X> {
 struct Answer<V> {
     points: crate::TemplatePoints,
     output: V,
-    programs: std::cell::RefCell<Vec<std::rc::Rc<crate::CapacityProgram>>>,
+    /// The compiled programs, each with the class point (the model's facts
+    /// with the class facts at one point's values) it was compiled at, or
+    /// `None` at the model's own points.
+    programs: std::cell::RefCell<Vec<(Option<Vec<u64>>, std::rc::Rc<crate::CapacityProgram>)>>,
 }
 
 impl<V> Answer<V> {
-    /// `template`'s buffers compiled at the model's points for slices named
-    /// like `slices`, compiled the first time a naming asks.
+    /// `template`'s buffers compiled for slices named like `slice`, at the
+    /// class `point` (its facts and their points, which fix the dimensions
+    /// of `classes`) or, where the family names no class facts, at the
+    /// model's own points, which fix none; compiled the first time a naming
+    /// asks at a point.
     fn program(
         &self,
         template: &NativeGraphResourceTemplate,
-        slices: &[NativeGraphClassSlice],
+        slice: &NativeGraphClassSlice,
+        classes: &[ClassFact],
+        point: Option<(&[u64], &crate::TemplatePoints)>,
     ) -> Result<std::rc::Rc<crate::CapacityProgram>, NativeGraphMetadataError> {
-        let Some(first) = slices.first() else {
-            return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
-        };
-        let names = first.names();
-        if let Some(program) = self.programs.borrow().iter().find(|program| program.names() == names) {
+        let (names, facts) = (slice.names(), point.map(|(facts, _)| facts));
+        if let Some((_, program)) = self
+            .programs
+            .borrow()
+            .iter()
+            .find(|(at, program)| at.as_deref() == facts && program.names() == names)
+        {
             return Ok(std::rc::Rc::clone(program));
         }
-        let program = std::rc::Rc::new(template.capacity_program(&self.points, first)?);
-        self.programs.borrow_mut().push(std::rc::Rc::clone(&program));
+        let at = point.map_or(&self.points, |(_, at)| at);
+        let program = std::rc::Rc::new(template.capacity_program(at, slice, classes)?);
+        self.programs.borrow_mut().push((facts.map(<[u64]>::to_vec), std::rc::Rc::clone(&program)));
         Ok(program)
+    }
+
+    /// Every buffer of `template` at its capacity over the classes of
+    /// `slices`, whose class points are `points`. Where the family names class
+    /// facts, each class point's buffers are its own: every dimension evaluated at the model's
+    /// facts with the class facts at the point's values, so a buffer follows
+    /// each dimension a class fact reaches whether or not the slices name it,
+    /// and the capacity is the widest over the points. Without class facts,
+    /// the slices' named dimensions vary it.
+    fn capacities(
+        &self,
+        template: &NativeGraphResourceTemplate,
+        points: &ClassPoints,
+        slices: &[NativeGraphClassSlice],
+    ) -> Result<crate::Capacities, NativeGraphMetadataError> {
+        if points.slices.iter().all(Vec::is_empty) {
+            let Some(first) = slices.first() else {
+                return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
+            };
+            return self.program(template, first, &[], None)?.at(slices);
+        }
+        let mut widest: Option<crate::Capacities> = None;
+        let mut first = None;
+        for (slice, facts) in points.points() {
+            let at = template.points(&facts).ok_or_else(|| {
+                NativeGraphMetadataError::Unsupported(format!("a dimension does not evaluate at class point {facts:?}"))
+            })?;
+            if let Some((entry, name)) = first.as_ref().and_then(|first| template.varied_static(first, &at)) {
+                return Err(NativeGraphMetadataError::Unsupported(format!(
+                    "graph regime classes vary `{entry}`'s static dimension `{name}`"
+                )));
+            }
+            let slice = std::slice::from_ref(&slices[slice]);
+            let capacities = self.program(template, &slice[0], &points.classes, Some((&facts, &at)))?.at(slice)?;
+            widest = Some(match widest {
+                None => capacities,
+                Some(widest) => widest.cover(capacities),
+            });
+            first.get_or_insert(at);
+        }
+        widest.ok_or_else(|| NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()))
     }
 
     /// `template`'s outline over `slices` at the model: the buffers' class
@@ -793,20 +845,20 @@ impl<V> Answer<V> {
     fn outline(
         &self,
         template: &NativeGraphResourceTemplate,
+        points: &ClassPoints,
         slices: &[NativeGraphClassSlice],
     ) -> Result<NativeGraphOutline, NativeGraphMetadataError> {
-        let program = self.program(template, slices)?;
-        template.outline_with(&program, slices)
+        template.outline_capacities(self.capacities(template, points, slices)?)
     }
 
     /// The layout `template` seals into over `slices` at the model.
     fn certify(
         &self,
         template: &NativeGraphResourceTemplate,
+        points: &ClassPoints,
         slices: &[NativeGraphClassSlice],
     ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
-        let program = self.program(template, slices)?;
-        template.certify_with(&program, slices)
+        template.certify_capacities(self.capacities(template, points, slices)?)
     }
 }
 
@@ -857,6 +909,8 @@ pub struct ClassFact {
 /// cannot change its outcome, are never formed.
 struct ClassPoints {
     facts: Vec<u64>,
+    /// The facts the slices replace per class.
+    classes: Vec<ClassFact>,
     slices: Vec<Vec<(usize, Vec<u64>)>>,
 }
 
@@ -884,7 +938,20 @@ impl ClassPoints {
                 varying
             })
             .collect();
-        Self { facts: facts.to_vec(), slices }
+        Self { facts: facts.to_vec(), classes: classes.to_vec(), slices }
+    }
+
+    /// Every class point: for each slice (its index), the model's facts with
+    /// the slice's class facts at each combination of their values.
+    fn points(&self) -> Vec<(usize, Vec<u64>)> {
+        let mut points = Vec::new();
+        for (index, slice) in self.slices.iter().enumerate() {
+            each_combination(&self.facts, &slice.iter().collect::<Vec<_>>(), |point| {
+                points.push((index, point.to_vec()));
+                None::<()>
+            });
+        }
+        points
     }
 
     /// A point at which `guard` does not go the way it went, if any: the
@@ -894,35 +961,46 @@ impl ClassPoints {
         if !guard.holds(&self.facts) {
             return Some(self.facts.clone());
         }
-        let mut point = self.facts.clone();
-        for slice in &self.slices {
+        self.slices.iter().find_map(|slice| {
             let read = slice
                 .iter()
                 .filter(|(fact, _)| guard.reads.binary_search(fact).is_ok())
                 .collect::<Vec<_>>();
             if read.is_empty() {
-                continue;
+                return None;
             }
-            let mut digits = vec![0; read.len()];
-            'combinations: loop {
-                for ((fact, values), &digit) in read.iter().zip(&digits) {
-                    point[*fact] = values[digit];
-                }
-                if !guard.holds(&point) {
-                    return Some(point);
-                }
-                for (digit, (_, values)) in digits.iter_mut().zip(&read) {
-                    *digit += 1;
-                    if *digit < values.len() {
-                        continue 'combinations;
-                    }
-                    *digit = 0;
-                }
-                break;
-            }
-            point.copy_from_slice(&self.facts);
+            each_combination(&self.facts, &read, |point| (!guard.holds(point)).then(|| point.to_vec()))
+        })
+    }
+}
+
+/// `facts` with each of `varying`'s facts at every combination of its
+/// values, passed to `each` until it finds something.
+fn each_combination<T>(
+    facts: &[u64],
+    varying: &[&(usize, Vec<u64>)],
+    mut each: impl FnMut(&[u64]) -> Option<T>,
+) -> Option<T> {
+    let mut point = facts.to_vec();
+    let mut digits = vec![0; varying.len()];
+    loop {
+        for ((fact, values), &digit) in varying.iter().map(|entry| (entry.0, &entry.1)).zip(&digits) {
+            point[fact] = values[digit];
         }
-        None
+        if let Some(found) = each(&point) {
+            return Some(found);
+        }
+        let advanced = digits.iter_mut().zip(varying).any(|(digit, (_, values))| {
+            *digit += 1;
+            if *digit < values.len() {
+                return true;
+            }
+            *digit = 0;
+            false
+        });
+        if !advanced {
+            return None;
+        }
     }
 }
 
@@ -961,7 +1039,7 @@ fn answer_from<X: TraceOutput>(
             return None;
         }
         let answer = answer.get_or_init(|| trace.at(facts, reals)).as_ref()?;
-        Some(answer.outline(&trace.template, slices).map(|outline| (outline, answer.output.clone())))
+        Some(answer.outline(&trace.template, points, slices).map(|outline| (outline, answer.output.clone())))
     })
 }
 
@@ -1030,7 +1108,7 @@ impl<K: Clone + Eq + Hash, X: TraceOutput> NativeGraphTraces<K, X> {
             let trace = Arc::new(Trace::record(key, facts, reals, record)?);
             trace.assert_holds_at(&points);
             let answer = trace.at(facts, reals).expect("a recording answers its own facts");
-            outlines.push((answer.outline(&trace.template, slices)?, answer.output.clone()));
+            outlines.push((answer.outline(&trace.template, &points, slices)?, answer.output.clone()));
             traces.push(Arc::clone(&trace));
             known.push((trace, std::cell::OnceCell::from(Some(answer))));
         }
@@ -1060,7 +1138,7 @@ impl<K: Clone + Eq + Hash, X: TraceOutput> NativeGraphTraces<K, X> {
         let answer = Answer { points, output: (), programs: Default::default() };
         let layouts = slice_sets
             .iter()
-            .map(|slices| answer.certify(&trace.template, slices))
+            .map(|slices| answer.certify(&trace.template, &ClassPoints::of(facts, classes, slices), slices))
             .collect::<Result<Vec<_>, _>>()?;
         let output = trace.output.at(facts, reals).expect("a recording's output evaluates at its own facts");
         Ok((layouts, output))

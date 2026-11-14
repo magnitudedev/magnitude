@@ -238,7 +238,7 @@ pub fn describe_projector(
         ));
     }
     let transforms = if stored.len() == 3 {
-        vec![ImportTransform::DropUnitAxis]
+        vec![ImportTransform::MergeLeadingAxes]
     } else {
         Vec::new()
     };
@@ -308,14 +308,17 @@ pub fn describe_projector(
         }),
         stages: vec![
             MergerStage {
+                norm: None,
                 linear: r.unbiased("mm.model.mlp.1.weight", projection, cell)?,
                 activation: Some(VisionActivation::ReluSquared),
             },
             MergerStage {
+                norm: None,
                 linear: r.unbiased("mm.model.mlp.3.weight", output_hidden, projection)?,
                 activation: None,
             },
         ],
+        feed_forward: None,
         output_norm: None,
     };
     let preprocessing = VisionPreprocessing {

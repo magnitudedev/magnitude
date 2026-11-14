@@ -269,10 +269,7 @@ fn resource_limits(
     let lookahead = model.lookahead && backend != seismic::BackendName::Cpu;
     Ok(ResourceLimits {
         max_launch_rows,
-        // Every request consumes at least one token in either phase. A
-        // prefill round can therefore have as many request slots as its
-        // larger token allowance admits.
-        max_launch_slots: max_launch_rows,
+        max_launch_slots: service.steps().launch_slots(),
         max_selected_rows: service.selection_bound(),
         max_drafting_slots: service.selection_bound(),
         exported_logits_rows: model.exported_logits_rows,

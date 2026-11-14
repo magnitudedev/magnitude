@@ -23,7 +23,7 @@ use crate::planning::{AttentionForm, AttentionWidths, RoundingWords};
 use crate::programs::graph::facts::Numbers;
 use crate::programs::graph::{GraphError, draft::ControlSource};
 use crate::{AttentionShape, CandidatePool, CandidatesBinding};
-use magnitude_family_contracts::{Attention, HeadNorm, HeadWeights, IndexerKeys, WeightKind};
+use magnitude_family_contracts::{Attention, HeadNorm, HeadWeights, IndexerKeys, Pool, PoolNorm, WeightKind};
 use seismic::{Argument, Dim, Element, Table};
 use std::sync::Arc;
 
@@ -59,13 +59,13 @@ pub(crate) struct AttentionSite<'a> {
 }
 
 /// A selected read's indexer at one graph class: its static axes and its
-/// raw keys' (Window) and block keys' (Block) history rows and slab rows.
+/// pending keys' (Window) and unit keys' (Block) history rows and slab rows.
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionSite {
     pub shape: crate::SelectionShape,
     /// Whether the class scores: some row of its launch has more than
-    /// `blocks` complete blocks. A class without scoring appends the
-    /// indexer's keys alone and reads every visible row.
+    /// `top` complete units. A class without scoring appends the indexer's
+    /// keys alone and reads every visible row.
     pub scored: bool,
     pub window_rows: u64,
     pub window_slab_rows: u32,
@@ -123,10 +123,12 @@ pub(crate) struct LowRankReals<R> {
     pub epsilon: R,
 }
 
-/// A selected read's query norm's epsilon.
+/// A selected read's reals: its keys' norm's epsilon (`pool_rows`) and its
+/// indexer's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SelectionReals<R> {
-    pub epsilon: R,
+    pub key_epsilon: R,
+    pub indexer: IndexedReals<R>,
 }
 
 /// An index-list source's reals: none for a reused one's.
@@ -182,20 +184,30 @@ impl<R, T> Numbers<R> for AttentionTopology<R, T> {
             rotary: self.rotary,
             key_rounding: self.key_rounding.map(&mut *f),
             low_rank_query: self.low_rank_query.map(|part| LowRankReals { epsilon: f(part.epsilon) }),
-            selection: self.selection.map(|part| SelectionReals { epsilon: f(part.epsilon) }),
+            selection: self.selection.map(|part| SelectionReals {
+                key_epsilon: f(part.key_epsilon),
+                indexer: part.indexer.map(&mut *f),
+            }),
             picked: self.picked.map(|picked| match picked {
                 PickedReals::Reused => PickedReals::Reused,
-                PickedReals::Indexed(reals) => PickedReals::Indexed(IndexedReals {
-                    query_norm: reals.query_norm.map(&mut *f),
-                    key_norm: reals.key_norm.map(&mut *f),
-                    scale: f(reals.scale),
-                    query_rounding: reals.query_rounding.map(&mut *f),
-                    key_rounding: reals.key_rounding.map(&mut *f),
-                    own: reals.own.map(|own| OwnReals {
-                        epsilon: f(own.epsilon),
-                        rounding: own.rounding.map(&mut *f),
-                    }),
-                }),
+                PickedReals::Indexed(reals) => PickedReals::Indexed(reals.map(&mut *f)),
+            }),
+        }
+    }
+}
+
+impl<R> Numbers<R> for IndexedReals<R> {
+    type Of<E> = IndexedReals<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> IndexedReals<E> {
+        IndexedReals {
+            query_norm: self.query_norm.map(&mut *f),
+            key_norm: self.key_norm.map(&mut *f),
+            scale: f(self.scale),
+            query_rounding: self.query_rounding.map(&mut *f),
+            key_rounding: self.key_rounding.map(&mut *f),
+            own: self.own.map(|own| OwnReals {
+                epsilon: f(own.epsilon),
+                rounding: own.rounding.map(&mut *f),
             }),
         }
     }
@@ -296,6 +308,7 @@ pub(crate) struct AttentionBlock<D = Dim> {
     pub(in crate::operators::attention) key_rounding: Option<RoundingWords<D>>,
     pub(in crate::operators::attention) low_rank_query: Option<LowRankQuery<D>>,
     pub(in crate::operators::attention) grouped: Option<GroupedOutput<D>>,
+    pub(in crate::operators::attention) absorbed: Option<AbsorbedQuery<D>>,
     pub(in crate::operators::attention) selection: Option<SelectedRead<D>>,
     pub(in crate::operators::attention) picked: Option<PickedSource<D>>,
 }
@@ -316,6 +329,21 @@ impl<D: Clone> AttentionBlock<D> {
         if let Some(PickedSource::Indexed(source)) = &mut self.picked {
             source.spans = segments.clone();
         }
+        if let Some(read) = &mut self.selection {
+            read.source.spans = segments.clone();
+        }
+    }
+}
+
+impl AttentionBlock {
+    /// `Q`: the rows the query projection (a low-rank query's up) yields:
+    /// the attended query rows, or an absorbed query's heads at their own
+    /// width.
+    pub(crate) fn query_projection_rows(&self, form: &AttentionForm) -> Dim {
+        match &self.absorbed {
+            None => self.widths.query_rows(form),
+            Some(absorbed) => &absorbed.heads * &absorbed.width,
+        }
     }
 }
 
@@ -323,6 +351,14 @@ impl<D: Clone> AttentionBlock<D> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LowRankQuery<D = Dim> {
     pub rank: D,
+}
+
+/// An absorbed query's `project_rows` axes (`AbsorbedQueryShape`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AbsorbedQuery<D = Dim> {
+    pub heads: D,
+    pub width: D,
+    pub keys: D,
 }
 
 /// A grouped output's `project_rows` axes.
@@ -333,18 +369,31 @@ pub(crate) struct GroupedOutput<D = Dim> {
     pub rank: D,
 }
 
-/// A selected read at one class: whether the class scores, its axes and
-/// its history domains' planes.
+/// A selected read over token rows at one class: whether the class scores,
+/// its units of `block` keys and its bitmap's `words`, its keys' pooling
+/// into the Window `window` and the Block plane its indexer `source` scores
+/// (`source.plane`: its list is the Block read's visible spans, `source.scores`
+/// its units; its picks are unit ordinals, `graph::select`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SelectedRead<D = Dim> {
     pub scored: bool,
-    pub heads: D,
-    pub width: D,
+    /// Whether its indexer's query projects the low-rank query's `qr` rows
+    /// (`IndexerInput::QueryRank`), not `x`.
+    pub query_rank: bool,
     pub block: D,
-    pub blocks: D,
     pub words: D,
     pub window: Plane<D>,
-    pub blocks_plane: Plane<D>,
+    pub keys: SelectedKeys,
+    pub source: IndexedSource<D>,
+}
+
+/// A selected read's key pooling (`pool_rows`' `GT`, `PR`, `TN`): softmax
+/// gated, with a per-place gate term, normed per token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SelectedKeys {
+    pub gated: bool,
+    pub place: bool,
+    pub token_norm: bool,
 }
 
 /// A history plane's rows and slab rows.
@@ -456,15 +505,19 @@ impl<D> Numbers<D> for AttentionBlock<D> {
                 inputs: f(grouped.inputs),
                 rank: f(grouped.rank),
             }),
+            absorbed: self.absorbed.map(|absorbed| AbsorbedQuery {
+                heads: f(absorbed.heads),
+                width: f(absorbed.width),
+                keys: f(absorbed.keys),
+            }),
             selection: self.selection.map(|read| SelectedRead {
                 scored: read.scored,
-                heads: f(read.heads),
-                width: f(read.width),
+                query_rank: read.query_rank,
                 block: f(read.block),
-                blocks: f(read.blocks),
                 words: f(read.words),
                 window: read.window.map(&mut *f),
-                blocks_plane: read.blocks_plane.map(&mut *f),
+                keys: read.keys,
+                source: read.source.map(&mut *f),
             }),
             picked: self.picked.map(|picked| match picked {
                 PickedSource::Reused { plane } => PickedSource::Reused { plane: plane.map(&mut *f) },
@@ -483,7 +536,7 @@ pub(crate) fn split(
     let attention = site.operator;
     let selected = match (site.selection, operator::admitted_selection(attention)) {
         (None, _) => None,
-        (Some(selection), Some(read)) => Some((selection, read)),
+        (Some(selection), Some(read)) => Some(split_selected(selection, read, site.segments)),
         (Some(_), None) => {
             return Err("a selected attention block's operator reads every visible row".into());
         }
@@ -510,7 +563,7 @@ pub(crate) fn split(
         },
         key_rounding: key_rounding.1,
         low_rank_query: low_rank_query.map(|(_, epsilon)| LowRankReals { epsilon }),
-        selection: selected.map(|(_, read)| SelectionReals { epsilon: read.query_norm.epsilon }),
+        selection: selected.as_ref().map(|(_, reals)| reals.clone()),
         picked: picked.as_ref().map(|(_, reals)| reals.clone()),
     };
     let numbers = AttentionBlock {
@@ -528,22 +581,12 @@ pub(crate) fn split(
             inputs: grouped.inputs,
             rank: grouped.rank,
         }),
-        selection: selected.map(|(selection, _)| SelectedRead {
-            scored: selection.scored,
-            heads: selection.shape.heads,
-            width: selection.shape.width,
-            block: selection.shape.block,
-            blocks: selection.shape.blocks,
-            words: selection.shape.words,
-            window: Plane {
-                rows: selection.window_rows,
-                slab_rows: u64::from(selection.window_slab_rows),
-            },
-            blocks_plane: Plane {
-                rows: selection.block_rows,
-                slab_rows: u64::from(selection.block_slab_rows),
-            },
+        absorbed: operator::absorbed_query(attention).map(|absorbed| AbsorbedQuery {
+            heads: absorbed.heads,
+            width: absorbed.width,
+            keys: absorbed.keys,
         }),
+        selection: selected.map(|(numbers, _)| numbers),
         picked: picked.map(|(numbers, _)| numbers),
     };
     Ok((topology, numbers))
@@ -556,6 +599,65 @@ fn bytes<V, const N: usize>(values: Vec<V>, of: fn(V) -> [u8; N]) -> Arc<[u8]> {
 
 fn plane(plane: PickedPlane) -> Plane<u64> {
     Plane { rows: plane.rows, slab_rows: u64::from(plane.slab_rows) }
+}
+
+/// [`split`] of a selected read over token rows at a class of `segments`
+/// visible spans: its numbers and its reals. Its indexer's list is the
+/// Block read's spans and its scores every unit the bitmap covers.
+fn split_selected(
+    site: SelectionSite,
+    read: operator::SelectedRead<'_>,
+    segments: u64,
+) -> (SelectedRead<u64>, SelectionReals<f64>) {
+    let indexer = read.indexer;
+    let (query_rounding, key_rounding) = operator::indexer_roundings(indexer);
+    let (query_rounding, query_floor) = query_rounding.part().unzip();
+    let (key_rounding, key_floor) = key_rounding.part().unzip();
+    let block = Plane { rows: site.block_rows, slab_rows: u64::from(site.block_slab_rows) };
+    let numbers = SelectedRead {
+        scored: site.scored,
+        query_rank: matches!(indexer.query.input, magnitude_family_contracts::IndexerInput::QueryRank),
+        block: site.shape.block,
+        words: site.shape.words,
+        window: Plane { rows: site.window_rows, slab_rows: u64::from(site.window_slab_rows) },
+        keys: SelectedKeys {
+            gated: matches!(read.keys.pool, Pool::SoftmaxGated { .. }),
+            place: matches!(read.keys.pool, Pool::SoftmaxGated { position: Some(_), .. }),
+            token_norm: matches!(read.keys.norm, PoolNorm::Token { .. }),
+        },
+        source: IndexedSource {
+            plane: block,
+            heads: indexer.heads,
+            width: indexer.width,
+            top: indexer.top,
+            spans: segments,
+            scores: site.shape.units(),
+            candidates: Candidates::All,
+            head_weights: matches!(indexer.head_weights, HeadWeights::Projected(_)),
+            query_rounding,
+            key_rounding,
+            own: None,
+        },
+    };
+    let reals = SelectionReals {
+        key_epsilon: match &read.keys.norm {
+            PoolNorm::Pooled(norm) => norm.epsilon,
+            PoolNorm::Token { norm, .. } => norm.epsilon,
+        },
+        indexer: IndexedReals {
+            query_norm: match &indexer.query.norm {
+                HeadNorm::Rms(norm) => Some(norm.epsilon),
+                HeadNorm::None => None,
+            },
+            // `pool_rows` writes the keys; the indexer writes none.
+            key_norm: None,
+            scale: indexer.scale,
+            query_rounding: query_floor,
+            key_rounding: key_floor,
+            own: None,
+        },
+    };
+    (numbers, reals)
 }
 
 /// [`split`] of an index-list source: its numbers and its reals.
@@ -610,7 +712,7 @@ fn split_picked(picked: PickedBlock<'_>) -> (PickedSource<u64>, PickedReals<f64>
         scale: indexer.scale,
         query_rounding: query_floor,
         key_rounding: key_floor,
-        own: own.zip(own_rounding).map(|(own, (_, rounding))| OwnReals { epsilon: own.rows.norm.epsilon, rounding }),
+        own: own.zip(own_rounding).map(|(own, (_, rounding))| OwnReals { epsilon: super::admitted_pooled_norm(own.rows).epsilon, rounding }),
     };
     (PickedSource::Indexed(numbers), PickedReals::Indexed(reals))
 }

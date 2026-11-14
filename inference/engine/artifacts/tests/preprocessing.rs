@@ -37,6 +37,67 @@ fn smart_resize_uses_half_to_even_and_pixel_bounds() {
     assert_eq!(downscale.resized_size(128, 64).unwrap(), (32, 32));
 }
 
+/// Expected canvases from transformers 5.17 `Glm5NextImageProcessor`
+/// (`smart_resize` with a 28-pixel cell, 16 to 8000 tokens), and the padding
+/// it leaves black before normalization (a 100 x 300 image on a 112 x 308
+/// canvas).
+#[test]
+fn padded_canvas_rounds_up_and_pads_with_black() {
+    let bounds = ImageResize::PaddedCanvas {
+        min_pixels: 12_544,
+        max_pixels: 6_272_000,
+    };
+    let value = configured(14, 2, bounds);
+    for (source, expected) in [
+        ((448, 560), (448, 560)),
+        ((100, 300), (112, 308)),
+        ((30, 40), (112, 140)),
+        ((5000, 3000), (3220, 1932)),
+        ((13, 2600), (28, 2604)),
+        ((1000, 1000), (1008, 1008)),
+        ((2000, 5000), (1568, 3920)),
+        ((3000, 4000), (2156, 2884)),
+    ] {
+        assert_eq!(value.resized_size(source.0, source.1).unwrap(), expected, "{source:?}");
+    }
+
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(RgbImage::from_pixel(300, 100, Rgb([255, 255, 255])))
+        .write_to(&mut encoded, ImageFormat::Png)
+        .unwrap();
+    let mean = [0.5f32; 3];
+    let unit = ImageProcessor::new(ImageProcessorConfig {
+        resize: bounds,
+        resampling: Resampling::Bicubic,
+        patch: 14,
+        merge: 2,
+        frames: 2,
+        mean,
+        std: [0.25; 3],
+    })
+    .unwrap();
+    let prepared = unit.prepare(&[encoded.into_inner()]).unwrap();
+    let pixels = prepared
+        .tensors()
+        .iter()
+        .find(|tensor| tensor.name() == "pixel_values")
+        .unwrap();
+    let values = pixels
+        .data()
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    // White content normalizes to 2, the padding (black) to -2.
+    assert!(values.iter().all(|value| (*value - 2.0).abs() < 1e-6 || (*value + 2.0).abs() < 1e-6));
+    assert!(values.iter().any(|value| *value > 1.0) && values.iter().any(|value| *value < -1.0));
+    let row_width = pixels.shape()[1];
+    assert_eq!(pixels.shape()[0], 8 * 22);
+    // The last cell row's patches (row 7) lie below the content's last pixel
+    // row 99 (patch row 7 spans rows 98 to 111): its first rows hold content.
+    let last = values.chunks_exact(row_width).last().unwrap();
+    assert!(last.iter().any(|value| *value < -1.0));
+}
+
 /// Expected sizes from transformers 5.17 `Gemma4ImageProcessor`
 /// (`get_aspect_ratio_preserving_size`, patch 16, pooling 3, 280 soft
 /// tokens).

@@ -98,7 +98,7 @@ fn check(vision: &VisionDescription, fused: bool) {
     assert_eq!(
         positions.table.transforms,
         if fused {
-            vec![ImportTransform::DropUnitAxis]
+            vec![ImportTransform::MergeLeadingAxes]
         } else {
             Vec::new()
         }

@@ -1,4 +1,4 @@
-use super::{AttentionKernels, DenseKernels, ProjectionKernels, RoutedKernels};
+use super::{AttentionKernels, DenseKernels, GeneralRoutedKernels, ProjectionKernels, RoutedKernels};
 use crate::HeadBinding;
 use magnitude_kernels::{
     attention_project, draft_rows, readout_features_rows, sample_rows,
@@ -19,6 +19,7 @@ pub struct HeadKernels {
     pub(super) priming_project: HashMap<HeadBinding, NativeKernel<attention_project::Entry>>,
     pub(super) dense: HashMap<HeadBinding, DenseKernels>,
     pub(super) routed: HashMap<HeadBinding, RoutedKernels>,
+    pub(super) general_routed: HashMap<HeadBinding, GeneralRoutedKernels>,
     pub(super) features: HashMap<HeadBinding, NativeKernel<readout_features_rows::Entry>>,
     pub(super) logits: HashMap<HeadBinding, ProjectionKernels>,
     /// Token selection over the draft vocabulary, shared by every block.

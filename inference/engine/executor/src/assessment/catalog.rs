@@ -1322,14 +1322,8 @@ fn every_served_head_outlines_its_graphs_from_traces(backend: BackendName) {
         let (Some(head_program), Some(head_state)) = (program.head(), state.head_state()) else {
             panic!("{line}: a selected causal head plans no head program or state");
         };
-        let history = head_state.sole_history().unwrap_or_else(|error| panic!("{line}: {error}"));
-        let classes = head_graph_classes(
-            LIMITS,
-            history.rows as u64,
-            history.slab_rows,
-            head_state.span_limit(),
-            HEAD_METHOD.draft_rows(),
-        )
+        let geometry = head_state.head_geometry().unwrap_or_else(|error| panic!("{line}: {error}"));
+        let classes = head_graph_classes(LIMITS, geometry, HEAD_METHOD.draft_rows())
         .unwrap_or_else(|error| panic!("{line}: its head classes: {error}"));
         let binding = head_program.blocks()[0];
         let outlined = tally.outline(head_traces_recorded, || {

@@ -54,7 +54,7 @@ use clap::{Args, Parser, Subcommand};
 use engine::EngineOptions;
 use fixture::FixtureSet;
 use magnitude_engine::host::HostArtifacts;
-use magnitude_engine::options::{PackageOptions, ProjectorSelection};
+use magnitude_engine::options::{ModelMethod, PackageOptions, ProjectorSelection};
 use magnitude_executor::STANDARD_TUNING_BUDGET;
 use record::{Run, RunRecord};
 use render::{Rendered, Renderer, RequestOptions};
@@ -254,6 +254,9 @@ enum Command {
         /// Size each fixture to this many tokens.
         #[arg(long)]
         context: Option<usize>,
+        /// How the load drafts: the catalog's drafter or the package's draft head (auto), or a named method.
+        #[arg(long, default_value = "auto", value_parser = parse_method)]
+        method: ModelMethod,
         /// Anchors per fixture, spread over its scored positions.
         #[arg(long, default_value_t = 8)]
         anchors: usize,
@@ -265,6 +268,14 @@ enum Command {
         #[arg(long)]
         attribute: bool,
     },
+}
+
+/// The engine's `ModelMethod` of `name`, as the engine names it.
+fn parse_method(name: &str) -> Result<ModelMethod, String> {
+    ModelMethod::named(name).ok_or_else(|| {
+        let names = ModelMethod::ALL.map(ModelMethod::name).join(", ");
+        format!("{name}: not a drafting method ({names})")
+    })
 }
 
 #[derive(Args)]
@@ -501,7 +512,7 @@ fn engine_options(
     inputs: &Inputs,
 ) -> Result<(EngineOptions, Development), String> {
     let budget = engine.tuning_budget.0;
-    let numerical_profile = engine.numerical_profile.as_deref().map(read_numerical_profile).transpose()?;
+    let numerical_profile = engine.numerical_profile.as_deref().map(magnitude_executor::NumericalProfile::read).transpose()?;
     // A survey measures: it is installed in the worker process that runs a
     // model's Prepare, never here, where the model is loaded.
     let worker_arguments = engine.survey.worker_arguments();
@@ -648,7 +659,7 @@ fn run(command: Command) -> Result<(), String> {
             let digest = inputs.write_rendered(&rendered)?;
             let (options, development) = engine_options(&engine, &inputs)?;
             let load = engine::Load {
-                drafter: false,
+                method: magnitude_engine::options::ModelMethod::Plain,
                 proposals: None,
                 context_tokens: context,
                 sequences: std::num::NonZeroUsize::MIN,
@@ -739,7 +750,7 @@ fn run(command: Command) -> Result<(), String> {
             backend: memory::backend(&device)?,
             target,
             kernel_cache: cache_dir,
-            numerical_profile: numerical_profile.as_deref().map(read_numerical_profile).transpose()?,
+            numerical_profile: numerical_profile.as_deref().map(magnitude_executor::NumericalProfile::read).transpose()?,
             context_tokens: context,
             weight_cap,
             decode: decode.zip(decode_tokens).map(|(rendered, tokens)| memory::Decode {
@@ -766,6 +777,7 @@ fn run(command: Command) -> Result<(), String> {
             run,
             engine,
             context,
+            method,
             anchors,
             proposals,
             attribute,
@@ -778,6 +790,7 @@ fn run(command: Command) -> Result<(), String> {
                 &inputs.artifacts.artifacts,
                 &options,
                 &draft::DraftOptions {
+                    method,
                     anchors,
                     proposals,
                     attribute,
@@ -793,8 +806,3 @@ fn run(command: Command) -> Result<(), String> {
     }
 }
 
-/// The numerical profile at `path` (`--numerical-profile`).
-fn read_numerical_profile(path: &std::path::Path) -> Result<magnitude_executor::NumericalProfile, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("numerical profile {}: {error}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("numerical profile {}: {error}", path.display()))
-}

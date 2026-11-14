@@ -135,7 +135,7 @@ pub struct StoreMotion {
     take_rate: f64,
     /// Written whether or not it is known: the worker transport's encoding
     /// is positional (postcard), so an omitted field misreads every field
-    /// after it. JSON writes `null`, which `MotionFigures` reads as none.
+    /// after it.
     sustained: Option<f64>,
 }
 
@@ -148,7 +148,6 @@ impl Eq for StoreMotion {}
 struct MotionFigures {
     fluctuation: u64,
     take_rate: f64,
-    #[serde(default)]
     sustained: Option<f64>,
 }
 
@@ -1730,7 +1729,7 @@ mod tests {
     fn no_motion_without_a_take_rate() {
         assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, 0.0)).is_err());
         assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, f64::NAN)).is_err());
-        assert!(serde_json::from_value::<StoreMotion>(serde_json::json!({ "fluctuation": 0, "take_rate": 0.0 })).is_err());
+        assert!(serde_json::from_value::<StoreMotion>(serde_json::json!({ "fluctuation": 0, "take_rate": 0.0, "sustained": null })).is_err());
         let m4_pro = recorded::m4_pro();
         assert!(MemoryReserves::new(StoreMotion::new(0, 1e9), crate::platform::ReleaseRate::new(1e9)).host_margin(m4_pro.host_ram()) > 0);
     }

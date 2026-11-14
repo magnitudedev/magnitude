@@ -230,6 +230,7 @@ native routed_down_sited for cuda from "cuda/routed_down_sited.cu":
 native routed_output_project for cuda from "cuda/routed_output_project.cu":
     static (H, K, F, S)
     params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
+    where F % 64 == 0 and S % 64 == 0
     scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
     scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
     launch routed_output_stage when operands(EDW) + operands(SDW) > 0:

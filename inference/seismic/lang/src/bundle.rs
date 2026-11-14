@@ -259,15 +259,16 @@ impl<'a> CheckedFields<'a> {
 }
 
 /// The owned form of [`CheckedFields`]. Each definition and family decodes
-/// in its own [`Scope`], which [`CheckedParts::into_module`] checks.
-#[derive(Deserialize)]
+/// in its own [`Scope`], which [`CheckedParts::into_module`] checks. It
+/// writes what [`CheckedFields`] writes, scopes left out.
+#[derive(Serialize, Deserialize)]
 struct CheckedParts {
     entries: Vec<EntryInfo>,
     native_implementations: Vec<NativeImplementation>,
     entry_families: Vec<usize>,
-    #[serde(deserialize_with = "wire::deserialize_scoped")]
+    #[serde(serialize_with = "wire::serialize_scoped", deserialize_with = "wire::deserialize_scoped")]
     definitions: Vec<(Definition, Scope)>,
-    #[serde(deserialize_with = "wire::deserialize_scoped")]
+    #[serde(serialize_with = "wire::serialize_scoped", deserialize_with = "wire::deserialize_scoped")]
     families: Vec<(Family, Scope)>,
     constants: Vec<(String, u64)>,
 }
@@ -551,6 +552,23 @@ mod tests {
         assert!(check_source(SourceSet::new(vec![words.clone(), twice])).is_err());
         let clash = file("clash.seismic", "fn FIRST() -> i32:\n    return 1\n");
         assert!(check_source(SourceSet::new(vec![words, clash])).is_err());
+    }
+
+    /// The checked section's owned form writes exactly the bytes it was read
+    /// from: its scoped elements, dimension ordinals and declared names
+    /// serialize as the borrowed form's derive wrote them.
+    #[test]
+    fn the_checked_parts_write_the_section_they_were_read_from() {
+        let encoded = embedded(encode_checked_bundle(&checked()));
+        let frame = Frame::read(verified(encoded).unwrap()).unwrap();
+        let (parts, decoded) = wire::decode(|| {
+            postcard::from_bytes::<CheckedParts>(frame.checked)
+                .map_err(|_| wire::WireError("checked section does not decode"))
+        })
+        .unwrap();
+        assert!(!parts.definitions.is_empty());
+        let rewritten = wire::encode(decoded.module, decoded.program, || postcard::to_stdvec(&parts)).unwrap();
+        assert_eq!(rewritten, frame.checked);
     }
 
     #[test]

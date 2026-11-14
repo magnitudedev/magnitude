@@ -85,6 +85,16 @@ parameter tags are then V4.1's, each name after a space (`<｜DSML｜ calls>`). 
 ported; its other V4.1 parts serve request fields the extraction never receives. For V4.1, as for V4, a
 JSON-schema reply is the value in a ```` ```json ```` fence.
 
+Patch 0031 completes the comparison filters as Jinja defines them: `unique` keeps each item whose
+key is new, in order; `sort`, `dictsort`, `min`, `max` and `unique` compare a string by its lower
+case unless `case_sensitive` (upstream ignored the argument and always compared exactly), take the
+key from `attribute` where Jinja does, and sorts are stable in either direction.
+
+Patch 0032 gives each iteration of a loop body its own scope, as Jinja does: an assignment in the
+body is undone when its iteration ends, so the next iteration sees the value from before the loop
+(upstream carried it over). The undo costs only the iteration's own assignments, never the scope's
+size.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

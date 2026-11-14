@@ -238,7 +238,7 @@ impl TargetLaunchInputs {
                         packed.destinations.iter().zip(packed.visible).enumerate()
                     {
                         let expected = crate::domain::indexer_history(
-                            store, advance, &appended, domain, row,
+                            store, advance, &appended, domain, row, 0,
                         )
                         .map_err(invalid)?;
                         if expected.destination != *destination

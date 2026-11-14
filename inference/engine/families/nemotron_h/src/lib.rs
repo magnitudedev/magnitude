@@ -33,7 +33,7 @@ use magnitude_family_contracts::{
     FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
     HeadReadout, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
     LatentExperts, ProjectedRows, RowProducer, RowRounding, TokenDomain, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+    OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
     VocabularyProjection, WeightDescriptor, FamilyError, checked_product,
 };
@@ -292,6 +292,7 @@ impl Geometry {
             query: QueryProjection::Full(
                 binder.bind(&format!("{prefix}attn_q.weight"), &[query_rows, hidden])?,
             ),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(

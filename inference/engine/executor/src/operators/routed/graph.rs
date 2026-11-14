@@ -121,6 +121,25 @@ pub(crate) struct GeneralRoutedGraphEntries<'a, G: GraphDraft + 'a> {
     )>,
 }
 
+impl<'a, G: GraphDraft + 'a> Copy for GeneralRoutedGraphEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for GeneralRoutedGraphEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, G: GraphDraft + 'a> Copy for ExpertEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for ExpertEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, G: GraphDraft + 'a> Copy for ExpansionEntry<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for ExpansionEntry<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 impl<'a> From<&'a GeneralRoutedKernels> for GeneralRoutedGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a GeneralRoutedKernels) -> Self {
         Self {

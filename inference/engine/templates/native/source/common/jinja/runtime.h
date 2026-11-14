@@ -91,11 +91,31 @@ struct context {
     }
 
     void set_val(const std::string & name, const value & val) {
-        env->insert(name, val);
+        set_val(mk_val<value_string>(name), val);
     }
 
     void set_val(const value & name, const value & val) {
+        if (iteration_assignments) {
+            iteration_assignments->push_back({name, env->has_key(name) ? env->at(name) : nullptr});
+        }
         env->insert(name, val);
+    }
+
+    // Each assignment made while a loop iteration runs, with the value its name had (null when it
+    // had none), so the iteration's scope ends with it: Jinja gives every iteration of a loop body
+    // its own scope. Null outside a loop body; a copied context starts outside one.
+    std::vector<std::pair<value, value>> * iteration_assignments = nullptr;
+
+    // Undo the iteration's assignments, latest first.
+    void end_iteration() {
+        for (auto it = iteration_assignments->rbegin(); it != iteration_assignments->rend(); ++it) {
+            if (it->second) {
+                env->insert(it->first, it->second);
+            } else {
+                env->erase(it->first);
+            }
+        }
+        iteration_assignments->clear();
     }
 
     void print_vars() const {
